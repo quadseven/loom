@@ -98,6 +98,18 @@ printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
 if /usr/bin/perl -e 'exit((stat(STDOUT) && stat(STDERR)) ? 0 : 1)'; then
   fds=ok; else fds=denied; fi
 printf 'fds=%s\\n' "$fds" >> "$TMPDIR/agent.log"
+# Relative mkdir: BSD mkdir -p on an absolute path calls mkdir on ancestors
+# outside the agent's home, which the sandbox refuses.
+(cd "$HOME" && mkdir -p .local/share/opencode/storage/session)
+echo '{"transcript": "the whole conversation"}' > "$HOME/.local/share/opencode/storage/session/s1.json"
+# opencode 1.18 keeps sessions in SQLite.
+echo "sqlite session store" > "$HOME/.local/share/opencode/opencode.db"
+echo "sqlite wal" > "$HOME/.local/share/opencode/opencode.db-wal"
+ln -s "$real_home/.ssh/id_planted" "$HOME/.local/share/opencode/storage/session/leak.json" 2>/dev/null
+# A link for a whole directory: .claude -> a directory outside the home.
+ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
+# A name with a newline and "..": a line-based reader would see "../outside.json".
+(cd "$HOME/.local/share/opencode" && mkdir -p "x"$'\\n'".." && echo decoy > "x"$'\\n'"../outside.json")
 echo fixed > fix.txt
 """
 
@@ -325,6 +337,34 @@ class LaneRunnerTest(unittest.TestCase):
         )
         self.assertEqual(victim.read_text(), "original\n")
         self.assertTrue(any("small=openrouter/vendor/model:free" in c for c in self.calls()))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_api_lane_transcripts_are_archived_without_following_links(self):
+        # The scratch home is wiped before the next run; the transcript must
+        # survive it, and a link the agent left must not pull in a secret.
+        # A file just outside the agent's home stands in for another lane's.
+        outside = self.loom / "run" / "outside.json"
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("another lane's file\n")
+        projects = self.loom / "run" / "elsewhere" / "projects"
+        projects.mkdir(parents=True)
+        (projects / "other.json").write_text("another lane's file\n")
+        self.api_lane(
+            "openrouter",
+            LOOM_OPENROUTER_KEY_SSM="/k/or",
+            FAKE_SECRET__k_or="fake-or-key",
+            LOOM_OPENROUTER_MODEL="openrouter/vendor/model:free",
+        )
+        archive = self.loom / "logs" / "openrouter" / "T042-fix-the-thing"
+        files = {p.name: p for p in archive.rglob("*") if p.is_file() and not p.is_symlink()}
+        self.assertIn("s1.json", files)
+        self.assertIn("the whole conversation", files["s1.json"].read_text())
+        self.assertIn("opencode.db", files)
+        self.assertIn("opencode.db-wal", files)
+        for p in (self.loom / "logs").rglob("*"):
+            if p.is_file() and not p.is_symlink():
+                self.assertNotIn("private key", p.read_text())
+                self.assertNotIn("another lane's file", p.read_text())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_openrouter_lane_refuses_a_paid_model(self):

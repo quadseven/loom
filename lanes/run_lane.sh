@@ -166,6 +166,37 @@ safe_git() {
   git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
 }
 
+# Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
+# session store and older session json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
+# The agent controls everything in that home, so: enter each parent directory
+# and refuse it unless its real path is the expected one (no link on the way;
+# once inside, a later swap of the name cannot move us), then hand rsync the
+# leaf by name without a trailing slash, so --no-links skips it if it is a link.
+# rsync walks the tree itself and never re-parses names, so a name built with
+# newlines and ".." cannot reach outside the home or the archive either.
+# A failed copy is written to the lane log; it never fails the run.
+archive_transcripts() {
+  local dest="$LOGDIR/$TICKET" home_real spec parent leaf
+  home_real="$(cd "$AGENT_HOME" 2> /dev/null && pwd -P)" || return 0
+  for spec in .claude:projects .local/share:opencode; do
+    parent="${spec%%:*}" leaf="${spec##*:}"
+    (
+      cd "$home_real/$parent" 2> /dev/null || exit 0
+      [ "$(pwd -P)" = "$home_real/$parent" ] || exit 0
+      mkdir -p "$dest/$parent"
+      if ! rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
+          --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
+          --include='opencode.db-shm' --exclude='*' "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
+        echo "[$(date -u +%FT%TZ)] $TICKET: archiving $parent/$leaf failed; transcript may be incomplete" >> "$LOG"
+      fi
+    )
+  done
+  return 0
+}
+
+# A fresh scratch home for every API-lane run. The agent can write inside it,
+# so anything left there (a link into the real HOME, say) must never meet the
+# runner, which is not sandboxed. rm -rf removes links without following them.
 fresh_agent_home() {
   rm -rf "$AGENT_HOME"
   mkdir -p "$AGENT_HOME/tmp"
@@ -291,6 +322,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1
   STATUS=$?
+  case "$LANE" in openrouter|opencode-go|anthropic) archive_transcripts ;; esac
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
