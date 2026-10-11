@@ -86,11 +86,13 @@ if cat "$real_home/.ssh/id_planted" > /dev/null 2>&1; then secret=readable; else
 if /usr/bin/nc -w 1 -U "$real_home/agent.sock" < /dev/null > /dev/null 2>&1; then sock=reachable; else sock=denied; fi
 if /usr/bin/osascript -e 'return 1' > /dev/null 2>&1; then osa=ran; else osa=denied; fi
 small="$(printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | sed -nE 's/.*"small_model": *"([^"]+)".*/\\1/p')"
+port="$(printf '%s' "$args" | sed -nE 's/.*PROBE_PORT=([0-9]+).*/\\1/p')"
+if [ -n "$port" ] && /usr/bin/nc -z -w 1 127.0.0.1 "$port" > /dev/null 2>&1; then lo=reachable; else lo=denied; fi
 procs="$(ps -axo args= 2>/dev/null)"
 case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
-printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s small=%s\\n' "$args" \\
+printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s lo=%s small=%s\\n' "$args" \\
   "$keyvar" "$key" "$HOME" "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" \\
-  "$secret" "$argv" "$sock" "$osa" "${small:-none}" >> "$TMPDIR/agent.log"
+  "$secret" "$argv" "$sock" "$osa" "$lo" "${small:-none}" >> "$TMPDIR/agent.log"
 if printf '#!/bin/sh\\ntouch "%s/hooked"\\n' "$real_home" > .git/hooks/pre-commit 2>/dev/null \\
    && chmod +x .git/hooks/pre-commit 2>/dev/null; then hook=planted; else hook=denied; fi
 printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
@@ -274,7 +276,14 @@ class LaneRunnerTest(unittest.TestCase):
         self.addCleanup(agent_sock.close)
         inbox = self.loom / "briefs" / lane
         inbox.mkdir(parents=True, exist_ok=True)
-        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", f"Lane: {lane}"))
+        # A local TCP service (the transcript viewer, say) the agent must not reach.
+        self.local_service = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.local_service.bind(("127.0.0.1", 0))
+        self.local_service.listen(1)
+        self.addCleanup(self.local_service.close)
+        port = self.local_service.getsockname()[1]
+        (inbox / "T042-fix-the-thing.md").write_text(
+            BRIEF.replace("Lane: codex", f"Lane: {lane}") + f"\nPROBE_PORT={port}\n")
         result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
         return inbox, result
 
@@ -298,6 +307,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("argv=clean", agent[0])
         self.assertIn("sock=denied", agent[0])
         self.assertIn("osa=denied", agent[0])
+        self.assertIn("lo=denied", agent[0])
         # A hook planted in the tree's .git would run when the runner commits.
         self.assertIn("hook=denied", self.calls())
         self.assertIn("fds=ok", self.calls())

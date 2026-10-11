@@ -25,6 +25,8 @@ the agent's messages, each tool call with its output, edits as diffs. It reads
 Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
 (openrouter, opencode-go) and codex rollouts. It binds localhost only and
 answers only localhost Host headers; transcripts never leave the machine.
+API-lane agents run on the same machine, so their sandbox denies every
+loopback connection; they cannot query the viewer or any other local service.
 
 ## API lanes: openrouter, opencode-go, anthropic
 
