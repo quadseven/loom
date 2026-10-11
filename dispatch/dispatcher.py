@@ -174,7 +174,62 @@ Difficulty: {difficulty}
     inbox.mkdir(parents=True, exist_ok=True)
     brief_path = inbox / f"{ticket_id}.md"
     brief_path.write_text(brief)
+
+    # Push to GitHub briefs branch for API access.
+    # Mac lanes fetch via https://raw.githubusercontent.com/<repo>/briefs/briefs/<lane>/<ticket>.md
+    # No filesystem access needed - pure HTTP API.
+    push_brief_to_github(lane, ticket_id, brief)
+
     return brief_path
+
+
+def push_brief_to_github(lane: str, ticket_id: str, brief: str) -> bool:
+    """Push a brief to the GitHub briefs branch for API access."""
+    try:
+        import base64
+        sys.path.insert(0, "/home/hatch/workspace/skills/github-pat/bin")
+        from importlib.machinery import SourceFileLoader
+        gh = SourceFileLoader("ghapi", "/home/hatch/workspace/skills/github-pat/bin/gh-api.py").load_module()
+        api = gh.api
+        R = "/repos/quadseven/loom"
+        BRANCH = "briefs"
+
+        # Ensure branch exists
+        try:
+            ref = api("GET", f"{R}/git/ref/heads/{BRANCH}")
+            base_sha = ref["object"]["sha"]
+        except Exception:
+            main = api("GET", f"{R}/git/ref/heads/main")
+            main_sha = main["object"]["sha"]
+            api("POST", f"{R}/git/refs",
+                {"ref": f"refs/heads/{BRANCH}", "sha": main_sha})
+            base_sha = main_sha
+
+        # Create blob
+        blob = api("POST", f"{R}/git/blobs", {
+            "content": base64.b64encode(brief.encode()).decode(),
+            "encoding": "base64"})
+
+        # Update tree
+        commit = api("GET", f"{R}/git/commits/{base_sha}")
+        path = f"briefs/{lane}/{ticket_id}.md"
+        tree = api("POST", f"{R}/git/trees", {
+            "base_tree": commit["tree"]["sha"],
+            "tree": [{"path": path, "mode": "100644",
+                      "type": "blob", "sha": blob["sha"]}],
+        })
+        new_commit = api("POST", f"{R}/git/commits", {
+            "message": f"Brief {ticket_id} for {lane}",
+            "tree": tree["sha"],
+            "parents": [base_sha],
+        })
+        api("PATCH", f"{R}/git/refs/heads/{BRANCH}",
+            {"sha": new_commit["sha"]})
+        log(f"  pushed brief to GitHub: {path}")
+        return True
+    except Exception as e:
+        log(f"  GitHub brief push failed: {e}")
+        return False
 
 
 def process_goal(goal_name: str, state: dict) -> int:
