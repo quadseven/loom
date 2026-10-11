@@ -9,6 +9,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 
 - An optional `Base:` line names the branch to start from and target; the
   default is the remote's default branch.
+- Every run passes an explicit model: the brief's `Model:` line, else the
+  lane default (`LOOM_CODEX_MODEL`, `LOOM_CLAUDE_MODEL`). The PR footer names
+  the lane and the model. A model from the other lane's family is refused.
 - A brief whose branch already has a PR in any state moves to `done/`
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the

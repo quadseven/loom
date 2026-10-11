@@ -56,7 +56,7 @@ fi
 # only edits it the way a sandboxed codex must ($FAKE_AGENT=edit), or exits
 # non-zero ($FAKE_AGENT=fail).
 FAKE_AGENT = """#!/usr/bin/env bash
-printf '%s %s\\n' "$(basename "$0")" "$1" >> "$FAKE_LOG"
+printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 echo fixed > fix.txt
@@ -119,6 +119,8 @@ class LaneRunnerTest(unittest.TestCase):
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
             "LOOM_REPO_OWNERS": "example",
+            "LOOM_CODEX_MODEL": "gpt-test-default",
+            "LOOM_CLAUDE_MODEL": "claude-test-default",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             **env,
@@ -187,6 +189,27 @@ class LaneRunnerTest(unittest.TestCase):
         create = [c for c in self.calls() if c.startswith("gh pr create")]
         self.assertEqual(len(create), 1)
         self.assertIn("--base develop", create[0])
+
+    def test_pr_footer_names_the_model_that_ran(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-test-sol"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("codex ")]
+        self.assertIn("--model gpt-test-sol", agent[0])
+        self.assertIn("lane codex, model gpt-test-sol", self.body.read_text())
+
+    def test_lane_default_model_is_used_and_named_when_brief_has_none(self):
+        self.drop_brief()
+        self.run_lane()
+        agent = [c for c in self.calls() if c.startswith("codex ")]
+        self.assertIn("--model gpt-test-default", agent[0])
+        self.assertIn("lane codex, model gpt-test-default", self.body.read_text())
+
+    def test_a_model_from_another_lanes_family_is_refused(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-4-5"))
+        self.run_lane()
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def test_failed_run_is_parked_once_and_the_next_brief_still_runs(self):
         self.drop_brief("T001-broken.md", BRIEF.replace("T042-fix-the-thing", "T001-broken"))

@@ -12,6 +12,8 @@
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
 # a brief may name; the agent trusts the cloned repo's own config),
+# LOOM_CODEX_MODEL / LOOM_CLAUDE_MODEL (the lane's model when a brief has no
+# Model: line; every run passes its model explicitly and names it in the PR),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CLONE_BASE (default git@github.com:).
@@ -54,9 +56,9 @@ section() {
 pr_body() {
   local size
   size="$(section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
-  printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s.\n' \
+  printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.\n' \
     "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
-    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE"
+    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL"
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
@@ -70,8 +72,8 @@ run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
   case "$LANE" in
-    codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write "$brief_text" < /dev/null ;;
-    claude) timeout "$AGENT_TIMEOUT" claude -p "$brief_text" < /dev/null ;;
+    codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
+    claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
 }
@@ -97,6 +99,21 @@ for BRIEF in "$INBOX"/*.md; do
   [ -n "$BASE_BRANCH" ] && BASE_ARGS=(--branch "$BASE_BRANCH")
   PR_BASE_ARGS=()
   [ -n "$BASE_BRANCH" ] && PR_BASE_ARGS=(--base "$BASE_BRANCH")
+  # The model: the brief's Model: line, else the lane default. Passed to the
+  # CLI explicitly so the PR names what actually ran.
+  MODEL="$(field Model "$BRIEF" || true)"
+  if [ -z "$MODEL" ]; then
+    case "$LANE" in codex) MODEL="${LOOM_CODEX_MODEL:-}" ;; claude) MODEL="${LOOM_CLAUDE_MODEL:-}" ;; esac
+  fi
+  if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/-]*$ ]]; then
+    park "$BRIEF" "no usable model: set Model: in the brief or the lane default"; continue
+  fi
+  case "$LANE:$MODEL" in
+    codex:claude*|codex:opus*|codex:sonnet*|codex:haiku*|codex:fable*)
+      park "$BRIEF" "model $MODEL is not a codex model"; continue ;;
+    claude:claude*|claude:opus*|claude:sonnet*|claude:haiku*|claude:fable*) ;;
+    claude:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
+  esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
