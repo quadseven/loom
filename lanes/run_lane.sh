@@ -166,8 +166,8 @@ safe_git() {
   git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
 }
 
-# Keep the agent's session transcripts (Claude Code .jsonl, opencode session
-# json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
+# Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
+# session store and older session json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
 # The agent controls everything in that home, so: enter each parent directory
 # and refuse it unless its real path is the expected one (no link on the way;
 # once inside, a later swap of the name cannot move us), then hand rsync the
@@ -184,7 +184,8 @@ archive_transcripts() {
       [ "$(pwd -P)" = "$home_real/$parent" ] || exit 0
       mkdir -p "$dest/$parent"
       rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
-        --include='*.jsonl' --exclude='*' "$leaf" "$dest/$parent/" > /dev/null 2>&1
+        --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
+        --include='opencode.db-shm' --exclude='*' "$leaf" "$dest/$parent/" > /dev/null 2>&1
     )
   done
   return 0

@@ -102,6 +102,9 @@ printf 'fds=%s\\n' "$fds" >> "$TMPDIR/agent.log"
 # outside the agent's home, which the sandbox refuses.
 (cd "$HOME" && mkdir -p .local/share/opencode/storage/session)
 echo '{"transcript": "the whole conversation"}' > "$HOME/.local/share/opencode/storage/session/s1.json"
+# opencode 1.18 keeps sessions in SQLite.
+echo "sqlite session store" > "$HOME/.local/share/opencode/opencode.db"
+echo "sqlite wal" > "$HOME/.local/share/opencode/opencode.db-wal"
 ln -s "$real_home/.ssh/id_planted" "$HOME/.local/share/opencode/storage/session/leak.json" 2>/dev/null
 # A link for a whole directory: .claude -> a directory outside the home.
 ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
@@ -356,6 +359,8 @@ class LaneRunnerTest(unittest.TestCase):
         files = {p.name: p for p in archive.rglob("*") if p.is_file() and not p.is_symlink()}
         self.assertIn("s1.json", files)
         self.assertIn("the whole conversation", files["s1.json"].read_text())
+        self.assertIn("opencode.db", files)
+        self.assertIn("opencode.db-wal", files)
         for p in (self.loom / "logs").rglob("*"):
             if p.is_file() and not p.is_symlink():
                 self.assertNotIn("private key", p.read_text())
