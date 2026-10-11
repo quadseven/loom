@@ -19,7 +19,13 @@ class DispatchHygiene(unittest.TestCase):
     def sources(self):
         files = sorted(DISPATCH.glob("*.py"))
         self.assertTrue(files)
-        return {f.name: f.read_text() for f in files}
+        sources = {}
+        for f in files:
+            try:
+                sources[f.name] = f.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                self.fail(f"cannot read {f.name}: {e}")
+        return sources
 
     def test_no_dispatch_code_writes_to_github(self):
         for name, text in self.sources().items():
