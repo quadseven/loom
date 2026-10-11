@@ -1,0 +1,36 @@
+{
+  "goals": [],
+  "lanes": {
+    "anthropic": {
+      "pending": 0,
+      "done": 0,
+      "pending_tickets": [],
+      "usage": {}
+    },
+    "claude": {
+      "pending": 0,
+      "done": 0,
+      "pending_tickets": [],
+      "usage": {}
+    },
+    "codex": {
+      "pending": 0,
+      "done": 0,
+      "pending_tickets": [],
+      "usage": {}
+    },
+    "opencode": {
+      "pending": 0,
+      "done": 0,
+      "pending_tickets": [],
+      "usage": {}
+    },
+    "sparks": {
+      "pending": 0,
+      "done": 0,
+      "pending_tickets": [],
+      "usage": {}
+    }
+  },
+  "updated": "2026-10-11T02:55:05.109009+00:00"
+}
