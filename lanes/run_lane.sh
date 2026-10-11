@@ -86,13 +86,15 @@ park() {
 }
 
 # Seatbelt profile for API-lane agents: no reads or writes anywhere under the
-# real HOME except the worktree (never its .git: a planted hook or config would
-# run when the runner commits), the scratch home and the directory holding
-# the CLI's binary; no keychain; no Unix sockets except DNS (an SSH agent's
-# socket would hand over its keys); no AppleEvents, LaunchServices,
-# osascript, open or launchctl (each can run a command outside the sandbox). Paths are canonical, because the sandbox matches
-# resolved paths; proper ancestors get metadata-only literals so getcwd and
-# realpath still work without making HOME listable.
+# real HOME except the worktree, the scratch home and the directory holding
+# the CLI's binary. Inside the worktree, .git stays readable (git diff and git
+# log need it; a fresh clone holds no credentials) but not writable: a planted
+# hook or config would run when the runner commits. Also no keychain, no Unix
+# sockets except DNS (an SSH agent's socket would hand over its keys), and no
+# AppleEvents, LaunchServices, osascript, open or launchctl (each can run a
+# command outside the sandbox). Paths are canonical, because the sandbox
+# matches resolved paths; proper ancestors get metadata-only literals so
+# getcwd and realpath still work without making HOME listable.
 sandbox_profile() {
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
   home="$(cd "$HOME" && pwd -P)"
