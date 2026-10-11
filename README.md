@@ -8,8 +8,9 @@ lanes, single shipper. Multi-project by design: one loom, many goals.
 - `docs/` - architecture, lane contracts, brief format, usage routing
 - `dispatch/` - the foreman: metrics, dispatcher, ship, verify, report
 - `lanes/` - worker lane runners (one per subscription)
- - `lanes/claude/` - Claude subscription lane (official Claude Code only)
- - `lanes/codex/` - Codex subscription lane (`codex exec`)
+ - `lanes/run_lane.sh` - the codex and claude lanes: one pass over a lane
+   inbox, one brief at a time (official CLIs only)
+ - `lanes/mac/install.sh` - installs those lanes as launchd agents
  - `lanes/opencode/` - opencode runner (OpenRouter, Poolside, other APIs)
  - `lanes/sparks/` - Nvidia sparks box: test farm + local models
 - `.github/ISSUE_TEMPLATE/` - ticket template
@@ -17,7 +18,8 @@ lanes, single shipper. Multi-project by design: one loom, many goals.
 ## Not in git
 
 - `state/` - metrics logs, usage snapshots, ship log (append-only, local)
-- `briefs/` - lane inboxes (transport, not history)
+- `briefs/` - lane inboxes (transport, not history). Briefs and lane logs
+  never go to GitHub: this repo is public.
 - `worktrees/` - per-ticket disposable clones
 
 Goals live in `~/workspace/goals/<slug>/` with their own tickets and metrics.
@@ -27,8 +29,15 @@ Loom serves all active goals.
 
 1. Read `docs/ARCHITECTURE.md`.
 2. Put API keys (OpenRouter, Poolside) in the secure vault; never in files.
-3. Install lane pollers where each subscription login lives.
+3. Install the lanes where each subscription login lives
+   (`lanes/mac/install.sh` on the login Mac).
 4. Run `dispatch/dispatch.py` on a schedule (every 30 min).
+5. Run the tests, the same command CI runs:
+   `python -B -m unittest discover -s tests -v`.
+   The suite checks that dispatcher briefs forbid merging and carry the repo
+   and loom branch, and runs `lanes/run_lane.sh` end to end against a local
+   bare repo with fake agent and `gh` commands (push and PR, base branch,
+   parking failed runs, and refusing off-limits repos or branches).
 
 ## Rules Loom enforces
 
