@@ -42,6 +42,7 @@ S: one function.
 # `pr create` prints a URL. Every call is appended to $FAKE_LOG.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
+if [ -n "${FAKE_GH_HANG:-}" ]; then exec sleep 30; fi
 if [ "$1 $2" = "pr list" ]; then
   case " $* " in *" --state all "*) printf '%s' "${FAKE_GH_EXISTING:-}" ;; esac
 fi
@@ -117,6 +118,7 @@ class LaneRunnerTest(unittest.TestCase):
             "LOOM_CLONE_BASE": self.clone_base,
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
+            "LOOM_REPO_OWNERS": "example",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             **env,
@@ -185,6 +187,22 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_brief_for_a_repo_outside_the_allowed_owners_is_refused(self):
+        # The agent trusts the cloned repo's own config, so only clone repos
+        # the operator owns.
+        self.drop_brief(text=BRIEF.replace("Repo: example/repo", "Repo: stranger/repo"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_hung_gh_call_leaves_the_brief_for_the_next_pass(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_GH_HANG="1", LOOM_NET_TIMEOUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertTrue((self.inbox / "T042-fix-the-thing.md").exists())
 
     def test_claude_lane_finds_the_cli_in_local_bin_under_a_bare_path(self):
         # launchd's PATH has no ~/.local/bin, where the official CLI installs.

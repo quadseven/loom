@@ -10,6 +10,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
+# Briefs may only name repos of these owners. Default: this checkout's owner.
+LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -40,6 +42,7 @@ for L in "${LANES[@]}"; do
     <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$HOME</string>
     <key>LOOM_HOME</key><string>$LOOM_HOME</string>
+    <key>LOOM_REPO_OWNERS</key><string>$LOOM_REPO_OWNERS</string>
   </dict>
 </dict>
 </plist>

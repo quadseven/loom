@@ -10,8 +10,11 @@
 # may commit); this runner commits what is left, pushes, and opens the PR.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
-# Env: LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default
-# 3600), LOOM_CLONE_BASE (default git@github.com:).
+# Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
+# a brief may name; the agent trusts the cloned repo's own config),
+# LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
+# LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
+# LOOM_CLONE_BASE (default git@github.com:).
 set -uo pipefail
 
 LANE="${1:?usage: run_lane.sh <lane>}"
@@ -31,6 +34,8 @@ echo $$ > "$LOCK/pid"
 trap 'rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
+NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
+REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$LANE"
@@ -82,10 +87,13 @@ for BRIEF in "$INBOX"/*.md; do
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
   fi
+  if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
+    park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
+  fi
 
-  # gh unreachable says nothing about the branch: leave the brief for the
-  # next pass rather than risk a second run.
-  if ! EXISTING="$(gh pr list -R "$REPO" --head "$BRANCH" --state all --json number --jq '.[0].number // empty')"; then
+  # gh unreachable or hung says nothing about the branch: leave the brief
+  # for the next pass rather than risk a second run.
+  if ! EXISTING="$(timeout "$NET_TIMEOUT" gh pr list -R "$REPO" --head "$BRANCH" --state all --json number --jq '.[0].number // empty')"; then
     echo "$TICKET: gh pr list failed; will retry next pass" >&2; continue
   fi
   if [ -n "$EXISTING" ]; then
@@ -97,7 +105,7 @@ for BRIEF in "$INBOX"/*.md; do
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $LANE" >> "$LOG"
-  if ! { git clone -q --depth 50 "${CLONE_BASE}${REPO}.git" "$TREE" &&
+  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 "${CLONE_BASE}${REPO}.git" "$TREE" &&
          git -C "$TREE" checkout -q -b "$BRANCH"; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed"; continue
   fi
@@ -117,10 +125,10 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$(git -C "$TREE" rev-parse "$BRANCH")" = "$BASE" ]; then
     park "$BRIEF" "agent made no commit on $BRANCH"; continue
   fi
-  if ! git -C "$TREE" push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
     park "$BRIEF" "push failed"; continue
   fi
-  if ! gh pr create -R "$REPO" --head "$BRANCH" --title "${TITLE:-$TICKET}" \
+  if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$(pr_body "$BRIEF" "$TICKET")" >> "$LOG" 2>&1; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed"; continue
   fi
