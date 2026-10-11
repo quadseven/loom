@@ -1,8 +1,12 @@
 """lanes/run_lane.sh run as a process: a temp loom home, a local bare repo as
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
+import json
+import shutil
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -66,6 +70,41 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 """
 
 
+# Fake opencode: records argv plus what the agent can see (key, HOME, SSH
+# agent, GitHub token, a secret planted in the real HOME, and whether the key
+# shows in any process's argv), then edits a file. The runner empties the
+# agent's environment, so FAKE_LOG does not reach it; it records to TMPDIR,
+# which the runner points at the agent's scratch home.
+FAKE_OPENCODE = """#!/usr/bin/env bash
+args="$*"; args="${args//$'\\n'/ }"
+keyvar=none; key=none
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY; do
+  if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
+done
+real_home="$(cd ../../.. && pwd)"
+if cat "$real_home/.ssh/id_planted" > /dev/null 2>&1; then secret=readable; else secret=denied; fi
+if /usr/bin/nc -w 1 -U "$real_home/agent.sock" < /dev/null > /dev/null 2>&1; then sock=reachable; else sock=denied; fi
+if /usr/bin/osascript -e 'return 1' > /dev/null 2>&1; then osa=ran; else osa=denied; fi
+procs="$(ps -axo args= 2>/dev/null)"
+case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
+printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s\\n' "$args" \\
+  "$keyvar" "$key" "$HOME" "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" \\
+  "$secret" "$argv" "$sock" "$osa" >> "$TMPDIR/agent.log"
+echo fixed > fix.txt
+"""
+
+# Fake aws: `ssm get-parameter --name N` prints $FAKE_SECRET_<N with / as _>
+# or fails like a missing parameter.
+FAKE_AWS = """#!/usr/bin/env bash
+printf 'aws %s\\n' "$*" >> "$FAKE_LOG"
+while [ $# -gt 0 ]; do [ "$1" = --name ] && name="$2"; shift; done
+var="FAKE_SECRET_$(printf '%s' "$name" | tr '/-' '__')"
+val="${!var:-}"
+[ -n "$val" ] || { echo "ParameterNotFound" >&2; exit 254; }
+printf '%s\\n' "$val"
+"""
+
+
 def git(*args, cwd=None):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
@@ -98,6 +137,8 @@ class LaneRunnerTest(unittest.TestCase):
 
         self.write_tool(self.bin / "gh", FAKE_GH)
         self.write_tool(self.bin / "codex", FAKE_AGENT)
+        self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
+        self.write_tool(self.bin / "aws", FAKE_AWS)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -129,7 +170,10 @@ class LaneRunnerTest(unittest.TestCase):
                               capture_output=True, text=True, timeout=60)
 
     def calls(self):
-        return self.log.read_text().splitlines()
+        extra = []
+        for agent in sorted((self.loom / "run").glob("*-home/tmp/agent.log")):
+            extra += agent.read_text().splitlines()
+        return self.log.read_text().splitlines() + extra
 
     def test_brief_with_an_existing_pr_is_retired_without_running(self):
         self.drop_brief()
@@ -210,6 +254,89 @@ class LaneRunnerTest(unittest.TestCase):
         self.run_lane()
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def api_lane(self, lane, **env):
+        planted = self.home / ".ssh" / "id_planted"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("private key\n")
+        # A listening Unix socket in the real HOME stands in for an SSH agent.
+        agent_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        agent_sock.bind(str(self.home / "agent.sock"))
+        agent_sock.listen(1)
+        self.addCleanup(agent_sock.close)
+        inbox = self.loom / "briefs" / lane
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", f"Lane: {lane}"))
+        result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
+        return inbox, result
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_api_lane_agent_sees_only_its_key_and_a_scratch_home(self):
+        inbox, result = self.api_lane(
+            "openrouter",
+            LOOM_OPENROUTER_KEY_SSM="/k/or",
+            FAKE_SECRET__k_or="fake-or-key",
+            LOOM_OPENROUTER_MODEL="openrouter/vendor/model:free",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("-m openrouter/vendor/model:free", agent[0])
+        self.assertIn("keyvar=OPENROUTER_API_KEY key=fake-or-key", agent[0])
+        self.assertIn("ssh=none", agent[0])
+        self.assertIn("ghtoken=none", agent[0])
+        self.assertIn("fakelog=none", agent[0])
+        self.assertIn("secret=denied", agent[0])
+        self.assertIn("argv=clean", agent[0])
+        self.assertIn("sock=denied", agent[0])
+        self.assertIn("osa=denied", agent[0])
+        self.assertNotIn(f"home={self.home} ", agent[0])
+        self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_openrouter_lane_refuses_a_paid_model(self):
+        inbox, _ = self.api_lane(
+            "openrouter",
+            LOOM_OPENROUTER_KEY_SSM="/k/or",
+            FAKE_SECRET__k_or="fake-or-key",
+            LOOM_OPENROUTER_MODEL="openrouter/vendor/model",
+        )
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_lane_without_its_credential_reports_unavailable_and_keeps_its_briefs(self):
+        inbox, result = self.api_lane(
+            "anthropic", LOOM_ANTHROPIC_KEY_SSM="/k/missing", LOOM_ANTHROPIC_MODEL="claude-test"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith(("opencode ", "claude ")) for c in self.calls()))
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "anthropic.json").read_text())
+        self.assertFalse(beat["available"])
+
+    def test_a_malformed_timeout_reports_unavailable_instead_of_running(self):
+        self.drop_brief()
+        result = self.run_lane(LOOM_AGENT_TIMEOUT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+
+    def test_a_ticket_name_with_unsafe_characters_is_parked(self):
+        self.drop_brief(name='T042-bad"name.md')
+        self.run_lane()
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / 'T042-bad"name.md').exists())
+
+    def test_a_pass_writes_a_fresh_available_heartbeat(self):
+        before = int(time.time())
+        self.run_lane()
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertTrue(beat["available"])
+        self.assertEqual(beat["lane"], "codex")
+        self.assertGreaterEqual(beat["at"], before)
 
     def test_failed_run_is_parked_once_and_the_next_brief_still_runs(self):
         self.drop_brief("T001-broken.md", BRIEF.replace("T042-fix-the-thing", "T001-broken"))

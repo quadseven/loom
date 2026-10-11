@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
-#   run_lane.sh <lane>        lane = codex | claude
+#   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -12,8 +12,10 @@
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
 # a brief may name; the agent trusts the cloned repo's own config),
-# LOOM_CODEX_MODEL / LOOM_CLAUDE_MODEL (the lane's model when a brief has no
-# Model: line; every run passes its model explicitly and names it in the PR),
+# LOOM_<LANE>_MODEL (the lane's model when a brief has no Model: line, e.g.
+# LOOM_OPENCODE_GO_MODEL; every run passes its model explicitly and names it
+# in the PR), LOOM_<LANE>_KEY_SSM (API lanes: the SSM parameter holding the
+# provider key, read at run time; never stored in this repo),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CLONE_BASE (default git@github.com:).
@@ -47,6 +49,21 @@ PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
+# LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
+lane_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$LANE" | tr '[:lower:]-' '[:upper:]_')" "$1"; }
+lane_setting() { local v; v="$(lane_var "$1")"; printf '%s' "${!v:-}"; }
+
+# Each pass records whether this lane can take work. The dispatcher routes
+# only to lanes with a fresh, available heartbeat.
+heartbeat() {
+  local reason
+  # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
+  reason="$(printf '%s' "$2" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
+  mkdir -p "$LOOM_HOME/state/usage"
+  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"}\n' \
+    "$LANE" "$(date +%s)" "$1" "$reason" > "$LOOM_HOME/state/usage/$LANE.json"
+}
+
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
   awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
@@ -68,15 +85,107 @@ park() {
   mv "$1" "$INBOX/failed/"
 }
 
+# Seatbelt profile for API-lane agents: no reads or writes anywhere under the
+# real HOME except the worktree, the scratch home and the directory holding
+# the CLI's binary; no keychain; no Unix sockets except DNS (an SSH agent's
+# socket would hand over its keys); no AppleEvents, LaunchServices,
+# osascript, open or launchctl (each can run a command outside the sandbox). Paths are canonical, because the sandbox matches
+# resolved paths; proper ancestors get metadata-only literals so getcwd and
+# realpath still work without making HOME listable.
+sandbox_profile() {
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
+  home="$(cd "$HOME" && pwd -P)"
+  tree="$(cd "$1" && pwd -P)"
+  cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
+  cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
+  cli_root="$(dirname "$cli_real")"
+  # Paths go into the profile's string grammar: refuse any that could close it.
+  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME"; do
+    # shellcheck disable=SC1003 # matching a literal backslash
+    case "$p" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
+  done
+  # Never let the CLI's directory cover HOME itself.
+  case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
+  allow_rw="(subpath \"$tree\") (subpath \"$(cd "$AGENT_HOME" && pwd -P)\")"
+  allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")"
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link"; do
+    p="$(dirname "$p")"
+    while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
+      meta="$meta (literal \"$p\")"
+      [ "$p" = "$home" ] && break
+      p="$(dirname "$p")"
+    done
+  done
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n' \
+    "$home" "$allow_rw" "$allow_ro" "$meta"
+}
+
+# API lanes run the agent with an emptied environment (its provider key, a
+# scratch HOME and TMPDIR, PATH) inside the sandbox above. The key is
+# exported, never put in argv, so `ps` cannot show it. The agent can edit its
+# tree but cannot read credentials, push, open, or merge; the runner does that.
+api_agent() {
+  local key_var="$1" cli="$2" profile
+  mkdir -p "$AGENT_HOME/tmp"
+  profile="$(sandbox_profile "$PWD" "$cli")" || return 3
+  (
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY"
+    for v in $(compgen -e); do unset "$v"; done
+    [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
+    export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
+    export "$key_var=$key"
+    exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
+  )
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
+    openrouter) api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    opencode-go) api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
 }
+
+# The lane's CLI and, for API lanes, its key. Sets API_KEY.
+lane_ready() {
+  local cli key_ssm
+  case "$LANE" in
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go) cli=opencode ;;
+    *) READY_REASON="unknown lane"; return 1 ;;
+  esac
+  command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
+  case "$LANE" in codex|claude) return 0 ;; esac
+  command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
+  API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
+    --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+  [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
+}
+
+# Timeouts must be positive integers: `timeout 0` means no limit at all, and a
+# wedged agent would then hold the lane lock forever.
+for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1"; do
+  IFS=: read -r t_name t_val t_min <<< "$t"
+  if ! [[ "$t_val" =~ ^[0-9]+$ ]] || [ "$t_val" -lt "$t_min" ]; then
+    heartbeat false "LOOM_$t_name must be an integer >= $t_min, got '$t_val'"
+    exit 0
+  fi
+done
+
+AGENT_HOME="$LOOM_HOME/run/$LANE-home"
+API_KEY=""
+READY_REASON=""
+if ! lane_ready; then
+  heartbeat false "$READY_REASON"
+  exit 0
+fi
+heartbeat true ""
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
@@ -88,6 +197,10 @@ for BRIEF in "$INBOX"/*.md; do
   BASE_BRANCH="$(field Base "$BRIEF" || true)"
   LOG="$LOGDIR/$TICKET.log"
 
+  # Ticket names become paths in the sandbox profile and the clone.
+  if ! [[ "$TICKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    park "$BRIEF" "ticket name must be letters, digits, dot, underscore or dash"; continue
+  fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -102,17 +215,20 @@ for BRIEF in "$INBOX"/*.md; do
   # The model: the brief's Model: line, else the lane default. Passed to the
   # CLI explicitly so the PR names what actually ran.
   MODEL="$(field Model "$BRIEF" || true)"
-  if [ -z "$MODEL" ]; then
-    case "$LANE" in codex) MODEL="${LOOM_CODEX_MODEL:-}" ;; claude) MODEL="${LOOM_CLAUDE_MODEL:-}" ;; esac
-  fi
+  [ -n "$MODEL" ] || MODEL="$(lane_setting MODEL)"
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/-]*$ ]]; then
-    park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or LOOM_$(echo "$LANE" | tr '[:lower:]' '[:upper:]')_MODEL"; continue
+    park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
   fi
   case "$LANE:$MODEL" in
     codex:claude*|codex:opus*|codex:sonnet*|codex:haiku*|codex:fable*)
       park "$BRIEF" "model $MODEL is not a codex model"; continue ;;
     claude:claude*|claude:opus*|claude:sonnet*|claude:haiku*|claude:fable*) ;;
-    claude:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
+    anthropic:claude*) ;;
+    claude:*|anthropic:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
+    openrouter:openrouter/*:free) ;;
+    openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
+    opencode-go:opencode-go/*) ;;
+    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model"; continue ;;
   esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue

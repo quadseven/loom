@@ -10,12 +10,21 @@ permissions:
 
 jobs:
   unittest:
-    runs-on: ubuntu-latest
+    # macOS: the API-lane tests run the agent under sandbox-exec, which only
+    # exists there, and launchd runs the lanes under /bin/bash 3.2.
+    runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: unittest
-        run: python -B -m unittest discover -s tests -v
+      - name: coreutils timeout
+        run: command -v timeout || brew install coreutils
+      - name: unittest (no test may skip)
+        run: |
+          python -B -m unittest discover -s tests -v 2>&1 | tee unittest.out
+          if grep -qE "\.\.\. skipped |skipped=[0-9]" unittest.out; then
+            echo "::error::a test skipped; the sandbox tests must run in CI"
+            exit 1
+          fi
