@@ -12,13 +12,15 @@ Difficulty definitions:
            single-component changes. Strong model handles it.
   easy   - Simple fixes, docs, config, boilerplate. Any model works.
 
-Lane routing (v1): $200 Anthropic API credits burn FIRST (expires Oct 21).
-  hard   -> anthropic (API credits) -> claude-opus (subscription) -> sparks-qwen
-  medium -> anthropic (API credits) -> claude-sonnet/claude/codex -> sparks-qwen
-  easy   -> anthropic (API credits) -> opencode (OpenRouter free) -> sparks-qwen
+Lane routing (v2): only lanes with a worker are routed, and only while that
+worker's runner reports a fresh, available heartbeat (state/usage/<lane>.json,
+written by lanes/run_lane.sh every pass). Anthropic API credits go first
+(they expire 2026-10-21), then subscriptions, then free lanes.
+  hard   -> anthropic -> claude -> codex
+  medium -> anthropic -> claude -> codex -> opencode-go
+  easy   -> anthropic -> openrouter (free) -> opencode-go -> codex -> claude
 
-Sparks (Nvidia DGX) runs Qwen Coder for code, not just tests/builds.
-Sparks never touches the live WoW realm.
+The Sparks lane is deferred until the Sparks overhaul is done (#9).
 
 Usage:
   python3 dispatch.py --once        # single pass
@@ -41,32 +43,16 @@ TICKETS = LOOM / "tickets"
 BRIEFS = LOOM / "briefs"
 STATE = LOOM / "state"
 
-# Lane tiers: which difficulties each lane can handle
-# Priority: API credits first (burn $200 before Oct 21), then subscriptions,
-# then free/compute lanes.
-#
-# Frontier models (hard tickets): anthropic API, claude-opus, codex-astra
-# Strong models (medium): claude-sonnet, codex-sol
-# Fast/free (easy): opencode, sparks-qwen
-LANE_TIERS = {
-    "anthropic": {"hard", "medium", "easy"},  # $200 credits, FIRST priority
-    "claude-opus": {"hard", "medium"},         # subscription, frontier
-    "codex-astra": {"hard", "medium"},         # subscription, frontier planning
-    "claude": {"medium", "easy"},              # subscription, sonnet
-    "codex": {"medium", "easy"},               # subscription, sol (default)
-    "sparks-qwen": {"hard", "medium", "easy"}, # DGX Qwen Coder, code + tests
-    "opencode": {"easy"},                      # OpenRouter free tier
-    "sparks": set(),  # legacy compute-only entry, use sparks-qwen for code
+# Preferred lanes per difficulty, first available wins. Every lane here has
+# a runner in lanes/run_lane.sh; a lane without one must not be listed.
+DIFFICULTY_LANE = {
+    "hard": ["anthropic", "claude", "codex"],
+    "medium": ["anthropic", "claude", "codex", "opencode-go"],
+    "easy": ["anthropic", "openrouter", "opencode-go", "codex", "claude"],
 }
 
-# Preferred lane per difficulty (first available wins).
-# Anthropic API credits are always first until exhausted (Oct 21 expiry).
-# Frontier: Opus and Astra can both do big planning, not just Claude.
-DIFFICULTY_LANE = {
-    "hard": ["anthropic", "claude-opus", "codex-astra", "sparks-qwen"],
-    "medium": ["anthropic", "claude", "codex", "sparks-qwen"],
-    "easy": ["anthropic", "opencode", "sparks-qwen", "claude", "codex"],
-}
+# A heartbeat older than this means the lane's runner is not running.
+HEARTBEAT_MAX_AGE_S = 600
 
 
 def log(msg: str) -> None:
@@ -108,18 +94,30 @@ def set_ticket_status(ticket_path: Path, status: str, lane: str = None, **extra)
 
 
 def pick_lane(difficulty: str, state: dict) -> str | None:
-    """Pick the best lane for a ticket by difficulty and availability."""
+    """The first lane for `difficulty` whose runner reports a fresh, available
+    heartbeat. No heartbeat, a stale one, or an unreadable one means no
+    worker is taking briefs there, so the lane gets nothing."""
+    now = time.time()
     for lane in DIFFICULTY_LANE.get(difficulty, []):
-        # Check lane heartbeat (skip if stale or over budget)
-        usage_file = STATE / "usage" / f"{lane}.json"
-        if usage_file.exists():
-            try:
-                usage = json.loads(usage_file.read_text())
-                # Skip if marked unavailable or rate-limited
-                if usage.get("unavailable") or usage.get("rate_limited"):
-                    continue
-            except (json.JSONDecodeError, OSError):
-                pass
+        path = STATE / "usage" / f"{lane}.json"
+        try:
+            beat = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue  # no runner has ever reported: no worker
+        except (OSError, ValueError) as e:
+            # The file exists but cannot be read: a fault worth seeing, not
+            # the same as a lane with no worker.
+            log(f"  skipping {lane}: unreadable heartbeat {path}: {e}")
+            continue
+        if not isinstance(beat, dict) or not beat.get("available"):
+            continue
+        try:
+            age = now - float(beat.get("at", 0))
+        except (TypeError, ValueError):
+            log(f"  skipping {lane}: heartbeat has no usable time: {beat.get('at')!r}")
+            continue
+        if age > HEARTBEAT_MAX_AGE_S:
+            continue
         return lane
     return None
 
