@@ -5,10 +5,20 @@ Watches ~/loom/goals/ for goals, ~/loom/tickets/<goal>/ for tickets,
 routes each ticket to a lane by difficulty, writes briefs to
 ~/loom/briefs/<lane>/, and tracks state in ~/loom/state/ for the dashboard.
 
-Lane routing (v1):
-  hard   -> anthropic (API credits, frontier model)
-  medium -> claude | codex (subscriptions, via Mac pollers)
-  easy   -> opencode (OpenRouter free tier)
+Difficulty definitions:
+  hard   - Architecture, complex refactors, novel problems, multi-file
+           changes with subtle interactions. Needs frontier reasoning.
+  medium - Feature implementation, bug fixes with clear scope,
+           single-component changes. Strong model handles it.
+  easy   - Simple fixes, docs, config, boilerplate. Any model works.
+
+Lane routing (v1): $200 Anthropic API credits burn FIRST (expires Oct 21).
+  hard   -> anthropic (API credits) -> claude-opus (subscription) -> sparks-qwen
+  medium -> anthropic (API credits) -> claude-sonnet/claude/codex -> sparks-qwen
+  easy   -> anthropic (API credits) -> opencode (OpenRouter free) -> sparks-qwen
+
+Sparks (Nvidia DGX) runs Qwen Coder for code, not just tests/builds.
+Sparks never touches the live WoW realm.
 
 Usage:
   python3 dispatch.py --once        # single pass
@@ -32,19 +42,30 @@ BRIEFS = LOOM / "briefs"
 STATE = LOOM / "state"
 
 # Lane tiers: which difficulties each lane can handle
+# Priority: API credits first (burn $200 before Oct 21), then subscriptions,
+# then free/compute lanes.
+#
+# Frontier models (hard tickets): anthropic API, claude-opus, codex-astra
+# Strong models (medium): claude-sonnet, codex-sol
+# Fast/free (easy): opencode, sparks-qwen
 LANE_TIERS = {
-    "anthropic": {"hard", "medium", "easy"},
-    "claude": {"medium", "easy"},
-    "codex": {"medium", "easy"},
-    "opencode": {"easy"},
-    "sparks": set(),  # compute only, not a model lane
+    "anthropic": {"hard", "medium", "easy"},  # $200 credits, FIRST priority
+    "claude-opus": {"hard", "medium"},         # subscription, frontier
+    "codex-astra": {"hard", "medium"},         # subscription, frontier planning
+    "claude": {"medium", "easy"},              # subscription, sonnet
+    "codex": {"medium", "easy"},               # subscription, sol (default)
+    "sparks-qwen": {"hard", "medium", "easy"}, # DGX Qwen Coder, code + tests
+    "opencode": {"easy"},                      # OpenRouter free tier
+    "sparks": set(),  # legacy compute-only entry, use sparks-qwen for code
 }
 
-# Preferred lane per difficulty (first available wins)
+# Preferred lane per difficulty (first available wins).
+# Anthropic API credits are always first until exhausted (Oct 21 expiry).
+# Frontier: Opus and Astra can both do big planning, not just Claude.
 DIFFICULTY_LANE = {
-    "hard": ["anthropic"],
-    "medium": ["codex", "claude", "anthropic"],
-    "easy": ["opencode", "codex", "claude", "anthropic"],
+    "hard": ["anthropic", "claude-opus", "codex-astra", "sparks-qwen"],
+    "medium": ["anthropic", "claude", "codex", "sparks-qwen"],
+    "easy": ["anthropic", "opencode", "sparks-qwen", "claude", "codex"],
 }
 
 
@@ -153,7 +174,62 @@ Difficulty: {difficulty}
     inbox.mkdir(parents=True, exist_ok=True)
     brief_path = inbox / f"{ticket_id}.md"
     brief_path.write_text(brief)
+
+    # Push to GitHub briefs branch for API access.
+    # Mac lanes fetch via https://raw.githubusercontent.com/<repo>/briefs/briefs/<lane>/<ticket>.md
+    # No filesystem access needed - pure HTTP API.
+    push_brief_to_github(lane, ticket_id, brief)
+
     return brief_path
+
+
+def push_brief_to_github(lane: str, ticket_id: str, brief: str) -> bool:
+    """Push a brief to the GitHub briefs branch for API access."""
+    try:
+        import base64
+        sys.path.insert(0, "/home/hatch/workspace/skills/github-pat/bin")
+        from importlib.machinery import SourceFileLoader
+        gh = SourceFileLoader("ghapi", "/home/hatch/workspace/skills/github-pat/bin/gh-api.py").load_module()
+        api = gh.api
+        R = "/repos/quadseven/loom"
+        BRANCH = "briefs"
+
+        # Ensure branch exists
+        try:
+            ref = api("GET", f"{R}/git/ref/heads/{BRANCH}")
+            base_sha = ref["object"]["sha"]
+        except Exception:
+            main = api("GET", f"{R}/git/ref/heads/main")
+            main_sha = main["object"]["sha"]
+            api("POST", f"{R}/git/refs",
+                {"ref": f"refs/heads/{BRANCH}", "sha": main_sha})
+            base_sha = main_sha
+
+        # Create blob
+        blob = api("POST", f"{R}/git/blobs", {
+            "content": base64.b64encode(brief.encode()).decode(),
+            "encoding": "base64"})
+
+        # Update tree
+        commit = api("GET", f"{R}/git/commits/{base_sha}")
+        path = f"briefs/{lane}/{ticket_id}.md"
+        tree = api("POST", f"{R}/git/trees", {
+            "base_tree": commit["tree"]["sha"],
+            "tree": [{"path": path, "mode": "100644",
+                      "type": "blob", "sha": blob["sha"]}],
+        })
+        new_commit = api("POST", f"{R}/git/commits", {
+            "message": f"Brief {ticket_id} for {lane}",
+            "tree": tree["sha"],
+            "parents": [base_sha],
+        })
+        api("PATCH", f"{R}/git/refs/heads/{BRANCH}",
+            {"sha": new_commit["sha"]})
+        log(f"  pushed brief to GitHub: {path}")
+        return True
+    except Exception as e:
+        log(f"  GitHub brief push failed: {e}")
+        return False
 
 
 def process_goal(goal_name: str, state: dict) -> int:
