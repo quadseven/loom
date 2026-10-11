@@ -8,11 +8,13 @@ lanes, single shipper. Multi-project by design: one loom, many goals.
 - `docs/` - architecture, lane contracts, brief format, usage routing
 - `dispatch/` - the foreman: metrics, dispatcher, ship, verify, report
 - `lanes/` - worker lane runners (one per subscription)
- - `lanes/run_lane.sh` - the codex and claude lanes: one pass over a lane
-   inbox, one brief at a time (official CLIs only)
- - `lanes/mac/install.sh` - installs those lanes as launchd agents
- - `lanes/opencode/` - opencode runner (OpenRouter, Poolside, other APIs)
- - `lanes/sparks/` - Nvidia sparks box: test farm + local models
+  - `lanes/run_lane.sh` - runs the codex, claude, openrouter, opencode-go and
+    anthropic lanes: one pass over a lane inbox, one brief at a time
+  - `lanes/mac/install.sh` - installs those lanes as launchd agents
+  - `lanes/opencode/` - older opencode runner (OpenRouter, Poolside, other
+    APIs); not used by run_lane.sh
+  - `lanes/sparks/` - older Nvidia sparks box (test farm + local models);
+    deferred, not used by run_lane.sh
 - `.github/ISSUE_TEMPLATE/` - ticket template
 
 ## Not in git
