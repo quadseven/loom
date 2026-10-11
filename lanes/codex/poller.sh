@@ -58,8 +58,34 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty')" ]; then
     echo "PR already exists for $BRANCH, skipping create"
   else
-    gh pr create --title "[$TICKET] $(grep -m1 '^# Brief:' "$BRIEF" | sed 's/# Brief: //')" \
-      --body "Part of loom ticket $TICKET. See brief for scope and definition of done."
+    # Build PR body from the brief. Grug Chief requires exact headings:
+    # ## Why, ## Summary, ## Acceptance criteria (3+ bullets), Size:, ## Out of scope
+    PR_TITLE="[$TICKET] $(grep -m1 '^# ' "$BRIEF" | sed 's/^# //')"
+    # Extract sections from brief (Why, What->Summary, Acceptance criteria, Size, Out of scope)
+    WHY="$(awk '/^## Why/{flag=1;next}/^## /{flag=0}flag' "$BRIEF" | sed '/^[[:space:]]*$/d')"
+    WHAT="$(awk '/^## What/{flag=1;next}/^## /{flag=0}flag' "$BRIEF" | sed '/^[[:space:]]*$/d')"
+    ACCEPT="$(awk '/^## Acceptance criteria/{flag=1;next}/^## /{flag=0}flag' "$BRIEF" | sed '/^[[:space:]]*$/d')"
+    SIZE="$(awk '/^## Size/{flag=1;next}/^## /{flag=0}flag' "$BRIEF" | sed '/^[[:space:]]*$/d' | head -1)"
+    OOS="$(awk '/^## Out of scope/{flag=1;next}/^## /{flag=0}flag' "$BRIEF" | sed '/^[[:space:]]*$/d')"
+    # Default size if not in brief
+    [ -z "$SIZE" ] && SIZE="M"
+    PR_BODY="## Why
+$WHY
+
+## Summary
+$WHAT
+
+## Acceptance criteria
+$ACCEPT
+
+Size: $SIZE
+
+## Out of scope
+$OOS
+
+---
+Loom ticket: $TICKET | Lane: codex | Repo: $REPO"
+    gh pr create --title "$PR_TITLE" --body "$PR_BODY"
   fi
 
   mv "$BRIEF" "$DONE/"
