@@ -1,0 +1,8 @@
+# Loom local state - never commit
+state/
+briefs/
+worktrees/
+*.log
+.env
+.DS_Store
+lanes/opencode/config.json
