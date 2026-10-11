@@ -85,11 +85,15 @@ real_home="$(cd ../../.. && pwd)"
 if cat "$real_home/.ssh/id_planted" > /dev/null 2>&1; then secret=readable; else secret=denied; fi
 if /usr/bin/nc -w 1 -U "$real_home/agent.sock" < /dev/null > /dev/null 2>&1; then sock=reachable; else sock=denied; fi
 if /usr/bin/osascript -e 'return 1' > /dev/null 2>&1; then osa=ran; else osa=denied; fi
+small="$(printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | sed -nE 's/.*"small_model": *"([^"]+)".*/\\1/p')"
 procs="$(ps -axo args= 2>/dev/null)"
 case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
-printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s\\n' "$args" \\
+printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s small=%s\\n' "$args" \\
   "$keyvar" "$key" "$HOME" "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" \\
-  "$secret" "$argv" "$sock" "$osa" >> "$TMPDIR/agent.log"
+  "$secret" "$argv" "$sock" "$osa" "${small:-none}" >> "$TMPDIR/agent.log"
+if printf '#!/bin/sh\\ntouch "%s/hooked"\\n' "$real_home" > .git/hooks/pre-commit 2>/dev/null \\
+   && chmod +x .git/hooks/pre-commit 2>/dev/null; then hook=planted; else hook=denied; fi
+printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
 echo fixed > fix.txt
 """
 
@@ -290,9 +294,32 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("argv=clean", agent[0])
         self.assertIn("sock=denied", agent[0])
         self.assertIn("osa=denied", agent[0])
+        # A hook planted in the tree's .git would run when the runner commits.
+        self.assertIn("hook=denied", self.calls())
+        self.assertFalse((self.home / "hooked").exists())
+        # opencode's helper (title) agent must not fall back to a paid model.
+        self.assertIn("small=openrouter/vendor/model:free", agent[0])
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_links_left_in_the_scratch_home_cannot_redirect_runner_writes(self):
+        # A previous agent could leave its config path as a link into the
+        # real HOME; the runner, which is not sandboxed, must not follow it.
+        victim = self.home / ".zshrc"
+        victim.write_text("original\n")
+        cfg = self.loom / "run" / "openrouter-home" / ".config" / "opencode" / "opencode.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.symlink_to(victim)
+        self.api_lane(
+            "openrouter",
+            LOOM_OPENROUTER_KEY_SSM="/k/or",
+            FAKE_SECRET__k_or="fake-or-key",
+            LOOM_OPENROUTER_MODEL="openrouter/vendor/model:free",
+        )
+        self.assertEqual(victim.read_text(), "original\n")
+        self.assertTrue(any("small=openrouter/vendor/model:free" in c for c in self.calls()))
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_openrouter_lane_refuses_a_paid_model(self):

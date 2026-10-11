@@ -33,6 +33,10 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic)
 
+# PATH puts the official CLI install dirs (~/.local/bin for claude,
+# ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
+# behind and break (a Homebrew opencode crashed on start, 2026-10-11).
+
 # Every LOOM_* setting in the environment, as plist entries.
 loom_env() {
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
@@ -63,7 +67,7 @@ for L in "${LANES[@]}"; do
   <key>StandardErrorPath</key><string>$LOOM_HOME/logs/$L-service.log</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$HOME</string>
     <key>LOOM_HOME</key><string>$LOOM_HOME</string>
     <key>LOOM_REPO_OWNERS</key><string>$LOOM_REPO_OWNERS</string>

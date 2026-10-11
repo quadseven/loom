@@ -45,7 +45,7 @@ WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$LANE"
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
-PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
@@ -87,11 +87,14 @@ park() {
 
 # Seatbelt profile for API-lane agents: no reads or writes anywhere under the
 # real HOME except the worktree, the scratch home and the directory holding
-# the CLI's binary; no keychain; no Unix sockets except DNS (an SSH agent's
-# socket would hand over its keys); no AppleEvents, LaunchServices,
-# osascript, open or launchctl (each can run a command outside the sandbox). Paths are canonical, because the sandbox matches
-# resolved paths; proper ancestors get metadata-only literals so getcwd and
-# realpath still work without making HOME listable.
+# the CLI's binary. Inside the worktree, .git stays readable (git diff and git
+# log need it; a fresh clone holds no credentials) but not writable: a planted
+# hook or config would run when the runner commits. Also no keychain, no Unix
+# sockets except DNS (an SSH agent's socket would hand over its keys), and no
+# AppleEvents, LaunchServices, osascript, open or launchctl (each can run a
+# command outside the sandbox). Paths are canonical, because the sandbox
+# matches resolved paths; proper ancestors get metadata-only literals so
+# getcwd and realpath still work without making HOME listable.
 sandbox_profile() {
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
   home="$(cd "$HOME" && pwd -P)"
@@ -116,8 +119,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n' \
-    "$home" "$allow_rw" "$allow_ro" "$meta"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n' \
+    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -129,23 +132,50 @@ api_agent() {
   mkdir -p "$AGENT_HOME/tmp"
   profile="$(sandbox_profile "$PWD" "$cli")" || return 3
   (
-    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY"
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV"
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
     export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     export "$key_var=$key"
+    [ -z "$extra" ] || export "${extra?}"
     exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
   )
+}
+
+# opencode runs helper agents (session titles) on its own default small model,
+# which can be a paid one; pin every opencode model to the lane's model so the
+# free lane stays free and the subscription lane stays in its catalogue. The
+# config travels in the environment: the runner writes nothing into space the
+# agent can write, so no link an agent leaves there can redirect it.
+opencode_config() {
+  # MODEL already passed the allowlist; refuse JSON-breaking characters here too.
+  # shellcheck disable=SC1003 # matching a literal backslash
+  case "$MODEL" in *'"'*|*'\'*) echo "refusing model with a quote or backslash" >&2; return 1 ;; esac
+  AGENT_EXTRA_ENV="OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"}"
+}
+
+# git in an agent's tree, run by the runner: never run hooks or an fsmonitor
+# the tree might name, whatever ended up in its config. (`timeout` cannot run
+# a shell function, so the push spells the same options out.)
+safe_git() {
+  git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+fresh_agent_home() {
+  rm -rf "$AGENT_HOME"
+  mkdir -p "$AGENT_HOME/tmp"
 }
 
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
+  AGENT_EXTRA_ENV=""
+  case "$LANE" in openrouter|opencode-go|anthropic) fresh_agent_home ;; esac
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
-    openrouter) api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    opencode-go) api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    openrouter) opencode_config && api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    opencode-go) opencode_config && api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
@@ -259,16 +289,16 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
-  if [ -n "$(git -C "$TREE" status --porcelain)" ]; then
-    if ! { git -C "$TREE" checkout -q "$BRANCH" && git -C "$TREE" add -A &&
-           git -C "$TREE" commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
+  if [ -n "$(safe_git status --porcelain)" ]; then
+    if ! { safe_git checkout -q "$BRANCH" && safe_git add -A &&
+           safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
   fi
-  if [ "$(git -C "$TREE" rev-parse "$BRANCH")" = "$BASE" ]; then
+  if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
     park "$BRIEF" "agent made no commit on $BRANCH"; continue
   fi
-  if ! timeout "$NET_TIMEOUT" git -C "$TREE" push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
     park "$BRIEF" "push failed"; continue
   fi
   if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
