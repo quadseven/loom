@@ -1,7 +1,26 @@
 {
   "goals": [
     {
-      "name": "wow-ragnaros",
+      "name": "custodian",
+      "tickets": [
+        {
+          "id": "C001-triage-open-prs",
+          "title": "# C001: Triage all 25 open PRs",
+          "status": "briefed",
+          "lane": "anthropic",
+          "updated": "2026-10-11T14:38:28.569288+00:00"
+        },
+        {
+          "id": "C002-merge-5275",
+          "title": "# C002: Merge infra#5275 (Loom dashboard inline logs)",
+          "status": "briefed",
+          "lane": "anthropic",
+          "updated": "2026-10-11T14:38:34.023314+00:00"
+        }
+      ]
+    },
+    {
+      "name": "overseer",
       "tickets": [
         {
           "id": "T001-realm-state-audit",
@@ -37,15 +56,56 @@
           "status": "briefed",
           "lane": "codex",
           "updated": "2026-10-11T03:46:13.430218+00:00"
+        },
+        {
+          "id": "T006-merge-918",
+          "title": "# T006: Pre-roll review and merge mod-overseer#918",
+          "status": "briefed",
+          "lane": "anthropic",
+          "updated": "2026-10-11T14:38:38.882301+00:00"
+        },
+        {
+          "id": "T007-close-828",
+          "title": "# T007: Close wow-overseer#828 with live evidence",
+          "status": "briefed",
+          "lane": "anthropic",
+          "updated": "2026-10-11T14:38:44.602846+00:00"
+        },
+        {
+          "id": "T008-close-833",
+          "title": "# T008: Close wow-overseer#833 with live evidence",
+          "status": "briefed",
+          "lane": "anthropic",
+          "updated": "2026-10-11T14:38:49.633192+00:00"
+        },
+        {
+          "id": "T009-overdue-report",
+          "title": "# T009: Generate overdue 2-hour report",
+          "status": "briefed",
+          "lane": "anthropic",
+          "updated": "2026-10-11T14:38:54.929749+00:00"
+        },
+        {
+          "id": "T010-shadowfang-stall",
+          "title": "# T010: Investigate Zug's Shadowfang campaign stall (#832)",
+          "status": "briefed",
+          "lane": "anthropic",
+          "updated": "2026-10-11T14:39:00.019271+00:00"
         }
       ]
     }
   ],
   "lanes": {
     "anthropic": {
-      "pending": 0,
+      "pending": 7,
       "done": 0,
-      "pending_tickets": [],
+      "pending_tickets": [
+        "C001-triage-open-prs",
+        "C002-merge-5275",
+        "T006-merge-918",
+        "T007-close-828",
+        "T008-close-833"
+      ],
       "usage": {}
     },
     "claude": {
@@ -80,9 +140,9 @@
       "usage": {}
     }
   },
-  "updated": "2026-10-11T05:24:02.860878+00:00",
+  "updated": "2026-10-11T14:39:12.581721+00:00",
   "dispatcher": {
     "goals": {},
-    "last_run": "2026-10-11T05:24:01.146755+00:00"
+    "last_run": "2026-10-11T14:39:00.020041+00:00"
   }
 }
