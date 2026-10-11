@@ -39,7 +39,9 @@ for BRIEF in "$INBOX"/*.md; do
 
   # Force push: this branch is loom-owned (loom/<ticket>-<slug>), and a
   # retry of a partial run must replace, not collide with, prior pushes.
-  git push -f -u origin "$BRANCH"
+  # Fenced like the agent run above: a push to an unreachable remote must
+  # not hang the lane forever.
+  timeout "$AGENT_TIMEOUT" git push -f -u origin "$BRANCH"
 
   # Idempotent: a retry after a partial run must not die on "PR exists".
   if [ -n "$(gh pr list --head "$BRANCH" --json number --jq '.[0].number // empty')" ]; then

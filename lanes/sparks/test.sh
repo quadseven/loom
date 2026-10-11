@@ -8,11 +8,13 @@
 set -euo pipefail
 
 TREE="$1"   # path to the worktree to test
+TEST_TIMEOUT="${LOOM_TEST_TIMEOUT:-1800}"
 
 cd "$TREE"
 
 if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
-  python3 -B -m pytest -x -q
+  # A hung suite must not wedge the lane forever: cap the whole run.
+  timeout "$TEST_TIMEOUT" python3 -B -m pytest -x -q
 fi
 
 if [ -f "CMakeLists.txt" ]; then

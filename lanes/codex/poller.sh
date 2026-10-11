@@ -23,7 +23,20 @@ for BRIEF in "$INBOX"/*.md; do
   BRANCH="$(grep -m1 '^Branch:' "$BRIEF" | cut -d' ' -f2-)"
   MODEL="$(grep -m1 '^Model:' "$BRIEF" | cut -d' ' -f2- || true)"
   MODEL_ARGS=()
-  [ -n "$MODEL" ] && MODEL_ARGS=(--model "$MODEL")
+  if [ -n "$MODEL" ]; then
+    # The Model: line is dispatcher-written, but validate anyway: it must
+    # look like a model id (letters, digits, . _ : / -), never a flag or
+    # shell metacharacters. A hostile or careless brief must not steer
+    # the lane to an arbitrary --model argument.
+    case "$MODEL" in
+      -*|*[^A-Za-z0-9._:/-]*)
+        echo "WARN: refusing suspicious Model '$MODEL' in $BRIEF; using default" >&2
+        ;;
+      *)
+        MODEL_ARGS=(--model "$MODEL")
+        ;;
+    esac
+  fi
   TREE="$WORKDIR/$TICKET"
 
   # Drop leftovers from a partial run so a retry always starts clean.
