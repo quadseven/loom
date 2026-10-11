@@ -30,7 +30,7 @@ worktree, and opens a PR. Lanes never merge.
 - `claude/` - deep root-cause work, hard refactors. Official Claude Code
  with the owner's subscription login. Brief in, PR out.
 - `codex/` - scoped implementation, CI repairs, review passes.
- `codex exec --full-auto` on a logged-in box. Models: Astra / Sol / Luna
+ `codex exec --sandbox workspace-write` on a logged-in box. Models: Astra / Sol / Luna
  chosen per ticket difficulty.
 - `opencode/` - volume lane. Headless opencode runs against API providers
  (OpenRouter free tier, Poolside, NVIDIA NIM). Many parallel workers, small
