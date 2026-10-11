@@ -32,6 +32,12 @@ Loom serves all active goals.
 3. Install the lanes where each subscription login lives
    (`lanes/mac/install.sh` on the login Mac).
 4. Run `dispatch/dispatch.py` on a schedule (every 30 min).
+5. Run the tests, the same command CI runs:
+   `python -B -m unittest discover -s tests -v`.
+   The suite checks that dispatcher briefs forbid merging and carry the repo
+   and loom branch, and runs `lanes/run_lane.sh` end to end against a local
+   bare repo with fake agent and `gh` commands (push and PR, base branch,
+   parking failed runs, and refusing off-limits repos or branches).
 
 ## Rules Loom enforces
 
