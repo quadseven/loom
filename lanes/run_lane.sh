@@ -148,6 +148,9 @@ api_agent() {
 # config travels in the environment: the runner writes nothing into space the
 # agent can write, so no link an agent leaves there can redirect it.
 opencode_config() {
+  # MODEL already passed the allowlist; refuse JSON-breaking characters here too.
+  # shellcheck disable=SC1003 # matching a literal backslash
+  case "$MODEL" in *'"'*|*'\'*) echo "refusing model with a quote or backslash" >&2; return 1 ;; esac
   AGENT_EXTRA_ENV="OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"}"
 }
 
@@ -171,8 +174,8 @@ run_agent() {
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
-    openrouter) opencode_config; api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    opencode-go) opencode_config; api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    openrouter) opencode_config && api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    opencode-go) opencode_config && api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
