@@ -45,7 +45,7 @@ WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$LANE"
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
-PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
@@ -138,14 +138,23 @@ api_agent() {
   )
 }
 
+# opencode runs helper agents (session titles) on its own default small model,
+# which can be a paid one; pin every opencode model to the lane's model so the
+# free lane stays free and the subscription lane stays in its catalogue.
+opencode_config() {
+  mkdir -p "$AGENT_HOME/.config/opencode"
+  printf '{"model": "%s", "small_model": "%s"}\n' "$MODEL" "$MODEL" \
+    > "$AGENT_HOME/.config/opencode/opencode.json"
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
-    openrouter) api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    opencode-go) api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    openrouter) opencode_config; api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    opencode-go) opencode_config; api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
