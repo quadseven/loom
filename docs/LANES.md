@@ -39,6 +39,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
 - Logs stay on the lane machine. Nothing is pushed except the ticket branch.
+- API-lane session transcripts (Claude Code `.jsonl`, opencode session files)
+  are copied to `logs/<lane>/<ticket>/` after each run, before the next run
+  wipes the scratch home. Links are never followed.
 - No background processes: launchd starts a pass every minute and a lock
   keeps one pass per lane.
 

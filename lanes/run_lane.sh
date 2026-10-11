@@ -166,6 +166,24 @@ safe_git() {
   git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
 }
 
+# Keep the agent's session transcripts (Claude Code .jsonl, opencode session
+# json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
+# find -type f lists regular files only and never follows links, so a link the
+# agent left cannot pull anything from outside its home into the archive.
+archive_transcripts() {
+  local dest="$LOGDIR/$TICKET" rel
+  [ -d "$AGENT_HOME" ] || return 0
+  (cd "$AGENT_HOME" && find . -type f \( -path './.claude/projects/*' -o -path './.local/share/opencode/*' \) \
+     \( -name '*.json' -o -name '*.jsonl' \) -print) |
+  while IFS= read -r rel; do
+    mkdir -p "$dest/$(dirname "$rel")" && cp -P "$AGENT_HOME/$rel" "$dest/$rel" 2> /dev/null
+  done
+  return 0
+}
+
+# A fresh scratch home for every API-lane run. The agent can write inside it,
+# so anything left there (a link into the real HOME, say) must never meet the
+# runner, which is not sandboxed. rm -rf removes links without following them.
 fresh_agent_home() {
   rm -rf "$AGENT_HOME"
   mkdir -p "$AGENT_HOME/tmp"
@@ -291,6 +309,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1
   STATUS=$?
+  case "$LANE" in openrouter|opencode-go|anthropic) archive_transcripts ;; esac
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
