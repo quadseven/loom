@@ -36,7 +36,6 @@ worktree, and opens a PR. Lanes never merge.
 - `anthropic/` - API-credit models via the official Claude Code CLI.
 - `zen/` - OpenCode Zen free models via opencode; public repos only.
 - `zai/` - Z.ai free GLM Flash models via opencode; public repos only.
-- `agy/` - the Google plan via the Antigravity CLI (`agy -p`).
 
 API-lane agents run sandboxed without credentials; the runner pushes the
 branch and opens the PR. The `sparks/` lane is deferred until the Sparks

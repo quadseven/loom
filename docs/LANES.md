@@ -28,7 +28,7 @@ answers only localhost Host headers; transcripts never leave the machine.
 API-lane agents run on the same machine, so their sandbox denies every
 loopback connection; they cannot query the viewer or any other local service.
 
-## API lanes: openrouter, opencode-go, anthropic (and zen, zai, agy below)
+## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
 
 - `openrouter` (free models via opencode), `opencode-go` (subscription models
   via opencode) and `anthropic` (API credits via the official Claude Code CLI).
@@ -83,45 +83,6 @@ lookup leaves the brief for the next pass. The rule covers:
   opencode reads.
 - Both run sandboxed exactly like the other API lanes and pin opencode's
   helper model to the lane's model.
-
-## agy/ - the Google plan
-
-- Tool: the Antigravity CLI, called directly per brief:
-  `agy -p <brief> --model <id> --dangerously-skip-permissions`. Never wrapped
-  inside another agent (agy's terms allow direct scripting only). agy's own
-  approval prompts are off because the Seatbelt profile is the boundary.
-- Models: agy's catalogue (`gemini-*`, `claude-*`, `gpt-oss-*`; default
-  `gemini-3.8-flash-high`). Anything else is refused.
-- Sign-in: agy keeps its Google login in the macOS keychain, not in an API
-  key, and looks for it in `$HOME/Library/Keychains/login.keychain-db`. The
-  agent cannot be given the operator's login keychain: it also holds `gh`'s
-  token, which any process able to run `security` can read. So agy signs in
-  once into a keychain of its own, `agy.keychain-db` in
-  `LOOM_AGY_LOGIN_HOME` (default `~/loom/agy-login`). Each run the runner
-  unlocks it by path (empty password; the file is the secret) and links it
-  into the fresh scratch home as `Library/Keychains/login.keychain-db`. The
-  sandbox lets the agent reach the keychain server and read that one file,
-  not write it, and still denies the rest of the real HOME, including the
-  operator's login keychain. The agent can read agy's own token, as other
-  API-lane agents can read their key. A lane with no sign-in keychain
-  reports itself unavailable.
-- One-time sign-in, by the operator at the Mac:
-
-  ```sh
-  D="$HOME/loom/agy-login"; mkdir -p "$D/home/Library/Keychains"
-  security list-keychains -d user        # note your search list
-  security create-keychain -p '' "$D/agy.keychain-db"
-  security list-keychains -d user -s ...  # restore the list noted above
-  security set-keychain-settings "$D/agy.keychain-db"   # no auto-lock
-  ln -s "$D/agy.keychain-db" "$D/home/Library/Keychains/login.keychain-db"
-  HOME="$D/home" agy                     # sign in; the token lands in agy.keychain-db
-  ```
-
-  The file must not be named `login.keychain-db` itself: macOS will not
-  unlock a file of that name with a password given on the command line.
-- Transcripts: agy's per-conversation SQLite files
-  (`.gemini/antigravity-cli/conversations/`) are archived like the other
-  API lanes'. The transcript viewer does not render them yet.
 
 ## claude/ - deep thought
 

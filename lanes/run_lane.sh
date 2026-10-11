@@ -2,7 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
-#                               | zen | zai | agy
+#                               | zen | zai
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -16,9 +16,7 @@
 # LOOM_<LANE>_MODEL (the lane's model when a brief has no Model: line, e.g.
 # LOOM_OPENCODE_GO_MODEL; every run passes its model explicitly and names it
 # in the PR), LOOM_<LANE>_KEY_SSM (API lanes: the SSM parameter holding the
-# provider key, read at run time; never stored in this repo; zen and agy
-# need none), LOOM_AGY_LOGIN_HOME (agy: the directory holding agy's own
-# sign-in keychain, default $LOOM_HOME/agy-login; see docs/LANES.md),
+# provider key, read at run time; never stored in this repo; zen needs none),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CLONE_BASE (default git@github.com:).
@@ -100,27 +98,22 @@ park() {
 # matches resolved paths; proper ancestors get metadata-only literals so
 # getcwd and realpath still work without making HOME listable.
 sandbox_profile() {
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" keychain='(global-name "com.apple.SecurityServer") ' sign_in=""
-  # agy signs in through the keychain: its lane may reach the keychain server
-  # and read one file, its own sign-in keychain (see agy_sign_in).
-  if [ "$LANE" = agy ]; then
-    keychain="" sign_in="$(realpath "$AGY_KEYCHAIN")" && [ -n "$sign_in" ] || { echo "refusing sandbox: cannot resolve $AGY_KEYCHAIN" >&2; return 1; }
-  fi
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
   cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
   cli_root="$(dirname "$cli_real")"
   # Paths go into the profile's string grammar: refuse any that could close it.
-  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$sign_in"; do
+  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME"; do
     # shellcheck disable=SC1003 # matching a literal backslash
     case "$p" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
   done
   # Never let the CLI's directory cover HOME itself.
   case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
   allow_rw="(subpath \"$tree\") (subpath \"$(cd "$AGENT_HOME" && pwd -P)\")"
-  allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")${sign_in:+ (literal \"$sign_in\")}"
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${sign_in:+"$sign_in"}; do
+  allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")"
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link"; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
       meta="$meta (literal \"$p\")"
@@ -128,8 +121,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta" "$keychain"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
+    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -177,8 +170,7 @@ safe_git() {
 }
 
 # Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
-# session store and older session json; agy's per-conversation SQLite files)
-# in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
+# session store and older session json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
 # The agent controls everything in that home, so: enter each parent directory
 # and refuse it unless its real path is the expected one (no link on the way;
 # once inside, a later swap of the name cannot move us), then hand rsync the
@@ -189,15 +181,15 @@ safe_git() {
 archive_transcripts() {
   local dest="$LOGDIR/$TICKET" home_real spec parent leaf
   home_real="$(cd "$AGENT_HOME" 2> /dev/null && pwd -P)" || return 0
-  for spec in .claude:projects .local/share:opencode .gemini/antigravity-cli:conversations; do
+  for spec in .claude:projects .local/share:opencode; do
     parent="${spec%%:*}" leaf="${spec##*:}"
     (
       cd "$home_real/$parent" 2> /dev/null || exit 0
       [ "$(pwd -P)" = "$home_real/$parent" ] || exit 0
       mkdir -p "$dest/$parent"
       if ! rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
-          --include='*.jsonl' --include='*.db' --include='*.db-wal' \
-          --include='*.db-shm' --exclude='*' "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
+          --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
+          --include='opencode.db-shm' --exclude='*' "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
         echo "[$(date -u +%FT%TZ)] $TICKET: archiving $parent/$leaf failed; transcript may be incomplete" >> "$LOG"
       fi
     )
@@ -213,22 +205,6 @@ fresh_agent_home() {
   mkdir -p "$AGENT_HOME/tmp"
 }
 
-# agy keeps its Google sign-in in the macOS keychain and looks for it in
-# $HOME/Library/Keychains/login.keychain-db. The sandbox must not open the
-# operator's login keychain: it also holds gh's token, readable by any process
-# that can run `security`. So agy signs in once into a keychain of its own,
-# agy.keychain-db (docs/LANES.md). Each run, the runner unlocks it by path
-# (its password is empty: the file is the secret; macOS will not unlock a
-# file named login.keychain-db that way, hence the other name) and links it
-# into the fresh scratch home under the name agy looks for. The sandbox lets
-# the agent read that one file, not write it: the agent can read agy's own
-# token, as API-lane agents can read their key, and nothing else.
-agy_sign_in() {
-  mkdir -p "$AGENT_HOME/Library/Keychains" &&
-    security unlock-keychain -p '' "$AGY_KEYCHAIN" &&
-    ln -s "$AGY_KEYCHAIN" "$AGENT_HOME/Library/Keychains/login.keychain-db"
-}
-
 # Lanes and models whose provider may train on prompts (docs/LANES.md lists
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
@@ -238,7 +214,7 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|agy) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai) return 0 ;; esac
   return 1
 }
 
@@ -255,9 +231,6 @@ run_agent() {
     zen) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
     zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
-    # Called directly, never wrapped in another agent (agy's terms). The
-    # Seatbelt profile is the boundary, so agy's own approval prompts are off.
-    agy) agy_sign_in && api_agent - agy -p "$brief_text" --model "$MODEL" --dangerously-skip-permissions ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
 }
@@ -266,18 +239,13 @@ run_agent() {
 lane_ready() {
   local cli key_ssm
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai) cli=opencode ;; agy) cli=agy ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai) cli=opencode ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
-  case "$LANE" in
-    zen) return 0 ;;
-    agy) [ -f "$AGY_KEYCHAIN" ] && [ ! -L "$AGY_KEYCHAIN" ] ||
-           { READY_REASON="agy is not signed in: no sign-in keychain under LOOM_AGY_LOGIN_HOME"; return 1; }
-         return 0 ;;
-  esac
+  case "$LANE" in zen) return 0 ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
@@ -296,7 +264,6 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1"; do
 done
 
 AGENT_HOME="$LOOM_HOME/run/$LANE-home"
-AGY_KEYCHAIN="${LOOM_AGY_LOGIN_HOME:-$LOOM_HOME/agy-login}/agy.keychain-db"
 API_KEY=""
 READY_REASON=""
 if ! lane_ready; then
@@ -351,8 +318,6 @@ for BRIEF in "$INBOX"/*.md; do
     zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
     zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
-    agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
-    agy:*) park "$BRIEF" "model $MODEL is not an agy model (see agy models)"; continue ;;
   esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue

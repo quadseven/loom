@@ -121,29 +121,6 @@ ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
 echo fixed > fix.txt
 """
 
-# Fake agy: like FAKE_OPENCODE it runs in an emptied environment and records
-# to TMPDIR what it can see: its argv, HOME, whether its sign-in keychain is
-# readable as its login keychain but not writable, and whether the real HOME's
-# secret and anything else in the sign-in directory are out of reach.
-FAKE_AGY = """#!/usr/bin/env bash
-args="$*"; args="${args//$'\\n'/ }"
-real_home="$(cd ../../.. && pwd)"
-if grep -q "agy sign-in" "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null; then kc=readable; else kc=missing; fi
-if printf x >> "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null; then kcw=writable; else kcw=denied; fi
-if cat "$real_home/loom/agy-login/other" > /dev/null 2>&1; then login=readable; else login=denied; fi
-if cat "$real_home/.ssh/id_planted" > /dev/null 2>&1; then secret=readable; else secret=denied; fi
-printf 'agy %s | home=%s keychain=%s kcwrite=%s login=%s secret=%s fakelog=%s\\n' "$args" "$HOME" "$kc" "$kcw" "$login" "$secret" \\
-  "${FAKE_LOG:-none}" >> "$TMPDIR/agent.log"
-(cd "$HOME" && mkdir -p .gemini/antigravity-cli/conversations)
-echo "agy conversation store" > "$HOME/.gemini/antigravity-cli/conversations/c1.db"
-echo fixed > fix.txt
-"""
-
-# Fake security: records the call (the runner unlocks the copied keychain).
-FAKE_SECURITY = """#!/usr/bin/env bash
-printf 'security %s\\n' "$*" >> "$FAKE_LOG"
-"""
-
 # Fake aws: `ssm get-parameter --name N` prints $FAKE_SECRET_<N with / as _>
 # or fails like a missing parameter.
 FAKE_AWS = """#!/usr/bin/env bash
@@ -190,8 +167,6 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "codex", FAKE_AGENT)
         self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
         self.write_tool(self.bin / "aws", FAKE_AWS)
-        self.write_tool(self.bin / "agy", FAKE_AGY)
-        self.write_tool(self.bin / "security", FAKE_SECURITY)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -520,61 +495,6 @@ class LaneRunnerTest(unittest.TestCase):
         beat = json.loads((self.loom / "state" / "usage" / "zai.json").read_text())
         self.assertFalse(beat["available"])
         self.assertIn("LOOM_ZAI_KEY_SSM", beat["reason"])
-
-    def agy_sign_in(self):
-        login = self.loom / "agy-login"
-        login.mkdir(parents=True)
-        (login / "agy.keychain-db").write_text("agy sign-in\n")
-        (login / "other").write_text("not for the agent\n")
-
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
-    def test_agy_lane_runs_headless_sandboxed_reading_only_its_own_sign_in(self):
-        self.agy_sign_in()
-        inbox, result = self.api_lane("agy", LOOM_AGY_MODEL="gemini-3.8-flash-high")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        agent = [c for c in self.calls() if c.startswith("agy ")]
-        self.assertEqual(len(agent), 1, self.calls())
-        self.assertTrue(agent[0].startswith("agy -p # Brief: T042-fix-the-thing"), agent[0])
-        self.assertIn("--model gemini-3.8-flash-high", agent[0])
-        self.assertIn("--dangerously-skip-permissions", agent[0])
-        self.assertIn("keychain=readable", agent[0])
-        self.assertIn("kcwrite=denied", agent[0])
-        self.assertIn("login=denied", agent[0])
-        self.assertIn("secret=denied", agent[0])
-        self.assertIn("fakelog=none", agent[0])
-        self.assertNotIn(f"home={self.home} ", agent[0])
-        unlock = [c for c in self.calls() if c.startswith("security unlock-keychain")]
-        self.assertEqual(len(unlock), 1, self.calls())
-        self.assertTrue(unlock[0].endswith("/agy-login/agy.keychain-db"), unlock[0])
-        self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
-        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
-
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
-    def test_agy_lane_transcripts_are_archived(self):
-        # agy keeps each conversation as a SQLite file.
-        self.agy_sign_in()
-        self.api_lane("agy", LOOM_AGY_MODEL="gemini-3.8-flash-high")
-        archive = self.loom / "logs" / "agy" / "T042-fix-the-thing"
-        db = archive / ".gemini" / "antigravity-cli" / "conversations" / "c1.db"
-        self.assertTrue(db.is_file(), sorted(str(p) for p in archive.rglob("*")))
-        self.assertIn("agy conversation store", db.read_text())
-
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
-    def test_agy_lane_without_its_sign_in_reports_unavailable(self):
-        inbox, result = self.api_lane("agy", LOOM_AGY_MODEL="gemini-3.8-flash-high")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(any(c.startswith("agy ") for c in self.calls()))
-        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
-        beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
-        self.assertFalse(beat["available"])
-        self.assertIn("not signed in", beat["reason"])
-
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
-    def test_agy_lane_refuses_a_model_outside_its_catalogue(self):
-        self.agy_sign_in()
-        inbox, _ = self.api_lane("agy", LOOM_AGY_MODEL="opencode-go/kimi-k2.7-code")
-        self.assertFalse(any(c.startswith("agy ") for c in self.calls()))
-        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def test_lane_without_its_credential_reports_unavailable_and_keeps_its_briefs(self):
         inbox, result = self.api_lane(
