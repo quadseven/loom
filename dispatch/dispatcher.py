@@ -47,7 +47,7 @@ STATE = LOOM / "state"
 #
 # Frontier models (hard tickets): anthropic API, claude-opus, codex-astra
 # Strong models (medium): claude-sonnet, codex-sol
-# Fast/free (easy): opencode, sparks-qwen
+# Fast/free (easy): openrouter (free tier), opencode-go ($10/mo sub), sparks-qwen
 LANE_TIERS = {
     "anthropic": {"hard", "medium", "easy"},  # $200 credits, FIRST priority
     "claude-opus": {"hard", "medium"},         # subscription, frontier
@@ -55,7 +55,8 @@ LANE_TIERS = {
     "claude": {"medium", "easy"},              # subscription, sonnet
     "codex": {"medium", "easy"},               # subscription, sol (default)
     "sparks-qwen": {"hard", "medium", "easy"}, # DGX Qwen Coder, code + tests
-    "opencode": {"easy"},                      # OpenRouter free tier
+    "openrouter": {"easy"},                    # OpenRouter free-tier models, $0
+    "opencode-go": {"easy"},                   # OpenCode Go curated models, $10/mo sub
     "sparks": set(),  # legacy compute-only entry, use sparks-qwen for code
 }
 
@@ -65,7 +66,7 @@ LANE_TIERS = {
 DIFFICULTY_LANE = {
     "hard": ["anthropic", "claude-opus", "codex-astra", "sparks-qwen"],
     "medium": ["anthropic", "claude", "codex", "sparks-qwen"],
-    "easy": ["anthropic", "opencode", "sparks-qwen", "claude", "codex"],
+    "easy": ["anthropic", "openrouter", "opencode-go", "sparks-qwen", "claude", "codex"],
 }
 
 
