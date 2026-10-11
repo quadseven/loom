@@ -115,6 +115,28 @@ lookup leaves the brief for the next pass. The rule covers:
 
 ## Adding a lane
 
-New lane = directory under `lanes/` with: a poller or runner script, a
-heartbeat writer, and a section appended here. No lane may merge, ship, or
-hold another lane's credentials.
+A lane is a name in `lanes/run_lane.sh`, not a directory of its own: that one
+runner polls, heartbeats, commits, pushes and opens the PR for every lane.
+Adding one takes:
+
+- In `lanes/run_lane.sh`, a CLI in `lane_ready`, and the name in the header
+  comment's lane list. An API lane also joins the case that wants
+  `sandbox-exec` and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
+  or key is missing reports itself unavailable and takes no work.
+- A branch in `run_agent` that runs the lane's CLI with the brief and the
+  model. An API lane calls `api_agent <key var or -> <CLI...>`, which runs it
+  under the sandbox in a fresh scratch home with only its own key exported,
+  and must be listed in `is_api_lane` (its transcripts are then archived).
+- A case in the `LANE:MODEL` model check, so a brief naming a model outside
+  the lane's family is parked rather than run.
+- An entry in `trains_on_prompts` if the provider may train on prompts: the
+  lane then takes public repos only.
+- In `lanes/mac/install.sh`, a default `LOOM_<LANE>_MODEL` (exported, so every
+  PR names it) and the lane in the list installed by default; an API lane's
+  `LOOM_<LANE>_KEY_SSM` is passed in the environment at install time.
+- Tests in `tests/test_run_lane.py` against the fake CLIs and gh already
+  there: a fake CLI for the new lane, and a pass that edits, pushes and opens
+  the PR (API-lane passes need macOS `sandbox-exec`).
+- A section here: what the lane is for and what it runs.
+
+No lane may merge, ship, or hold another lane's credentials.
