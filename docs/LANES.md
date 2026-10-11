@@ -10,8 +10,22 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 - An optional `Base:` line names the branch to start from and target; the
   default is the remote's default branch.
 - Every run passes an explicit model: the brief's `Model:` line, else the
-  lane default (`LOOM_CODEX_MODEL`, `LOOM_CLAUDE_MODEL`). The PR footer names
-  the lane and the model. A model from the other lane's family is refused.
+  lane default (`LOOM_<LANE>_MODEL`). The PR footer names the lane and the
+  model. A model outside the lane's family is refused; the `openrouter` lane
+  runs `:free` models only.
+- Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
+  whose CLI or key is missing reports `available: false` and leaves its briefs
+  alone; the dispatcher routes only to fresh, available lanes.
+
+## API lanes: openrouter, opencode-go, anthropic
+
+- `openrouter` (free models via opencode), `opencode-go` (subscription models
+  via opencode) and `anthropic` (API credits via the official Claude Code CLI).
+- The provider key is read from SSM at run time (`LOOM_<LANE>_KEY_SSM`, set at
+  install, never in this repo) and handed to the agent in an otherwise empty
+  environment with a scratch HOME. The agent has no git or gh config, SSH
+  agent or token, so it can edit files but cannot push, open, or merge. The
+  runner does that with the machine's own credentials.
 - A brief whose branch already has a PR in any state moves to `done/`
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the

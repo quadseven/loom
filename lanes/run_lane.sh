@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
-#   run_lane.sh <lane>        lane = codex | claude
+#   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -12,8 +12,10 @@
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
 # a brief may name; the agent trusts the cloned repo's own config),
-# LOOM_CODEX_MODEL / LOOM_CLAUDE_MODEL (the lane's model when a brief has no
-# Model: line; every run passes its model explicitly and names it in the PR),
+# LOOM_<LANE>_MODEL (the lane's model when a brief has no Model: line, e.g.
+# LOOM_OPENCODE_GO_MODEL; every run passes its model explicitly and names it
+# in the PR), LOOM_<LANE>_KEY_SSM (API lanes: the SSM parameter holding the
+# provider key, read at run time; never stored in this repo),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CLONE_BASE (default git@github.com:).
@@ -47,6 +49,18 @@ PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
+# LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
+lane_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$LANE" | tr '[:lower:]-' '[:upper:]_')" "$1"; }
+lane_setting() { local v; v="$(lane_var "$1")"; printf '%s' "${!v:-}"; }
+
+# Each pass records whether this lane can take work. The dispatcher routes
+# only to lanes with a fresh, available heartbeat.
+heartbeat() {
+  mkdir -p "$LOOM_HOME/state/usage"
+  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"}\n' \
+    "$LANE" "$(date +%s)" "$1" "$2" > "$LOOM_HOME/state/usage/$LANE.json"
+}
+
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
   awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
@@ -68,15 +82,53 @@ park() {
   mv "$1" "$INBOX/failed/"
 }
 
+# API lanes run the agent with an emptied environment: its provider key, a
+# scratch HOME and a PATH. No git or gh config, no SSH agent, no tokens, so it
+# can edit files but cannot push, open, or merge anything.
+api_agent() {
+  local key_var="$1"; shift
+  mkdir -p "$AGENT_HOME"
+  timeout "$AGENT_TIMEOUT" env -i PATH="$PATH" HOME="$AGENT_HOME" TERM=dumb \
+    LANG="${LANG:-en_US.UTF-8}" TMPDIR="${TMPDIR:-/tmp}" "$key_var=$API_KEY" "$@" < /dev/null
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
+    openrouter) api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    opencode-go) api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
 }
+
+# The lane's CLI and, for API lanes, its key. Sets API_KEY.
+lane_ready() {
+  local cli key_ssm
+  case "$LANE" in
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go) cli=opencode ;;
+    *) READY_REASON="unknown lane"; return 1 ;;
+  esac
+  command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
+  case "$LANE" in codex|claude) return 0 ;; esac
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
+  API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
+    --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+  [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
+}
+
+AGENT_HOME="$LOOM_HOME/run/$LANE-home"
+API_KEY=""
+READY_REASON=""
+if ! lane_ready; then
+  heartbeat false "$READY_REASON"
+  exit 0
+fi
+heartbeat true ""
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
@@ -102,17 +154,20 @@ for BRIEF in "$INBOX"/*.md; do
   # The model: the brief's Model: line, else the lane default. Passed to the
   # CLI explicitly so the PR names what actually ran.
   MODEL="$(field Model "$BRIEF" || true)"
-  if [ -z "$MODEL" ]; then
-    case "$LANE" in codex) MODEL="${LOOM_CODEX_MODEL:-}" ;; claude) MODEL="${LOOM_CLAUDE_MODEL:-}" ;; esac
-  fi
+  [ -n "$MODEL" ] || MODEL="$(lane_setting MODEL)"
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/-]*$ ]]; then
-    park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or LOOM_$(echo "$LANE" | tr '[:lower:]' '[:upper:]')_MODEL"; continue
+    park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
   fi
   case "$LANE:$MODEL" in
     codex:claude*|codex:opus*|codex:sonnet*|codex:haiku*|codex:fable*)
       park "$BRIEF" "model $MODEL is not a codex model"; continue ;;
     claude:claude*|claude:opus*|claude:sonnet*|claude:haiku*|claude:fable*) ;;
-    claude:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
+    anthropic:claude*) ;;
+    claude:*|anthropic:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
+    openrouter:openrouter/*:free) ;;
+    openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
+    opencode-go:opencode-go/*) ;;
+    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model"; continue ;;
   esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
