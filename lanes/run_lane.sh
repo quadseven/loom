@@ -132,27 +132,25 @@ api_agent() {
   mkdir -p "$AGENT_HOME/tmp"
   profile="$(sandbox_profile "$PWD" "$cli")" || return 3
   (
-    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY"
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV"
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
     export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     export "$key_var=$key"
+    [ -z "$extra" ] || export "${extra?}"
     exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
   )
 }
 
 # opencode runs helper agents (session titles) on its own default small model,
 # which can be a paid one; pin every opencode model to the lane's model so the
-# free lane stays free and the subscription lane stays in its catalogue.
+# free lane stays free and the subscription lane stays in its catalogue. The
+# config travels in the environment: the runner writes nothing into space the
+# agent can write, so no link an agent leaves there can redirect it.
 opencode_config() {
-  mkdir -p "$AGENT_HOME/.config/opencode"
-  printf '{"model": "%s", "small_model": "%s"}\n' "$MODEL" "$MODEL" \
-    > "$AGENT_HOME/.config/opencode/opencode.json"
+  AGENT_EXTRA_ENV="OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"}"
 }
 
-# A fresh scratch home for every API-lane run. The agent can write inside it,
-# so anything left there (a link into the real HOME, say) must never meet the
-# runner, which is not sandboxed. rm -rf removes links without following them.
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
 # the tree might name, whatever ended up in its config. (`timeout` cannot run
 # a shell function, so the push spells the same options out.)
@@ -168,6 +166,7 @@ fresh_agent_home() {
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
+  AGENT_EXTRA_ENV=""
   case "$LANE" in openrouter|opencode-go|anthropic) fresh_agent_home ;; esac
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
