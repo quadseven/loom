@@ -21,22 +21,20 @@ for BRIEF in "$INBOX"/*.md; do
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(grep -m1 '^Repo:' "$BRIEF" | cut -d' ' -f2-)"
   BRANCH="$(grep -m1 '^Branch:' "$BRIEF" | cut -d' ' -f2-)"
-  MODEL="$(grep -m1 '^Model:' "$BRIEF" | cut -d' ' -f2- || true)"
+  # Model: is brief-supplied and therefore untrusted: read raw, then allowlist
+  # it to model-id characters [A-Za-z0-9._:/-] before it may reach
+  # `codex exec --model`. Flags and shell metacharacters are refused outright
+  # (Elder: unvalidated-external-input).
+  MODEL_RAW="$(grep -m1 '^Model:' "$BRIEF" | cut -d' ' -f2- || true)"
+  case "$MODEL_RAW" in
+    -*|*[^A-Za-z0-9._:/-]*|"")
+      [ -n "$MODEL_RAW" ] && echo "WARN: refusing suspicious Model '$MODEL_RAW' in $BRIEF; using default" >&2
+      MODEL=""
+      ;;
+    *) MODEL="$MODEL_RAW" ;;
+  esac
   MODEL_ARGS=()
-  if [ -n "$MODEL" ]; then
-    # The Model: line is dispatcher-written, but validate anyway: it must
-    # look like a model id (letters, digits, . _ : / -), never a flag or
-    # shell metacharacters. A hostile or careless brief must not steer
-    # the lane to an arbitrary --model argument.
-    case "$MODEL" in
-      -*|*[^A-Za-z0-9._:/-]*)
-        echo "WARN: refusing suspicious Model '$MODEL' in $BRIEF; using default" >&2
-        ;;
-      *)
-        MODEL_ARGS=(--model "$MODEL")
-        ;;
-    esac
-  fi
+  [ -n "$MODEL" ] && MODEL_ARGS=(--model "$MODEL")
   TREE="$WORKDIR/$TICKET"
 
   # Drop leftovers from a partial run so a retry always starts clean.
