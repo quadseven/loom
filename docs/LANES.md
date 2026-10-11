@@ -20,7 +20,7 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 ## Transcript viewer
 
 `lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves
-every lane's agent session as a chat at `http://localhost:8765/`: the brief,
+every lane's agent session as a chat at `http://localhost:7340/`: the brief,
 the agent's messages, each tool call with its output, edits as diffs. It reads
 Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
 (openrouter, opencode-go) and codex rollouts. It binds localhost only and

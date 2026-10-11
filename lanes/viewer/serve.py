@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Loom lane transcript viewer: every agent session on this machine, as chat.
 
-    python3 lanes/viewer/serve.py            # http://localhost:8765/
+    python3 lanes/viewer/serve.py            # http://localhost:7340/
 
 Binds 127.0.0.1 only and answers only requests addressed to localhost, so the
 transcripts (agent output, never published) stay on this machine and a web
 page cannot reach the viewer by DNS rebinding. Pages carry a CSP that allows
 no scripts at all.
 
-Env: LOOM_HOME (default ~/loom), LOOM_VIEWER_PORT (default 8765).
+Env: LOOM_HOME (default ~/loom), LOOM_VIEWER_PORT (default 7340).
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def make_handler(loom: Path, port: int):
 
 def main() -> None:
     loom = Path(os.environ.get("LOOM_HOME", str(Path.home() / "loom")))
-    raw = os.environ.get("LOOM_VIEWER_PORT", "8765")
+    raw = os.environ.get("LOOM_VIEWER_PORT", "7340")
     if not raw.isdigit() or not 0 < int(raw) < 65536:
         sys.exit(f"LOOM_VIEWER_PORT must be a port number, got {raw!r}")
     port = int(raw)

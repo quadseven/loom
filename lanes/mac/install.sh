@@ -88,6 +88,7 @@ done
 # The transcript viewer: a long-running server on localhost, restarted if it
 # exits. Installed alongside the lanes unless LOOM_VIEWER=0.
 if [ "${LOOM_VIEWER:-1}" != 0 ]; then
+  VIEWER_PORT="${LOOM_VIEWER_PORT:-7340}"
   LABEL="com.loom.viewer"
   PLIST="$AGENTS/$LABEL.plist"
   cat > "$PLIST" <<EOF
@@ -103,17 +104,19 @@ if [ "${LOOM_VIEWER:-1}" != 0 ]; then
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>$X_LOOM/logs/viewer.log</string>
   <key>StandardErrorPath</key><string>$X_LOOM/logs/viewer.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
+    <key>LOOM_VIEWER_PORT</key><string>$(xml "$VIEWER_PORT")</string>
   </dict>
 </dict>
 </plist>
 EOF
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  echo "installed $LABEL -> http://localhost:${LOOM_VIEWER_PORT:-8765}/"
+  echo "installed $LABEL -> http://localhost:$VIEWER_PORT/"
 fi
