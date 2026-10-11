@@ -2,11 +2,13 @@
 # Install the codex and claude lanes as launchd agents on the login machine.
 #
 #   lanes/mac/install.sh [lane ...]
-#     default: codex claude openrouter opencode-go anthropic
+#     default: codex claude openrouter opencode-go anthropic zen zai agy
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
-# LOOM_OPENCODE_GO_KEY_SSM, LOOM_ANTHROPIC_KEY_SSM, optional LOOM_AWS_REGION);
+# LOOM_OPENCODE_GO_KEY_SSM, LOOM_ANTHROPIC_KEY_SSM, LOOM_ZAI_KEY_SSM, optional
+# LOOM_AWS_REGION); zen needs no key, and agy uses its own sign-in keychain
+# (docs/LANES.md);
 # they are written into the local plists only, never into this repo. A lane
 # whose key is missing reports itself unavailable and receives no work.
 #
@@ -24,14 +26,18 @@ LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1:free}"
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
 LOOM_ANTHROPIC_MODEL="${LOOM_ANTHROPIC_MODEL:-claude-sonnet-5-5}"
-export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_ANTHROPIC_MODEL
+LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/space-bunny-free}"
+LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
+LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
+export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_ANTHROPIC_MODEL \
+  LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_AGY_MODEL
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
 LANES=("$@")
-[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic)
+[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai agy)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag

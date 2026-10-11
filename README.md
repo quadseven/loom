@@ -8,8 +8,9 @@ lanes, single shipper. Multi-project by design: one loom, many goals.
 - `docs/` - architecture, lane contracts, brief format, usage routing
 - `dispatch/` - the foreman: metrics, dispatcher, ship, verify, report
 - `lanes/` - worker lane runners (one per subscription)
-  - `lanes/run_lane.sh` - runs the codex, claude, openrouter, opencode-go and
-    anthropic lanes: one pass over a lane inbox, one brief at a time
+  - `lanes/run_lane.sh` - runs the codex, claude, openrouter, opencode-go,
+    anthropic, zen, zai and agy lanes: one pass over a lane inbox, one brief
+    at a time
   - `lanes/mac/install.sh` - installs those lanes as launchd agents
   - `lanes/opencode/` - older opencode runner (OpenRouter, Poolside, other
     APIs); not used by run_lane.sh
@@ -32,11 +33,13 @@ Loom serves all active goals.
 1. Read `docs/ARCHITECTURE.md`.
 2. Put API keys (OpenRouter, Poolside) in the secure vault; never in files.
 3. Install the lanes where each subscription login lives
-   (`lanes/mac/install.sh` on the login Mac). The openrouter, opencode-go and
-   anthropic lanes read their provider key from SSM at run time, so name each
-   parameter in the environment when you run the installer:
-   `LOOM_OPENROUTER_KEY_SSM`, `LOOM_OPENCODE_GO_KEY_SSM` and
-   `LOOM_ANTHROPIC_KEY_SSM` (plus optional `LOOM_AWS_REGION`). Those names are
+   (`lanes/mac/install.sh` on the login Mac). The openrouter, opencode-go,
+   anthropic and zai lanes read their provider key from SSM at run time, so
+   name each parameter in the environment when you run the installer:
+   `LOOM_OPENROUTER_KEY_SSM`, `LOOM_OPENCODE_GO_KEY_SSM`,
+   `LOOM_ANTHROPIC_KEY_SSM` and `LOOM_ZAI_KEY_SSM` (plus optional
+   `LOOM_AWS_REGION`). zen needs no key; agy needs a one-time sign-in into a
+   keychain of its own (`docs/LANES.md`). Those names are
    written only into the local launchd plists, never into this repo. A lane
    whose key is missing reports itself unavailable and gets no work.
 4. Run `dispatch/dispatch.py` on a schedule (every 30 min).

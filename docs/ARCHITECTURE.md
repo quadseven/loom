@@ -27,13 +27,16 @@ Template: `.github/ISSUE_TEMPLATE/ticket.md`.
 Each lane polls its inbox in `briefs/<lane>/`, does the work in a fresh
 worktree, and opens a PR. Lanes never merge.
 
-`lanes/run_lane.sh` runs the five active lanes:
+`lanes/run_lane.sh` runs these lanes:
 
 - `codex/` - scoped implementation, CI repairs, and review passes.
 - `claude/` - deep root-cause work and hard refactors.
 - `openrouter/` - free models via opencode.
 - `opencode-go/` - subscription models via opencode.
 - `anthropic/` - API-credit models via the official Claude Code CLI.
+- `zen/` - OpenCode Zen free models via opencode; public repos only.
+- `zai/` - Z.ai free GLM Flash models via opencode; public repos only.
+- `agy/` - the Google plan via the Antigravity CLI (`agy -p`).
 
 API-lane agents run sandboxed without credentials; the runner pushes the
 branch and opens the PR. The `sparks/` lane is deferred until the Sparks
