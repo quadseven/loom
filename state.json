@@ -2,7 +2,43 @@
   "goals": [
     {
       "name": "wow-ragnaros",
-      "tickets": []
+      "tickets": [
+        {
+          "id": "T001-realm-state-audit",
+          "title": "# T001: Audit current realm state via overseer API",
+          "status": "briefed",
+          "lane": "codex",
+          "updated": "2026-10-11T03:46:13.422550+00:00"
+        },
+        {
+          "id": "T002-metric-watcher-setup",
+          "title": "# T002: Set up 30-minute metric snapshot watcher",
+          "status": "briefed",
+          "lane": "codex",
+          "updated": "2026-10-11T03:46:13.424878+00:00"
+        },
+        {
+          "id": "T003-api-audit",
+          "title": "# T003: Audit overseer API endpoints",
+          "status": "briefed",
+          "lane": "opencode",
+          "updated": "2026-10-11T03:46:13.427430+00:00"
+        },
+        {
+          "id": "T004-now-page-improvements",
+          "title": "# T004: Improve /dev/#/now frontend",
+          "status": "briefed",
+          "lane": "codex",
+          "updated": "2026-10-11T03:46:13.428186+00:00"
+        },
+        {
+          "id": "T005-death-loop-check",
+          "title": "# T005: Check overseer_death for death loops and ghost clusters",
+          "status": "briefed",
+          "lane": "codex",
+          "updated": "2026-10-11T03:46:13.430218+00:00"
+        }
+      ]
     }
   ],
   "lanes": {
@@ -19,15 +55,22 @@
       "usage": {}
     },
     "codex": {
-      "pending": 0,
+      "pending": 4,
       "done": 0,
-      "pending_tickets": [],
+      "pending_tickets": [
+        "T001-realm-state-audit",
+        "T002-metric-watcher-setup",
+        "T004-now-page-improvements",
+        "T005-death-loop-check"
+      ],
       "usage": {}
     },
     "opencode": {
-      "pending": 0,
+      "pending": 1,
       "done": 0,
-      "pending_tickets": [],
+      "pending_tickets": [
+        "T003-api-audit"
+      ],
       "usage": {}
     },
     "sparks": {
@@ -37,9 +80,9 @@
       "usage": {}
     }
   },
-  "updated": "2026-10-11T03:45:52.775645+00:00",
+  "updated": "2026-10-11T03:46:29.015047+00:00",
   "dispatcher": {
     "goals": {},
-    "last_run": "2026-10-11T03:45:43.409335+00:00"
+    "last_run": "2026-10-11T03:46:13.430954+00:00"
   }
 }
