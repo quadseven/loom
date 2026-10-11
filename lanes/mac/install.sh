@@ -37,11 +37,15 @@ LANES=("$@")
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
 # behind and break (a Homebrew opencode crashed on start, 2026-10-11).
 
+# XML-escape a value for a plist <string>.
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")"
+
 # Every LOOM_* setting in the environment, as plist entries.
 loom_env() {
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
     case "$k" in LOOM_HOME|LOOM_REPO_OWNERS) continue ;; LOOM_*) ;; *) continue ;; esac
-    v="$(printf '%s' "$v" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+    v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
   done
 }
@@ -58,19 +62,19 @@ for L in "${LANES[@]}"; do
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>$REPO_ROOT/lanes/run_lane.sh</string>
+    <string>$X_REPO/lanes/run_lane.sh</string>
     <string>$L</string>
   </array>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$LOOM_HOME/logs/$L-service.log</string>
-  <key>StandardErrorPath</key><string>$LOOM_HOME/logs/$L-service.log</string>
+  <key>StandardOutPath</key><string>$X_LOOM/logs/$L-service.log</string>
+  <key>StandardErrorPath</key><string>$X_LOOM/logs/$L-service.log</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>HOME</key><string>$HOME</string>
-    <key>LOOM_HOME</key><string>$LOOM_HOME</string>
-    <key>LOOM_REPO_OWNERS</key><string>$LOOM_REPO_OWNERS</string>
+    <key>PATH</key><string>$X_HOME/.local/bin:$X_HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$X_HOME</string>
+    <key>LOOM_HOME</key><string>$X_LOOM</string>
+    <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
 $(loom_env)
   </dict>
 </dict>
@@ -78,5 +82,38 @@ $(loom_env)
 EOF
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  echo "installed $LABEL -> $REPO_ROOT/lanes/run_lane.sh $L"
+  echo "installed $LABEL -> $X_REPO/lanes/run_lane.sh $L"
 done
+
+# The transcript viewer: a long-running server on localhost, restarted if it
+# exits. Installed alongside the lanes unless LOOM_VIEWER=0.
+if [ "${LOOM_VIEWER:-1}" != 0 ]; then
+  LABEL="com.loom.viewer"
+  PLIST="$AGENTS/$LABEL.plist"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>$X_REPO/lanes/viewer/serve.py</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$X_LOOM/logs/viewer.log</string>
+  <key>StandardErrorPath</key><string>$X_LOOM/logs/viewer.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$X_HOME</string>
+    <key>LOOM_HOME</key><string>$X_LOOM</string>
+  </dict>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "installed $LABEL -> http://localhost:${LOOM_VIEWER_PORT:-8765}/"
+fi
