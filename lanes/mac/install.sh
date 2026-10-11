@@ -80,3 +80,36 @@ EOF
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "installed $LABEL -> $REPO_ROOT/lanes/run_lane.sh $L"
 done
+
+# The transcript viewer: a long-running server on localhost, restarted if it
+# exits. Installed alongside the lanes unless LOOM_VIEWER=0.
+if [ "${LOOM_VIEWER:-1}" != 0 ]; then
+  LABEL="com.loom.viewer"
+  PLIST="$AGENTS/$LABEL.plist"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>$REPO_ROOT/lanes/viewer/serve.py</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOOM_HOME/logs/viewer.log</string>
+  <key>StandardErrorPath</key><string>$LOOM_HOME/logs/viewer.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>LOOM_HOME</key><string>$LOOM_HOME</string>
+  </dict>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "installed $LABEL -> http://localhost:${LOOM_VIEWER_PORT:-8765}/"
+fi

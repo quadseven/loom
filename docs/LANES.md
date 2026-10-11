@@ -17,6 +17,15 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
 
+## Transcript viewer
+
+`lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves
+every lane's agent session as a chat at `http://localhost:8765/`: the brief,
+the agent's messages, each tool call with its output, edits as diffs. It reads
+Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
+(openrouter, opencode-go) and codex rollouts. It binds localhost only and
+answers only localhost Host headers; transcripts never leave the machine.
+
 ## API lanes: openrouter, opencode-go, anthropic
 
 - `openrouter` (free models via opencode), `opencode-go` (subscription models
