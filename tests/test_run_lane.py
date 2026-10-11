@@ -77,15 +77,18 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 # which the runner points at the agent's scratch home.
 FAKE_OPENCODE = """#!/usr/bin/env bash
 args="$*"; args="${args//$'\\n'/ }"
-key="${OPENROUTER_API_KEY:-${OPENCODE_API_KEY:-${ANTHROPIC_API_KEY:-none}}}"
+keyvar=none; key=none
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY; do
+  if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
+done
 real_home="$(cd ../../.. && pwd)"
 if cat "$real_home/.ssh/id_planted" > /dev/null 2>&1; then secret=readable; else secret=denied; fi
 if /usr/bin/nc -w 1 -U "$real_home/agent.sock" < /dev/null > /dev/null 2>&1; then sock=reachable; else sock=denied; fi
 if /usr/bin/osascript -e 'return 1' > /dev/null 2>&1; then osa=ran; else osa=denied; fi
 procs="$(ps -axo args= 2>/dev/null)"
 case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
-printf 'opencode %s | key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s\\n' "$args" \\
-  "$key" "$HOME" "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" \\
+printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s\\n' "$args" \\
+  "$keyvar" "$key" "$HOME" "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" \\
   "$secret" "$argv" "$sock" "$osa" >> "$TMPDIR/agent.log"
 echo fixed > fix.txt
 """
@@ -264,7 +267,7 @@ class LaneRunnerTest(unittest.TestCase):
         inbox = self.loom / "briefs" / lane
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", f"Lane: {lane}"))
-        result = self.run_lane(lane, SSH_AUTH_SOCK="/tmp/agent.sock", GH_TOKEN="gh-secret", **env)
+        result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
         return inbox, result
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
@@ -272,14 +275,14 @@ class LaneRunnerTest(unittest.TestCase):
         inbox, result = self.api_lane(
             "openrouter",
             LOOM_OPENROUTER_KEY_SSM="/k/or",
-            FAKE_SECRET__k_or="or-key",
+            FAKE_SECRET__k_or="fake-or-key",
             LOOM_OPENROUTER_MODEL="openrouter/vendor/model:free",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         agent = [c for c in self.calls() if c.startswith("opencode ")]
         self.assertEqual(len(agent), 1, self.calls())
         self.assertIn("-m openrouter/vendor/model:free", agent[0])
-        self.assertIn("key=or-key", agent[0])
+        self.assertIn("keyvar=OPENROUTER_API_KEY key=fake-or-key", agent[0])
         self.assertIn("ssh=none", agent[0])
         self.assertIn("ghtoken=none", agent[0])
         self.assertIn("fakelog=none", agent[0])
@@ -296,7 +299,7 @@ class LaneRunnerTest(unittest.TestCase):
         inbox, _ = self.api_lane(
             "openrouter",
             LOOM_OPENROUTER_KEY_SSM="/k/or",
-            FAKE_SECRET__k_or="or-key",
+            FAKE_SECRET__k_or="fake-or-key",
             LOOM_OPENROUTER_MODEL="openrouter/vendor/model",
         )
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
@@ -311,6 +314,21 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
         beat = json.loads((self.loom / "state" / "usage" / "anthropic.json").read_text())
         self.assertFalse(beat["available"])
+
+    def test_a_malformed_timeout_reports_unavailable_instead_of_running(self):
+        self.drop_brief()
+        result = self.run_lane(LOOM_AGENT_TIMEOUT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+
+    def test_a_ticket_name_with_unsafe_characters_is_parked(self):
+        self.drop_brief(name='T042-bad"name.md')
+        self.run_lane()
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / 'T042-bad"name.md').exists())
 
     def test_a_pass_writes_a_fresh_available_heartbeat(self):
         before = int(time.time())

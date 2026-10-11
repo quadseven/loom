@@ -37,6 +37,7 @@ LANES=("$@")
 loom_env() {
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
     case "$k" in LOOM_HOME|LOOM_REPO_OWNERS) continue ;; LOOM_*) ;; *) continue ;; esac
+    v="$(printf '%s' "$v" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
   done
 }
