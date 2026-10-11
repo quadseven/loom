@@ -32,8 +32,12 @@ def load_events(lane: str, ticket: str, loom: Path, claude_projects: Path,
     archive = loom / "logs" / lane / ticket
     events: list[dict] = []
     if lane == "claude":
-        project = claude_projects / str(loom / "worktrees" / ticket).replace("/", "-").replace(".", "-")
-        events = _claude_dir(project)
+        tree = str(loom / "worktrees" / ticket)
+        # Claude Code names the project dir after the cwd with "/" and "." as
+        # "-", so distinct tickets can share one; keep only sessions whose
+        # recorded cwd is this ticket's worktree.
+        project = claude_projects / tree.replace("/", "-").replace(".", "-")
+        events = _claude_dir(project, cwd=tree)
     elif lane == "anthropic":
         events = _claude_dir(archive)
     elif lane in ("openrouter", "opencode-go"):
@@ -51,15 +55,32 @@ def load_events(lane: str, ticket: str, loom: Path, claude_projects: Path,
     return events
 
 
-def _claude_dir(root: Path) -> list[dict]:
+def _claude_dir(root: Path, cwd: str | None = None) -> list[dict]:
     if not root.is_dir():
         return []
     files = sorted((p for p in root.rglob("*.jsonl") if p.is_file() and not p.is_symlink()),
                    key=lambda p: p.stat().st_mtime)
     events: list[dict] = []
     for f in files:
-        events += claude_events(f.read_text(errors="replace").splitlines())
+        lines = f.read_text(errors="replace").splitlines()
+        if cwd is not None and not _has_cwd(lines, cwd):
+            continue
+        events += claude_events(lines)
     return events
+
+
+def _rows(lines: list[str]):
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            yield row
+
+
+def _has_cwd(lines: list[str], cwd: str) -> bool:
+    return any(row.get("cwd") == cwd for row in _rows(lines))
 
 
 def _text(content) -> str:
@@ -70,44 +91,57 @@ def _text(content) -> str:
     return ""
 
 
+def _claude_user(content, calls: dict) -> list[dict]:
+    """A user row: the prompt text, or tool results joined to their calls."""
+    if isinstance(content, str):
+        return [{"kind": "user", "text": content}]
+    out = []
+    for c in content or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "tool_result" and c.get("tool_use_id") in calls:
+            calls[c["tool_use_id"]]["output"] = _text(c.get("content"))
+        elif c.get("type") == "text":
+            out.append({"kind": "user", "text": c.get("text", "")})
+    return out
+
+
+def _claude_block(c: dict, calls: dict) -> dict | None:
+    """One block of an assistant row as an event (tool calls are remembered)."""
+    t = c.get("type")
+    if t == "text" and c.get("text", "").strip():
+        return {"kind": "assistant", "text": c["text"]}
+    if t == "thinking" and c.get("thinking", "").strip():
+        return {"kind": "thinking", "text": c["thinking"]}
+    if t == "tool_use":
+        call = {"kind": "tool", "tool": c.get("name", "?"), "input": c.get("input") or {}, "output": ""}
+        calls[c.get("id", "")] = call
+        return call
+    return None
+
+
 def claude_events(lines: list[str]) -> list[dict]:
     """Claude Code transcript lines -> events; tool results join their call."""
     events: list[dict] = []
     calls: dict[str, dict] = {}
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("type") not in ("user", "assistant"):
-            continue
+    for row in _rows(lines):
         content = (row.get("message") or {}).get("content")
-        if row["type"] == "user":
-            if isinstance(content, str):
-                events.append({"kind": "user", "text": content})
-                continue
+        if row.get("type") == "user":
+            events += _claude_user(content, calls)
+        elif row.get("type") == "assistant":
             for c in content or []:
-                if c.get("type") == "tool_result" and c.get("tool_use_id") in calls:
-                    calls[c["tool_use_id"]]["output"] = _text(c.get("content"))
-                elif c.get("type") == "text":
-                    events.append({"kind": "user", "text": c.get("text", "")})
-            continue
-        for c in content or []:
-            if c.get("type") == "text" and c.get("text", "").strip():
-                events.append({"kind": "assistant", "text": c["text"]})
-            elif c.get("type") == "thinking" and c.get("thinking", "").strip():
-                events.append({"kind": "thinking", "text": c["thinking"]})
-            elif c.get("type") == "tool_use":
-                call = {"kind": "tool", "tool": c.get("name", "?"),
-                        "input": c.get("input") or {}, "output": ""}
-                calls[c.get("id", "")] = call
-                events.append(call)
+                ev = _claude_block(c, calls) if isinstance(c, dict) else None
+                if ev:
+                    events.append(ev)
     return events
 
 
 def opencode_events(db: Path) -> list[dict]:
     """opencode 1.18 SQLite store -> events, oldest first."""
-    con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+    except sqlite3.Error:
+        return []
     try:
         con.execute("PRAGMA trusted_schema=OFF")
         rows = con.execute(
@@ -156,34 +190,38 @@ def _codex_rollout(sessions: Path, tree: Path) -> Path | None:
     return best
 
 
+def _codex_item(p: dict) -> dict | None:
+    """A codex response item as an event; outputs are handled by the caller."""
+    t = p.get("type")
+    if t == "message" and p.get("role") in ("user", "assistant"):
+        text = _text(p.get("content"))
+        return {"kind": p["role"], "text": text} if text.strip() else None
+    if t == "reasoning":
+        text = _text(p.get("summary"))
+        return {"kind": "thinking", "text": text} if text.strip() else None
+    if t in ("custom_tool_call", "function_call"):
+        raw = p.get("input") or p.get("arguments") or ""
+        return {"kind": "tool", "tool": p.get("name", "?"),
+                "input": {"command": raw if isinstance(raw, str) else json.dumps(raw)}, "output": ""}
+    return None
+
+
 def codex_events(lines: list[str]) -> list[dict]:
     """codex rollout lines -> events; a call's output joins the call."""
     events: list[dict] = []
     last_call: dict | None = None
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
+    for row in _rows(lines):
         if row.get("type") != "response_item":
             continue
         p = row.get("payload") or {}
-        t = p.get("type")
-        if t == "message" and p.get("role") in ("user", "assistant"):
-            text = _text(p.get("content"))
-            if text.strip():
-                events.append({"kind": p["role"], "text": text})
-        elif t == "reasoning":
-            text = _text(p.get("summary"))
-            if text.strip():
-                events.append({"kind": "thinking", "text": text})
-        elif t in ("custom_tool_call", "function_call"):
-            raw = p.get("input") or p.get("arguments") or ""
-            last_call = {"kind": "tool", "tool": p.get("name", "?"),
-                         "input": {"command": raw if isinstance(raw, str) else json.dumps(raw)},
-                         "output": ""}
-            events.append(last_call)
-        elif t in ("custom_tool_call_output", "function_call_output") and last_call is not None:
-            out = p.get("output")
-            last_call["output"] = out if isinstance(out, str) else _text(out)
+        if p.get("type") in ("custom_tool_call_output", "function_call_output"):
+            if last_call is not None:
+                out = p.get("output")
+                last_call["output"] = out if isinstance(out, str) else _text(out)
+            continue
+        ev = _codex_item(p)
+        if ev:
+            events.append(ev)
+            if ev["kind"] == "tool":
+                last_call = ev
     return events

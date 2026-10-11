@@ -43,7 +43,7 @@ def rows(loom: Path) -> list[dict]:
 
 
 def allowed_host(host: str, port: int) -> bool:
-    return host in (f"localhost:{port}", f"127.0.0.1:{port}")
+    return host.strip().lower() in (f"localhost:{port}", f"127.0.0.1:{port}")
 
 
 def make_handler(loom: Path, port: int):
@@ -88,7 +88,10 @@ def make_handler(loom: Path, port: int):
 
 def main() -> None:
     loom = Path(os.environ.get("LOOM_HOME", str(Path.home() / "loom")))
-    port = int(os.environ.get("LOOM_VIEWER_PORT", "8765"))
+    raw = os.environ.get("LOOM_VIEWER_PORT", "8765")
+    if not raw.isdigit() or not 0 < int(raw) < 65536:
+        sys.exit(f"LOOM_VIEWER_PORT must be a port number, got {raw!r}")
+    port = int(raw)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(loom, port))
     print(f"Loom viewer on http://localhost:{port}/", flush=True)
     server.serve_forever()

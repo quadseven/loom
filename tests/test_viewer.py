@@ -66,9 +66,31 @@ class LoadEvents(Fixture):
     def test_claude_lane_reads_the_worktree_project_in_claude_home(self):
         tree = self.loom / "worktrees" / "T1"
         mangled = str(tree).replace("/", "-").replace(".", "-")
-        self.write_jsonl(self.claude_projects / mangled / "s.jsonl", claude_lines())
+        rows = [dict(r, cwd=str(tree)) for r in claude_lines()]  # real rows record their cwd
+        self.write_jsonl(self.claude_projects / mangled / "s.jsonl", rows)
         events = transcripts.load_events("claude", "T1", self.loom, self.claude_projects, self.codex_sessions)
         self.assertEqual(events[0]["kind"], "user")
+
+    def test_claude_lane_matches_sessions_by_cwd_not_just_the_mangled_name(self):
+        # "T1.a" and "T1-a" mangle to the same project directory.
+        mine = self.loom / "worktrees" / "T1.a"
+        other = self.loom / "worktrees" / "T1-a"
+        mangled = str(mine).replace("/", "-").replace(".", "-")
+        rows_mine = [dict(r, cwd=str(mine)) for r in claude_lines()]
+        rows_other = [{"type": "user", "cwd": str(other), "message": {"content": "someone else's brief"}}]
+        self.write_jsonl(self.claude_projects / mangled / "a.jsonl", rows_other)
+        self.write_jsonl(self.claude_projects / mangled / "b.jsonl", rows_mine)
+        events = transcripts.load_events("claude", "T1.a", self.loom, self.claude_projects, self.codex_sessions)
+        self.assertNotIn("someone else's brief", [e.get("text") for e in events])
+        self.assertEqual(events[0]["kind"], "user")
+
+    def test_a_corrupt_opencode_store_reads_as_no_transcript(self):
+        db = self.loom / "logs/openrouter/T2/.local/share/opencode/opencode.db"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"not sqlite at all")
+        (self.loom / "logs/openrouter/T2.log").write_text("printed\n")
+        events = transcripts.load_events("openrouter", "T2", self.loom, self.claude_projects, self.codex_sessions)
+        self.assertEqual(events, [{"kind": "log", "text": "printed\n"}])
 
     def test_opencode_lane_reads_the_archived_sqlite_store(self):
         db = self.loom / "logs/openrouter/T1/.local/share/opencode/opencode.db"
@@ -152,6 +174,7 @@ class Server(Fixture):
         self.assertTrue(serve.allowed_host("127.0.0.1:8765", 8765))
         self.assertFalse(serve.allowed_host("evil.example:8765", 8765))
         self.assertFalse(serve.allowed_host("", 8765))
+        self.assertTrue(serve.allowed_host(" LocalHost:8765 ", 8765))
 
 
 if __name__ == "__main__":
