@@ -17,7 +17,7 @@ MAX_LINES = 12
 STYLE = """
 body { background: #1a1a1a; color: #d6d6d6; margin: 0;
   font: 13px/1.5 ui-monospace, "SF Mono", Menlo, monospace; }
-main { max-width: 1100px; margin: 0 auto; padding: 24px 28px 80px; }
+main { max-width: 1400px; margin: 0 auto; padding: 24px 28px 80px; }
 header { color: #8a8a8a; border-bottom: 1px solid #333; padding-bottom: 12px; margin-bottom: 18px; }
 header b { color: #e8e8e8; }
 a { color: #6cb6ff; }
