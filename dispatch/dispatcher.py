@@ -99,13 +99,24 @@ def pick_lane(difficulty: str, state: dict) -> str | None:
     worker is taking briefs there, so the lane gets nothing."""
     now = time.time()
     for lane in DIFFICULTY_LANE.get(difficulty, []):
+        path = STATE / "usage" / f"{lane}.json"
         try:
-            beat = json.loads((STATE / "usage" / f"{lane}.json").read_text())
-        except (OSError, json.JSONDecodeError):
+            beat = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue  # no runner has ever reported: no worker
+        except (OSError, ValueError) as e:
+            # The file exists but cannot be read: a fault worth seeing, not
+            # the same as a lane with no worker.
+            log(f"  skipping {lane}: unreadable heartbeat {path}: {e}")
             continue
-        if not beat.get("available"):
+        if not isinstance(beat, dict) or not beat.get("available"):
             continue
-        if now - float(beat.get("at", 0)) > HEARTBEAT_MAX_AGE_S:
+        try:
+            age = now - float(beat.get("at", 0))
+        except (TypeError, ValueError):
+            log(f"  skipping {lane}: heartbeat has no usable time: {beat.get('at')!r}")
+            continue
+        if age > HEARTBEAT_MAX_AGE_S:
             continue
         return lane
     return None
