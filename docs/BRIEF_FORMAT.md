@@ -1,39 +1,46 @@
-# Ticket brief format
+# Brief format
 
-Briefs are markdown files dropped into `briefs/<lane>/`. One brief per
-ticket. The lane worker needs nothing else.
+Briefs are markdown files dropped into `briefs/<lane>/`, one per ticket. The
+lane runner reads the fields and sections shown below to prepare the work and
+open a pull request.
+
+`Repo` must use `owner/name` form, and its owner must be listed in the
+runner's space-separated `LOOM_REPO_OWNERS` setting. `Branch` must start with
+`loom/` and contain only letters, numbers, dots, underscores, hyphens, and
+slashes after the prefix. `Base` is optional; when present, it names the
+branch to start from and the pull request target.
+
+The agent edits files in the checked-out repository and leaves the result on
+the requested branch. The runner commits any remaining changes, pushes that
+branch, and opens the pull request. Lanes never merge pull requests.
 
 ```markdown
 # Brief: TICKET-0001 - <short title>
 
-Goal: <goal slug>
-Repo: <owner/repo>
+Repo: <owner/name>
 Branch: loom/<ticket>-<slug>
-Model: <provider/model, optional - dispatcher picks>
+Base: <target branch, optional>
 
-## Problem
-<what is broken, in plain language>
+## Why
+<why this change is needed>
 
-## Cost
-<how much north-star metric this is burning>
+## What
+<what to change>
 
-## Failing test
-<exact command, e.g. python -B -m pytest tests/test_x.py::test_y>
-<what it proves>
+## Acceptance criteria
+- [ ] <observable result>
 
-## Scope
-<files / areas to touch; what is out of scope>
+## Size
+<XS, S, M, or L>
+
+## Out of scope
+- <work this brief does not include>
 
 ## Definition of done
-- [ ] failing test now passes, full gates green
-- [ ] PR opened, bot comments answered
-- [ ] live verification: <proof log line> + <metric moved>
-
-## Constraints
-<goal rules that apply: e.g. natural progression only, no @grug, ASCII>
+- [ ] Acceptance criteria are met
+- [ ] Changes are left on the requested branch for the runner
 ```
 
-## Ticket template (GitHub issue)
-
-`.github/ISSUE_TEMPLATE/ticket.md` mirrors this format. Tickets are issues;
-briefs are the lane-facing rendering of the assigned ticket.
+The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, and `Out of
+scope` sections when it builds the pull request body. Keep these headings
+exactly as written.
