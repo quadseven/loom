@@ -174,6 +174,7 @@ safe_git() {
 # leaf by name without a trailing slash, so --no-links skips it if it is a link.
 # rsync walks the tree itself and never re-parses names, so a name built with
 # newlines and ".." cannot reach outside the home or the archive either.
+# A failed copy is written to the lane log; it never fails the run.
 archive_transcripts() {
   local dest="$LOGDIR/$TICKET" home_real spec parent leaf
   home_real="$(cd "$AGENT_HOME" 2> /dev/null && pwd -P)" || return 0
@@ -183,9 +184,11 @@ archive_transcripts() {
       cd "$home_real/$parent" 2> /dev/null || exit 0
       [ "$(pwd -P)" = "$home_real/$parent" ] || exit 0
       mkdir -p "$dest/$parent"
-      rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
-        --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
-        --include='opencode.db-shm' --exclude='*' "$leaf" "$dest/$parent/" > /dev/null 2>&1
+      if ! rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
+          --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
+          --include='opencode.db-shm' --exclude='*' "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
+        echo "[$(date -u +%FT%TZ)] $TICKET: archiving $parent/$leaf failed; transcript may be incomplete" >> "$LOG"
+      fi
     )
   done
   return 0
