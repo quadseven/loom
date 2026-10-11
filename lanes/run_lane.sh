@@ -139,7 +139,10 @@ api_agent() {
     export "$key_var=$key"
     [ -z "$extra" ] || export "${extra?}"
     exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
-  )
+  ) 2>&1 | cat
+  # The agent writes into a pipe, not the log file: the log lives under HOME,
+  # where the sandbox denies even fstat, and CLIs fstat their output at start.
+  # pipefail carries the agent's exit status through `cat`.
 }
 
 # opencode runs helper agents (session titles) on its own default small model,
