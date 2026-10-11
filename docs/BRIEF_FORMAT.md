@@ -8,18 +8,25 @@ open a pull request.
 runner's space-separated `LOOM_REPO_OWNERS` setting. `Branch` must start with
 `loom/` and contain only letters, numbers, dots, underscores, hyphens, and
 slashes after the prefix. `Base` is optional; when present, it names the
-branch to start from and the pull request target.
+branch to start from and the pull request target. `Model` is optional; without
+it the runner uses the lane default (`LOOM_CODEX_MODEL` or
+`LOOM_CLAUDE_MODEL`). Every run passes its model to the CLI explicitly, and the
+pull request footer names the lane and the model. A model from the other
+lane's family is refused.
 
 The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that
 branch, and opens the pull request. Lanes never merge pull requests.
 
 ```markdown
-# Brief: TICKET-0001 - <short title>
+# Brief: T0001-<slug>
 
 Repo: <owner/name>
-Branch: loom/<ticket>-<slug>
+Branch: loom/T0001-<slug>
 Base: <target branch, optional>
+Model: <model id, optional>
+
+# T0001: <short title>
 
 ## Why
 <why this change is needed>
@@ -39,7 +46,12 @@ Base: <target branch, optional>
 ## Definition of done
 - [ ] Acceptance criteria are met
 - [ ] Changes are left on the requested branch for the runner
+- [ ] Never merge, never close issues or PRs, never push to another branch
+- [ ] No personal names, hostnames, domains, IPs, or local paths; ASCII only
 ```
+
+The `# T0001: <short title>` heading becomes the pull request title; without
+it the title is the ticket id.
 
 The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, and `Out of
 scope` sections when it builds the pull request body. Keep these headings
