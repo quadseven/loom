@@ -168,15 +168,24 @@ safe_git() {
 
 # Keep the agent's session transcripts (Claude Code .jsonl, opencode session
 # json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
-# find -type f lists regular files only and never follows links, so a link the
-# agent left cannot pull anything from outside its home into the archive.
+# The agent controls everything in that home, so: enter each parent directory
+# and refuse it unless its real path is the expected one (no link on the way;
+# once inside, a later swap of the name cannot move us), then hand rsync the
+# leaf by name without a trailing slash, so --no-links skips it if it is a link.
+# rsync walks the tree itself and never re-parses names, so a name built with
+# newlines and ".." cannot reach outside the home or the archive either.
 archive_transcripts() {
-  local dest="$LOGDIR/$TICKET" rel
-  [ -d "$AGENT_HOME" ] || return 0
-  (cd "$AGENT_HOME" && find . -type f \( -path './.claude/projects/*' -o -path './.local/share/opencode/*' \) \
-     \( -name '*.json' -o -name '*.jsonl' \) -print) |
-  while IFS= read -r rel; do
-    mkdir -p "$dest/$(dirname "$rel")" && cp -P "$AGENT_HOME/$rel" "$dest/$rel" 2> /dev/null
+  local dest="$LOGDIR/$TICKET" home_real spec parent leaf
+  home_real="$(cd "$AGENT_HOME" 2> /dev/null && pwd -P)" || return 0
+  for spec in .claude:projects .local/share:opencode; do
+    parent="${spec%%:*}" leaf="${spec##*:}"
+    (
+      cd "$home_real/$parent" 2> /dev/null || exit 0
+      [ "$(pwd -P)" = "$home_real/$parent" ] || exit 0
+      mkdir -p "$dest/$parent"
+      rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
+        --include='*.jsonl' --exclude='*' "$leaf" "$dest/$parent/" > /dev/null 2>&1
+    )
   done
   return 0
 }
