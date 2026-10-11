@@ -165,6 +165,29 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_brief_base_branch_is_cloned_and_targeted_by_the_pr(self):
+        # The remote's default branch is not where work lands: seed one with
+        # a different tree and name the real base in the brief.
+        work = Path(self._tmp.name) / "work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", "develop", cwd=work)
+        (work / "ONLY_ON_DEVELOP").write_text("x\n")
+        git("add", "ONLY_ON_DEVELOP", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "develop", cwd=work)
+        git("push", "-q", "origin", "develop", cwd=work)
+        self.drop_brief(text=BRIEF.replace("Branch: loom/T042-fix-the-thing",
+                                           "Branch: loom/T042-fix-the-thing\nBase: develop"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = subprocess.run(
+            ["git", "--git-dir", str(self.remote), "ls-tree", "--name-only",
+             "loom/T042-fix-the-thing"], capture_output=True, text=True).stdout.split()
+        self.assertIn("ONLY_ON_DEVELOP", files)
+        create = [c for c in self.calls() if c.startswith("gh pr create")]
+        self.assertEqual(len(create), 1)
+        self.assertIn("--base develop", create[0])
+
     def test_failed_run_is_parked_once_and_the_next_brief_still_runs(self):
         self.drop_brief("T001-broken.md", BRIEF.replace("T042-fix-the-thing", "T001-broken"))
         self.drop_brief("T002-later.md", BRIEF.replace("T042-fix-the-thing", "T002-later"))

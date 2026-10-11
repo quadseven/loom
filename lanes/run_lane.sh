@@ -81,12 +81,22 @@ for BRIEF in "$INBOX"/*.md; do
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
   BRANCH="$(field Branch "$BRIEF")"
+  # Optional: the branch work starts from and the PR targets. Default is the
+  # remote's default branch, which is not always where work lands.
+  BASE_BRANCH="$(field Base "$BRIEF" || true)"
   LOG="$LOGDIR/$TICKET.log"
 
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
   fi
+  if [ -n "$BASE_BRANCH" ] && ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
+    park "$BRIEF" "brief Base: is not a branch name"; continue
+  fi
+  BASE_ARGS=()
+  [ -n "$BASE_BRANCH" ] && BASE_ARGS=(--branch "$BASE_BRANCH")
+  PR_BASE_ARGS=()
+  [ -n "$BASE_BRANCH" ] && PR_BASE_ARGS=(--base "$BASE_BRANCH")
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
@@ -105,7 +115,7 @@ for BRIEF in "$INBOX"/*.md; do
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $LANE" >> "$LOG"
-  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 "${CLONE_BASE}${REPO}.git" "$TREE" &&
+  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${BASE_ARGS[@]+"${BASE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          git -C "$TREE" checkout -q -b "$BRANCH"; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed"; continue
   fi
@@ -128,7 +138,7 @@ for BRIEF in "$INBOX"/*.md; do
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
     park "$BRIEF" "push failed"; continue
   fi
-  if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" --head "$BRANCH" --title "${TITLE:-$TICKET}" \
+  if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$(pr_body "$BRIEF" "$TICKET")" >> "$LOG" 2>&1; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed"; continue
   fi
