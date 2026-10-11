@@ -94,6 +94,10 @@ printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secr
 if printf '#!/bin/sh\\ntouch "%s/hooked"\\n' "$real_home" > .git/hooks/pre-commit 2>/dev/null \\
    && chmod +x .git/hooks/pre-commit 2>/dev/null; then hook=planted; else hook=denied; fi
 printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
+# Real CLIs fstat their stdout and stderr (Bun does on start).
+if /usr/bin/perl -e 'exit((stat(STDOUT) && stat(STDERR)) ? 0 : 1)'; then
+  fds=ok; else fds=denied; fi
+printf 'fds=%s\\n' "$fds" >> "$TMPDIR/agent.log"
 echo fixed > fix.txt
 """
 
@@ -296,6 +300,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("osa=denied", agent[0])
         # A hook planted in the tree's .git would run when the runner commits.
         self.assertIn("hook=denied", self.calls())
+        self.assertIn("fds=ok", self.calls())
         self.assertFalse((self.home / "hooked").exists())
         # opencode's helper (title) agent must not fall back to a paid model.
         self.assertIn("small=openrouter/vendor/model:free", agent[0])
