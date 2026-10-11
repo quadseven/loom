@@ -27,16 +27,17 @@ Template: `.github/ISSUE_TEMPLATE/ticket.md`.
 Each lane polls its inbox in `briefs/<lane>/`, does the work in a fresh
 worktree, and opens a PR. Lanes never merge.
 
-- `claude/` - deep root-cause work, hard refactors. Official Claude Code
- with the owner's subscription login. Brief in, PR out.
-- `codex/` - scoped implementation, CI repairs, review passes.
- `codex exec --sandbox workspace-write` on a logged-in box. Models: Astra / Sol / Luna
- chosen per ticket difficulty.
-- `opencode/` - volume lane. Headless opencode runs against API providers
- (OpenRouter free tier, Poolside, NVIDIA NIM). Many parallel workers, small
- well-scoped tickets.
-- `sparks/` - compute, not a model lane. Test farm (full gates) and local
- model inference. Never touches live realms.
+`lanes/run_lane.sh` runs the five active lanes:
+
+- `codex/` - scoped implementation, CI repairs, and review passes.
+- `claude/` - deep root-cause work and hard refactors.
+- `openrouter/` - free models via opencode.
+- `opencode-go/` - subscription models via opencode.
+- `anthropic/` - API-credit models via the official Claude Code CLI.
+
+API-lane agents run sandboxed without credentials; the runner pushes the
+branch and opens the PR. The `sparks/` lane is deferred until the Sparks
+overhaul.
 
 Lane contracts: `docs/LANES.md`.
 
