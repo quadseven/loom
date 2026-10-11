@@ -43,10 +43,16 @@ S: one function.
 
 # Fake gh: $FAKE_GH_EXISTING is the number of a MERGED PR on the branch.
 # Like real gh, `pr list` shows it only when asked for all states.
-# `pr create` prints a URL. Every call is appended to $FAKE_LOG.
+# `pr create` prints a URL. `api repos/O/N --jq .private` prints
+# $FAKE_GH_PRIVATE (default false). Every call is appended to $FAKE_LOG.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ -n "${FAKE_GH_HANG:-}" ]; then exec sleep 30; fi
+if [ "$1" = api ]; then
+  [ -z "${FAKE_GH_API_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
+  [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
+  exit 0
+fi
 if [ "$1 $2" = "pr list" ]; then
   case " $* " in *" --state all "*) printf '%s' "${FAKE_GH_EXISTING:-}" ;; esac
 fi
@@ -78,7 +84,7 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 FAKE_OPENCODE = """#!/usr/bin/env bash
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
-for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY; do
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY; do
   if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
 done
 real_home="$(cd ../../.. && pwd)"
@@ -386,6 +392,109 @@ class LaneRunnerTest(unittest.TestCase):
         )
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_zen_lane_runs_a_free_model_sandboxed_without_a_key(self):
+        # OpenCode Zen serves its free models with no stored credential.
+        inbox, result = self.api_lane("zen", LOOM_ZEN_MODEL="opencode/space-bunny-free")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("-m opencode/space-bunny-free", agent[0])
+        self.assertIn("keyvar=none", agent[0])
+        self.assertIn("secret=denied", agent[0])
+        self.assertIn("small=opencode/space-bunny-free", agent[0])
+        self.assertNotIn(f"home={self.home} ", agent[0])
+        self.assertIn("lane zen, model opencode/space-bunny-free", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_zen_lane_refuses_a_paid_model(self):
+        inbox, _ = self.api_lane("zen", LOOM_ZEN_MODEL="opencode/claude-opus-5-5")
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_zen_lane_refuses_a_private_repo_before_cloning(self):
+        # Zen's free providers may train on prompts: public repos only.
+        inbox, result = self.api_lane(
+            "zen", LOOM_ZEN_MODEL="opencode/space-bunny-free", FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh api repos/example/repo --jq .private", self.calls())
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertFalse((self.loom / "worktrees" / "T042-fix-the-thing").exists())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "zen" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("private", log)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_failed_privacy_lookup_leaves_the_brief_for_the_next_pass(self):
+        inbox, result = self.api_lane(
+            "zen", LOOM_ZEN_MODEL="opencode/space-bunny-free", FAKE_GH_API_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_opencode_go_muse_spark_contributor_refuses_a_private_repo(self):
+        # Muse Spark Contributor trains Meta's models; the rest of Go keeps 0-30 days.
+        inbox, _ = self.api_lane(
+            "opencode-go", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/muse-spark-1.3-contributor", FAKE_GH_PRIVATE="true")
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_opencode_go_other_models_still_take_a_private_repo(self):
+        inbox, result = self.api_lane(
+            "opencode-go", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/kimi-k2.7-code", FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_zai_lane_hands_its_key_to_a_free_flash_model(self):
+        inbox, result = self.api_lane(
+            "zai", LOOM_ZAI_KEY_SSM="/k/zai", FAKE_SECRET__k_zai="fake-zai-key",
+            LOOM_ZAI_MODEL="zai/glm-4.7-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("-m zai/glm-4.7-flash", agent[0])
+        self.assertIn("keyvar=ZHIPU_API_KEY key=fake-zai-key", agent[0])
+        self.assertIn("argv=clean", agent[0])
+        self.assertIn("secret=denied", agent[0])
+        self.assertIn("small=zai/glm-4.7-flash", agent[0])
+        self.assertIn("lane zai, model zai/glm-4.7-flash", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_zai_lane_refuses_a_paid_model(self):
+        # Z.ai's GLM-5.3 Flash is billed per token; only 4.7 and 4.5 Flash are free.
+        inbox, _ = self.api_lane(
+            "zai", LOOM_ZAI_KEY_SSM="/k/zai", FAKE_SECRET__k_zai="fake-zai-key",
+            LOOM_ZAI_MODEL="zai/glm-5.3-flash")
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_zai_lane_refuses_a_private_repo(self):
+        inbox, _ = self.api_lane(
+            "zai", LOOM_ZAI_KEY_SSM="/k/zai", FAKE_SECRET__k_zai="fake-zai-key",
+            LOOM_ZAI_MODEL="zai/glm-4.7-flash", FAKE_GH_PRIVATE="true")
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_zai_lane_without_a_key_reports_unavailable(self):
+        inbox, result = self.api_lane("zai", LOOM_ZAI_MODEL="zai/glm-4.7-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "zai.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("LOOM_ZAI_KEY_SSM", beat["reason"])
 
     def test_lane_without_its_credential_reports_unavailable_and_keeps_its_briefs(self):
         inbox, result = self.api_lane(

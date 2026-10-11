@@ -11,8 +11,8 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   default is the remote's default branch.
 - Every run passes an explicit model: the brief's `Model:` line, else the
   lane default (`LOOM_<LANE>_MODEL`). The PR footer names the lane and the
-  model. A model outside the lane's family is refused; the `openrouter` lane
-  runs `:free` models only.
+  model. A model outside the lane's family is refused; the `openrouter`,
+  `zen` and `zai` lanes run free models only.
 - Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
@@ -28,7 +28,7 @@ answers only localhost Host headers; transcripts never leave the machine.
 API-lane agents run on the same machine, so their sandbox denies every
 loopback connection; they cannot query the viewer or any other local service.
 
-## API lanes: openrouter, opencode-go, anthropic
+## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
 
 - `openrouter` (free models via opencode), `opencode-go` (subscription models
   via opencode) and `anthropic` (API credits via the official Claude Code CLI).
@@ -55,6 +55,34 @@ loopback connection; they cannot query the viewer or any other local service.
   wipes the scratch home. Links are never followed.
 - No background processes: launchd starts a pass every minute and a lock
   keeps one pass per lane.
+
+## Public repos only: providers that train on prompts
+
+Some free providers may train on what they are sent. Their briefs must name a
+public repo. Before cloning, the runner asks `gh api repos/<owner>/<name>
+--jq .private`; a private repo parks the brief with the reason, and a failed
+lookup leaves the brief for the next pass. The rule covers:
+
+- the `zen` lane (several OpenCode Zen free models may train on prompts;
+  Nemotron free models are NVIDIA trial endpoints),
+- the `zai` lane (Z.ai free Flash models),
+- `opencode-go` runs of a Muse Spark Contributor model (it trains Meta's
+  models); other Go models keep 0 to 30 days and take any repo.
+
+## API lanes: zen, zai
+
+- `zen`: OpenCode Zen free models through opencode, `-m opencode/<id>-free`
+  (default `opencode/space-bunny-free`). Zen serves its free models with no
+  stored credential, so the lane reads no key; the agent's environment holds
+  no provider key at all. opencode sends Zen's `x-opencode-session` header
+  itself.
+- `zai`: Z.ai's free Flash models through opencode's `zai` provider,
+  `zai/glm-4.7-flash` (default) or `zai/glm-4.5-flash`. GLM-5.3 Flash and
+  the FlashX models are paid and refused. The key comes from SSM
+  (`LOOM_ZAI_KEY_SSM`) and reaches the agent as `ZHIPU_API_KEY`, the variable
+  opencode reads.
+- Both run sandboxed exactly like the other API lanes and pin opencode's
+  helper model to the lane's model.
 
 ## claude/ - deep thought
 

@@ -2,6 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
+#                               | zen | zai
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -15,7 +16,7 @@
 # LOOM_<LANE>_MODEL (the lane's model when a brief has no Model: line, e.g.
 # LOOM_OPENCODE_GO_MODEL; every run passes its model explicitly and names it
 # in the PR), LOOM_<LANE>_KEY_SSM (API lanes: the SSM parameter holding the
-# provider key, read at run time; never stored in this repo),
+# provider key, read at run time; never stored in this repo; zen needs none),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CLONE_BASE (default git@github.com:).
@@ -125,7 +126,8 @@ sandbox_profile() {
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
-# scratch HOME and TMPDIR, PATH) inside the sandbox above. The key is
+# scratch HOME and TMPDIR, PATH) inside the sandbox above. A key_var of "-"
+# means the provider needs no key (OpenCode Zen's free models). The key is
 # exported, never put in argv, so `ps` cannot show it. The agent can edit its
 # tree but cannot read credentials, push, open, or merge; the runner does that.
 api_agent() {
@@ -137,7 +139,7 @@ api_agent() {
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
     export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
-    export "$key_var=$key"
+    [ "$key_var" = - ] || export "$key_var=$key"
     [ -z "$extra" ] || export "${extra?}"
     exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
   ) 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
@@ -203,16 +205,31 @@ fresh_agent_home() {
   mkdir -p "$AGENT_HOME/tmp"
 }
 
+# Lanes and models whose provider may train on prompts (docs/LANES.md lists
+# them). Their briefs must name a public repo.
+trains_on_prompts() {
+  case "$LANE:$MODEL" in zen:*|zai:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  return 1
+}
+
+# Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
+is_api_lane() {
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai) return 0 ;; esac
+  return 1
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
   AGENT_EXTRA_ENV=""
-  case "$LANE" in openrouter|opencode-go|anthropic) fresh_agent_home ;; esac
+  is_api_lane && fresh_agent_home
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
     openrouter) opencode_config && api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     opencode-go) opencode_config && api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    zen) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
+    zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
@@ -222,12 +239,13 @@ run_agent() {
 lane_ready() {
   local cli key_ssm
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go) cli=opencode ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai) cli=opencode ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
+  case "$LANE" in zen) return 0 ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
@@ -296,9 +314,25 @@ for BRIEF in "$INBOX"/*.md; do
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
     opencode-go:opencode-go/*) ;;
     opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model"; continue ;;
+    zen:opencode/*-free) ;;
+    zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
+    zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
+    zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
   esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
+  fi
+  # Providers that train on prompts take public repos only. Asked before the
+  # clone; a failed lookup proves nothing, so the brief waits for the next pass.
+  if trains_on_prompts; then
+    if ! PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
+      echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
+    fi
+    case "$PRIVATE" in
+      false) ;;
+      true) park "$BRIEF" "$REPO is private; lane $LANE with $MODEL trains on prompts and takes public repos only"; continue ;;
+      *) echo "$TICKET: unexpected privacy answer '$PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+    esac
   fi
 
   # gh unreachable or hung says nothing about the branch: leave the brief
@@ -323,7 +357,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1
   STATUS=$?
-  case "$LANE" in openrouter|opencode-go|anthropic) archive_transcripts ;; esac
+  is_api_lane && archive_transcripts
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
