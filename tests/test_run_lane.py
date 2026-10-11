@@ -2,6 +2,7 @@
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import json
+import shutil
 import subprocess
 import tempfile
 import time
@@ -68,15 +69,21 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 """
 
 
-# Fake opencode: records argv plus what the agent can see of the
-# environment (key present, HOME, SSH agent, GitHub token), then edits a file.
-# The runner empties the agent's environment, so FAKE_LOG does not reach it;
-# it records to TMPDIR, one of the few variables passed through.
+# Fake opencode: records argv plus what the agent can see (key, HOME, SSH
+# agent, GitHub token, a secret planted in the real HOME, and whether the key
+# shows in any process's argv), then edits a file. The runner empties the
+# agent's environment, so FAKE_LOG does not reach it; it records to TMPDIR,
+# which the runner points at the agent's scratch home.
 FAKE_OPENCODE = """#!/usr/bin/env bash
 args="$*"; args="${args//$'\\n'/ }"
-printf 'opencode %s | key=%s home=%s ssh=%s ghtoken=%s fakelog=%s\\n' "$args" \\
-  "${OPENROUTER_API_KEY:-${OPENCODE_API_KEY:-${ANTHROPIC_API_KEY:-none}}}" "$HOME" \\
-  "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" >> "$TMPDIR/agent.log"
+key="${OPENROUTER_API_KEY:-${OPENCODE_API_KEY:-${ANTHROPIC_API_KEY:-none}}}"
+real_home="$(cd ../../.. && pwd)"
+if cat "$real_home/.ssh/id_planted" > /dev/null 2>&1; then secret=readable; else secret=denied; fi
+procs="$(ps -axo args= 2>/dev/null)"
+case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
+printf 'opencode %s | key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s\\n' "$args" \\
+  "$key" "$HOME" "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" \\
+  "$secret" "$argv" >> "$TMPDIR/agent.log"
 echo fixed > fix.txt
 """
 
@@ -146,7 +153,6 @@ class LaneRunnerTest(unittest.TestCase):
             "LOOM_CLONE_BASE": self.clone_base,
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
-            "TMPDIR": self._tmp.name,
             "LOOM_REPO_OWNERS": "example",
             "LOOM_CODEX_MODEL": "gpt-test-default",
             "LOOM_CLAUDE_MODEL": "claude-test-default",
@@ -158,8 +164,9 @@ class LaneRunnerTest(unittest.TestCase):
                               capture_output=True, text=True, timeout=60)
 
     def calls(self):
-        agent = Path(self._tmp.name) / "agent.log"
-        extra = agent.read_text().splitlines() if agent.exists() else []
+        extra = []
+        for agent in sorted((self.loom / "run").glob("*-home/tmp/agent.log")):
+            extra += agent.read_text().splitlines()
         return self.log.read_text().splitlines() + extra
 
     def test_brief_with_an_existing_pr_is_retired_without_running(self):
@@ -243,12 +250,16 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def api_lane(self, lane, **env):
+        planted = self.home / ".ssh" / "id_planted"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("private key\n")
         inbox = self.loom / "briefs" / lane
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", f"Lane: {lane}"))
         result = self.run_lane(lane, SSH_AUTH_SOCK="/tmp/agent.sock", GH_TOKEN="gh-secret", **env)
         return inbox, result
 
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_api_lane_agent_sees_only_its_key_and_a_scratch_home(self):
         inbox, result = self.api_lane(
             "openrouter",
@@ -264,10 +275,13 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("ssh=none", agent[0])
         self.assertIn("ghtoken=none", agent[0])
         self.assertIn("fakelog=none", agent[0])
+        self.assertIn("secret=denied", agent[0])
+        self.assertIn("argv=clean", agent[0])
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_openrouter_lane_refuses_a_paid_model(self):
         inbox, _ = self.api_lane(
             "openrouter",

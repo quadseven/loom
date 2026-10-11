@@ -82,14 +82,49 @@ park() {
   mv "$1" "$INBOX/failed/"
 }
 
-# API lanes run the agent with an emptied environment: its provider key, a
-# scratch HOME and a PATH. No git or gh config, no SSH agent, no tokens, so it
-# can edit files but cannot push, open, or merge anything.
+# Seatbelt profile for API-lane agents: no reads or writes anywhere under the
+# real HOME except the worktree, the scratch home and the directory holding
+# the CLI's binary, and no keychain. Paths are canonical, because the sandbox matches
+# resolved paths; proper ancestors get metadata-only literals so getcwd and
+# realpath still work without making HOME listable.
+sandbox_profile() {
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
+  home="$(cd "$HOME" && pwd -P)"
+  tree="$(cd "$1" && pwd -P)"
+  cli_link="$(command -v "$2")"
+  cli_real="$(realpath "$cli_link")"
+  cli_root="$(dirname "$cli_real")"
+  # Never let the CLI's directory cover HOME itself.
+  case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
+  allow_rw="(subpath \"$tree\") (subpath \"$(cd "$AGENT_HOME" && pwd -P)\")"
+  allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")"
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link"; do
+    p="$(dirname "$p")"
+    while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
+      meta="$meta (literal \"$p\")"
+      [ "$p" = "$home" ] && break
+      p="$(dirname "$p")"
+    done
+  done
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer"))\n' \
+    "$home" "$allow_rw" "$allow_ro" "$meta"
+}
+
+# API lanes run the agent with an emptied environment (its provider key, a
+# scratch HOME and TMPDIR, PATH) inside the sandbox above. The key is
+# exported, never put in argv, so `ps` cannot show it. The agent can edit its
+# tree but cannot read credentials, push, open, or merge; the runner does that.
 api_agent() {
-  local key_var="$1"; shift
-  mkdir -p "$AGENT_HOME"
-  timeout "$AGENT_TIMEOUT" env -i PATH="$PATH" HOME="$AGENT_HOME" TERM=dumb \
-    LANG="${LANG:-en_US.UTF-8}" TMPDIR="${TMPDIR:-/tmp}" "$key_var=$API_KEY" "$@" < /dev/null
+  local key_var="$1" cli="$2" profile
+  mkdir -p "$AGENT_HOME/tmp"
+  profile="$(sandbox_profile "$PWD" "$cli")" || return 3
+  (
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY"
+    for v in $(compgen -e); do unset "$v" 2> /dev/null; done
+    export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
+    export "$key_var=$key"
+    exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
+  )
 }
 
 run_agent() {
@@ -114,6 +149,7 @@ lane_ready() {
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   case "$LANE" in codex|claude) return 0 ;; esac
+  command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \

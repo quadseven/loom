@@ -22,10 +22,14 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 - `openrouter` (free models via opencode), `opencode-go` (subscription models
   via opencode) and `anthropic` (API credits via the official Claude Code CLI).
 - The provider key is read from SSM at run time (`LOOM_<LANE>_KEY_SSM`, set at
-  install, never in this repo) and handed to the agent in an otherwise empty
-  environment with a scratch HOME. The agent has no git or gh config, SSH
-  agent or token, so it can edit files but cannot push, open, or merge. The
-  runner does that with the machine's own credentials.
+  install, never in this repo) and exported to the agent, never passed in
+  argv, in an otherwise empty environment with a scratch HOME and TMPDIR.
+- The agent runs under a macOS Seatbelt profile (`sandbox-exec`): no reads or
+  writes anywhere under the real HOME except its worktree, its scratch home
+  and the directory holding its CLI, and no keychain access. It can edit its
+  tree but cannot read credentials, push, open, or merge; the runner does
+  that with the machine's own credentials. Without `sandbox-exec` an API lane
+  reports itself unavailable.
 - A brief whose branch already has a PR in any state moves to `done/`
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
