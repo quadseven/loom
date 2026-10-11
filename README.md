@@ -32,7 +32,13 @@ Loom serves all active goals.
 1. Read `docs/ARCHITECTURE.md`.
 2. Put API keys (OpenRouter, Poolside) in the secure vault; never in files.
 3. Install the lanes where each subscription login lives
-   (`lanes/mac/install.sh` on the login Mac).
+   (`lanes/mac/install.sh` on the login Mac). The openrouter, opencode-go and
+   anthropic lanes read their provider key from SSM at run time, so name each
+   parameter in the environment when you run the installer:
+   `LOOM_OPENROUTER_KEY_SSM`, `LOOM_OPENCODE_GO_KEY_SSM` and
+   `LOOM_ANTHROPIC_KEY_SSM` (plus optional `LOOM_AWS_REGION`). Those names are
+   written only into the local launchd plists, never into this repo. A lane
+   whose key is missing reports itself unavailable and gets no work.
 4. Run `dispatch/dispatch.py` on a schedule (every 30 min).
 5. Run the tests, the same command CI runs:
    `python -B -m unittest discover -s tests -v`.
