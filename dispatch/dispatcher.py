@@ -44,11 +44,16 @@ STATE = LOOM / "state"
 # Lane tiers: which difficulties each lane can handle
 # Priority: API credits first (burn $200 before Oct 21), then subscriptions,
 # then free/compute lanes.
+#
+# Frontier models (hard tickets): anthropic API, claude-opus, codex-astra
+# Strong models (medium): claude-sonnet, codex-sol
+# Fast/free (easy): opencode, sparks-qwen
 LANE_TIERS = {
     "anthropic": {"hard", "medium", "easy"},  # $200 credits, FIRST priority
     "claude-opus": {"hard", "medium"},         # subscription, frontier
+    "codex-astra": {"hard", "medium"},         # subscription, frontier planning
     "claude": {"medium", "easy"},              # subscription, sonnet
-    "codex": {"medium", "easy"},               # subscription
+    "codex": {"medium", "easy"},               # subscription, sol (default)
     "sparks-qwen": {"hard", "medium", "easy"}, # DGX Qwen Coder, code + tests
     "opencode": {"easy"},                      # OpenRouter free tier
     "sparks": set(),  # legacy compute-only entry, use sparks-qwen for code
@@ -56,8 +61,9 @@ LANE_TIERS = {
 
 # Preferred lane per difficulty (first available wins).
 # Anthropic API credits are always first until exhausted (Oct 21 expiry).
+# Frontier: Opus and Astra can both do big planning, not just Claude.
 DIFFICULTY_LANE = {
-    "hard": ["anthropic", "claude-opus", "sparks-qwen"],
+    "hard": ["anthropic", "claude-opus", "codex-astra", "sparks-qwen"],
     "medium": ["anthropic", "claude", "codex", "sparks-qwen"],
     "easy": ["anthropic", "opencode", "sparks-qwen", "claude", "codex"],
 }
