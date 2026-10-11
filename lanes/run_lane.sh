@@ -86,7 +86,8 @@ park() {
 }
 
 # Seatbelt profile for API-lane agents: no reads or writes anywhere under the
-# real HOME except the worktree, the scratch home and the directory holding
+# real HOME except the worktree (never its .git: a planted hook or config would
+# run when the runner commits), the scratch home and the directory holding
 # the CLI's binary; no keychain; no Unix sockets except DNS (an SSH agent's
 # socket would hand over its keys); no AppleEvents, LaunchServices,
 # osascript, open or launchctl (each can run a command outside the sandbox). Paths are canonical, because the sandbox matches
@@ -116,8 +117,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n' \
-    "$home" "$allow_rw" "$allow_ro" "$meta"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n' \
+    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -147,9 +148,25 @@ opencode_config() {
     > "$AGENT_HOME/.config/opencode/opencode.json"
 }
 
+# A fresh scratch home for every API-lane run. The agent can write inside it,
+# so anything left there (a link into the real HOME, say) must never meet the
+# runner, which is not sandboxed. rm -rf removes links without following them.
+# git in an agent's tree, run by the runner: never run hooks or an fsmonitor
+# the tree might name, whatever ended up in its config. (`timeout` cannot run
+# a shell function, so the push spells the same options out.)
+safe_git() {
+  git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+fresh_agent_home() {
+  rm -rf "$AGENT_HOME"
+  mkdir -p "$AGENT_HOME/tmp"
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
+  case "$LANE" in openrouter|opencode-go|anthropic) fresh_agent_home ;; esac
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
@@ -268,16 +285,16 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
-  if [ -n "$(git -C "$TREE" status --porcelain)" ]; then
-    if ! { git -C "$TREE" checkout -q "$BRANCH" && git -C "$TREE" add -A &&
-           git -C "$TREE" commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
+  if [ -n "$(safe_git status --porcelain)" ]; then
+    if ! { safe_git checkout -q "$BRANCH" && safe_git add -A &&
+           safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
   fi
-  if [ "$(git -C "$TREE" rev-parse "$BRANCH")" = "$BASE" ]; then
+  if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
     park "$BRIEF" "agent made no commit on $BRANCH"; continue
   fi
-  if ! timeout "$NET_TIMEOUT" git -C "$TREE" push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
     park "$BRIEF" "push failed"; continue
   fi
   if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
