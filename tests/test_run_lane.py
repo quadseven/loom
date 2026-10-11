@@ -3,6 +3,7 @@ the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import json
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -79,11 +80,13 @@ args="$*"; args="${args//$'\\n'/ }"
 key="${OPENROUTER_API_KEY:-${OPENCODE_API_KEY:-${ANTHROPIC_API_KEY:-none}}}"
 real_home="$(cd ../../.. && pwd)"
 if cat "$real_home/.ssh/id_planted" > /dev/null 2>&1; then secret=readable; else secret=denied; fi
+if /usr/bin/nc -w 1 -U "$real_home/agent.sock" < /dev/null > /dev/null 2>&1; then sock=reachable; else sock=denied; fi
+if /usr/bin/osascript -e 'return 1' > /dev/null 2>&1; then osa=ran; else osa=denied; fi
 procs="$(ps -axo args= 2>/dev/null)"
 case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
-printf 'opencode %s | key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s\\n' "$args" \\
+printf 'opencode %s | key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s\\n' "$args" \\
   "$key" "$HOME" "${SSH_AUTH_SOCK:-none}" "${GH_TOKEN:-none}" "${FAKE_LOG:-none}" \\
-  "$secret" "$argv" >> "$TMPDIR/agent.log"
+  "$secret" "$argv" "$sock" "$osa" >> "$TMPDIR/agent.log"
 echo fixed > fix.txt
 """
 
@@ -253,6 +256,11 @@ class LaneRunnerTest(unittest.TestCase):
         planted = self.home / ".ssh" / "id_planted"
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_text("private key\n")
+        # A listening Unix socket in the real HOME stands in for an SSH agent.
+        agent_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        agent_sock.bind(str(self.home / "agent.sock"))
+        agent_sock.listen(1)
+        self.addCleanup(agent_sock.close)
         inbox = self.loom / "briefs" / lane
         inbox.mkdir(parents=True, exist_ok=True)
         (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", f"Lane: {lane}"))
@@ -277,6 +285,8 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("fakelog=none", agent[0])
         self.assertIn("secret=denied", agent[0])
         self.assertIn("argv=clean", agent[0])
+        self.assertIn("sock=denied", agent[0])
+        self.assertIn("osa=denied", agent[0])
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())

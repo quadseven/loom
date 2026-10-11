@@ -84,7 +84,9 @@ park() {
 
 # Seatbelt profile for API-lane agents: no reads or writes anywhere under the
 # real HOME except the worktree, the scratch home and the directory holding
-# the CLI's binary, and no keychain. Paths are canonical, because the sandbox matches
+# the CLI's binary; no keychain; no Unix sockets except DNS (an SSH agent's
+# socket would hand over its keys); no AppleEvents, LaunchServices,
+# osascript, open or launchctl (each can run a command outside the sandbox). Paths are canonical, because the sandbox matches
 # resolved paths; proper ancestors get metadata-only literals so getcwd and
 # realpath still work without making HOME listable.
 sandbox_profile() {
@@ -106,7 +108,7 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer"))\n' \
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n' \
     "$home" "$allow_rw" "$allow_ro" "$meta"
 }
 
