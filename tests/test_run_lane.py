@@ -197,6 +197,13 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    def test_an_empty_owner_list_refuses_every_brief(self):
+        self.drop_brief()
+        result = self.run_lane(LOOM_REPO_OWNERS="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
     def test_a_hung_gh_call_leaves_the_brief_for_the_next_pass(self):
         self.drop_brief()
         result = self.run_lane(FAKE_GH_HANG="1", LOOM_NET_TIMEOUT="1")
