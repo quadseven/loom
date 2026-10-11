@@ -106,7 +106,7 @@ for BRIEF in "$INBOX"/*.md; do
     case "$LANE" in codex) MODEL="${LOOM_CODEX_MODEL:-}" ;; claude) MODEL="${LOOM_CLAUDE_MODEL:-}" ;; esac
   fi
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/-]*$ ]]; then
-    park "$BRIEF" "no usable model: set Model: in the brief or the lane default"; continue
+    park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or LOOM_$(echo "$LANE" | tr '[:lower:]' '[:upper:]')_MODEL"; continue
   fi
   case "$LANE:$MODEL" in
     codex:claude*|codex:opus*|codex:sonnet*|codex:haiku*|codex:fable*)
