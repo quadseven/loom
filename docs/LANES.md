@@ -7,6 +7,8 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 
 `lanes/run_lane.sh <lane>` makes one pass over `briefs/<lane>/`:
 
+- An optional `Base:` line names the branch to start from and target; the
+  default is the remote's default branch.
 - A brief whose branch already has a PR in any state moves to `done/`
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
