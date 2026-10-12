@@ -813,6 +813,15 @@ class ReportsTest(Base):
         with open(os.path.join(self.home, "state", "station", "reports.json")) as fh:
             self.assertEqual(json.load(fh)[REPO.replace("/", ".")], 100)
 
+    def test_closed_goal_home_is_not_read_or_forwarded(self):
+        self.add_goal()
+        self.fake.issues[40]["state"] = "closed"
+        self.comment(40, 100, station.REPORT_MARKER + "\nclosed history")
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertFalse(any("/issues/40/comments" in path
+                             for _, path in self.fake.calls))
+
     def test_failed_send_is_retried(self):
         self.prime()
         self.comment(40, 100, station.REPORT_MARKER + "\nreport")

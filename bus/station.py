@@ -800,6 +800,48 @@ class Station:
             body = body[:max(0, room)].rsplit("\n", 1)[0]
         return (prefix + body + suffix)[:DISCORD_MAX]
 
+    def _report_comments(self, repo: str, issues: List[Dict[str, Any]], since: str
+                         ) -> List[Tuple[int, Dict[str, Any], Dict[str, Any]]]:
+        comments = []
+        for issue in issues:
+            path = "/repos/%s/issues/%d/comments?since=%s" % (
+                repo, int(issue["number"]), since)
+            for comment in self.gh.paginate(path):
+                if (isinstance(comment, dict)
+                        and str(comment.get("body") or "").startswith(REPORT_MARKER)):
+                    comments.append((self._report_id(comment), issue, comment))
+        comments.sort(key=lambda row: row[0])
+        return comments
+
+    def _forward_repo_reports(self, repo: str, comments: List[Tuple[int, Dict[str, Any], Dict[str, Any]]],
+                              ledger: Dict[str, Any], path: str, allowed: set) -> bool:
+        key = repo.replace("/", ".")
+        if key not in ledger:
+            ledger[key] = max((ident for ident, _, _ in comments), default=0)
+            return True
+        try:
+            last_id = int(ledger[key])
+        except (TypeError, ValueError):
+            last_id = 0
+        url = None
+        webhook_checked = False
+        for ident, issue, comment in comments:
+            if ident <= last_id:
+                continue
+            author = str((comment.get("user") or {}).get("login") or "").lower()
+            if author in allowed:
+                if not webhook_checked:
+                    url = self._webhook()
+                    webhook_checked = True
+                if url is None:
+                    continue
+                if not self._send(url, self._report_text(issue, comment), mention=False):
+                    _write_json(path, ledger)
+                    return False
+            ledger[key] = ident
+            last_id = ident
+        return True
+
     def forward_reports(self) -> None:
         if not self.s.webhook_ssm:
             return
@@ -820,46 +862,9 @@ class Station:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
             issues = self._goal_issues(repo)
-            comments: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
-            for issue in issues:
-                for comment in self.gh.paginate(
-                        "/repos/%s/issues/%d/comments?since=%s"
-                        % (repo, int(issue["number"]), since)):
-                    if isinstance(comment, dict) and str(comment.get("body") or "").startswith(REPORT_MARKER):
-                        comments.append((self._report_id(comment), issue, comment))
-            comments.sort(key=lambda row: row[0])
-            key = repo.replace("/", ".")
-            last = ledger.get(key)
-            if last is None:
-                newest = max((ident for ident, _, _ in comments), default=0)
-                ledger[key] = newest
-                _write_json(path, ledger)
-                continue
-            try:
-                last_id = int(last)
-            except (TypeError, ValueError):
-                last_id = 0
-            pending = [(ident, issue, comment) for ident, issue, comment in comments
-                       if ident > last_id]
-            if not pending:
-                continue
-            url = self._webhook()
-            if url is None:
-                continue
-            for ident, issue, comment in pending:
-                author = str((comment.get("user") or {}).get("login") or "").lower()
-                if author not in allowed:
-                    # Advance past untrusted comments; they must never be replayed.
-                    ledger[key] = ident
-                    _write_json(path, ledger)
-                    last_id = ident
-                    continue
-                if not self._send(url, self._report_text(issue, comment), mention=False):
-                    # Read again next pass, not after REPORT_CHECK.
-                    return
-                ledger[key] = ident
-                _write_json(path, ledger)
-                last_id = ident
+            comments = self._report_comments(repo, issues, since)
+            if not self._forward_repo_reports(repo, comments, ledger, path, allowed):
+                return
         ledger["_checked"] = self.now
         _write_json(path, ledger)
 
