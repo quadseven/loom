@@ -154,6 +154,21 @@ class BrainTests(unittest.TestCase):
         self.assertIn("/git/refs/heads/loom/8-work", fake.calls[3][1])
         self.assertEqual(fake.calls[4][0], "GET")
 
+    def test_a_branch_already_deleted_still_counts_as_merged(self):
+        pr, query = self._merge_replies()
+        fake = Fake(pr, query, reply(200, {"merged": True}), reply(422, {"message": "Reference does not exist"}),
+                    reply(200, {"state": "open", "labels": [{"name": "loom:pr"}]}), reply(200, {}))
+        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        self.assertEqual(fake.calls[-1][0], "PUT")
+        self.assertIn("loom:shipped", fake.calls[-1][2]["labels"])
+
+    def test_merge_refuses_when_the_head_repo_is_unknown(self):
+        fake = Fake(*self._merge_replies({"pr": {"head": {"ref": "loom/8-work", "sha": "checked"}},
+                                          "details": {"headRepository": None}}))
+        with self.assertRaises(ValueError):
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_merge_does_not_delete_when_github_does_not_confirm(self):
         pr, query = self._merge_replies()
         fake = Fake(pr, query, reply(200, {"merged": False}))
