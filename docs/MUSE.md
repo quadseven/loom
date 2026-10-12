@@ -123,11 +123,22 @@ tickets and pull requests like any other work.
    Every 2 hours per goal (when the goal's newest report is 2 hours old or
    there is none), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
-   `<!-- loom:report v1 -->` followed by the report itself. Use the format
-   the goal home asks for (for example its five report lines); without one,
-   five lines: metric changes, what moved, the top blocker, shipped and
-   verified, next. The station sends every report to the operator's phone,
-   so it must stand on its own: numbers, not references.
+   `<!-- loom:report v1 -->` followed by the report itself, written as a
+   standup the operator can read in thirty seconds on a phone:
+   - First line: one sentence on how the goal is doing since the last report
+     (better, the same, or worse, and the one number that shows it).
+   - Going well: one to three things that moved, in plain words.
+   - Not going well: one to three things that got worse or failed.
+   - Still stuck since last report: anything the previous report already
+     named as stuck or blocked and still is, with how long; say "nothing"
+     when the list is empty. Read the previous report to fill this in.
+   - Next: what the brain will do before the next report.
+   - Needs you: only what only the operator can do, or "nothing".
+   Write sentences, not ticket lists: name a ticket only where the operator
+   may want to open it, and never more than one or two per line. Numbers
+   over adjectives. A goal home may ask for extra lines; add them after
+   these. The station sends every report to the operator's phone, so it
+   must stand on its own.
 9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
 
