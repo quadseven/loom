@@ -83,11 +83,13 @@ section() {
 
 # Chief's format: ## Why, ## Summary, ## Acceptance criteria, Size:, ## Out of scope.
 pr_body() {
-  local size
+  local size issue refs=""
+  issue="$(field Issue "$1" || true)"
+  [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   size="$(section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
-  printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.\n' \
+  printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s\n' \
     "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
-    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL"
+    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$refs"
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
