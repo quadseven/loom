@@ -2,17 +2,20 @@
 
 ## Heartbeats
 
-Every lane writes `state/usage/<lane>.json` on a schedule (every 30 min):
+Every lane writes `state/usage/<lane>.json` on every runner pass (including when a lane is unavailable). The file contains:
 
 ```json
 {
  "lane": "codex",
- "models": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"],
- "budget": {"used": 312, "limit": 1000, "unit": "requests", "resets_at": "..."},
- "burn_rate_per_hour": 41,
- "rate_limited": false
+ "at": 1731234567,
+ "available": true,
+ "reason": ""
 }
 ```
+
+`lane` is the lane name, `at` is a Unix timestamp from the runner's current time, `available` is true when the lane can take new work, and `reason` explains unavailability. The dispatcher reads this file and routes only to lanes with fresh heartbeats (`within 600 seconds`) that report `available: true`.
+
+Quota fields (models, budget, burn_rate_per_hour, rate_limited) are not written yet and are a planned addition.
 
 ## Sources (ToS-clean)
 
