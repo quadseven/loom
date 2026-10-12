@@ -361,6 +361,12 @@ agy_key() {
 # unlock makes the lane unavailable; its briefs wait.
 agy_unlock() {
   compgen -G "$INBOX/*.md" > /dev/null || return 0
+  # security -i splits its command line on whitespace and treats quotes and
+  # backslashes specially; only a password free of them unlocks as written.
+  # printf is a builtin, so the password reaches no process's argv.
+  case "$API_KEY" in *[!A-Za-z0-9._~+=/@%:,^-]*)
+    READY_REASON="the agy lane keychain password has characters security -i would split; use letters, digits and ._~+=/@%:,^-"; return 1 ;;
+  esac
   printf 'unlock-keychain -p %s %s\n' "$API_KEY" "$AGY_KEYCHAIN" | "${AGY_RUNAS[@]}" security -i > /dev/null 2>&1 ||
     { READY_REASON="could not unlock the agy lane keychain $AGY_KEYCHAIN"; return 1; }
 }

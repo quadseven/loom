@@ -142,7 +142,9 @@ exec "$@"
 """
 
 # Fake security: records unlock-keychain calls and whether the password
-# matched $FAKE_KC_PW, never the password itself.
+# matched $FAKE_KC_PW, never the password itself. It splits its stdin line on
+# whitespace as security -i does; the runner refuses passwords containing
+# whitespace, quotes or backslashes, where the two could disagree.
 FAKE_SECURITY = """#!/usr/bin/env bash
 # Interactive mode reads one command per line from stdin, so a password
 # never appears in argv; record whether argv carried one.
@@ -485,9 +487,8 @@ class LaneRunnerTest(unittest.TestCase):
             LOOM_AGY_BIN=str(agy),
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
-            FAKE_SECRET__k_kc="fake-kc-password",
             LOOM_AGY_MODEL=model,
-            **{"FAKE_KC_PW": "fake-kc-password", **env},
+            **{"FAKE_KC_PW": "fake-kc-password", "FAKE_SECRET__k_kc": "fake-kc-password", **env},
         )
         agy_log = lane_home / "tmp" / "agy.log"
         return inbox, workdir, result, (agy_log.read_text().splitlines() if agy_log.exists() else [])
@@ -527,6 +528,8 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual((state / "installation_id").read_text(), "install-1")
         self.assertTrue((state / "cache" / "onboarding.json").exists())
         self.assertFalse((state / "cache" / "last_conversations.json").exists())
+        # The wipe itself, checked on disk: the planted memory is gone.
+        self.assertFalse((state / "brain" / "planted.md").exists())
         self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
@@ -538,6 +541,18 @@ class LaneRunnerTest(unittest.TestCase):
         beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
         self.assertFalse(beat["available"])
         self.assertIn("unlock", beat["reason"])
+
+    def test_agy_lane_refuses_a_keychain_password_security_would_split(self):
+        pw = "two words"
+        inbox, _, result, agy = self.agy_lane(FAKE_KC_PW=pw, FAKE_SECRET__k_kc=pw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        self.assertFalse(any(c.startswith("security") for c in self.calls()))
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("security -i would split", beat["reason"])
+        self.assertNotIn(pw, beat["reason"])
 
     def test_agy_lane_is_unavailable_when_it_cannot_become_the_lane_user(self):
         inbox, _, result, agy = self.agy_lane(runas_ok=False)
