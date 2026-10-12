@@ -18,6 +18,11 @@ from REST APIs. Never write to a live system. When a step needs a fact no API
 serves, write what is needed on the ticket and leave it; never claim a live
 result you did not read yourself.
 
+Read and write GitHub only from the shell, through the Loom commands or the
+GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
+for GitHub or anything else in a scheduled run: each new web request asks
+the operator for approval, and the run stops until someone answers.
+
 ## The brain's job
 
 A goal is never finished until its home issue says so. Every tick moves it:
