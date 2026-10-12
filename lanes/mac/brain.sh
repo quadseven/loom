@@ -56,6 +56,10 @@ case "$SCOPE" in all|live) ;; *) say "LOOM_BRAIN_SCOPE must be all or live"; exi
 
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 
+# The agent's bus.brain and journal writes check that this holder still has
+# the lock (bus/stages.py), so a tick whose lock expired writes nothing.
+export LOOM_BRAIN_HOLDER="$HOLDER" LOOM_STATUS_REPO="$LOCK_REPO"
+
 # The lock outlives the agent by 5 minutes, so a tick cut off by the timeout
 # still releases it below before anyone else could take it.
 [[ "$WAIT" =~ ^[0-9]+$ && "$WAIT_STEP" =~ ^[0-9]+$ ]] || { say "LOOM_BRAIN_WAIT and LOOM_BRAIN_WAIT_STEP must be whole numbers"; exit 1; }
@@ -83,14 +87,18 @@ is already held for you as holder $HOLDER by the wrapper, so skip the lock and u
 (never lock or unlock). LOOM_REPOS is set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
 goal. This replaces the 15-minute limit in MUSE.md: stop within \
-$((MINUTES - 5)) minutes; you are cut off at $MINUTES."
+$((MINUTES - 5)) minutes; you are cut off at $MINUTES. Spend the first \
+$((MINUTES / 4)) minutes at most on the items status lists under Takeover, \
+before any broad measurement."
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps and reads live data through \
 REST APIs, but has no cluster or database access. Do only what needs this \
 machine: ships and rolls where a goal's rules make them the brain's, and \
 checks or measurements that need cluster or database access; put what you \
-find on the ticket. Review, merge, brief and answer asks only when no other \
-brain has journaled on any goal in the last 2 hours."
+find on the ticket. Review, merge, brief and answer asks only for the items \
+status lists under Takeover (work another brain yielded or left overdue, \
+however recently it journaled), or when no other brain has journaled on any \
+goal in the last 2 hours. Record each as done with the stage command."
 fi
 
 say "tick start (model $MODEL, scope $SCOPE)"

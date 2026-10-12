@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from typing import List, Optional
 
-from . import journal, labels, lock, station
+from . import journal, labels, lock, stages, station
 from .github import GitHub, GitHubError, token_from_env
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -58,6 +59,9 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
         ok = lock.release(gh, args.repo, args.holder)
         print("lock released" if ok else "lock not released")
         return 0 if ok else 1
+    # A journal is a write: with LOOM_BRAIN_HOLDER set, only the lock holder posts.
+    if os.environ.get("LOOM_BRAIN_HOLDER"):
+        stages.require_lock(gh, stages.lock_repo(), os.environ["LOOM_BRAIN_HOLDER"])
     repo, _, num = args.target.partition("#")
     with open(args.file, encoding="utf-8") as fh:
         text = fh.read()

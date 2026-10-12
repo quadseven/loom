@@ -5,7 +5,9 @@ At the start of each tick, run `git -C loom pull`. Clone
 Run every command from that checkout. Set `LOOM_GITHUB_TOKEN` and
 `LOOM_REPOS` (space separated `OWNER/NAME` values). Use `muse` as your lock
 holder (the lane machine's tick uses its own name and takes the lock for
-you). The lock lives in `quadseven/loom`.
+you). The lock lives in `quadseven/loom`. Set `LOOM_BRAIN_HOLDER=muse` and
+`LOOM_STATUS_REPO=quadseven/loom` too: every write command then refuses
+unless you hold the lock.
 
 ## What Muse does and leaves
 
@@ -60,7 +62,11 @@ tickets and pull requests like any other work.
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
    is held.
 2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
-   each goal's latest journal.
+   each goal's latest journal. Then finish the items it lists under
+   Takeover, before any broad measurement and in at most a quarter of the
+   tick: work a brain yielded, or ready work left untouched past
+   `LOOM_STAGE_OVERDUE_HOURS` (default 2). Any brain holding the lock
+   finishes them, however recently the brain that left them journaled.
 3. For each lane pull request, read its whole diff against its ticket and
    acceptance criteria. A lane pull request with failing checks or
    unresolved findings goes back to the lane that wrote it with
@@ -104,7 +110,16 @@ tickets and pull requests like any other work.
    five lines: metric changes, what moved, the top blocker, shipped and
    verified, next. The station sends every report to the operator's phone,
    so it must stand on its own: numbers, not references.
-9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
+9. Record stage work on the goal home with
+   `python3 -m bus.brain stage OWNER/NAME#GOAL --stage STAGE --item N`
+   (stages: review, merge, verify, failed, ask, brief, report; brief and
+   report take no item). Add `--done` after finishing an item from Takeover.
+   Add `--deferred --resume TEXT` for every ready item you leave for later,
+   for budget or time: that yields the stage, and the next brain holding the
+   lock finishes it from TEXT. A done record, or a change to the item (pull
+   request merged, closed or pushed to; ticket relabelled or closed), drops
+   the older resume item, so it is never done twice.
+10. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
 
 ## Lane choice

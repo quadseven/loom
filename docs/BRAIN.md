@@ -208,6 +208,32 @@ and shipped tickets hold no slot);
 write the journal; report when due; release the lock. No retry loops: a
 failed step is journalled and left for the next tick.
 
+## Stage ownership
+
+The journal says a brain was alive, not that it did the work. Each goal
+home also carries stage records (`python3 -m bus.brain stage`, format in
+`bus/stages.py`): for a stage (review, merge, verify, failed, ask, brief,
+report) and an item, `done` or `deferred` with a resume item, the holder,
+and the item's version (a pull request's head SHA, a ticket's state
+labels). `status` reads them from the goal comments it already fetches and
+prints, per goal, the brain responsible for each stage and its last
+completed action, then a Takeover list:
+
+- yielded: the newest record for the item is a deferral and the item has
+  not changed since. Deferring yields the stage to whichever brain holds
+  the lock next, however fresh the deferring brain's journals are.
+- overdue: a ready pull request (green checks, no open threads) or a
+  `loom:failed` ticket untouched for `LOOM_STAGE_OVERDUE_HOURS` (default 2)
+  that no resume item covers.
+
+A later `done` record, a new head commit, a merge or close, or a relabel
+invalidates an older resume item. With `LOOM_BRIEF_AUTHORS` set, only
+records from those logins count. With `LOOM_BRAIN_HOLDER` set, every
+write command (`bus.brain` brief, move, merge, close, fix and reply, and
+`bus journal`) refuses unless that holder has the unexpired tick lock in
+`LOOM_STATUS_REPO`; `stage` always checks. So only the current lock holder acts, and the lock
+keeps two brains from finishing the same item.
+
 ## Journal
 
 One comment per tick that changed something, on the goal's home issue:

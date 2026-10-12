@@ -75,3 +75,11 @@ _Avoid_: test, check
 **Journal**:
 The comment the brain leaves on a goal's home issue for each tick that changed something (shipped, briefed, waiting, asks and cost), with a five-line report every two hours.
 _Avoid_: log, summary
+
+**Stage record**:
+A comment on a goal home saying a brain finished (done) or left (deferred, with a resume item) one stage of work on one item, such as merging a pull request or re-briefing a failed ticket; a deferral yields that stage to whichever brain holds the tick lock next.
+_Avoid_: claim, handoff note
+
+**Takeover**:
+The items `status` lists for any lock holder to finish first: resume items another brain yielded, and ready work left untouched for too long.
+_Avoid_: backlog, steal

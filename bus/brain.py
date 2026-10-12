@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, token_from_env
-from . import text
+from . import stages, text
 from .labels import LANES
 from .tickets import FIX_MARKER
 
@@ -54,7 +54,7 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     for n in pr_ids:
         fields.append("p%d: pullRequest(number:%d) { commits(last:1) { nodes { commit { statusCheckRollup { state } } } } reviewThreads(first:100) { nodes { isResolved } } }" % (n, n))
     for n in goal_ids:
-        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt } } }" % (n, n))
+        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n))
     if not fields:
         return {"prs": {}, "goals": {}}
     q = "query { repository(owner:%s, name:%s) { %s } }" % (
@@ -109,6 +109,38 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]]) -> str:
         pr["number"], pr.get("title", ""), (rollup or {}).get("state", "UNKNOWN"), unresolved)
 
 
+def _authors() -> List[str]:
+    return [x for x in re.split(r"[\s,]+", os.environ.get("LOOM_BRIEF_AUTHORS", "")) if x]
+
+
+def _stage_sections(goals: List[Dict[str, Any]], issues: List[Dict[str, Any]],
+                    prs: List[Dict[str, Any]], data: Dict[str, Any],
+                    now: datetime) -> List[str]:
+    """Stage owners per goal, then the items any lock holder may finish now:
+    resume items another brain yielded, and ready work left untouched."""
+    versions = {int(i["number"]): stages.issue_version(_labels(i)) for i in issues}
+    versions.update({int(p["number"]): str((p.get("head") or {}).get("sha") or "")
+                     for p in prs})
+    owners: List[str] = []
+    items: List[Dict[str, Any]] = []
+    for goal in goals:
+        node = data["goals"].get(int(goal["number"])) or {}
+        recs = stages.records((node.get("comments") or {}).get("nodes") or [], _authors())
+        owners += stages.stage_lines(int(goal["number"]), recs)
+        items += stages.yielded(recs, versions, int(goal["number"]))
+    ready = [("merge", int(p["number"]), stages._time(p.get("updated_at"))) for p in prs
+             if _pr_ready(data["prs"].get(int(p["number"])))]
+    ready += [("failed", int(i["number"]), stages._time(i.get("updated_at"))) for i in issues
+              if "loom:failed" in _labels(i)]
+    items += stages.overdue(ready, [x["item"] for x in items], now, stages.overdue_hours())
+    return (["### Stages"] + owners + ["", "### Takeover"]
+            + [stages.takeover_line(x) for x in items])
+
+
+def _pr_ready(node: Optional[Dict[str, Any]]) -> bool:
+    return _checks_green(node or {}) and _threads_resolved(node or {})
+
+
 def _repo_section(gh: GitHub, repo: str, now: datetime) -> List[str]:
     issues = _issues(gh, repo)
     goals = [i for i in issues if "loom:goal" in _labels(i)]
@@ -117,6 +149,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime) -> List[str]:
            if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
     data = _graphql_status(gh, repo, prs, goals)
     lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data) + [""]
+    lines += _stage_sections(goals, issues, prs, data, now) + [""]
     lines += _ticket_lines(tickets, now) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"]))) for pr in prs]
     lines += ["", "### Needs operator"]
@@ -505,6 +538,7 @@ def parser() -> argparse.ArgumentParser:
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True)
+    st = sub.add_parser("stage"); st.add_argument("goal"); st.add_argument("--stage", choices=stages.STAGES, required=True); st.add_argument("--item", type=int); st.add_argument("--deferred", dest="action", action="store_const", const="deferred"); st.add_argument("--done", dest="action", action="store_const", const="done"); st.add_argument("--resume", default=""); st.add_argument("--holder")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
@@ -559,9 +593,35 @@ def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
     fix(gh, repo, number, _ref(args.ticket, "ticket"), _read(args.file))
 
 
+def _cmd_stage(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, goal = _ref(args.goal, "goal")
+    if args.action is None:
+        raise ValueError("say --deferred or --done")
+    print(stages.record(gh, repo, goal, args.stage, args.action, _holder(args),
+                        args.item, args.resume))
+
+
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
-            "fix": _cmd_fix}
+            "fix": _cmd_fix, "stage": _cmd_stage}
+# Commands that write to GitHub. With LOOM_BRAIN_HOLDER set, each refuses
+# unless that holder has the tick lock (LOOM_STATUS_REPO), so a brain whose
+# lock expired or was never taken writes nothing.
+WRITES = ("brief", "move", "merge", "close", "fix", "reply")
+
+
+def _holder(args: argparse.Namespace) -> str:
+    holder = getattr(args, "holder", None) or os.environ.get("LOOM_BRAIN_HOLDER", "")
+    if not holder:
+        raise ValueError("a stage record needs --holder or LOOM_BRAIN_HOLDER")
+    return holder
+
+
+def guard(gh: GitHub, command: str, env: Optional[Dict[str, str]] = None) -> None:
+    env = os.environ if env is None else env
+    holder = env.get("LOOM_BRAIN_HOLDER", "")
+    if command in WRITES and holder:
+        stages.require_lock(gh, stages.lock_repo(env), holder)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -569,6 +629,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         args = parser().parse_args(argv)
         gh = GitHub(token_from_env())
+        guard(gh, args.command)
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:

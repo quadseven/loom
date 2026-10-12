@@ -32,6 +32,7 @@ exit 0
 FAKE_CLAUDE = """#!/usr/bin/env bash
 printf 'claude %s\\n' "$*" >> "$FAKE_LOG"
 printf 'cwd %s\\n' "$PWD" >> "$FAKE_LOG"
+printf 'env %s %s\\n' "${LOOM_BRAIN_HOLDER:-}" "${LOOM_STATUS_REPO:-}" >> "$FAKE_LOG"
 exit "${FAKE_CLAUDE_EXIT:-0}"
 """
 
@@ -180,6 +181,21 @@ class BrainTickTest(unittest.TestCase):
         _, calls = self.tick()
         claude = [c for c in calls if c.startswith("claude ")][-1]
         self.assertNotIn("Do only what needs this machine", claude)
+
+    def test_the_agent_writes_only_as_the_lock_holder(self):
+        _, calls = self.tick(LOOM_BRAIN_HOLDER="night")
+        self.assertIn("env night example/loom", calls)
+
+    def test_a_tick_finishes_takeover_items_before_measuring(self):
+        _, calls = self.tick(LOOM_BRAIN_MINUTES="40")
+        claude = [c for c in calls if c.startswith("claude ")][0]
+        self.assertIn("first 10 minutes at most on the items status lists under Takeover", claude)
+
+    def test_a_live_tick_takes_over_yielded_work_despite_fresh_journals(self):
+        _, calls = self.tick(LOOM_BRAIN_SCOPE="live")
+        claude = [c for c in calls if c.startswith("claude ")][0]
+        self.assertIn("only for the items status lists under Takeover", claude)
+        self.assertIn("however recently it journaled", claude)
 
     def test_an_invalid_time_limit_never_takes_the_lock(self):
         run, calls = self.tick(LOOM_BRAIN_MINUTES="2")
