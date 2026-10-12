@@ -834,7 +834,9 @@ class Station:
                     url = self._webhook()
                     webhook_checked = True
                 if url is None:
-                    continue
+                    # Unreadable webhook: keep the position and the read time,
+                    # so the next pass reads this window again.
+                    return False
                 if not self._send(url, self._report_text(issue, comment), mention=False):
                     _write_json(path, ledger)
                     return False
@@ -858,6 +860,10 @@ class Station:
                  else self.now - REPORT_FIRST_LOOKBACK)
         since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
         allowed = {a.lower() for a in self.s.authors}
+        # Forget repos that left LOOM_REPOS, so the ledger stays their size.
+        keep = {r.replace("/", ".") for r in self.s.repos} | {"_checked"}
+        for stale in [k for k in ledger if k not in keep]:
+            del ledger[stale]
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue

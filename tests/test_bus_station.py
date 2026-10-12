@@ -832,6 +832,32 @@ class ReportsTest(Base):
         self.go()
         self.assertEqual(len(self.sent), 1)
 
+    def test_an_unreadable_webhook_keeps_the_read_window(self):
+        self.prime()
+        self.comment(40, 100, station.REPORT_MARKER + "\nreport")
+        gh = GitHub("token", transport=self.fake)
+        self.clock += station.REPORT_CHECK + 1
+
+        def no_secret(name, region):
+            raise OSError("unreadable")
+        station.Station(gh, self.settings, now=self.clock, read_secret=no_secret,
+                        post=lambda u, p: self.sent.append(p)).run_pass()
+        self.assertEqual(self.sent, [])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_the_ledger_forgets_repos_that_left(self):
+        self.prime()
+        path = os.path.join(self.home, "state", "station", "reports.json")
+        with open(path) as fh:
+            ledger = json.load(fh)
+        ledger["gone.repo"] = 5
+        with open(path, "w") as fh:
+            json.dump(ledger, fh)
+        self.go()
+        with open(path) as fh:
+            self.assertNotIn("gone.repo", json.load(fh))
+
     def test_long_report_is_cut_at_line_break_and_keeps_link(self):
         self.prime()
         self.comment(40, 100, station.REPORT_MARKER + "\n" + "line\n" * 700)
