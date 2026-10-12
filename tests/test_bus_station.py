@@ -117,6 +117,9 @@ class FakeGitHub:
 
     def _issues_and_status(self, method, rest, query, headers, data):
         if method == "GET" and rest == "issues":
+            if "labels=loom%3Apr" in query:
+                return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:pr" in self.names(i["number"])])
             if "needs-operator" in query:
                 return self._list_asks(headers)
             if "loom:goal" in query:
@@ -211,6 +214,43 @@ class Base(unittest.TestCase):
             return []
 
 
+class ReconcilePullRequestTest(Base):
+    def test_merged_pr_repairs_failed_ticket_label_once(self):
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 99, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        failed = [False]
+
+        def transport(method, url, headers, body):
+            if method == "PUT" and url.endswith("/issues/12/labels") and not failed[0]:
+                failed[0] = True
+                raise station.GitHubError("temporary failure", 500)
+            return self.fake(method, url, headers, body)
+
+        gh = GitHub("token", transport=transport)
+        runner = station.Station(gh, self.settings)
+        with self.assertRaises(station.GitHubError):
+            runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:verified", self.fake.names(12))
+        puts = len([call for call in self.fake.calls if call[0] == "PUT"])
+        runner.reconcile_pull_requests()
+        self.assertEqual(puts, len([call for call in self.fake.calls if call[0] == "PUT"]))
+
+    def test_closed_unmerged_pr_gets_distinct_disposition(self):
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 99, "state": "closed", "merged_at": None,
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:closed-unmerged", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
+
 class CorruptStateTest(Base):
     def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
         self.fake.add(12, state="running")
@@ -225,7 +265,7 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        self.assertEqual(self.run_pass().requests, 0)
+        self.assertEqual(self.run_pass().requests, 2)
 
 
 class TicketsTest(unittest.TestCase):
@@ -355,8 +395,8 @@ class ClaimTest(Base):
         self.run_pass()
         first = len(self.fake.calls)
         gh = self.run_pass()
-        self.assertEqual(len(self.fake.calls), first + 1)
-        self.assertEqual(gh.requests, 1)
+        self.assertEqual(len(self.fake.calls), first + 3)
+        self.assertEqual(gh.requests, 3)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
     def test_a_304_reuses_the_stored_list(self):
@@ -536,7 +576,8 @@ class FixTest(Base):
         self.assertEqual([c["body"] for c in self.fake.comments[12]],
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
 
 
 class RefusalTest(Base):
@@ -604,7 +645,9 @@ class OutcomeTest(Base):
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
 
     def test_done_without_a_pull_request_is_retried_not_reported(self):
         self.finished("done")

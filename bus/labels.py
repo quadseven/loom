@@ -24,6 +24,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:pr": {"color": "0075ca", "description": "The runner opened a pull request"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
+    "loom:closed-unmerged": {"color": "d93f0b", "description": "Linked pull request closed without merging"},
     "loom:shipped": {"color": "2ea44f", "description": "Deployed by the project's ship owner"},
     "loom:verified": {"color": "006b75", "description": "Verified live"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},

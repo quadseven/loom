@@ -509,6 +509,45 @@ class Station:
                 reported[key] = kind
                 _write_json(path, reported)
 
+    def reconcile_pull_requests(self) -> None:
+        """Repair ticket state from the PR's authoritative terminal state."""
+        for repo in self.s.repos:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                continue
+            path = "/repos/%s/issues?state=open&labels=loom%%3Apr" % repo
+            issues = self.gh.paginate(path)
+            tickets_by_number = {int(i["number"]): i for i in issues
+                                 if "loom:ticket" in _label_names(i)}
+            prs = self.gh.paginate("/repos/%s/pulls?state=all" % repo)
+            for pr in prs:
+                if not isinstance(pr, dict):
+                    continue
+                body = str(pr.get("body") or "")
+                ref = re.search(r"^Refs %s#([0-9]+)[ \t]*$" % re.escape(repo), body, re.M)
+                head = str((pr.get("head") or {}).get("ref") or "")
+                branch = re.match(r"loom/([0-9]+)(?:-|$)", head)
+                match = ref or branch
+                if not match:
+                    continue
+                ticket = tickets_by_number.get(int(match.group(1)))
+                if ticket is None:
+                    continue
+                labels = _label_names(ticket)
+                if "loom:merged" in labels or "loom:shipped" in labels or "loom:verified" in labels:
+                    continue
+                merged = bool(pr.get("merged_at")) or pr.get("merged") is True
+                target = "loom:merged" if merged else (
+                    "loom:closed-unmerged" if pr.get("state") == "closed" else None)
+                if target and target not in labels:
+                    state_names = ("queued", "briefed", "running", "pr", "failed",
+                                   "merged", "shipped", "verified", "closed-unmerged")
+                    states = {"loom:" + state for state in state_names}
+                    kept = [name for name in labels if name not in states]
+                    kept.append(target)
+                    self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
+                                 {"labels": kept})
+                    ticket["labels"] = [{"name": name} for name in kept]
+
     def _field(self, text: str, name: str) -> str:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
         return m.group(1) if m else ""
@@ -1045,6 +1084,10 @@ class Station:
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
+        try:
+            self.reconcile_pull_requests()
+        except (GitHubError, OSError) as err:
+            _say("pull request reconciliation failed: %s" % err)
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
                      self.watch_brain):
