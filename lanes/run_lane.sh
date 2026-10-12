@@ -33,6 +33,16 @@ mkdir -p "$INBOX/done" "$INBOX/failed" "$LOOM_HOME/run"
 # cleared when its pid is gone.
 if ! mkdir "$LOCK" 2>/dev/null; then
   if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+  stale_pgid="$(cat "$LOCK/pgid" 2>/dev/null || true)"
+  if [[ "$stale_pgid" =~ ^[0-9]+$ ]] && kill -0 -- "-$stale_pgid" 2>/dev/null; then
+    echo "stale lane lock: terminating process group $stale_pgid" >&2
+    kill -TERM -- "-$stale_pgid" 2>/dev/null || true
+    for _ in {1..50}; do
+      kill -0 -- "-$stale_pgid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 -- "-$stale_pgid" 2>/dev/null; then kill -KILL -- "-$stale_pgid" 2>/dev/null || true; fi
+  fi
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
@@ -502,7 +512,10 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
 
-  (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1
+  (set -m; (cd "$TREE" && set +m && run_agent "$BRIEF") >> "$LOG" 2>&1) &
+  AGENT_PID=$!
+  echo "$AGENT_PID" > "$LOCK/pgid"
+  wait "$AGENT_PID"
   STATUS=$?
   is_api_lane && archive_transcripts
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi

@@ -2,6 +2,7 @@
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bus import tickets  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
+INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
 
 BRIEF = """# Brief: T042-fix-the-thing
 
@@ -813,6 +815,55 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(any(c.startswith("claude ") for c in self.calls()), result.stderr)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+
+    def test_stale_lock_kills_its_recorded_process_group_before_running(self):
+        self.drop_brief()
+        lock = self.loom / "run" / "codex.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("99999999\n")
+        sleeper = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        (lock / "pgid").write_text(f"{sleeper.pid}\n")
+        check = self.bin / "codex"
+        check.write_text(
+            "#!/bin/bash\n"
+            f"kill -0 -- -{sleeper.pid} 2>/dev/null && exit 19\n"
+            f"exec \"{self.bin / 'real-codex'}\" \"$@\"\n"
+        )
+        check.chmod(0o755)
+        self.write_tool(self.bin / "real-codex", FAKE_AGENT)
+        try:
+            result = self.run_lane()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(sleeper.wait(timeout=2) is not None)
+            self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        finally:
+            if sleeper.poll() is None:
+                sleeper.kill()
+                sleeper.wait()
+
+    def test_stale_lock_without_a_live_group_is_reclaimed(self):
+        self.drop_brief()
+        lock = self.loom / "run" / "codex.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text("99999999\n")
+        (lock / "pgid").write_text("99999999\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_installer_busy_check_recognizes_a_live_runner_pid(self):
+        lock = Path(self._tmp.name) / "lane.lock"
+        lock.mkdir()
+        (lock / "pid").write_text(f"{os.getpid()}\n")
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; runner_busy "$2"', "test",
+             str(INSTALL_LOCK), str(lock)], capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        (lock / "pid").write_text("99999999\n")
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; runner_busy "$2"', "test",
+             str(INSTALL_LOCK), str(lock)], capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

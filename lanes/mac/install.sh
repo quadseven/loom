@@ -17,6 +17,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$REPO_ROOT/lanes/mac/lock.sh"
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 # Lane default models, named in every PR. codex: the CLI's own configured
 # default; claude: the current Opus. Override either in the environment.
@@ -58,6 +59,10 @@ loom_env() {
 
 for L in "${LANES[@]}"; do
   LABEL="com.loom.$L"
+  if runner_busy "$LOOM_HOME/run/$L.lock"; then
+    echo "skipped $LABEL: runner busy, re-run the installer later"
+    continue
+  fi
   PLIST="$AGENTS/$LABEL.plist"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -87,6 +92,7 @@ $(loom_env)
 </plist>
 EOF
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  wait_job_gone "gui/$(id -u)/$LABEL"
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "installed $LABEL -> $X_REPO/lanes/run_lane.sh $L"
 done
@@ -129,6 +135,7 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+wait_job_gone "gui/$(id -u)/$LABEL"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed $LABEL -> python3 -m bus station (idle unless LOOM_REPOS is set)"
 
@@ -164,6 +171,7 @@ if [ "${LOOM_VIEWER:-1}" != 0 ]; then
 </plist>
 EOF
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  wait_job_gone "gui/$(id -u)/$LABEL"
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "installed $LABEL -> http://localhost:$VIEWER_PORT/"
 fi
