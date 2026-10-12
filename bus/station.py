@@ -693,47 +693,57 @@ class Station:
             _say("could not read the webhook parameter (%s); next pass" % type(err).__name__)
             return None
 
-    def forward_asks(self) -> None:
-        if not self.s.webhook_ssm:
-            # Not configured: skip quietly; a line every minute would only grow
-            # the station log (docs/LANES.md says how to turn it on).
-            return
+    def _ask_ledger(self) -> Tuple[str, Dict[str, Any], List[str]]:
         path = os.path.join(self.state, "asks.json")
         sent = _read_json(path, {})
         if not isinstance(sent, dict):
             raise StateError("state file %s does not hold an object" % path)
         urgent_sent = sent.get("urgent") if isinstance(sent.get("urgent"), list) else []
+        return path, sent, urgent_sent
+
+    def _today_and_digest_due(self, sent: Dict[str, Any]) -> Tuple[str, bool]:
         local = time.localtime(self.now)
         today = time.strftime("%Y-%m-%d", local)
-        digest_due = local.tm_hour >= self.s.digest_hour and sent.get("digest") != today
-        keyed = self._gather_asks()
-        if keyed is None:
-            return
-        urgent_keys = {k for k, _, i in keyed
-                       if URGENT in _label_names(i) and k not in urgent_sent}
-        if not urgent_keys and not digest_due:
-            return
-        wanted = {k for k, _, _ in keyed} if digest_due else urgent_keys
-        trust = self._check_asks(keyed, wanted)
-        if trust is None:
-            return
-        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
-        digest = [i for k, _, i in keyed if trust.get(k)]
-        send_digest = digest_due and bool(digest)
-        if not todo and not send_digest:
-            return
-        url = self._webhook()
-        if url is None:
-            return
+        return today, local.tm_hour >= self.s.digest_hour and sent.get("digest") != today
+
+    def _deliver(self, url: str, todo: List[Tuple[str, Dict[str, Any]]],
+                 digest: List[Dict[str, Any]], ledger: Tuple[str, Dict[str, Any], List[str]],
+                 today: str) -> None:
+        path, sent, urgent_sent = ledger
         for key, issue in todo:
             title = " ".join(str(issue.get("title") or "").split())
             if self._send(url, "Urgent ask: %s %s" % (title, issue["html_url"])):
                 urgent_sent.append(key)
                 sent["urgent"] = urgent_sent
                 _write_json(path, sent)
-        if send_digest and self._send(url, self._digest_text([self._line(i) for i in digest])):
+        if digest and self._send(url, self._digest_text([self._line(i) for i in digest])):
             sent["digest"] = today
             _write_json(path, sent)
+
+    def forward_asks(self) -> None:
+        if not self.s.webhook_ssm:
+            # Not configured: skip quietly; a line every minute would only grow
+            # the station log (docs/LANES.md says how to turn it on).
+            return
+        ledger = self._ask_ledger()
+        today, digest_due = self._today_and_digest_due(ledger[1])
+        keyed = self._gather_asks()
+        if keyed is None:
+            return
+        urgent_keys = {k for k, _, i in keyed
+                       if URGENT in _label_names(i) and k not in ledger[2]}
+        if not urgent_keys and not digest_due:
+            return
+        trust = self._check_asks(keyed, {k for k, _, _ in keyed} if digest_due else urgent_keys)
+        if trust is None:
+            return
+        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
+        digest = [i for k, _, i in keyed if trust.get(k)] if digest_due else []
+        if not todo and not digest:
+            return
+        url = self._webhook()
+        if url is not None:
+            self._deliver(url, todo, digest, ledger, today)
 
     # -- one pass --------------------------------------------------------
     def run_pass(self) -> None:
