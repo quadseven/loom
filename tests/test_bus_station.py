@@ -42,6 +42,26 @@ class FakeGitHub:
         self.pulls = []
         self.calls = []
         self.version = 1
+        self.lanes_issues = []
+        self.status_comments = []
+        self.created = []
+        self.edits = []
+        self.posts = []
+        self.asks = []
+
+    def _list_asks(self, headers):
+        etag = '"a%d"' % len(self.asks)
+        if headers.get("If-None-Match") == etag:
+            return reply(304, None, {"ETag": etag})
+        return reply(200, self.asks, {"ETag": etag})
+
+    def add_ask(self, number, title="Need a decision", author="alice-example",
+                labeller="alice-example", urgent=False):
+        labels = [{"name": "needs-operator"}] + ([{"name": "loom:urgent"}] if urgent else [])
+        self.asks.append({"number": number, "title": title, "user": {"login": author},
+                          "labels": labels, "created_at": "2030-01-01T00:00:00Z",
+                          "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
+        self.events[number] = [labeled("needs-operator", labeller)]
 
     def add(self, number, title="Fix the thing", lane="codex", body=BODY,
             author="alice-example", created="2030-01-01T00:00:00Z",
@@ -75,14 +95,35 @@ class FakeGitHub:
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
-        if method == "GET" and rest == "issues":
-            return self._list_briefed(headers)
+        if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
+                or (rest == "issues/1/comments" and self.lanes_issues):
+            return self._issues_and_status(method, rest, parts.query, headers, data)
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _issues_and_status(self, method, rest, query, headers, data):
+        if method == "GET" and rest == "issues":
+            if "needs-operator" in query:
+                return self._list_asks(headers)
+            if "loom:lanes" in query:
+                return reply(200, self.lanes_issues)
+            return self._list_briefed(headers)
+        if method == "POST" and rest == "issues":
+            self.created.append(data)
+            self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
+            return reply(201, {"number": 1})
+        if method == "PATCH":
+            self.edits.append(data["body"])
+            return reply(200, {})
+        if method == "GET":
+            return reply(200, self.status_comments)
+        self.status_comments.append({"id": 77, "body": data["body"]})
+        self.posts.append(data["body"])
+        return reply(201, {"id": 77})
 
     def _graphql(self, data):
         editor = self.editors[data["variables"]["number"]]
@@ -101,6 +142,8 @@ class FakeGitHub:
 
     def _issue_call(self, method, n, sub, data):
         if method == "GET":
+            if sub == "events" and n not in self.issues:
+                return reply(200, self.events[n])
             found = {None: self.issues, "events": self.events, "comments": self.comments}
             if sub in found:
                 return reply(200, found[sub][n])
@@ -538,6 +581,167 @@ class LockAndCliTest(Base):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+NOON = time.mktime((2030, 5, 5, 12, 0, 0, 0, 0, -1))
+EARLY = time.mktime((2030, 5, 5, 7, 0, 0, 0, 0, -1))
+URL = "https://discord.example.com/api/webhooks/SECRET"
+
+
+class StatusTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings.status_repo = REPO
+
+    def go(self, later=0):
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=time.time() + later).run_pass()
+
+    def test_published_on_first_run_and_issue_created(self):
+        self.go()
+        self.assertEqual(len(self.fake.created), 1)
+        self.assertEqual(self.fake.created[0]["labels"], ["loom:lanes"])
+        body = self.fake.posts[0]
+        self.assertTrue(body.startswith("<!-- loom:lanes v1 -->\nUpdated "))
+        self.assertIn("| codex | yes |", body)
+        self.assertIn("| agy | no | - |", body)
+
+    def test_existing_issue_is_reused(self):
+        self.fake.lanes_issues = [{"number": 1}]
+        self.go()
+        self.assertEqual(self.fake.created, [])
+        self.assertEqual(len(self.fake.posts), 1)
+
+    def test_not_republished_when_nothing_changed(self):
+        self.go()
+        self.fake.calls.clear()
+        self.go(30)
+        self.assertEqual([c for c in self.fake.calls if "lanes" in c[1] or "comments" in c[1]], [])
+
+    def test_republished_on_change_by_editing_the_comment(self):
+        self.go()
+        self.heartbeat("codex", available=False)
+        self.go(30)
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertIn("| codex | no |", self.fake.edits[0])
+
+    def test_republished_after_an_hour(self):
+        self.go()
+        self.heartbeat("codex", age=0)
+        self.go(3601 - 0)
+        self.assertEqual(len(self.fake.edits), 1)
+
+    def test_never_contains_a_reason(self):
+        d = os.path.join(self.home, "state", "usage")
+        self.write(os.path.join(d, "zen.json"), json.dumps({
+            "lane": "zen", "at": int(time.time()), "available": False,
+            "reason": "/private/path secret-reason"}))
+        self.go()
+        self.assertNotIn("secret-reason", self.fake.posts[0])
+        self.assertNotIn("/private", self.fake.posts[0])
+
+
+class AsksTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings.webhook_ssm = "/example/webhook"
+        self.sent = []
+        self.fail = False
+        self.read = []
+
+    def go(self, now=NOON):
+        def post(url, payload):
+            if self.fail:
+                raise OSError("down")
+            self.sent.append((url, payload))
+
+        def secret(name, region):
+            self.read.append((name, region))
+            return URL
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=now, read_secret=secret, post=post).run_pass()
+
+    def test_untrusted_asks_are_ignored(self):
+        self.fake.add_ask(5, author="stranger", urgent=True)
+        self.fake.add_ask(6, labeller="stranger", urgent=True)
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_urgent_is_sent_once(self):
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        self.go(EARLY)
+        self.go(EARLY + 60)
+        self.assertEqual(len(self.sent), 1)
+        url, payload = self.sent[0]
+        self.assertEqual(url, URL)
+        self.assertEqual(payload["content"],
+                         "Urgent ask: Pick one https://github.com/%s/issues/5" % REPO)
+        self.assertEqual(payload["allowed_mentions"], {"parse": []})
+        self.assertEqual(self.read[0], ("/example/webhook", "us-east-1"))
+
+    def test_a_failed_trust_check_holds_every_send_until_the_next_pass(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        with mock.patch.object(station.Station, "_ask_trusted",
+                               side_effect=GitHubError("boom", 502)):
+            self.go(EARLY)
+        self.assertEqual(self.sent, [])
+        self.go(EARLY + 60)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_the_urgent_ledger_forgets_asks_that_closed(self):
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        self.go(EARLY)
+        ledger = os.path.join(self.home, "state", "station", "asks.json")
+        with open(ledger) as fh:
+            self.assertEqual(json.load(fh)["urgent"], ["%s#5" % REPO])
+        self.fake.asks.clear()
+        self.fake.version += 1
+        self.go(EARLY + 60)
+        with open(ledger) as fh:
+            self.assertEqual(json.load(fh)["urgent"], [])
+
+    def test_digest_once_per_day_after_the_hour_only(self):
+        self.fake.add_ask(5, title="Slow one")
+        self.go(EARLY)
+        self.assertEqual(self.sent, [])
+        self.go(NOON)
+        self.go(NOON + 600)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][1]["content"].splitlines()[1],
+                         "- Slow one https://github.com/%s/issues/5" % REPO)
+        self.go(NOON + 86400)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_no_digest_without_asks(self):
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_mention_is_the_only_allowed_one(self):
+        self.settings.mention = "123456"
+        self.fake.add_ask(5, urgent=True)
+        self.go()
+        payload = self.sent[0][1]
+        self.assertTrue(payload["content"].startswith("<@123456> "))
+        self.assertEqual(payload["allowed_mentions"], {"parse": [], "users": ["123456"]})
+
+    def test_nothing_sent_without_the_webhook_setting(self):
+        self.settings.webhook_ssm = ""
+        self.fake.add_ask(5, urgent=True)
+        self.go()
+        self.assertEqual((self.sent, self.read), ([], []))
+
+    def test_a_failed_post_is_retried_next_pass(self):
+        self.fake.add_ask(5, urgent=True)
+        self.fail = True
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.fail = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 2)  # the urgent ask and the digest
+        self.go(NOON + 120)
+        self.assertEqual(len(self.sent), 2)
 
 
 if __name__ == "__main__":

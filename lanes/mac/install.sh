@@ -100,7 +100,9 @@ done
 # The station: one pass a minute that turns briefed ticket issues into local
 # briefs and reports outcomes (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
-# with LOOM_REPOS empty it stays idle. Runs from this checkout, like the lanes.
+# with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
+# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
+# LOOM_DIGEST_HOUR and LOOM_AWS_REGION. Runs from this checkout, like the lanes.
 LABEL="com.loom.station"
 PLIST="$AGENTS/$LABEL.plist"
 cat > "$PLIST" <<EOF
@@ -130,6 +132,11 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REPOS</key><string>$(xml "${LOOM_REPOS:-}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
+    <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
+    <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
+    <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
+    <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
+    <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
   </dict>
 </dict>
 </plist>

@@ -30,6 +30,23 @@ ticket, with local paths removed from failure reasons; the runner adds
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
 
+Lane status: every pass the station reads each lane's heartbeat (`yes` when
+available and at most 600 seconds old, else `no`) and keeps one comment on the
+open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
+`origin`; the issue is created when missing) current. It edits the comment
+only when a yes or no changes and at least hourly, and never publishes the
+heartbeat's reason.
+
+Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
+(ETag polls) and forwards those whose author and latest `needs-operator`
+labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
+from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
+`LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
+empty nothing is forwarded). A `loom:urgent` ask is posted at once, once; all
+open asks go in one digest per day after `LOOM_DIGEST_HOUR` (local hour,
+default 9). Posts mention nobody except the numeric user id in
+`LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
+
 ## Transcript viewer
 
 `lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves
