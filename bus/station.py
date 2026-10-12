@@ -43,6 +43,15 @@ URGENT = "loom:urgent"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+# When every ask does not fit in the daily notification, the full digest is a
+# comment on this issue in each ask's own repo (so a private repo's asks stay
+# in that repo), and the notification links to it.
+DIGEST_LABEL = "loom:digest"
+DIGEST_TITLE = "Loom asks digest"
+DIGEST_MARKER = "<!-- loom:digest v1 -->"
+# Room kept for the mention, which _send adds in front.
+MENTION_ROOM = 40
+GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # Reports come every 2 hours, so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
@@ -694,18 +703,6 @@ class Station:
             return False
         return True
 
-    def _digest_text(self, lines: List[str]) -> str:
-        room = DISCORD_MAX - 60  # the mention and the "and N more" line
-        keep, size = [], len(DIGEST_HEAD)
-        for line in lines:
-            size += len(line) + 1
-            if size > room:
-                break
-            keep.append(line)
-        if len(keep) < len(lines):
-            keep.append("- and %d more" % (len(lines) - len(keep)))
-        return DIGEST_HEAD + "\n" + "\n".join(keep)
-
     def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """(key, repo, issue) for every open ask, oldest first; None when any
         repo could not be read (a partial list must not become a digest)."""
@@ -770,9 +767,8 @@ class Station:
         today = time.strftime("%Y-%m-%d", local)
         return today, local.tm_hour >= self.s.digest_hour and sent.get("digest") != today
 
-    def _deliver(self, url: str, todo: List[Tuple[str, Dict[str, Any]]],
-                 digest: List[Dict[str, Any]], ledger: Tuple[str, Dict[str, Any], List[str]],
-                 today: str) -> None:
+    def _send_urgent(self, url: str, todo: List[Tuple[str, Dict[str, Any]]],
+                     ledger: Tuple[str, Dict[str, Any], List[str]]) -> None:
         path, sent, urgent_sent = ledger
         for key, issue in todo:
             title = " ".join(str(issue.get("title") or "").split())
@@ -780,8 +776,146 @@ class Station:
                 urgent_sent.append(key)
                 sent["urgent"] = urgent_sent
                 _write_json(path, sent)
-        if digest and self._send(url, self._digest_text([self._line(i) for i in digest])):
+
+    @staticmethod
+    def _ask_rev(issue: Dict[str, Any]) -> str:
+        """The revision of an ask: its title and body as the operator reads them."""
+        return _sha12("%s\n%s" % (issue.get("title") or "", issue.get("body") or ""))
+
+    def _plan_digest(self, asks: List[Tuple[str, str, Dict[str, Any]]],
+                     covered_before: Any, today: str) -> Dict[str, Any]:
+        """Today's digest, fixed before anything is sent so a retry sends the
+        same one. Asks new or changed since the last sent digest go first,
+        newest first, so they are not buried behind old ones."""
+        prev = covered_before if isinstance(covered_before, dict) else {}
+        covered = {k: self._ask_rev(i) for k, _, i in asks}
+        new = [a for a in reversed(asks) if prev.get(a[0]) != covered[a[0]]]
+        seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
+        plan: Dict[str, Any] = {
+            "day": today, "covered": covered, "new": len(new),
+            "lines": [self._line(i) for _, _, i in new + seen], "pages": {}}
+        whole = "\n".join([self._digest_head(plan)] + plan["lines"])
+        if len(whole) <= DISCORD_MAX - MENTION_ROOM:
+            return plan
+        repos: List[str] = []
+        for _, repo, _ in asks:
+            if repo not in repos:
+                repos.append(repo)
+        plan["pages"] = {repo: {"body": self._page_body(
+            repo, [i for _, r, i in asks if r == repo], today), "url": ""}
+            for repo in repos}
+        plan["order"] = repos
+        return plan
+
+    def _page_body(self, repo: str, issues: List[Dict[str, Any]], today: str) -> str:
+        """Every ask in one repo, grouped under the goal home its body names."""
+        goals = {int(g["number"]): g for g in self._goal_issues(repo)}
+        groups: Dict[Optional[int], List[Dict[str, Any]]] = {}
+        for issue in issues:
+            refs = [int(n) for n in GOAL_REF_RE.findall(str(issue.get("body") or ""))]
+            goal = next((n for n in refs if n in goals), None)
+            groups.setdefault(goal, []).append(issue)
+        out = [DIGEST_MARKER, "Asks waiting for the operator on %s: %d in this repo."
+               % (today, len(issues))]
+        for goal in sorted(groups, key=lambda g: (g is None, g or 0)):
+            if goal is None:
+                head = "Not filed under a goal"
+            else:
+                head = "%s (#%d)" % (" ".join(str(goals[goal].get("title") or "").split()), goal)
+            out += ["", "## " + head.replace("@", "@\u200b"), ""]
+            out += ["- #%d %s" % (int(i["number"]),
+                                  " ".join(str(i.get("title") or "").split()).replace("@", "@\u200b"))
+                    for i in groups[goal]]
+        return "\n".join(out)
+
+    @staticmethod
+    def _digest_head(plan: Dict[str, Any]) -> str:
+        return "%s %d, %d new since the last digest" % (DIGEST_HEAD, len(plan["lines"]), plan["new"])
+
+    def _digest_text(self, plan: Dict[str, Any]) -> str:
+        """The daily notification: as many asks as fit, then a link per repo
+        to the full digest when some do not."""
+        lines = plan["lines"]
+        head = self._digest_head(plan)
+        pages = plan.get("pages") or {}
+        tail = ["Every ask, by goal:"] + [
+            "- %s %s" % (repo, pages[repo].get("url") or "")
+            for repo in plan.get("order") or []] if pages else []
+        room = DISCORD_MAX - MENTION_ROOM - len(head) - sum(len(t) + 1 for t in tail)
+        keep: List[str] = []
+        size = len("- and 9999 more") + 1 if pages else 0
+        for line in lines:
+            size += len(line) + 1
+            if size > room:
+                break
+            keep.append(line)
+        if len(keep) < len(lines):
+            keep.append("- and %d more" % (len(lines) - len(keep)))
+        return "\n".join([head] + keep + tail)
+
+    def _digest_issue(self, repo: str) -> int:
+        found = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                 % (repo, DIGEST_LABEL))
+        numbers = sorted(int(i["number"]) for i in found
+                         if isinstance(i, dict) and "pull_request" not in i and "number" in i)
+        if numbers:
+            return numbers[0]
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": DIGEST_TITLE, "labels": [DIGEST_LABEL],
+            "body": "The station posts the full daily digest of asks here when "
+                    "they do not all fit in the operator's notification."}).data
+        if not isinstance(made, dict) or "number" not in made:
+            raise GitHubError("no issue was created in %s" % repo)
+        return int(made["number"])
+
+    def _post_pages(self, plan: Dict[str, Any], ledger: Tuple[str, Dict[str, Any], List[str]]
+                    ) -> bool:
+        """Post each repo's full digest once; the link is kept in the plan, so
+        a retry reuses a page already posted."""
+        path, sent, _ = ledger
+        for repo in plan.get("order") or []:
+            page = plan["pages"][repo]
+            if page.get("url"):
+                continue
+            try:
+                number = self._digest_issue(repo)
+                made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                                    {"body": page["body"]}).data
+            except GitHubError as err:
+                _say("could not post the digest page in %s: %s; next pass" % (repo, err))
+                return False
+            url = made.get("html_url") if isinstance(made, dict) else None
+            if not url:
+                _say("no digest page link from %s; next pass" % repo)
+                return False
+            page["url"] = str(url)
+            _write_json(path, sent)
+        return True
+
+    def _send_digest(self, url: Optional[str], keyed: List[Tuple[str, str, Dict[str, Any]]],
+                     ledger: Tuple[str, Dict[str, Any], List[str]], today: str) -> None:
+        path, sent, _ = ledger
+        plan = sent.get("pending")
+        if not (isinstance(plan, dict) and plan.get("day") == today):
+            trust = self._check_asks(keyed, {k for k, _, _ in keyed})
+            if trust is None:
+                return
+            asks = [a for a in keyed if trust.get(a[0])]
+            if not asks:
+                return
+            plan = self._plan_digest(asks, sent.get("covered"), today)
+            sent["pending"] = plan
+            _write_json(path, sent)
+        if url is None:
+            url = self._webhook()
+        if url is None or not self._post_pages(plan, ledger):
+            return
+        if self._send(url, self._digest_text(plan)):
+            # What the operator was sent: each ask's revision and the links.
             sent["digest"] = today
+            sent["covered"] = plan["covered"]
+            sent["pages"] = {r: p["url"] for r, p in (plan.get("pages") or {}).items()}
+            del sent["pending"]
             _write_json(path, sent)
 
     def forward_asks(self) -> None:
@@ -797,18 +931,18 @@ class Station:
         self._prune_urgent(ledger, {k for k, _, _ in keyed})
         urgent_keys = {k for k, _, i in keyed
                        if URGENT in _label_names(i) and k not in ledger[2]}
-        if not urgent_keys and not digest_due:
-            return
-        trust = self._check_asks(keyed, {k for k, _, _ in keyed} if digest_due else urgent_keys)
-        if trust is None:
-            return
-        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
-        digest = [i for k, _, i in keyed if trust.get(k)] if digest_due else []
-        if not todo and not digest:
-            return
-        url = self._webhook()
-        if url is not None:
-            self._deliver(url, todo, digest, ledger, today)
+        url = None
+        # Urgent asks go out on their own: nothing the digest needs (a trust
+        # check of an old ask, a page post) can hold them.
+        trust = self._check_asks(keyed, urgent_keys) if urgent_keys else {}
+        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and (trust or {}).get(k)]
+        if todo:
+            url = self._webhook()
+            if url is None:
+                return
+            self._send_urgent(url, todo, ledger)
+        if digest_due:
+            self._send_digest(url, keyed, ledger, today)
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:

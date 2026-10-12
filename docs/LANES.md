@@ -68,10 +68,18 @@ Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
-empty nothing is forwarded). A `loom:urgent` ask is posted at once, once; all
-open asks go in one digest per day after `LOOM_DIGEST_HOUR` (local hour,
-default 9). Posts mention nobody except the numeric user id in
-`LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
+empty nothing is forwarded). A `loom:urgent` ask is posted at once, once, and
+nothing the digest needs can hold it; all open asks go in one digest per day
+after `LOOM_DIGEST_HOUR` (local hour, default 9). The digest lists asks new or
+changed since the last digest first. When the asks do not all fit in one
+message, the station posts every ask, grouped by the goal home its body names
+(`#N`), as a comment on the open `loom:digest` issue in the ask's own repo
+(created when missing), and the message links to each repo's comment. The
+digest is fixed in `state/station/asks.json` (`pending`) before it is sent, so
+a retry sends the same one; once sent, `covered` holds each ask's revision
+(a hash of its title and body) and `pages` the links. Posts mention nobody
+except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried
+on the next pass.
 
 Reports: the station also reads comments on open `loom:goal` issues in each
 `LOOM_REPOS` repo. On first run it records the newest report comment per repo
