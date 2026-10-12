@@ -113,6 +113,17 @@ lookup leaves the brief for the next pass. The rule covers:
  C++ builds) and local model inference (triage/review workers).
 - Rule: sparks power Loom. Sparks never touch a live realm.
 
+## workersai: Cloudflare Workers AI
+
+- Cloudflare Workers AI through opencode's `cloudflare-workers-ai` provider,
+  within the account's free daily allowance (about 10,000 Neurons a day; on a
+  free plan requests fail past it, on a paid plan they are billed).
+- Needs a Workers AI token (`LOOM_WORKERSAI_KEY_SSM`) and the account id it
+  belongs to (`LOOM_WORKERSAI_ACCOUNT_SSM`), both read from SSM at run time and
+  handed to the agent in its emptied environment.
+- Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
+  on prompts, so private repos are allowed.
+
 ## Adding a lane
 
 A lane is a name in `lanes/run_lane.sh`, not a directory of its own: that one

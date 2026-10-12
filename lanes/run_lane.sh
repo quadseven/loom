@@ -2,7 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
-#                               | zen | zai
+#                               | zen | zai | workersai
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -140,7 +140,8 @@ api_agent() {
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
     export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     [ "$key_var" = - ] || export "$key_var=$key"
-    [ -z "$extra" ] || export "${extra?}"
+    # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
+    while IFS= read -r kv; do [ -z "$kv" ] || export "${kv?}"; done <<< "$extra"
     exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
   ) 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
   # The agent writes into a pipe, not the log file: the log lives under HOME,
@@ -159,7 +160,8 @@ opencode_config() {
   # MODEL already passed the allowlist; refuse JSON-breaking characters here too.
   # shellcheck disable=SC1003 # matching a literal backslash
   case "$MODEL" in *'"'*|*'\'*) echo "refusing model with a quote or backslash" >&2; return 1 ;; esac
-  AGENT_EXTRA_ENV="OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"}"
+  AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
+}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"}"
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
@@ -214,7 +216,7 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai) return 0 ;; esac
   return 1
 }
 
@@ -230,6 +232,8 @@ run_agent() {
     opencode-go) opencode_config && api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     zen) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
     zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
+      opencode_config && api_agent CLOUDFLARE_API_TOKEN opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
@@ -239,7 +243,7 @@ run_agent() {
 lane_ready() {
   local cli key_ssm
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai) cli=opencode ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai) cli=opencode ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
@@ -251,6 +255,15 @@ lane_ready() {
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
     --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
   [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
+  # Cloudflare Workers AI also needs the account the token belongs to.
+  if [ "$LANE" = workersai ]; then
+    local account_ssm
+    account_ssm="$(lane_setting ACCOUNT_SSM)"
+    [ -n "$account_ssm" ] || { READY_REASON="$(lane_var ACCOUNT_SSM) is not set"; return 1; }
+    LANE_ACCOUNT="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
+      --name "$account_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+    [[ "$LANE_ACCOUNT" =~ ^[A-Za-z0-9]+$ ]] || { READY_REASON="no account id readable at $(lane_var ACCOUNT_SSM)"; return 1; }
+  fi
 }
 
 # Timeouts must be positive integers: `timeout 0` means no limit at all, and a
@@ -265,6 +278,7 @@ done
 
 AGENT_HOME="$LOOM_HOME/run/$LANE-home"
 API_KEY=""
+LANE_ACCOUNT=""
 READY_REASON=""
 if ! lane_ready; then
   heartbeat false "$READY_REASON"
@@ -301,7 +315,7 @@ for BRIEF in "$INBOX"/*.md; do
   # CLI explicitly so the PR names what actually ran.
   MODEL="$(field Model "$BRIEF" || true)"
   [ -n "$MODEL" ] || MODEL="$(lane_setting MODEL)"
-  if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/-]*$ ]]; then
+  if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/@-]*$ ]]; then
     park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
   fi
   case "$LANE:$MODEL" in
@@ -318,6 +332,8 @@ for BRIEF in "$INBOX"/*.md; do
     zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
     zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
+    workersai:cloudflare-workers-ai/@cf/*) ;;
+    workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
