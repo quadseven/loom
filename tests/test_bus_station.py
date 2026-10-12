@@ -834,6 +834,21 @@ class BrainTest(Base):
         self.assertEqual(len(self.sent), 2)
         self.assertIn("ticking again", self.sent[1])
 
+    def test_a_journal_older_than_a_day_is_not_named(self):
+        self.tick(outcome="failed", code=1, ok_age=3 * 3600)
+        self.fake.add_goal(50, [("alice-example", 25 * 3600)])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("No journal from an allowed author in the last day.", self.sent[0])
+
+    def test_a_journal_just_under_a_day_old_is_named(self):
+        self.tick(outcome="failed", code=1, ok_age=3 * 3600)
+        self.fake.add_goal(50, [("alice-example", 23 * 3600)])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Newest journal:", self.sent[0])
+        self.assertIn("%s#50" % REPO, self.sent[0])
+
     def test_a_github_read_error_sends_nothing(self):
         self.tick(outcome="failed", code=1, ok_age=3 * 3600)
         self.fake.goal_error = True

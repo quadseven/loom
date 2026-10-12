@@ -830,8 +830,11 @@ class Station:
                     login = (c.get("user") or {}).get("login")
                     body = str(c.get("body") or "").lstrip()
                     at = self._epoch(c.get("created_at", ""))
+                    # since= filters on the last edit, so an old journal
+                    # edited today still comes back: check when it was posted.
                     if (login in self.s.authors and body.startswith(JOURNAL_MARKER)
-                            and at is not None and (best is None or at > best["at"])):
+                            and at is not None and self.now - at <= JOURNAL_LOOKBACK
+                            and (best is None or at > best["at"])):
                         best = {"at": at, "goal": "%s#%d" % (repo, number)}
         return best
 
@@ -853,6 +856,27 @@ class Station:
         _write_json(path, {"checked": self.now, "journal": journal})
         return True, journal
 
+    def _brain_state(self, ok_at: Optional[float]
+                     ) -> Optional[Tuple[bool, Optional[Dict[str, Any]]]]:
+        """(fresh, newest journal), or None when GitHub cannot be read. The
+        journal is read only when the local tick files say stale."""
+        if self._brain_fresh(ok_at):
+            return True, None
+        read, journal = self._journal()
+        if not read:
+            return None
+        return bool(journal and self.now - journal["at"] <= BRAIN_STALE), journal
+
+    def _tell_brain(self, url: str, path: str, fresh: bool, last: Dict[str, Any],
+                    ok_at: Optional[float], journal: Optional[Dict[str, Any]]) -> None:
+        if fresh:
+            good = max(ok_at or 0, journal["at"] if journal else 0) or self.now
+            if self._send(url, "The Loom brain is ticking again (last good tick %s)."
+                          % self._utc(good)):
+                _write_json(path, {})
+        elif self._send(url, self._brain_alert_text(last, ok_at, journal)):
+            _write_json(path, {"sent": True, "at": self.now})
+
     def watch_brain(self) -> None:
         """Tell the operator once when the brain stops ticking, and once when
         it is back. The brain is fresh when the lane machine's own tick files
@@ -863,31 +887,20 @@ class Station:
         if brain is None:
             return
         last, ok_at = brain
+        state = self._brain_state(ok_at)
+        if state is None:
+            return
+        fresh, journal = state
         path = os.path.join(self.state, "brain-alert.json")
         alert = _read_json(path, {}, strict=False)
         alerted = isinstance(alert, dict) and alert.get("sent") is True
-        fresh = self._brain_fresh(ok_at)
-        journal = None
-        if not fresh:
-            read, journal = self._journal()
-            if not read:
-                return
-            if journal and self.now - journal["at"] <= BRAIN_STALE:
-                fresh = True
         # A message is due only when the state moved: stale and not yet told,
         # or fresh again after an alert.
         if fresh != alerted:
             return
         url = self._webhook()
-        if url is None:
-            return
-        if fresh:
-            good = max(ok_at or 0, journal["at"] if journal else 0) or self.now
-            if self._send(url, "The Loom brain is ticking again (last good tick %s)."
-                          % self._utc(good)):
-                _write_json(path, {})
-        elif self._send(url, self._brain_alert_text(last, ok_at, journal)):
-            _write_json(path, {"sent": True, "at": self.now})
+        if url is not None:
+            self._tell_brain(url, path, fresh, last, ok_at, journal)
 
     # -- one pass --------------------------------------------------------
     def run_pass(self) -> None:
