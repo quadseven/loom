@@ -84,13 +84,31 @@ class BrainTests(unittest.TestCase):
                     brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex", **kw)
                 self.assertEqual(fake.calls, [])
 
+    @staticmethod
+    def _children(*states):
+        return [{"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:" + s}]}
+                for s in states]
+
     def test_brief_capacity_refusal(self):
-        children = [{"state": "open", "labels": [{"name": "loom:ticket"}]}] * 5
+        children = self._children(*(["briefed", "running", "pr", "failed"] * 2))
         fake = Fake(reply(200, goal()), reply(200, children))
         gh = GitHub("t", transport=fake)
         with self.assertRaises(ValueError):
             brain.brief(gh, REPO, 1, "Ticket", BODY, "codex")
         self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+    def test_merged_and_shipped_tickets_hold_no_slot(self):
+        children = self._children(*(["merged", "shipped"] * 6 + ["running"] * 7))
+        fake = Fake(reply(200, goal()), reply(200, children),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        url = brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex")
+        self.assertEqual(url, "https://example.com/ticket")
+
+    def test_the_cap_comes_from_the_environment(self):
+        self.assertEqual(8, brain.goal_cap({}))
+        self.assertEqual(3, brain.goal_cap({"LOOM_GOAL_CAP": "3"}))
+        for bad in ("0", "-2", "x", ""):
+            self.assertEqual(8, brain.goal_cap({"LOOM_GOAL_CAP": bad}))
 
     def test_good_brief_creates_ticket_and_subissue(self):
         fake = Fake(reply(200, goal()), reply(200, []), reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))

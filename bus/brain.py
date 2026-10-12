@@ -14,6 +14,11 @@ from . import text
 from .labels import LANES
 
 STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
+# Tickets that hold a lane slot: waiting for a lane, in one, or back from one.
+# Merged and shipped tickets wait on a deploy or a live check, not on a lane,
+# so they never count against a goal's cap.
+IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
+DEFAULT_GOAL_CAP = 8
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
@@ -155,6 +160,13 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
         raise ValueError("body must contain all required sections")
 
 
+def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
+    """Tickets in flight per goal: LOOM_GOAL_CAP, a whole number of at least 1,
+    else DEFAULT_GOAL_CAP."""
+    raw = (os.environ if env is None else env).get("LOOM_GOAL_CAP", "")
+    return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
+
+
 def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
     try:
         goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
@@ -165,9 +177,11 @@ def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
     if goal_issue.get("state") != "open" or "loom:goal" not in _labels(goal_issue):
         raise ValueError("goal must be an open loom:goal issue")
     children = gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
-    count = sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i))
-    if count >= 5:
-        raise ValueError("goal already has 5 open tickets")
+    count = sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i)
+                and any(state in _labels(i) for state in IN_FLIGHT))
+    cap = goal_cap()
+    if count >= cap:
+        raise ValueError("goal already has %d tickets in flight (cap %d)" % (count, cap))
 
 
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
