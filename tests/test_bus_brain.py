@@ -239,6 +239,147 @@ def fix_ticket(*states):
     return {"state": "open", "labels": [{"name": n} for n in names]}
 
 
+EVIDENCE = "The owed clock stopped again after the ship.\nMeasured: 0 of 12 clocks restored in the last hour.\n"
+
+
+class GoalFake:
+    """A goal with sub-issues: enough of the issues API for brief and regress."""
+
+    def __init__(self, ordinary, cap_env="16"):
+        self.issues = {1: dict(goal(), html_url="https://example.com/1")}
+        self.children = []
+        self.calls = []
+        for n in range(ordinary):
+            self.add(100 + n, "running")
+        self.add(50, "shipped")
+        self.add(51, "shipped")
+
+    def add(self, number, state, extra=()):
+        self.issues[number] = {
+            "number": number, "id": 1000 + number, "state": "open",
+            "html_url": "https://example.com/%d" % number,
+            "labels": [{"name": n} for n in ("loom:ticket", "loom:" + state) + tuple(extra)]}
+        self.children.append(number)
+
+    def names(self, number):
+        return [x["name"] for x in self.issues[number]["labels"]]
+
+    def __call__(self, method, url, headers, body):
+        data = json.loads(body) if body else None
+        path = url.split("api.github.com")[1].split("?")[0]
+        self.calls.append((method, path, data))
+        rest = path[len("/repos/%s/" % REPO):]
+        if method == "GET" and rest == "issues/1/sub_issues":
+            return reply(200, [self.issues[n] for n in self.children])
+        if method == "POST" and rest == "issues":
+            number = max(self.issues) + 1
+            self.issues[number] = {"number": number, "id": 1000 + number, "state": "open",
+                                   "html_url": "https://example.com/%d" % number,
+                                   "labels": [{"name": n} for n in data["labels"]]}
+            return reply(201, self.issues[number])
+        if method == "POST" and rest == "issues/1/sub_issues":
+            self.children.append(data["sub_issue_id"] - 1000)
+            return reply(201, {})
+        number = int(rest.split("/")[1])
+        if method == "GET":
+            return reply(200, self.issues[number])
+        if method == "PUT":
+            self.issues[number]["labels"] = [{"name": n} for n in data["labels"]]
+            return reply(200, [])
+        if method == "PATCH":
+            self.issues[number].update(data)
+            return reply(200, {})
+        return reply(201, {})
+
+    def writes(self):
+        return [c for c in self.calls if c[0] != "GET"]
+
+
+class RegressionTests(unittest.TestCase):
+    def setUp(self):
+        old = os.environ.pop("LOOM_GOAL_CAP", None)
+        self.addCleanup(lambda: old is None or os.environ.__setitem__("LOOM_GOAL_CAP", old))
+
+    def test_a_full_goal_admits_one_regression_and_no_ordinary_brief(self):
+        fake = GoalFake(16)
+        gh = GitHub("t", transport=fake)
+        out = brain.regress(gh, REPO, 1, 50, "codex", EVIDENCE)
+        self.assertIn("17 in flight, cap 16", out)
+        self.assertEqual(fake.names(50), ["loom:ticket", "loom:briefed", "lane:codex", "loom:regression"])
+        comment = [c[2]["body"] for c in fake.writes() if c[0] == "POST"][0]
+        self.assertTrue(comment.startswith(tickets.REGRESSION_MARKER + "\nGoal: %s#1\n" % REPO))
+        self.assertIn("regression slot: 16 tickets in flight, cap 16", comment)
+        self.assertIn("Measured: 0 of 12", comment)
+        # No new issue: the shipped ticket itself went back to a lane.
+        self.assertFalse(any(c[1].endswith("/issues") for c in fake.writes()))
+        before = len(fake.writes())
+        with self.assertRaises(ValueError):
+            brain.brief(gh, REPO, 1, "Ticket", BODY, "codex")
+        self.assertEqual(len(fake.writes()), before)
+
+    def test_the_slot_holds_one_regression_and_admitting_it_again_changes_nothing(self):
+        fake = GoalFake(16)
+        gh = GitHub("t", transport=fake)
+        brain.regress(gh, REPO, 1, 50, "codex", EVIDENCE)
+        before = len(fake.writes())
+        self.assertIn("already admitted", brain.regress(gh, REPO, 1, 50, "agy", EVIDENCE))
+        with self.assertRaises(ValueError):
+            brain.regress(gh, REPO, 1, 51, "codex", EVIDENCE)
+        self.assertEqual(len(fake.writes()), before)
+        self.assertIn("loom:shipped", fake.names(51))
+        # Still taken while the regression is anywhere in flight, even below the cap.
+        fake.issues[100]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:shipped"}]
+        fake.issues[50]["labels"].append({"name": "loom:pr"})
+        with self.assertRaises(ValueError):
+            brain.regress(gh, REPO, 1, 51, "codex", EVIDENCE)
+
+    def test_the_slot_frees_once_the_regression_ships_and_capacity_recovers(self):
+        fake = GoalFake(16)
+        gh = GitHub("t", transport=fake)
+        brain.regress(gh, REPO, 1, 50, "codex", EVIDENCE)
+        brain.move(gh, REPO, 50, "shipped")
+        with self.assertRaises(ValueError):
+            brain.brief(gh, REPO, 1, "Ticket", BODY, "codex")
+        brain.regress(gh, REPO, 1, 51, "codex", EVIDENCE)
+        brain.move(gh, REPO, 101, "merged")
+        brain.move(gh, REPO, 102, "merged")
+        self.assertIn("example.com", brain.brief(gh, REPO, 1, "Ticket", BODY, "codex"))
+
+    def test_below_the_cap_a_regression_is_admitted_within_capacity(self):
+        fake = GoalFake(3)
+        brain.regress(GitHub("t", transport=fake), REPO, 1, 50, "codex", EVIDENCE)
+        comment = [c[2]["body"] for c in fake.writes() if c[0] == "POST"][0]
+        self.assertIn("Admitted within capacity: 3 tickets in flight, cap 16.", comment)
+
+    def test_a_verified_and_closed_ticket_is_reopened(self):
+        fake = GoalFake(16)
+        fake.issues[50].update(state="closed", state_reason="completed",
+                               labels=[{"name": "loom:ticket"}, {"name": "loom:verified"}])
+        brain.regress(GitHub("t", transport=fake), REPO, 1, 50, "codex", EVIDENCE)
+        self.assertEqual(fake.issues[50]["state"], "open")
+        self.assertIn("loom:briefed", fake.names(50))
+
+    def test_regress_refusals_write_nothing(self):
+        cases = [
+            (50, "codex", "No measurement.\n"),
+            (50, "bogus", EVIDENCE),
+            (100, "codex", EVIDENCE),
+            (999, "codex", EVIDENCE),
+        ]
+        for number, lane, evidence in cases:
+            with self.subTest(number=number, lane=lane):
+                fake = GoalFake(4)
+                fake.issues[999] = dict(fake.issues[50], number=999)
+                with self.assertRaises(ValueError):
+                    brain.regress(GitHub("t", transport=fake), REPO, 1, number, lane, evidence)
+                self.assertEqual(fake.writes(), [])
+        fake = GoalFake(4)
+        fake.issues[50].update(state="closed", state_reason="not_planned")
+        with self.assertRaises(ValueError):
+            brain.regress(GitHub("t", transport=fake), REPO, 1, 50, "codex", EVIDENCE)
+        self.assertEqual(fake.writes(), [])
+
+
 class FixTests(unittest.TestCase):
     def refused(self, pr, ticket=None, ref=(REPO, 9)):
         fake = Fake(reply(200, pr), reply(200, ticket or fix_ticket()))

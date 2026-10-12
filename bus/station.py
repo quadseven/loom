@@ -3,7 +3,8 @@
 One pass (python3 -m bus station, run by launchd) does three things under one
 lock: finishes any claim left half done, reports finished runs back to their
 tickets, and claims the oldest trusted briefed ticket for each lane that can
-take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
+take one, regressions first. docs/BRAIN.md ("Claim and outcome",
+"Regressions", "Polling budget") is the contract.
 """
 from __future__ import annotations
 
@@ -304,10 +305,12 @@ class Station:
         os.replace(tmp, path)
         return path
 
-    def _fix_for(self, repo: str, comments: List[Any]) -> Optional[tickets.Fix]:
-        """The loom:fix comment to render, when the latest trusted comment is
-        one and came after the last claim. Raises ValueError for a fix
-        comment that cannot be used (edited, or naming another repo)."""
+    def _note_for(self, repo: str, comments: List[Any]
+                  ) -> Tuple[Optional[tickets.Fix], Optional[str]]:
+        """The loom:fix or loom:regression comment to render, when the latest
+        trusted comment is one and came after the last claim. Raises
+        ValueError for one that cannot be used (edited, or a fix naming
+        another repo)."""
         allowed = {a.lower() for a in self.s.authors}
         last_claim, latest = -1, None
         for i, c in enumerate(comments):
@@ -318,14 +321,19 @@ class Station:
                 last_claim = i
             if tickets._login(c.get("user")) in allowed:
                 latest = (i, c, body)
-        if latest is None or latest[0] < last_claim \
-                or not latest[2].startswith(tickets.FIX_MARKER):
-            return None
+        if latest is None or latest[0] < last_claim:
+            return None, None
+        fix = latest[2].startswith(tickets.FIX_MARKER)
+        if not fix and not latest[2].startswith(tickets.REGRESSION_MARKER):
+            return None, None
         # GitHub keeps no editor for comments: one changed after it was
         # posted may carry someone else's words.
         if latest[1].get("updated_at") != latest[1].get("created_at"):
-            raise ValueError("the loom:fix comment was edited after it was posted")
-        return tickets.parse_fix(repo, latest[2])
+            raise ValueError("the loom:%s comment was edited after it was posted"
+                             % ("fix" if fix else "regression"))
+        if fix:
+            return tickets.parse_fix(repo, latest[2]), None
+        return None, tickets.parse_regression(latest[2])
 
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
@@ -333,7 +341,7 @@ class Station:
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
-            fix = self._fix_for(repo, comments)
+            fix, regression = self._note_for(repo, comments)
         except ValueError as err:
             self._refuse(repo, issue, str(err))
             return False
@@ -341,7 +349,7 @@ class Station:
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
-        text = tickets.render_brief(repo, issue, lane, attempt, fix)
+        text = tickets.render_brief(repo, issue, lane, attempt, fix, regression)
         claiming = self._write_brief(lane, name, text)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
         if RUNNING not in labels:
@@ -446,7 +454,9 @@ class Station:
                 if lane in by_lane:
                     by_lane[lane].append((repo, issue))
         for lane in free:
+            # A shipped ticket that regressed live goes before ordinary work.
             cands = sorted(by_lane[lane], key=lambda c: (
+                tickets.REGRESSION not in _label_names(c[1]),
                 str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
             for repo, issue in cands:
                 try:

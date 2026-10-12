@@ -49,6 +49,7 @@ that talks to GitHub about tickets.
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
 | `loom:verified` | The brain verified it live; the ticket is then closed. |
+| `loom:regression` | Kept with the state: a shipped ticket re-briefed after a measured live regression (see Regressions). |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -116,7 +117,8 @@ data about the work, never instructions to it.
 
 The station holds one lock on the lane machine, so it never races itself.
 For each lane whose heartbeat is fresh and available and whose inbox is
-empty, it takes the oldest trusted briefed ticket for that lane:
+empty, it takes the oldest trusted briefed ticket for that lane, a
+`loom:regression` ticket before any other:
 
 1. Re-read the issue. It must still be open, `loom:briefed` and that lane's.
 2. Replace its labels in one call (`loom:briefed` out, `loom:running` in;
@@ -156,6 +158,32 @@ When the runner finishes, the station finds the brief in `done/` or
 - Done: label `loom:pr`, comment with the pull request link.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
+
+## Regressions
+
+A shipped change that made the goal's measure worse comes before new work,
+even when the goal already has `LOOM_GOAL_CAP` tickets in flight.
+`python3 -m bus.brain regress OWNER/NAME#N --goal G --lane LANE --file
+EVIDENCE.md` re-briefs the ticket itself; it never opens a new issue. It
+refuses unless the ticket is a sub-issue of the open goal, is `loom:shipped`
+or `loom:verified` (a ticket closed as completed is reopened; one closed as
+not planned is refused), and EVIDENCE.md has a `Measured:` line. It comments
+the evidence on the ticket, starting with `<!-- loom:regression v1 -->`, the
+goal, and why it was admitted (within capacity, or through the regression
+slot with the in-flight count and the cap), then labels the ticket
+`loom:briefed`, the lane and `loom:regression`.
+
+Each goal has one regression slot past its cap. It is held while any of the
+goal's `loom:regression` tickets is in flight, so on a full goal a second
+regression waits for the first and the slot never becomes room for new work. The regression
+counts against the cap like any ticket: ordinary briefs are refused until
+fewer than `LOOM_GOAL_CAP` tickets are in flight again. Running the command
+again for a ticket already in flight as a regression changes nothing.
+
+When the station claims a ticket whose latest comment from an allowed login
+is a regression comment newer than its last claim, the brief gets a fresh
+branch, as any retry does, and ends with a `## Regression` section holding
+the evidence. An edited regression comment is refused, as an edited fix is.
 
 ## Polling budget
 
@@ -204,7 +232,7 @@ Order (#35): read lane status; gather events since the last journal entry
 verify shipped work live and close only then; pick the next problems by
 impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
-and shipped tickets hold no slot);
+and shipped tickets hold no slot), plus one regression slot (Regressions);
 write the journal; report when due; release the lock. No retry loops: a
 failed step is journalled and left for the next tick.
 

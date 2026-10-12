@@ -113,8 +113,22 @@ def parse_fix(repo: str, body: Optional[str]) -> Fix:
     return Fix(int(m.group(2)), m.group(3), "\n".join(rest).strip("\n"))
 
 
+REGRESSION = "loom:regression"
+REGRESSION_MARKER = "<!-- loom:regression v1 -->"
+
+
+def parse_regression(body: Optional[str]) -> str:
+    """The evidence in a loom:regression comment written by bus.brain regress,
+    with lines the runner could read as a header or section quoted."""
+    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].strip() != REGRESSION_MARKER:
+        raise ValueError("not a loom:regression comment")
+    rest = ["    " + l if _FIX_UNSAFE_RE.match(l) else l for l in lines[1:]]
+    return "\n".join(rest).strip("\n")
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
-                 fix: Optional[Fix] = None) -> str:
+                 fix: Optional[Fix] = None, regression: Optional[str] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -137,6 +151,10 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
                  "need and keep the rest of the work.\n\n%s\n" % (fix.pr, fix.branch, fix.findings))
+    if regression:
+        text += ("\n## Regression\n\nThis ticket shipped once and has regressed live. "
+                 "The measured evidence is below: restore what it shows is broken.\n\n%s\n"
+                 % regression)
     return text
 
 

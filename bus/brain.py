@@ -12,7 +12,7 @@ from urllib.parse import quote
 from .github import GitHub, GitHubError, token_from_env
 from . import text
 from .labels import LANES
-from .tickets import FIX_MARKER
+from .tickets import FIX_MARKER, REGRESSION, REGRESSION_MARKER
 
 STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 # Tickets that hold a lane slot: waiting for a lane, in one, or back from one.
@@ -168,7 +168,8 @@ def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
 
 
-def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
+def _goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """The sub-issues of an open loom:goal issue."""
     try:
         goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
     except GitHubError as exc:
@@ -177,9 +178,17 @@ def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
         raise
     if goal_issue.get("state") != "open" or "loom:goal" not in _labels(goal_issue):
         raise ValueError("goal must be an open loom:goal issue")
-    children = gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
-    count = sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i)
-                and any(state in _labels(i) for state in IN_FLIGHT))
+    return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
+
+
+def _in_flight(issue: Dict[str, Any]) -> bool:
+    names = _labels(issue)
+    return (issue.get("state") == "open" and "loom:ticket" in names
+            and any(state in names for state in IN_FLIGHT))
+
+
+def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
+    count = sum(1 for i in _goal_children(gh, repo, goal) if _in_flight(i))
     cap = goal_cap()
     if count >= cap:
         raise ValueError("goal already has %d tickets in flight (cap %d)" % (count, cap))
@@ -207,6 +216,59 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
             {"sub_issue_id": issue["id"]})
     return str(issue.get("html_url", ""))
+
+
+def _check_regress_args(lane: str, evidence: str) -> None:
+    if lane not in LANES:
+        raise ValueError("unknown lane")
+    if not re.search(r"^Measured:[ \t]*\S", evidence, re.M):
+        raise ValueError("regression evidence needs a Measured: line")
+    _check_written_text(evidence)
+
+
+def _regression_comment(repo: str, goal: int, count: int, cap: int, evidence: str) -> str:
+    if count >= cap:
+        why = ("Admitted through the goal's regression slot: %d tickets in flight, cap %d. "
+               "Ordinary briefs wait until fewer than %d are in flight." % (count, cap, cap))
+    else:
+        why = "Admitted within capacity: %d tickets in flight, cap %d." % (count, cap)
+    return "\n".join([REGRESSION_MARKER, "Goal: %s#%d" % (repo, goal), why, "",
+                      evidence.strip(), ""])
+
+
+def regress(gh: GitHub, repo: str, goal: int, number: int, lane: str, evidence: str) -> str:
+    """Send a shipped ticket that regressed live back to a lane. Each goal has
+    one slot past its cap for this, held while a loom:regression ticket is in
+    flight; the ticket is re-briefed, never copied into a new issue."""
+    _check_regress_args(lane, evidence)
+    children = _goal_children(gh, repo, goal)
+    if not any(int(c.get("number", 0)) == number for c in children):
+        raise ValueError("ticket is not a sub-issue of the goal")
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    names = _labels(issue)
+    url = str(issue.get("html_url", ""))
+    if REGRESSION in names and _in_flight(issue):
+        return "%s already admitted as a regression" % url
+    if "loom:ticket" not in names or not ("loom:shipped" in names or "loom:verified" in names):
+        raise ValueError("only a shipped or verified ticket can regress")
+    if issue.get("state") != "open" and issue.get("state_reason") == "not_planned":
+        raise ValueError("a ticket closed as not planned cannot regress")
+    others = [c for c in children if int(c.get("number", 0)) != number and _in_flight(c)]
+    count, cap = len(others), goal_cap()
+    held = any(REGRESSION in _labels(c) for c in others)
+    if count >= cap and (held or count > cap):
+        raise ValueError("goal already has %d tickets in flight (cap %d) and its "
+                         "regression slot is %s" % (count, cap, "taken" if held else "past the cap"))
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+            {"body": _regression_comment(repo, goal, count, cap, evidence)})
+    kept = _moved_labels(names, "briefed", lane)
+    if REGRESSION not in kept:
+        kept.append(REGRESSION)
+    if issue.get("state") != "open":
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+    return "%s re-briefed for lane %s as a regression (%d in flight, cap %d)" % (
+        url, lane, count + 1, cap)
 
 
 def _check_move_args(state: str, lane: Optional[str], note: Optional[str]) -> None:
@@ -505,6 +567,7 @@ def parser() -> argparse.ArgumentParser:
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True)
+    rg = sub.add_parser("regress"); rg.add_argument("ticket"); rg.add_argument("--goal", type=int, required=True); rg.add_argument("--lane", required=True); rg.add_argument("--file", required=True)
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
@@ -538,6 +601,11 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
     move(gh, repo, number, args.to, args.lane, args.note)
 
 
+def _cmd_regress(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    print(regress(gh, repo, args.goal, number, args.lane, _read(args.file)))
+
+
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     close(gh, repo, number, args.reason, args.note)
@@ -561,7 +629,7 @@ def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
-            "fix": _cmd_fix}
+            "fix": _cmd_fix, "regress": _cmd_regress}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

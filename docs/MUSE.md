@@ -90,12 +90,20 @@ tickets and pull requests like any other work.
    one exact ask in its body. The station forwards every open ask to the
    operator, so an ask left open is a message to the operator's phone.
 7. Fill every free lane slot with the highest-ranked work (The brain's job),
-   regressions first, with
+   regressions first. A shipped or verified ticket whose change regressed a
+   measured metric goes back to a lane as itself, never as a new issue, with
+   `python3 -m bus.brain regress OWNER/NAME#N --goal G --lane LANE --file EVIDENCE.md`
+   (EVIDENCE.md holds a `Measured:` line with the metric before and now).
+   Each goal has one regression slot past its cap, so this works even when
+   the goal is full; running it again for the same ticket changes nothing.
+   Other work goes out with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
 8. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
-   goal's measure.
+   goal's measure. A regression admitted with `regress` gets the line the
+   command printed (why it bypassed the cap), and every later journal links
+   its next measured result until the metric is back.
    Every 2 hours per goal (when the goal's newest report is 2 hours old or
    there is none), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
