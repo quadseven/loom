@@ -75,9 +75,13 @@ tickets and pull requests like any other work.
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. Verify shipped tickets against the live system named in the ticket. Then
-   run `python3 -m bus.brain move OWNER/NAME#N --to verified`, then close the
-   ticket with `python3 -m bus.brain close OWNER/NAME#N`.
+4. Verify shipped tickets against the live system named in the ticket. Tick
+   each acceptance criterion in the ticket body only once you have seen it
+   hold, write the proof record (docs/BRAIN.md, Proof), then run
+   `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
+   and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
+   refuse a missing proof or an unchecked criterion: never invent evidence to
+   get past them; leave the ticket open and say what is missing.
 5. Handle `loom:failed` tickets. Re-brief with a sharper brief or another
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
