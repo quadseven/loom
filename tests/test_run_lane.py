@@ -76,12 +76,18 @@ fi
 """
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
-# only edits it the way a sandboxed codex must ($FAKE_AGENT=edit), or exits
-# non-zero ($FAKE_AGENT=fail).
+# only edits it the way a sandboxed codex must ($FAKE_AGENT=edit), exits
+# non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits $FAKE_EXIT,
+# editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
+if [ "${FAKE_AGENT:-commit}" = say ]; then
+  [ -z "${FAKE_EDIT:-}" ] || echo partial > fix.txt
+  printf '%s\\n' "$FAKE_OUT"
+  exit "${FAKE_EXIT:-1}"
+fi
 echo fixed > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
@@ -885,6 +891,102 @@ class LaneRunnerTest(unittest.TestCase):
         self.log.write_text("")
         self.run_lane()
         self.assertEqual(self.calls(), [])
+
+    def failure_line(self, ticket="T042-fix-the-thing", lane="codex"):
+        lines = [l for l in (self.loom / "logs" / lane / (ticket + ".log")).read_text().splitlines()
+                 if " failed: " in l]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0].split(" failed: ", 1)[1]
+
+    def beat(self, lane="codex"):
+        return json.loads((self.loom / "state" / "usage" / (lane + ".json")).read_text())
+
+    # (agent output, exit status, edited the tree, expected class)
+    SAMPLES = [
+        ("Claude AI usage limit reached|1999999999", 1, False, "limit"),
+        ('API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}', 1, True, "limit"),
+        ("Error: You exceeded your current quota, please check your plan", 1, True, "limit"),
+        ("ProviderError: HTTP 402 Payment Required", 1, False, "limit"),
+        ("Rate limit hit. Please try again in 20 minutes.", 0, False, "limit"),
+        ("TypeError: fetch failed (ECONNRESET)", 1, True, "transient"),
+        ('API Error: 529 {"type":"overloaded_error"}', 1, True, "transient"),
+        ("panic: something broke before any edit", 1, False, "transient"),
+        ("killed", 137, True, "transient"),
+        ("FAILED tests/test_x.py::test_y - AssertionError at line 429", 1, True, "work"),
+        ("I looked and there is nothing to change.", 0, False, "work"),
+    ]
+
+    def test_each_failure_is_classed_from_the_agents_exit_and_output(self):
+        for out, status, edited, want in self.SAMPLES:
+            with self.subTest(out=out):
+                for d in ("logs", "state", "briefs"):
+                    shutil.rmtree(self.loom / d, ignore_errors=True)
+                self.inbox.mkdir(parents=True)
+                self.drop_brief()
+                env = {"FAKE_AGENT": "say", "FAKE_OUT": out, "FAKE_EXIT": str(status)}
+                if edited:
+                    env["FAKE_EDIT"] = "1"
+                result = self.run_lane(**env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+                self.assertTrue(self.failure_line().startswith("[%s] " % want), self.failure_line())
+                self.assertEqual(self.beat()["available"], want != "limit")
+
+    def test_a_limit_holds_the_lane_unavailable_until_the_providers_reset(self):
+        reset = int(time.time()) + 7200
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="Claude AI usage limit reached|%d" % reset)
+        self.assertIn("provider limit reached", self.failure_line())
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertEqual(beat["retry_at"], reset)
+        # Later passes take no brief and read no key until the reset.
+        self.drop_brief("T043-next.md", BRIEF.replace("T042-fix-the-thing", "T043-next"))
+        self.log.write_text("")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.inbox / "T043-next.md").exists())
+        self.assertFalse(self.beat()["available"])
+        self.assertEqual(self.beat()["retry_at"], reset)
+
+    def test_a_limit_without_a_reset_waits_an_hour(self):
+        before = int(time.time())
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="Error: 429 Too Many Requests")
+        self.assertTrue(before + 3600 <= self.beat()["retry_at"] <= int(time.time()) + 3600)
+
+    def test_a_limit_with_a_retry_after_waits_that_long(self):
+        before = int(time.time())
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="status 429: retry after 120 seconds")
+        self.assertTrue(before + 120 <= self.beat()["retry_at"] <= int(time.time()) + 120)
+
+    def test_a_lane_takes_work_again_once_its_retry_time_passed(self):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        (usage / "codex.json").write_text(json.dumps(
+            {"lane": "codex", "at": 1, "available": False, "reason": "limit",
+             "retry_at": int(time.time()) - 5}))
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat()["available"])
+        self.assertNotIn("retry_at", self.beat())
+
+    def test_a_finished_run_that_mentions_rate_limits_still_opens_its_pr(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EDIT="1", FAKE_EXIT="0",
+                               FAKE_OUT="Added a rate limit and a quota check; HTTP 429 now.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat()["available"])
+
+    def test_a_refusal_by_a_guard_is_a_work_failure(self):
+        self.drop_brief(text=BRIEF.replace("Repo: example/repo", "Repo: stranger/repo"))
+        self.run_lane()
+        self.assertTrue(self.failure_line().startswith("[work] owner stranger"))
 
     def test_brief_aimed_at_a_non_loom_branch_is_refused_before_running(self):
         self.drop_brief(text=BRIEF.replace("Branch: loom/T042-fix-the-thing", "Branch: hotfix"))

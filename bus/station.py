@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -60,6 +61,32 @@ JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 JOURNAL_CHECK = 600
 JOURNAL_LOOKBACK = 24 * 3600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
+# Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
+# each failure reason with its class; a reason without one is a work failure.
+CLASS_RE = re.compile(r"^\[(limit|transient|work)\] ")
+RETRY_CLASSES = ("limit", "transient")
+RETRY_MAX = 2
+RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
+                      r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
+# The brain's lane order for a retry, after the failed lane's own provider.
+# claude is never chosen: it spends the operator's own subscription.
+RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
+               "codex", "codex-2", "opencode-go", "agy"]
+# Free lanes take only easy tickets on public repos.
+FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
+# The model families each lane's runner accepts (lanes/run_lane.sh); codex
+# takes any model outside the claude family.
+CLAUDE_MODELS = ["claude*", "opus*", "sonnet*", "haiku*", "fable*"]
+LANE_MODELS = {
+    "claude": CLAUDE_MODELS,
+    "anthropic": ["claude*"],
+    "openrouter": ["openrouter/*:free"],
+    "opencode-go": ["opencode-go/*"],
+    "zen": ["opencode/*-free"],
+    "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
+    "workersai": ["cloudflare-workers-ai/@cf/*"],
+    "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
+}
 
 SecretReader = Callable[[str, str], str]
 Poster = Callable[[str, Dict[str, Any]], None]
@@ -69,7 +96,7 @@ class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
                  mention: str = "", digest_hour: int = 9,
-                 region: str = "us-east-1") -> None:
+                 region: str = "us-east-1", retry_max: int = RETRY_MAX) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -79,6 +106,7 @@ class Settings:
         self.mention = mention
         self.digest_hour = digest_hour
         self.region = region
+        self.retry_max = retry_max
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -93,13 +121,19 @@ class Settings:
             hour = 9
         if not 0 <= hour <= 23:
             hour = 9
+        try:
+            retry_max = int(env.get("LOOM_RETRY_MAX", "").strip() or RETRY_MAX)
+        except ValueError:
+            retry_max = RETRY_MAX
+        retry_max = max(retry_max, 0)
         return cls(home, words("LOOM_REPOS"), words("LOOM_BRIEF_AUTHORS"),
                    words("LOOM_REPO_OWNERS"),
                    status_repo=env.get("LOOM_STATUS_REPO", "").strip() or _origin_repo(),
                    webhook_ssm=env.get("LOOM_DISCORD_WEBHOOK_SSM", "").strip(),
                    mention=env.get("LOOM_DISCORD_MENTION", "").strip(),
                    digest_hour=hour,
-                   region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1")
+                   region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
+                   retry_max=retry_max)
 
 
 def _origin_repo() -> str:
@@ -194,6 +228,53 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
     """The one lane the issue names, or None when it names none or several."""
     lanes = [n[len("lane:"):] for n in _label_names(issue) if n.startswith("lane:")]
     return lanes[0] if len(lanes) == 1 and lanes[0] in LANES else None
+
+
+def provider(lane: str) -> str:
+    """The provider lane of a slot (anthropic-2 -> anthropic), as the runner
+    maps it."""
+    return re.sub(r"-[0-9]+$", "", lane)
+
+
+def failure_class(reason: str) -> str:
+    m = CLASS_RE.match(reason)
+    return m.group(1) if m else "work"
+
+
+def lane_takes_model(lane: str, model: str) -> bool:
+    """Whether the lane's runner accepts the model (lanes/run_lane.sh)."""
+    lane = provider(lane)
+    if lane == "codex":
+        return not any(fnmatch.fnmatchcase(model, p) for p in CLAUDE_MODELS)
+    return any(fnmatch.fnmatchcase(model, p) for p in LANE_MODELS.get(lane, []))
+
+
+def needs_public_repo(lane: str, model: str) -> bool:
+    """Free lanes, and lanes whose provider trains on prompts, take public
+    repos only."""
+    lane = provider(lane)
+    return (lane in FREE_LANES or lane == "agy"
+            or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
+
+
+def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]]]:
+    """(automatic retries since the ticket last went to the brain or opened a
+    pull request, the lanes those retries left, and (from, to) of the latest
+    retry when no claim has followed it: a retry whose relabel did not
+    happen yet)."""
+    used, left, pending = 0, set(), None
+    for c in comments:
+        body = str(c.get("body") or "").strip() if isinstance(c, dict) else ""
+        m = RETRY_RE.match(body)
+        if m:
+            used += 1
+            left.add(m.group(1))
+            pending = (m.group(1), m.group(2))
+        elif body.startswith("Lane "):
+            used, left, pending = 0, set(), None
+        elif CLAIM_RE.fullmatch(body):
+            pending = None
+    return used, left, pending
 
 
 def scrub(reason: str) -> str:
@@ -536,10 +617,99 @@ class Station:
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         reason = self._failure_reason(lane, name)
+        fix_pr = self._field(text, "Fix-PR")
+        if fix_pr:
+            # A fresh attempt would open a second pull request for the ticket.
+            self._relabel(repo, number, "loom:pr")
+            self._comment(repo, number, "Lane %s failed: %s. This was a fix round on pull "
+                          "request #%s; the ticket is back at loom:pr and the pull request "
+                          "is unchanged." % (lane, reason, fix_pr))
+            _say("reported %s#%d fix failed, back to loom:pr: %s" % (repo, number, reason))
+            return True
+        klass = failure_class(reason)
+        note = ""
+        if klass in RETRY_CLASSES:
+            note = self._retry(repo, number, lane, klass, reason)
+            if not note:
+                return True
+            note = ". Not retried: %s." % note
         self._relabel(repo, number, "loom:failed")
-        self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
+        self._comment(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
+        """Brief a running ticket to another lane after a limit or transient
+        failure. Its next claim is a new attempt, so a fresh branch. Returns ""
+        when it moved, else why not."""
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if RUNNING not in names:
+            return "the ticket is no longer running"
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        used, left, pending = retry_chain(comments)
+        if pending and pending[0] == lane:
+            # An earlier pass commented this retry but did not relabel.
+            target = pending[1]
+        else:
+            if used >= self.s.retry_max:
+                return "%d of %d automatic retries used" % (used, self.s.retry_max)
+            target = self._retry_lane(repo, issue, lane, klass, left | {lane})
+            if target is None:
+                return "no other eligible lane is available"
+            # The comment comes first: it is the count of retries, and it tells
+            # a pass that finds the relabel undone where the ticket was going.
+            self._comment(repo, number, "Automatic retry %d of %d (%s): moved from lane %s "
+                          "to lane %s. Lane %s failed: %s"
+                          % (used + 1, self.s.retry_max, klass, lane, target, lane, reason))
+        labels = [n for n in names if n != RUNNING and not n.startswith("lane:")]
+        labels += [BRIEFED, "lane:" + target]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        _say("retrying %s#%d on lane %s after a %s failure on lane %s"
+             % (repo, number, target, klass, lane))
+        return ""
+
+    def _retry_lane(self, repo: str, issue: Dict[str, Any], failed: str, klass: str,
+                    skip: set) -> Optional[str]:
+        """The next eligible lane: another slot of the failed lane's provider
+        (not after a limit, which the slots share), then RETRY_ORDER, then free
+        lanes for an easy ticket. Only available lanes whose runner takes the
+        ticket's model and repo; an idle one before a busy one."""
+        try:
+            headers = tickets.parse(issue.get("body"))[0]
+        except ValueError:
+            headers = {}
+        model = headers.get("Model", "")
+        same = [l for l in LANES if provider(l) == provider(failed)]
+        order = ([] if klass == "limit" else same) + RETRY_ORDER
+        if headers.get("Difficulty") == "easy":
+            order += FREE_LANES
+        public: Optional[bool] = None
+        busy = None
+        for cand in dict.fromkeys(order):
+            if cand in skip or cand not in LANES or not self._heartbeat_ok(cand):
+                continue
+            if klass == "limit" and provider(cand) == provider(failed):
+                continue
+            if model and not lane_takes_model(cand, model):
+                continue
+            if needs_public_repo(cand, model):
+                if public is None:
+                    public = self._public(repo)
+                if not public:
+                    continue
+            if self._inbox_empty(cand):
+                return cand
+            busy = busy or cand
+        return busy
+
+    def _public(self, repo: str) -> bool:
+        try:
+            data = self.gh.rest("GET", "/repos/%s" % repo).data
+        except GitHubError as err:
+            _say("could not read whether %s is public: %s" % (repo, err))
+            return False
+        return isinstance(data, dict) and data.get("private") is False
 
     def _failure_reason(self, lane: str, name: str) -> str:
         log = os.path.join(self.s.home, "logs", lane, name + ".log")

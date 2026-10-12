@@ -13,7 +13,11 @@
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
 # failed/ (the run did not produce one). A brief is never run twice, so a
-# crash or restart cannot turn into a re-run loop. The agent edits (and
+# crash or restart cannot turn into a re-run loop. Each failure is classed
+# limit, transient or work in its log line; the station may re-brief a limit
+# or transient failure to another lane as a new attempt on a fresh branch.
+# A limit failure also holds this lane unavailable until the provider's reset
+# (else 60 minutes). The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
 # A fix brief (a Fix-PR: <number> line, from the station) instead works on
 # that open PR's existing branch: it pushes fast-forward only and comments on
@@ -111,14 +115,63 @@ lane_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$LANE" | tr '[:lower:]-' '[:upp
 lane_setting() { local v; v="$(lane_var "$1")"; printf '%s' "${!v:-}"; }
 
 # Each pass records whether this lane can take work. The dispatcher routes
-# only to lanes with a fresh, available heartbeat.
+# only to lanes with a fresh, available heartbeat. An optional third argument
+# is the epoch time a provider limit lifts; until then every pass stays
+# unavailable without reading the key or taking a brief.
+BEAT="$LOOM_HOME/state/usage/$SLOT.json"
 heartbeat() {
-  local reason
+  local reason retry=""
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
   reason="$(printf '%s' "$2" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
+  [[ "${3:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $3"
   mkdir -p "$LOOM_HOME/state/usage"
-  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"}\n' \
-    "$SLOT" "$(date +%s)" "$1" "$reason" > "$LOOM_HOME/state/usage/$SLOT.json"
+  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s}\n' \
+    "$SLOT" "$(date +%s)" "$1" "$reason" "$retry" > "$BEAT.tmp" && mv "$BEAT.tmp" "$BEAT"
+}
+
+utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
+
+# What ended a failed run, from the tail of the agent's output. A provider
+# limit: a usage, rate or quota limit, or an HTTP 429 or 402 answer. A
+# transient fault: the network or the provider's servers. The patterns look
+# at the last lines only, so a ticket that is about rate limits does not
+# read as one.
+LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network error|fetch failed|connection (reset|refused|closed)|could not resolve host|overloaded|service unavailable|bad gateway|gateway timeout|internal server error|(http|status|code|error)[^0-9a-z]{0,3}(500|502|503|504|529)([^0-9]|$)'
+# When the provider says its limit lifts: an epoch after "limit reached|" or a
+# "reset" key, or a "retry after" / "try again in" / "resets in" duration.
+EPOCH_RE='(limit reached\||reset[a-z_-]*["'"'"': =]+)([0-9]{10})([^0-9]|$)'
+AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^a-z]|$)'
+LIMIT_WAIT=3600
+LIMIT_WAIT_MAX=86400
+
+# Sets FAIL_CLASS (limit, transient or work) for a run that ended with exit
+# status $1 and output $2, where $3 is "edited" when the agent changed the
+# tree. On limit also sets RETRY_AT. A crash before any edit, a timeout, a
+# signal or a network fault is transient; anything else is work.
+classify_failure() {
+  local status="$1" out="$2" edited="$3" now n
+  FAIL_CLASS=work RETRY_AT=""
+  now="$(date +%s)"
+  shopt -s nocasematch
+  if [[ "$out" =~ $LIMIT_RE ]]; then
+    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
+    if [[ "$out" =~ $EPOCH_RE ]]; then
+      RETRY_AT="${BASH_REMATCH[2]}"
+    elif [[ "$out" =~ $AFTER_RE ]]; then
+      n="${BASH_REMATCH[2]}"
+      case "${BASH_REMATCH[3]}" in h*) n=$((n * 3600)) ;; m*) n=$((n * 60)) ;; esac
+      RETRY_AT=$((now + n))
+    fi
+    [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
+    [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX))
+  elif [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
+       [[ "$out" =~ $NET_RE ]]; then
+      FAIL_CLASS=transient
+    fi
+  fi
+  shopt -u nocasematch
 }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
@@ -158,9 +211,11 @@ fix_items() {
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
-# The orchestrator reads failed/ and re-briefs by hand.
+# The reason starts with the failure's class ($3, default work): the station
+# re-briefs limit and transient failures to another lane as a new attempt,
+# and leaves work failures to the brain.
 park() {
-  echo "[$(date -u +%FT%TZ)] $TICKET failed: $2" | tee -a "$LOG" >&2
+  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
   mv "$1" "$INBOX/failed/"
 }
 
@@ -470,6 +525,13 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1"; do
   fi
 done
 
+# A provider limit hit by an earlier pass holds until its retry time.
+LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+if [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
+  heartbeat false "provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" "$LIMIT_UNTIL"
+  exit 0
+fi
+
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 API_KEY=""
 LANE_ACCOUNT=""
@@ -577,9 +639,10 @@ for BRIEF in "$INBOX"/*.md; do
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
-    park "$BRIEF" "clone or branch failed"; continue
+    park "$BRIEF" "clone or branch failed" transient; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
+  LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
@@ -592,7 +655,22 @@ for BRIEF in "$INBOX"/*.md; do
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
+  EDITED=""
+  { [ -n "$(safe_git status --porcelain)" ] || [ "$(safe_git rev-parse HEAD)" != "$BASE" ]; } && EDITED=edited
+  # Only a run that failed or changed nothing is classed: a finished run's
+  # summary may well mention rate limits.
+  FAIL_CLASS=work
+  if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
+    classify_failure "$STATUS" "$(tail -c +$((LOG_START + 1)) "$LOG" | tail -n 40)" "$EDITED"
+  fi
+  if [ "$FAIL_CLASS" = limit ]; then
+    # Unavailable before the brief is parked, so the station never sends
+    # this lane the retry. The rest of the inbox waits for the reset.
+    heartbeat false "provider limit reached; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    park "$BRIEF" "agent exited $STATUS: provider limit reached; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    break
+  fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
@@ -612,7 +690,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   # Never forced: a branch that moved on the remote refuses the push.
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
-    park "$BRIEF" "push failed"; continue
+    park "$BRIEF" "push failed" transient; continue
   fi
   if [ -n "$FIX_PR" ]; then
     ITEMS="$(fix_items "$BRIEF")"
