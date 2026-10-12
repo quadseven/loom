@@ -3,7 +3,7 @@
 #
 #   lanes/mac/install.sh [lane ...]
 #     default: codex claude openrouter opencode-go anthropic zen zai workersai agy,
-#     plus the extra slots anthropic-2 anthropic-3 anthropic-4 codex-2
+#     plus the extra slots anthropic-2 to anthropic-8, codex-2 and opencode-go-2
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
@@ -44,7 +44,8 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy
-  anthropic-2 anthropic-3 anthropic-4 codex-2)
+  anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
+  codex-2 opencode-go-2)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
