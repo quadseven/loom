@@ -124,6 +124,35 @@ lookup leaves the brief for the next pass. The rule covers:
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
 
+## agy: the Google plan, as a separate macOS user
+
+- agy (Google's Antigravity CLI) on the operator's Google plan, called
+  directly with the brief in print mode and `--mode accept-edits` (never
+  wrapped in another agent). Its catalog includes Gemini, Claude and GPT-OSS
+  models (`gemini-*`, `claude-*`, `gpt-oss-*`); default
+  `gemini-3.8-flash-high`.
+- agy keeps its sign-in in the macOS keychain. A sandboxed agent that can
+  reach the keychain server could ask for any of the operator's keychain
+  entries, so the agent runs as a dedicated standard macOS user (default
+  `loom`) instead: the runner starts it with `sudo -n -u loom`, in that user's
+  emptied environment, inside the sandbox (keychain server allowed, loopback
+  and everything else denied as for the other API lanes).
+- Public repos only: whether the plan trains on prompts is not established.
+- One-time setup, done by the operator:
+  1. Create the standard user, hidden, and store its password in SSM.
+  2. `chmod 700` the operator's home: the new user shares the `staff` group,
+     so a `750` home would still let it in.
+  3. A sudoers rule letting the operator's user run commands as `loom` (a
+     step down in privilege, not up): `<operator> ALL=(loom) NOPASSWD: ALL`.
+  4. A shared work folder under the user's home with inherited ACLs for both
+     users (`LOOM_AGY_WORKDIR`).
+  5. A keychain for the user that is not named `login` (a `login` keychain
+     will not unlock from the command line), set as its default, no
+     auto-lock, password from step 1 (`LOOM_AGY_KEYCHAIN`, `LOOM_AGY_KEY_SSM`).
+  6. Install agy for the user and sign it in once, in a shell as that user.
+- Each run unlocks that keychain first (it locks again on reboot), passing
+  the password on stdin to a shell running as the lane user.
+
 ## Adding a lane
 
 A lane is a name in `lanes/run_lane.sh`, not a directory of its own: that one

@@ -2,7 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
-#                               | zen | zai | workersai
+#                               | zen | zai | workersai | agy
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -44,6 +44,17 @@ REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$LANE"
+# The agy lane's agent runs as a dedicated macOS user (default "loom") that
+# cannot read this user's home or keychain. agy keeps its sign-in in that
+# user's own keychain, a non-"login" keychain (a "login" keychain will not
+# unlock from the command line), unlocked with its password from SSM.
+AGY_USER="${LOOM_AGY_USER:-loom}"
+AGY_HOME="${LOOM_AGY_HOME:-/Users/$AGY_USER}"
+AGY_BIN="${LOOM_AGY_BIN:-$AGY_HOME/.local/bin/agy}"
+AGY_KEYCHAIN="${LOOM_AGY_KEYCHAIN:-$AGY_HOME/Library/Keychains/loom.keychain-db}"
+if [ -n "${LOOM_AGY_RUNAS:-}" ]; then AGY_RUNAS=("$LOOM_AGY_RUNAS"); else AGY_RUNAS=(sudo -n -u "$AGY_USER" -H); fi
+# Its trees live in a folder both users can write (ACLs set up with the user).
+[ "$LANE" = agy ] && WORKDIR="${LOOM_AGY_WORKDIR:-$AGY_HOME/lanes}"
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
@@ -92,12 +103,16 @@ park() {
 # log need it; a fresh clone holds no credentials) but not writable: a planted
 # hook or config would run when the runner commits. Also no keychain, no Unix
 # sockets except DNS (an SSH agent's socket would hand over its keys), and no
-# AppleEvents, LaunchServices, osascript, open or launchctl (each can run a
-# command outside the sandbox), and no connections to this machine's own
+# AppleEvents, LaunchServices, osascript, open, launchctl, sudo or su (each can
+# run a command outside the sandbox or as another user), and no connections to this machine's own
 # loopback services (the transcript viewer serves other lanes' sessions). Paths are canonical, because the sandbox
 # matches resolved paths; proper ancestors get metadata-only literals so
 # getcwd and realpath still work without making HOME listable.
 sandbox_profile() {
+  # The agy lane reaches the keychain server: it runs as the lane user, whose
+  # only keychain is its own. Every other lane is denied it.
+  local keychain_deny='(global-name "com.apple.SecurityServer") '
+  [ "$LANE" = agy ] && keychain_deny=""
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
@@ -121,8 +136,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
+    "$home" "$allow_rw" "$(agy_write_rules "$allow_rw")" "$tree" "$allow_ro" "$meta" "$keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -138,6 +153,7 @@ api_agent() {
     keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV"
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
+    # shellcheck disable=SC2030 # deliberately local to the agent's subshell
     export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     [ "$key_var" = - ] || export "$key_var=$key"
     # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
@@ -149,6 +165,68 @@ api_agent() {
   # pipefail carries the agent's exit status through `cat`. The reader has its
   # own deadline: a process the agent detached into another process group
   # survives `timeout` and would hold the pipe, and the lane lock, open.
+}
+
+# The agy lane's agent runs as the lane user, so that user's home is its real
+# home, not a scratch one. It may write only its tree, its TMPDIR, agy's state
+# directory, and the keychain and caches agy needs; agy's settings, binaries
+# and built-in skills stay read-only, and so does everything else there (shell
+# startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
+AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache)
+AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
+agy_write_rules() {
+  [ "$LANE" = agy ] || return 0
+  local h s
+  h="$(cd "$AGY_HOME" && pwd -P)" || return 1
+  s="$h/.gemini/antigravity-cli"
+  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Keychains") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
+    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s"
+}
+
+# agy remembers past conversations (brain, summaries, annotations) and reads
+# them back. Before each run, delete everything in its state directory except
+# the sign-in and install state, so nothing one ticket's agent left behind
+# reaches the next.
+agy_forget() {
+  local s="$AGY_HOME/.gemini/antigravity-cli"
+  # shellcheck disable=SC2016 # expanded by the lane user's shell
+  "${AGY_RUNAS[@]}" /bin/bash -c '
+    s="$1"; shift; keep=" "; cache_keep=" "
+    while [ "$1" != -- ]; do keep="$keep$1 "; shift; done; shift
+    for k in "$@"; do cache_keep="$cache_keep$k "; done
+    [ -d "$s" ] || exit 0
+    # Kept entries are real files and directories. A link an agent left in
+    # their place is removed, never followed: the forget would otherwise
+    # delete through it, into the keychain folder or another ticket'"'"'s tree.
+    for e in "$s"/* "$s"/.[!.]*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      [ -L "$e" ] && { rm -f "$e" || exit 1; continue; }
+      case "$keep" in *" ${e##*/} "*) continue ;; esac
+      rm -rf "$e" || exit 1
+    done
+    [ -d "$s/cache" ] || exit 0
+    for e in "$s"/cache/* "$s"/cache/.[!.]*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      [ -L "$e" ] && { rm -f "$e" || exit 1; continue; }
+      case "$cache_keep" in *" ${e##*/} "*) continue ;; esac
+      rm -rf "$e" || exit 1
+    done' agy-forget "$s" "${AGY_STATE_KEEP[@]}" -- "${AGY_CACHE_KEEP[@]}"
+}
+
+# The agy lane: unlock the lane user's keychain (password on stdin to a shell
+# running as that user, never in this process's argv), then run agy as that
+# user in an emptied environment inside the sandbox, edits only. The runner,
+# as this user, commits, pushes and opens the PR from the shared tree.
+agy_agent() {
+  local profile
+  AGENT_HOME="$AGY_HOME/tmp"
+  "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
+  agy_forget || { echo "could not clear agy's memory of earlier runs" >&2; return 3; }
+  profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
+  # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
+  "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
+    LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
+    "$AGY_BIN" -p "$1" --mode accept-edits --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
 }
 
 # opencode runs helper agents (session titles) on its own default small model,
@@ -210,7 +288,7 @@ fresh_agent_home() {
 # Lanes and models whose provider may train on prompts (docs/LANES.md lists
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
-  case "$LANE:$MODEL" in zen:*|zai:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  case "$LANE:$MODEL" in zen:*|zai:*|agy:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
   return 1
 }
 
@@ -235,6 +313,7 @@ run_agent() {
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_config && api_agent CLOUDFLARE_API_TOKEN opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
+    agy) agy_agent "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
 }
@@ -242,6 +321,14 @@ run_agent() {
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
 lane_ready() {
   local cli key_ssm
+  if [ "$LANE" = agy ]; then
+    command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
+    "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
+      { READY_REASON="cannot run $AGY_BIN as $AGY_USER"; return 1; }
+    agy_key || return 1
+    agy_unlock
+    return
+  fi
   case "$LANE" in
     codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai) cli=opencode ;;
     *) READY_REASON="unknown lane"; return 1 ;;
@@ -255,6 +342,36 @@ lane_ready() {
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
     --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
   [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
+  lane_extra_ready
+}
+
+# The agy lane's "key" is its keychain password (LOOM_AGY_KEY_SSM).
+agy_key() {
+  local key_ssm
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
+  API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
+    --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+  [ -n "$API_KEY" ] || { READY_REASON="no keychain password readable at $(lane_var KEY_SSM)"; return 1; }
+}
+
+# Unlock the lane user's keychain (it locks again on reboot), only when a
+# brief is waiting. `security -i` reads its command from stdin, so the
+# password never appears in any process's argv. A keychain that will not
+# unlock makes the lane unavailable; its briefs wait.
+agy_unlock() {
+  compgen -G "$INBOX/*.md" > /dev/null || return 0
+  # security -i splits its command line on whitespace and treats quotes and
+  # backslashes specially; only a password free of them unlocks as written.
+  # printf is a builtin, so the password reaches no process's argv.
+  case "$API_KEY" in *[!A-Za-z0-9._~+=/@%:,^-]*)
+    READY_REASON="the agy lane keychain password has characters security -i would split; use letters, digits and ._~+=/@%:,^-"; return 1 ;;
+  esac
+  printf 'unlock-keychain -p %s %s\n' "$API_KEY" "$AGY_KEYCHAIN" | "${AGY_RUNAS[@]}" security -i > /dev/null 2>&1 ||
+    { READY_REASON="could not unlock the agy lane keychain $AGY_KEYCHAIN"; return 1; }
+}
+
+lane_extra_ready() {
   # Cloudflare Workers AI also needs the account the token belongs to.
   if [ "$LANE" = workersai ]; then
     local account_ssm
@@ -333,6 +450,8 @@ for BRIEF in "$INBOX"/*.md; do
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
     zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
     workersai:cloudflare-workers-ai/@cf/*) ;;
+    agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
+    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then

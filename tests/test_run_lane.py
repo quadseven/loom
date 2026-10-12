@@ -134,6 +134,43 @@ printf '%s\\n' "$val"
 """
 
 
+# Fake "become the lane user" command: runs its arguments as-is and records
+# that it was used. Production uses sudo to the dedicated macOS user.
+FAKE_RUNAS = """#!/usr/bin/env bash
+printf 'runas %s\\n' "$1" >> "$FAKE_LOG"
+exec "$@"
+"""
+
+# Fake security: records unlock-keychain calls and whether the password
+# matched $FAKE_KC_PW, never the password itself. It splits its stdin line on
+# whitespace as security -i does; the runner refuses passwords containing
+# whitespace, quotes or backslashes, where the two could disagree.
+FAKE_SECURITY = """#!/usr/bin/env bash
+# Interactive mode reads one command per line from stdin, so a password
+# never appears in argv; record whether argv carried one.
+if [ "$1" = -i ]; then IFS= read -r line; set -- $line; via=stdin; else via=argv; fi
+if [ "$1" = unlock-keychain ]; then
+  if [ "$3" = "$FAKE_KC_PW" ]; then ok=pw-ok; else ok=pw-bad; fi
+  printf 'security unlock-keychain %s %s via=%s\\n' "$4" "$ok" "$via" >> "$FAKE_LOG"
+  [ "$ok" = pw-ok ] || exit 51
+fi
+"""
+
+# Fake agy: records its flags and working dir, then edits a file.
+FAKE_AGY = """#!/usr/bin/env bash
+args="$*"; args="${args//$'\\n'/ }"
+G="$HOME/.gemini"
+# What a previous run left in agy's memory, and whether this run can plant
+# config that would steer the next one.
+if [ -e "$G/antigravity-cli/brain/planted.md" ]; then mem=leftover; else mem=clean; fi
+if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
+if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" >> "$TMPDIR/agy.log"
+mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
+echo fixed > fix.txt
+"""
+
+
 def git(*args, cwd=None):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
@@ -414,6 +451,127 @@ class LaneRunnerTest(unittest.TestCase):
             LOOM_WORKERSAI_MODEL="openrouter/vendor/model:free",
         )
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, **env):
+        lane_home = Path(self._tmp.name) / "loomuser"
+        workdir = lane_home / "lanes"
+        (lane_home / "tmp").mkdir(parents=True)
+        workdir.mkdir()
+        # agy's real state: config, and memory a previous run left behind.
+        (lane_home / ".gemini" / "config").mkdir(parents=True)
+        (lane_home / ".gemini" / "config" / "mcp_config.json").write_text("{}")
+        (lane_home / ".gemini" / "antigravity-cli" / "brain").mkdir(parents=True)
+        (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
+        (lane_home / ".zshrc").write_text("# lane user shell\n")
+        (lane_home / ".gemini" / "antigravity-cli" / "installation_id").write_text("install-1")
+        if cache_link is None:
+            (lane_home / ".gemini" / "antigravity-cli" / "cache").mkdir()
+        else:
+            (lane_home / ".gemini" / "antigravity-cli" / "cache").symlink_to(cache_link)
+        (lane_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json").write_text("{}")
+        (lane_home / ".gemini" / "antigravity-cli" / "cache" / "last_conversations.json").write_text("[]")
+        agy = lane_home / "agy"
+        self.write_tool(agy, FAKE_AGY)
+        self.write_tool(self.bin / "security", FAKE_SECURITY)
+        runas = Path(self._tmp.name) / "runas"
+        self.write_tool(runas, FAKE_RUNAS if runas_ok else "#!/usr/bin/env bash\nexit 1\n")
+        inbox = self.loom / "briefs" / "agy"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: agy"))
+        result = self.run_lane(
+            "agy",
+            LOOM_AGY_RUNAS=str(runas),
+            LOOM_AGY_HOME=str(lane_home),
+            LOOM_AGY_WORKDIR=str(workdir),
+            LOOM_AGY_BIN=str(agy),
+            LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
+            LOOM_AGY_KEY_SSM="/k/kc",
+            LOOM_AGY_MODEL=model,
+            **{"FAKE_KC_PW": "fake-kc-password", "FAKE_SECRET__k_kc": "fake-kc-password", **env},
+        )
+        agy_log = lane_home / "tmp" / "agy.log"
+        return inbox, workdir, result, (agy_log.read_text().splitlines() if agy_log.exists() else [])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_forget_never_deletes_through_a_link_an_earlier_run_left(self):
+        # A previous agent swapped agy's cache directory for a link to the
+        # keychain folder; clearing the cache must not empty the keychains.
+        victim = Path(self._tmp.name) / "keychains"
+        victim.mkdir()
+        (victim / "loom.keychain-db").write_text("keychain")
+        inbox, workdir, result, agy = self.agy_lane(cache_link=victim)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((victim / "loom.keychain-db").read_text(), "keychain")
+        self.assertFalse((workdir.parent / ".gemini" / "antigravity-cli" / "cache").is_symlink())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_unlocks_its_keychain_then_runs_as_the_lane_user(self):
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        unlocks = [i for i, c in enumerate(calls) if c.startswith("security unlock-keychain")]
+        self.assertEqual(len(unlocks), 1, calls)
+        self.assertIn("loom.keychain-db pw-ok via=stdin", calls[unlocks[0]])
+        self.assertEqual(len(agy), 1, (calls, result.stderr))
+        self.assertIn("-p # Brief: T042-fix-the-thing", agy[0])
+        self.assertIn("--mode accept-edits", agy[0])
+        self.assertIn("--model gemini-3.8-flash-high", agy[0])
+        self.assertIn(f"cwd={workdir.resolve()}/T042-fix-the-thing", agy[0])
+        # Nothing from a previous run reaches this one, and this run cannot
+        # plant config or shell startup files for the next.
+        self.assertIn("mem=clean", agy[0])
+        self.assertIn("cfg=locked", agy[0])
+        self.assertIn("rc=locked", agy[0])
+        # Sign-in and install state survive the wipe; conversation lists do not.
+        state = workdir.parent / ".gemini" / "antigravity-cli"
+        self.assertEqual((state / "installation_id").read_text(), "install-1")
+        self.assertTrue((state / "cache" / "onboarding.json").exists())
+        self.assertFalse((state / "cache" / "last_conversations.json").exists())
+        # The wipe itself, checked on disk: the planted memory is gone.
+        self.assertFalse((state / "brain" / "planted.md").exists())
+        self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):
+        inbox, _, result, agy = self.agy_lane(FAKE_KC_PW="some-other-password")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("unlock", beat["reason"])
+
+    def test_agy_lane_refuses_a_keychain_password_security_would_split(self):
+        pw = "two words"
+        inbox, _, result, agy = self.agy_lane(FAKE_KC_PW=pw, FAKE_SECRET__k_kc=pw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        self.assertFalse(any(c.startswith("security") for c in self.calls()))
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("security -i would split", beat["reason"])
+        self.assertNotIn(pw, beat["reason"])
+
+    def test_agy_lane_is_unavailable_when_it_cannot_become_the_lane_user(self):
+        inbox, _, result, agy = self.agy_lane(runas_ok=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
+        self.assertFalse(beat["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_refuses_a_model_outside_its_catalog(self):
+        inbox, _, _, agy = self.agy_lane(model="openrouter/vendor/model:free")
+        self.assertEqual(agy, [])
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_takes_public_repos_only(self):
+        inbox, _, _, agy = self.agy_lane(FAKE_GH_PRIVATE="true")
+        self.assertEqual(agy, [])
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
