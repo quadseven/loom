@@ -6,3 +6,5 @@ worktrees/
 .env
 .DS_Store
 lanes/opencode/config.json
+__pycache__/
+*.pyc

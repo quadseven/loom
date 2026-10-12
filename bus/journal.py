@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Iterable, Union
 
+from . import text as _text
 from .github import GitHub
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
@@ -56,5 +57,6 @@ def render_report(when, holder, measure, shipped, in_flight, blocked,
 def post(gh: GitHub, repo: str, issue_number: int, text: str):
     if not text.startswith((JOURNAL_MARKER, REPORT_MARKER)):
         raise ValueError("comment must start with a loom journal or report marker")
+    _text.check(text)
     return gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue_number)),
                    {"body": text})
