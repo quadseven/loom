@@ -4,7 +4,8 @@ At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
 Run every command from that checkout. Set `LOOM_GITHUB_TOKEN` and
 `LOOM_REPOS` (space separated `OWNER/NAME` values). Use `muse` as your lock
-holder. The lock lives in `quadseven/loom`.
+holder (the lane machine's tick uses its own name and takes the lock for
+you). The lock lives in `quadseven/loom`.
 
 ## Tick
 
@@ -27,11 +28,18 @@ holder. The lock lives in `quadseven/loom`.
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
    `python3 -m bus.brain close OWNER/NAME#N --reason not_planned --note TEXT`.
-6. Brief new tickets up to capacity with
+6. Read every open `needs-operator` issue in `LOOM_REPOS`. Do yourself
+   whatever does not need the operator's own hands, money, accounts or a
+   decision the goal home reserves for the operator: fix it, ticket it, or
+   record the decision the evidence supports. Then comment what was done and
+   remove the label. Keep an ask only when only the operator can do it, with
+   one exact ask in its body. The station forwards every open ask to the
+   operator, so an ask left open is a message to the operator's phone.
+7. Brief new tickets up to capacity with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
-7. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`.
+8. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`.
    Every 2 hours, write the report too.
-8. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
+9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
 
 ## Lane choice

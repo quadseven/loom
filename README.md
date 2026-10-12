@@ -50,6 +50,9 @@ Loom serves all active goals.
    their briefs and reports each outcome on the ticket. Set `LOOM_REPOS`,
    `LOOM_BRIEF_AUTHORS` (GitHub logins) and `LOOM_REPO_OWNERS` when you
    install; with `LOOM_REPOS` empty it stays idle. See docs/BRAIN.md.
+   It also adds the brain tick (`com.loom.brain`, every 30 minutes), which
+   runs one docs/MUSE.md tick with the claude CLI under the brain lock
+   (`LOOM_BRAIN=0` leaves it out).
 4. Run `dispatch/dispatch.py` on a schedule (every 30 min).
 5. Run the tests, the same command CI runs:
    `python -B -m unittest discover -s tests -v`.

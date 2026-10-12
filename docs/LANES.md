@@ -17,6 +17,17 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
 
+## The brain tick
+
+`lanes/mac/install.sh` also installs `com.loom.brain`, which runs
+`lanes/mac/brain.sh` every `LOOM_BRAIN_INTERVAL` seconds (default 1800). A
+tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
+before any model call), updates its own clone of this repo under
+`$LOOM_HOME/brain`, runs `claude -p` (model `LOOM_BRAIN_MODEL`, default the
+current Opus) on docs/MUSE.md with a hard stop of `LOOM_BRAIN_MINUTES`
+(default 40), and releases the lock, also after a failure. It logs to
+`$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it.
+
 ## The station
 
 `lanes/mac/install.sh` also installs `com.loom.station`, which runs
