@@ -43,6 +43,13 @@ URGENT = "loom:urgent"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+REPORT_MARKER = "<!-- loom:report v1 -->"
+# Reports come every 2 hours, so the goal homes are read at most this often,
+# and only for comments since the last read (with an overlap; the ledger of
+# comment ids keeps a report from going out twice).
+REPORT_CHECK = 300
+REPORT_OVERLAP = 3600
+REPORT_FIRST_LOOKBACK = 24 * 3600
 # A brain tick runs every 30 minutes; no tick ending well for this long means
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
@@ -297,15 +304,44 @@ class Station:
         os.replace(tmp, path)
         return path
 
-    def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
-        """Steps 2 and 3 for an issue already re-read and trusted."""
+    def _fix_for(self, repo: str, comments: List[Any]) -> Optional[tickets.Fix]:
+        """The loom:fix comment to render, when the latest trusted comment is
+        one and came after the last claim. Raises ValueError for a fix
+        comment that cannot be used (edited, or naming another repo)."""
+        allowed = {a.lower() for a in self.s.authors}
+        last_claim, latest = -1, None
+        for i, c in enumerate(comments):
+            if not isinstance(c, dict):
+                continue
+            body = str(c.get("body") or "")
+            if CLAIM_RE.fullmatch(body.strip()):
+                last_claim = i
+            if tickets._login(c.get("user")) in allowed:
+                latest = (i, c, body)
+        if latest is None or latest[0] < last_claim \
+                or not latest[2].startswith(tickets.FIX_MARKER):
+            return None
+        # GitHub keeps no editor for comments: one changed after it was
+        # posted may carry someone else's words.
+        if latest[1].get("updated_at") != latest[1].get("created_at"):
+            raise ValueError("the loom:fix comment was edited after it was posted")
+        return tickets.parse_fix(repo, latest[2])
+
+    def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
+        """Steps 2 and 3 for an issue already re-read and trusted. False when
+        its fix comment cannot be used (refused, as an untrusted ticket is)."""
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        try:
+            fix = self._fix_for(repo, comments)
+        except ValueError as err:
+            self._refuse(repo, issue, str(err))
+            return False
         earlier = sum(1 for c in comments
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
-        text = tickets.render_brief(repo, issue, lane, attempt)
+        text = tickets.render_brief(repo, issue, lane, attempt, fix)
         claiming = self._write_brief(lane, name, text)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
         if RUNNING not in labels:
@@ -317,6 +353,7 @@ class Station:
                       % (lane, _sha12(issue.get("body")))})
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
+        return True
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -369,7 +406,8 @@ class Station:
             os.remove(path)
             self._refuse(repo, issue, reason)
             return
-        self._claim(repo, lane, issue)
+        if not self._claim(repo, lane, issue):
+            os.remove(path)
 
     def _heartbeat_ok(self, lane: str) -> bool:
         beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
@@ -437,8 +475,7 @@ class Station:
                 or fresh.get("updated_at") != issue.get("updated_at"):
             _say("%s#%s changed since it was checked; next pass" % (repo, issue["number"]))
             return False
-        self._claim(repo, lane, fresh)
-        return True
+        return self._claim(repo, lane, fresh)
 
     # -- outcomes -------------------------------------------------------
     def _finished_briefs(self):
@@ -494,7 +531,8 @@ class Station:
                 _say("no pull request found yet for %s (%s)" % (name, branch))
                 return False
             self._relabel(repo, number, "loom:pr")
-            self._comment(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
+            verb = "pushed fixes to" if self._field(text, "Fix-PR") else "opened"
+            self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         reason = self._failure_reason(lane, name)
@@ -640,9 +678,9 @@ class Station:
     def _line(issue: Dict[str, Any]) -> str:
         return "- %s %s" % (" ".join(str(issue.get("title") or "").split()), issue["html_url"])
 
-    def _send(self, url: str, content: str) -> bool:
+    def _send(self, url: str, content: str, mention: bool = True) -> bool:
         allowed: Dict[str, Any] = {"parse": []}
-        if self.s.mention.isdigit():
+        if mention and self.s.mention.isdigit():
             content = "<@%s> %s" % (self.s.mention, content)
             allowed["users"] = [self.s.mention]
         try:
@@ -771,6 +809,107 @@ class Station:
         url = self._webhook()
         if url is not None:
             self._deliver(url, todo, digest, ledger, today)
+
+    # -- goal reports -----------------------------------------------------
+    def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
+        data = self.gh.paginate(
+            "/repos/%s/issues?labels=loom:goal&state=open&per_page=100" % repo)
+        return [i for i in (data if isinstance(data, list) else [])
+                if isinstance(i, dict) and "pull_request" not in i
+                and "number" in i]
+
+    @staticmethod
+    def _report_id(comment: Dict[str, Any]) -> int:
+        try:
+            return int(comment.get("id", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _report_text(self, issue: Dict[str, Any], comment: Dict[str, Any]) -> str:
+        title = " ".join(str(issue.get("title") or "").split())
+        body = str(comment.get("body") or "")[len(REPORT_MARKER):].lstrip("\r\n ")
+        link = str(comment.get("html_url") or issue.get("html_url") or "")
+        prefix = title + "\n"
+        suffix = "\n" + link if link else ""
+        room = DISCORD_MAX - len(prefix) - len(suffix)
+        if len(body) > room:
+            # Keep whole report lines and reserve the comment link at the end.
+            body = body[:max(0, room)].rsplit("\n", 1)[0]
+        return (prefix + body + suffix)[:DISCORD_MAX]
+
+    def _report_comments(self, repo: str, issues: List[Dict[str, Any]], since: str
+                         ) -> List[Tuple[int, Dict[str, Any], Dict[str, Any]]]:
+        comments = []
+        for issue in issues:
+            path = "/repos/%s/issues/%d/comments?since=%s" % (
+                repo, int(issue["number"]), since)
+            for comment in self.gh.paginate(path):
+                if (isinstance(comment, dict)
+                        and str(comment.get("body") or "").startswith(REPORT_MARKER)):
+                    comments.append((self._report_id(comment), issue, comment))
+        comments.sort(key=lambda row: row[0])
+        return comments
+
+    def _forward_repo_reports(self, repo: str, comments: List[Tuple[int, Dict[str, Any], Dict[str, Any]]],
+                              ledger: Dict[str, Any], path: str, allowed: set) -> bool:
+        key = repo.replace("/", ".")
+        if key not in ledger:
+            ledger[key] = max((ident for ident, _, _ in comments), default=0)
+            return True
+        try:
+            last_id = int(ledger[key])
+        except (TypeError, ValueError):
+            last_id = 0
+        url = None
+        webhook_checked = False
+        for ident, issue, comment in comments:
+            if ident <= last_id:
+                continue
+            author = str((comment.get("user") or {}).get("login") or "").lower()
+            if author in allowed:
+                if not webhook_checked:
+                    url = self._webhook()
+                    webhook_checked = True
+                if url is None:
+                    # Unreadable webhook: keep the position and the read time,
+                    # so the next pass reads this window again.
+                    return False
+                if not self._send(url, self._report_text(issue, comment), mention=False):
+                    _write_json(path, ledger)
+                    return False
+            ledger[key] = ident
+            last_id = ident
+        return True
+
+    def forward_reports(self) -> None:
+        if not self.s.webhook_ssm:
+            return
+        path = os.path.join(self.state, "reports.json")
+        ledger = _read_json(path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        checked = ledger.get("_checked")
+        if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
+                and 0 <= self.now - checked < REPORT_CHECK):
+            return
+        start = (checked - REPORT_OVERLAP
+                 if isinstance(checked, (int, float)) and not isinstance(checked, bool)
+                 else self.now - REPORT_FIRST_LOOKBACK)
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+        allowed = {a.lower() for a in self.s.authors}
+        # Forget repos that left LOOM_REPOS, so the ledger stays their size.
+        keep = {r.replace("/", ".") for r in self.s.repos} | {"_checked"}
+        for stale in [k for k in ledger if k not in keep]:
+            del ledger[stale]
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = self._goal_issues(repo)
+            comments = self._report_comments(repo, issues, since)
+            if not self._forward_repo_reports(repo, comments, ledger, path, allowed):
+                return
+        ledger["_checked"] = self.now
+        _write_json(path, ledger)
 
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
@@ -907,7 +1046,8 @@ class Station:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
-        for step in (self.publish_lanes, self.forward_asks, self.watch_brain):
+        for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
+                     self.watch_brain):
             try:
                 step()
             except (GitHubError, OSError) as err:

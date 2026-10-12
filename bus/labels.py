@@ -8,6 +8,11 @@ from .github import GitHub
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy"]
+# Extra slots: parallel copies of a lane on the same provider (run_lane.sh
+# maps a slot to its lane). anthropic has credits that expire, so it gets the
+# most; claude has none, because it spends the operator's own subscription.
+SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "codex-2"]
+LANES = LANES + SLOTS
 
 # name -> (6-hex color, short ASCII description)
 LABELS: Dict[str, Dict[str, str]] = {

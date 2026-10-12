@@ -131,6 +131,25 @@ A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
 
+A lane pull request with failing checks or review findings goes back to its
+lane, not to the brain: `python3 -m bus.brain fix OWNER/NAME#PR --ticket
+OWNER/NAME#N --file FINDINGS.md` refuses unless the pull request is open, on
+a same-repo `loom/` branch and linked to the ticket (its `Refs` line or its
+branch number), and the ticket is `loom:pr`. It comments the findings on the
+ticket, starting with `<!-- loom:fix v1 -->` and naming the pull request and
+its branch (the failing checks with the last lines of their logs, each
+unresolved review thread with its id, path, line and text), then moves the
+ticket back to `loom:briefed` on the same lane.
+
+When the station claims a ticket whose latest comment from an allowed login
+is such a fix comment, newer than its last claim, the brief keeps the pull
+request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
+section holding the comment. A fix comment edited after it was posted is
+refused, as an untrusted ticket is. The runner then checks out that branch,
+pushes the agent's work onto it (fast-forward only, never forced) and
+comments on the pull request; it never opens a second one. A fix brief whose
+pull request is no longer open is parked as failed.
+
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
 
@@ -183,7 +202,7 @@ Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review and ship ready pull requests
 (read every diff, green checks and the review bot, answer every thread);
 verify shipped work live and close only then; pick the next problems by
-impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 8)
+impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
 and shipped tickets hold no slot);
 write the journal; report when due; release the lock. No retry loops: a
