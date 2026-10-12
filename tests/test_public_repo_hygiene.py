@@ -5,10 +5,12 @@ and load a credential helper from another machine's home directory.
 """
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
-DISPATCH = Path(__file__).resolve().parent.parent / "dispatch"
+ROOT = Path(__file__).resolve().parent.parent
+DISPATCH = ROOT / "dispatch"
 
 # Writing a ref or a file through the GitHub API, or pushing with git.
 WRITES_TO_GITHUB = re.compile(r"git/refs|git/commits|/contents/|git\s+push")
@@ -34,6 +36,32 @@ class DispatchHygiene(unittest.TestCase):
     def test_no_dispatch_code_names_a_home_directory(self):
         for name, text in self.sources().items():
             self.assertIsNone(HOME_PATH.search(text), name)
+
+
+class RepoText(unittest.TestCase):
+    """Every tracked file is ASCII: lanes write prose here, and an em dash or a
+    smart quote slips in unnoticed unless a test says so."""
+
+    def tracked(self):
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        files = [ROOT / p for p in out.stdout.decode().split("\0") if p]
+        self.assertTrue(files)
+        return files
+
+    # Copied verbatim from the shared public-repo rules in infra-public, as in
+    # the operator's other public repos; it changes there, not here.
+    VENDORED = {"AGENTS.md"}
+
+    def test_every_tracked_file_is_ascii(self):
+        bad = []
+        for f in self.tracked():
+            if not f.is_file() or f.relative_to(ROOT).as_posix() in self.VENDORED:
+                continue
+            for n, line in enumerate(f.read_bytes().splitlines(), 1):
+                if any(b > 0x7F for b in line):
+                    bad.append("%s:%d" % (f.relative_to(ROOT), n))
+        self.assertEqual(bad, [], "non-ASCII text: " + ", ".join(bad[:20]))
 
 
 if __name__ == "__main__":
