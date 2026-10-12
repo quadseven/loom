@@ -213,6 +213,14 @@ agy_forget() {
     done' agy-forget "$s" "${AGY_STATE_KEEP[@]}" -- "${AGY_CACHE_KEEP[@]}"
 }
 
+# agy stores its token so that /usr/bin/security may read it without a
+# prompt, and agy itself reads it that way, so the sandbox cannot forbid that
+# tool. Any shell command the agent ran could therefore copy the token out.
+# The lane stays edits-only (never --dangerously-skip-permissions): print mode
+# soft-denies shell commands, and a denied command ends the run with no
+# output, so the brief says so up front. Slash commands and skills stay off.
+AGY_TOOLS_NOTE="Tools on this lane: shell commands are not available here, and asking for one ends the run. Read files with your file viewing and search tools, and change them with your edit tools only."
+
 # The agy lane: unlock the lane user's keychain (password on stdin to a shell
 # running as that user, never in this process's argv), then run agy as that
 # user in an emptied environment inside the sandbox, edits only. The runner,
@@ -226,7 +234,9 @@ agy_agent() {
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
     LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
-    "$AGY_BIN" -p "$1" --mode accept-edits --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
+    "$AGY_BIN" -p "$1
+
+$AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
 }
 
 # opencode runs helper agents (session titles) on its own default small model,

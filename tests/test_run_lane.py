@@ -516,6 +516,11 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(len(agy), 1, (calls, result.stderr))
         self.assertIn("-p # Brief: T042-fix-the-thing", agy[0])
         self.assertIn("--mode accept-edits", agy[0])
+        # Edits only: no shell commands (the lane user's keychain hands agy's
+        # token to /usr/bin/security without a prompt), no skill expansion.
+        self.assertIn("--disable-slash-commands", agy[0])
+        self.assertNotIn("--dangerously-skip-permissions", agy[0])
+        self.assertIn("shell commands are not available", agy[0])
         self.assertIn("--model gemini-3.8-flash-high", agy[0])
         self.assertIn(f"cwd={workdir.resolve()}/T042-fix-the-thing", agy[0])
         # Nothing from a previous run reaches this one, and this run cannot

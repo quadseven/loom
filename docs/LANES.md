@@ -137,6 +137,13 @@ lookup leaves the brief for the next pass. The rule covers:
   `loom`) instead: the runner starts it with `sudo -n -u loom`, in that user's
   emptied environment, inside the sandbox (keychain server allowed, loopback
   and everything else denied as for the other API lanes).
+- Edits only. agy stores its token so that `/usr/bin/security` can read it
+  without a prompt, and reads it that way itself, so the sandbox cannot block
+  that tool; a shell command from the agent could copy the token out. The
+  runner never passes `--dangerously-skip-permissions`, passes
+  `--disable-slash-commands`, and tells agy in the brief that shell commands
+  are unavailable (print mode soft-denies them, and a denied command ends the
+  run with no output).
 - Public repos only: whether the plan trains on prompts is not established.
 - One-time setup, done by the operator:
   1. Create the standard user, hidden, and store its password in SSM.
