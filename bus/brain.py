@@ -18,7 +18,7 @@ STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "
 # Merged and shipped tickets wait on a deploy or a live check, not on a lane,
 # so they never count against a goal's cap.
 IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
-DEFAULT_GOAL_CAP = 8
+DEFAULT_GOAL_CAP = 16
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"

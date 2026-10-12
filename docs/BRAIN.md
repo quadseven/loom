@@ -183,7 +183,7 @@ Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review and ship ready pull requests
 (read every diff, green checks and the review bot, answer every thread);
 verify shipped work live and close only then; pick the next problems by
-impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 8)
+impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
 and shipped tickets hold no slot);
 write the journal; report when due; release the lock. No retry loops: a
