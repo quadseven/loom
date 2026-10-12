@@ -84,7 +84,7 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 FAKE_OPENCODE = """#!/usr/bin/env bash
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
-for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_TOKEN; do
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY; do
   if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
 done
 real_home="$(cd ../../.. && pwd)"
@@ -435,7 +435,7 @@ class LaneRunnerTest(unittest.TestCase):
         agent = [c for c in calls if c.startswith("opencode ")]
         self.assertEqual(len(agent), 1, calls)
         self.assertIn("-m cloudflare-workers-ai/@cf/vendor/model", agent[0])
-        self.assertIn("keyvar=CLOUDFLARE_API_TOKEN key=fake-cf-token", agent[0])
+        self.assertIn("keyvar=CLOUDFLARE_API_KEY key=fake-cf-token", agent[0])
         self.assertIn("account=fakeaccount0123", calls)
         self.assertIn("small=cloudflare-workers-ai/@cf/vendor/model", agent[0])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
