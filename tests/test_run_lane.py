@@ -84,7 +84,7 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 FAKE_OPENCODE = """#!/usr/bin/env bash
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
-for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY; do
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_TOKEN; do
   if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
 done
 real_home="$(cd ../../.. && pwd)"
@@ -94,6 +94,7 @@ if /usr/bin/osascript -e 'return 1' > /dev/null 2>&1; then osa=ran; else osa=den
 small="$(printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | sed -nE 's/.*"small_model": *"([^"]+)".*/\\1/p')"
 port="$(printf '%s' "$args" | sed -nE 's/.*PROBE_PORT=([0-9]+).*/\\1/p')"
 if [ -n "$port" ] && /usr/bin/nc -z -w 1 127.0.0.1 "$port" > /dev/null 2>&1; then lo=reachable; else lo=denied; fi
+printf 'account=%s\\n' "${CLOUDFLARE_ACCOUNT_ID:-none}" >> "$TMPDIR/agent.log"
 procs="$(ps -axo args= 2>/dev/null)"
 case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
 printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s lo=%s small=%s\\n' "$args" \\
@@ -381,6 +382,39 @@ class LaneRunnerTest(unittest.TestCase):
             if p.is_file() and not p.is_symlink():
                 self.assertNotIn("private key", p.read_text())
                 self.assertNotIn("another lane's file", p.read_text())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_workersai_lane_gets_its_token_and_account_id(self):
+        inbox, result = self.api_lane(
+            "workersai",
+            LOOM_WORKERSAI_KEY_SSM="/k/cf",
+            FAKE_SECRET__k_cf="fake-cf-token",
+            LOOM_WORKERSAI_ACCOUNT_SSM="/k/acct",
+            FAKE_SECRET__k_acct="fakeaccount0123",
+            LOOM_WORKERSAI_MODEL="cloudflare-workers-ai/@cf/vendor/model",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        agent = [c for c in calls if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, calls)
+        self.assertIn("-m cloudflare-workers-ai/@cf/vendor/model", agent[0])
+        self.assertIn("keyvar=CLOUDFLARE_API_TOKEN key=fake-cf-token", agent[0])
+        self.assertIn("account=fakeaccount0123", calls)
+        self.assertIn("small=cloudflare-workers-ai/@cf/vendor/model", agent[0])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_workersai_lane_refuses_a_model_from_elsewhere(self):
+        inbox, _ = self.api_lane(
+            "workersai",
+            LOOM_WORKERSAI_KEY_SSM="/k/cf",
+            FAKE_SECRET__k_cf="fake-cf-token",
+            LOOM_WORKERSAI_ACCOUNT_SSM="/k/acct",
+            FAKE_SECRET__k_acct="fakeaccount0123",
+            LOOM_WORKERSAI_MODEL="openrouter/vendor/model:free",
+        )
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_openrouter_lane_refuses_a_paid_model(self):
