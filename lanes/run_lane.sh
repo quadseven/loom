@@ -41,6 +41,7 @@ INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
 mkdir -p "$INBOX/done" "$INBOX/failed" "$LOOM_HOME/run"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # The process groups in the tree under pid $1: the agent's job-control
 # subshell and everything below it. `timeout` puts itself in a group of its
@@ -155,6 +156,15 @@ fix_items() {
   awk '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
        on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
        END {print out}' "$1" | cut -c1-500
+}
+
+# Reconcile the generated title/body sections of an existing PR with the
+# approved ticket revision in the brief, preserving reviewer-authored text
+# outside those sections. Scope changes are logged with old/new body hashes.
+# Exit: 0 = updated, 1 = no change needed, 2 = refused, 3 = gh/helper error.
+repair_pr_text() {
+  NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
+    --apply "$FIX_PR" --repo "$REPO" "$BRIEF" "$LANE" "$MODEL" "$TICKET"
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
@@ -602,25 +612,47 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
   fi
-  if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
-    park "$BRIEF" "agent made no commit on $BRANCH"; continue
+  COMMITTED=0
+  if [ "$(safe_git rev-parse "$BRANCH")" != "$BASE" ]; then
+    COMMITTED=1
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
     park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
   fi
+  # For fix-mode briefs, reconcile generated PR sections with the approved
+  # ticket revision. A metadata-only repair is a valid outcome.
+  METADATA_CHANGED=0
+  if [ -n "$FIX_PR" ]; then
+    if repair_pr_text >> "$LOG" 2>&1; then
+      METADATA_CHANGED=1
+    fi
+  fi
+  if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ]; then
+    park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
+  fi
   # Never forced: a branch that moved on the remote refuses the push.
-  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
-    park "$BRIEF" "push failed"; continue
+  if [ "$COMMITTED" -eq 1 ]; then
+    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
+      park "$BRIEF" "push failed"; continue
+    fi
   fi
   if [ -n "$FIX_PR" ]; then
     ITEMS="$(fix_items "$BRIEF")"
-    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" \
-         --body "Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}" >> "$LOG" 2>&1; then
+    if [ "$COMMITTED" -eq 1 ]; then
+      COMMENT="Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}"
+    else
+      COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
+    fi
+    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" --body "$COMMENT" >> "$LOG" 2>&1; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
-    echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    if [ "$COMMITTED" -eq 1 ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    else
+      echo "[$(date -u +%FT%TZ)] $TICKET done, PR text repaired on #$FIX_PR" >> "$LOG"
+    fi
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
