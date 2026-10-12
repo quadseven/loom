@@ -701,6 +701,17 @@ class Station:
         urgent_sent = sent.get("urgent") if isinstance(sent.get("urgent"), list) else []
         return path, sent, urgent_sent
 
+    @staticmethod
+    def _prune_urgent(ledger: Tuple[str, Dict[str, Any], List[str]], open_keys: set) -> None:
+        """Forget urgent asks that are no longer open, so the ledger stays the
+        size of the open asks (a reopened urgent ask is sent again)."""
+        path, sent, urgent_sent = ledger
+        kept = [k for k in urgent_sent if k in open_keys]
+        if len(kept) != len(urgent_sent):
+            urgent_sent[:] = kept
+            sent["urgent"] = urgent_sent
+            _write_json(path, sent)
+
     def _today_and_digest_due(self, sent: Dict[str, Any]) -> Tuple[str, bool]:
         local = time.localtime(self.now)
         today = time.strftime("%Y-%m-%d", local)
@@ -730,6 +741,7 @@ class Station:
         keyed = self._gather_asks()
         if keyed is None:
             return
+        self._prune_urgent(ledger, {k for k, _, _ in keyed})
         urgent_keys = {k for k, _, i in keyed
                        if URGENT in _label_names(i) and k not in ledger[2]}
         if not urgent_keys and not digest_due:

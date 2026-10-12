@@ -690,6 +690,18 @@ class AsksTest(Base):
         self.go(EARLY + 60)
         self.assertEqual(len(self.sent), 1)
 
+    def test_the_urgent_ledger_forgets_asks_that_closed(self):
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        self.go(EARLY)
+        ledger = os.path.join(self.home, "state", "station", "asks.json")
+        with open(ledger) as fh:
+            self.assertEqual(json.load(fh)["urgent"], ["%s#5" % REPO])
+        self.fake.asks.clear()
+        self.fake.version += 1
+        self.go(EARLY + 60)
+        with open(ledger) as fh:
+            self.assertEqual(json.load(fh)["urgent"], [])
+
     def test_digest_once_per_day_after_the_hour_only(self):
         self.fake.add_ask(5, title="Slow one")
         self.go(EARLY)
