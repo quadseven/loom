@@ -34,6 +34,10 @@ export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
+# Checked before anything is installed.
+BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
+[[ "$BRAIN_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BRAIN_INTERVAL" -ge 60 ] ||
+  { echo "LOOM_BRAIN_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -171,7 +175,7 @@ else
     <string>/bin/bash</string>
     <string>$X_REPO/lanes/mac/brain.sh</string>
   </array>
-  <key>StartInterval</key><integer>$(xml "${LOOM_BRAIN_INTERVAL:-1800}")</integer>
+  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$X_LOOM/logs/brain-service.log</string>
   <key>StandardErrorPath</key><string>$X_LOOM/logs/brain-service.log</string>

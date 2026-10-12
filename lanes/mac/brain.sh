@@ -22,13 +22,14 @@ LOG="$LOOM_HOME/logs/brain.log"
 MODEL="${LOOM_BRAIN_MODEL:-claude-opus-5-5}"
 HOLDER="${LOOM_BRAIN_HOLDER:-lane-machine}"
 MINUTES="${LOOM_BRAIN_MINUTES:-40}"
-ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin)"
+ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)"
 LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')}"
 mkdir -p "$WORK" "$(dirname "$LOG")"
 
 say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 
 [ -n "${LOOM_REPOS:-}" ] || exit 0
+[ -n "$ORIGIN" ] && [ -n "$LOCK_REPO" ] || { say "no origin remote in $REPO_ROOT, so no lock repo"; exit 1; }
 [[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -ge 5 ] || { say "LOOM_BRAIN_MINUTES must be a number of at least 5"; exit 1; }
 
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
@@ -53,7 +54,8 @@ with these differences: the checkout is already up to date, and the tick lock \
 is already held for you as holder $HOLDER by the wrapper, so skip the lock and unlock steps \
 (never lock or unlock). LOOM_REPOS is set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
-goal. Stop within $((MINUTES - 5)) minutes, not 15; you are cut off at $MINUTES."
+goal. This replaces the 15-minute limit in MUSE.md: stop within \
+$((MINUTES - 5)) minutes; you are cut off at $MINUTES."
 
 say "tick start (model $MODEL)"
 (cd "$WORK" && timeout "$((MINUTES * 60))" claude -p --model "$MODEL" \

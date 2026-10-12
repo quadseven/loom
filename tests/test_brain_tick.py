@@ -113,6 +113,16 @@ class BrainTickTest(unittest.TestCase):
         muse = self.home / "brain" / "loom" / "docs" / "MUSE.md"
         self.assertIn("new", muse.read_text())
 
+    def test_no_origin_never_takes_the_lock(self):
+        git("remote", "remove", "origin", cwd=self.root)
+        env = {k: v for k, v in self.env.items() if k != "LOOM_STATUS_REPO"}
+        run = subprocess.run(
+            ["bash", str(self.root / "lanes" / "mac" / "brain.sh")],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(1, run.returncode)
+        self.assertFalse(self.log.exists())
+
     def test_an_invalid_time_limit_never_takes_the_lock(self):
         run, calls = self.tick(LOOM_BRAIN_MINUTES="2")
         self.assertEqual(1, run.returncode)
@@ -124,7 +134,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("--holder night --minutes 25", calls[0])
         claude = [c for c in calls if c.startswith("claude ")][0]
         self.assertIn("--model claude-sonnet-5-5", claude)
-        self.assertIn("Stop within 15 minutes", claude)
+        self.assertIn("stop within 15 minutes; you are cut off at 20", claude)
 
 
 if __name__ == "__main__":
