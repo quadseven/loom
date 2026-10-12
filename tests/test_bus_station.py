@@ -947,6 +947,29 @@ class TranscriptTest(Base):
         self.go()
         self.assertEqual(self.sent, [])
 
+    def test_a_corrupt_brain_tick_is_logged_and_not_sent(self):
+        self.go()
+        self.write(os.path.join(self.home, "state", "brain.json"), json.dumps(
+            {"at": 1893492060, "outcome": "ok", "exit": 0, "started": "soon"}))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.go()
+        self.assertEqual(self.sent, [])
+        self.assertIn("station: not uploading the last brain tick: state/brain.json "
+                      "has started 'soon' and at 1893492060", err.getvalue())
+
+    def test_the_ledger_keeps_only_runs_still_finished(self):
+        self.go()
+        self.finish("T1")
+        self.finish("T2")
+        self.go()
+        os.remove(self.inbox("anthropic-3", "done", "T1.md"))
+        self.go()
+        path = os.path.join(self.home, "state", "station", "transcripts.json")
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), {"anthropic-3/T2": "sent"})
+        self.assertEqual(len(self.sent), 2)
+
     def test_the_post_sends_the_bearer_token_and_never_shows_the_url(self):
         seen = {}
 

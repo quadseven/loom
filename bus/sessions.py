@@ -232,29 +232,33 @@ def opencode_events(db: Path) -> list[dict]:
         return []
     finally:
         con.close()
-    events: list[dict] = []
-    for mdata, pdata, created in rows:
-        try:
-            role = json.loads(mdata).get("role")
-            part = json.loads(pdata)
-        except (ValueError, TypeError, AttributeError):
-            continue
-        if not isinstance(part, dict):
-            continue
-        kind, ts = part.get("type"), _iso(created)
-        if kind == "text" and part.get("text", "").strip():
-            events.append({"kind": "user" if role == "user" else "assistant", "ts": ts,
-                           "text": part["text"]})
-        elif kind == "reasoning" and part.get("text", "").strip():
-            events.append({"kind": "thinking", "ts": ts, "text": part["text"]})
-        elif kind == "tool":
-            state = part.get("state") if isinstance(part.get("state"), dict) else {}
-            took = state.get("time") if isinstance(state.get("time"), dict) else {}
-            events.append({"kind": "tool", "ts": ts, "tool": part.get("tool", "?"),
-                           "input": state.get("input") or {},
-                           "output": state.get("output") or state.get("error") or "",
-                           "output_ts": _iso(took.get("end")) or ts})
-    return events
+    events = (_opencode_part(*row) for row in rows)
+    return [ev for ev in events if ev]
+
+
+def _opencode_part(mdata, pdata, created) -> dict | None:
+    """One opencode message part as an event, or None."""
+    try:
+        role = json.loads(mdata).get("role")
+        part = json.loads(pdata)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(part, dict):
+        return None
+    kind, ts = part.get("type"), _iso(created)
+    if kind == "text" and part.get("text", "").strip():
+        return {"kind": "user" if role == "user" else "assistant", "ts": ts,
+                "text": part["text"]}
+    if kind == "reasoning" and part.get("text", "").strip():
+        return {"kind": "thinking", "ts": ts, "text": part["text"]}
+    if kind == "tool":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        took = state.get("time") if isinstance(state.get("time"), dict) else {}
+        return {"kind": "tool", "ts": ts, "tool": part.get("tool", "?"),
+                "input": state.get("input") or {},
+                "output": state.get("output") or state.get("error") or "",
+                "output_ts": _iso(took.get("end")) or ts}
+    return None
 
 
 def _codex_rollout(sessions: Path, tree: Path) -> Path | None:

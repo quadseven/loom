@@ -21,9 +21,10 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import tickets
+from . import tickets, transcripts
 from .github import GitHub, GitHubError, _OPENER
 from .labels import LANES
+from .scrub import scrub_paths
 
 HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
@@ -31,9 +32,6 @@ RUNNING = "loom:running"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
-# An absolute path: a run of non-space characters starting with a slash (not
-# the slash inside a word such as owner/name).
-PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
 REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
@@ -202,11 +200,6 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
     """The one lane the issue names, or None when it names none or several."""
     lanes = [n[len("lane:"):] for n in _label_names(issue) if n.startswith("lane:")]
     return lanes[0] if len(lanes) == 1 and lanes[0] in LANES else None
-
-
-def scrub_paths(text: str) -> str:
-    """Every absolute path in text as <path>."""
-    return PATH_RE.sub("<path>", text)
 
 
 def scrub(reason: str) -> str:
@@ -860,14 +853,17 @@ class Station:
             return None
         last = brain[0]
         started, at = last.get("started"), last.get("at")
-        if last.get("outcome") not in ("ok", "failed") or not all(
-                isinstance(v, (int, float)) and not isinstance(v, bool) for v in (started, at)) \
-                or not 0 < started <= at:
+        # No start time: the tick never ran the agent (or predates uploads).
+        if last.get("outcome") not in ("ok", "failed") or started is None:
+            return None
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   for v in (started, at)) or not 0 < started <= at:
+            _say("not uploading the last brain tick: state/brain.json has started %r "
+                 "and at %r, not two times in order" % (started, at))
             return None
         return "brain/" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)), last
 
     def _transcript_body(self, key: str, run: Any) -> Optional[Dict[str, Any]]:
-        from . import transcripts
         if key.startswith("brain/"):
             return transcripts.brain_body(
                 self.s.home, self.user_home, run["started"], run["at"],
@@ -887,17 +883,41 @@ class Station:
                  % type(err).__name__)
             return None
 
-    def upload_transcripts(self) -> None:
-        """Upload each finished run (and brain tick) once. A failed upload is
-        retried on the next pass and given up after UPLOAD_TRIES failures.
-        Runs that finished before the first pass with the settings are only
-        recorded, never sent."""
-        if not self.s.transcript_url or not self.s.transcript_token_ssm:
-            return
+    def _finished_runs(self) -> Dict[str, Any]:
+        """Every finished run by its ledger key, the last brain tick included."""
         runs: Dict[str, Any] = {"%s/%s" % (r[0], r[3]): r for r in self._finished_briefs()}
         tick = self._brain_tick()
         if tick is not None:
             runs[tick[0]] = tick[1]
+        return runs
+
+    def _upload_one(self, key: str, run: Any, token: str, ledger: Dict[str, Any]) -> None:
+        """Upload one run and record the result in the ledger."""
+        try:
+            body = self._transcript_body(key, run)
+            if body is not None:
+                self.upload(self.s.transcript_url, token, body)
+            ledger[key] = "sent" if body is not None else "empty"
+        # Deliberately broad, as in _send: an error text can carry the URL
+        # or the token; only the type is logged, and only when giving up.
+        except Exception as err:  # noqa: BLE001
+            tries = (ledger.get(key) if isinstance(ledger.get(key), int) else 0) + 1
+            ledger[key] = tries
+            if tries >= UPLOAD_TRIES:
+                ledger[key] = "gave-up"
+                _say("gave up uploading the transcript of %s after %d failures (%s)"
+                     % (key, tries, type(err).__name__))
+
+    def upload_transcripts(self) -> None:
+        """Upload each finished run (and brain tick) once. A failed upload is
+        retried on the next pass and given up after UPLOAD_TRIES failures.
+        Runs that finished before the first pass with the settings are only
+        recorded, never sent. The ledger keeps only runs still finished
+        (briefs in done/ or failed/, the last brain tick), so it stays as
+        small as those folders."""
+        if not self.s.transcript_url or not self.s.transcript_token_ssm:
+            return
+        runs = self._finished_runs()
         path = os.path.join(self.state, "transcripts.json")
         ledger = _read_json(path, None)
         if ledger is None:
@@ -905,25 +925,15 @@ class Station:
             return
         if not isinstance(ledger, dict):
             raise StateError("state file %s does not hold an object" % path)
+        if any(k not in runs for k in ledger):
+            ledger = {k: v for k, v in ledger.items() if k in runs}
+            _write_json(path, ledger)
         todo = [k for k in runs if k not in ledger or isinstance(ledger[k], int)]
         token = self._transcript_token() if todo else None
         if token is None:
             return
         for key in todo:
-            try:
-                body = self._transcript_body(key, runs[key])
-                if body is not None:
-                    self.upload(self.s.transcript_url, token, body)
-                ledger[key] = "sent" if body is not None else "empty"
-            # Deliberately broad, as in _send: an error text can carry the URL
-            # or the token; only the type is logged, and only when giving up.
-            except Exception as err:  # noqa: BLE001
-                tries = (ledger.get(key) if isinstance(ledger.get(key), int) else 0) + 1
-                ledger[key] = tries
-                if tries >= UPLOAD_TRIES:
-                    ledger[key] = "gave-up"
-                    _say("gave up uploading the transcript of %s after %d failures (%s)"
-                         % (key, tries, type(err).__name__))
+            self._upload_one(key, runs[key], token, ledger)
             _write_json(path, ledger)
 
     # -- one pass --------------------------------------------------------

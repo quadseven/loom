@@ -7,7 +7,7 @@ kind is text, tool_use, tool_result or log; role is user, assistant,
 thinking, tool or runner. The run is read through bus/sessions.py, the
 parser the local viewer uses. Every text is scrubbed before it leaves the
 machine: key shapes become [redacted], the run's worktree becomes ".", and
-any other absolute path becomes <path> (the station's scrub). Each event is
+any other absolute path becomes <path> (bus/scrub.py). Each event is
 capped at EVENT_MAX characters and the body at BODY_MAX bytes of JSON, which
 drops the oldest tool results first.
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import sessions
-from .station import scrub_paths
+from .scrub import scrub_paths
 
 EVENT_MAX = 20000
 BODY_MAX = 8 * 1024 * 1024
