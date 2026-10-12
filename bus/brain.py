@@ -479,6 +479,17 @@ def _fix_body(repo: str, number: int, branch: str, notes: str,
     return text + "\n"
 
 
+def render_fix_body(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                    notes: str, threads: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Render the canonical loom:fix body used by both the brain and station."""
+    sha = str((pr.get("head") or {}).get("sha") or "")
+    checks = _failing_checks(gh, repo, sha) if sha else []
+    if threads is None:
+        threads = _open_threads(gh, repo, number)
+    body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
+    return body
+
+
 def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str) -> None:
     """Send a lane's pull request back to the lane: the failing checks and the
     unresolved review threads go on the ticket as a loom:fix comment, and the
@@ -487,10 +498,7 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str)
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
     _check_fix(repo, pr, ticket, issue)
-    sha = str((pr.get("head") or {}).get("sha") or "")
-    checks = _failing_checks(gh, repo, sha) if sha else []
-    threads = _open_threads(gh, repo, number)
-    body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
+    body = render_fix_body(gh, repo, number, pr, notes)
     kept = _moved_labels(_labels(issue), "briefed", None)
     gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})

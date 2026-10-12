@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import tickets
 from .github import GitHub, GitHubError, _OPENER
 from .labels import LANES
+from . import brain
 
 HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
@@ -49,6 +50,9 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 REPORT_CHECK = 300
 REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
+DEFAULT_FIX_ROUNDS = 3
+READY = "loom:ready"
+NEEDS_BRAIN = "needs-brain"
 # A brain tick runs every 30 minutes; no tick ending well for this long means
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
@@ -562,6 +566,120 @@ class Station:
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                      {"body": body})
 
+    def _pr_details(self, repo: str, number: int) -> Dict[str, Any]:
+        owner, name = repo.split("/", 1)
+        query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
+                 ' commits(last:1) { nodes { commit { oid statusCheckRollup { state contexts(first:100) { nodes { __typename ... on CheckRun { status conclusion } ... on StatusContext { state } } } } } }'
+                 ' reviewThreads(first:100) { nodes { id isResolved path line originalLine'
+                 ' comments(first:20) { nodes { databaseId body author { login } } } } }'
+                 ' } } }') % (brain._gql(owner), brain._gql(name), number)
+        data = self.gh.graphql(query) or {}
+        return ((data.get("repository") or {}).get("pullRequest") or {})
+
+    def _fix_rounds(self, repo: str, number: int) -> int:
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        return sum(1 for c in comments if isinstance(c, dict)
+                   and str(c.get("body") or "").startswith(tickets.FIX_MARKER))
+
+    def _hand_back_repo(self, repo: str) -> None:
+        issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % repo).data
+        if not isinstance(issues, list) or not issues:
+            return
+        prs = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data
+        if not isinstance(prs, list):
+            return
+        by_branch = {str((p.get("head") or {}).get("ref") or ""): p for p in prs
+                     if isinstance(p, dict) and str((p.get("head") or {}).get("ref") or "").startswith("loom/")}
+        raw_limit = os.environ.get("LOOM_FIX_ROUNDS", str(DEFAULT_FIX_ROUNDS))
+        rounds_limit = int(raw_limit) if raw_limit.isdigit() else DEFAULT_FIX_ROUNDS
+        if rounds_limit < 0:
+            rounds_limit = DEFAULT_FIX_ROUNDS
+        ledger_path = os.path.join(self.state, "fix-rounds.json")
+        ledger = _read_json(ledger_path, {})
+        if not isinstance(ledger, dict):
+            ledger = {}
+        for issue in issues:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            number = int(issue.get("number", 0))
+            if not number:
+                continue
+            lane = _lane_of(issue)
+            if lane is None:
+                continue
+            if NEEDS_BRAIN in _label_names(issue):
+                continue
+            candidates = [p for p in by_branch.values()
+                          if ((p.get("head") or {}).get("repo") or {}).get("full_name") == repo
+                          and brain._linked((repo, number), p)]
+            if len(candidates) != 1:
+                continue
+            pr = candidates[0]
+            pr_number = int(pr["number"])
+            details = self._pr_details(repo, pr_number)
+            commits = (details.get("commits") or {}).get("nodes") or []
+            commit = commits[-1].get("commit") or {} if commits else {}
+            sha = str(commit.get("oid") or "")
+            rollup = commit.get("statusCheckRollup") or {}
+            check_state = str(rollup.get("state") or "UNKNOWN").upper()
+            contexts = (rollup.get("contexts") or {}).get("nodes") or []
+            unfinished = any(
+                (str(c.get("status") or "").upper() != "COMPLETED"
+                 if c.get("__typename") == "CheckRun"
+                 else str(c.get("state") or "").upper() in ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS"))
+                for c in contexts)
+            if not sha or unfinished or check_state in ("EXPECTED", "PENDING", "QUEUED", "IN_PROGRESS", "UNKNOWN"):
+                continue
+            key = "%s#%d" % (repo, number)
+            record = ledger.get(key) if isinstance(ledger.get(key), dict) else {}
+            current_names = _label_names(issue)
+            if sha and READY in current_names and record.get("ready_sha") != sha:
+                current_names = [n for n in current_names if n != READY]
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": current_names})
+            if record.get("sha") == sha:
+                continue
+            threads = (details.get("reviewThreads") or {}).get("nodes") or []
+            bot_threads = [t for t in threads if not t.get("isResolved")
+                           and (t.get("comments") or {}).get("nodes")
+                           and str(((t["comments"]["nodes"][0].get("author") or {}).get("login") or "")).lower()
+                           == "grug-tribe[bot]"]
+            checks = check_state != "SUCCESS"
+            if checks or bot_threads:
+                if self._fix_rounds(repo, number) >= rounds_limit:
+                    labels = [n for n in current_names if n != READY]
+                    if NEEDS_BRAIN not in labels:
+                        labels.append(NEEDS_BRAIN)
+                    self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+                    continue
+                notes = ""
+                if bot_threads:
+                    notes = "Fix the actionable findings from the review bot below. For each finding that does not apply, write a one-line reason in .loom/replies.json."
+                body = brain.render_fix_body(self.gh, repo, pr_number, pr, notes, bot_threads)
+                self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+                labels = [n for n in current_names if n not in ("loom:pr", READY)]
+                for name in ("loom:briefed", "lane:" + lane):
+                    if name not in labels:
+                        labels.append(name)
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+                ledger[key] = {"sha": sha}
+                _write_json(ledger_path, ledger)
+            elif check_state == "SUCCESS":
+                labels = [n for n in current_names if n != NEEDS_BRAIN]
+                if READY not in labels:
+                    labels.append(READY)
+                if labels != current_names:
+                    self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+                ledger[key] = {"ready_sha": sha}
+                _write_json(ledger_path, ledger)
+
+    def hand_back(self) -> None:
+        for repo in self.s.repos:
+            try:
+                self._hand_back_repo(repo)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("could not hand back findings in %s: %s" % (repo, err))
+
     # -- lane status ------------------------------------------------------
     @staticmethod
     def _utc(at: float) -> str:
@@ -964,6 +1082,7 @@ class Station:
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
+        self.hand_back()
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
                      self.watch_brain):

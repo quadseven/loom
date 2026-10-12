@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -115,6 +116,10 @@ class FakeGitHub:
                                    and "loom:goal" in self.names(i["number"])])
             if "loom:lanes" in query:
                 return reply(200, self.lanes_issues)
+            if "loom:pr" in query or "loom%3Apr" in query:
+                return reply(200, [dict(i, repository_url="https://api.github.com/repos/" + REPO)
+                                   for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:pr" in self.names(i["number"])])
             return self._list_briefed(headers)
         if method == "POST" and rest == "issues":
             self.created.append(data)
@@ -211,7 +216,7 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        self.assertEqual(self.run_pass().requests, 0)
+        self.assertEqual(self.run_pass().requests, 1)  # loom:pr hand-back scan
 
 
 class TicketsTest(unittest.TestCase):
@@ -341,9 +346,10 @@ class ClaimTest(Base):
         self.run_pass()
         first = len(self.fake.calls)
         gh = self.run_pass()
-        self.assertEqual(len(self.fake.calls), first + 1)
-        self.assertEqual(gh.requests, 1)
-        self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
+        self.assertEqual(len(self.fake.calls), first + 2)
+        self.assertEqual(gh.requests, 2)
+        self.assertTrue(any(path == "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % REPO
+                            for _, path in self.fake.calls[first:]))
 
     def test_a_304_reuses_the_stored_list(self):
         self.fake.add(12)
@@ -464,6 +470,89 @@ class FixTest(Base):
         self.assertNotIn("drive-by", text)
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running"])
 
+
+class HandBackTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 99, "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing", "sha": "sha-1",
+                                     "repo": {"full_name": REPO}}}]
+        self.gh = GitHub("token", transport=self.fake)
+        self.details = {"commits": {"nodes": [{"commit": {
+            "oid": "sha-1", "statusCheckRollup": {"state": "SUCCESS", "contexts": {"nodes": []}}}}]},
+            "reviewThreads": {"nodes": []}}
+
+    def station(self):
+        s = station.Station(self.gh, self.settings)
+        self.gh.graphql = lambda query: {"repository": {"pullRequest": self.details}}
+        return s
+
+    def test_failed_check_posts_shared_fix_body_and_briefs_same_lane(self):
+        self.details["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        with mock.patch("bus.brain.render_fix_body", return_value="<!-- loom:fix v1 -->\nshared"):
+            self.station()._hand_back_repo(REPO)
+        self.assertEqual(self.fake.comments[12][-1]["body"], "<!-- loom:fix v1 -->\nshared")
+        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
+        self.assertNotIn("loom:pr", self.fake.names(12))
+
+    def test_only_unresolved_threads_started_by_the_review_bot_trigger_hand_back(self):
+        self.details["reviewThreads"]["nodes"] = [{"id": "thread-1", "isResolved": False,
+            "path": "src/a.py", "line": 4, "comments": {"nodes": [
+                {"databaseId": 7, "body": "fix this", "author": {"login": "grug-tribe[bot]"}}]}}]
+        with mock.patch("bus.brain.render_fix_body", return_value="<!-- loom:fix v1 -->\nshared") as render:
+            self.station()._hand_back_repo(REPO)
+        render.assert_called_once()
+        self.assertIn("loom:briefed", self.fake.names(12))
+
+    def test_unresolved_thread_from_another_author_does_not_trigger_hand_back(self):
+        self.details["reviewThreads"]["nodes"] = [{"id": "thread-2", "isResolved": False,
+            "comments": {"nodes": [{"body": "untrusted content", "author": {"login": "other[bot]"}}]}}]
+        with mock.patch("bus.brain.render_fix_body") as render:
+            self.station()._hand_back_repo(REPO)
+        render.assert_not_called()
+        self.assertIn("loom:ready", self.fake.names(12))
+
+    def test_same_head_fix_is_not_queued_twice(self):
+        path = os.path.join(self.home, "state", "station", "fix-rounds.json")
+        station._write_json(path, {"%s#12" % REPO: {"sha": "sha-1"}})
+        self.station()._hand_back_repo(REPO)
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_round_cap_marks_needs_brain(self):
+        self.details["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        self.fake.comments[12] = [{"body": "<!-- loom:fix v1 -->\nold"}] * 3
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}), \
+             mock.patch("bus.brain.render_fix_body") as render:
+            self.station()._hand_back_repo(REPO)
+        render.assert_not_called()
+        self.assertIn("needs-brain", self.fake.names(12))
+
+    def test_ready_label_tracks_the_head_and_is_removed_after_a_push(self):
+        self.station()._hand_back_repo(REPO)
+        self.assertIn("loom:ready", self.fake.names(12))
+        self.fake.pulls[0]["head"]["sha"] = "sha-2"
+        self.details["commits"]["nodes"][0]["commit"]["oid"] = "sha-2"
+        self.details["reviewThreads"]["nodes"] = [{"id": "thread-1", "isResolved": False,
+            "comments": {"nodes": [{"body": "x", "author": {"login": "grug-tribe[bot]"}}]}}]
+        with mock.patch("bus.brain.render_fix_body", return_value="<!-- loom:fix v1 -->"):
+            self.station()._hand_back_repo(REPO)
+        self.assertNotIn("loom:ready", self.fake.names(12))
+
+
+class FixTest(Base):
+    def comment(self, number, body, author="alice-example", edited=False):
+        at = "2030-01-02T00:00:00Z"
+        self.fake.comments[number].append({
+            "body": body, "user": {"login": author}, "created_at": at,
+            "updated_at": "2030-01-03T00:00:00Z" if edited else at})
+
+    def claimed_brief(self, name="example-owner.example-repo-12-r2"):
+        self.assertEqual(self.listing(), [name + ".md"])
+        with open(self.inbox("codex", name + ".md")) as fh:
+            return fh.read()
+
     def assert_plain_brief(self):
         text = self.claimed_brief()
         self.assertNotIn("Fix-PR", text)
@@ -522,7 +611,8 @@ class FixTest(Base):
         self.assertEqual([c["body"] for c in self.fake.comments[12]],
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertIn("/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO, pulls)
+        self.assertLessEqual(pulls.count("/repos/%s/pulls?state=open&per_page=100" % REPO), 2)
 
 
 class RefusalTest(Base):
@@ -590,7 +680,8 @@ class OutcomeTest(Base):
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertIn("/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO, pulls)
+        self.assertLessEqual(pulls.count("/repos/%s/pulls?state=open&per_page=100" % REPO), 2)
 
     def test_done_without_a_pull_request_is_retried_not_reported(self):
         self.finished("done")

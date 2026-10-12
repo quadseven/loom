@@ -61,17 +61,13 @@ tickets and pull requests like any other work.
    is held.
 2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
    each goal's latest journal.
-3. For each lane pull request, read its whole diff against its ticket and
-   acceptance criteria. A lane pull request with failing checks or
-   unresolved findings goes back to the lane that wrote it with
-   `python3 -m bus.brain fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md`
-   (FINDINGS.md says what to change; the command adds the failing check logs
-   and the open review threads itself). Fix it yourself only when the fix is
-   a one-line mechanical change. For each ready one, reply to every review
-   thread using
-   `python3 -m bus.brain reply OWNER/NAME#PR --comment ID --file BODY.md --resolve`.
-   Then run `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
-   which moves the ticket to `loom:merged`. Merged is not deployed: the
+3. The station hands failed checks and unresolved review-bot findings back to
+   the authoring lane, up to `LOOM_FIX_ROUNDS` (default 3) times. It marks a
+   clean PR `loom:ready`. Merge `loom:ready` PRs after checking green checks,
+   no unresolved threads and a verdict for the current head SHA with
+   `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`. Review in
+   full only tickets labelled `needs-brain` (the lane fix-round cap was
+   reached). The merge command moves the ticket to `loom:merged`. Merged is not deployed: the
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.

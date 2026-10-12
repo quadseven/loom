@@ -150,6 +150,15 @@ pushes the agent's work onto it (fast-forward only, never forced) and
 comments on the pull request; it never opens a second one. A fix brief whose
 pull request is no longer open is parked as failed.
 
+The station performs this hand-back each pass without waiting for a brain
+tick. It considers review threads only when their first comment is by
+`grug-tribe[bot]`. `LOOM_FIX_ROUNDS` (default 3) caps automatic rounds per
+ticket; tickets at the cap get `needs-brain`. A clean lane PR gets
+`loom:ready`, which is removed if later checks or review findings need work.
+The brain merges ready PRs only after checking the current head SHA, green
+checks and resolved threads. It reviews the full ticket only when
+`needs-brain` is present.
+
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
 

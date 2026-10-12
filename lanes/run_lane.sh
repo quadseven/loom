@@ -580,6 +580,9 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "clone or branch failed"; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
+  # Agent-provided review replies are runner input, never branch content.
+  mkdir -p "$TREE/.git/info"
+  printf '\n/.loom/replies.json\n' >> "$TREE/.git/info/exclude"
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
@@ -593,6 +596,13 @@ for BRIEF in "$INBOX"/*.md; do
   STATUS=$?
   is_api_lane && archive_transcripts
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
+  REPLIES="$WORKDIR/$TICKET.replies.json"
+  if [ -f "$TREE/.loom/replies.json" ]; then
+    cp "$TREE/.loom/replies.json" "$REPLIES"
+    rm -f "$TREE/.loom/replies.json"
+  else
+    rm -f "$REPLIES"
+  fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
@@ -615,6 +625,40 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "push failed"; continue
   fi
   if [ -n "$FIX_PR" ]; then
+    if [ -f "$REPLIES" ]; then
+      if python3 - "$REPLIES" <<'PY' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    rows = json.load(f)
+if not isinstance(rows, list): raise ValueError("expected a list")
+for row in rows:
+    if (not isinstance(row, dict) or set(row) != {"thread", "reply", "resolve"}
+            or not isinstance(row["thread"], str) or not row["thread"]
+            or not isinstance(row["reply"], str) or not row["reply"].strip()
+            or not isinstance(row["resolve"], bool)):
+        raise ValueError("invalid reply")
+PY
+      then
+        while IFS=$'\t' read -r THREAD REPLY RESOLVE; do
+          [ -n "$THREAD" ] || continue
+          if ! timeout "$NET_TIMEOUT" gh api graphql -f query='mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}' -f id="$THREAD" -f body="$REPLY" >> "$LOG" 2>&1; then
+            echo "[$(date -u +%FT%TZ)] $TICKET: reply on a review thread failed" >> "$LOG"
+            continue
+          fi
+          if [ "$RESOLVE" = true ] && ! timeout "$NET_TIMEOUT" gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -f id="$THREAD" >> "$LOG" 2>&1; then
+            echo "[$(date -u +%FT%TZ)] $TICKET: resolving a review thread failed" >> "$LOG"
+          fi
+        done < <(python3 - "$REPLIES" <<'PY'
+import json, sys
+for row in json.load(open(sys.argv[1], encoding="utf-8")):
+    print("%s\t%s\t%s" % (row["thread"], row["reply"].replace("\t", " ").replace("\n", " "), str(row["resolve"]).lower()))
+PY
+)
+      else
+        echo "[$(date -u +%FT%TZ)] $TICKET: invalid .loom/replies.json ignored" >> "$LOG"
+      fi
+      rm -f "$REPLIES"
+    fi
     ITEMS="$(fix_items "$BRIEF")"
     if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" \
          --body "Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}" >> "$LOG" 2>&1; then

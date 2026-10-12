@@ -83,6 +83,7 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 echo fixed > fix.txt
+if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
 git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
@@ -407,6 +408,28 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
                                    "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_fix_replies_are_posted_resolved_and_excluded_from_the_commit(self):
+        name, _ = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES='[{"thread":"PRRT_1","reply":"Not applicable: already covered.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_1" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_1" in c for c in calls))
+        after = self.remote_head(self.FIX_BRANCH)
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", after],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertNotIn(".loom/replies.json", files)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_invalid_fix_replies_are_ignored(self):
+        self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES='{"thread":"bad"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c for c in calls))
+        log = next((self.loom / "logs" / "codex").glob("*.log")).read_text()
+        self.assertIn("invalid .loom/replies.json ignored", log)
 
     def test_a_fix_brief_whose_pull_request_closed_is_parked_unrun(self):
         name, before = self.fix_brief()
