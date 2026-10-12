@@ -195,14 +195,19 @@ agy_forget() {
     while [ "$1" != -- ]; do keep="$keep$1 "; shift; done; shift
     for k in "$@"; do cache_keep="$cache_keep$k "; done
     [ -d "$s" ] || exit 0
+    # Kept entries are real files and directories. A link an agent left in
+    # their place is removed, never followed: the forget would otherwise
+    # delete through it, into the keychain folder or another ticket'"'"'s tree.
     for e in "$s"/* "$s"/.[!.]*; do
       [ -e "$e" ] || [ -L "$e" ] || continue
+      [ -L "$e" ] && { rm -f "$e" || exit 1; continue; }
       case "$keep" in *" ${e##*/} "*) continue ;; esac
       rm -rf "$e" || exit 1
     done
     [ -d "$s/cache" ] || exit 0
     for e in "$s"/cache/* "$s"/cache/.[!.]*; do
       [ -e "$e" ] || [ -L "$e" ] || continue
+      [ -L "$e" ] && { rm -f "$e" || exit 1; continue; }
       case "$cache_keep" in *" ${e##*/} "*) continue ;; esac
       rm -rf "$e" || exit 1
     done' agy-forget "$s" "${AGY_STATE_KEEP[@]}" -- "${AGY_CACHE_KEEP[@]}"
