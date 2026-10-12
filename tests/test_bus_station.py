@@ -73,40 +73,45 @@ class FakeGitHub:
         self.calls.append((method, path))
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
-            n = data["variables"]["number"]
-            editor = self.editors[n]
-            return reply(200, {"data": {"repository": {"issue": {
-                "editor": {"login": editor} if editor and editor != "<ghost>" else None,
-                "lastEditedAt": "2030-01-01T00:05:00Z" if editor else None}}}})
-        m = re.match(r"/repos/%s/(.*)" % REPO, parts.path)
-        rest = m.group(1)
+            return self._graphql(data)
+        rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "issues":
-            etag = '"v%d"' % self.version
-            if headers.get("If-None-Match") == etag:
-                return reply(304, None, {"ETag": etag})
-            listed = [dict(i, repository_url="https://api.github.com/repos/" + REPO)
-                      for i in self.issues.values() if i["state"] == "open"
-                      and any(lab["name"] == "loom:briefed" for lab in i["labels"])]
-            return reply(200, listed, {"ETag": etag})
+            return self._list_briefed(headers)
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
-            n, sub = int(m.group(1)), m.group(2)
-            if method == "GET" and sub is None:
-                return reply(200, self.issues[n])
-            if method == "GET" and sub == "events":
-                return reply(200, self.events[n])
-            if method == "GET" and sub == "comments":
-                return reply(200, self.comments[n])
-            if method == "POST" and sub == "comments":
-                self.comments[n].append({"body": data["body"]})
-                return reply(201, {})
-            if method == "PUT" and sub == "labels":
-                self.issues[n]["labels"] = [{"name": x} for x in data["labels"]]
-                self.version += 1
-                return reply(200, [])
+            return self._issue_call(method, int(m.group(1)), m.group(2), data)
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _graphql(self, data):
+        editor = self.editors[data["variables"]["number"]]
+        return reply(200, {"data": {"repository": {"issue": {
+            "editor": {"login": editor} if editor and editor != "<ghost>" else None,
+            "lastEditedAt": "2030-01-01T00:05:00Z" if editor else None}}}})
+
+    def _list_briefed(self, headers):
+        etag = '"v%d"' % self.version
+        if headers.get("If-None-Match") == etag:
+            return reply(304, None, {"ETag": etag})
+        listed = [dict(i, repository_url="https://api.github.com/repos/" + REPO)
+                  for i in self.issues.values() if i["state"] == "open"
+                  and any(lab["name"] == "loom:briefed" for lab in i["labels"])]
+        return reply(200, listed, {"ETag": etag})
+
+    def _issue_call(self, method, n, sub, data):
+        if method == "GET":
+            found = {None: self.issues, "events": self.events, "comments": self.comments}
+            if sub in found:
+                return reply(200, found[sub][n])
+        if method == "POST" and sub == "comments":
+            self.comments[n].append({"body": data["body"]})
+            return reply(201, {})
+        if method == "PUT" and sub == "labels":
+            self.issues[n]["labels"] = [{"name": x} for x in data["labels"]]
+            self.version += 1
+            return reply(200, [])
+        raise AssertionError("unexpected issue call %s %s/%s" % (method, n, sub))
 
 
 class Base(unittest.TestCase):
@@ -143,6 +148,23 @@ class Base(unittest.TestCase):
             return sorted(os.listdir(self.inbox(lane)))
         except OSError:
             return []
+
+
+class CorruptStateTest(Base):
+    def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
+        self.fake.add(12, state="running")
+        self.write(self.inbox("codex", "done", "example-owner.example-repo-12.md"),
+                   "Repo: %s\nBranch: loom/12-fix-the-thing\nIssue: %s#12\n" % (REPO, REPO))
+        self.write(os.path.join(self.home, "state", "station", "reported.json"), "{not json")
+        gh = GitHub("token", transport=self.fake)
+        self.assertEqual(station.run(self.settings, gh), 1)
+        self.assertEqual(self.fake.paths("POST"), [])
+        self.assertEqual(self.fake.paths("PUT"), [])
+
+    def test_a_half_written_heartbeat_only_idles_that_lane(self):
+        d = os.path.join(self.home, "state", "usage")
+        self.write(os.path.join(d, "codex.json"), '{"lane": "co')
+        self.assertEqual(self.run_pass().requests, 0)
 
 
 class TicketsTest(unittest.TestCase):

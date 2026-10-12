@@ -126,28 +126,33 @@ def _latest_label_actor(events: Iterable[Dict[str, Any]], match) -> Optional[str
     return actor
 
 
+def _labeller_problem(events: List[Dict[str, Any]], allowed: set) -> Optional[str]:
+    """Why the latest loom:briefed or lane: labeller is not trusted, if so."""
+    for label, what, match in (
+            ("loom:briefed", "loom:briefed", lambda n: n == "loom:briefed"),
+            ("lane:", "the lane label", lambda n: n.startswith("lane:"))):
+        actor = _latest_label_actor(events, match)
+        if actor is None:
+            return "no %s labelled event found" % label
+        if actor not in allowed:
+            return "%s was applied by %s, not in LOOM_BRIEF_AUTHORS" % (what, actor or "unknown")
+    return None
+
+
 def trusted(issue: Dict[str, Any], events: List[Dict[str, Any]],
             editor_login: Optional[str], authors: Iterable[str],
             owners: Iterable[str]) -> Tuple[bool, str]:
     """Every rule in docs/BRAIN.md "Trust"; the reason says which one failed."""
     allowed = {a.lower() for a in authors}
-    allowed_owners = {o.lower() for o in owners}
     author = _login(issue.get("user"))
     if not author or author not in allowed:
         return False, "issue author %s is not in LOOM_BRIEF_AUTHORS" % (author or "unknown")
-    briefed = _latest_label_actor(events, lambda n: n == "loom:briefed")
-    if briefed is None:
-        return False, "no loom:briefed labelled event found"
-    if briefed not in allowed:
-        return False, "loom:briefed was applied by %s, not in LOOM_BRIEF_AUTHORS" % (briefed or "unknown")
-    lane = _latest_label_actor(events, lambda n: n.startswith("lane:"))
-    if lane is None:
-        return False, "no lane: labelled event found"
-    if lane not in allowed:
-        return False, "the lane label was applied by %s, not in LOOM_BRIEF_AUTHORS" % (lane or "unknown")
+    problem = _labeller_problem(events, allowed)
+    if problem:
+        return False, problem
     if editor_login is not None and editor_login.lower() not in allowed:
         return False, "body last edited by %s, not in LOOM_BRIEF_AUTHORS" % editor_login
     owner = issue_owner(issue).lower()
-    if not owner or owner not in allowed_owners:
+    if not owner or owner not in {o.lower() for o in owners}:
         return False, "repo owner %s is not in LOOM_REPO_OWNERS" % (owner or "unknown")
     return True, "ok"

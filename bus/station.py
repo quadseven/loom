@@ -55,11 +55,24 @@ def _say(msg: str) -> None:
     print("station: " + msg, file=sys.stderr)
 
 
-def _read_json(path: str, default: Any) -> Any:
+class StateError(Exception):
+    """A state file that exists but cannot be read."""
+
+
+def _read_json(path: str, default: Any, strict: bool = True) -> Any:
+    """The file's JSON, or `default` when it does not exist. A file that
+    exists but cannot be read raises StateError when strict: the ledgers of
+    refusals and reports would otherwise read as empty and every ticket would
+    be told again. Heartbeats and the ETag cache are not strict (a heartbeat
+    can be caught mid-write; a lost cache only costs one full read)."""
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as err:
+        if strict:
+            raise StateError("unreadable state file %s: %s" % (path, err)) from None
         return default
 
 
@@ -142,7 +155,7 @@ class Station:
 
     def _poll(self, repo: str) -> List[Dict[str, Any]]:
         path = os.path.join(self.state, repo.replace("/", ".") + ".json")
-        saved = _read_json(path, {})
+        saved = _read_json(path, {}, strict=False)
         if not isinstance(saved, dict):
             saved = {}
         stored = saved.get("issues") if isinstance(saved.get("issues"), list) else None
@@ -154,6 +167,8 @@ class Station:
         else:
             items = resp.data if isinstance(resp.data, list) else []
             _write_json(path, {"etag": resp.etag, "issues": items})
+            if len(items) >= 100:
+                _say("%s has 100 or more briefed tickets; only the first page is read" % repo)
         out = []
         for item in items:
             if isinstance(item, dict) and "pull_request" not in item:
@@ -267,7 +282,8 @@ class Station:
         self._claim(repo, lane, issue)
 
     def _heartbeat_ok(self, lane: str) -> bool:
-        beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"), None)
+        beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                          None, strict=False)
         if not isinstance(beat, dict) or beat.get("available") is not True:
             return False
         at = beat.get("at")
@@ -335,11 +351,8 @@ class Station:
         return True
 
     # -- outcomes -------------------------------------------------------
-    def report_outcomes(self) -> None:
-        path = os.path.join(self.state, "reported.json")
-        reported = _read_json(path, {})
-        if not isinstance(reported, dict):
-            reported = {}
+    def _finished_briefs(self):
+        """(lane, kind, path, name) for every brief in done/ or failed/."""
         for lane in LANES:
             for kind in ("done", "failed"):
                 folder = os.path.join(self.inbox(lane), kind)
@@ -348,17 +361,26 @@ class Station:
                 except OSError:
                     continue
                 for entry in entries:
-                    if not entry.endswith(".md"):
-                        continue
-                    key = "%s/%s" % (lane, entry[:-3])
-                    if key in reported:
-                        continue
-                    try:
-                        if self._report(lane, kind, os.path.join(folder, entry), entry[:-3]):
-                            reported[key] = kind
-                            _write_json(path, reported)
-                    except (GitHubError, OSError) as err:
-                        _say("could not report %s: %s" % (key, err))
+                    if entry.endswith(".md"):
+                        yield lane, kind, os.path.join(folder, entry), entry[:-3]
+
+    def report_outcomes(self) -> None:
+        path = os.path.join(self.state, "reported.json")
+        reported = _read_json(path, {})
+        if not isinstance(reported, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        for lane, kind, brief, name in self._finished_briefs():
+            key = "%s/%s" % (lane, name)
+            if key in reported:
+                continue
+            try:
+                done = self._report(lane, kind, brief, name)
+            except (GitHubError, OSError) as err:
+                _say("could not report %s: %s" % (key, err))
+                continue
+            if done:
+                reported[key] = kind
+                _write_json(path, reported)
 
     def _field(self, text: str, name: str) -> str:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
@@ -444,6 +466,9 @@ def run(settings: Settings, gh: Optional[GitHub] = None) -> int:
             gh = GitHub(token_from_env())
         try:
             Station(gh, settings).run_pass()
+        except StateError as err:
+            _say("stopping: %s" % err)
+            return 1
         finally:
             _say("requests: %d" % gh.requests)
         return 0
