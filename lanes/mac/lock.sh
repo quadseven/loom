@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Sourced by lanes/mac/install.sh: is a lane's runner busy, and wait for a
+# booted-out launchd job to be gone before bootstrapping it again.
 
 runner_busy() {
   local pid_file="$1/pid" pid
@@ -12,5 +14,6 @@ wait_job_gone() {
     launchctl print "$target" >/dev/null 2>&1 || return 0
     sleep 0.2
   done
-  launchctl print "$target" >/dev/null 2>&1 && return 1
+  # Gone at the last look counts as gone; still there is a failure.
+  ! launchctl print "$target" >/dev/null 2>&1
 }

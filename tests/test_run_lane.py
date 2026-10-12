@@ -888,6 +888,19 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_wait_job_gone_counts_a_job_that_vanishes_at_the_last_look_as_gone(self):
+        # A fake launchctl that finds the job 50 times, then not.
+        fake = self.bin / "launchctl"
+        count = Path(self._tmp.name) / "prints"
+        fake.write_text("#!/bin/bash\n"
+                        f"n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'\n"
+                        "[ $n -le 50 ]\n")
+        fake.chmod(0o755)
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; sleep() { :; }; wait_job_gone gui/1/x', "test", str(INSTALL_LOCK)],
+            env={"PATH": f"{self.bin}:/usr/bin:/bin"}, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_installer_busy_check_recognizes_a_live_runner_pid(self):
         lock = Path(self._tmp.name) / "lane.lock"
         lock.mkdir()
