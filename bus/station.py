@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import tickets
 from .github import GitHub, GitHubError, _OPENER
+from .journal import REPLY_RE
 from .labels import LANES
 
 HEARTBEAT_MAX_AGE = 600
@@ -60,16 +61,37 @@ JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 JOURNAL_CHECK = 600
 JOURNAL_LOOKBACK = 24 * 3600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
+# Operator messages in the Discord channel become notes on a goal home, and
+# the brain's replies go back to the channel (docs/LANES.md, "Talking to the
+# brain"). The channel and the goal homes are read at most this often.
+OPERATOR_MARKER = "<!-- loom:operator v1 discord=%s -->"
+OPERATOR_CHECK = 30
+# The first read of the channel relays only messages this recent.
+OPERATOR_FIRST_LOOKBACK = 600
+# Replies are read since the last read less this overlap; forwarded comment
+# ids are kept this long so a reply goes out once, and only replies posted
+# within REPLY_LOOKBACK are forwarded at all.
+REPLY_OVERLAP = 3600
+REPLY_LOOKBACK = 24 * 3600
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_EPOCH_MS = 1420070400000
+CHECKMARK = "%E2%9C%85"  # U+2705, URL-encoded for the reactions path
+GOAL_REF_RE = re.compile(r"(?<![A-Za-z0-9._/-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)\b")
+NUMBER_REF_RE = re.compile(r"(?<![A-Za-z0-9._/-])#([0-9]+)\b")
+TITLE_WORD_MIN = 4
 
 SecretReader = Callable[[str, str], str]
 Poster = Callable[[str, Dict[str, Any]], None]
+# (method, path under the API, bot token, JSON body or None) -> parsed reply.
+DiscordCall = Callable[[str, str, str, Optional[Dict[str, Any]]], Any]
 
 
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
                  mention: str = "", digest_hour: int = 9,
-                 region: str = "us-east-1") -> None:
+                 region: str = "us-east-1", channel_id: str = "",
+                 bot_token_ssm: str = "", default_goal: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -79,6 +101,9 @@ class Settings:
         self.mention = mention
         self.digest_hour = digest_hour
         self.region = region
+        self.channel_id = channel_id
+        self.bot_token_ssm = bot_token_ssm
+        self.default_goal = default_goal
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -99,7 +124,10 @@ class Settings:
                    webhook_ssm=env.get("LOOM_DISCORD_WEBHOOK_SSM", "").strip(),
                    mention=env.get("LOOM_DISCORD_MENTION", "").strip(),
                    digest_hour=hour,
-                   region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1")
+                   region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
+                   channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
+                   bot_token_ssm=env.get("LOOM_DISCORD_BOT_TOKEN_SSM", "").strip(),
+                   default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip())
 
 
 def _origin_repo() -> str:
@@ -121,7 +149,7 @@ def read_ssm(name: str, region: str) -> str:
          "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
         capture_output=True, text=True, timeout=POST_TIMEOUT)
     if out.returncode != 0 or not out.stdout.strip():
-        raise OSError("could not read the webhook parameter from SSM")
+        raise OSError("could not read the parameter from SSM")
     return out.stdout.strip()
 
 
@@ -142,6 +170,41 @@ def post_webhook(url: str, payload: Dict[str, Any]) -> None:
         raise OSError("the webhook post failed to connect") from None
     if not 200 <= status < 300:
         raise OSError("the webhook answered %d" % status)
+
+
+class DiscordError(OSError):
+    """A failed Discord call. Its message never carries the token."""
+
+
+def discord_call(method: str, path: str, token: str,
+                 body: Optional[Dict[str, Any]] = None) -> Any:
+    """One Discord REST call as the bot. Errors name only the method and the
+    status: the token, and the path's ids, stay out of the log."""
+    req = urllib.request.Request(  # noqa: S310 - a fixed https host
+        DISCORD_API + path, method=method,
+        data=None if body is None else json.dumps(body).encode("utf-8"),
+        headers={"Authorization": "Bot " + token,
+                 "Content-Type": "application/json",
+                 "User-Agent": "DiscordBot (https://github.com/quadseven/loom, 1)"})
+    try:
+        with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        status, raw = err.code, b""
+        err.close()
+    except (urllib.error.URLError, OSError):
+        raise DiscordError("discord %s failed to connect" % method) from None
+    if not 200 <= status < 300:
+        raise DiscordError("discord %s answered %d" % (method, status))
+    try:
+        return json.loads(raw.decode("utf-8")) if raw.strip() else None
+    except ValueError:
+        return None
+
+
+def _snowflake(at: float) -> int:
+    """The smallest Discord id a message posted at this time can have."""
+    return max(0, int(at * 1000) - DISCORD_EPOCH_MS) << 22
 
 
 def _say(msg: str) -> None:
@@ -205,11 +268,14 @@ class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
                  read_secret: Optional[SecretReader] = None,
-                 post: Optional[Poster] = None) -> None:
+                 post: Optional[Poster] = None,
+                 discord: Optional[DiscordCall] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
+        self.discord = discord or discord_call
+        self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
 
@@ -1041,13 +1107,201 @@ class Station:
         if url is not None:
             self._tell_brain(url, path, fresh, last, ok_at, journal)
 
+    # -- talking to the brain --------------------------------------------
+    @staticmethod
+    def _num(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def relay_operator(self) -> None:
+        """Relay the operator's new Discord messages to goal homes as
+        loom:operator notes, and forward the brain's loom:reply comments back
+        to the channel as replies. Each runs at most every OPERATOR_CHECK
+        seconds; with any setting empty nothing runs."""
+        if not (self.s.channel_id.isdigit() and self.s.bot_token_ssm
+                and self.s.mention.isdigit()):
+            return
+        path = os.path.join(self.state, "operator.json")
+        ledger = _read_json(path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        checked = ledger.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < OPERATOR_CHECK:
+            return
+        token = self._bot_token()
+        if token is None:
+            return
+        ledger["checked"] = self.now
+        try:
+            self._relay_messages(token, ledger, path)
+            self._forward_replies(token, ledger, path)
+        finally:
+            _write_json(path, ledger)
+
+    def _bot_token(self) -> Optional[str]:
+        try:
+            return self.read_secret(self.s.bot_token_ssm, self.s.region)
+        # Deliberately broad, as in _webhook: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not read the bot token parameter (%s); next pass"
+                 % type(err).__name__)
+            return None
+
+    def _bot(self, token: str, method: str, path: str,
+             body: Optional[Dict[str, Any]] = None) -> Tuple[bool, Any]:
+        """(ok, reply) for one Discord call. A DiscordError's text is ours and
+        never carries the token; any other error is logged by type only."""
+        try:
+            return True, self.discord(method, path, token, body)
+        except Exception as err:  # noqa: BLE001
+            why = str(err) if type(err) is DiscordError else type(err).__name__
+            _say("discord call failed (%s); next pass" % why)
+            return False, None
+
+    def _goal_homes(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """(repo, issue) for every open loom:goal issue in LOOM_REPOS, read
+        once per pass. Raises GitHubError: a partial list could send a note
+        to the wrong goal."""
+        if self._goals is None:
+            self._goals = [(repo, issue) for repo in self.s.repos
+                           if tickets.REPO_RE.fullmatch(repo)
+                           for issue in self._goal_issues(repo)]
+        return self._goals
+
+    def _goal_for(self, text: str) -> Optional[Tuple[str, int, str]]:
+        """(repo, number, link) of the goal the message names: an
+        owner/name#N or a #N of a goal home in LOOM_REPOS, else a word found
+        in one goal title only, else LOOM_DISCORD_DEFAULT_GOAL."""
+        goals = {(repo, int(i["number"])): i for repo, i in self._goal_homes()}
+
+        def found(key: Tuple[str, int]) -> Tuple[str, int, str]:
+            return key[0], key[1], str((goals.get(key) or {}).get("html_url") or "")
+        for m in GOAL_REF_RE.finditer(text):
+            if (m.group(1), int(m.group(2))) in goals:
+                return found((m.group(1), int(m.group(2))))
+        numbers = {int(m.group(1)) for m in NUMBER_REF_RE.finditer(text)}
+        hits = [key for key in goals if key[1] in numbers]
+        if len(hits) == 1:
+            return found(hits[0])
+        holders: Dict[str, set] = {}
+        for key, issue in goals.items():
+            for word in set(re.findall(r"[a-z0-9]+", str(issue.get("title") or "").lower())):
+                if len(word) >= TITLE_WORD_MIN:
+                    holders.setdefault(word, set()).add(key)
+        named = {next(iter(holders[w])) for w in set(re.findall(r"[a-z0-9]+", text.lower()))
+                 if len(holders.get(w, ())) == 1}
+        if len(named) == 1:
+            return found(named.pop())
+        m = GOAL_REF_RE.fullmatch(self.s.default_goal)
+        if m and m.group(1) in self.s.repos and tickets.REPO_RE.fullmatch(m.group(1)):
+            return found((m.group(1), int(m.group(2))))
+        return None
+
+    def _relay_messages(self, token: str, ledger: Dict[str, Any], path: str) -> None:
+        after = str(ledger.get("after") or "")
+        if not after.isdigit():
+            # First read: start a little before now rather than relaying the
+            # channel's whole history.
+            after = str(_snowflake(self.now - OPERATOR_FIRST_LOOKBACK))
+            ledger["after"] = after
+        chan = self.s.channel_id
+        ok, data = self._bot(token, "GET", "/channels/%s/messages?after=%s&limit=100"
+                             % (chan, after))
+        if not ok or not isinstance(data, list):
+            return
+        messages = sorted((m for m in data if isinstance(m, dict)
+                           and str(m.get("id") or "").isdigit()
+                           and int(m["id"]) > int(after)),
+                          key=lambda m: int(m["id"]))
+        for msg in messages:
+            author = msg.get("author") if isinstance(msg.get("author"), dict) else {}
+            text = str(msg.get("content") or "").strip()
+            if str(author.get("id") or "") == self.s.mention and not author.get("bot") and text:
+                self._relay_one(token, str(msg["id"]), text)
+            ledger["after"] = str(msg["id"])
+            _write_json(path, ledger)
+
+    def _relay_one(self, token: str, msg_id: str, text: str) -> None:
+        """Note one operator message on its goal home, then acknowledge it in
+        the channel. A GitHub error propagates before the ledger moves, so the
+        message is tried again next pass; the acknowledgements are best
+        effort once the note is posted."""
+        chan = self.s.channel_id
+        goal = self._goal_for(text)
+        if goal is None:
+            self._bot(token, "POST", "/channels/%s/messages" % chan, {
+                "content": "Not noted: name the goal as owner/name#N or #N.",
+                "message_reference": {"message_id": msg_id, "fail_if_not_exists": False},
+                "allowed_mentions": {"parse": []}})
+            _say("operator message %s names no goal; not noted" % msg_id)
+            return
+        repo, number, goal_link = goal
+        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                            {"body": OPERATOR_MARKER % msg_id + "\n" + text}).data
+        link = str((made or {}).get("html_url") or "") if isinstance(made, dict) else ""
+        link = link or goal_link
+        _say("noted operator message %s on %s#%d" % (msg_id, repo, number))
+        self._bot(token, "PUT", "/channels/%s/messages/%s/reactions/%s/@me"
+                  % (chan, msg_id, CHECKMARK))
+        self._bot(token, "POST", "/channels/%s/messages" % chan, {
+            "content": ("Noted for the brain on %s#%d %s" % (repo, number, link)).strip(),
+            "message_reference": {"message_id": msg_id, "fail_if_not_exists": False},
+            "allowed_mentions": {"parse": []}})
+
+    @staticmethod
+    def _reply_text(body: str, link: str) -> str:
+        suffix = "\n" + link if link else ""
+        room = DISCORD_MAX - len(suffix)
+        if len(body) > room:
+            body = body[:max(0, room - 4)].rstrip() + " ..."
+        return (body + suffix)[:DISCORD_MAX]
+
+    def _forward_replies(self, token: str, ledger: Dict[str, Any], path: str) -> None:
+        """Send each trusted loom:reply comment on a goal home to the channel
+        once, as a reply to the Discord message it names."""
+        last = ledger.get("replies_at")
+        start = (last if self._num(last) else self.now) - REPLY_OVERLAP
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+        sent = ledger.get("forwarded") if isinstance(ledger.get("forwarded"), dict) else {}
+        # Ids are kept as long as their reply could still be forwarded.
+        sent = {k: v for k, v in sent.items()
+                if self._num(v) and self.now - v <= REPLY_LOOKBACK}
+        ledger["forwarded"] = sent
+        allowed = {a.lower() for a in self.s.authors}
+        found = []
+        for repo, goal in self._goal_homes():
+            for c in self.gh.paginate("/repos/%s/issues/%d/comments?since=%s"
+                                      % (repo, int(goal["number"]), since)):
+                if not isinstance(c, dict):
+                    continue
+                body = str(c.get("body") or "")
+                m = REPLY_RE.match(body)
+                login = str((c.get("user") or {}).get("login") or "").lower()
+                ident = self._report_id(c)
+                # since= filters on the last edit: check when it was posted.
+                at = self._epoch(c.get("created_at", ""))
+                if (m and login in allowed and ident and str(ident) not in sent
+                        and at is not None and self.now - at <= REPLY_LOOKBACK):
+                    link = str(c.get("html_url") or goal.get("html_url") or "")
+                    found.append((ident, m.group(1), body[m.end():].strip(), link, at))
+        for ident, msg_id, text, link, at in sorted(found, key=lambda row: row[0]):
+            ok, _ = self._bot(token, "POST", "/channels/%s/messages" % self.s.channel_id, {
+                "content": self._reply_text(text, link),
+                "message_reference": {"message_id": msg_id, "fail_if_not_exists": False},
+                "allowed_mentions": {"parse": [], "replied_user": True}})
+            if not ok:
+                return  # replies_at stays, so the next pass reads this window again
+            sent[str(ident)] = at
+            _write_json(path, ledger)
+            _say("forwarded brain reply %d to the channel" % ident)
+        ledger["replies_at"] = self.now
+
     # -- one pass --------------------------------------------------------
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
-                     self.watch_brain):
+                     self.watch_brain, self.relay_operator):
             try:
                 step()
             except (GitHubError, OSError) as err:
