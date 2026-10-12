@@ -646,7 +646,8 @@ class Station:
 
     def forward_asks(self) -> None:
         if not self.s.webhook_ssm:
-            _say("LOOM_DISCORD_WEBHOOK_SSM is not set; asks are not forwarded")
+            # Not configured: skip quietly; a line every minute would only grow
+            # the station log (docs/LANES.md says how to turn it on).
             return
         path = os.path.join(self.state, "asks.json")
         sent = _read_json(path, {})
