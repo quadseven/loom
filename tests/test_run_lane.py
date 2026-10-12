@@ -739,6 +739,35 @@ class LaneRunnerTest(unittest.TestCase):
         beat = json.loads((self.loom / "state" / "usage" / "anthropic.json").read_text())
         self.assertFalse(beat["available"])
 
+    def test_a_slot_reads_its_lanes_settings_and_keeps_its_own_inbox(self):
+        inbox, result = self.api_lane(
+            "anthropic-2", LOOM_ANTHROPIC_KEY_SSM="/k/missing", LOOM_ANTHROPIC_MODEL="claude-test"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "anthropic-2.json").read_text())
+        self.assertEqual(beat["lane"], "anthropic-2")
+        self.assertFalse(beat["available"])
+        self.assertNotIn("unknown lane", beat["reason"])  # mapped to the anthropic lane
+        self.assertFalse((self.loom / "state" / "usage" / "anthropic.json").exists())
+
+    def test_a_codex_slot_runs_its_brief_with_codex(self):
+        slot = self.loom / "briefs" / "codex-2"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "T042-fix-the-thing.md").write_text(BRIEF)
+        result = self.run_lane("codex-2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((slot / "done" / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "codex-2.json").read_text())
+        self.assertEqual(beat["lane"], "codex-2")
+
+    def test_a_bad_lane_name_is_refused(self):
+        for name in ("anthropic-", "../codex", "codex-2/x", "Codex"):
+            result = self.run_lane(name)
+            self.assertEqual(result.returncode, 2, name)
+        self.assertEqual(self.calls(), [])
+
     def test_a_malformed_timeout_reports_unavailable_instead_of_running(self):
         self.drop_brief()
         result = self.run_lane(LOOM_AGENT_TIMEOUT="0")

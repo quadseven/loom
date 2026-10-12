@@ -3,6 +3,12 @@
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
 #                               | zen | zai | workersai | agy
+#                               | <lane>-<n> (an extra slot of that lane)
+#
+# A slot such as anthropic-2 is a second copy of the anthropic lane: its own
+# inbox, lock, log, scratch home and heartbeat, the same provider, key and
+# model settings (LOOM_ANTHROPIC_*). Slots let one provider run several briefs
+# at once.
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -22,10 +28,14 @@
 # LOOM_CLONE_BASE (default git@github.com:).
 set -uo pipefail
 
-LANE="${1:?usage: run_lane.sh <lane>}"
+SLOT="${1:?usage: run_lane.sh <lane>}"
+[[ "$SLOT" =~ ^[a-z][a-z-]*[a-z](-[0-9]+)?$ ]] || { echo "bad lane name $SLOT" >&2; exit 2; }
+# The provider lane: the slot without a trailing -<n> (opencode-go stays whole).
+LANE="$SLOT"
+[[ "$SLOT" =~ -[0-9]+$ ]] && LANE="${SLOT%-*}"
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
-INBOX="$LOOM_HOME/briefs/$LANE"
-LOCK="$LOOM_HOME/run/$LANE.lock"
+INBOX="$LOOM_HOME/briefs/$SLOT"
+LOCK="$LOOM_HOME/run/$SLOT.lock"
 
 mkdir -p "$INBOX/done" "$INBOX/failed" "$LOOM_HOME/run"
 
@@ -45,7 +55,7 @@ agent_groups() {
 stop_orphaned_agent() {
   local leader="$1" mine groups g alive
   [[ "$leader" =~ ^[0-9]+$ ]] && kill -0 "$leader" 2>/dev/null || return 0
-  ps -o command= -p "$leader" 2>/dev/null | grep -q "run_lane.sh $LANE" || return 0
+  ps -o command= -p "$leader" 2>/dev/null | grep -q -- "run_lane.sh $SLOT\$" || return 0
   mine="$(ps -o pgid= -p $$ | tr -d ' ')"
   groups="$(agent_groups "$leader" | grep -v -x -e "$mine" -e 0 -e 1 | sort -u | tr '\n' ' ')"
   [ -n "$groups" ] || return 0
@@ -75,7 +85,7 @@ NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
 WORKDIR="$LOOM_HOME/worktrees"
-LOGDIR="$LOOM_HOME/logs/$LANE"
+LOGDIR="$LOOM_HOME/logs/$SLOT"
 # The agy lane's agent runs as a dedicated macOS user (default "loom") that
 # cannot read this user's home or keychain. agy keeps its sign-in in that
 # user's own keychain, a non-"login" keychain (a "login" keychain will not
@@ -105,7 +115,7 @@ heartbeat() {
   reason="$(printf '%s' "$2" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
   mkdir -p "$LOOM_HOME/state/usage"
   printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"}\n' \
-    "$LANE" "$(date +%s)" "$1" "$reason" > "$LOOM_HOME/state/usage/$LANE.json"
+    "$SLOT" "$(date +%s)" "$1" "$reason" > "$LOOM_HOME/state/usage/$SLOT.json"
 }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
@@ -437,7 +447,7 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1"; do
   fi
 done
 
-AGENT_HOME="$LOOM_HOME/run/$LANE-home"
+AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
@@ -527,7 +537,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
-  echo "[$(date -u +%FT%TZ)] $TICKET start, lane $LANE" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${BASE_ARGS[@]+"${BASE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          git -C "$TREE" checkout -q -b "$BRANCH"; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed"; continue
