@@ -744,5 +744,83 @@ class AsksTest(Base):
         self.assertEqual(len(self.sent), 2)
 
 
+
+class BrainTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings.webhook_ssm = "/example/webhook"
+        self.settings.status_repo = REPO
+        self.sent = []
+
+    def tick(self, outcome="ok", code=0, ok_age=None):
+        state = os.path.join(self.home, "state")
+        self.write(os.path.join(state, "brain.json"),
+                   json.dumps({"at": int(time.time()), "outcome": outcome, "exit": code}))
+        if ok_age is not None:
+            ok = os.path.join(state, "brain-ok")
+            self.write(ok, "")
+            at = time.time() - ok_age
+            os.utime(ok, (at, at))
+
+    def go(self, later=0):
+        def post(url, payload):
+            self.sent.append(payload["content"])
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=time.time() + later,
+                        read_secret=lambda n, r: URL, post=post).run_pass()
+
+    def test_no_brain_tick_installed_means_no_row_and_no_message(self):
+        self.go()
+        self.assertNotIn("| brain |", self.fake.posts[0])
+        self.assertEqual(self.sent, [])
+
+    def test_a_fresh_brain_is_published_and_quiet(self):
+        self.tick(ok_age=60)
+        self.go()
+        self.assertIn("| brain | yes |", self.fake.posts[0])
+        self.assertEqual(self.sent, [])
+
+    def test_a_stale_brain_is_told_once_then_its_return_once(self):
+        self.tick(outcome="failed", code=124, ok_age=3 * 3600)
+        self.go()
+        self.go(60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Urgent: the Loom brain has not finished a tick since", self.sent[0])
+        self.assertIn("failed (exit 124)", self.sent[0])
+        self.assertIn("| brain | no |", self.fake.posts[0])
+        self.tick(ok_age=0)
+        self.go(120)
+        self.go(180)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("ticking again", self.sent[1])
+
+    def test_a_brain_that_never_ended_well_is_told(self):
+        self.tick(outcome="failed", code=1)
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("has not finished a tick yet", self.sent[0])
+
+    def test_a_skip_for_a_held_lock_counts_as_alive(self):
+        self.tick(outcome="skipped", ok_age=0)
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_odd_values_in_the_tick_file_never_reach_the_message(self):
+        self.tick(outcome="/private/x <@1>", code="rm", ok_age=3 * 3600)
+        self.go()
+        self.assertIn("unknown (exit ?)", self.sent[0])
+        self.assertNotIn("/private", self.sent[0])
+
+    def test_a_failed_send_is_retried_next_pass(self):
+        self.tick(outcome="failed", code=1, ok_age=3 * 3600)
+        gh = GitHub("token", transport=self.fake)
+
+        def down(url, payload):
+            raise OSError("down")
+        station.Station(gh, self.settings, read_secret=lambda n, r: URL, post=down).run_pass()
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,18 @@ mkdir -p "$WORK" "$(dirname "$LOG")"
 
 say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 
+# The station reads these to tell the operator when the brain stops ticking:
+# state/brain.json holds the last tick (outcome ok, skipped or failed, with the
+# agent's exit code), and state/brain-ok is touched by every tick that ended
+# well, a skip for a held lock included (another brain is acting).
+STATE="$LOOM_HOME/state"
+beat() {
+  mkdir -p "$STATE"
+  printf '{"at": %s, "outcome": "%s", "exit": %s}\n' "$(date +%s)" "$1" "$2" > "$STATE/brain.json.tmp" &&
+    mv "$STATE/brain.json.tmp" "$STATE/brain.json"
+  case "$1" in ok|skipped) touch "$STATE/brain-ok" ;; esac
+}
+
 [ -n "${LOOM_REPOS:-}" ] || exit 0
 [ -n "$ORIGIN" ] && [ -n "$LOCK_REPO" ] || { say "no origin remote in $REPO_ROOT, so no lock repo"; exit 1; }
 [[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -ge 5 ] || { say "LOOM_BRAIN_MINUTES must be a number of at least 5"; exit 1; }
@@ -37,6 +49,7 @@ bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 # The lock outlives the agent by 5 minutes, so a tick cut off by the timeout
 # still releases it below before anyone else could take it.
 if ! bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$((MINUTES + 5))" >> "$LOG" 2>&1; then
+  beat skipped 0
   exit 0
 fi
 trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1' EXIT
@@ -44,9 +57,9 @@ trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1' EXIT
 trap 'exit 143' TERM INT
 
 if [ -d "$WORK/loom/.git" ]; then
-  git -C "$WORK/loom" pull -q --ff-only >> "$LOG" 2>&1 || { say "could not update $WORK/loom"; exit 1; }
+  git -C "$WORK/loom" pull -q --ff-only >> "$LOG" 2>&1 || { say "could not update $WORK/loom"; beat failed 1; exit 1; }
 else
-  git clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; exit 1; }
+  git clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; beat failed 1; exit 1; }
 fi
 
 PROMPT="You are the Loom brain for one tick. Follow $WORK/loom/docs/MUSE.md, \
@@ -60,4 +73,6 @@ $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
 say "tick start (model $MODEL)"
 (cd "$WORK" && timeout "$((MINUTES * 60))" claude -p --model "$MODEL" \
   --permission-mode bypassPermissions "$PROMPT" < /dev/null) >> "$LOG" 2>&1
-say "tick end (exit $?)"
+code=$?
+say "tick end (exit $code)"
+if [ "$code" = 0 ]; then beat ok 0; else beat failed "$code"; fi

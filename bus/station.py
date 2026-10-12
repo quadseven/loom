@@ -42,6 +42,10 @@ URGENT = "loom:urgent"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+# A brain tick runs every 30 minutes; no tick ending well for this long means
+# the brain has stopped, and the operator is told once.
+BRAIN_STALE = 2 * 3600
+BRAIN_OUTCOMES = ("ok", "skipped", "failed")
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 
 SecretReader = Callable[[str, str], str]
@@ -534,6 +538,11 @@ class Station:
             when = (self._utc(at) if not isinstance(at, bool) and isinstance(at, (int, float))
                     else "-")
             rows.append((lane, "yes" if self._heartbeat_ok(lane) else "no", when))
+        brain = self._brain()
+        if brain is not None:
+            ok_at = brain[1]
+            rows.append(("brain", "yes" if self._brain_fresh(ok_at) else "no",
+                         self._utc(ok_at) if ok_at is not None else "-"))
         return rows
 
     def _lanes_issue(self, repo: str) -> int:
@@ -757,12 +766,67 @@ class Station:
         if url is not None:
             self._deliver(url, todo, digest, ledger, today)
 
+    # -- the brain -------------------------------------------------------
+    def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
+        """The last brain tick (lanes/mac/brain.sh) and when a tick last ended
+        well, or None when no brain tick runs on this machine."""
+        state = os.path.join(self.s.home, "state")
+        last = _read_json(os.path.join(state, "brain.json"), None, strict=False)
+        if not isinstance(last, dict):
+            return None
+        try:
+            ok_at: Optional[float] = os.path.getmtime(os.path.join(state, "brain-ok"))
+        except OSError:
+            ok_at = None
+        return last, ok_at
+
+    def _brain_fresh(self, ok_at: Optional[float]) -> bool:
+        return ok_at is not None and self.now - ok_at <= BRAIN_STALE
+
+    def _brain_alert_text(self, last: Dict[str, Any], ok_at: Optional[float]) -> str:
+        at, outcome, code = last.get("at"), last.get("outcome"), last.get("exit")
+        when = (self._utc(at) if not isinstance(at, bool) and isinstance(at, (int, float))
+                else "an unknown time")
+        outcome = outcome if outcome in BRAIN_OUTCOMES else "unknown"
+        code = code if isinstance(code, int) and not isinstance(code, bool) else "?"
+        since = ("since " + self._utc(ok_at)) if ok_at is not None else "yet"
+        return ("Urgent: the Loom brain has not finished a tick %s, so no goal is "
+                "moving. Last tick: %s, %s (exit %s). Its log is brain.log on the "
+                "lane machine." % (since, when, outcome, code))
+
+    def watch_brain(self) -> None:
+        """Tell the operator once when the brain stops ticking, and once when
+        it is back."""
+        if not self.s.webhook_ssm:
+            return
+        brain = self._brain()
+        if brain is None:
+            return
+        last, ok_at = brain
+        path = os.path.join(self.state, "brain-alert.json")
+        alert = _read_json(path, {}, strict=False)
+        alerted = isinstance(alert, dict) and alert.get("sent") is True
+        fresh = self._brain_fresh(ok_at)
+        # A message is due only when the state moved: stale and not yet told,
+        # or fresh again after an alert.
+        if fresh != alerted:
+            return
+        url = self._webhook()
+        if url is None:
+            return
+        if fresh:
+            if self._send(url, "The Loom brain is ticking again (last good tick %s)."
+                          % self._utc(ok_at or self.now)):
+                _write_json(path, {})
+        elif self._send(url, self._brain_alert_text(last, ok_at)):
+            _write_json(path, {"sent": True, "at": self.now})
+
     # -- one pass --------------------------------------------------------
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
-        for step in (self.publish_lanes, self.forward_asks):
+        for step in (self.publish_lanes, self.forward_asks, self.watch_brain):
             try:
                 step()
             except (GitHubError, OSError) as err:

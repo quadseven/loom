@@ -2,6 +2,7 @@
 whose origin is a local bare repo, and fake python3 (the bus lock) and
 claude commands on PATH that record their calls."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -72,6 +73,26 @@ class BrainTickTest(unittest.TestCase):
         )
         calls = self.log.read_text().splitlines() if self.log.exists() else []
         return run, calls
+
+    def beat(self):
+        state = self.home / "state"
+        last = json.loads((state / "brain.json").read_text())
+        return last, (state / "brain-ok").exists()
+
+    def test_heartbeats_say_how_each_tick_ended(self):
+        self.tick()
+        last, ok = self.beat()
+        self.assertEqual(("ok", 0), (last["outcome"], last["exit"]))
+        self.assertTrue(ok)
+        (self.home / "state" / "brain-ok").unlink()
+        self.tick(FAKE_CLAUDE_EXIT="124")
+        last, ok = self.beat()
+        self.assertEqual(("failed", 124), (last["outcome"], last["exit"]))
+        self.assertFalse(ok)
+        self.tick(FAKE_LOCK="1")
+        last, ok = self.beat()
+        self.assertEqual("skipped", last["outcome"])
+        self.assertTrue(ok)
 
     def test_no_repos_means_no_lock_and_no_model_call(self):
         run, calls = self.tick(LOOM_REPOS="")
