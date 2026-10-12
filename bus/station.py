@@ -7,6 +7,7 @@ take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
 """
 from __future__ import annotations
 
+import calendar
 import fcntl
 import hashlib
 import json
@@ -46,6 +47,11 @@ DIGEST_HEAD = "Asks waiting for you:"
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
 BRAIN_OUTCOMES = ("ok", "skipped", "failed")
+# Every brain, on any machine, posts a journal on the goal homes; the station
+# reads GitHub at most this often, and looks back this far.
+JOURNAL_MARKER = "<!-- loom:journal v1 -->"
+JOURNAL_CHECK = 600
+JOURNAL_LOOKBACK = 24 * 3600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 
 SecretReader = Callable[[str, str], str]
@@ -783,20 +789,74 @@ class Station:
     def _brain_fresh(self, ok_at: Optional[float]) -> bool:
         return ok_at is not None and self.now - ok_at <= BRAIN_STALE
 
-    def _brain_alert_text(self, last: Dict[str, Any], ok_at: Optional[float]) -> str:
+    def _brain_alert_text(self, last: Dict[str, Any], ok_at: Optional[float],
+                          journal: Optional[Dict[str, Any]] = None) -> str:
         at, outcome, code = last.get("at"), last.get("outcome"), last.get("exit")
         when = (self._utc(at) if not isinstance(at, bool) and isinstance(at, (int, float))
                 else "an unknown time")
         outcome = outcome if outcome in BRAIN_OUTCOMES else "unknown"
         code = code if isinstance(code, int) and not isinstance(code, bool) else "?"
         since = ("since " + self._utc(ok_at)) if ok_at is not None else "yet"
+        seen = ("Newest journal: %s on %s." % (self._utc(journal["at"]), journal["goal"])
+                if journal else "No journal from an allowed author in the last day.")
         return ("Urgent: the Loom brain has not finished a tick %s, so no goal is "
-                "moving. Last tick: %s, %s (exit %s). Its log is brain.log on the "
-                "lane machine." % (since, when, outcome, code))
+                "moving. %s Last tick on the lane machine: %s, %s (exit %s). Its log "
+                "is brain.log there." % (since, seen, when, outcome, code))
+
+    @staticmethod
+    def _epoch(stamp: str) -> Optional[float]:
+        try:
+            return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+        except (ValueError, TypeError):
+            return None
+
+    def _newest_journal(self) -> Optional[Dict[str, Any]]:
+        """The newest journal comment from an allowed login on any open
+        loom:goal issue in LOOM_REPOS, as {"at", "goal"}, or None when there is
+        none in the last day. Raises GitHubError when GitHub cannot be read."""
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(self.now - JOURNAL_LOOKBACK))
+        best: Optional[Dict[str, Any]] = None
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            for goal in self.gh.paginate(
+                    "/repos/%s/issues?labels=loom:goal&state=open" % repo):
+                if not isinstance(goal, dict) or "number" not in goal:
+                    continue
+                number = int(goal["number"])
+                for c in self.gh.paginate(
+                        "/repos/%s/issues/%d/comments?since=%s" % (repo, number, since)):
+                    login = (c.get("user") or {}).get("login")
+                    body = str(c.get("body") or "").lstrip()
+                    at = self._epoch(c.get("created_at", ""))
+                    if (login in self.s.authors and body.startswith(JOURNAL_MARKER)
+                            and at is not None and (best is None or at > best["at"])):
+                        best = {"at": at, "goal": "%s#%d" % (repo, number)}
+        return best
+
+    def _journal(self) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """(read ok, newest journal), re-read at most every JOURNAL_CHECK
+        seconds and kept in the station state between reads."""
+        path = os.path.join(self.state, "brain-journal.json")
+        cache = _read_json(path, {}, strict=False)
+        checked = cache.get("checked") if isinstance(cache, dict) else None
+        if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
+                and 0 <= self.now - checked < JOURNAL_CHECK):
+            journal = cache.get("journal")
+            return True, journal if isinstance(journal, dict) else None
+        try:
+            journal = self._newest_journal()
+        except GitHubError as err:
+            _say("brain journal read failed: %s" % err)
+            return False, None
+        _write_json(path, {"checked": self.now, "journal": journal})
+        return True, journal
 
     def watch_brain(self) -> None:
         """Tell the operator once when the brain stops ticking, and once when
-        it is back."""
+        it is back. The brain is fresh when the lane machine's own tick files
+        say so or a journal on any goal is at most BRAIN_STALE old."""
         if not self.s.webhook_ssm:
             return
         brain = self._brain()
@@ -807,6 +867,13 @@ class Station:
         alert = _read_json(path, {}, strict=False)
         alerted = isinstance(alert, dict) and alert.get("sent") is True
         fresh = self._brain_fresh(ok_at)
+        journal = None
+        if not fresh:
+            read, journal = self._journal()
+            if not read:
+                return
+            if journal and self.now - journal["at"] <= BRAIN_STALE:
+                fresh = True
         # A message is due only when the state moved: stale and not yet told,
         # or fresh again after an alert.
         if fresh != alerted:
@@ -815,10 +882,11 @@ class Station:
         if url is None:
             return
         if fresh:
+            good = max(ok_at or 0, journal["at"] if journal else 0) or self.now
             if self._send(url, "The Loom brain is ticking again (last good tick %s)."
-                          % self._utc(ok_at or self.now)):
+                          % self._utc(good)):
                 _write_json(path, {})
-        elif self._send(url, self._brain_alert_text(last, ok_at)):
+        elif self._send(url, self._brain_alert_text(last, ok_at, journal)):
             _write_json(path, {"sent": True, "at": self.now})
 
     # -- one pass --------------------------------------------------------

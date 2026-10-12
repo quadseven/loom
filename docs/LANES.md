@@ -33,9 +33,15 @@ rest to Muse (docs/MUSE.md).
 
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. The station adds a `brain` row to the lane status, and when no tick
-has ended well for 2 hours it sends one urgent Discord message, then one more
-when the brain is back.
+included. The station adds a `brain` row to the lane status. The brain also
+runs on Muse, so the station reads GitHub too: while no local tick has ended
+well for 2 hours it looks (at most every 10 minutes) for the newest
+`<!-- loom:journal v1 -->` comment from a `LOOM_BRIEF_AUTHORS` login on the
+open `loom:goal` issues in `LOOM_REPOS`. The brain is alive when either the
+local tick or a journal is at most 2 hours old. Only when both are older does
+the station send one urgent Discord message, naming the newest journal's time
+and goal, then one more when the brain is back. A GitHub read error never
+counts as stale; that pass makes no decision.
 
 ## The station
 

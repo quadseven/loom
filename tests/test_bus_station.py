@@ -48,6 +48,16 @@ class FakeGitHub:
         self.edits = []
         self.posts = []
         self.asks = []
+        self.goals = []
+        self.goal_error = False
+
+    def add_goal(self, number, journals=()):
+        """journals: (login, age in seconds) pairs, posted as journal comments."""
+        self.goals.append({"number": number, "labels": [{"name": "loom:goal"}]})
+        self.comments[number] = [
+            {"body": "<!-- loom:journal v1 -->\nTick", "user": {"login": login},
+             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))}
+            for login, age in journals]
 
     def _list_asks(self, headers):
         etag = '"a%d"' % len(self.asks)
@@ -109,6 +119,10 @@ class FakeGitHub:
         if method == "GET" and rest == "issues":
             if "needs-operator" in query:
                 return self._list_asks(headers)
+            if "loom:goal" in query:
+                if self.goal_error:
+                    return reply(500, {"message": "down"})
+                return reply(200, self.goals)
             if "loom:lanes" in query:
                 return reply(200, self.lanes_issues)
             return self._list_briefed(headers)
@@ -793,6 +807,38 @@ class BrainTest(Base):
         self.go(180)
         self.assertEqual(len(self.sent), 2)
         self.assertIn("ticking again", self.sent[1])
+
+    def test_a_fresh_journal_keeps_a_stale_local_tick_quiet(self):
+        self.tick(outcome="failed", code=1, ok_age=3 * 3600)
+        self.fake.add_goal(50, [("alice-example", 600)])
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_journals_from_other_logins_do_not_count(self):
+        self.tick(outcome="failed", code=1, ok_age=3 * 3600)
+        self.fake.add_goal(50, [("stranger-example", 60)])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_both_stale_sends_once_naming_the_journal_then_recovery_once(self):
+        self.tick(outcome="failed", code=1, ok_age=3 * 3600)
+        self.fake.add_goal(50, [("bob-example", 3 * 3600)])
+        self.go()
+        self.go(60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Newest journal:", self.sent[0])
+        self.assertIn("%s#50" % REPO, self.sent[0])
+        self.fake.add_goal(51, [("alice-example", 0)])
+        self.go(700)
+        self.go(800)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("ticking again", self.sent[1])
+
+    def test_a_github_read_error_sends_nothing(self):
+        self.tick(outcome="failed", code=1, ok_age=3 * 3600)
+        self.fake.goal_error = True
+        self.go()
+        self.assertEqual(self.sent, [])
 
     def test_a_brain_that_never_ended_well_is_told(self):
         self.tick(outcome="failed", code=1)
