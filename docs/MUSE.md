@@ -34,6 +34,14 @@ not looked hard enough yet. Each tick the brain:
   top ones, up to the goal's cap. Problems nobody has ticketed yet count:
   look at the live system for what is slow, stuck, failing or unnatural, and
   ticket it with the evidence.
+- Finishes before it starts: each tick merges every lane pull request that
+  is ready (checks green, no unresolved threads, a fix-up already pushed
+  for each finding) before it briefs anything new.
+- When a goal is at its cap, a brief that fixes a live regression on a
+  ticket already shipped may still be filed, past the cap, by setting
+  `LOOM_GOAL_CAP` to the cap plus 8 for that one brief command (until a
+  reserved regression slot exists, #102). Ordinary new work waits for the
+  cap.
 - Proves every change: a ticket is verified only when its proof shows on the
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.
