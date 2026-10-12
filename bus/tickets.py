@@ -84,15 +84,150 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
 class Fix:
     """A loom:fix comment: the lane's open pull request and what to fix on it."""
 
-    def __init__(self, pr: int, branch: str, findings: str) -> None:
+    def __init__(self, pr: int, branch: str, findings: str = "") -> None:
         self.pr = pr
         self.branch = branch
         self.findings = findings
+        self._findings_list: Optional[List[Finding]] = None
+
+    @property
+    def findings_list(self) -> List[Finding]:
+        if self._findings_list is None:
+            self._findings_list = parse_findings(self.findings)
+        return self._findings_list
+
+    def has_all_dispositions(self) -> bool:
+        """Return True if all findings have a disposition (any value, including 'does_not_apply')."""
+        return all(f.disposition for f in self.findings_list)
+
+
+class Finding:
+    """A single pre-roll finding with a stable ID and disposition."""
+
+    DISPOSITIONS = ("fixed", "existing_ticket", "new_ticket", "does_not_apply")
+    
+    def __init__(self, id: str, text: str, location: Optional[Tuple[str, int, int]] = None,
+                 disposition: Optional[str] = None, ticket: Optional[str] = None) -> None:
+        if id and not re.match(r"^F[0-9]+$", id):
+            raise ValueError("Finding ID must be F<number>")
+        if disposition is not None and disposition not in self.DISPOSITIONS:
+            raise ValueError("Disposition must be one of %s" % ", ".join(self.DISPOSITIONS))
+        self.id = id
+        self.text = text
+        self.location = location
+        self.disposition = disposition
+        self.ticket = ticket
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {"id": self.id, "text": self.text, "disposition": self.disposition}
+        if self.location:
+            result["location"] = [self.location[0], self.location[1], self.location[2]]
+        if self.ticket:
+            result["ticket"] = self.ticket
+        return result
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "Finding":
+        return Finding(
+            id=data.get("id", ""),
+            text=data.get("text", ""),
+            location=tuple(data["location"]) if "location" in data else None,
+            disposition=data.get("disposition", "does_not_apply"),
+            ticket=data.get("ticket")
+        )
+
+
+def parse_findings(body: str) -> List[Finding]:
+    """Parse findings from a loom:fix comment body.
+    
+    Returns a list of Finding objects. Findings without a dispositions
+    line are assumed to be 'does_not_apply'.
+    """
+    findings: List[Finding] = []
+    lines = body.split("\n")
+    current_thread = None
+    current_comments = []
+    next_id = 1  # Next auto-assigned ID number
+    pending_disposition = None
+    pending_disposition_value = None
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        
+        # Look for a thread header: "### Thread <id> (comment <id>) at <path>:<line>"
+        # Thread ID is optional (F1, F2, etc. can be omitted initially)
+        thread_match = re.match(r"^### Thread(?: ([A-Za-z0-9]+))? \(comment ([0-9]+)\) at (.+):(\d+)$", stripped)
+        if thread_match:
+            # Save the previous thread if any, with its disposition
+            if current_thread:
+                finding = Finding(
+                    id=current_thread["id"],
+                    text="\n".join(current_comments).rstrip("\n"),
+                    location=(current_thread["path"], int(current_thread["line"]), int(current_thread["comment_id"])),
+                    disposition=pending_disposition
+                )
+                if pending_disposition == "existing_ticket" and pending_disposition_value:
+                    finding.ticket = pending_disposition_value
+                findings.append(finding)
+                pending_disposition = None
+                pending_disposition_value = None
+            
+            thread_id = thread_match.group(1)
+            if not thread_id:
+                thread_id = "F%d" % next_id
+                next_id += 1
+            current_thread = {
+                "id": thread_id,
+                "comment_id": thread_match.group(2),
+                "path": thread_match.group(3),
+                "line": thread_match.group(4)
+            }
+            current_comments = []
+            continue
+        
+        # Look for dispositions: "Fixing: <ticket>" or "Does not apply"
+        fixing_match = re.match(r"^Fixing: (.+)$", stripped)
+        if fixing_match:
+            pending_disposition = "existing_ticket"
+            pending_disposition_value = fixing_match.group(1)
+            continue
+        
+        # Look for explicit "Does not apply" at the start of a comment
+        if stripped == "Does not apply":
+            pending_disposition = "does_not_apply"
+            continue
+        
+        # If we're inside a thread, add the comment
+        if current_thread:
+            current_comments.append(line)
+    
+    # Don't forget the last thread
+    if current_thread:
+        finding = Finding(
+            id=current_thread["id"],
+            text="\n".join(current_comments).rstrip("\n"),
+            location=(current_thread["path"], int(current_thread["line"]), int(current_thread["comment_id"])),
+            disposition=pending_disposition
+        )
+        if pending_disposition == "existing_ticket" and pending_disposition_value:
+            finding.ticket = pending_disposition_value
+        findings.append(finding)
+    
+    return findings
+
+
+def find_uncovered_dispositions(findings: List[Finding]) -> List[Finding]:
+    """Return findings that don't have a disposition other than 'does_not_apply'.
+    
+    These are findings that still need to be dispositioned.
+    """
+    return [f for f in findings if f.disposition == "does_not_apply"]
 
 
 FIX_MARKER = "<!-- loom:fix v1 -->"
 FIX_PR_RE = re.compile(r"Pull request: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+), "
                        r"branch (loom/[A-Za-z0-9._/-]+)[ \t]*")
+FIXING_DISPOSITION_RE = re.compile(r"^Fixing: (.+)$")
 # Lines in the findings the runner could read as a brief header or a section
 # of the ticket get indented, which makes them plain quoted text.
 _FIX_UNSAFE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Difficulty|Fix-PR):|#{1,2} ")
@@ -113,8 +248,34 @@ def parse_fix(repo: str, body: Optional[str]) -> Fix:
     return Fix(int(m.group(2)), m.group(3), "\n".join(rest).strip("\n"))
 
 
+def render_findings(findings: List[Finding]) -> str:
+    """Render findings with their dispositions for a loom:fix comment.
+    
+    Format:
+    ### Thread <id> (comment <id>) at <path>:<line>
+    <comment text>
+    <comment text>
+    <disposition line if any>
+    """
+    lines = []
+    for f in findings:
+        lines.append("### Thread %s (comment %s) at %s:%s" % (
+            f.id, f.location[2] if f.location else "?",
+            f.location[0] if f.location else "?",
+            f.location[1] if f.location else "?"))
+        for line in f.text.split("\n"):
+            lines.append(line)
+        if f.disposition:
+            if f.ticket:
+                lines.append("Fixing: %s" % f.ticket)
+            elif f.disposition == "fixed":
+                lines.append("Fixing: fixed in this PR")
+        lines.append("")
+    return "\n".join(lines).strip("\n")
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
-                 fix: Optional[Fix] = None) -> str:
+                  fix: Optional[Fix] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -128,6 +289,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     ]
     if fix:
         out.append("Fix-PR: %d" % fix.pr)
+        for f in fix.findings_list:
+            out.append("Finding-%s: %s" % (f.id, f.text[:200]))
     out += ["%s: %s" % (k, v) for k, v in headers.items()]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"

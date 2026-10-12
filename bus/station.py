@@ -337,6 +337,17 @@ class Station:
         except ValueError as err:
             self._refuse(repo, issue, str(err))
             return False
+        
+        if fix is None:
+            self._refuse(repo, issue, "no loom:fix comment found")
+            return False
+        
+        # Check if all findings have dispositions
+        if not fix.has_all_dispositions():
+            undispositioned = [f.id for f in fix.findings_list if not f.disposition]
+            self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
+            return False
+        
         earlier = sum(1 for c in comments
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
         attempt = earlier + 1

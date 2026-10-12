@@ -153,8 +153,10 @@ fix_pr_open() {
 # What a fix brief fixed: the ### headings of its ## Fix section, one line.
 fix_items() {
   awk '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
-       on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
-       END {print out}' "$1" | cut -c1-500
+        on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
+        on && /^Fixing: / {sub(/^Fixing: /, ""); out = out (n++ ? "; " : "") $0}
+        on && /^Does not apply/ {out = out (n++ ? "; " : "") "does_not_apply"}
+        END {print out}' "$1" | cut -c1-500
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
