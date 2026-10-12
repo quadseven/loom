@@ -10,21 +10,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, token_from_env
+from . import text
 from .labels import LANES
 
 STATES = ("queued", "briefed", "running", "pr", "failed", "shipped", "verified")
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
-REVIEW_BOT_SHORT_NAME = "coderabbit"
-CLOSING_REFERENCE = re.compile(r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved):?\s+(?:#[0-9]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+)\b", re.IGNORECASE)
-
-
-def _check_written_text(text: str) -> None:
-    if re.search(r"@" + re.escape(REVIEW_BOT_SHORT_NAME), text, re.IGNORECASE):
-        raise ValueError("body must not mention the review bot handle")
-    if CLOSING_REFERENCE.search(text):
-        raise ValueError("body must not contain a closing reference")
+_check_written_text = text.check
 
 
 def _repo(value: str) -> str:
@@ -230,7 +223,7 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
              ' commits(last:1) { nodes { commit { statusCheckRollup { state } } } } '
-             ' reviewThreads(first:100) { nodes { isResolved comments(first:1) { nodes { databaseId } } } }'
+             ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes { databaseId } } } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     return ((data.get("repository") or {}).get("pullRequest") or {})
@@ -285,7 +278,6 @@ def reply_to_review(gh: GitHub, repo: str, number: int, comment_id: int,
     if resolve:
         details = _pr_graphql(gh, repo, number)
         thread_id = _thread_for_comment(details, comment_id)
-        owner, name = repo.split("/", 1)
         query = ('mutation { resolveReviewThread(input:{threadId:%s}) { thread { isResolved } } }' % _gql(str(thread_id)))
         gh.graphql(query)
 
@@ -299,6 +291,26 @@ def _thread_for_comment(details: Dict[str, Any], comment_id: int) -> str:
     raise ValueError("review comment thread was not found")
 
 
+def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
+          note: Optional[str] = None) -> None:
+    """Close a ticket. Completed only once it is verified (never close before
+    live verification); not_planned for tickets the brain drops."""
+    if reason not in ("completed", "not_planned"):
+        raise ValueError("reason is completed or not_planned")
+    if note is not None:
+        _check_written_text(note)
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+    names = _labels(issue)
+    if issue.get("state") != "open" or "loom:ticket" not in names:
+        raise ValueError("only open loom:ticket issues are closed here")
+    if reason == "completed" and "loom:verified" not in names:
+        raise ValueError("a ticket is closed as completed only after loom:verified")
+    if note is not None:
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+    gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+            {"state": "closed", "state_reason": reason})
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
@@ -306,6 +318,7 @@ def parser() -> argparse.ArgumentParser:
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base")
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
+    cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
@@ -329,6 +342,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not match:
                 raise ValueError("ticket must be OWNER/NAME#N")
             move(gh, match.group(1), int(match.group(2)), args.to, args.lane, args.note)
+        elif args.command == "close":
+            match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)", args.ticket)
+            if not match:
+                raise ValueError("ticket must be OWNER/NAME#N")
+            close(gh, match.group(1), int(match.group(2)), args.reason, args.note)
         elif args.command in ("merge", "reply"):
             match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)", args.pull_request)
             if not match:
