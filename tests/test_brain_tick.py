@@ -144,6 +144,19 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual(1, run.returncode)
         self.assertFalse(self.log.exists())
 
+    def test_an_unknown_scope_never_takes_the_lock(self):
+        run, calls = self.tick(LOOM_BRAIN_SCOPE="some")
+        self.assertEqual(1, run.returncode)
+        self.assertEqual([], calls)
+
+    def test_live_scope_leaves_github_steps_to_muse(self):
+        _, calls = self.tick(LOOM_BRAIN_SCOPE="live")
+        claude = [c for c in calls if c.startswith("claude ")][0]
+        self.assertIn("Do only what needs this machine", claude)
+        _, calls = self.tick()
+        claude = [c for c in calls if c.startswith("claude ")][-1]
+        self.assertNotIn("Do only what needs this machine", claude)
+
     def test_an_invalid_time_limit_never_takes_the_lock(self):
         run, calls = self.tick(LOOM_BRAIN_MINUTES="2")
         self.assertEqual(1, run.returncode)

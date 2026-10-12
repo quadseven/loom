@@ -7,6 +7,17 @@ Run every command from that checkout. Set `LOOM_GITHUB_TOKEN` and
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
+## What Muse does and leaves
+
+Muse reads live data only through REST APIs on the tailnet, through its
+proxy, and has no cluster or database access. The lane machine's tick runs
+with `LOOM_BRAIN_SCOPE=live` and does what needs the cluster: ships and rolls,
+and checks that need cluster or database access. Muse does everything else:
+reviews, merges, briefs, failed tickets, asks, journals, and verification
+from REST APIs. Never write to a live system. When a step needs a fact no API
+serves, write what is needed on the ticket and leave it; never claim a live
+result you did not read yourself.
+
 ## Tick
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
