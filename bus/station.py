@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import text as _text
 from . import tickets
 from .github import GitHub, GitHubError, _OPENER
 from .journal import REPLY_RE
@@ -1235,6 +1236,17 @@ class Station:
             _say("operator message %s names no goal; not noted" % msg_id)
             return
         repo, number, goal_link = goal
+        try:
+            # The note lands on GitHub as written: the shared checks keep out
+            # the review bot's at-handle and closing keywords next to issues.
+            _text.check(text)
+        except ValueError as err:
+            self._bot(token, "POST", "/channels/%s/messages" % chan, {
+                "content": "Not noted: %s. Reword it and send again." % err,
+                "message_reference": {"message_id": msg_id, "fail_if_not_exists": False},
+                "allowed_mentions": {"parse": []}})
+            _say("operator message %s refused by the text checks" % msg_id)
+            return
         made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                             {"body": OPERATOR_MARKER % msg_id + "\n" + text}).data
         link = str((made or {}).get("html_url") or "") if isinstance(made, dict) else ""

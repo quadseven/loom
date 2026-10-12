@@ -1189,6 +1189,12 @@ class OperatorTest(Base):
         self.assertEqual(ack["message_reference"]["message_id"], mine)
         self.assertEqual(ack["allowed_mentions"], {"parse": []})
 
+    def test_a_message_the_text_checks_refuse_is_not_noted(self):
+        self.say(2, "%s#41 this fixes #3" % REPO)
+        self.go()
+        self.assertEqual(self.notes(41), [])
+        self.assertTrue(any("Not noted" in b["content"] for b in self.discord.sent))
+
     def test_goal_choice_by_reference_number_title_word_and_default(self):
         self.say(1, "about #40 please")
         self.say(2, "the TICKETS are slow")
