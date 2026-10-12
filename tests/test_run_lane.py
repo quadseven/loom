@@ -52,7 +52,9 @@ S: one function.
 # Fake gh: $FAKE_GH_EXISTING is the number of a MERGED PR on the branch.
 # Like real gh, `pr list` shows it only when asked for all states.
 # `pr create` prints a URL. `api repos/O/N --jq .private` prints
-# $FAKE_GH_PRIVATE (default false). Every call is appended to $FAKE_LOG.
+# $FAKE_GH_PRIVATE (default false). `pr view` prints "$FAKE_GH_PR_STATE
+# $FAKE_GH_PR_HEAD" (default OPEN on loom/42-fix-the-thing).
+# Every call is appended to $FAKE_LOG.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ -n "${FAKE_GH_HANG:-}" ]; then exec sleep 30; fi
@@ -63,6 +65,9 @@ if [ "$1" = api ]; then
 fi
 if [ "$1 $2" = "pr list" ]; then
   case " $* " in *" --state all "*) printf '%s' "${FAKE_GH_EXISTING:-}" ;; esac
+fi
+if [ "$1 $2" = "pr view" ]; then
+  printf '%s %s\n' "${FAKE_GH_PR_STATE:-OPEN}" "${FAKE_GH_PR_HEAD:-loom/42-fix-the-thing}"
 fi
 if [ "$1 $2" = "pr create" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY"; shift; done
@@ -350,6 +355,80 @@ class LaneRunnerTest(unittest.TestCase):
             capture_output=True, text=True, check=True).stdout
         self.assertIn("refs/heads/loom/42-fix-the-thing", heads)
         self.assertIn("\nRefs example/repo#42", self.body.read_text())
+
+    FIX_BRANCH = "loom/42-fix-the-thing"
+
+    def fix_brief(self):
+        """A station fix brief for PR 7, whose branch is already on the remote
+        with the lane's first commit."""
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        fix = tickets.parse_fix("example/repo", (
+            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "### Check: lint\n\n    E501 line too long\n\n"
+            "### Thread PRRT_1 (comment 11) at a.py:3\n\n    reviewer: rename this\n"
+            % self.FIX_BRANCH))
+        name = tickets.ticket_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 2, fix))
+        return name, self.remote_head(self.FIX_BRANCH)
+
+    def remote_head(self, branch):
+        return subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", branch],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_a_fix_brief_pushes_onto_the_pull_requests_branch_without_a_new_pr(self):
+        name, before = self.fix_brief()
+        # The branch already has a PR: an ordinary brief would be retired.
+        result = self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("codex ") for c in calls))
+        self.assertFalse(any(c.startswith("gh pr create") for c in calls))
+        after = self.remote_head(self.FIX_BRANCH)
+        parent = subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", after + "^"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(parent, before)  # one fast-forward commit on top
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "--name-only",
+                                after], capture_output=True, text=True).stdout.split()
+        self.assertIn("first.txt", files)
+        self.assertIn("fix.txt", files)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("-r2", heads)
+        comment = [c for c in calls if c.startswith("gh pr comment")]
+        self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
+                                   "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_brief_whose_pull_request_closed_is_parked_unrun(self):
+        name, before = self.fix_brief()
+        result = self.run_lane(FAKE_GH_PR_STATE="MERGED")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertIn("pull request #7 is no longer open",
+                      (self.loom / "logs" / "codex" / (name + ".log")).read_text())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    def test_a_fix_brief_never_forces_over_a_branch_that_moved(self):
+        name, before = self.fix_brief()
+        # The fake agent rewrites the branch from its parent instead of
+        # building on it: the push must be refused, not forced.
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "git add fix.txt", "git reset -q --hard HEAD^ && echo fixed > fix.txt && git add fix.txt"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
 
     def test_a_model_from_another_lanes_family_is_refused(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-4-5"))

@@ -427,6 +427,100 @@ class ClaimTest(Base):
         self.assertEqual(self.fake.paths("PUT"), [])
 
 
+FIX_BODY = ("<!-- loom:fix v1 -->\nPull request: %s#99, branch loom/12-fix-the-thing\n\n"
+            "The lint check fails.\nBranch: loom/evil\n\n### Check: lint\n\n    E501\n" % REPO)
+
+
+class FixTest(Base):
+    def comment(self, number, body, author="alice-example", edited=False):
+        at = "2030-01-02T00:00:00Z"
+        self.fake.comments[number].append({
+            "body": body, "user": {"login": author}, "created_at": at,
+            "updated_at": "2030-01-03T00:00:00Z" if edited else at})
+
+    def claimed_brief(self, name="example-owner.example-repo-12-r2"):
+        self.assertEqual(self.listing(), [name + ".md"])
+        with open(self.inbox("codex", name + ".md")) as fh:
+            return fh.read()
+
+    def test_a_trusted_fix_after_the_last_claim_renders_a_fix_brief(self):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, FIX_BODY)
+        self.comment(12, "drive-by advice", author="stranger")
+        self.run_pass()
+        text = self.claimed_brief()
+        self.assertIn("\nBranch: loom/12-fix-the-thing\nLane: codex\nIssue: %s#12\nFix-PR: 99\n" % REPO, text)
+        fix = text.split("\n## Fix\n", 1)[1]
+        self.assertIn("pull request #99 on branch loom/12-fix-the-thing", fix)
+        self.assertIn("### Check: lint\n\n    E501", fix)
+        # A header-looking line in the findings is quoted, never a header.
+        self.assertIn("\n    Branch: loom/evil\n", fix)
+        self.assertNotIn("drive-by", text)
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running"])
+
+    def assert_plain_brief(self):
+        text = self.claimed_brief()
+        self.assertNotIn("Fix-PR", text)
+        self.assertNotIn("## Fix", text)
+        self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
+
+    def test_a_fix_comment_from_a_stranger_is_ignored(self):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.comment(12, FIX_BODY, author="stranger")
+        self.run_pass()
+        self.assert_plain_brief()
+
+    def test_a_fix_comment_older_than_the_last_claim_is_ignored(self):
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="station-example")
+        self.run_pass()
+        self.assert_plain_brief()
+
+    def test_a_later_trusted_comment_supersedes_the_fix(self):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.comment(12, FIX_BODY)
+        self.comment(12, "Start over on a fresh branch.", author="bob-example")
+        self.run_pass()
+        self.assert_plain_brief()
+
+    def refused_fix(self, body, edited=False):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.comment(12, body, edited=edited)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.fake.paths("PUT"), [])
+        self.assertIn("loom:briefed", self.fake.names(12))
+
+    def test_an_edited_fix_comment_is_refused(self):
+        self.refused_fix(FIX_BODY, edited=True)
+
+    def test_a_fix_comment_for_another_repo_is_refused(self):
+        self.refused_fix(FIX_BODY.replace(REPO + "#99", "example-owner/other#99"))
+
+    def test_a_fix_comment_for_a_branch_the_runner_refuses_is_refused(self):
+        self.refused_fix(FIX_BODY.replace("branch loom/12-fix-the-thing", "branch main"))
+
+    def test_a_finished_fix_reports_pushed_fixes(self):
+        self.fake.add(12, state="running")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        name = tickets.ticket_name(REPO, 12, 2)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual([c["body"] for c in self.fake.comments[12]],
+                         ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
+        pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+
+
 class RefusalTest(Base):
     def refused(self, **kw):
         self.fake.add(12, **kw)

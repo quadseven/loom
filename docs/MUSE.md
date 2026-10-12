@@ -44,8 +44,14 @@ not looked hard enough yet. Each tick the brain:
    is held.
 2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
    each goal's latest journal.
-3. For each ready lane pull request, read its whole diff against its ticket
-   and acceptance criteria. Reply to every review thread using
+3. For each lane pull request, read its whole diff against its ticket and
+   acceptance criteria. A lane pull request with failing checks or
+   unresolved findings goes back to the lane that wrote it with
+   `python3 -m bus.brain fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md`
+   (FINDINGS.md says what to change; the command adds the failing check logs
+   and the open review threads itself). Fix it yourself only when the fix is
+   a one-line mechanical change. For each ready one, reply to every review
+   thread using
    `python3 -m bus.brain reply OWNER/NAME#PR --comment ID --file BODY.md --resolve`.
    Then run `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
    which moves the ticket to `loom:merged`. Merged is not deployed: the

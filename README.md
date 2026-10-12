@@ -59,6 +59,7 @@ Loom serves all active goals.
    The suite checks that dispatcher briefs forbid merging and carry the repo
    and loom branch, and runs `lanes/run_lane.sh` end to end against a local
    bare repo with fake agent and `gh` commands (push and PR, base branch,
+   fix briefs pushed onto an existing pull request's branch,
    parking failed runs, and refusing off-limits repos or branches).
 
 ## Rules Loom enforces
