@@ -112,7 +112,7 @@ def post_webhook(url: str, payload: Dict[str, Any]) -> None:
     """POST JSON to the webhook. Errors never carry the URL (it is a secret)."""
     if not url.startswith("https://"):
         raise OSError("the webhook URL is not https")
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 - https only, checked above
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", "User-Agent": "loom-station"})
     try:
@@ -550,6 +550,33 @@ class Station:
             raise GitHubError("no issue was created in %s" % repo)
         return int(made["number"])
 
+    def _lanes_unchanged(self, repo: str, values: Dict[str, str]) -> bool:
+        """Same yes/no values published to the same repo within the hour."""
+        saved = _read_json(os.path.join(self.state, "lanes.json"), {}, strict=False)
+        if not isinstance(saved, dict):
+            return False
+        last_at = saved.get("at")
+        if isinstance(last_at, bool) or not isinstance(last_at, (int, float)):
+            return False
+        return (saved.get("repo") == repo and saved.get("values") == values
+                and 0 <= self.now - last_at <= LANES_REPUBLISH)
+
+    def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
+        return "\n".join(
+            [LANES_MARKER, "Updated " + self._utc(self.now), "",
+             "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
+            + ["| %s | %s | %s |" % row for row in rows])
+
+    def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
+        for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)):
+            if isinstance(c, dict) and str(c.get("body") or "").startswith(LANES_MARKER):
+                self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(c["id"])),
+                             {"body": body})
+                return int(c["id"])
+        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                            {"body": body}).data
+        return int(made["id"]) if isinstance(made, dict) and "id" in made else None
+
     def publish_lanes(self) -> None:
         repo = self.s.status_repo
         if not repo:
@@ -559,35 +586,13 @@ class Station:
             return
         rows = self._lane_rows()
         values = {lane: yn for lane, yn, _ in rows}
-        path = os.path.join(self.state, "lanes.json")
-        saved = _read_json(path, {}, strict=False)
-        if not isinstance(saved, dict):
-            saved = {}
-        last_at = saved.get("at")
-        fresh = (saved.get("repo") == repo and saved.get("values") == values
-                 and isinstance(last_at, (int, float)) and not isinstance(last_at, bool)
-                 and 0 <= self.now - last_at <= LANES_REPUBLISH)
-        if fresh:
+        if self._lanes_unchanged(repo, values):
             return
-        body = "\n".join(
-            [LANES_MARKER, "Updated " + self._utc(self.now), "",
-             "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
-            + ["| %s | %s | %s |" % row for row in rows])
         number = self._lanes_issue(repo)
-        comment_id = None
-        for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)):
-            if isinstance(c, dict) and str(c.get("body") or "").startswith(LANES_MARKER):
-                comment_id = int(c["id"])
-                break
-        if comment_id is None:
-            made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                                {"body": body}).data
-            comment_id = int(made["id"]) if isinstance(made, dict) and "id" in made else None
-        else:
-            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, comment_id),
-                         {"body": body})
-        _write_json(path, {"repo": repo, "issue": number, "comment_id": comment_id,
-                           "values": values, "at": self.now})
+        comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows))
+        _write_json(os.path.join(self.state, "lanes.json"),
+                    {"repo": repo, "issue": number, "comment_id": comment_id,
+                     "values": values, "at": self.now})
         _say("published lane status to %s#%d" % (repo, number))
 
     # -- asks -------------------------------------------------------------
@@ -627,7 +632,11 @@ class Station:
             allowed["users"] = [self.s.mention]
         try:
             self.post(url, {"content": content[:DISCORD_MAX], "allowed_mentions": allowed})
-        except Exception as err:  # the URL must not leak through an error text
+        # Deliberately broad: urllib's errors (a ValueError for a malformed
+        # URL, for one) can carry the URL, which is a secret, and anything
+        # this does not catch would reach the log with its message. Only the
+        # exception's type is logged.
+        except Exception as err:  # noqa: BLE001
             _say("could not post to the webhook (%s); next pass" % type(err).__name__)
             return False
         return True
@@ -644,6 +653,46 @@ class Station:
             keep.append("- and %d more" % (len(lines) - len(keep)))
         return DIGEST_HEAD + "\n" + "\n".join(keep)
 
+    def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
+        """(key, repo, issue) for every open ask, oldest first; None when any
+        repo could not be read (a partial list must not become a digest)."""
+        asks: List[Tuple[str, Dict[str, Any]]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                asks += [(repo, i) for i in self._poll_asks(repo)]
+            except GitHubError as err:
+                _say("could not list asks in %s: %s" % (repo, err))
+                return None
+        asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
+        return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
+
+    def _check_asks(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
+                    wanted: set) -> Optional[Dict[str, bool]]:
+        """Trust for the wanted asks; None when a check failed, which holds
+        every send until the next pass."""
+        trust: Dict[str, bool] = {}
+        for key, repo, issue in keyed:
+            if key not in wanted:
+                continue
+            try:
+                trust[key] = self._ask_trusted(repo, issue)
+            except GitHubError as err:
+                _say("could not check ask %s: %s; holding sends until the next pass"
+                     % (key, err))
+                return None
+        return trust
+
+    def _webhook(self) -> Optional[str]:
+        try:
+            return self.read_secret(self.s.webhook_ssm, self.s.region)
+        # Deliberately broad, as in _send: an error text must never carry the
+        # secret; only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not read the webhook parameter (%s); next pass" % type(err).__name__)
+            return None
+
     def forward_asks(self) -> None:
         if not self.s.webhook_ssm:
             # Not configured: skip quietly; a line every minute would only grow
@@ -657,37 +706,24 @@ class Station:
         local = time.localtime(self.now)
         today = time.strftime("%Y-%m-%d", local)
         digest_due = local.tm_hour >= self.s.digest_hour and sent.get("digest") != today
-        asks: List[Tuple[str, Dict[str, Any]]] = []
-        for repo in self.s.repos:
-            if not tickets.REPO_RE.fullmatch(repo):
-                continue
-            try:
-                asks += [(repo, i) for i in self._poll_asks(repo)]
-            except GitHubError as err:
-                _say("could not list asks in %s: %s" % (repo, err))
-                return  # a partial list must not become a digest
-        asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
-        keyed = [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
+        keyed = self._gather_asks()
+        if keyed is None:
+            return
         urgent_keys = {k for k, _, i in keyed
                        if URGENT in _label_names(i) and k not in urgent_sent}
         if not urgent_keys and not digest_due:
             return
-        trust: Dict[str, bool] = {}
-        for key, repo, issue in keyed:
-            if digest_due or key in urgent_keys:
-                try:
-                    trust[key] = self._ask_trusted(repo, issue)
-                except GitHubError as err:
-                    _say("could not check ask %s: %s" % (key, err))
+        wanted = {k for k, _, _ in keyed} if digest_due else urgent_keys
+        trust = self._check_asks(keyed, wanted)
+        if trust is None:
+            return
         todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
         digest = [i for k, _, i in keyed if trust.get(k)]
-        send_digest = digest_due and bool(digest) and len(trust) == len(keyed)
+        send_digest = digest_due and bool(digest)
         if not todo and not send_digest:
             return
-        try:
-            url = self.read_secret(self.s.webhook_ssm, self.s.region)
-        except Exception as err:
-            _say("could not read the webhook parameter (%s); next pass" % type(err).__name__)
+        url = self._webhook()
+        if url is None:
             return
         for key, issue in todo:
             title = " ".join(str(issue.get("title") or "").split())

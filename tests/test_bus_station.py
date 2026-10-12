@@ -95,31 +95,35 @@ class FakeGitHub:
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
-        if method == "GET" and rest == "issues":
-            if "needs-operator" in parts.query:
-                return self._list_asks(headers)
-            if "loom:lanes" in parts.query:
-                return reply(200, self.lanes_issues)
-            return self._list_briefed(headers)
-        if method == "POST" and rest == "issues":
-            self.created.append(data)
-            self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
-            return reply(201, {"number": 1})
-        if method == "PATCH" and re.match(r"issues/comments/\d+$", rest):
-            self.edits.append(data["body"])
-            return reply(200, {})
-        if rest == "issues/1/comments" and self.lanes_issues:
-            if method == "GET":
-                return reply(200, self.status_comments)
-            self.status_comments.append({"id": 77, "body": data["body"]})
-            self.posts.append(data["body"])
-            return reply(201, {"id": 77})
+        if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
+                or (rest == "issues/1/comments" and self.lanes_issues):
+            return self._issues_and_status(method, rest, parts.query, headers, data)
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _issues_and_status(self, method, rest, query, headers, data):
+        if method == "GET" and rest == "issues":
+            if "needs-operator" in query:
+                return self._list_asks(headers)
+            if "loom:lanes" in query:
+                return reply(200, self.lanes_issues)
+            return self._list_briefed(headers)
+        if method == "POST" and rest == "issues":
+            self.created.append(data)
+            self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
+            return reply(201, {"number": 1})
+        if method == "PATCH":
+            self.edits.append(data["body"])
+            return reply(200, {})
+        if method == "GET":
+            return reply(200, self.status_comments)
+        self.status_comments.append({"id": 77, "body": data["body"]})
+        self.posts.append(data["body"])
+        return reply(201, {"id": 77})
 
     def _graphql(self, data):
         editor = self.editors[data["variables"]["number"]]
@@ -674,6 +678,17 @@ class AsksTest(Base):
                          "Urgent ask: Pick one https://github.com/%s/issues/5" % REPO)
         self.assertEqual(payload["allowed_mentions"], {"parse": []})
         self.assertEqual(self.read[0], ("/example/webhook", "us-east-1"))
+
+    def test_a_failed_trust_check_holds_every_send_until_the_next_pass(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        with mock.patch.object(station.Station, "_ask_trusted",
+                               side_effect=GitHubError("boom", 502)):
+            self.go(EARLY)
+        self.assertEqual(self.sent, [])
+        self.go(EARLY + 60)
+        self.assertEqual(len(self.sent), 1)
 
     def test_digest_once_per_day_after_the_hour_only(self):
         self.fake.add_ask(5, title="Slow one")
