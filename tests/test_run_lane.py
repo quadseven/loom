@@ -178,7 +178,11 @@ G="$HOME/.gemini"
 if [ -e "$G/antigravity-cli/brain/planted.md" ]; then mem=leftover; else mem=clean; fi
 if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
 if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
-printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" >> "$TMPDIR/agy.log"
+# The permission rules this run got, and whether it can widen them for the next.
+S="$G/antigravity-cli/settings.json"
+cp "$S" "$TMPDIR/agy-settings-seen.json"
+if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$S" 2>/dev/null; then set=writable; else set=locked; fi
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
 echo fixed > fix.txt
 """
@@ -580,6 +584,10 @@ class LaneRunnerTest(unittest.TestCase):
         (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
         (lane_home / ".zshrc").write_text("# lane user shell\n")
         (lane_home / ".gemini" / "antigravity-cli" / "installation_id").write_text("install-1")
+        # The operator's sign-in trusted the work folder; an older file also
+        # carries a wider rule that no run may keep.
+        (lane_home / ".gemini" / "antigravity-cli" / "settings.json").write_text(json.dumps(
+            {"trustedWorkspaces": [str(workdir)], "permissions": {"allow": ["read_url(*)"]}, "toolPermission": "always-proceed"}))
         if cache_link is None:
             (lane_home / ".gemini" / "antigravity-cli" / "cache").mkdir()
         else:
@@ -631,11 +639,12 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(len(agy), 1, (calls, result.stderr))
         self.assertIn("-p # Brief: T042-fix-the-thing", agy[0])
         self.assertIn("--mode accept-edits", agy[0])
-        # Edits only: no shell commands (the lane user's keychain hands agy's
-        # token to /usr/bin/security without a prompt), no skill expansion.
+        # Shell commands come from settings rules, never from skipping
+        # permissions; no skill expansion. The brief says to run the tests.
         self.assertIn("--disable-slash-commands", agy[0])
         self.assertNotIn("--dangerously-skip-permissions", agy[0])
-        self.assertIn("shell commands are not available", agy[0])
+        self.assertNotIn("shell commands are not available", agy[0])
+        self.assertIn("run the repo's tests and lint with your shell tool", agy[0])
         self.assertIn("--model gemini-3.8-flash-high", agy[0])
         self.assertIn(f"cwd={workdir.resolve()}/T042-fix-the-thing", agy[0])
         # Nothing from a previous run reaches this one, and this run cannot
@@ -643,6 +652,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("mem=clean", agy[0])
         self.assertIn("cfg=locked", agy[0])
         self.assertIn("rc=locked", agy[0])
+        self.assertIn("set=locked", agy[0])
         # Sign-in and install state survive the wipe; conversation lists do not.
         state = workdir.parent / ".gemini" / "antigravity-cli"
         self.assertEqual((state / "installation_id").read_text(), "install-1")
@@ -652,6 +662,42 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertFalse((state / "brain" / "planted.md").exists())
         self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_rewrites_its_settings_to_allow_commands_and_deny_web_fetching(self):
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, result.stderr)
+        state = workdir.parent / ".gemini" / "antigravity-cli"
+        template = json.loads((RUNNER.parent / "agy" / "settings.json").read_text())
+        expected = {**template, "trustedWorkspaces": [str(workdir)]}
+        # What the run saw: the template's rules, the operator's trusted work
+        # folder kept, the older file's wider rule and other keys gone.
+        seen = json.loads((workdir.parent / "tmp" / "agy-settings-seen.json").read_text())
+        self.assertEqual(seen, expected)
+        self.assertIn("command(*)", seen["permissions"]["allow"])
+        self.assertIn("read_url(*)", seen["permissions"]["deny"])
+        self.assertNotIn("read_url(*)", seen["permissions"]["allow"])
+        # The file is restored after the run, whatever it did, and the
+        # sandbox kept the run from widening it in the first place.
+        self.assertEqual(json.loads((state / "settings.json").read_text()), expected)
+        self.assertFalse((state / ".settings.json.new").exists())
+        self.assertIn("set=locked", agy[0])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_settings_never_write_through_a_link_left_in_their_place(self):
+        # A link at the scratch file's name would send the template into
+        # whatever it points at; the runner removes it and writes a fresh file.
+        victim = Path(self._tmp.name) / "victim.txt"
+        victim.write_text("keep")
+        state = Path(self._tmp.name) / "loomuser" / ".gemini" / "antigravity-cli"
+        state.mkdir(parents=True)
+        (state / ".settings.json.new").symlink_to(victim)
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertIn("command(*)", json.loads((state / "settings.json").read_text())["permissions"]["allow"])
 
     def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):
         inbox, _, result, agy = self.agy_lane(FAKE_KC_PW="some-other-password")
