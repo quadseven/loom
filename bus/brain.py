@@ -254,10 +254,11 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
 
 
 def merge(gh: GitHub, repo: str, number: int,
-          ticket: Optional[Tuple[str, int]] = None) -> None:
+          ticket: Optional[Tuple[str, int]] = None) -> Dict[str, Any]:
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     details = _pr_graphql(gh, repo, number)
     _validate_merge_pr(repo, pr, details)
+    association = _validate_ticket_association(gh, repo, number, pr, ticket, "pr")
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -269,8 +270,10 @@ def merge(gh: GitHub, repo: str, number: int,
     # GitHub's own auto-delete may have removed it already: still merged.
     gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
             ok=(404, 422))
-    if ticket:
-        move(gh, ticket[0], ticket[1], "merged")
+    if association:
+        move(gh, association[0], association[1], "merged")
+    return {"merged": True, "pull_request": (repo, number),
+            "ticket": association, "head_sha": sha}
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
@@ -424,13 +427,44 @@ def _open_threads(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
     return [t for t in threads if not t.get("isResolved")]
 
 
-def _linked(ticket: Tuple[str, int], pr: Dict[str, Any]) -> bool:
-    """The PR carries the runner's `Refs OWNER/NAME#N` line, or its branch is
-    the station's for that ticket number."""
-    refs = re.search(r"^Refs %s#%d[ \t]*$" % (re.escape(ticket[0]), ticket[1]),
-                     str(pr.get("body") or ""), re.M)
-    branch = re.match(r"loom/%d(?:-|$)" % ticket[1], str((pr.get("head") or {}).get("ref") or ""))
-    return bool(refs or branch)
+_TICKET_REF = re.compile(r"^Refs ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)[ \t]*$", re.M)
+_BRANCH_TICKET = re.compile(r"^loom/([0-9]+)(?:-[A-Za-z0-9._/-]+)?$")
+
+
+def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Resolve the PR's ticket from its runner reference and/or Loom branch."""
+    refs = {(match.group(1), int(match.group(2)))
+            for match in _TICKET_REF.finditer(str(pr.get("body") or ""))}
+    branch = _BRANCH_TICKET.fullmatch(str((pr.get("head") or {}).get("ref") or ""))
+    if branch:
+        refs.add((repo, int(branch.group(1))))
+    if len(refs) > 1:
+        raise ValueError("pull request has conflicting ticket references")
+    if not refs:
+        return None
+    association = next(iter(refs))
+    if association[0] != repo:
+        raise ValueError("ticket and pull request must be in the same repository")
+    return association
+
+
+def _validate_ticket_association(gh: GitHub, repo: str, number: int,
+                                 pr: Dict[str, Any], supplied: Optional[Tuple[str, int]],
+                                 expected_state: str) -> Optional[Tuple[str, int]]:
+    association = _ticket_association(repo, pr)
+    if supplied is not None and supplied != association:
+        raise ValueError("supplied ticket does not match pull request")
+    if association is None:
+        if supplied is not None:
+            raise ValueError("pull request is not linked to the supplied ticket")
+        return None
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % association).data or {}
+    names = _labels(issue)
+    if issue.get("state") != "open" or "loom:ticket" not in names:
+        raise ValueError("ticket is not an open loom:ticket")
+    if "loom:" + expected_state not in names:
+        raise ValueError("ticket is not loom:" + expected_state)
+    return association
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
@@ -443,7 +477,7 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
          "pull request head is not a loom branch"),
         (_same_repo(repo, pr, {}), "pull request must use the same repository"),
         (ticket[0] == repo, "ticket and pull request must be in the same repository"),
-        (_linked(ticket, pr), "pull request is not linked to the ticket"),
+        (_ticket_association(repo, pr) == ticket, "pull request is not linked to the ticket"),
         (issue.get("state") == "open" and "loom:ticket" in names, "ticket is not an open loom:ticket"),
         ("loom:pr" in names, "ticket is not loom:pr"),
         (sum(1 for x in names if x.startswith("lane:")) == 1, "ticket must have exactly one lane label"),

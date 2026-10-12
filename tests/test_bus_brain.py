@@ -140,8 +140,8 @@ class BrainTests(unittest.TestCase):
             brain.move(GitHub("t", transport=fake), REPO, 8, "queued", "codex")
 
     def _merge_replies(self, changes=None):
-        pr = {"state": "open", "draft": False, "head": {"ref": "loom/8-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
-        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/8-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}}
+        pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}}
         if changes:
             pr.update(changes.get("pr", {}))
             details.update(changes.get("details", {}))
@@ -165,17 +165,35 @@ class BrainTests(unittest.TestCase):
 
     def test_good_merge_uses_checked_sha_then_deletes_and_moves_ticket(self):
         pr, query = self._merge_replies()
-        fake = Fake(pr, query, reply(200, {"merged": True}), reply(204),
-                    reply(200, {"state": "open", "labels": [{"name": "loom:pr"}]}), reply(200, {}))
-        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
-        self.assertEqual(fake.calls[2][2], {"merge_method": "squash", "sha": "checked"})
-        self.assertIn("/git/refs/heads/loom/8-work", fake.calls[3][1])
-        self.assertEqual(fake.calls[4][0], "GET")
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+                    reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "checked"})
+        self.assertIn("/git/refs/heads/loom/9-work", fake.calls[4][1])
+        self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
+                                  "ticket": (REPO, 9), "head_sha": "checked"})
+        self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
+
+    def test_merge_refuses_an_unrelated_closed_or_non_ticket_issue_before_write(self):
+        cases = [
+            ((REPO, 999), {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
+            ((REPO, 9), {"state": "closed", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
+            ((REPO, 9), {"state": "open", "labels": [{"name": "loom:pr"}]}),
+        ]
+        for supplied, issue in cases:
+            pr, query = self._merge_replies()
+            fake = Fake(pr, query, reply(200, issue))
+            with self.assertRaises(ValueError):
+                brain.merge(GitHub("t", transport=fake), REPO, 8, supplied)
+            self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+            self.assertFalse(any(call[0] in ("PUT", "DELETE") for call in fake.calls))
 
     def test_a_branch_already_deleted_still_counts_as_merged(self):
         pr, query = self._merge_replies()
-        fake = Fake(pr, query, reply(200, {"merged": True}), reply(422, {"message": "Reference does not exist"}),
-                    reply(200, {"state": "open", "labels": [{"name": "loom:pr"}]}), reply(200, {}))
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
+                    reply(422, {"message": "Reference does not exist"}), reply(200, issue), reply(200, {}))
         brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
         self.assertEqual(fake.calls[-1][0], "PUT")
         # Merged is not deployed: the ticket says merged until the project's
