@@ -17,6 +17,19 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
 
+## The station
+
+`lanes/mac/install.sh` also installs `com.loom.station`, which runs
+`python3 -m bus station` from this checkout every 60 seconds. It turns trusted
+`loom:briefed` ticket issues into briefs in the lane inboxes
+(`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
+`loom:running`, and later reports the run from `done/` or `failed/` back to the
+ticket, with local paths removed from failure reasons; the runner adds
+`Refs <owner/name>#<number>` to the pull request. It reads `LOOM_REPOS`,
+`LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
+install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
+`GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
+
 ## Transcript viewer
 
 `lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves

@@ -7,8 +7,13 @@ import socket
 import subprocess
 import tempfile
 import time
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from bus import tickets  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 
@@ -314,6 +319,32 @@ class LaneRunnerTest(unittest.TestCase):
         agent = [c for c in self.calls() if c.startswith("codex ")]
         self.assertIn("--model gpt-test-default", agent[0])
         self.assertIn("lane codex, model gpt-test-default", self.body.read_text())
+
+    def test_pr_body_ends_with_refs_for_a_station_brief(self):
+        self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo#42\n"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.body.read_text().rstrip("\n").endswith(
+            "lane codex, model gpt-test-default.\nRefs example/repo#42"))
+
+    def test_pr_body_has_no_refs_without_an_issue_line(self):
+        self.drop_brief()
+        self.run_lane()
+        self.assertNotIn("Refs ", self.body.read_text())
+
+    def test_a_brief_rendered_by_the_station_is_accepted_and_refs_its_issue(self):
+        issue = {"number": 42, "title": "Fix the thing",
+                 "body": "Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n"}
+        name = tickets.ticket_name("example/repo", 42, 1)
+        self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        heads = subprocess.run(
+            ["git", "ls-remote", "--heads", str(self.remote), "loom/42-fix-the-thing"],
+            capture_output=True, text=True, check=True).stdout
+        self.assertIn("refs/heads/loom/42-fix-the-thing", heads)
+        self.assertIn("\nRefs example/repo#42", self.body.read_text())
 
     def test_a_model_from_another_lanes_family_is_refused(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-4-5"))

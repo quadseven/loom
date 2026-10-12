@@ -7,7 +7,7 @@ lanes, single shipper. Multi-project by design: one loom, many goals.
 
 - `docs/` - architecture, lane contracts, brief format, usage routing
 - `dispatch/` - the foreman: metrics, dispatcher, ship, verify, report
-- `bus/` - GitHub layer for the brain and station: client, labels, tick lock, journal
+- `bus/` - GitHub layer for the brain and station: client, labels, tick lock, journal, ticket briefs, station
 - `lanes/` - worker lane runners (one per subscription)
   - `lanes/run_lane.sh` - runs the codex, claude, openrouter, opencode-go,
     anthropic, zen, zai, workersai and agy lanes: one pass over a lane
@@ -45,6 +45,11 @@ Loom serves all active goals.
    docs/LANES.md. Those names are
    written only into the local launchd plists, never into this repo. A lane
    whose key is missing reports itself unavailable and gets no work.
+   The same installer adds the station (`com.loom.station`, once a minute),
+   which claims trusted `loom:briefed` ticket issues for free lanes, writes
+   their briefs and reports each outcome on the ticket. Set `LOOM_REPOS`,
+   `LOOM_BRIEF_AUTHORS` (GitHub logins) and `LOOM_REPO_OWNERS` when you
+   install; with `LOOM_REPOS` empty it stays idle. See docs/BRAIN.md.
 4. Run `dispatch/dispatch.py` on a schedule (every 30 min).
 5. Run the tests, the same command CI runs:
    `python -B -m unittest discover -s tests -v`.

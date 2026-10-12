@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the codex and claude lanes as launchd agents on the login machine.
+# Install the lanes (and the station) as launchd agents on the login machine.
 #
 #   lanes/mac/install.sh [lane ...]
 #     default: codex claude openrouter opencode-go anthropic zen zai workersai agy
@@ -90,6 +90,47 @@ EOF
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "installed $LABEL -> $X_REPO/lanes/run_lane.sh $L"
 done
+
+# The station: one pass a minute that turns briefed ticket issues into local
+# briefs and reports outcomes (docs/BRAIN.md). It reads LOOM_REPOS,
+# LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
+# with LOOM_REPOS empty it stays idle. Runs from this checkout, like the lanes.
+LABEL="com.loom.station"
+PLIST="$AGENTS/$LABEL.plist"
+cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>-m</string>
+    <string>bus</string>
+    <string>station</string>
+  </array>
+  <key>WorkingDirectory</key><string>$X_REPO</string>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$X_LOOM/logs/station.log</string>
+  <key>StandardErrorPath</key><string>$X_LOOM/logs/station.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$X_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$X_HOME</string>
+    <key>LOOM_HOME</key><string>$X_LOOM</string>
+    <key>LOOM_REPOS</key><string>$(xml "${LOOM_REPOS:-}")</string>
+    <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
+    <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
+  </dict>
+</dict>
+</plist>
+EOF
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+echo "installed $LABEL -> python3 -m bus station (idle unless LOOM_REPOS is set)"
 
 # The transcript viewer: a long-running server on localhost, restarted if it
 # exits. Installed alongside the lanes unless LOOM_VIEWER=0.
