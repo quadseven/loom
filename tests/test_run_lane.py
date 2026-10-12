@@ -82,9 +82,9 @@ FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
-echo fixed > fix.txt
+if [ "${FAKE_AGENT:-commit}" != replies-only ]; then echo fixed > fix.txt; fi
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
-if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = edit ] || [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
 git add fix.txt
 git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 """
@@ -430,6 +430,18 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c
                              for c in self.calls()))
+
+    def test_reply_only_fix_posts_replies_without_a_commit_or_push(self):
+        name, before = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="replies-only",
+                               FAKE_REPLIES='[{"thread":"PRRT_fake","reply":"Not applicable: false positive.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c for c in calls))
+        self.assertFalse(any(c.startswith("git push") for c in calls))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
 
     def test_a_fix_brief_whose_pull_request_closed_is_parked_unrun(self):
         name, before = self.fix_brief()

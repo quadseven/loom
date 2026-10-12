@@ -207,18 +207,9 @@ class ReviewFake:
         self.writes = []
 
     def rest(self, method, path, data=None):
-        if method == "GET" and path.startswith("/repos/%s/issues?labels=loom:pr" % REPO):
-            return mock.Mock(data=[dict(self.issue)])
-        if method == "GET" and path.startswith("/repos/%s/pulls?" % REPO):
-            return mock.Mock(data=[self.pr])
-        if method == "GET" and path == "/repos/%s/pulls/7" % REPO:
-            return mock.Mock(data=self.pr)
-        if method == "GET" and path.endswith("/check-runs?per_page=100"):
-            return mock.Mock(data={"check_runs": self.check_runs})
-        if method == "GET" and path.endswith("/status"):
-            return mock.Mock(data={"statuses": self.statuses})
-        if method == "GET" and path == "/repos/%s/issues/12" % REPO:
-            return mock.Mock(data=self.issue)
+        response = self._get(method, path)
+        if response is not None:
+            return response
         if method == "PUT" and path == "/repos/%s/issues/12/labels" % REPO:
             self.issue["labels"] = [{"name": x} for x in data["labels"]]
             self.writes.append((method, path, data))
@@ -228,6 +219,23 @@ class ReviewFake:
             return mock.Mock(data={})
         raise AssertionError("unexpected %s %s" % (method, path))
 
+    def _get(self, method, path):
+        if method != "GET":
+            return None
+        if path.startswith("/repos/%s/issues?labels=loom:pr" % REPO):
+            return mock.Mock(data=[dict(self.issue)])
+        if path.startswith("/repos/%s/pulls?" % REPO):
+            return mock.Mock(data=[self.pr])
+        if path == "/repos/%s/pulls/7" % REPO:
+            return mock.Mock(data=self.pr)
+        if path.endswith("/check-runs?per_page=100"):
+            return mock.Mock(data={"check_runs": self.check_runs})
+        if path.endswith("/status"):
+            return mock.Mock(data={"statuses": self.statuses})
+        if path == "/repos/%s/issues/12" % REPO:
+            return mock.Mock(data=self.issue)
+        return None
+
     def paginate(self, path):
         if path == "/repos/%s/issues/12/comments" % REPO:
             return self.comments
@@ -236,8 +244,10 @@ class ReviewFake:
 
 class HandBackTest(unittest.TestCase):
     def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.gh = ReviewFake()
-        self.station = station.Station(self.gh, station.Settings("/tmp/loom", [REPO], AUTHORS, OWNERS))
+        self.station = station.Station(self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS))
 
     def run_hand_back(self, checks=None, threads=None):
         with mock.patch("bus.brain._failing_checks", return_value=checks or []), \
@@ -274,12 +284,21 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
 
     def test_fix_round_cap_adds_needs_brain(self):
-        self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}
-                                for _ in range(3))
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
+                                for i in range(1, 4))
         with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
             self.run_hand_back(checks=[("lint", "failed")])
         self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
         self.assertEqual(len(self.gh.comments), 3)
+
+    def test_markerless_fix_comments_do_not_consume_rounds(self):
+        self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}
+                                for _ in range(3))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertNotIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(len(self.gh.comments), 4)
 
     def test_clean_pr_gets_ready_and_a_new_head_removes_it_while_checks_run(self):
         self.run_hand_back()

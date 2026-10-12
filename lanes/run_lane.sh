@@ -666,6 +666,12 @@ for BRIEF in "$INBOX"/*.md; do
     fi
   fi
   if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
+    if [ -n "$FIX_PR" ] && [ -n "$REPLIES_FILE" ]; then
+      post_replies
+      echo "[$(date -u +%FT%TZ)] $TICKET done, review replies posted without code changes" >> "$LOG"
+      mv "$BRIEF" "$INBOX/done/"
+      continue
+    fi
     park "$BRIEF" "agent made no commit on $BRANCH"; continue
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
