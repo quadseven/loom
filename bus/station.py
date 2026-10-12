@@ -43,6 +43,12 @@ DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
 REPORT_MARKER = "<!-- loom:report v1 -->"
+# Reports come every 2 hours, so the goal homes are read at most this often,
+# and only for comments since the last read (with an overlap; the ledger of
+# comment ids keeps a report from going out twice).
+REPORT_CHECK = 300
+REPORT_OVERLAP = 3600
+REPORT_FIRST_LOOKBACK = 24 * 3600
 # A brain tick runs every 30 minutes; no tick ending well for this long means
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
@@ -801,6 +807,14 @@ class Station:
         ledger = _read_json(path, {})
         if not isinstance(ledger, dict):
             raise StateError("state file %s does not hold an object" % path)
+        checked = ledger.get("_checked")
+        if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
+                and 0 <= self.now - checked < REPORT_CHECK):
+            return
+        start = (checked - REPORT_OVERLAP
+                 if isinstance(checked, (int, float)) and not isinstance(checked, bool)
+                 else self.now - REPORT_FIRST_LOOKBACK)
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
         allowed = {a.lower() for a in self.s.authors}
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
@@ -809,7 +823,8 @@ class Station:
             comments: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
             for issue in issues:
                 for comment in self.gh.paginate(
-                        "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))):
+                        "/repos/%s/issues/%d/comments?since=%s"
+                        % (repo, int(issue["number"]), since)):
                     if isinstance(comment, dict) and str(comment.get("body") or "").startswith(REPORT_MARKER):
                         comments.append((self._report_id(comment), issue, comment))
             comments.sort(key=lambda row: row[0])
@@ -840,10 +855,13 @@ class Station:
                     last_id = ident
                     continue
                 if not self._send(url, self._report_text(issue, comment), mention=False):
-                    break
+                    # Read again next pass, not after REPORT_CHECK.
+                    return
                 ledger[key] = ident
                 _write_json(path, ledger)
                 last_id = ident
+        ledger["_checked"] = self.now
+        _write_json(path, ledger)
 
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:

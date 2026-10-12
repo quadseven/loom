@@ -765,14 +765,24 @@ class ReportsTest(Base):
         self.fake.comments[number].append({"id": ident, "body": body,
             "user": {"login": author}, "html_url": "https://github.com/%s/issues/%d#issuecomment-%d" % (REPO, number, ident)})
 
-    def go(self):
+    def go(self, step=station.REPORT_CHECK + 1):
         def post(url, payload):
             if self.fail_post:
                 raise OSError("down")
             self.sent.append(payload)
+        self.clock = getattr(self, "clock", time.time()) + step
         gh = GitHub("token", transport=self.fake)
-        station.Station(gh, self.settings, read_secret=lambda n, r: URL,
+        station.Station(gh, self.settings, now=self.clock, read_secret=lambda n, r: URL,
                         post=post).run_pass()
+
+    def test_goal_homes_are_read_at_most_every_few_minutes(self):
+        self.prime()
+        self.fake.calls.clear()
+        self.go(step=10)
+        self.assertFalse(any("comments" in c[1] for c in self.fake.calls))
+        self.go()
+        reads = [c[1] for c in self.fake.calls if "/issues/40/comments" in c[1]]
+        self.assertTrue(reads and all("since=" in r for r in reads))
 
     def prime(self, number=40):
         self.add_goal(number)
