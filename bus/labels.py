@@ -20,6 +20,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:shipped": {"color": "2ea44f", "description": "Merged and rolled out"},
     "loom:verified": {"color": "006b75", "description": "Verified live"},
+    "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
 }

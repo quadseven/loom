@@ -46,6 +46,7 @@ that talks to GitHub about tickets.
 | `loom:shipped` | The brain merged and rolled out the pull request. |
 | `loom:verified` | The brain verified it live; the ticket is then closed. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
+| `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
 

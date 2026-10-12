@@ -138,7 +138,28 @@ class ClientTests(unittest.TestCase):
             gh.graphql("query { a }", {})
 
 
+class TokenScopeTests(unittest.TestCase):
+    def test_the_token_never_goes_to_a_url_outside_the_api(self):
+        fake = Scripted(reply(200, []))
+        gh = GitHub("secret-token", transport=fake)
+        for url in ("https://example.com/repos/x", "http://api.github.com/repos/x",
+                    "https://api.github.com.example.com/x"):
+            with self.assertRaises(GitHubError):
+                gh.rest("GET", url)
+        self.assertEqual(fake.calls, [])
+
+    def test_pagination_follows_next_links_on_the_api_host(self):
+        fake = Scripted(
+            reply(200, [1], {"Link": '<https://api.github.com/repositories/1/labels?page=2>; rel="next"'}),
+            reply(200, [2]))
+        self.assertEqual(GitHub("t", transport=fake).paginate("/repos/a/b/labels"), [1, 2])
+
+
 class LabelTests(unittest.TestCase):
+    def test_the_lane_status_label_is_in_the_set(self):
+        self.assertIn("loom:lanes", labels.LABELS)
+
+
     def test_set_shape(self):
         for lane in labels.LANES:
             self.assertIn("lane:" + lane, labels.LABELS)

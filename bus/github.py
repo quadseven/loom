@@ -62,12 +62,20 @@ class GitHub:
         self.requests = 0
 
     def _url(self, path: str) -> str:
-        if path.startswith("http://") or path.startswith("https://"):
+        # Absolute URLs (pagination's next links) must stay on the API host:
+        # the token goes with every request.
+        if "://" in path:
+            if not path.startswith(self.api + "/"):
+                raise GitHubError("refusing to send the token outside %s: %s"
+                                  % (self.api, path.split("?")[0]))
             return path
+        if not path.startswith("/"):
+            raise GitHubError("API paths start with /: %s" % path)
         return self.api + path
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        url = self._url(path)
         headers = {
             "Authorization": "Bearer " + self._token,
             "Accept": "application/vnd.github+json",
@@ -81,7 +89,7 @@ class GitHub:
         if etag:
             headers["If-None-Match"] = etag
         self.requests += 1
-        status, raw_headers, raw = self.transport(method, self._url(path),
+        status, raw_headers, raw = self.transport(method, url,
                                                   headers, payload)
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
         text = (raw or b"").decode("utf-8", "replace")
