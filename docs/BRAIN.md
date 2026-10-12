@@ -43,7 +43,8 @@ that talks to GitHub about tickets.
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:failed` | The runner gave up; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
-| `loom:shipped` | The brain merged and rolled out the pull request. |
+| `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
+| `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
 | `loom:verified` | The brain verified it live; the ticket is then closed. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -51,7 +52,8 @@ that talks to GitHub about tickets.
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
 
 A ticket carries exactly one state label. The #35 states are queued,
-briefed, pr, shipped and verified; `running` and `failed` exist because the
+briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
+and `running` and `failed` exist because the
 station and the runner need to say "taken" and "gave up" without the brain
 present.
 
