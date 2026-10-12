@@ -59,8 +59,11 @@ tickets and pull requests like any other work.
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
    is held.
-2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
-   each goal's latest journal.
+2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+   for each goal, its latest journal, report, measurement and completed
+   action, and its report deadline. Every goal under "Reports owed before
+   unlock" gets its report in step 8 this tick, whatever else waits: keep
+   time for it.
 3. For each lane pull request, read its whole diff against its ticket and
    acceptance criteria. A lane pull request with failing checks or
    unresolved findings goes back to the lane that wrote it with
@@ -96,14 +99,17 @@ tickets and pull requests like any other work.
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure.
-   Every 2 hours per goal (when the goal's newest report is 2 hours old or
-   there is none), also post the report: a separate comment on the goal
+   Every 2 hours per goal (when status lists the goal as due or overdue),
+   also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself. Use the format
    the goal home asks for (for example its five report lines); without one,
    five lines: metric changes, what moved, the top blocker, shipped and
    verified, next. The station sends every report to the operator's phone,
-   so it must stand on its own: numbers, not references.
+   so it must stand on its own: numbers, not references. Each goal needs
+   its own report on its own home: a report on a parent goal does not
+   cover its child goals, and a journal or a report quoted inside another
+   comment does not count.
 9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
 

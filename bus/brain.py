@@ -5,7 +5,7 @@ import argparse
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
@@ -22,6 +22,12 @@ IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:fai
 DEFAULT_GOAL_CAP = 16
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
+REPORT_MARKER = "<!-- loom:report v1 -->"
+# Every goal owes its own report every REPORT_EVERY seconds, counted from its
+# newest valid report or, with none, from when the goal was opened. A report
+# that is one tick (REPORT_GRACE) past due is overdue.
+REPORT_EVERY = 2 * 3600
+REPORT_GRACE = 30 * 60
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 _check_written_text = text.check
 
@@ -54,7 +60,7 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     for n in pr_ids:
         fields.append("p%d: pullRequest(number:%d) { commits(last:1) { nodes { commit { statusCheckRollup { state } } } } reviewThreads(first:100) { nodes { isResolved } } }" % (n, n))
     for n in goal_ids:
-        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt } } }" % (n, n))
+        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n))
     if not fields:
         return {"prs": {}, "goals": {}}
     q = "query { repository(owner:%s, name:%s) { %s } }" % (
@@ -74,15 +80,79 @@ def _age(issue: Dict[str, Any], now: datetime) -> int:
     return max(0, int((now - created).total_seconds() // 3600))
 
 
-def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> List[str]:
+def _stamp(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _field_set(body: str, name: str) -> bool:
+    """The comment has a `- Name: value` line whose value is not none."""
+    match = re.search(r"^-?[ \t]*%s:[ \t]*(.*)$" % name, body, re.I | re.M)
+    return bool(match and match.group(1).strip().lower() not in ("", "none"))
+
+
+def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
+                now: datetime, authors: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """When the goal last had a journal, a valid report, a measurement and a
+    completed action, and where its report deadline stands.
+
+    Only a comment on this goal that starts with the report marker counts as
+    its report: a marker inside another comment, a journal, or a report on
+    another goal (a parent goal included) does not. With `authors`, only
+    their comments count, as only theirs reach the operator's phone."""
+    allowed = {a.lower() for a in authors} if authors else None
+    seen: Dict[str, str] = {}
+    for c in ((node or {}).get("comments") or {}).get("nodes") or []:
+        login = str((c.get("author") or {}).get("login") or "").lower()
+        at = str(c.get("createdAt") or "")
+        body = str(c.get("body") or "")
+        if _stamp(at) is None or (allowed is not None and login not in allowed):
+            continue
+        kinds = []
+        if body.startswith(JOURNAL_MARKER):
+            kinds.append("journal")
+        elif body.startswith(REPORT_MARKER):
+            kinds.append("report")
+        if kinds and _field_set(body, "Measure"):
+            kinds.append("measure")
+        if kinds and _field_set(body, "Shipped"):
+            kinds.append("action")
+        for kind in kinds:
+            seen[kind] = max(seen.get(kind, ""), at)
+    start = _stamp(seen.get("report", "")) or _stamp(str(issue.get("created_at") or "")) or now
+    due = start + timedelta(seconds=REPORT_EVERY)
+    if now >= due + timedelta(seconds=REPORT_GRACE):
+        state = "overdue"
+    elif now >= due:
+        state = "due"
+    else:
+        state = "ok"
+    return dict(seen, due=_iso(due), state=state)
+
+
+def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
+                authors: Optional[Sequence[str]] = None) -> List[str]:
     lines = ["### Goals"]
+    owed = []
     for issue in goals:
-        node = data["goals"].get(int(issue["number"])) or {}
-        comments = (node.get("comments") or {}).get("nodes") or []
-        latest = [c.get("createdAt", "") for c in comments
-                  if JOURNAL_MARKER in c.get("body", "")]
-        lines.append("- #%s %s - latest journal %s" % (
-            issue["number"], issue.get("title", ""), max(latest) if latest else "none"))
+        led = goal_ledger(issue, data["goals"].get(int(issue["number"])), now, authors)
+        lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
+                     " - report %s (due %s)" % (
+                         issue["number"], issue.get("title", ""),
+                         led.get("journal", "none"), led.get("report", "none"),
+                         led.get("measure", "none"), led.get("action", "none"),
+                         led["state"], led["due"]))
+        if led["state"] != "ok":
+            owed.append("- #%s report %s since %s" % (issue["number"], led["state"].upper(), led["due"]))
+    # A missed report deadline is its own condition: not a forwarding failure
+    # and not a stopped brain. Post these before unlocking.
+    lines += ["", "### Reports owed before unlock"] + (owed or ["- none"])
     return lines
 
 
@@ -109,14 +179,15 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]]) -> str:
         pr["number"], pr.get("title", ""), (rollup or {}).get("state", "UNKNOWN"), unresolved)
 
 
-def _repo_section(gh: GitHub, repo: str, now: datetime) -> List[str]:
+def _repo_section(gh: GitHub, repo: str, now: datetime,
+                  authors: Optional[Sequence[str]] = None) -> List[str]:
     issues = _issues(gh, repo)
     goals = [i for i in issues if "loom:goal" in _labels(i)]
     tickets = [i for i in issues if "loom:ticket" in _labels(i)]
     prs = [i for i in gh.paginate("/repos/%s/pulls?state=open" % repo)
            if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
     data = _graphql_status(gh, repo, prs, goals)
-    lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data) + [""]
+    lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"]))) for pr in prs]
     lines += ["", "### Needs operator"]
@@ -136,11 +207,14 @@ def _lane_status(gh: GitHub, lanes_repo: str) -> str:
     return max(marked, key=lambda c: c.get("created_at", ""))["body"]
 
 
-def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom") -> str:
-    now = datetime.now(timezone.utc)
+def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
+           now: Optional[datetime] = None, authors: Optional[Sequence[str]] = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    if authors is None:
+        authors = os.environ.get("LOOM_BRIEF_AUTHORS", "").replace(",", " ").split()
     out: List[str] = ["# Loom status"]
     for repo in repos:
-        out += _repo_section(gh, repo, now)
+        out += _repo_section(gh, repo, now, authors)
     out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
 
