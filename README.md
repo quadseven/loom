@@ -7,6 +7,7 @@ lanes, single shipper. Multi-project by design: one loom, many goals.
 
 - `docs/` - architecture, lane contracts, brief format, usage routing
 - `dispatch/` - the foreman: metrics, dispatcher, ship, verify, report
+- `bus/` - GitHub layer for the brain and station: client, labels, tick lock, journal
 - `lanes/` - worker lane runners (one per subscription)
   - `lanes/run_lane.sh` - runs the codex, claude, openrouter, opencode-go,
     anthropic, zen, zai, workersai and agy lanes: one pass over a lane
