@@ -12,12 +12,15 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import tickets
-from .github import GitHub, GitHubError
+from .github import GitHub, GitHubError, _OPENER
 from .labels import LANES
 
 HEARTBEAT_MAX_AGE = 600
@@ -30,15 +33,35 @@ FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
 REASON_MAX = 300
+LANES_MARKER = "<!-- loom:lanes v1 -->"
+LANES_LABEL = "loom:lanes"
+LANES_TITLE = "Loom lane status"
+LANES_REPUBLISH = 3600
+NEEDS_OPERATOR = "needs-operator"
+URGENT = "loom:urgent"
+DISCORD_MAX = 2000
+POST_TIMEOUT = 30
+DIGEST_HEAD = "Asks waiting for you:"
+REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
+
+SecretReader = Callable[[str, str], str]
+Poster = Callable[[str, Dict[str, Any]], None]
 
 
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
-                 owners: List[str]) -> None:
+                 owners: List[str], status_repo: str = "", webhook_ssm: str = "",
+                 mention: str = "", digest_hour: int = 9,
+                 region: str = "us-east-1") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
         self.owners = owners
+        self.status_repo = status_repo
+        self.webhook_ssm = webhook_ssm
+        self.mention = mention
+        self.digest_hour = digest_hour
+        self.region = region
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -47,8 +70,61 @@ class Settings:
 
         def words(name: str) -> List[str]:
             return env.get(name, "").replace(",", " ").split()
+        try:
+            hour = int(env.get("LOOM_DIGEST_HOUR", "").strip() or 9)
+        except ValueError:
+            hour = 9
+        if not 0 <= hour <= 23:
+            hour = 9
         return cls(home, words("LOOM_REPOS"), words("LOOM_BRIEF_AUTHORS"),
-                   words("LOOM_REPO_OWNERS"))
+                   words("LOOM_REPO_OWNERS"),
+                   status_repo=env.get("LOOM_STATUS_REPO", "").strip() or _origin_repo(),
+                   webhook_ssm=env.get("LOOM_DISCORD_WEBHOOK_SSM", "").strip(),
+                   mention=env.get("LOOM_DISCORD_MENTION", "").strip(),
+                   digest_hour=hour,
+                   region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1")
+
+
+def _origin_repo() -> str:
+    """owner/name of this checkout's origin remote, or "" when unknown."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", root, "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = REMOTE_RE.search(out.stdout.strip()) if out.returncode == 0 else None
+    return m.group(1) if m else ""
+
+
+def read_ssm(name: str, region: str) -> str:
+    """A SecureString parameter, read the way lanes/run_lane.sh reads keys."""
+    out = subprocess.run(
+        ["aws", "ssm", "get-parameter", "--region", region, "--name", name,
+         "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
+        capture_output=True, text=True, timeout=POST_TIMEOUT)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise OSError("could not read the webhook parameter from SSM")
+    return out.stdout.strip()
+
+
+def post_webhook(url: str, payload: Dict[str, Any]) -> None:
+    """POST JSON to the webhook. Errors never carry the URL (it is a secret)."""
+    if not url.startswith("https://"):
+        raise OSError("the webhook URL is not https")
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "loom-station"})
+    try:
+        with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
+            status = resp.status
+    except urllib.error.HTTPError as err:
+        status = err.code
+        err.close()
+    except (urllib.error.URLError, OSError):
+        raise OSError("the webhook post failed to connect") from None
+    if not 200 <= status < 300:
+        raise OSError("the webhook answered %d" % status)
 
 
 def _say(msg: str) -> None:
@@ -110,9 +186,13 @@ def scrub(reason: str) -> str:
 
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
-                 now: Optional[float] = None) -> None:
+                 now: Optional[float] = None,
+                 read_secret: Optional[SecretReader] = None,
+                 post: Optional[Poster] = None) -> None:
         self.gh = gh
         self.s = settings
+        self.read_secret = read_secret or read_ssm
+        self.post = post or post_webhook
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
 
@@ -440,14 +520,197 @@ class Station:
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                      {"body": body})
 
+    # -- lane status ------------------------------------------------------
+    @staticmethod
+    def _utc(at: float) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(at))
+
+    def _lane_rows(self) -> List[Tuple[str, str, str]]:
+        rows = []
+        for lane in LANES:
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            at = beat.get("at") if isinstance(beat, dict) else None
+            when = (self._utc(at) if not isinstance(at, bool) and isinstance(at, (int, float))
+                    else "-")
+            rows.append((lane, "yes" if self._heartbeat_ok(lane) else "no", when))
+        return rows
+
+    def _lanes_issue(self, repo: str) -> int:
+        found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&per_page=100"
+                             % (repo, LANES_LABEL)).data
+        for item in found if isinstance(found, list) else []:
+            if isinstance(item, dict) and "pull_request" not in item:
+                return int(item["number"])
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": LANES_TITLE, "labels": [LANES_LABEL],
+            "body": "The station keeps the comment below current with each "
+                    "lane's availability."}).data
+        if not isinstance(made, dict) or "number" not in made:
+            raise GitHubError("no issue was created in %s" % repo)
+        return int(made["number"])
+
+    def publish_lanes(self) -> None:
+        repo = self.s.status_repo
+        if not repo:
+            return
+        if not tickets.REPO_RE.fullmatch(repo):
+            _say("ignoring LOOM_STATUS_REPO %r: not OWNER/NAME" % repo)
+            return
+        rows = self._lane_rows()
+        values = {lane: yn for lane, yn, _ in rows}
+        path = os.path.join(self.state, "lanes.json")
+        saved = _read_json(path, {}, strict=False)
+        if not isinstance(saved, dict):
+            saved = {}
+        last_at = saved.get("at")
+        fresh = (saved.get("repo") == repo and saved.get("values") == values
+                 and isinstance(last_at, (int, float)) and not isinstance(last_at, bool)
+                 and 0 <= self.now - last_at <= LANES_REPUBLISH)
+        if fresh:
+            return
+        body = "\n".join(
+            [LANES_MARKER, "Updated " + self._utc(self.now), "",
+             "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
+            + ["| %s | %s | %s |" % row for row in rows])
+        number = self._lanes_issue(repo)
+        comment_id = None
+        for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)):
+            if isinstance(c, dict) and str(c.get("body") or "").startswith(LANES_MARKER):
+                comment_id = int(c["id"])
+                break
+        if comment_id is None:
+            made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                                {"body": body}).data
+            comment_id = int(made["id"]) if isinstance(made, dict) and "id" in made else None
+        else:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, comment_id),
+                         {"body": body})
+        _write_json(path, {"repo": repo, "issue": number, "comment_id": comment_id,
+                           "values": values, "at": self.now})
+        _say("published lane status to %s#%d" % (repo, number))
+
+    # -- asks -------------------------------------------------------------
+    def _poll_asks(self, repo: str) -> List[Dict[str, Any]]:
+        path = os.path.join(self.state, "asks-" + repo.replace("/", ".") + ".json")
+        saved = _read_json(path, {}, strict=False)
+        if not isinstance(saved, dict):
+            saved = {}
+        stored = saved.get("issues") if isinstance(saved.get("issues"), list) else None
+        resp = self.gh.rest(
+            "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, NEEDS_OPERATOR),
+            etag=saved.get("etag") if stored is not None else None)
+        if resp.status == 304 and stored is not None:
+            items = stored
+        else:
+            items = resp.data if isinstance(resp.data, list) else []
+            _write_json(path, {"etag": resp.etag, "issues": items})
+        return [i for i in items if isinstance(i, dict) and "pull_request" not in i
+                and i.get("html_url") and "number" in i]
+
+    def _ask_trusted(self, repo: str, issue: Dict[str, Any]) -> bool:
+        allowed = {a.lower() for a in self.s.authors}
+        if tickets._login(issue.get("user")) not in allowed:
+            return False
+        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+        actor = tickets._latest_label_actor(events, lambda n: n == NEEDS_OPERATOR)
+        return actor is not None and actor in allowed
+
+    @staticmethod
+    def _line(issue: Dict[str, Any]) -> str:
+        return "- %s %s" % (" ".join(str(issue.get("title") or "").split()), issue["html_url"])
+
+    def _send(self, url: str, content: str) -> bool:
+        allowed: Dict[str, Any] = {"parse": []}
+        if self.s.mention.isdigit():
+            content = "<@%s> %s" % (self.s.mention, content)
+            allowed["users"] = [self.s.mention]
+        try:
+            self.post(url, {"content": content[:DISCORD_MAX], "allowed_mentions": allowed})
+        except Exception as err:  # the URL must not leak through an error text
+            _say("could not post to the webhook (%s); next pass" % type(err).__name__)
+            return False
+        return True
+
+    def _digest_text(self, lines: List[str]) -> str:
+        room = DISCORD_MAX - 60  # the mention and the "and N more" line
+        keep, size = [], len(DIGEST_HEAD)
+        for line in lines:
+            size += len(line) + 1
+            if size > room:
+                break
+            keep.append(line)
+        if len(keep) < len(lines):
+            keep.append("- and %d more" % (len(lines) - len(keep)))
+        return DIGEST_HEAD + "\n" + "\n".join(keep)
+
+    def forward_asks(self) -> None:
+        if not self.s.webhook_ssm:
+            _say("LOOM_DISCORD_WEBHOOK_SSM is not set; asks are not forwarded")
+            return
+        path = os.path.join(self.state, "asks.json")
+        sent = _read_json(path, {})
+        if not isinstance(sent, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        urgent_sent = sent.get("urgent") if isinstance(sent.get("urgent"), list) else []
+        local = time.localtime(self.now)
+        today = time.strftime("%Y-%m-%d", local)
+        digest_due = local.tm_hour >= self.s.digest_hour and sent.get("digest") != today
+        asks: List[Tuple[str, Dict[str, Any]]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                asks += [(repo, i) for i in self._poll_asks(repo)]
+            except GitHubError as err:
+                _say("could not list asks in %s: %s" % (repo, err))
+                return  # a partial list must not become a digest
+        asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
+        keyed = [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
+        urgent_keys = {k for k, _, i in keyed
+                       if URGENT in _label_names(i) and k not in urgent_sent}
+        if not urgent_keys and not digest_due:
+            return
+        trust: Dict[str, bool] = {}
+        for key, repo, issue in keyed:
+            if digest_due or key in urgent_keys:
+                try:
+                    trust[key] = self._ask_trusted(repo, issue)
+                except GitHubError as err:
+                    _say("could not check ask %s: %s" % (key, err))
+        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
+        digest = [i for k, _, i in keyed if trust.get(k)]
+        send_digest = digest_due and bool(digest) and len(trust) == len(keyed)
+        if not todo and not send_digest:
+            return
+        try:
+            url = self.read_secret(self.s.webhook_ssm, self.s.region)
+        except Exception as err:
+            _say("could not read the webhook parameter (%s); next pass" % type(err).__name__)
+            return
+        for key, issue in todo:
+            title = " ".join(str(issue.get("title") or "").split())
+            if self._send(url, "Urgent ask: %s %s" % (title, issue["html_url"])):
+                urgent_sent.append(key)
+                sent["urgent"] = urgent_sent
+                _write_json(path, sent)
+        if send_digest and self._send(url, self._digest_text([self._line(i) for i in digest])):
+            sent["digest"] = today
+            _write_json(path, sent)
+
     # -- one pass --------------------------------------------------------
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
+        for step in (self.publish_lanes, self.forward_asks):
+            try:
+                step()
+            except (GitHubError, OSError) as err:
+                _say("%s failed: %s" % (step.__name__, err))
 
 
-def run(settings: Settings, gh: Optional[GitHub] = None) -> int:
+def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
     """One pass. Exits 0 at once when another pass holds the lock."""
     if not settings.repos:
         _say("LOOM_REPOS is empty; nothing to do")
@@ -465,7 +728,7 @@ def run(settings: Settings, gh: Optional[GitHub] = None) -> int:
             from .github import token_from_env
             gh = GitHub(token_from_env())
         try:
-            Station(gh, settings).run_pass()
+            Station(gh, settings, **hooks).run_pass()
         except StateError as err:
             _say("stopping: %s" % err)
             return 1
