@@ -163,8 +163,30 @@ lookup leaves the brief for the next pass. The rule covers:
      will not unlock from the command line), set as its default, no
      auto-lock, password from step 1 (`LOOM_AGY_KEYCHAIN`, `LOOM_AGY_KEY_SSM`).
   6. Install agy for the user and sign it in once, in a shell as that user.
-- Each run unlocks that keychain first (it locks again on reboot), passing
-  the password on stdin to a shell running as the lane user.
+- The keychain is unlocked during the runner's readiness check, only when
+  briefs are waiting (it locks again on reboot). The password is sent on
+  stdin to `security -i` running as the lane user, so it never reaches
+  argv. Because `security -i` splits commands on whitespace and treats
+  quotes and backslashes specially, passwords with whitespace, quotes,
+  backslashes, or any characters outside letters, digits, and
+  `._~+=/@%:,^-` are refused. A refused password or a failed unlock marks
+  the lane unavailable and leaves its briefs waiting.
+- Under the lane user's home, the sandbox allows writes only to the
+  worktree, the agent's TMPDIR (`tmp`), agy's state directory
+  (`~/.gemini/antigravity-cli`), `Library/Keychains`, and `Library/Caches`.
+  Inside the state directory, `settings.json`, `installation_id`, `bin`,
+  and `builtin` stay read-only. Everything else under the lane user's home
+  stays read-only as well, including shell startup files, `~/.gemini`
+  config, and MCP servers.
+- Before each run, the runner clears agy's memory of earlier runs
+  (`agy_forget`), deleting everything in its state directory except sign-in
+  and install state. Kept entries in the state directory are `settings.json`,
+  `bin`, `builtin`, `installation_id`, `jetski_state.pbtxt`, `updater`,
+  `last_check.timestamp`, `log`, `cli.log`, `crashes`, and `cache`; kept
+  entries under `cache` are `onboarding.json` and `default_project_id.txt`.
+  Kept entries must be real files and directories: a link left in place of
+  a kept entry is removed, never followed, so deletion cannot reach into
+  the keychain folder or another ticket's tree.
 
 ## Adding a lane
 
