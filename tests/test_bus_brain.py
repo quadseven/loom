@@ -160,7 +160,10 @@ class BrainTests(unittest.TestCase):
                     reply(200, {"state": "open", "labels": [{"name": "loom:pr"}]}), reply(200, {}))
         brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
         self.assertEqual(fake.calls[-1][0], "PUT")
-        self.assertIn("loom:shipped", fake.calls[-1][2]["labels"])
+        # Merged is not deployed: the ticket says merged until the project's
+        # ship owner deploys it.
+        self.assertIn("loom:merged", fake.calls[-1][2]["labels"])
+        self.assertNotIn("loom:shipped", fake.calls[-1][2]["labels"])
 
     def test_merge_refuses_when_the_head_repo_is_unknown(self):
         fake = Fake(*self._merge_replies({"pr": {"head": {"ref": "loom/8-work", "sha": "checked"}},

@@ -13,7 +13,7 @@ from .github import GitHub, GitHubError, token_from_env
 from . import text
 from .labels import LANES
 
-STATES = ("queued", "briefed", "running", "pr", "failed", "shipped", "verified")
+STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
@@ -255,7 +255,7 @@ def merge(gh: GitHub, repo: str, number: int,
     gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
             ok=(404, 422))
     if ticket:
-        move(gh, ticket[0], ticket[1], "shipped")
+        move(gh, ticket[0], ticket[1], "merged")
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:

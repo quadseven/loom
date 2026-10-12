@@ -15,7 +15,11 @@ holder. The lock lives in `quadseven/loom`.
 3. For each ready lane pull request, read its whole diff against its ticket
    and acceptance criteria. Reply to every review thread using
    `python3 -m bus.brain reply OWNER/NAME#PR --comment ID --file BODY.md --resolve`.
-   Then run `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`.
+   Then run `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
+   which moves the ticket to `loom:merged`. Merged is not deployed: the
+   project's goal home issue says who deploys. Never deploy, bump a pinned
+   image or restart a live service unless that issue makes it yours; where
+   it does, `move --to shipped` only once it is out.
 4. Verify shipped tickets against the live system named in the ticket. Then
    run `python3 -m bus.brain move OWNER/NAME#N --to verified`, then close the
    ticket with `python3 -m bus.brain close OWNER/NAME#N`.
