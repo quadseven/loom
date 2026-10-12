@@ -9,8 +9,8 @@ lanes, single shipper. Multi-project by design: one loom, many goals.
 - `dispatch/` - the foreman: metrics, dispatcher, ship, verify, report
 - `lanes/` - worker lane runners (one per subscription)
   - `lanes/run_lane.sh` - runs the codex, claude, openrouter, opencode-go,
-    anthropic, zen and zai lanes: one pass over a lane inbox, one brief at a
-    time
+    anthropic, zen, zai, workersai and agy lanes: one pass over a lane
+    inbox, one brief at a time
   - `lanes/mac/install.sh` - installs those lanes as launchd agents
   - `lanes/opencode/` - older opencode runner (OpenRouter, Poolside, other
     APIs); not used by run_lane.sh
@@ -38,7 +38,10 @@ Loom serves all active goals.
    name each parameter in the environment when you run the installer:
    `LOOM_OPENROUTER_KEY_SSM`, `LOOM_OPENCODE_GO_KEY_SSM`,
    `LOOM_ANTHROPIC_KEY_SSM` and `LOOM_ZAI_KEY_SSM` (plus optional
-   `LOOM_AWS_REGION`); zen needs no key. Those names are
+   `LOOM_AWS_REGION`); zen needs no key. The workersai lane also reads its
+   Cloudflare account id from SSM, and the agy lane reads its lane user's
+   keychain password from SSM and needs the one-time setup in
+   docs/LANES.md. Those names are
    written only into the local launchd plists, never into this repo. A lane
    whose key is missing reports itself unavailable and gets no work.
 4. Run `dispatch/dispatch.py` on a schedule (every 30 min).
