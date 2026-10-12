@@ -136,7 +136,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if fix:
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
-                 "need and keep the rest of the work.\n\n%s\n" % (fix.pr, fix.branch, fix.findings))
+                 "need and keep the rest of the work. If a finding does not apply, include "
+                 "a one-line reason in its thread reply. You may write .loom/replies.json as a JSON array of "
+                 "{\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
+                 "objects; the runner posts these after pushing and resolves threads marked "
+                 "true.\n\n%s\n" % (fix.pr, fix.branch, fix.findings))
     return text
 
 

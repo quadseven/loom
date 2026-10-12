@@ -20,6 +20,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import tickets
+from . import brain
 from .github import GitHub, GitHubError, _OPENER
 from .labels import LANES
 
@@ -42,6 +43,7 @@ URGENT = "loom:urgent"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+FIX_ROUNDS_DEFAULT = 3
 # A brain tick runs every 30 minutes; no tick ending well for this long means
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
@@ -186,6 +188,21 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
 def scrub(reason: str) -> str:
     text = PATH_RE.sub("<path>", " ".join(reason.split()))
     return text[:REASON_MAX]
+
+
+def _fix_round_limit() -> int:
+    try:
+        return max(0, int(os.environ.get("LOOM_FIX_ROUNDS", str(FIX_ROUNDS_DEFAULT))))
+    except ValueError:
+        return FIX_ROUNDS_DEFAULT
+
+
+def _linked_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
+    number = int(issue.get("number", 0))
+    return bool(re.search(r"^Refs %s#%d[ \t]*$" % (re.escape(repo), number),
+                          str(pr.get("body") or ""), re.M)
+                or re.match(r"loom/%d(?:-|$)" % number,
+                            str((pr.get("head") or {}).get("ref") or "")))
 
 
 class Station:
@@ -495,6 +512,102 @@ class Station:
             if done:
                 reported[key] = kind
                 _write_json(path, reported)
+
+    def hand_back(self) -> None:
+        """Return completed lane PRs with failed checks or bot findings."""
+        rounds = _fix_round_limit()
+        for repo in self.s.repos:
+            issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % repo).data or []
+            issues = [i for i in issues if isinstance(i, dict) and "pull_request" not in i]
+            if not issues:
+                continue
+            prs = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data or []
+            for issue in issues:
+                number = int(issue["number"])
+                lane = _lane_of(issue)
+                if not lane:
+                    continue
+                pr = next((p for p in prs if _linked_pr(issue, repo, p)), None)
+                if not pr:
+                    continue
+                pr_number = int(pr["number"])
+                detail = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+                sha = str((detail.get("head") or {}).get("sha") or "")
+                if not sha:
+                    continue
+                comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                ready_heads = [m.group(1) for c in comments if isinstance(c, dict)
+                               for m in [re.search(r"<!-- loom:ready-head ([0-9a-f]+) -->",
+                                                   str(c.get("body") or ""))] if m]
+                names = _label_names(issue)
+                # A queued/running fix owns this head until its runner reports.
+                if ("loom:briefed" in names or "loom:running" in names) and any(
+                       tickets._login(c.get("user")) in {a.lower() for a in self.s.authors}
+                       and str(c.get("body") or "").startswith(tickets.FIX_MARKER)
+                       and "<!-- loom:fix-head %s -->" % sha in str(c.get("body") or "")
+                       for c in comments if isinstance(c, dict)):
+                    continue
+                if "loom:ready" in names and (not ready_heads or ready_heads[-1] != sha):
+                    self._remove_label(repo, number, "loom:ready")
+                    names.remove("loom:ready")
+                if "loom:briefed" in names or "loom:running" in names:
+                    continue
+                check_runs = (self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data or {}).get("check_runs") or []
+                statuses = (self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}).get("statuses") or []
+                if any(x.get("status") != "completed" for x in check_runs) or any(x.get("state") == "pending" for x in statuses):
+                    if "loom:ready" in names:
+                        self._remove_label(repo, number, "loom:ready")
+                    continue
+                failed = brain._failing_checks(self.gh, repo, sha)
+                threads = [t for t in brain._open_threads(self.gh, repo, pr_number)
+                           if ((t.get("comments") or {}).get("nodes") or [])
+                           and ((t["comments"]["nodes"][0].get("author") or {}).get("login") == "grug-tribe[bot]")]
+                if not failed and not threads:
+                    if "loom:ready" not in names:
+                        self._add_label(repo, number, "loom:ready")
+                    if not ready_heads or ready_heads[-1] != sha:
+                        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                                     {"body": "<!-- loom:ready-head %s -->" % sha})
+                    continue
+                if "loom:ready" in names:
+                    self._remove_label(repo, number, "loom:ready")
+                allowed_authors = {a.lower() for a in self.s.authors}
+                rounds_seen = set()
+                for index, comment in enumerate(comments):
+                    if (not isinstance(comment, dict)
+                            or tickets._login(comment.get("user")) not in allowed_authors):
+                        continue
+                    body_text = str(comment.get("body") or "")
+                    if not body_text.startswith(tickets.FIX_MARKER):
+                        continue
+                    head_match = re.search(r"<!-- loom:fix-head ([0-9a-f]+) -->", body_text)
+                    rounds_seen.add(head_match.group(1) if head_match else "comment-%d" % index)
+                count = len(rounds_seen)
+                if count >= rounds:
+                    if "needs-brain" not in names:
+                        self._add_label(repo, number, "needs-brain")
+                    continue
+                body = brain._fix_body(repo, pr_number, str((detail.get("head") or {}).get("ref") or ""),
+                                       "", failed, threads)
+                body = body.rstrip() + "\n\n<!-- loom:fix-head %s -->\n" % sha
+                self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+                updated = [n for n in names if n not in (
+                    "loom:pr", "loom:ready", "needs-brain", "loom:running", "loom:briefed")
+                           and not n.startswith("lane:")]
+                updated.extend(("loom:briefed", "lane:" + lane))
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": updated})
+
+    def _add_label(self, repo: str, number: int, label: str) -> None:
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if label not in names:
+            names.append(label)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
+
+    def _remove_label(self, repo: str, number: int, label: str) -> None:
+        issue = self._issue(repo, number)
+        names = [n for n in _label_names(issue) if n != label]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
 
     def _field(self, text: str, name: str) -> str:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
@@ -856,6 +969,10 @@ class Station:
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
+        try:
+            self.hand_back()
+        except (GitHubError, OSError, ValueError) as err:
+            _say("hand_back failed: %s" % err)
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.watch_brain):
             try:

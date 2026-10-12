@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -193,6 +194,102 @@ class Base(unittest.TestCase):
             return []
 
 
+class ReviewFake:
+    def __init__(self):
+        self.api = "https://api.github.com"
+        self.issue = {"number": 12, "state": "open", "body": "", "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:pr"}, {"name": "lane:codex"}]}
+        self.pr = {"number": 7, "body": "Refs %s#12" % REPO,
+                   "head": {"ref": "loom/12-fix", "sha": "a" * 40}}
+        self.check_runs = [{"status": "completed", "conclusion": "success"}]
+        self.statuses = []
+        self.comments = []
+        self.writes = []
+
+    def rest(self, method, path, data=None):
+        if method == "GET" and path.startswith("/repos/%s/issues?labels=loom:pr" % REPO):
+            return mock.Mock(data=[dict(self.issue)])
+        if method == "GET" and path.startswith("/repos/%s/pulls?" % REPO):
+            return mock.Mock(data=[self.pr])
+        if method == "GET" and path == "/repos/%s/pulls/7" % REPO:
+            return mock.Mock(data=self.pr)
+        if method == "GET" and path.endswith("/check-runs?per_page=100"):
+            return mock.Mock(data={"check_runs": self.check_runs})
+        if method == "GET" and path.endswith("/status"):
+            return mock.Mock(data={"statuses": self.statuses})
+        if method == "GET" and path == "/repos/%s/issues/12" % REPO:
+            return mock.Mock(data=self.issue)
+        if method == "PUT" and path == "/repos/%s/issues/12/labels" % REPO:
+            self.issue["labels"] = [{"name": x} for x in data["labels"]]
+            self.writes.append((method, path, data))
+            return mock.Mock(data=[])
+        if method == "POST" and path == "/repos/%s/issues/12/comments" % REPO:
+            self.comments.append({"body": data["body"], "user": {"login": "alice-example"}})
+            return mock.Mock(data={})
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def paginate(self, path):
+        if path == "/repos/%s/issues/12/comments" % REPO:
+            return self.comments
+        raise AssertionError(path)
+
+
+class HandBackTest(unittest.TestCase):
+    def setUp(self):
+        self.gh = ReviewFake()
+        self.station = station.Station(self.gh, station.Settings("/tmp/loom", [REPO], AUTHORS, OWNERS))
+
+    def run_hand_back(self, checks=None, threads=None):
+        with mock.patch("bus.brain._failing_checks", return_value=checks or []), \
+             mock.patch("bus.brain._open_threads", return_value=threads or []):
+            self.station.hand_back()
+
+    def test_failed_check_is_sent_back_to_its_lane(self):
+        self.run_hand_back(checks=[("lint", "last log line")])
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertIn("last log line", self.gh.comments[0]["body"])
+
+    def test_unresolved_review_bot_thread_is_sent_back(self):
+        thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
+                  "comments": {"nodes": [{"databaseId": 9, "body": "change this",
+                                             "author": {"login": "grug-tribe[bot]"}}]}}
+        self.run_hand_back(threads=[thread])
+        self.assertIn("PRRT_fake", self.gh.comments[0]["body"])
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_unresolved_thread_not_started_by_the_review_bot_is_ignored(self):
+        thread = {"id": "PRRT_user", "path": "a.py", "line": 4,
+                  "comments": {"nodes": [{"databaseId": 9, "body": "ignore this",
+                                             "author": {"login": "someone-else"}}]}}
+        self.run_hand_back(threads=[thread])
+        self.assertEqual(self.gh.comments[-1]["body"], "<!-- loom:ready-head %s -->" % ("a" * 40))
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_fix_pending_for_current_head_is_not_handed_back_twice(self):
+        self.gh.issue["labels"].append({"name": "loom:running"})
+        self.gh.comments.append({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head " + "a" * 40 + " -->"})
+        self.run_hand_back(checks=[("lint", "failed")])
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_fix_round_cap_adds_needs_brain(self):
+        self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}
+                                for _ in range(3))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(len(self.gh.comments), 3)
+
+    def test_clean_pr_gets_ready_and_a_new_head_removes_it_while_checks_run(self):
+        self.run_hand_back()
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.gh.pr["head"]["sha"] = "b" * 40
+        self.gh.check_runs = [{"status": "in_progress"}]
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+
 class CorruptStateTest(Base):
     def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
         self.fake.add(12, state="running")
@@ -207,7 +304,7 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        self.assertEqual(self.run_pass().requests, 0)
+        self.assertEqual(self.run_pass().requests, 1)  # PR review polling still runs.
 
 
 class TicketsTest(unittest.TestCase):
@@ -332,13 +429,13 @@ class ClaimTest(Base):
         with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
             self.assertIn("Branch: loom/12-fix-the-thing-r2\n", fh.read())
 
-    def test_a_second_pass_after_a_304_makes_one_call(self):
+    def test_a_second_pass_after_a_304_also_polls_for_pr_reviews(self):
         self.fake.add(12, author="stranger")
         self.run_pass()
         first = len(self.fake.calls)
         gh = self.run_pass()
-        self.assertEqual(len(self.fake.calls), first + 1)
-        self.assertEqual(gh.requests, 1)
+        self.assertEqual(len(self.fake.calls), first + 3)
+        self.assertEqual(gh.requests, 3)  # Includes the PR review poll.
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
     def test_a_304_reuses_the_stored_list(self):
