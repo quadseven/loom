@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import spend
 from . import text as _text
 from . import tickets
 from .github import GitHub, GitHubError, _OPENER
@@ -92,7 +93,8 @@ class Settings:
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
                  mention: str = "", digest_hour: int = 9,
                  region: str = "us-east-1", channel_id: str = "",
-                 bot_token_ssm: str = "", default_goal: str = "") -> None:
+                 bot_token_ssm: str = "", default_goal: str = "",
+                 anthropic: Optional[spend.Budget] = None) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -105,6 +107,7 @@ class Settings:
         self.channel_id = channel_id
         self.bot_token_ssm = bot_token_ssm
         self.default_goal = default_goal
+        self.anthropic = anthropic or spend.Budget()
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -119,6 +122,11 @@ class Settings:
             hour = 9
         if not 0 <= hour <= 23:
             hour = 9
+        try:
+            budget = spend.Budget.from_env(env)
+        except ValueError as err:
+            _say("ignoring the anthropic budget: %s" % err)
+            budget = spend.Budget()
         return cls(home, words("LOOM_REPOS"), words("LOOM_BRIEF_AUTHORS"),
                    words("LOOM_REPO_OWNERS"),
                    status_repo=env.get("LOOM_STATUS_REPO", "").strip() or _origin_repo(),
@@ -128,7 +136,8 @@ class Settings:
                    region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
                    bot_token_ssm=env.get("LOOM_DISCORD_BOT_TOKEN_SSM", "").strip(),
-                   default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip())
+                   default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip(),
+                   anthropic=budget)
 
 
 def _origin_repo() -> str:
@@ -279,6 +288,7 @@ class Station:
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
+        self._spend: Optional[spend.Summary] = None
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -476,7 +486,16 @@ class Station:
         if not self._claim(repo, lane, issue):
             os.remove(path)
 
+    def _anthropic_spend(self) -> spend.Summary:
+        if self._spend is None:
+            self._spend = spend.summarize(self.s.home, self.s.anthropic, self.now)
+        return self._spend
+
     def _heartbeat_ok(self, lane: str) -> bool:
+        # Credit under the floor stops the anthropic slots even before their
+        # runner next reports it.
+        if lane.split("-")[0] == "anthropic" and self._anthropic_spend().under_floor():
+            return False
         beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                           None, strict=False)
         if not isinstance(beat, dict) or beat.get("available") is not True:
@@ -681,11 +700,20 @@ class Station:
         return (saved.get("repo") == repo and saved.get("values") == values
                 and 0 <= self.now - last_at <= LANES_REPUBLISH)
 
+    def _spend_shown(self) -> Optional[spend.Summary]:
+        """The anthropic spend, once there is a budget or a recorded run."""
+        summary = self._anthropic_spend()
+        if summary.runs or summary.today or self.s.anthropic.usd is not None:
+            return summary
+        return None
+
     def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
+        summary = self._spend_shown()
         return "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now), "",
              "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
-            + ["| %s | %s | %s |" % row for row in rows])
+            + ["| %s | %s | %s |" % row for row in rows]
+            + (["", summary.line()] if summary is not None else []))
 
     def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
         for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)):
@@ -706,6 +734,12 @@ class Station:
             return
         rows = self._lane_rows()
         values = {lane: yn for lane, yn, _ in rows}
+        summary = self._spend_shown()
+        if summary is not None:
+            # A new run (or a budget change) republishes; the clock alone waits
+            # for the hourly republish.
+            values["anthropic spend"] = "%d runs, $%.2f, budget %s" % (
+                summary.runs, summary.spent, self.s.anthropic.usd)
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
