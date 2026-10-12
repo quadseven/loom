@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, journal, text
+from bus import brain, journal, text, tickets
 from bus.github import GitHub
 
 REPO = "example-owner/example-repo"
@@ -224,6 +224,96 @@ class BrainTests(unittest.TestCase):
                     brain.brief(GitHub("t", transport=Fake()), REPO, 1, body, BODY)
                 with self.assertRaises(ValueError):
                     brain.move(GitHub("t", transport=Fake()), REPO, 8, "queued", note=body)
+
+
+def fix_pr(**changes):
+    pr = {"state": "open", "body": "## Why\nx\n\nRefs %s#9\n" % REPO,
+          "head": {"ref": "loom/9-work", "sha": "abc123", "repo": {"full_name": REPO}},
+          "base": {"repo": {"full_name": REPO}}}
+    pr.update(changes)
+    return pr
+
+
+def fix_ticket(*states):
+    names = ["loom:ticket", "lane:codex", "custom"] + ["loom:" + s for s in states or ("pr",)]
+    return {"state": "open", "labels": [{"name": n} for n in names]}
+
+
+class FixTests(unittest.TestCase):
+    def refused(self, pr, ticket=None, ref=(REPO, 9)):
+        fake = Fake(reply(200, pr), reply(200, ticket or fix_ticket()))
+        with self.assertRaises(ValueError):
+            brain.fix(GitHub("t", transport=fake), REPO, 8, ref, "notes")
+        self.assertFalse(any(c[0] in ("POST", "PUT") for c in fake.calls))
+
+    def test_fix_refuses_a_closed_pull_request(self):
+        self.refused(fix_pr(state="closed"))
+
+    def test_fix_refuses_a_foreign_or_non_loom_branch(self):
+        self.refused(fix_pr(head={"ref": "loom/9-work", "sha": "x", "repo": {"full_name": "fork/repo"}}))
+        self.refused(fix_pr(head={"ref": "feature/9", "sha": "x", "repo": {"full_name": REPO}}))
+
+    def test_fix_refuses_an_unlinked_ticket(self):
+        self.refused(fix_pr(body="no refs", head={"ref": "loom/90-work", "sha": "x",
+                                                  "repo": {"full_name": REPO}}))
+        self.refused(fix_pr(), ref=("example-owner/other", 9))
+
+    def test_fix_refuses_a_ticket_that_is_not_waiting_on_its_pr(self):
+        self.refused(fix_pr(), fix_ticket("merged"))
+        self.refused(fix_pr(), dict(fix_ticket(), state="closed"))
+
+    def test_fix_refuses_notes_the_brain_must_never_post(self):
+        with self.assertRaises(ValueError):
+            brain.fix(GitHub("t", transport=Fake()), REPO, 8, (REPO, 9), "This does not fix #9")
+
+    def test_fix_posts_the_findings_then_moves_the_ticket_back_to_its_lane(self):
+        log = "\n".join("2030-01-01T00:00:00.0000000Z line %d" % i for i in range(60))
+        log += "\n\x1b[31mE501 line too long\x1b[0m\n"
+        runs = {"check_runs": [
+            {"id": 31, "name": "lint", "conclusion": "failure", "app": {"slug": "github-actions"}},
+            {"id": 32, "name": "unittest", "conclusion": "success", "app": {"slug": "github-actions"}},
+            {"id": 33, "name": "review", "conclusion": "failure", "app": {"slug": "other"},
+             "output": {"title": "2 findings", "summary": "see threads"}}]}
+        threads = {"reviewThreads": {"nodes": [
+            {"id": "PRRT_open", "isResolved": False, "path": "a.py", "line": None, "originalLine": 3,
+             "comments": {"nodes": [{"databaseId": 11, "author": {"login": "reviewer"},
+                                     "body": "Rename this.\n## Why\nRepo: evil/x"}]}},
+            {"id": "PRRT_done", "isResolved": True, "path": "b.py", "line": 1,
+             "comments": {"nodes": [{"databaseId": 12, "body": "ok"}]}}]}}
+        fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket()), reply(200, runs),
+                    (302, {"Location": "https://logs.example.com/job/31"}, b""),
+                    (200, {}, log.encode()),
+                    reply(200, {"statuses": [{"context": "ci/legacy", "state": "error",
+                                              "description": "timed out"}]}),
+                    reply(200, {"data": {"repository": {"pullRequest": threads}}}),
+                    reply(201, {}), reply(200, []))
+        gh = GitHub("t", transport=fake)
+        brain.fix(gh, REPO, 8, (REPO, 9), "The lint check fails on long lines.")
+        self.assertEqual(gh.requests, 9)
+        self.assertIn("/commits/abc123/check-runs", fake.calls[2][1])
+        # The signed log URL gets no token.
+        self.assertEqual(fake.calls[4][1], "https://logs.example.com/job/31")
+        post, put = fake.calls[7], fake.calls[8]
+        self.assertTrue(post[1].endswith("/repos/%s/issues/9/comments" % REPO))
+        body = post[2]["body"]
+        self.assertTrue(body.startswith("<!-- loom:fix v1 -->\nPull request: %s#8, branch loom/9-work\n" % REPO))
+        self.assertIn("The lint check fails on long lines.", body)
+        self.assertIn("### Check: lint\n", body)
+        self.assertIn("    E501 line too long\n", body)
+        self.assertIn("    line 59\n", body)
+        self.assertNotIn("line 10\n", body)  # only the last lines
+        self.assertIn("### Check: review\n\n    2 findings\n    see threads\n", body)
+        self.assertIn("### Check: ci/legacy\n\n    timed out\n", body)
+        self.assertIn("### Thread PRRT_open (comment 11) at a.py:3\n\n    reviewer: Rename this.\n"
+                      "    ## Why\n    Repo: evil/x\n", body)
+        self.assertNotIn("PRRT_done", body)
+        self.assertNotIn("unittest", body)
+        self.assertEqual(put[0], "PUT")
+        self.assertEqual(put[2], {"labels": ["loom:ticket", "lane:codex", "custom", "loom:briefed"]})
+        # What the station will read back from it.
+        fix = tickets.parse_fix(REPO, body)
+        self.assertEqual((fix.pr, fix.branch), (8, "loom/9-work"))
+        self.assertIn("\n    ## Why\n", fix.findings)
 
 
 class TextAndCloseTests(unittest.TestCase):

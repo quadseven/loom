@@ -14,6 +14,13 @@ it the runner uses the lane default (`LOOM_CODEX_MODEL` or
 pull request footer names the lane and the model. A model from the other
 lane's family is refused.
 
+`Fix-PR` is optional and written only by the station: it names the open pull
+request already on `Branch`. The runner then clones that branch instead of
+creating it, runs the agent with the brief and its closing `## Fix` section,
+pushes onto the branch fast-forward only, and comments on the pull request
+instead of opening one. If the pull request is no longer open, the brief is
+parked.
+
 The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that
 branch, and opens the pull request. Lanes never merge pull requests.

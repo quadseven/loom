@@ -291,15 +291,44 @@ class Station:
         os.replace(tmp, path)
         return path
 
-    def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
-        """Steps 2 and 3 for an issue already re-read and trusted."""
+    def _fix_for(self, repo: str, comments: List[Any]) -> Optional[tickets.Fix]:
+        """The loom:fix comment to render, when the latest trusted comment is
+        one and came after the last claim. Raises ValueError for a fix
+        comment that cannot be used (edited, or naming another repo)."""
+        allowed = {a.lower() for a in self.s.authors}
+        last_claim, latest = -1, None
+        for i, c in enumerate(comments):
+            if not isinstance(c, dict):
+                continue
+            body = str(c.get("body") or "")
+            if CLAIM_RE.fullmatch(body.strip()):
+                last_claim = i
+            if tickets._login(c.get("user")) in allowed:
+                latest = (i, c, body)
+        if latest is None or latest[0] < last_claim \
+                or not latest[2].startswith(tickets.FIX_MARKER):
+            return None
+        # GitHub keeps no editor for comments: one changed after it was
+        # posted may carry someone else's words.
+        if latest[1].get("updated_at") != latest[1].get("created_at"):
+            raise ValueError("the loom:fix comment was edited after it was posted")
+        return tickets.parse_fix(repo, latest[2])
+
+    def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
+        """Steps 2 and 3 for an issue already re-read and trusted. False when
+        its fix comment cannot be used (refused, as an untrusted ticket is)."""
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        try:
+            fix = self._fix_for(repo, comments)
+        except ValueError as err:
+            self._refuse(repo, issue, str(err))
+            return False
         earlier = sum(1 for c in comments
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
-        text = tickets.render_brief(repo, issue, lane, attempt)
+        text = tickets.render_brief(repo, issue, lane, attempt, fix)
         claiming = self._write_brief(lane, name, text)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
         if RUNNING not in labels:
@@ -311,6 +340,7 @@ class Station:
                       % (lane, _sha12(issue.get("body")))})
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
+        return True
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -363,7 +393,8 @@ class Station:
             os.remove(path)
             self._refuse(repo, issue, reason)
             return
-        self._claim(repo, lane, issue)
+        if not self._claim(repo, lane, issue):
+            os.remove(path)
 
     def _heartbeat_ok(self, lane: str) -> bool:
         beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
@@ -431,8 +462,7 @@ class Station:
                 or fresh.get("updated_at") != issue.get("updated_at"):
             _say("%s#%s changed since it was checked; next pass" % (repo, issue["number"]))
             return False
-        self._claim(repo, lane, fresh)
-        return True
+        return self._claim(repo, lane, fresh)
 
     # -- outcomes -------------------------------------------------------
     def _finished_briefs(self):
@@ -488,7 +518,8 @@ class Station:
                 _say("no pull request found yet for %s (%s)" % (name, branch))
                 return False
             self._relabel(repo, number, "loom:pr")
-            self._comment(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
+            verb = "pushed fixes to" if self._field(text, "Fix-PR") else "opened"
+            self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         reason = self._failure_reason(lane, name)

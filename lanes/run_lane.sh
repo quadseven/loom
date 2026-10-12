@@ -15,6 +15,9 @@
 # failed/ (the run did not produce one). A brief is never run twice, so a
 # crash or restart cannot turn into a re-run loop. The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
+# A fix brief (a Fix-PR: <number> line, from the station) instead works on
+# that open PR's existing branch: it pushes fast-forward only and comments on
+# the PR, and never opens a second one.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
@@ -132,6 +135,26 @@ pr_body() {
   printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s\n' \
     "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
     "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$refs"
+}
+
+# A fix brief's PR must still be open on the brief's branch. Returns 1 with
+# FIX_REASON set when it is not, and with FIX_REASON empty when gh could not
+# say (the brief then waits for the next pass).
+fix_pr_open() {
+  local state
+  FIX_REASON=""
+  state="$(timeout "$NET_TIMEOUT" gh pr view "$FIX_PR" -R "$REPO" --json state,headRefName \
+    --jq '.state + " " + .headRefName')" || return 1
+  [ "$state" = "OPEN $BRANCH" ] && return 0
+  FIX_REASON="pull request #$FIX_PR is no longer open on $BRANCH (${state:-no answer})"
+  return 1
+}
+
+# What a fix brief fixed: the ### headings of its ## Fix section, one line.
+fix_items() {
+  awk '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
+       on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
+       END {print out}' "$1" | cut -c1-500
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
@@ -524,22 +547,36 @@ for BRIEF in "$INBOX"/*.md; do
     esac
   fi
 
-  # gh unreachable or hung says nothing about the branch: leave the brief
-  # for the next pass rather than risk a second run.
-  if ! EXISTING="$(timeout "$NET_TIMEOUT" gh pr list -R "$REPO" --head "$BRANCH" --state all --json number --jq '.[0].number // empty')"; then
-    echo "$TICKET: gh pr list failed; will retry next pass" >&2; continue
-  fi
-  if [ -n "$EXISTING" ]; then
-    echo "$TICKET: $REPO#$EXISTING already exists for $BRANCH; retiring brief"
-    mv "$BRIEF" "$INBOX/done/"
-    continue
+  FIX_PR="$(field Fix-PR "$BRIEF" || true)"
+  if [ -n "$FIX_PR" ]; then
+    if ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
+      park "$BRIEF" "brief Fix-PR: is not a pull request number"; continue
+    fi
+    if ! fix_pr_open; then
+      [ -n "$FIX_REASON" ] && { park "$BRIEF" "$FIX_REASON"; continue; }
+      echo "$TICKET: gh pr view failed; will retry next pass" >&2; continue
+    fi
+    # The PR's own branch, as it is on the remote; nothing is created.
+    CLONE_ARGS=(--branch "$BRANCH")
+  else
+    # gh unreachable or hung says nothing about the branch: leave the brief
+    # for the next pass rather than risk a second run.
+    if ! EXISTING="$(timeout "$NET_TIMEOUT" gh pr list -R "$REPO" --head "$BRANCH" --state all --json number --jq '.[0].number // empty')"; then
+      echo "$TICKET: gh pr list failed; will retry next pass" >&2; continue
+    fi
+    if [ -n "$EXISTING" ]; then
+      echo "$TICKET: $REPO#$EXISTING already exists for $BRANCH; retiring brief"
+      mv "$BRIEF" "$INBOX/done/"
+      continue
+    fi
+    CLONE_ARGS=(${BASE_ARGS[@]+"${BASE_ARGS[@]}"})
   fi
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
-  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${BASE_ARGS[@]+"${BASE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
-         git -C "$TREE" checkout -q -b "$BRANCH"; } >> "$LOG" 2>&1; then
+  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
+         { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed"; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
@@ -557,6 +594,7 @@ for BRIEF in "$INBOX"/*.md; do
   is_api_lane && archive_transcripts
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
+  [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
   if [ -n "$(safe_git status --porcelain)" ]; then
     if ! { safe_git checkout -q "$BRANCH" && safe_git add -A &&
@@ -567,8 +605,24 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
     park "$BRIEF" "agent made no commit on $BRANCH"; continue
   fi
+  # A PR closed or merged during the run gets nothing pushed: a push would
+  # bring its deleted branch back.
+  if [ -n "$FIX_PR" ] && ! fix_pr_open; then
+    park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
+  fi
+  # Never forced: a branch that moved on the remote refuses the push.
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
     park "$BRIEF" "push failed"; continue
+  fi
+  if [ -n "$FIX_PR" ]; then
+    ITEMS="$(fix_items "$BRIEF")"
+    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" \
+         --body "Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}" >> "$LOG" 2>&1; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
+    fi
+    echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
   fi
   if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$(pr_body "$BRIEF" "$TICKET")" >> "$LOG" 2>&1; then

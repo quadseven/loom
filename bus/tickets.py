@@ -18,7 +18,7 @@ DIFFICULTIES = ("easy", "medium", "hard")
 HEADER_RE = re.compile(r"(Difficulty|Model|Base):[ \t]*(.*)")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
-FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base):")
+FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR):")
 SLUG_MAX = 40
 
 
@@ -81,7 +81,40 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     return headers, "\n".join(rest).rstrip("\n")
 
 
-def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1) -> str:
+class Fix:
+    """A loom:fix comment: the lane's open pull request and what to fix on it."""
+
+    def __init__(self, pr: int, branch: str, findings: str) -> None:
+        self.pr = pr
+        self.branch = branch
+        self.findings = findings
+
+
+FIX_MARKER = "<!-- loom:fix v1 -->"
+FIX_PR_RE = re.compile(r"Pull request: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+), "
+                       r"branch (loom/[A-Za-z0-9._/-]+)[ \t]*")
+# Lines in the findings the runner could read as a brief header or a section
+# of the ticket get indented, which makes them plain quoted text.
+_FIX_UNSAFE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Difficulty|Fix-PR):|#{1,2} ")
+
+
+def parse_fix(repo: str, body: Optional[str]) -> Fix:
+    """A loom:fix comment written by bus.brain fix. Raises ValueError when it
+    names another repo or a branch the runner would refuse."""
+    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].strip() != FIX_MARKER:
+        raise ValueError("not a loom:fix comment")
+    m = FIX_PR_RE.fullmatch(lines[1]) if len(lines) > 1 else None
+    if not m:
+        raise ValueError("loom:fix comment names no pull request and branch")
+    if m.group(1) != repo:
+        raise ValueError("loom:fix comment names a pull request in another repo")
+    rest = ["    " + l if _FIX_UNSAFE_RE.match(l) else l for l in lines[2:]]
+    return Fix(int(m.group(2)), m.group(3), "\n".join(rest).strip("\n"))
+
+
+def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
+                 fix: Optional[Fix] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -89,15 +122,21 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1) 
         "# Brief: %s" % ticket_name(repo, number, attempt),
         "",
         "Repo: %s" % repo,
-        "Branch: %s" % branch_for(number, title, attempt),
+        "Branch: %s" % (fix.branch if fix else branch_for(number, title, attempt)),
         "Lane: %s" % lane,
         "Issue: %s#%d" % (repo, number),
     ]
+    if fix:
+        out.append("Fix-PR: %d" % fix.pr)
     out += ["%s: %s" % (k, v) for k, v in headers.items()]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
     if body:
         text += body + "\n"
+    if fix:
+        text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
+                 "Fix what is listed below on that branch: change only what the findings "
+                 "need and keep the rest of the work.\n\n%s\n" % (fix.pr, fix.branch, fix.findings))
     return text
 
 
