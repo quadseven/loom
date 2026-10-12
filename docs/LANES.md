@@ -27,9 +27,9 @@ before any model call), updates its own clone of this repo under
 current Opus) on docs/MUSE.md with a hard stop of `LOOM_BRAIN_MINUTES`
 (default 40), and releases the lock, also after a failure. It logs to
 `$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it. With
-`LOOM_BRAIN_SCOPE=live` the tick does only the work that needs this machine
-(live verification, ships and rolls, live measurements) and leaves the
-GitHub-only steps to Muse (docs/MUSE.md).
+`LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
+(ships and rolls, checks that need cluster or database access) and leaves the
+rest to Muse (docs/MUSE.md).
 
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock

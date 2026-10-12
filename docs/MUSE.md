@@ -9,12 +9,14 @@ you). The lock lives in `quadseven/loom`.
 
 ## What Muse does and leaves
 
-Muse cannot reach the lane machine, the realm or any private service. The
-lane machine's tick runs with `LOOM_BRAIN_SCOPE=live` and does the live work:
-verification against a live system, ships and rolls, and measurements of
-live problems. Muse does everything else: reviews, merges, briefs, failed
-tickets, asks and journals. When a step needs a live fact, write what is
-needed on the ticket and leave it; never claim a live result.
+Muse reads live data only through REST APIs on the tailnet, through its
+proxy, and has no cluster or database access. The lane machine's tick runs
+with `LOOM_BRAIN_SCOPE=live` and does what needs the cluster: ships and rolls,
+and checks that need cluster or database access. Muse does everything else:
+reviews, merges, briefs, failed tickets, asks, journals, and verification
+from REST APIs. Never write to a live system. When a step needs a fact no API
+serves, write what is needed on the ticket and leave it; never claim a live
+result you did not read yourself.
 
 ## Tick
 

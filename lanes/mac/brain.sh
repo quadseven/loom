@@ -13,8 +13,7 @@
 # Settings: LOOM_REPOS, LOOM_STATUS_REPO (where the lock lives; default this
 # checkout's origin), LOOM_BRAIN_MODEL, LOOM_BRAIN_HOLDER, LOOM_BRAIN_MINUTES
 # (the agent's hard stop, also the lock's expiry), and LOOM_BRAIN_SCOPE: all
-# (the default) or live, which leaves the GitHub-only steps to Muse, which
-# cannot reach this machine's live systems.
+# (the default) or live, which leaves everything but cluster work to Muse.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -74,12 +73,12 @@ $WORK/loom. Read each goal's home issue and its rules before acting on that \
 goal. This replaces the 15-minute limit in MUSE.md: stop within \
 $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
 if [ "$SCOPE" = live ]; then
-  PROMPT="$PROMPT Muse, which cannot reach this machine's live systems, does \
-the GitHub-only steps. Do only what needs this machine: live verification, \
-ships and rolls where a goal's rules make them the brain's, measurements of \
-live problems, and live evidence on tickets and pull requests. Review, merge, \
-brief and answer asks only when no other brain has journaled on any goal in \
-the last 2 hours."
+  PROMPT="$PROMPT Muse does the GitHub steps and reads live data through \
+REST APIs, but has no cluster or database access. Do only what needs this \
+machine: ships and rolls where a goal's rules make them the brain's, and \
+checks or measurements that need cluster or database access; put what you \
+find on the ticket. Review, merge, brief and answer asks only when no other \
+brain has journaled on any goal in the last 2 hours."
 fi
 
 say "tick start (model $MODEL, scope $SCOPE)"
