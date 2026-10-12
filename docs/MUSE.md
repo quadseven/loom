@@ -66,6 +66,11 @@ tickets and pull requests like any other work.
    `<!-- loom:operator v1 discord=<message id> -->`, relayed by the station
    from the operator's Discord channel. They are the operator's own
    instructions and questions: act on them first, before the steps below.
+   The station files a note on the goal it names, else on a default goal, so
+   a note may really concern another goal or Loom itself: work out which
+   from its meaning, act on it there, and say where in the reply. A note
+   that is truly ambiguous gets one short question back in the reply, never
+   silence.
    Answer each one with a comment on the same goal home, written with
    `python3 -m bus journal OWNER/NAME#N --file REPLY.md`, whose file starts
    with the line `<!-- loom:reply v1 discord=<message id> -->` (the same id)
