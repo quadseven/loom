@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import io
 import json
 import os
 import re
@@ -8,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -820,6 +823,153 @@ class BrainTest(Base):
         station.Station(gh, self.settings, read_secret=lambda n, r: URL, post=down).run_pass()
         self.go()
         self.assertEqual(len(self.sent), 1)
+
+
+TOKEN = "transcript-token-SECRET"
+TRANSCRIPT_URL = "https://dashboard.example.com/api/transcripts?key=QUERYSECRET"
+
+
+class TranscriptTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings.transcript_url = TRANSCRIPT_URL
+        self.settings.transcript_token_ssm = "/example/transcript-token"
+        self.user = os.path.join(self._tmp.name, "user")
+        self.sent = []
+        self.secrets = []
+        self.fail = False
+
+    def upload(self, url, token, body):
+        if self.fail:
+            raise OSError("refused by %s with %s" % (url, token))
+        self.sent.append((url, token, body))
+
+    def read_secret(self, name, region):
+        self.secrets.append(name)
+        return TOKEN
+
+    def go(self):
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, read_secret=self.read_secret,
+                        upload=self.upload, user_home=self.user).run_pass()
+
+    def finish(self, name="T1", slot="anthropic-3", kind="done"):
+        self.write(self.inbox(slot, kind, name + ".md"), "# Brief: %s\n\nModel: claude-sonnet-5-5\n" % name)
+        self.write(os.path.join(self.home, "logs", slot, name + ".log"),
+                   "[2030-01-01T10:00:00Z] %s start, lane %s, model claude-sonnet-5-5\n"
+                   "token %s in %s/run\n[2030-01-01T10:09:00Z] %s %s\n"
+                   % (name, slot, "gh" + "p_" + "Q" * 36, self.home, name, kind))
+
+    def test_a_finished_run_is_uploaded_once_scrubbed(self):
+        self.go()  # the first pass records what already finished
+        self.finish()
+        self.go()
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        url, token, body = self.sent[0]
+        self.assertEqual((url, token), (TRANSCRIPT_URL, TOKEN))
+        self.assertEqual((body["ticket"], body["slot"], body["outcome"], body["model"]),
+                         ("T1", "anthropic-3", "done", "claude-sonnet-5-5"))
+        self.assertEqual(body["started_at"], "2030-01-01T10:00:00Z")
+        text = json.dumps(body)
+        self.assertNotIn(self.home, text)
+        self.assertNotIn("Q" * 36, text)
+        self.assertIn("token [redacted] in <path>", text)
+        self.assertEqual(self.secrets, ["/example/transcript-token"])
+
+    def test_runs_finished_before_the_first_pass_are_never_sent(self):
+        self.finish("T0", kind="failed")
+        self.go()
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_a_failed_upload_is_retried_then_given_up_with_one_quiet_line(self):
+        self.go()
+        self.finish()
+        self.fail = True
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.go()
+            self.fail = False
+            self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.finish("T2", kind="failed")
+        self.fail = True
+        with contextlib.redirect_stderr(err):
+            for _ in range(7):
+                self.go()
+        lines = [l for l in err.getvalue().splitlines() if "transcript" in l]
+        self.assertEqual(lines, ["station: gave up uploading the transcript of "
+                                 "anthropic-3/T2 after 5 failures (OSError)"])
+        self.assertNotIn("SECRET", err.getvalue())
+        self.fail = False
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_nothing_is_sent_without_both_settings(self):
+        for url, ssm in (("", "/example/transcript-token"), (TRANSCRIPT_URL, "")):
+            self.settings.transcript_url, self.settings.transcript_token_ssm = url, ssm
+            self.go()
+            self.finish()
+            self.go()
+        self.assertEqual((self.sent, self.secrets), ([], []))
+        self.assertFalse(os.path.exists(os.path.join(self.home, "state", "station", "transcripts.json")))
+
+    def test_no_token_read_when_nothing_is_new(self):
+        self.go()
+        self.go()
+        self.assertEqual(self.secrets, [])
+
+    def test_a_brain_tick_is_uploaded_once_as_brain_and_its_start(self):
+        self.go()
+        state = os.path.join(self.home, "state")
+        started = int(time.time()) - 60
+        self.write(os.path.join(state, "brain.json"), json.dumps(
+            {"at": started + 60, "outcome": "ok", "exit": 0, "started": started,
+             "model": "claude-opus-5-5"}))
+        project = os.path.join(self.user, ".claude", "projects",
+                               os.path.join(self.home, "brain").replace("/", "-").replace(".", "-"))
+        self.write(os.path.join(project, "s.jsonl"), json.dumps(
+            {"type": "user", "message": {"content": "tick"}}) + "\n")
+        self.go()
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        body = self.sent[0][2]
+        self.assertEqual((body["ticket"], body["slot"], body["outcome"], body["model"]),
+                         ("brain/" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                          "brain", "done", "claude-opus-5-5"))
+        self.assertEqual(body["events"][0]["text"], "tick")
+
+    def test_a_skipped_brain_tick_uploads_nothing(self):
+        self.go()
+        self.write(os.path.join(self.home, "state", "brain.json"), json.dumps(
+            {"at": 1893492060, "outcome": "skipped", "exit": 0, "started": None}))
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_the_post_sends_the_bearer_token_and_never_shows_the_url(self):
+        seen = {}
+
+        class Opener:
+            def open(self, req, timeout):
+                seen.update(req.header_items())
+                raise urllib.error.URLError("no route to " + req.full_url)
+        old = station._OPENER
+        station._OPENER = Opener()
+        try:
+            with self.assertRaises(OSError) as ctx:
+                station.post_transcript(TRANSCRIPT_URL, TOKEN, {"events": []})
+        finally:
+            station._OPENER = old
+        self.assertEqual(seen["Authorization"], "Bearer " + TOKEN)
+        self.assertNotIn("SECRET", str(ctx.exception))
+        with self.assertRaises(OSError):
+            station.post_transcript("http://dashboard.example.com/", TOKEN, {})
+
+    def test_settings_come_from_the_environment(self):
+        s = station.Settings.from_env({"LOOM_TRANSCRIPT_URL": " https://x.example/t ",
+                                       "LOOM_TRANSCRIPT_TOKEN_SSM": "/p"})
+        self.assertEqual((s.transcript_url, s.transcript_token_ssm), ("https://x.example/t", "/p"))
 
 
 if __name__ == "__main__":

@@ -67,16 +67,37 @@ open asks go in one digest per day after `LOOM_DIGEST_HOUR` (local hour,
 default 9). Posts mention nobody except the numeric user id in
 `LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
 
-## Transcript viewer
+## Transcripts
 
-`lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves
-every lane's agent session as a chat at `http://localhost:7340/`: the brief,
-the agent's messages, each tool call with its output, edits as diffs. It reads
-Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
-(openrouter, opencode-go) and codex rollouts. It binds localhost only and
-answers only localhost Host headers; transcripts never leave the machine.
-API-lane agents run on the same machine, so their sandbox denies every
-loopback connection; they cannot query the viewer or any other local service.
+The way to read a transcript is the Loom dashboard, which keeps them and
+serves them to the operator's own devices (it is not part of this repo). Each
+station pass uploads every run that newly finished in a slot's `done/` or
+`failed/`, and each brain tick that ran the agent (as ticket
+`brain/<UTC start>`), as one JSON body: `{ticket, slot, model, outcome,
+started_at, finished_at, events: [{ts, role, kind, text}]}`, with kind `text`,
+`tool_use`, `tool_result` or `log`. `bus/transcripts.py` builds it from the
+agent's own session record and the lane log, read by `bus/sessions.py`, the
+one parser the viewer below uses too. Before anything leaves the machine,
+key shapes (GitHub, Anthropic, OpenAI, AWS, Cloudflare, bearer tokens) become
+`[redacted]`, the run's worktree becomes `.` and every other absolute path
+becomes `<path>`; each event is capped at 20,000 characters and the body at
+8 MB, dropping the oldest tool results first. The station POSTs it to
+`LOOM_TRANSCRIPT_URL` (https only) with `Authorization: Bearer <token>`, the
+token read from the SSM parameter named by `LOOM_TRANSCRIPT_TOKEN_SSM`. Both
+come from the installing environment and reach only the station's plist,
+never an agent's; with either empty nothing is uploaded. The URL and token
+are never logged. A failed upload is retried on the next pass and given up
+after 5 failures with one line in `station.log`. Runs that finished before
+the first pass with both settings are recorded in
+`state/station/transcripts.json` and never sent.
+
+`lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) stays
+for local use: it serves every lane's agent session as a chat at
+`http://localhost:7340/`: the brief, the agent's messages, each tool call with
+its output, edits as diffs. It binds localhost only and answers only
+localhost Host headers. API-lane agents run on the same machine, so their
+sandbox denies every loopback connection; they cannot query the viewer or any
+other local service.
 
 ## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
 
@@ -99,7 +120,8 @@ loopback connection; they cannot query the viewer or any other local service.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
-- Logs stay on the lane machine. Nothing is pushed except the ticket branch.
+- Logs stay on the lane machine, except the scrubbed transcript uploads above.
+  Nothing is pushed except the ticket branch.
 - API-lane session transcripts (Claude Code `.jsonl`, opencode's `opencode.db`)
   are copied to `logs/<lane>/<ticket>/` after each run, before the next run
   wipes the scratch home. Links are never followed.

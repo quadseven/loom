@@ -20,18 +20,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import render  # noqa: E402
-import transcripts  # noqa: E402
+from bus import sessions as transcripts  # noqa: E402  (the one transcript parser)
+from bus.labels import LANES  # noqa: E402
 
 CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
-ROUTE = re.compile(r"^/t/([a-z-]+)/([A-Za-z0-9._-]+)$")
+ROUTE = re.compile(r"^/t/([a-z0-9-]+)/([A-Za-z0-9._-]+)$")
 
 
 def rows(loom: Path) -> list[dict]:
-    """Every brief across the lanes, newest first, with done/failed/queued."""
+    """Every brief across the lanes and slots, newest first, with done/failed/queued."""
     found = []
-    for lane in transcripts.LANES:
+    for lane in LANES:
         inbox = loom / "briefs" / lane
         for status, folder in (("done", inbox / "done"), ("failed", inbox / "failed"), ("queued", inbox)):
             if not folder.is_dir():

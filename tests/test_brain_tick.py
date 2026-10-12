@@ -94,6 +94,16 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual("skipped", last["outcome"])
         self.assertTrue(ok)
 
+    def test_a_tick_that_ran_the_agent_records_its_start_and_model(self):
+        self.tick()
+        last, _ = self.beat()
+        self.assertIsInstance(last["started"], int)
+        self.assertLessEqual(last["started"], last["at"])
+        self.assertEqual(last["model"], "claude-opus-5-5")
+        self.tick(FAKE_LOCK="1")
+        last, _ = self.beat()
+        self.assertIsNone(last["started"])
+
     def test_no_repos_means_no_lock_and_no_model_call(self):
         run, calls = self.tick(LOOM_REPOS="")
         self.assertEqual(0, run.returncode)

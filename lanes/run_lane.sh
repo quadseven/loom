@@ -537,7 +537,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
-  echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT, model $MODEL" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${BASE_ARGS[@]+"${BASE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          git -C "$TREE" checkout -q -b "$BRANCH"; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed"; continue

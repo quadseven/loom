@@ -54,10 +54,11 @@ LANES=("$@")
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")"
 
-# Every LOOM_* setting in the environment, as plist entries.
+# Every LOOM_* setting in the environment, as plist entries. The transcript
+# upload settings are the station's alone: no agent ever sees them.
 loom_env() {
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
-    case "$k" in LOOM_HOME|LOOM_REPO_OWNERS) continue ;; LOOM_*) ;; *) continue ;; esac
+    case "$k" in LOOM_HOME|LOOM_REPO_OWNERS|LOOM_TRANSCRIPT_*) continue ;; LOOM_*) ;; *) continue ;; esac
     v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
   done
@@ -108,7 +109,11 @@ done
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
 # with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
-# LOOM_DIGEST_HOUR and LOOM_AWS_REGION. Runs from this checkout, like the lanes.
+# LOOM_DIGEST_HOUR and LOOM_AWS_REGION, and uploads finished transcripts to
+# LOOM_TRANSCRIPT_URL with the token in the SSM parameter named by
+# LOOM_TRANSCRIPT_TOKEN_SSM (both from the installing environment, never this
+# repo; with either empty nothing is uploaded). Runs from this checkout, like
+# the lanes.
 LABEL="com.loom.station"
 PLIST="$AGENTS/$LABEL.plist"
 cat > "$PLIST" <<EOF
@@ -143,6 +148,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
+    <key>LOOM_TRANSCRIPT_URL</key><string>$(xml "${LOOM_TRANSCRIPT_URL:-}")</string>
+    <key>LOOM_TRANSCRIPT_TOKEN_SSM</key><string>$(xml "${LOOM_TRANSCRIPT_TOKEN_SSM:-}")</string>
   </dict>
 </dict>
 </plist>

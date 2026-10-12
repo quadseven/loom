@@ -14,10 +14,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lanes" / "viewer"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import render  # noqa: E402
 import serve  # noqa: E402
-import transcripts  # noqa: E402
+from bus import sessions as transcripts  # noqa: E402
 
 
 def claude_lines():
@@ -90,7 +91,7 @@ class LoadEvents(Fixture):
         db.write_bytes(b"not sqlite at all")
         (self.loom / "logs/openrouter/T2.log").write_text("printed\n")
         events = transcripts.load_events("openrouter", "T2", self.loom, self.claude_projects, self.codex_sessions)
-        self.assertEqual(events, [{"kind": "log", "text": "printed\n"}])
+        self.assertEqual(events, [{"kind": "log", "ts": None, "text": "printed\n"}])
 
     def test_opencode_lane_reads_the_archived_sqlite_store(self):
         db = self.loom / "logs/openrouter/T1/.local/share/opencode/opencode.db"
@@ -131,7 +132,7 @@ class LoadEvents(Fixture):
         log.parent.mkdir(parents=True)
         log.write_text("agent printed this\n")
         events = transcripts.load_events("openrouter", "T9", self.loom, self.claude_projects, self.codex_sessions)
-        self.assertEqual(events, [{"kind": "log", "text": "agent printed this\n"}])
+        self.assertEqual(events, [{"kind": "log", "ts": None, "text": "agent printed this\n"}])
 
     def test_unsafe_lane_or_ticket_names_are_refused(self):
         for lane, ticket in (("codex", "../x"), ("bogus", "T1"), ("codex", "T1/../../x")):

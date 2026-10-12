@@ -4,6 +4,8 @@ One pass (python3 -m bus station, run by launchd) does three things under one
 lock: finishes any claim left half done, reports finished runs back to their
 tickets, and claims the oldest trusted briefed ticket for each lane that can
 take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
+After those it publishes lane status, forwards asks, watches the brain and
+uploads finished transcripts (docs/LANES.md).
 """
 from __future__ import annotations
 
@@ -46,17 +48,21 @@ DIGEST_HEAD = "Asks waiting for you:"
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
 BRAIN_OUTCOMES = ("ok", "skipped", "failed")
+# A transcript upload that failed this many times is given up.
+UPLOAD_TRIES = 5
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 
 SecretReader = Callable[[str, str], str]
 Poster = Callable[[str, Dict[str, Any]], None]
+Uploader = Callable[[str, str, Dict[str, Any]], None]
 
 
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
                  mention: str = "", digest_hour: int = 9,
-                 region: str = "us-east-1") -> None:
+                 region: str = "us-east-1", transcript_url: str = "",
+                 transcript_token_ssm: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -66,6 +72,8 @@ class Settings:
         self.mention = mention
         self.digest_hour = digest_hour
         self.region = region
+        self.transcript_url = transcript_url
+        self.transcript_token_ssm = transcript_token_ssm
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -86,7 +94,9 @@ class Settings:
                    webhook_ssm=env.get("LOOM_DISCORD_WEBHOOK_SSM", "").strip(),
                    mention=env.get("LOOM_DISCORD_MENTION", "").strip(),
                    digest_hour=hour,
-                   region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1")
+                   region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
+                   transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
+                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip())
 
 
 def _origin_repo() -> str:
@@ -108,17 +118,28 @@ def read_ssm(name: str, region: str) -> str:
          "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
         capture_output=True, text=True, timeout=POST_TIMEOUT)
     if out.returncode != 0 or not out.stdout.strip():
-        raise OSError("could not read the webhook parameter from SSM")
+        raise OSError("could not read the parameter from SSM")
     return out.stdout.strip()
 
 
 def post_webhook(url: str, payload: Dict[str, Any]) -> None:
     """POST JSON to the webhook. Errors never carry the URL (it is a secret)."""
+    _post_json(url, payload, {}, "webhook")
+
+
+def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
+    """POST one transcript to the dashboard. Errors carry neither the URL nor
+    the token."""
+    _post_json(url, body, {"Authorization": "Bearer " + token}, "transcript")
+
+
+def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], what: str) -> None:
     if not url.startswith("https://"):
-        raise OSError("the webhook URL is not https")
+        raise OSError("the %s URL is not https" % what)
     req = urllib.request.Request(  # noqa: S310 - https only, checked above
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "loom-station"})
+        headers=dict(headers, **{"Content-Type": "application/json",
+                                 "User-Agent": "loom-station"}))
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status = resp.status
@@ -126,9 +147,9 @@ def post_webhook(url: str, payload: Dict[str, Any]) -> None:
         status = err.code
         err.close()
     except (urllib.error.URLError, OSError):
-        raise OSError("the webhook post failed to connect") from None
+        raise OSError("the %s post failed to connect" % what) from None
     if not 200 <= status < 300:
-        raise OSError("the webhook answered %d" % status)
+        raise OSError("the %s answered %d" % (what, status))
 
 
 def _say(msg: str) -> None:
@@ -183,20 +204,29 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
     return lanes[0] if len(lanes) == 1 and lanes[0] in LANES else None
 
 
+def scrub_paths(text: str) -> str:
+    """Every absolute path in text as <path>."""
+    return PATH_RE.sub("<path>", text)
+
+
 def scrub(reason: str) -> str:
-    text = PATH_RE.sub("<path>", " ".join(reason.split()))
-    return text[:REASON_MAX]
+    return scrub_paths(" ".join(reason.split()))[:REASON_MAX]
 
 
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
                  read_secret: Optional[SecretReader] = None,
-                 post: Optional[Poster] = None) -> None:
+                 post: Optional[Poster] = None,
+                 upload: Optional[Uploader] = None,
+                 user_home: Optional[str] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
+        self.upload = upload or post_transcript
+        # Where the claude and codex CLIs keep their sessions (~/.claude, ~/.codex).
+        self.user_home = user_home or os.path.expanduser("~")
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
 
@@ -821,12 +851,88 @@ class Station:
         elif self._send(url, self._brain_alert_text(last, ok_at)):
             _write_json(path, {"sent": True, "at": self.now})
 
+    # -- transcripts -----------------------------------------------------
+    def _brain_tick(self) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """("brain/<start>", the tick) for the last brain tick that ran the
+        agent and has ended, or None."""
+        brain = self._brain()
+        if brain is None:
+            return None
+        last = brain[0]
+        started, at = last.get("started"), last.get("at")
+        if last.get("outcome") not in ("ok", "failed") or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) for v in (started, at)) \
+                or not 0 < started <= at:
+            return None
+        return "brain/" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)), last
+
+    def _transcript_body(self, key: str, run: Any) -> Optional[Dict[str, Any]]:
+        from . import transcripts
+        if key.startswith("brain/"):
+            return transcripts.brain_body(
+                self.s.home, self.user_home, run["started"], run["at"],
+                "done" if run["outcome"] == "ok" else "failed", run.get("model"))
+        slot, kind, brief, name = run
+        with open(brief, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        return transcripts.run_body(self.s.home, slot, name, kind, text, self.user_home,
+                                    os.stat(brief).st_ctime)
+
+    def _transcript_token(self) -> Optional[str]:
+        try:
+            return self.read_secret(self.s.transcript_token_ssm, self.s.region)
+        # Deliberately broad, as in _webhook: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not read the transcript token parameter (%s); next pass"
+                 % type(err).__name__)
+            return None
+
+    def upload_transcripts(self) -> None:
+        """Upload each finished run (and brain tick) once. A failed upload is
+        retried on the next pass and given up after UPLOAD_TRIES failures.
+        Runs that finished before the first pass with the settings are only
+        recorded, never sent."""
+        if not self.s.transcript_url or not self.s.transcript_token_ssm:
+            return
+        runs: Dict[str, Any] = {"%s/%s" % (r[0], r[3]): r for r in self._finished_briefs()}
+        tick = self._brain_tick()
+        if tick is not None:
+            runs[tick[0]] = tick[1]
+        path = os.path.join(self.state, "transcripts.json")
+        ledger = _read_json(path, None)
+        if ledger is None:
+            _write_json(path, {key: "old" for key in runs})
+            return
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        todo = [k for k in runs if k not in ledger or isinstance(ledger[k], int)]
+        token = self._transcript_token() if todo else None
+        if token is None:
+            return
+        for key in todo:
+            try:
+                body = self._transcript_body(key, runs[key])
+                if body is not None:
+                    self.upload(self.s.transcript_url, token, body)
+                ledger[key] = "sent" if body is not None else "empty"
+            # Deliberately broad, as in _send: an error text can carry the URL
+            # or the token; only the type is logged, and only when giving up.
+            except Exception as err:  # noqa: BLE001
+                tries = (ledger.get(key) if isinstance(ledger.get(key), int) else 0) + 1
+                ledger[key] = tries
+                if tries >= UPLOAD_TRIES:
+                    ledger[key] = "gave-up"
+                    _say("gave up uploading the transcript of %s after %d failures (%s)"
+                         % (key, tries, type(err).__name__))
+            _write_json(path, ledger)
+
     # -- one pass --------------------------------------------------------
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
-        for step in (self.publish_lanes, self.forward_asks, self.watch_brain):
+        for step in (self.publish_lanes, self.forward_asks, self.watch_brain,
+                     self.upload_transcripts):
             try:
                 step()
             except (GitHubError, OSError) as err:

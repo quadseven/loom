@@ -33,11 +33,18 @@ say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 # The station reads these to tell the operator when the brain stops ticking:
 # state/brain.json holds the last tick (outcome ok, skipped or failed, with the
 # agent's exit code), and state/brain-ok is touched by every tick that ended
-# well, a skip for a held lock included (another brain is acting).
+# well, a skip for a held lock included (another brain is acting). A tick that
+# ran the agent also records when it started and its model, so the station
+# can upload that session's transcript.
 STATE="$LOOM_HOME/state"
+STARTED=null
 beat() {
+  local model
+  # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
+  model="$(printf '%s' "$MODEL" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
   mkdir -p "$STATE"
-  printf '{"at": %s, "outcome": "%s", "exit": %s}\n' "$(date +%s)" "$1" "$2" > "$STATE/brain.json.tmp" &&
+  printf '{"at": %s, "outcome": "%s", "exit": %s, "started": %s, "model": "%s"}\n' \
+    "$(date +%s)" "$1" "$2" "$STARTED" "$model" > "$STATE/brain.json.tmp" &&
     mv "$STATE/brain.json.tmp" "$STATE/brain.json"
   case "$1" in ok|skipped) touch "$STATE/brain-ok" ;; esac
 }
@@ -81,6 +88,7 @@ find on the ticket. Review, merge, brief and answer asks only when no other \
 brain has journaled on any goal in the last 2 hours."
 fi
 
+STARTED="$(date +%s)"
 say "tick start (model $MODEL, scope $SCOPE)"
 (cd "$WORK" && timeout "$((MINUTES * 60))" claude -p --model "$MODEL" \
   --permission-mode bypassPermissions "$PROMPT" < /dev/null) >> "$LOG" 2>&1
