@@ -3,6 +3,7 @@ the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import json
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -226,7 +227,11 @@ class LaneRunnerTest(unittest.TestCase):
         (self.inbox / name).write_text(text)
 
     def run_lane(self, lane="codex", **env):
-        full = {
+        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env),
+                              capture_output=True, text=True, timeout=60)
+
+    def lane_env(self, **env):
+        return {
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
             "LOOM_CLONE_BASE": self.clone_base,
@@ -239,8 +244,6 @@ class LaneRunnerTest(unittest.TestCase):
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             **env,
         }
-        return subprocess.run(["bash", str(RUNNER), lane], env=full,
-                              capture_output=True, text=True, timeout=60)
 
     def calls(self):
         extra = []
@@ -816,30 +819,64 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue(any(c.startswith("claude ") for c in self.calls()), result.stderr)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
 
-    def test_stale_lock_kills_its_recorded_process_group_before_running(self):
+    def test_a_recorded_pid_that_is_not_this_lanes_runner_is_left_alone(self):
+        # The recorded pid may have been recycled by an unrelated process.
         self.drop_brief()
         lock = self.loom / "run" / "codex.lock"
         lock.mkdir(parents=True)
         (lock / "pid").write_text("99999999\n")
-        sleeper = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        (lock / "pgid").write_text(f"{sleeper.pid}\n")
-        check = self.bin / "codex"
-        check.write_text(
-            "#!/bin/bash\n"
-            f"kill -0 -- -{sleeper.pid} 2>/dev/null && exit 19\n"
-            f"exec \"{self.bin / 'real-codex'}\" \"$@\"\n"
-        )
-        check.chmod(0o755)
-        self.write_tool(self.bin / "real-codex", FAKE_AGENT)
+        bystander = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        (lock / "pgid").write_text(f"{bystander.pid}\n")
         try:
             result = self.run_lane()
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(sleeper.wait(timeout=2) is not None)
+            self.assertIsNone(bystander.poll())
             self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
         finally:
-            if sleeper.poll() is None:
-                sleeper.kill()
-                sleeper.wait()
+            bystander.kill()
+            bystander.wait()
+
+    def test_an_agent_orphaned_by_a_killed_runner_is_stopped_by_the_next_pass(self):
+        # What a reinstall did: launchd's bootout kills the runner's process
+        # group mid-brief, and the agent (under timeout, in a group of its own)
+        # lives on. The next pass must stop it before running anything.
+        self.drop_brief()
+        agent_pid = Path(self._tmp.name) / "agent.pid"
+        second = Path(self._tmp.name) / "second-run"
+        self.write_tool(self.bin / "real-codex", FAKE_AGENT)
+        self.write_tool(self.bin / "codex",
+                        "#!/bin/bash\n"
+                        f"if [ -e '{second}' ]; then exec \"{self.bin / 'real-codex'}\" \"$@\"; fi\n"
+                        f"echo $$ > '{agent_pid}'\n"
+                        "exec sleep 30\n")
+        runner = subprocess.Popen(["bash", str(RUNNER), "codex"], env=self.lane_env(),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        orphan = None
+        try:
+            for _ in range(100):
+                if agent_pid.exists() and agent_pid.read_text().strip():
+                    break
+                time.sleep(0.1)
+            orphan = int(agent_pid.read_text())
+            os.killpg(runner.pid, signal.SIGKILL)
+            runner.wait(timeout=5)
+            time.sleep(0.3)
+            os.kill(orphan, 0)  # the agent outlived its runner
+            second.write_text("")
+            result = self.run_lane()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with self.assertRaises(ProcessLookupError):
+                for _ in range(30):
+                    os.kill(orphan, 0)
+                    time.sleep(0.1)
+            self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        finally:
+            if orphan:
+                try:
+                    os.kill(orphan, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_stale_lock_without_a_live_group_is_reclaimed(self):
         self.drop_brief()

@@ -29,20 +29,42 @@ LOCK="$LOOM_HOME/run/$LANE.lock"
 
 mkdir -p "$INBOX/done" "$INBOX/failed" "$LOOM_HOME/run"
 
+# The process groups in the tree under pid $1: the agent's job-control
+# subshell and everything below it. `timeout` puts itself in a group of its
+# own, so killing one group is not enough.
+agent_groups() {
+  local c
+  ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '
+  for c in $(pgrep -P "$1" 2>/dev/null); do agent_groups "$c"; done
+}
+
+# A runner killed mid-brief (a reinstall's bootout kills its process group)
+# leaves its agent running in groups of their own. Before a new run, stop the
+# whole tree under the recorded subshell, but only if that pid is still this
+# lane's runner subshell (a recycled pid is left alone).
+stop_orphaned_agent() {
+  local leader="$1" mine groups g alive
+  [[ "$leader" =~ ^[0-9]+$ ]] && kill -0 "$leader" 2>/dev/null || return 0
+  ps -o command= -p "$leader" 2>/dev/null | grep -q "run_lane.sh $LANE" || return 0
+  mine="$(ps -o pgid= -p $$ | tr -d ' ')"
+  groups="$(agent_groups "$leader" | grep -v -x -e "$mine" -e 0 -e 1 | sort -u | tr '\n' ' ')"
+  [ -n "$groups" ] || return 0
+  echo "stale lane lock: stopping the orphaned agent's process groups $groups" >&2
+  for g in $groups; do kill -TERM -- "-$g" 2>/dev/null || true; done
+  for _ in {1..50}; do
+    alive=""
+    for g in $groups; do kill -0 -- "-$g" 2>/dev/null && alive=1; done
+    [ -n "$alive" ] || return 0
+    sleep 0.1
+  done
+  for g in $groups; do kill -KILL -- "-$g" 2>/dev/null || true; done
+}
+
 # One runner per lane. mkdir is atomic; a stale lock from a killed run is
 # cleared when its pid is gone.
 if ! mkdir "$LOCK" 2>/dev/null; then
   if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then exit 0; fi
-  stale_pgid="$(cat "$LOCK/pgid" 2>/dev/null || true)"
-  if [[ "$stale_pgid" =~ ^[0-9]+$ ]] && kill -0 -- "-$stale_pgid" 2>/dev/null; then
-    echo "stale lane lock: terminating process group $stale_pgid" >&2
-    kill -TERM -- "-$stale_pgid" 2>/dev/null || true
-    for _ in {1..50}; do
-      kill -0 -- "-$stale_pgid" 2>/dev/null || break
-      sleep 0.1
-    done
-    if kill -0 -- "-$stale_pgid" 2>/dev/null; then kill -KILL -- "-$stale_pgid" 2>/dev/null || true; fi
-  fi
+  stop_orphaned_agent "$(cat "$LOCK/pgid" 2>/dev/null || true)"
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
@@ -512,10 +534,15 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
 
-  (set -m; (cd "$TREE" && set +m && run_agent "$BRIEF") >> "$LOG" 2>&1) &
-  AGENT_PID=$!
-  echo "$AGENT_PID" > "$LOCK/pgid"
-  wait "$AGENT_PID"
+  # The agent runs as a background job of a job-control subshell, which puts
+  # it in its own process group (id = its pid) and records that id. If this
+  # runner is killed (a reinstall's bootout), the agent survives in its group,
+  # and the next pass's stale-lock recovery above kills exactly that group.
+  ( set -m
+    (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1 &
+    echo $! > "$LOCK/pgid"
+    wait $! ) &
+  wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
