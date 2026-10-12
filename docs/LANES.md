@@ -80,6 +80,54 @@ without sending old reports; later `<!-- loom:report v1 -->` comments from
 successful send advances the per-repo ledger, while a failed send is retried
 on the next pass.
 
+### Talking to the brain from Discord
+
+The webhook only posts. To let the operator answer a report, ask a question
+or give an instruction from the channel, the station also reads the channel
+with a Discord bot, at most every 30 seconds:
+
+- Each new message whose author id is `LOOM_DISCORD_MENTION` (the operator)
+  becomes one comment on a goal home, starting with
+  `<!-- loom:operator v1 discord=<message id> -->` and then the message text.
+  Messages from anyone else, bots included, are ignored. The goal is the one
+  the message names: `owner/name#N` or `#N` of an open `loom:goal` issue in
+  `LOOM_REPOS`, else a word of four or more letters found in one goal title
+  only, else `LOOM_DISCORD_DEFAULT_GOAL` (`owner/name#N`). The station reacts
+  with a checkmark and replies naming the goal; a message that names no goal
+  when no default is set gets a "Not noted" reply instead. The last message
+  id is kept in `$LOOM_HOME/state/station/operator.json`, so each message is
+  noted once; the first read only looks back 10 minutes.
+- A comment on an open goal home starting with
+  `<!-- loom:reply v1 discord=<message id> -->` from a `LOOM_BRIEF_AUTHORS`
+  login (the brain's answer, docs/MUSE.md) is posted to the channel once, as
+  a reply to that message, with the comment link.
+
+The note is posted with the station's GitHub token, and the brain trusts
+only notes from `LOOM_BRIEF_AUTHORS` logins, so that token's login must be
+on the list. The note is a GitHub comment: in a public repo, what the
+operator types is public. The bot token is read from SSM (region `LOOM_AWS_REGION`) and never
+printed; a failed Discord call is logged by method and status only, and
+retried on the next pass. With `LOOM_DISCORD_CHANNEL_ID`,
+`LOOM_DISCORD_BOT_TOKEN_SSM` or `LOOM_DISCORD_MENTION` empty, none of this
+runs.
+
+One-time bot setup:
+
+1. In the Discord developer portal, create an application and add a bot to
+   it. In the bot's settings, enable the Message Content intent (without it
+   the bot reads empty messages).
+2. Invite the bot to the server (OAuth2 URL generator, scope `bot`) and give
+   it, on the operator's channel, View Channel, Read Message History, Send
+   Messages and Add Reactions.
+3. Store the bot token as a SecureString parameter in SSM, in
+   `LOOM_AWS_REGION`, under a name of your choice such as
+   `/YOUR/PATH/discord-bot-token`.
+4. Turn on Developer Mode in Discord, copy the channel id, and run
+   `lanes/mac/install.sh` with `LOOM_DISCORD_CHANNEL_ID=<channel id>`,
+   `LOOM_DISCORD_BOT_TOKEN_SSM=/YOUR/PATH/discord-bot-token`,
+   `LOOM_DISCORD_MENTION=<the operator's user id>` and, optionally,
+   `LOOM_DISCORD_DEFAULT_GOAL=owner/name#N`.
+
 ## Transcript viewer
 
 `lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves

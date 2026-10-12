@@ -1102,3 +1102,240 @@ class BrainTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+BOT_TOKEN = "BOT-TOKEN-SECRET"
+OPERATOR = "123456"
+
+
+class FakeDiscord:
+    """The channel: messages in, the bot's posts and reactions out."""
+
+    def __init__(self):
+        self.messages = []
+        self.calls = []
+        self.sent = []
+        self.reactions = []
+        self.fail_post = False
+
+    def add(self, ident, content, author=OPERATOR, bot=False):
+        self.messages.append({"id": str(ident), "content": content,
+                              "author": {"id": author, "bot": bot}})
+
+    def __call__(self, method, path, token, body):
+        assert token == BOT_TOKEN
+        self.calls.append((method, path))
+        m = re.match(r"/channels/555/messages\?after=(\d+)&limit=100$", path)
+        if method == "GET" and m:
+            newer = [x for x in self.messages if int(x["id"]) > int(m.group(1))]
+            return sorted(newer, key=lambda x: -int(x["id"]))
+        if method == "PUT" and re.match(r"/channels/555/messages/\d+/reactions/%s/@me$"
+                                        % station.CHECKMARK, path):
+            self.reactions.append(path.split("/")[4])
+            return None
+        if method == "POST" and path == "/channels/555/messages":
+            if self.fail_post:
+                raise station.DiscordError("discord POST answered 500")
+            self.sent.append(body)
+            return {"id": "1"}
+        raise AssertionError("unexpected discord call %s %s" % (method, path))
+
+
+class OperatorTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings.channel_id = "555"
+        self.settings.bot_token_ssm = "/example/bot-token"
+        self.settings.mention = OPERATOR
+        self.discord = FakeDiscord()
+        self.clock = time.time()
+        self.base = station._snowflake(self.clock)
+        for number, title in ((40, "Members find events faster"),
+                              (41, "Loom ships tickets quicker")):
+            self.fake.add(number, title=title, state="goal")
+            self.fake.issues[number]["labels"] = [{"name": "loom:goal"}]
+        self.secrets = []
+
+    def go(self, step=station.OPERATOR_CHECK + 1):
+        def secret(name, region):
+            self.secrets.append(name)
+            return BOT_TOKEN
+        self.clock += step
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=self.clock, read_secret=secret,
+                        discord=self.discord).run_pass()
+
+    def notes(self, number):
+        return [c["body"] for c in self.fake.comments[number]
+                if c["body"].startswith("<!-- loom:operator")]
+
+    def say(self, k, content, **kw):
+        ident = self.base + k
+        self.discord.add(ident, content, **kw)
+        return str(ident)
+
+    def test_only_the_operators_messages_become_notes(self):
+        mine = self.say(1, "Please look at %s#41 today" % REPO)
+        self.say(2, "%s#41 from a stranger" % REPO, author="999")
+        self.say(3, "%s#41 from a bot" % REPO, author=OPERATOR, bot=True)
+        self.go()
+        self.assertEqual(self.notes(41), ["<!-- loom:operator v1 discord=%s -->\n"
+                                          "Please look at %s#41 today" % (mine, REPO)])
+        self.assertEqual(self.notes(40), [])
+        self.assertEqual(self.discord.reactions, [mine])
+        self.assertEqual(len(self.discord.sent), 1)
+        ack = self.discord.sent[0]
+        self.assertIn("%s#41" % REPO, ack["content"])
+        self.assertEqual(ack["message_reference"]["message_id"], mine)
+        self.assertEqual(ack["allowed_mentions"], {"parse": []})
+
+    def test_a_message_the_text_checks_refuse_is_not_noted(self):
+        self.say(2, "%s#41 this fixes #3" % REPO)
+        self.go()
+        self.assertEqual(self.notes(41), [])
+        self.assertTrue(any("Not noted" in b["content"] for b in self.discord.sent))
+
+    def test_goal_choice_by_reference_number_title_word_and_default(self):
+        self.say(1, "about #40 please")
+        self.say(2, "the TICKETS are slow")
+        self.go()
+        self.assertEqual(len(self.notes(40)), 1)
+        self.assertEqual(len(self.notes(41)), 1)
+        self.assertTrue(self.notes(41)[0].endswith("the TICKETS are slow"))
+        # Nothing named and no default: not noted, and told so.
+        self.say(3, "hello there")
+        self.go()
+        self.assertEqual((len(self.notes(40)), len(self.notes(41))), (1, 1))
+        self.assertIn("Not noted", self.discord.sent[-1]["content"])
+        self.settings.default_goal = "%s#40" % REPO
+        self.say(4, "hello again")
+        self.go()
+        self.assertTrue(self.notes(40)[-1].endswith("hello again"))
+
+    def test_a_reference_outside_the_goal_homes_falls_back_to_the_default(self):
+        self.settings.default_goal = "%s#41" % REPO
+        self.say(1, "other/repo#40 and #12 and words in both: faster quicker")
+        self.go()
+        self.assertEqual(self.notes(40), [])
+        self.assertEqual(len(self.notes(41)), 1)
+
+    def test_each_message_is_relayed_once_across_passes(self):
+        self.say(1, "#40 first")
+        self.go()
+        self.go()
+        self.say(2, "#40 second")
+        self.go()
+        self.go()
+        self.assertEqual([n.split("\n")[1] for n in self.notes(40)], ["#40 first", "#40 second"])
+        self.assertEqual(len(self.discord.reactions), 2)
+
+    def test_the_channel_is_read_at_most_every_thirty_seconds(self):
+        self.go()
+        self.go(step=10)
+        self.assertEqual(len([c for c in self.discord.calls if c[0] == "GET"]), 1)
+        self.go(step=station.OPERATOR_CHECK)
+        self.assertEqual(len([c for c in self.discord.calls if c[0] == "GET"]), 2)
+
+    def test_old_history_is_not_relayed_on_the_first_read(self):
+        self.discord.add(station._snowflake(self.clock - 3600), "#40 an hour ago")
+        self.say(1, "#40 just now")
+        self.go()
+        self.assertEqual([n.split("\n")[1] for n in self.notes(40)], ["#40 just now"])
+
+    def test_a_github_failure_keeps_the_message_for_the_next_pass(self):
+        self.say(1, "#40 keep me")
+        real = self.fake
+
+        def flaky(method, url, headers, body):
+            if method == "POST" and url.endswith("/issues/40/comments"):
+                real.calls.append((method, url))
+                return reply(502, {"message": "bad gateway"})
+            return real(method, url, headers, body)
+        self.fake = flaky
+        self.go()
+        self.assertEqual(self.discord.reactions, [])
+        self.fake = real
+        self.go()
+        self.assertEqual(len(self.notes(40)), 1)
+
+    def reply_comment(self, number, ident, msg_id, text, author="alice-example", age=60):
+        self.fake.comments[number].append({
+            "id": ident, "user": {"login": author},
+            "body": "<!-- loom:reply v1 discord=%s -->\n%s" % (msg_id, text),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        time.gmtime(self.clock - age)),
+            "html_url": "https://github.com/%s/issues/%d#issuecomment-%d"
+                        % (REPO, number, ident)})
+
+    def test_a_reply_comment_is_forwarded_once_as_a_reply(self):
+        self.go()
+        self.reply_comment(40, 900, "777", "Done: shipped the fix.")
+        self.reply_comment(40, 901, "778", "A stranger's reply", author="stranger")
+        self.reply_comment(41, 902, "779", "Too old", age=station.REPLY_LOOKBACK + 60)
+        self.go()
+        self.go()
+        self.assertEqual(len(self.discord.sent), 1)
+        sent = self.discord.sent[0]
+        self.assertEqual(sent["content"], "Done: shipped the fix.\nhttps://github.com/"
+                         "%s/issues/40#issuecomment-900" % REPO)
+        self.assertEqual(sent["message_reference"]["message_id"], "777")
+        self.assertEqual(sent["allowed_mentions"], {"parse": [], "replied_user": True})
+
+    def test_a_failed_reply_is_sent_on_a_later_pass(self):
+        self.go()
+        self.reply_comment(40, 900, "777", "Answer")
+        self.discord.fail_post = True
+        self.go()
+        self.assertEqual(self.discord.sent, [])
+        self.discord.fail_post = False
+        self.go(step=station.REPLY_OVERLAP)
+        self.go()
+        self.assertEqual([s["content"].split("\n")[0] for s in self.discord.sent], ["Answer"])
+
+    def test_the_token_is_never_logged(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+        self.say(1, "#40 hi")
+
+        def leaky(method, path, token, body):
+            raise ValueError("bad request with " + token)
+
+        def opener_fails(req, timeout):
+            raise OSError("connect failed, header Bot " + BOT_TOKEN)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.discord = leaky
+            self.go()
+            self.discord = station.discord_call
+            with mock.patch.object(station._OPENER, "open", side_effect=opener_fails):
+                self.go()
+            gh = GitHub("token", transport=self.fake)
+
+            def secret_fails(name, region):
+                raise OSError("token " + BOT_TOKEN)
+            self.clock += station.OPERATOR_CHECK + 1
+            station.Station(gh, self.settings, now=self.clock,
+                            read_secret=secret_fails).run_pass()
+        log = err.getvalue()
+        self.assertIn("discord call failed", log)
+        self.assertIn("bot token parameter", log)
+        self.assertNotIn(BOT_TOKEN, log)
+
+    def test_with_the_settings_empty_nothing_runs(self):
+        self.say(1, "#40 hi")
+        for field in ("channel_id", "bot_token_ssm", "mention"):
+            saved = getattr(self.settings, field)
+            setattr(self.settings, field, "")
+            self.go()
+            setattr(self.settings, field, saved)
+        self.assertEqual(self.discord.calls, [])
+        self.assertEqual(self.secrets, [])
+        self.assertEqual(self.notes(40), [])
+
+    def test_settings_come_from_the_environment(self):
+        s = station.Settings.from_env({
+            "LOOM_DISCORD_CHANNEL_ID": " 555 ", "LOOM_DISCORD_BOT_TOKEN_SSM": "/x/bot",
+            "LOOM_DISCORD_DEFAULT_GOAL": "a/b#3"})
+        self.assertEqual((s.channel_id, s.bot_token_ssm, s.default_goal),
+                         ("555", "/x/bot", "a/b#3"))
