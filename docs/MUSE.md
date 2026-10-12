@@ -18,6 +18,26 @@ from REST APIs. Never write to a live system. When a step needs a fact no API
 serves, write what is needed on the ticket and leave it; never claim a live
 result you did not read yourself.
 
+## The brain's job
+
+A goal is never finished until its home issue says so. Every tick moves it:
+there is always a next improvement, and an empty queue means the brain has
+not looked hard enough yet. Each tick the brain:
+
+- Measures the goal with the metrics its home issue names, and compares them
+  with the last journal. A metric that got worse since a change shipped is a
+  regression: it comes first, before any new work (fix it, or revert the
+  change through a pull request), and the journal says which change and which
+  metric.
+- Ranks the open problems by the goal's own measure (for example members
+  affected times hours lost) and keeps every available lane busy with the
+  top ones, up to the goal's cap. Problems nobody has ticketed yet count:
+  look at the live system for what is slow, stuck, failing or unnatural, and
+  ticket it with the evidence.
+- Proves every change: a ticket is verified only when its proof shows on the
+  live system and the metric it targets moved. A change that moved nothing is
+  not done; say so on the ticket and plan the next attempt.
+
 ## Tick
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
@@ -46,10 +66,13 @@ result you did not read yourself.
    remove the label. Keep an ask only when only the operator can do it, with
    one exact ask in its body. The station forwards every open ask to the
    operator, so an ask left open is a message to the operator's phone.
-7. Brief new tickets up to capacity with
+7. Fill every free lane slot with the highest-ranked work (The brain's job),
+   regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
-8. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`.
-   Every 2 hours, write the report too.
+8. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
+   before unlocking. It states the goal's metrics against the last journal,
+   any regression and what was done about it, and the top problem by the
+   goal's measure. Every 2 hours, write the report too.
 9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
 
