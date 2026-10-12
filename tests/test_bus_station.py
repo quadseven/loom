@@ -109,6 +109,10 @@ class FakeGitHub:
         if method == "GET" and rest == "issues":
             if "needs-operator" in query:
                 return self._list_asks(headers)
+            if "loom:goal" in query:
+                return reply(200, [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
+                                   for i in self.issues.values() if i["state"] == "open"
+                                   and "loom:goal" in self.names(i["number"])])
             if "loom:lanes" in query:
                 return reply(200, self.lanes_issues)
             return self._list_briefed(headers)
@@ -742,6 +746,81 @@ class AsksTest(Base):
         self.assertEqual(len(self.sent), 2)  # the urgent ask and the digest
         self.go(NOON + 120)
         self.assertEqual(len(self.sent), 2)
+
+
+class ReportsTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings.webhook_ssm = "/example/webhook"
+        self.settings.mention = "123456"
+        self.sent = []
+        self.fail_post = False
+
+    def add_goal(self, number=40):
+        self.fake.add(number, title="Goal title", state="goal")
+        self.fake.issues[number]["labels"] = [{"name": "loom:goal"}]
+        return self.fake.comments[number]
+
+    def comment(self, number, ident, body, author="alice-example"):
+        self.fake.comments[number].append({"id": ident, "body": body,
+            "user": {"login": author}, "html_url": "https://github.com/%s/issues/%d#issuecomment-%d" % (REPO, number, ident)})
+
+    def go(self):
+        def post(url, payload):
+            if self.fail_post:
+                raise OSError("down")
+            self.sent.append(payload)
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, read_secret=lambda n, r: URL,
+                        post=post).run_pass()
+
+    def prime(self, number=40):
+        self.add_goal(number)
+        self.go()
+        self.sent.clear()
+
+    def test_new_trusted_report_is_sent_once_without_mention(self):
+        self.prime()
+        self.comment(40, 100, station.REPORT_MARKER + "\nFive report lines")
+        self.go()
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["content"], "Goal title\nFive report lines\nhttps://github.com/%s/issues/40#issuecomment-100" % REPO)
+        self.assertEqual(self.sent[0]["allowed_mentions"], {"parse": []})
+
+    def test_untrusted_and_journal_comments_are_ignored(self):
+        self.prime()
+        self.comment(40, 100, station.REPORT_MARKER + "\nreport", "stranger")
+        self.comment(40, 101, "journal entry")
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_first_run_records_existing_report_without_sending(self):
+        self.add_goal()
+        self.comment(40, 100, station.REPORT_MARKER + "\nhistory")
+        self.go()
+        self.assertEqual(self.sent, [])
+        with open(os.path.join(self.home, "state", "station", "reports.json")) as fh:
+            self.assertEqual(json.load(fh)[REPO.replace("/", ".")], 100)
+
+    def test_failed_send_is_retried(self):
+        self.prime()
+        self.comment(40, 100, station.REPORT_MARKER + "\nreport")
+        self.fail_post = True
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.fail_post = False
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_long_report_is_cut_at_line_break_and_keeps_link(self):
+        self.prime()
+        self.comment(40, 100, station.REPORT_MARKER + "\n" + "line\n" * 700)
+        self.go()
+        content = self.sent[0]["content"]
+        self.assertLessEqual(len(content), station.DISCORD_MAX)
+        self.assertTrue(content.endswith("https://github.com/%s/issues/40#issuecomment-100" % REPO))
+        self.assertTrue(content.splitlines()[-2] == "line")
 
 
 

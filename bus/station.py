@@ -42,6 +42,7 @@ URGENT = "loom:urgent"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+REPORT_MARKER = "<!-- loom:report v1 -->"
 # A brain tick runs every 30 minutes; no tick ending well for this long means
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
@@ -634,9 +635,9 @@ class Station:
     def _line(issue: Dict[str, Any]) -> str:
         return "- %s %s" % (" ".join(str(issue.get("title") or "").split()), issue["html_url"])
 
-    def _send(self, url: str, content: str) -> bool:
+    def _send(self, url: str, content: str, mention: bool = True) -> bool:
         allowed: Dict[str, Any] = {"parse": []}
-        if self.s.mention.isdigit():
+        if mention and self.s.mention.isdigit():
             content = "<@%s> %s" % (self.s.mention, content)
             allowed["users"] = [self.s.mention]
         try:
@@ -766,6 +767,84 @@ class Station:
         if url is not None:
             self._deliver(url, todo, digest, ledger, today)
 
+    # -- goal reports -----------------------------------------------------
+    def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
+        data = self.gh.paginate(
+            "/repos/%s/issues?labels=loom:goal&state=open&per_page=100" % repo)
+        return [i for i in (data if isinstance(data, list) else [])
+                if isinstance(i, dict) and "pull_request" not in i
+                and "number" in i]
+
+    @staticmethod
+    def _report_id(comment: Dict[str, Any]) -> int:
+        try:
+            return int(comment.get("id", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _report_text(self, issue: Dict[str, Any], comment: Dict[str, Any]) -> str:
+        title = " ".join(str(issue.get("title") or "").split())
+        body = str(comment.get("body") or "")[len(REPORT_MARKER):].lstrip("\r\n ")
+        link = str(comment.get("html_url") or issue.get("html_url") or "")
+        prefix = title + "\n"
+        suffix = "\n" + link if link else ""
+        room = DISCORD_MAX - len(prefix) - len(suffix)
+        if len(body) > room:
+            # Keep whole report lines and reserve the comment link at the end.
+            body = body[:max(0, room)].rsplit("\n", 1)[0]
+        return (prefix + body + suffix)[:DISCORD_MAX]
+
+    def forward_reports(self) -> None:
+        if not self.s.webhook_ssm:
+            return
+        path = os.path.join(self.state, "reports.json")
+        ledger = _read_json(path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        allowed = {a.lower() for a in self.s.authors}
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = self._goal_issues(repo)
+            comments: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+            for issue in issues:
+                for comment in self.gh.paginate(
+                        "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))):
+                    if isinstance(comment, dict) and str(comment.get("body") or "").startswith(REPORT_MARKER):
+                        comments.append((self._report_id(comment), issue, comment))
+            comments.sort(key=lambda row: row[0])
+            key = repo.replace("/", ".")
+            last = ledger.get(key)
+            if last is None:
+                newest = max((ident for ident, _, _ in comments), default=0)
+                ledger[key] = newest
+                _write_json(path, ledger)
+                continue
+            try:
+                last_id = int(last)
+            except (TypeError, ValueError):
+                last_id = 0
+            pending = [(ident, issue, comment) for ident, issue, comment in comments
+                       if ident > last_id]
+            if not pending:
+                continue
+            url = self._webhook()
+            if url is None:
+                continue
+            for ident, issue, comment in pending:
+                author = str((comment.get("user") or {}).get("login") or "").lower()
+                if author not in allowed:
+                    # Advance past untrusted comments; they must never be replayed.
+                    ledger[key] = ident
+                    _write_json(path, ledger)
+                    last_id = ident
+                    continue
+                if not self._send(url, self._report_text(issue, comment), mention=False):
+                    break
+                ledger[key] = ident
+                _write_json(path, ledger)
+                last_id = ident
+
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
         """The last brain tick (lanes/mac/brain.sh) and when a tick last ended
@@ -826,7 +905,8 @@ class Station:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
-        for step in (self.publish_lanes, self.forward_asks, self.watch_brain):
+        for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
+                     self.watch_brain):
             try:
                 step()
             except (GitHubError, OSError) as err:

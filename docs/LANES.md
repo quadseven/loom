@@ -67,6 +67,13 @@ open asks go in one digest per day after `LOOM_DIGEST_HOUR` (local hour,
 default 9). Posts mention nobody except the numeric user id in
 `LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
 
+Reports: the station also reads comments on open `loom:goal` issues in each
+`LOOM_REPOS` repo. On first run it records the newest report comment per repo
+without sending old reports; later `<!-- loom:report v1 -->` comments from
+`LOOM_BRIEF_AUTHORS` are sent to the same webhook, without a mention. A
+successful send advances the per-repo ledger, while a failed send is retried
+on the next pass.
+
 ## Transcript viewer
 
 `lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves
