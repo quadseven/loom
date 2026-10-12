@@ -141,7 +141,7 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - Compute, not a model lane. Test farm (full gates: `python -B` suites,
  C++ builds) and local model inference (triage/review workers).
-- Rule: sparks power Loom. Sparks never touch a live realm.
+- Rule: sparks power Loom. Sparks never touch a live system.
 
 ## workersai: Cloudflare Workers AI
 

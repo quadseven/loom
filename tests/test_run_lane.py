@@ -32,7 +32,7 @@ Difficulty: medium
 # T042: Fix the thing
 
 ## Why
-The thing is broken for every guild.
+The thing is broken for every user.
 
 ## What
 Make the thing work.
@@ -270,7 +270,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertFalse(any(c.startswith("gh pr merge") for c in self.calls()))
         body = self.body.read_text()
-        self.assertIn("## Why\nThe thing is broken for every guild.", body)
+        self.assertIn("## Why\nThe thing is broken for every user.", body)
         self.assertIn("## Acceptance criteria\n- [ ] The thing works\n- [ ] A test covers the thing\n- [ ] Nothing else changes", body)
         self.assertIn("\nSize: S\n", body)
         self.assertIn("## Out of scope\n- Other things", body)

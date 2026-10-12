@@ -10,10 +10,8 @@ subscriptions are the crew. Nobody shares credentials across lanes.
 ### 1. Goal + scoreboard (`dispatch/metrics.py`)
 
 Every 30 minutes, per active goal, measure the north-star metric and write it
-to `state/metrics/<goal>.jsonl` (append-only). For the WoW goal the north star
-is member-hours of natural progress: members gaining XP, median and lowest
-level, dungeon clears per attempts, class quests done. Other goals define
-their own metric in their goal doc.
+to `state/metrics/<goal>.jsonl` (append-only). Each goal defines its metric
+on its goal home issue, in the project's own repo.
 
 ### 2. Ticket queue (GitHub issues)
 
@@ -59,10 +57,8 @@ Model names are discovered at runtime, never hardcoded.
 
 One shipper (Muse). Squash merges, answers every bot comment, batches ships.
 Every PR is reviewed by grug (Grug - Chief) before merge - no exceptions.
-Per-goal ship rules live in the goal doc. WoW rules: at most one worldserver
-roll per hour, never while a family is inside a dungeon (wait up to 60 min),
-batch bridge restarts, mod-overseer bumps move all five pins together with
-worldserver+db-import pinned as a pair.
+Per-goal ship rules (deploy caps, windows when nothing may roll, pins that
+move together) live on each goal's home issue in the project's own repo.
 
 ### 6. Verifier (`dispatch/verify.py`)
 

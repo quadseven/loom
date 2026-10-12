@@ -4,7 +4,7 @@
 # test.sh runs the full gates for a ticket's worktree on the sparks box:
 #   python -B test suites, C++ builds, whatever the repo's gates are.
 # Called by lane runners or the dispatcher before a PR is handed to the
-# shipper. Rule: sparks power Loom. Sparks never touch a live realm.
+# shipper. Rule: sparks power Loom. Sparks never touch a live system.
 set -euo pipefail
 
 TREE="$1"   # path to the worktree to test
