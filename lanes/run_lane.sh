@@ -2,7 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
-#                               | zen | zai | workersai
+#                               | zen | zai | workersai | agy
 #
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
@@ -44,6 +44,17 @@ REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$LANE"
+# The agy lane's agent runs as a dedicated macOS user (default "loom") that
+# cannot read this user's home or keychain. agy keeps its sign-in in that
+# user's own keychain, a non-"login" keychain (a "login" keychain will not
+# unlock from the command line), unlocked with its password from SSM.
+AGY_USER="${LOOM_AGY_USER:-loom}"
+AGY_HOME="${LOOM_AGY_HOME:-/Users/$AGY_USER}"
+AGY_BIN="${LOOM_AGY_BIN:-$AGY_HOME/.local/bin/agy}"
+AGY_KEYCHAIN="${LOOM_AGY_KEYCHAIN:-$AGY_HOME/Library/Keychains/loom.keychain-db}"
+if [ -n "${LOOM_AGY_RUNAS:-}" ]; then AGY_RUNAS=("$LOOM_AGY_RUNAS"); else AGY_RUNAS=(sudo -n -u "$AGY_USER" -H); fi
+# Its trees live in a folder both users can write (ACLs set up with the user).
+[ "$LANE" = agy ] && WORKDIR="${LOOM_AGY_WORKDIR:-$AGY_HOME/lanes}"
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
@@ -98,6 +109,10 @@ park() {
 # matches resolved paths; proper ancestors get metadata-only literals so
 # getcwd and realpath still work without making HOME listable.
 sandbox_profile() {
+  # The agy lane reaches the keychain server: it runs as the lane user, whose
+  # only keychain is its own. Every other lane is denied it.
+  local keychain_deny='(global-name "com.apple.SecurityServer") '
+  [ "$LANE" = agy ] && keychain_deny=""
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
@@ -121,8 +136,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
+    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta" "$keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -138,6 +153,7 @@ api_agent() {
     keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV"
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
+    # shellcheck disable=SC2030 # deliberately local to the agent's subshell
     export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     [ "$key_var" = - ] || export "$key_var=$key"
     # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
@@ -149,6 +165,24 @@ api_agent() {
   # pipefail carries the agent's exit status through `cat`. The reader has its
   # own deadline: a process the agent detached into another process group
   # survives `timeout` and would hold the pipe, and the lane lock, open.
+}
+
+# The agy lane: unlock the lane user's keychain (password on stdin to a shell
+# running as that user, never in this process's argv), then run agy as that
+# user in an emptied environment inside the sandbox, edits only. The runner,
+# as this user, commits, pushes and opens the PR from the shared tree.
+agy_agent() {
+  local profile
+  AGENT_HOME="$AGY_HOME/tmp"
+  "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
+  profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
+  # shellcheck disable=SC2016 # expanded by the inner shell, as the lane user
+  printf '%s\n' "$API_KEY" | "${AGY_RUNAS[@]}" /bin/sh -c 'IFS= read -r p; exec security unlock-keychain -p "$p" "$1"' sh "$AGY_KEYCHAIN" ||
+    { echo "could not unlock the agy lane keychain" >&2; return 3; }
+  # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
+  "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
+    LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
+    "$AGY_BIN" -p "$1" --mode accept-edits --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
 }
 
 # opencode runs helper agents (session titles) on its own default small model,
@@ -210,7 +244,7 @@ fresh_agent_home() {
 # Lanes and models whose provider may train on prompts (docs/LANES.md lists
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
-  case "$LANE:$MODEL" in zen:*|zai:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  case "$LANE:$MODEL" in zen:*|zai:*|agy:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
   return 1
 }
 
@@ -235,6 +269,7 @@ run_agent() {
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_config && api_agent CLOUDFLARE_API_TOKEN opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
+    agy) agy_agent "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
 }
@@ -242,6 +277,13 @@ run_agent() {
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
 lane_ready() {
   local cli key_ssm
+  if [ "$LANE" = agy ]; then
+    command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
+    "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
+      { READY_REASON="cannot run $AGY_BIN as $AGY_USER"; return 1; }
+    agy_key
+    return
+  fi
   case "$LANE" in
     codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai) cli=opencode ;;
     *) READY_REASON="unknown lane"; return 1 ;;
@@ -255,6 +297,20 @@ lane_ready() {
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
     --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
   [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
+  lane_extra_ready
+}
+
+# The agy lane's "key" is its keychain password (LOOM_AGY_KEY_SSM).
+agy_key() {
+  local key_ssm
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
+  API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
+    --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+  [ -n "$API_KEY" ] || { READY_REASON="no keychain password readable at $(lane_var KEY_SSM)"; return 1; }
+}
+
+lane_extra_ready() {
   # Cloudflare Workers AI also needs the account the token belongs to.
   if [ "$LANE" = workersai ]; then
     local account_ssm
@@ -333,6 +389,8 @@ for BRIEF in "$INBOX"/*.md; do
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
     zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
     workersai:cloudflare-workers-ai/@cf/*) ;;
+    agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
+    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then

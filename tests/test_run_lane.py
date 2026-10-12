@@ -134,6 +134,30 @@ printf '%s\\n' "$val"
 """
 
 
+# Fake "become the lane user" command: runs its arguments as-is and records
+# that it was used. Production uses sudo to the dedicated macOS user.
+FAKE_RUNAS = """#!/usr/bin/env bash
+printf 'runas %s\\n' "$1" >> "$FAKE_LOG"
+exec "$@"
+"""
+
+# Fake security: records unlock-keychain calls and whether the password
+# matched $FAKE_KC_PW, never the password itself.
+FAKE_SECURITY = """#!/usr/bin/env bash
+if [ "$1" = unlock-keychain ]; then
+  if [ "$3" = "$FAKE_KC_PW" ]; then ok=pw-ok; else ok=pw-bad; fi
+  printf 'security unlock-keychain %s %s\\n' "$4" "$ok" >> "$FAKE_LOG"
+fi
+"""
+
+# Fake agy: records its flags and working dir, then edits a file.
+FAKE_AGY = """#!/usr/bin/env bash
+args="$*"; args="${args//$'\\n'/ }"
+printf 'agy %s | cwd=%s home=%s\\n' "$args" "$PWD" "$HOME" >> "$TMPDIR/agy.log"
+echo fixed > fix.txt
+"""
+
+
 def git(*args, cwd=None):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
@@ -414,6 +438,71 @@ class LaneRunnerTest(unittest.TestCase):
             LOOM_WORKERSAI_MODEL="openrouter/vendor/model:free",
         )
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", **env):
+        lane_home = Path(self._tmp.name) / "loomuser"
+        workdir = lane_home / "lanes"
+        (lane_home / "tmp").mkdir(parents=True)
+        workdir.mkdir()
+        agy = lane_home / "agy"
+        self.write_tool(agy, FAKE_AGY)
+        self.write_tool(self.bin / "security", FAKE_SECURITY)
+        runas = Path(self._tmp.name) / "runas"
+        self.write_tool(runas, FAKE_RUNAS if runas_ok else "#!/usr/bin/env bash\nexit 1\n")
+        inbox = self.loom / "briefs" / "agy"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: agy"))
+        result = self.run_lane(
+            "agy",
+            LOOM_AGY_RUNAS=str(runas),
+            LOOM_AGY_HOME=str(lane_home),
+            LOOM_AGY_WORKDIR=str(workdir),
+            LOOM_AGY_BIN=str(agy),
+            LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
+            LOOM_AGY_KEY_SSM="/k/kc",
+            FAKE_SECRET__k_kc="fake-kc-password",
+            FAKE_KC_PW="fake-kc-password",
+            LOOM_AGY_MODEL=model,
+            **env,
+        )
+        agy_log = lane_home / "tmp" / "agy.log"
+        return inbox, workdir, result, (agy_log.read_text().splitlines() if agy_log.exists() else [])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_unlocks_its_keychain_then_runs_as_the_lane_user(self):
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        unlocks = [i for i, c in enumerate(calls) if c.startswith("security unlock-keychain")]
+        self.assertEqual(len(unlocks), 1, calls)
+        self.assertIn("loom.keychain-db pw-ok", calls[unlocks[0]])
+        self.assertEqual(len(agy), 1, (calls, result.stderr))
+        self.assertIn("-p # Brief: T042-fix-the-thing", agy[0])
+        self.assertIn("--mode accept-edits", agy[0])
+        self.assertIn("--model gemini-3.8-flash-high", agy[0])
+        self.assertIn(f"cwd={workdir.resolve()}/T042-fix-the-thing", agy[0])
+        self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agy_lane_is_unavailable_when_it_cannot_become_the_lane_user(self):
+        inbox, _, result, agy = self.agy_lane(runas_ok=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
+        self.assertFalse(beat["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_refuses_a_model_outside_its_catalog(self):
+        inbox, _, _, agy = self.agy_lane(model="openrouter/vendor/model:free")
+        self.assertEqual(agy, [])
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_takes_public_repos_only(self):
+        inbox, _, _, agy = self.agy_lane(FAKE_GH_PRIVATE="true")
+        self.assertEqual(agy, [])
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
