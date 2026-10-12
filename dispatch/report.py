@@ -7,5 +7,5 @@
  4. shipped and verified
  5. next
 
-Decisions are indexed per the goal doc (WoW: #512 daily).
+Decisions are indexed on each goal's home issue.
 """
