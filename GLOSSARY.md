@@ -73,5 +73,5 @@ Confirm on the live system that a shipped change shows its proof and moved the m
 _Avoid_: test, check
 
 **Journal**:
-The comment the brain leaves on a goal's home issue for each tick that changed something — shipped, briefed, waiting, asks and cost — with a five-line report every two hours.
+The comment the brain leaves on a goal's home issue for each tick that changed something (shipped, briefed, waiting, asks and cost), with a five-line report every two hours.
 _Avoid_: log, summary
