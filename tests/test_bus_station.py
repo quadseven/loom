@@ -453,6 +453,7 @@ class FixTest(Base):
     def comment(self, number, body, author="alice-example", edited=False):
         at = "2030-01-02T00:00:00Z"
         self.fake.comments[number].append({
+            "id": len(self.fake.comments[number]) + 1,
             "body": body, "user": {"login": author}, "created_at": at,
             "updated_at": "2030-01-03T00:00:00Z" if edited else at})
 
@@ -498,13 +499,15 @@ class FixTest(Base):
         self.run_pass()
         self.assert_plain_brief()
 
-    def test_a_later_trusted_comment_supersedes_the_fix(self):
+    def test_a_fix_followed_by_a_later_trusted_comment_still_renders_a_fix(self):
         self.fake.add(12)
         self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
         self.comment(12, FIX_BODY)
         self.comment(12, "Start over on a fresh branch.", author="bob-example")
         self.run_pass()
-        self.assert_plain_brief()
+        text = self.claimed_brief()
+        self.assertIn("Fix-PR: 99\n", text)
+        self.assertIn("\n## Fix\n", text)
 
     def refused_fix(self, body, edited=False):
         self.fake.add(12)

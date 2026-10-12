@@ -371,28 +371,27 @@ class Station:
         os.replace(tmp, path)
         return path
 
-    def _fix_for(self, repo: str, comments: List[Any]) -> Optional[tickets.Fix]:
-        """The loom:fix comment to render, when the latest trusted comment is
-        one and came after the last claim. Raises ValueError for a fix
-        comment that cannot be used (edited, or naming another repo)."""
+    def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
+        """Return the newest trusted fix after the last claim, regardless of
+        later non-fix comments. Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
-        last_claim, latest = -1, None
+        last_claim, newest_fix = -1, None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
             if CLAIM_RE.fullmatch(body.strip()):
                 last_claim = i
-            if tickets._login(c.get("user")) in allowed:
-                latest = (i, c, body)
-        if latest is None or latest[0] < last_claim \
-                or not latest[2].startswith(tickets.FIX_MARKER):
+            if (tickets._login(c.get("user")) in allowed
+                    and body.startswith(tickets.FIX_MARKER)):
+                newest_fix = (i, c, body)
+        if newest_fix is None or newest_fix[0] < last_claim:
             return None
         # GitHub keeps no editor for comments: one changed after it was
         # posted may carry someone else's words.
-        if latest[1].get("updated_at") != latest[1].get("created_at"):
+        if newest_fix[1].get("updated_at") != newest_fix[1].get("created_at"):
             raise ValueError("the loom:fix comment was edited after it was posted")
-        return tickets.parse_fix(repo, latest[2])
+        return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1].get("id")
 
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
@@ -400,7 +399,7 @@ class Station:
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
-            fix = self._fix_for(repo, comments)
+            fix_source = self._fix_for(repo, comments)
         except ValueError as err:
             self._refuse(repo, issue, str(err))
             return False
@@ -408,6 +407,7 @@ class Station:
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
+        fix, fix_comment_id = fix_source if fix_source else (None, None)
         text = tickets.render_brief(repo, issue, lane, attempt, fix)
         claiming = self._write_brief(lane, name, text)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
@@ -419,6 +419,9 @@ class Station:
                      {"body": "Claimed for lane %s (body sha256 %s)"
                       % (lane, _sha12(issue.get("body")))})
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        if fix:
+            _say("rendered %s#%d fix brief from loom:fix comment %s"
+                 % (repo, number, fix_comment_id if fix_comment_id is not None else "with unknown id"))
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
         return True
 
