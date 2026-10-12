@@ -15,6 +15,9 @@
 # failed/ (the run did not produce one). A brief is never run twice, so a
 # crash or restart cannot turn into a re-run loop. The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
+# A repo with a validation contract (.loom/validation.conf) is prepared
+# before the agent and checked again on its commit; a failing check parks
+# the brief and keeps the edits on a side branch instead of opening a PR.
 # A fix brief (a Fix-PR: <number> line, from the station) instead works on
 # that open PR's existing branch: it pushes fast-forward only and comments on
 # the PR, and never opens a second one.
@@ -28,6 +31,8 @@
 # provider key, read at run time; never stored in this repo; zen needs none),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
+# LOOM_CHECK_TIMEOUT (seconds per validation step, default 1800; see
+# load_contract for the repo's .loom/validation.conf),
 # LOOM_CLONE_BASE (default git@github.com:).
 set -uo pipefail
 
@@ -85,6 +90,7 @@ trap 'rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
+CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
 WORKDIR="$LOOM_HOME/worktrees"
@@ -132,9 +138,11 @@ pr_body() {
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   size="$(section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
-  printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s\n' \
+  local validated=""
+  [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
+  printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
     "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
-    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$refs"
+    "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
 # A fix brief's PR must still be open on the brief's branch. Returns 1 with
@@ -177,10 +185,11 @@ park() {
 # getcwd and realpath still work without making HOME listable.
 sandbox_profile() {
   # The agy lane reaches the keychain server: it runs as the lane user, whose
-  # only keychain is its own. Every other lane is denied it.
-  local keychain_deny='(global-name "com.apple.SecurityServer") '
-  [ "$LANE" = agy ] && keychain_deny=""
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
+  # only keychain is its own. Every other lane is denied it, and so is a
+  # validation run ($3 = check), whichever lane it serves.
+  local keychain_deny='(global-name "com.apple.SecurityServer") ' agy_lane=""
+  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { keychain_deny=""; agy_lane=1; }
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules=""
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
@@ -203,8 +212,9 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
+  [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
   printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$(agy_write_rules "$allow_rw")" "$tree" "$allow_ro" "$meta" "$keychain_deny"
+    "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$meta" "$keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -326,6 +336,164 @@ safe_git() {
   git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
 }
 
+# The repo's validation contract: .loom/validation.conf, the same interpreter,
+# submodules, setup and check its CI uses. Lines are "key: value":
+#   interpreter: python3.12     a command that must be on the lane's PATH
+#   submodules: yes             check out the pinned submodules first
+#   setup: <shell command>      prepares the tree (a venv, locked deps, lint)
+#   check: <shell command>      the required check; exit 0 and no tracked
+#                               file changed means it passed
+# It is read from the base revision before the agent starts, so nothing the
+# agent edits changes what is checked. A repo without the file is not
+# validated by the runner (its CI still is).
+CONTRACT_FILE=.loom/validation.conf
+load_contract() {
+  local f="$TREE/$CONTRACT_FILE" line key val
+  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
+  [ -e "$f" ] || [ -L "$f" ] || return 0
+  HAS_CONTRACT=1
+  { [ -f "$f" ] && [ ! -L "$f" ]; } || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key="${line%%:*}" val="${line#*:}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    case "$key" in
+      interpreter) C_INTERP="$val" ;;
+      submodules) C_SUBMODULES="$val" ;;
+      setup) C_SETUP="$val" ;;
+      check) C_CHECK="$val" ;;
+      *) SETUP_REASON="$CONTRACT_FILE has an unknown line '${line:0:40}'"; return 1 ;;
+    esac
+  done < "$f"
+  [ -n "$C_CHECK" ] || { SETUP_REASON="$CONTRACT_FILE has no check: line"; return 1; }
+  case "$C_SUBMODULES" in yes|no) ;; *) SETUP_REASON="$CONTRACT_FILE submodules: must be yes or no"; return 1 ;; esac
+  [ -z "$C_INTERP" ] || [[ "$C_INTERP" =~ ^[A-Za-z0-9._+-]+$ ]] ||
+    { SETUP_REASON="$CONTRACT_FILE interpreter: must be a command name"; return 1; }
+}
+
+# One line of $RECORD per step: phase, command, exit code, the tree revision
+# it ran on, and whether it passed. Only a final line with "ok": true lets the
+# runner open (or push to) a pull request.
+json_str() {
+  # shellcheck disable=SC1003 # escaping a literal backslash
+  printf '"%s"' "$(printf '%s' "$1" | tr '[:cntrl:]' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+record() {
+  printf '{"ticket": %s, "phase": "%s", "command": %s, "exit": %s, "revision": "%s", "ok": %s, "detail": %s, "at": "%s"}\n' \
+    "$(json_str "$TICKET")" "$1" "$(json_str "$2")" "$3" "$4" "$5" "$(json_str "${6:-}")" \
+    "$(date -u +%FT%TZ)" >> "$RECORD"
+}
+
+# Run one contract command in the tree the way an API-lane agent runs: an
+# emptied environment with a scratch HOME, under the sandbox profile (its
+# second argument is the interpreter, whose directory stays readable). The
+# check after the agent runs the agent's code, so it must never see the
+# runner's HOME, keys or SSH agent. Output goes through a pipe to the log.
+contract_run() {
+  local profile
+  profile="$(AGENT_HOME="$CHECK_HOME" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
+  # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
+  (
+    cd "$TREE" || exit 125
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" home="$CHECK_HOME"
+    for v in $(compgen -e); do unset "$v"; done
+    export PATH="$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang"
+    exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < /dev/null
+  ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
+}
+
+tracked_changes() {
+  safe_git status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' '
+}
+
+# What setup and the first check leave untracked (a venv, caches) stays out
+# of the agent's commit: each path goes into .git/info/exclude, which an
+# API-lane agent cannot write.
+exclude_untracked() {
+  local p
+  mkdir -p "$TREE/.git/info"
+  while IFS= read -r -d '' p; do
+    [[ "$p" =~ ^[A-Za-z0-9._@+/-]+$ ]] || { SETUP_REASON="setup left a file whose name the runner will not exclude"; return 1; }
+    printf '/%s\n' "$p" >> "$TREE/.git/info/exclude"
+  done < <(safe_git ls-files -z --others --exclude-standard --directory)
+}
+
+# Before the agent: interpreter, submodules, setup, then the check on the
+# base (recorded, so a failure the base already had is told apart from one
+# the agent caused; it does not stop the run, since a ticket may exist to fix
+# it). Returns 1 with SETUP_REASON when the environment cannot be prepared.
+prepare_validation() {
+  local rc interp="" subs="" changed what
+  SETUP_REASON=""
+  load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
+  [ -n "$HAS_CONTRACT" ] || return 0
+  what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
+  if ! command -v sandbox-exec > /dev/null; then SETUP_REASON="sandbox-exec not available"
+  elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then SETUP_REASON="interpreter $C_INTERP is not on PATH"
+  elif [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+         -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
+    SETUP_REASON="submodule checkout failed"
+  fi
+  if [ -n "$SETUP_REASON" ]; then record prepare "$what" 1 "$BASE" false "$SETUP_REASON"; return 1; fi
+  [ -n "$interp" ] && interp="$interp $("$interp" --version 2>&1 | head -1)"
+  [ "$C_SUBMODULES" = yes ] && subs="$(safe_git submodule status --recursive | tr '\n' ';')"
+  record prepare "$what" 0 "$BASE" true "interpreter: ${interp:-none}; submodules: ${subs:-none}"
+  CHECK_CLI="${C_INTERP:-bash}"
+  rm -rf "$CHECK_HOME"
+  mkdir -p "$CHECK_HOME/tmp"
+  if [ -n "$C_SETUP" ]; then
+    contract_run "$C_SETUP"; rc=$?
+    record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
+    [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
+  fi
+  contract_run "$C_CHECK"; BASELINE_EXIT=$?
+  changed="$(tracked_changes)"
+  record baseline "$C_CHECK" "$BASELINE_EXIT" "$BASE" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+    "${changed:+changed tracked files: $changed}"
+  [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
+  exclude_untracked
+}
+
+# After the agent, on the committed branch head: the same check again. Sets
+# VALIDATION_REASON when it did not pass.
+final_validation() {
+  local rc rev changed ok=false
+  VALIDATION_REASON=""
+  safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
+  rev="$(safe_git rev-parse HEAD)"
+  contract_run "$C_CHECK"; rc=$?
+  changed="$(tracked_changes)"
+  case "$rc" in
+    0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
+    124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    125|126|127) VALIDATION_REASON="validation environment unavailable: the check exited $rc" ;;
+    *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
+  esac
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
+  [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
+  VALIDATED="check exited 0 at ${rev:0:12}"
+}
+
+# A run that failed validation keeps its edits: they are committed and pushed
+# to a side branch, never to the ticket's branch or an open pull request.
+preserve_unvalidated() {
+  local side
+  side="$BRANCH-unvalidated-$(date +%s)"
+  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       push -q origin "$BRANCH:refs/heads/$side" >> "$LOG" 2>&1; then
+    printf 'the edits are on branch %s' "$side"
+  else
+    printf 'the push of %s failed; the edits are committed in the lane tree' "$side"
+  fi
+}
+
+# What the agent is told about the contract, after its brief.
+validation_note() {
+  [ -n "$HAS_CONTRACT" ] || return 0
+  printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the base it exited %s.\n\n    %s\n' \
+    "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_EXIT" "$C_CHECK"
+}
+
 # Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
 # session store and older session json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
 # The agent controls everything in that home, so: enter each parent directory
@@ -377,7 +545,7 @@ is_api_lane() {
 
 run_agent() {
   local brief_text
-  brief_text="$(cat "$1")"
+  brief_text="$(cat "$1")$(validation_note)"
   AGENT_EXTRA_ENV=""
   is_api_lane && fresh_agent_home
   case "$LANE" in
@@ -462,7 +630,7 @@ lane_extra_ready() {
 
 # Timeouts must be positive integers: `timeout 0` means no limit at all, and a
 # wedged agent would then hold the lane lock forever.
-for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1"; do
+for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_TIMEOUT:$CHECK_TIMEOUT:60"; do
   IFS=: read -r t_name t_val t_min <<< "$t"
   if ! [[ "$t_val" =~ ^[0-9]+$ ]] || [ "$t_val" -lt "$t_min" ]; then
     heartbeat false "LOOM_$t_name must be an integer >= $t_min, got '$t_val'"
@@ -471,6 +639,7 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1"; do
 done
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
+CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
@@ -580,6 +749,12 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "clone or branch failed"; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
+  RECORD="$LOGDIR/$TICKET.validation.jsonl"
+  rm -f "$RECORD"
+  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED=""
+  if ! prepare_validation >> "$LOG" 2>&1; then
+    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run"; continue
+  fi
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
@@ -604,6 +779,13 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
     park "$BRIEF" "agent made no commit on $BRANCH"; continue
+  fi
+  # An agent's exit code is not evidence: only a passing check on the
+  # committed head hands the work on.
+  if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
+    HANDOFF="no pull request opened"
+    [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
+    park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF"; continue
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
