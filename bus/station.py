@@ -123,12 +123,16 @@ class Station:
         data = self.gh.graphql(
             "query($owner:String!,$name:String!,$number:Int!){"
             "repository(owner:$owner,name:$name){issue(number:$number){"
-            "editor{login}}}}", {"owner": owner, "name": name, "number": number})
+            "editor{login} lastEditedAt}}}", {"owner": owner, "name": name, "number": number})
         issue = ((data or {}).get("repository") or {}).get("issue")
         if issue is None:
             raise GitHubError("graphql returned no issue %s#%d" % (repo, number))
         editor = issue.get("editor")
-        return str(editor["login"]) if editor and editor.get("login") else None
+        if editor and editor.get("login"):
+            return str(editor["login"])
+        # Edited, but GitHub names no editor (a deleted account): nobody on
+        # the list can vouch for this body.
+        return "(deleted account)" if issue.get("lastEditedAt") else None
 
     def _check_trust(self, repo: str, issue: Dict[str, Any]) -> Tuple[bool, str]:
         number = int(issue["number"])

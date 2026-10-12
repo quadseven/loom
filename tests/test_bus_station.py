@@ -45,7 +45,7 @@ class FakeGitHub:
 
     def add(self, number, title="Fix the thing", lane="codex", body=BODY,
             author="alice-example", created="2030-01-01T00:00:00Z",
-            events=None, editor=None, state="briefed"):
+            events=None, editor=None, state="briefed", ghost_edit=False):
         self.issues[number] = {
             "number": number, "title": title, "body": body, "state": "open",
             "user": {"login": author}, "created_at": created,
@@ -56,7 +56,9 @@ class FakeGitHub:
         self.events[number] = events if events is not None else [
             labeled("loom:briefed", "alice-example"), labeled("lane:" + lane, "bob-example")]
         self.comments[number] = []
-        self.editors[number] = editor
+        # A body edited by an account since deleted: GitHub reports the edit
+        # time but no editor.
+        self.editors[number] = "<ghost>" if ghost_edit else editor
         self.version += 1
 
     def names(self, number):
@@ -74,7 +76,8 @@ class FakeGitHub:
             n = data["variables"]["number"]
             editor = self.editors[n]
             return reply(200, {"data": {"repository": {"issue": {
-                "editor": {"login": editor} if editor else None}}}})
+                "editor": {"login": editor} if editor and editor != "<ghost>" else None,
+                "lastEditedAt": "2030-01-01T00:05:00Z" if editor else None}}}})
         m = re.match(r"/repos/%s/(.*)" % REPO, parts.path)
         rest = m.group(1)
         if method == "GET" and rest == "issues":
@@ -380,6 +383,9 @@ class RefusalTest(Base):
 
     def test_body_edited_by_a_stranger(self):
         self.refused(editor="stranger")
+
+    def test_body_edited_by_a_deleted_account(self):
+        self.refused(ghost_edit=True)
 
     def test_repo_owner_not_listed(self):
         self.settings.owners = ["someone-else"]
