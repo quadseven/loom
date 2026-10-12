@@ -155,6 +155,18 @@ class TokenScopeTests(unittest.TestCase):
         self.assertEqual(GitHub("t", transport=fake).paginate("/repos/a/b/labels"), [1, 2])
 
 
+class TransportTests(unittest.TestCase):
+    def test_the_default_transport_opens_https_only(self):
+        from bus.github import urllib_transport
+        for url in ("file:///etc/hosts", "http://api.github.com/x", "ftp://x/y"):
+            with self.assertRaises(GitHubError):
+                urllib_transport("GET", url, {}, None)
+
+    def test_the_default_transport_never_follows_a_redirect(self):
+        from bus.github import _NoRedirect
+        self.assertIsNone(_NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://elsewhere.example/x"))
+
+
 class LabelTests(unittest.TestCase):
     def test_the_lane_status_label_is_in_the_set(self):
         self.assertIn("loom:lanes", labels.LABELS)
@@ -189,7 +201,7 @@ class LabelTests(unittest.TestCase):
         patches = [c for c in t.calls if c[0] == "PATCH"]
         self.assertEqual(len(patches), 1)
         self.assertTrue(patches[0][1].endswith("/labels/loom%3Agoal"))
-        for method, url, _, body in t.calls[1:]:
+        for method, url, _, _body in t.calls[1:]:
             self.assertIn(method, ("POST", "PATCH"))
             self.assertNotIn("/bug", url)
             self.assertNotIn("needs-operator", url)

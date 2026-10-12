@@ -38,11 +38,25 @@ class Response:
         self.headers = headers if headers is not None else {}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib would follow a redirect with the Authorization header still
+    attached, to whatever host it names; hand the 3xx back instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def urllib_transport(method: str, url: str, headers: Dict[str, str],
                      body: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
+    if not url.startswith("https://"):
+        raise GitHubError("refusing a non-https URL: %s" % url.split("?")[0])
     req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        # https only (checked above), never file: or custom schemes.
+        with _OPENER.open(req, timeout=TIMEOUT) as resp:  # noqa: S310
             return resp.status, dict(resp.headers.items()), resp.read()
     except urllib.error.HTTPError as err:
         try:
