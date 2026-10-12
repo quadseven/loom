@@ -95,7 +95,15 @@ tickets and pull requests like any other work.
 8. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
-   goal's measure. Every 2 hours, write the report too.
+   goal's measure.
+   Every 2 hours per goal (when the goal's newest report is 2 hours old or
+   there is none), also post the report: a separate comment on the goal
+   home, written with the same command, whose file starts with the line
+   `<!-- loom:report v1 -->` followed by the report itself. Use the format
+   the goal home asks for (for example its five report lines); without one,
+   five lines: metric changes, what moved, the top blocker, shipped and
+   verified, next. The station sends every report to the operator's phone,
+   so it must stand on its own: numbers, not references.
 9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
 
