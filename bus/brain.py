@@ -16,6 +16,15 @@ STATES = ("queued", "briefed", "running", "pr", "failed", "shipped", "verified")
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
+REVIEW_BOT_SHORT_NAME = "coderabbit"
+CLOSING_REFERENCE = re.compile(r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved):?\s+(?:#[0-9]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+)\b", re.IGNORECASE)
+
+
+def _check_written_text(text: str) -> None:
+    if re.search(r"@" + re.escape(REVIEW_BOT_SHORT_NAME), text, re.IGNORECASE):
+        raise ValueError("body must not mention the review bot handle")
+    if CLOSING_REFERENCE.search(text):
+        raise ValueError("body must not contain a closing reference")
 
 
 def _repo(value: str) -> str:
@@ -179,6 +188,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
           model: Optional[str] = None, base: Optional[str] = None) -> str:
     _check_brief_args(title, body, lane, model, base)
+    _check_written_text(title + "\n" + body)
     _check_goal_capacity(gh, repo, goal)
     names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
     if lane:
@@ -197,6 +207,8 @@ def move(gh: GitHub, repo: str, number: int, state: str,
         raise ValueError("invalid state")
     if lane is not None and (state != "briefed" or lane not in LANES):
         raise ValueError("lane is valid only for briefed and must be known")
+    if note is not None:
+        _check_written_text(note)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
@@ -213,12 +225,88 @@ def move(gh: GitHub, repo: str, number: int, state: str,
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
 
 
+def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
+    owner, name = repo.split("/", 1)
+    query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
+             ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
+             ' commits(last:1) { nodes { commit { statusCheckRollup { state } } } } '
+             ' reviewThreads(first:100) { nodes { isResolved comments(first:1) { nodes { databaseId } } } }'
+             ' } } }') % (_gql(owner), _gql(name), number)
+    data = gh.graphql(query) or {}
+    return ((data.get("repository") or {}).get("pullRequest") or {})
+
+
+def merge(gh: GitHub, repo: str, number: int,
+          ticket: Optional[Tuple[str, int]] = None) -> None:
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    details = _pr_graphql(gh, repo, number)
+    _validate_merge_pr(repo, pr, details)
+    sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
+    if not sha:
+        raise ValueError("pull request has no head SHA")
+    result = gh.rest("PUT", "/repos/%s/pulls/%d/merge" % (repo, number),
+                     {"merge_method": "squash", "sha": sha}).data or {}
+    if result.get("merged") is not True:
+        raise ValueError("GitHub did not confirm the merge")
+    branch = pr["head"]["ref"]
+    gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")))
+    if ticket:
+        move(gh, ticket[0], ticket[1], "shipped")
+
+
+def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> None:
+    head = pr.get("head") or {}
+    base_repo = pr.get("base", {}).get("repo", {}).get("full_name")
+    head_repo = head.get("repo", {}).get("full_name") or details.get("headRepository", {}).get("nameWithOwner")
+    if pr.get("state") != "open":
+        raise ValueError("pull request is not open")
+    if details.get("isDraft") or pr.get("draft"):
+        raise ValueError("pull request is a draft")
+    if not str(head.get("ref", details.get("headRefName", ""))).startswith("loom/"):
+        raise ValueError("pull request head is not a loom branch")
+    graph_head_repo = details.get("headRepository", {}).get("nameWithOwner")
+    if head_repo != repo or base_repo != repo or (graph_head_repo and graph_head_repo != repo):
+        raise ValueError("pull request must use the same repository")
+    if pr.get("mergeable") is not True:
+        raise ValueError("pull request is not mergeable")
+    commits = (details.get("commits") or {}).get("nodes") or []
+    rollup = commits[-1].get("commit", {}).get("statusCheckRollup") if commits else None
+    if (rollup or {}).get("state") != "SUCCESS":
+        raise ValueError("pull request checks are not successful")
+    threads = (details.get("reviewThreads") or {}).get("nodes") or []
+    if any(not thread.get("isResolved") for thread in threads):
+        raise ValueError("pull request has unresolved review threads")
+
+
+def reply_to_review(gh: GitHub, repo: str, number: int, comment_id: int,
+                    body: str, resolve: bool = False) -> None:
+    _check_written_text(body)
+    gh.rest("POST", "/repos/%s/pulls/%d/comments/%d/replies" % (repo, number, comment_id), {"body": body})
+    if resolve:
+        details = _pr_graphql(gh, repo, number)
+        thread_id = _thread_for_comment(details, comment_id)
+        owner, name = repo.split("/", 1)
+        query = ('mutation { resolveReviewThread(input:{threadId:%s}) { thread { isResolved } } }' % _gql(str(thread_id)))
+        gh.graphql(query)
+
+
+def _thread_for_comment(details: Dict[str, Any], comment_id: int) -> str:
+    threads = (details.get("reviewThreads") or {}).get("nodes") or []
+    for thread in threads:
+        comments = (thread.get("comments") or {}).get("nodes") or []
+        if comments and int(comments[0].get("databaseId", -1)) == comment_id:
+            return str(thread.get("id"))
+    raise ValueError("review comment thread was not found")
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base")
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note")
+    mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
+    rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
 
@@ -236,11 +324,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             with open(args.file, "r", encoding="utf-8") as stream:
                 url = brief(gh, repo, args.goal, args.title, stream.read(), args.lane, args.difficulty, args.model, args.base)
             print(url)
-        else:
+        elif args.command == "move":
             match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)", args.ticket)
             if not match:
                 raise ValueError("ticket must be OWNER/NAME#N")
             move(gh, match.group(1), int(match.group(2)), args.to, args.lane, args.note)
+        elif args.command in ("merge", "reply"):
+            match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)", args.pull_request)
+            if not match:
+                raise ValueError("pull request must be OWNER/NAME#N")
+            repo, number = match.group(1), int(match.group(2))
+            if args.command == "merge":
+                ticket = None
+                if args.ticket:
+                    parsed = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)", args.ticket)
+                    if not parsed:
+                        raise ValueError("ticket must be OWNER/NAME#N")
+                    ticket = (parsed.group(1), int(parsed.group(2)))
+                merge(gh, repo, number, ticket)
+            else:
+                with open(args.file, "r", encoding="utf-8") as stream:
+                    reply_to_review(gh, repo, number, args.comment, stream.read(), args.resolve)
         return 0
     except (ValueError, OSError, GitHubError) as exc:
         print("error: %s" % exc, file=sys.stderr)
