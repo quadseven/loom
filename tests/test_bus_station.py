@@ -837,11 +837,10 @@ class ReportsTest(Base):
         self.comment(40, 100, station.REPORT_MARKER + "\nreport")
         gh = GitHub("token", transport=self.fake)
         self.clock += station.REPORT_CHECK + 1
-
-        def no_secret(name, region):
-            raise OSError("unreadable")
-        station.Station(gh, self.settings, now=self.clock, read_secret=no_secret,
-                        post=lambda u, p: self.sent.append(p)).run_pass()
+        from unittest import mock
+        with mock.patch.object(station, "read_ssm", side_effect=OSError("unreadable")):
+            station.Station(gh, self.settings, now=self.clock,
+                            post=lambda u, p: self.sent.append(p)).run_pass()
         self.assertEqual(self.sent, [])
         self.go()
         self.assertEqual(len(self.sent), 1)
