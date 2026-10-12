@@ -1,6 +1,9 @@
 # The brain on GitHub
 
-The brain runs on Muse's own VM, on Muse's own schedule (#35, amended). Muse
+The brain runs on Muse's own VM, on Muse's own schedule (#35, amended), or
+as a launchd tick on the lane machine (`lanes/mac/brain.sh`, every 30
+minutes) until Muse runs it. Both take the same lock, so one brain acts at a
+time, and both follow docs/MUSE.md. Muse
 cannot reach the lane machine, and the lane machine does not expose anything
 to the internet, so GitHub is the only state the brain, the lane machine and
 the operator share. A fresh tick rebuilds everything it needs from GitHub

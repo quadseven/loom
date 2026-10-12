@@ -34,6 +34,10 @@ export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
+# Checked before anything is installed.
+BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
+[[ "$BRAIN_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BRAIN_INTERVAL" -ge 60 ] ||
+  { echo "LOOM_BRAIN_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -145,6 +149,49 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 wait_job_gone "gui/$(id -u)/$LABEL"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed $LABEL -> python3 -m bus station (idle unless LOOM_REPOS is set)"
+
+# The brain tick (lanes/mac/brain.sh): every LOOM_BRAIN_INTERVAL seconds
+# (default 1800), take the brain lock and run one docs/MUSE.md tick with the
+# claude CLI. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
+# LOOM_AWS_REGION and LOOM_BRAIN_* from the installing environment; with
+# LOOM_REPOS empty it stays idle. LOOM_BRAIN=0 skips it and removes an
+# installed one.
+LABEL="com.loom.brain"
+PLIST="$AGENTS/$LABEL.plist"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+wait_job_gone "gui/$(id -u)/$LABEL"
+if [ "${LOOM_BRAIN:-1}" = 0 ]; then
+  rm -f "$PLIST"
+  echo "removed $LABEL (LOOM_BRAIN=0)"
+else
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$X_REPO/lanes/mac/brain.sh</string>
+  </array>
+  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$X_LOOM/logs/brain-service.log</string>
+  <key>StandardErrorPath</key><string>$X_LOOM/logs/brain-service.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$X_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$X_HOME</string>
+    <key>LOOM_HOME</key><string>$X_LOOM</string>
+$(loom_env)
+  </dict>
+</dict>
+</plist>
+EOF
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "installed $LABEL -> $X_REPO/lanes/mac/brain.sh"
+fi
 
 # The transcript viewer: a long-running server on localhost, restarted if it
 # exits. Installed alongside the lanes unless LOOM_VIEWER=0.
