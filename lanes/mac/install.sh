@@ -161,7 +161,7 @@ PLIST="$AGENTS/$LABEL.plist"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 wait_job_gone "gui/$(id -u)/$LABEL"
 if [ "${LOOM_BRAIN:-1}" = 0 ]; then
-  rm -f "$PLIST"
+  rm -f "$PLIST" "$LOOM_HOME/state/brain.json" "$LOOM_HOME/state/brain-ok"
   echo "removed $LABEL (LOOM_BRAIN=0)"
 else
   cat > "$PLIST" <<EOF

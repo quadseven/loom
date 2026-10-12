@@ -28,6 +28,12 @@ current Opus) on docs/MUSE.md with a hard stop of `LOOM_BRAIN_MINUTES`
 (default 40), and releases the lock, also after a failure. It logs to
 `$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it.
 
+Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
+`$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
+included. The station adds a `brain` row to the lane status, and when no tick
+has ended well for 2 hours it sends one urgent Discord message, then one more
+when the brain is back.
+
 ## The station
 
 `lanes/mac/install.sh` also installs `com.loom.station`, which runs
