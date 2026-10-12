@@ -7,6 +7,15 @@ Run every command from that checkout. Set `LOOM_GITHUB_TOKEN` and
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
+## What Muse does and leaves
+
+Muse cannot reach the lane machine, the realm or any private service. The
+lane machine's tick runs with `LOOM_BRAIN_SCOPE=live` and does the live work:
+verification against a live system, ships and rolls, and measurements of
+live problems. Muse does everything else: reviews, merges, briefs, failed
+tickets, asks and journals. When a step needs a live fact, write what is
+needed on the ticket and leave it; never claim a live result.
+
 ## Tick
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock

@@ -12,7 +12,9 @@
 #
 # Settings: LOOM_REPOS, LOOM_STATUS_REPO (where the lock lives; default this
 # checkout's origin), LOOM_BRAIN_MODEL, LOOM_BRAIN_HOLDER, LOOM_BRAIN_MINUTES
-# (the agent's hard stop, also the lock's expiry).
+# (the agent's hard stop, also the lock's expiry), and LOOM_BRAIN_SCOPE: all
+# (the default) or live, which leaves the GitHub-only steps to Muse, which
+# cannot reach this machine's live systems.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -22,6 +24,7 @@ LOG="$LOOM_HOME/logs/brain.log"
 MODEL="${LOOM_BRAIN_MODEL:-claude-opus-5-5}"
 HOLDER="${LOOM_BRAIN_HOLDER:-lane-machine}"
 MINUTES="${LOOM_BRAIN_MINUTES:-40}"
+SCOPE="${LOOM_BRAIN_SCOPE:-all}"
 ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)"
 LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')}"
 mkdir -p "$WORK" "$(dirname "$LOG")"
@@ -42,6 +45,7 @@ beat() {
 
 [ -n "${LOOM_REPOS:-}" ] || exit 0
 [ -n "$ORIGIN" ] && [ -n "$LOCK_REPO" ] || { say "no origin remote in $REPO_ROOT, so no lock repo"; exit 1; }
+case "$SCOPE" in all|live) ;; *) say "LOOM_BRAIN_SCOPE must be all or live"; exit 1 ;; esac
 [[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -ge 5 ] || { say "LOOM_BRAIN_MINUTES must be a number of at least 5"; exit 1; }
 
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
@@ -69,8 +73,16 @@ is already held for you as holder $HOLDER by the wrapper, so skip the lock and u
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
 goal. This replaces the 15-minute limit in MUSE.md: stop within \
 $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
+if [ "$SCOPE" = live ]; then
+  PROMPT="$PROMPT Muse, which cannot reach this machine's live systems, does \
+the GitHub-only steps. Do only what needs this machine: live verification, \
+ships and rolls where a goal's rules make them the brain's, measurements of \
+live problems, and live evidence on tickets and pull requests. Review, merge, \
+brief and answer asks only when no other brain has journaled on any goal in \
+the last 2 hours."
+fi
 
-say "tick start (model $MODEL)"
+say "tick start (model $MODEL, scope $SCOPE)"
 (cd "$WORK" && timeout "$((MINUTES * 60))" claude -p --model "$MODEL" \
   --permission-mode bypassPermissions "$PROMPT" < /dev/null) >> "$LOG" 2>&1
 code=$?
