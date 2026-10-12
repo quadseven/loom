@@ -311,7 +311,7 @@ run_agent() {
     zen) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
     zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
-      opencode_config && api_agent CLOUDFLARE_API_TOKEN opencode run -m "$MODEL" "$brief_text" ;;
+      opencode_config && api_agent CLOUDFLARE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;

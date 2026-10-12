@@ -120,7 +120,13 @@ lookup leaves the brief for the next pass. The rule covers:
   free plan requests fail past it, on a paid plan they are billed).
 - Needs a Workers AI token (`LOOM_WORKERSAI_KEY_SSM`) and the account id it
   belongs to (`LOOM_WORKERSAI_ACCOUNT_SSM`), both read from SSM at run time and
-  handed to the agent in its emptied environment.
+  handed to the agent in its emptied environment. opencode reads them as
+  `CLOUDFLARE_API_KEY` and `CLOUDFLARE_ACCOUNT_ID`; without the key it sends
+  no credentials and Cloudflare answers "Authentication error".
+- Default model `@cf/qwen/qwen3.8-27b`: it calls tools, has a 262k context and
+  runs on the Workers Free plan. Models without tool calls or with a 32k
+  context (qwen2.5-coder-32b) fail under opencode's agent prompt, and some
+  newer models (glm-5.3-flash) are paid-plan only.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
 
