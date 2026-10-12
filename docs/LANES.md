@@ -78,7 +78,16 @@ Reports: the station also reads comments on open `loom:goal` issues in each
 without sending old reports; later `<!-- loom:report v1 -->` comments from
 `LOOM_BRIEF_AUTHORS` are sent to the same webhook, without a mention. A
 successful send advances the per-repo ledger, while a failed send is retried
-on the next pass.
+on the next pass. When the Discord bot below is set up
+(`LOOM_DISCORD_CHANNEL_ID` and `LOOM_DISCORD_BOT_TOKEN_SSM`), reports go
+through the bot instead, and the webhook setting is not needed for them:
+each report is one short line, the goal's short name in bold and the
+report's first line, with a thread on it holding the full report and the
+comment link, so tapping the line expands it. The short name is a
+`Short name: ...` line in the goal home body when there is one, else the goal
+home title. A failed line is retried on the next pass; once the line is out,
+a failed thread is only logged, so the line is never posted twice. Every
+station post, through the webhook or the bot, suppresses link previews.
 
 ### Talking to the brain from Discord
 
@@ -88,12 +97,17 @@ with a Discord bot, at most every 30 seconds:
 
 - Each new message whose author id is `LOOM_DISCORD_MENTION` (the operator)
   becomes one comment on a goal home, starting with
-  `<!-- loom:operator v1 discord=<message id> -->` and then the message text.
+  `<!-- loom:operator v1 discord=<message id> -->` and then the message text,
+  followed by an `Attachments:` list with the link of each attached image or
+  file, so the brain can open a screenshot (a message with only an
+  attachment is noted too). Discord's attachment links expire after about a
+  day.
   Messages from anyone else, bots included, are ignored. The goal is the one
   the message names: `owner/name#N` or `#N` of an open `loom:goal` issue in
   `LOOM_REPOS`, else a word of four or more letters found in one goal title
   only, else `LOOM_DISCORD_DEFAULT_GOAL` (`owner/name#N`). The station reacts
-  with a checkmark and replies naming the goal; a message that names no goal
+  with a checkmark and replies "Noted for the brain" with the note's link,
+  naming the goal only when the message named one; a message that names no goal
   when no default is set gets a "Not noted" reply instead. The last message
   id is kept in `$LOOM_HOME/state/station/operator.json`, so each message is
   noted once; the first read only looks back 10 minutes.
@@ -118,7 +132,8 @@ One-time bot setup:
    the bot reads empty messages).
 2. Invite the bot to the server (OAuth2 URL generator, scope `bot`) and give
    it, on the operator's channel, View Channel, Read Message History, Send
-   Messages and Add Reactions.
+   Messages, Add Reactions, Create Public Threads and Send Messages in
+   Threads.
 3. Store the bot token as a SecureString parameter in SSM, in
    `LOOM_AWS_REGION`, under a name of your choice such as
    `/YOUR/PATH/discord-bot-token`.
