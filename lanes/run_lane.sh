@@ -103,8 +103,8 @@ park() {
 # log need it; a fresh clone holds no credentials) but not writable: a planted
 # hook or config would run when the runner commits. Also no keychain, no Unix
 # sockets except DNS (an SSH agent's socket would hand over its keys), and no
-# AppleEvents, LaunchServices, osascript, open or launchctl (each can run a
-# command outside the sandbox), and no connections to this machine's own
+# AppleEvents, LaunchServices, osascript, open, launchctl, sudo or su (each can
+# run a command outside the sandbox or as another user), and no connections to this machine's own
 # loopback services (the transcript viewer serves other lanes' sessions). Paths are canonical, because the sandbox
 # matches resolved paths; proper ancestors get metadata-only literals so
 # getcwd and realpath still work without making HOME listable.
@@ -136,8 +136,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$tree" "$allow_ro" "$meta" "$keychain_deny"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
+    "$home" "$allow_rw" "$(agy_write_rules "$allow_rw")" "$tree" "$allow_ro" "$meta" "$keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -167,6 +167,47 @@ api_agent() {
   # survives `timeout` and would hold the pipe, and the lane lock, open.
 }
 
+# The agy lane's agent runs as the lane user, so that user's home is its real
+# home, not a scratch one. It may write only its tree, its TMPDIR, agy's state
+# directory, and the keychain and caches agy needs; agy's settings, binaries
+# and built-in skills stay read-only, and so does everything else there (shell
+# startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
+AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache)
+AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
+agy_write_rules() {
+  [ "$LANE" = agy ] || return 0
+  local h s
+  h="$(cd "$AGY_HOME" && pwd -P)" || return 1
+  s="$h/.gemini/antigravity-cli"
+  printf '(deny file-write* (subpath "%s"))\n(allow file-write* %s (subpath "%s") (subpath "%s/Library/Keychains") (subpath "%s/Library/Caches"))\n(deny file-write* (literal "%s/settings.json") (literal "%s/installation_id") (subpath "%s/bin") (subpath "%s/builtin"))\n' \
+    "$h" "$1" "$s" "$h" "$h" "$s" "$s" "$s" "$s"
+}
+
+# agy remembers past conversations (brain, summaries, annotations) and reads
+# them back. Before each run, delete everything in its state directory except
+# the sign-in and install state, so nothing one ticket's agent left behind
+# reaches the next.
+agy_forget() {
+  local s="$AGY_HOME/.gemini/antigravity-cli"
+  # shellcheck disable=SC2016 # expanded by the lane user's shell
+  "${AGY_RUNAS[@]}" /bin/bash -c '
+    s="$1"; shift; keep=" "; cache_keep=" "
+    while [ "$1" != -- ]; do keep="$keep$1 "; shift; done; shift
+    for k in "$@"; do cache_keep="$cache_keep$k "; done
+    [ -d "$s" ] || exit 0
+    for e in "$s"/* "$s"/.[!.]*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      case "$keep" in *" ${e##*/} "*) continue ;; esac
+      rm -rf "$e" || exit 1
+    done
+    [ -d "$s/cache" ] || exit 0
+    for e in "$s"/cache/* "$s"/cache/.[!.]*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      case "$cache_keep" in *" ${e##*/} "*) continue ;; esac
+      rm -rf "$e" || exit 1
+    done' agy-forget "$s" "${AGY_STATE_KEEP[@]}" -- "${AGY_CACHE_KEEP[@]}"
+}
+
 # The agy lane: unlock the lane user's keychain (password on stdin to a shell
 # running as that user, never in this process's argv), then run agy as that
 # user in an emptied environment inside the sandbox, edits only. The runner,
@@ -175,10 +216,8 @@ agy_agent() {
   local profile
   AGENT_HOME="$AGY_HOME/tmp"
   "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
+  agy_forget || { echo "could not clear agy's memory of earlier runs" >&2; return 3; }
   profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
-  # shellcheck disable=SC2016 # expanded by the inner shell, as the lane user
-  printf '%s\n' "$API_KEY" | "${AGY_RUNAS[@]}" /bin/sh -c 'IFS= read -r p; exec security unlock-keychain -p "$p" "$1"' sh "$AGY_KEYCHAIN" ||
-    { echo "could not unlock the agy lane keychain" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
     LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
@@ -281,7 +320,8 @@ lane_ready() {
     command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
     "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
       { READY_REASON="cannot run $AGY_BIN as $AGY_USER"; return 1; }
-    agy_key
+    agy_key || return 1
+    agy_unlock
     return
   fi
   case "$LANE" in
@@ -308,6 +348,16 @@ agy_key() {
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
     --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
   [ -n "$API_KEY" ] || { READY_REASON="no keychain password readable at $(lane_var KEY_SSM)"; return 1; }
+}
+
+# Unlock the lane user's keychain (it locks again on reboot), only when a
+# brief is waiting. `security -i` reads its command from stdin, so the
+# password never appears in any process's argv. A keychain that will not
+# unlock makes the lane unavailable; its briefs wait.
+agy_unlock() {
+  compgen -G "$INBOX/*.md" > /dev/null || return 0
+  printf 'unlock-keychain -p %s %s\n' "$API_KEY" "$AGY_KEYCHAIN" | "${AGY_RUNAS[@]}" security -i > /dev/null 2>&1 ||
+    { READY_REASON="could not unlock the agy lane keychain $AGY_KEYCHAIN"; return 1; }
 }
 
 lane_extra_ready() {

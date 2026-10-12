@@ -144,16 +144,27 @@ exec "$@"
 # Fake security: records unlock-keychain calls and whether the password
 # matched $FAKE_KC_PW, never the password itself.
 FAKE_SECURITY = """#!/usr/bin/env bash
+# Interactive mode reads one command per line from stdin, so a password
+# never appears in argv; record whether argv carried one.
+if [ "$1" = -i ]; then IFS= read -r line; set -- $line; via=stdin; else via=argv; fi
 if [ "$1" = unlock-keychain ]; then
   if [ "$3" = "$FAKE_KC_PW" ]; then ok=pw-ok; else ok=pw-bad; fi
-  printf 'security unlock-keychain %s %s\\n' "$4" "$ok" >> "$FAKE_LOG"
+  printf 'security unlock-keychain %s %s via=%s\\n' "$4" "$ok" "$via" >> "$FAKE_LOG"
+  [ "$ok" = pw-ok ] || exit 51
 fi
 """
 
 # Fake agy: records its flags and working dir, then edits a file.
 FAKE_AGY = """#!/usr/bin/env bash
 args="$*"; args="${args//$'\\n'/ }"
-printf 'agy %s | cwd=%s home=%s\\n' "$args" "$PWD" "$HOME" >> "$TMPDIR/agy.log"
+G="$HOME/.gemini"
+# What a previous run left in agy's memory, and whether this run can plant
+# config that would steer the next one.
+if [ -e "$G/antigravity-cli/brain/planted.md" ]; then mem=leftover; else mem=clean; fi
+if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
+if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" >> "$TMPDIR/agy.log"
+mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
 echo fixed > fix.txt
 """
 
@@ -445,6 +456,16 @@ class LaneRunnerTest(unittest.TestCase):
         workdir = lane_home / "lanes"
         (lane_home / "tmp").mkdir(parents=True)
         workdir.mkdir()
+        # agy's real state: config, and memory a previous run left behind.
+        (lane_home / ".gemini" / "config").mkdir(parents=True)
+        (lane_home / ".gemini" / "config" / "mcp_config.json").write_text("{}")
+        (lane_home / ".gemini" / "antigravity-cli" / "brain").mkdir(parents=True)
+        (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
+        (lane_home / ".zshrc").write_text("# lane user shell\n")
+        (lane_home / ".gemini" / "antigravity-cli" / "installation_id").write_text("install-1")
+        (lane_home / ".gemini" / "antigravity-cli" / "cache").mkdir()
+        (lane_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json").write_text("{}")
+        (lane_home / ".gemini" / "antigravity-cli" / "cache" / "last_conversations.json").write_text("[]")
         agy = lane_home / "agy"
         self.write_tool(agy, FAKE_AGY)
         self.write_tool(self.bin / "security", FAKE_SECURITY)
@@ -462,9 +483,8 @@ class LaneRunnerTest(unittest.TestCase):
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
             FAKE_SECRET__k_kc="fake-kc-password",
-            FAKE_KC_PW="fake-kc-password",
             LOOM_AGY_MODEL=model,
-            **env,
+            **{"FAKE_KC_PW": "fake-kc-password", **env},
         )
         agy_log = lane_home / "tmp" / "agy.log"
         return inbox, workdir, result, (agy_log.read_text().splitlines() if agy_log.exists() else [])
@@ -476,14 +496,33 @@ class LaneRunnerTest(unittest.TestCase):
         calls = self.calls()
         unlocks = [i for i, c in enumerate(calls) if c.startswith("security unlock-keychain")]
         self.assertEqual(len(unlocks), 1, calls)
-        self.assertIn("loom.keychain-db pw-ok", calls[unlocks[0]])
+        self.assertIn("loom.keychain-db pw-ok via=stdin", calls[unlocks[0]])
         self.assertEqual(len(agy), 1, (calls, result.stderr))
         self.assertIn("-p # Brief: T042-fix-the-thing", agy[0])
         self.assertIn("--mode accept-edits", agy[0])
         self.assertIn("--model gemini-3.8-flash-high", agy[0])
         self.assertIn(f"cwd={workdir.resolve()}/T042-fix-the-thing", agy[0])
+        # Nothing from a previous run reaches this one, and this run cannot
+        # plant config or shell startup files for the next.
+        self.assertIn("mem=clean", agy[0])
+        self.assertIn("cfg=locked", agy[0])
+        self.assertIn("rc=locked", agy[0])
+        # Sign-in and install state survive the wipe; conversation lists do not.
+        state = workdir.parent / ".gemini" / "antigravity-cli"
+        self.assertEqual((state / "installation_id").read_text(), "install-1")
+        self.assertTrue((state / "cache" / "onboarding.json").exists())
+        self.assertFalse((state / "cache" / "last_conversations.json").exists())
         self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):
+        inbox, _, result, agy = self.agy_lane(FAKE_KC_PW="some-other-password")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "agy.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("unlock", beat["reason"])
 
     def test_agy_lane_is_unavailable_when_it_cannot_become_the_lane_user(self):
         inbox, _, result, agy = self.agy_lane(runas_ok=False)
