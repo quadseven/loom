@@ -38,6 +38,23 @@ not looked hard enough yet. Each tick the brain:
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.
 
+## Improving Loom itself
+
+Loom is a goal too (loom#30), and every brain works on it, not only on the
+project goals. Muse, the lane machine's tick and the operator's interactive
+session are peers here: each improves the brain and the factory, through
+tickets and pull requests like any other work.
+
+- Each tick, note in the journal what slowed the factory down: a lane PR
+  that failed for a reason the runner could catch, a step done by hand that
+  the station could do, a rule a brief kept missing, a check that wasted a
+  reply.
+- Every 2 hours, with the report, brief the single biggest such problem as a
+  ticket on loom#30 (or on the review bot's goal, quadseven/grug#1143, when
+  the review bot caused it), with the evidence. Skip it when a ticket for it
+  is already open; add the new evidence there instead.
+- Review the other brains' Loom pull requests like any lane PR.
+
 ## Tick
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
