@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import os
 import sys
@@ -46,8 +44,20 @@ class BrainTests(unittest.TestCase):
         report = brain.status(gh, [REPO], REPO)
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "SUCCESS", "1 unresolved threads"):
             self.assertIn(section, report)
-        # Project repo: issues, PRs, one GraphQL request. Lane repo: issues and comments.
-        self.assertLessEqual(gh.requests, 8)
+        # Project repo: issues, pulls, one GraphQL request; lane repo: issues
+        # (no loom:lanes issue here, so no comments read). The fake has no
+        # replies left, so any extra call fails the test.
+        self.assertEqual(gh.requests, 4)
+
+    def test_status_reads_lane_comments_with_one_more_request(self):
+        lanes_issue = {"number": 9, "title": "Loom lane status", "labels": [{"name": "loom:lanes"}]}
+        gh = GitHub("t", transport=Fake(
+            reply(200, []), reply(200, []),
+            reply(200, [lanes_issue]),
+            reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z"}])))
+        report = brain.status(gh, [REPO], REPO)
+        self.assertIn("| codex | yes |", report)
+        self.assertEqual(gh.requests, 4)
 
     def test_brief_refusals_create_nothing(self):
         cases = [

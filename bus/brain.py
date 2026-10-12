@@ -66,56 +66,79 @@ def _age(issue: Dict[str, Any], now: datetime) -> int:
     return max(0, int((now - created).total_seconds() // 3600))
 
 
+def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> List[str]:
+    lines = ["### Goals"]
+    for issue in goals:
+        node = data["goals"].get(int(issue["number"])) or {}
+        comments = (node.get("comments") or {}).get("nodes") or []
+        latest = [c.get("createdAt", "") for c in comments
+                  if JOURNAL_MARKER in c.get("body", "")]
+        lines.append("- #%s %s - latest journal %s" % (
+            issue["number"], issue.get("title", ""), max(latest) if latest else "none"))
+    return lines
+
+
+def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime) -> List[str]:
+    lines = ["### Tickets"]
+    for state in STATES:
+        lines.append("#### %s" % state)
+        for issue in tickets:
+            if "loom:" + state not in _labels(issue):
+                continue
+            lane = next((x for x in _labels(issue) if x.startswith("lane:")), "none")
+            lines.append("- #%s %s - %s - %dh" % (
+                issue["number"], issue.get("title", ""), lane, _age(issue, now)))
+    return lines
+
+
+def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]]) -> str:
+    node = node or {}
+    commits = (node.get("commits") or {}).get("nodes") or []
+    rollup = commits[-1].get("commit", {}).get("statusCheckRollup") if commits else None
+    threads = (node.get("reviewThreads") or {}).get("nodes") or []
+    unresolved = sum(1 for t in threads if not t.get("isResolved"))
+    return "- #%s %s - checks %s - %d unresolved threads" % (
+        pr["number"], pr.get("title", ""), (rollup or {}).get("state", "UNKNOWN"), unresolved)
+
+
+def _repo_section(gh: GitHub, repo: str, now: datetime) -> List[str]:
+    issues = _issues(gh, repo)
+    goals = [i for i in issues if "loom:goal" in _labels(i)]
+    tickets = [i for i in issues if "loom:ticket" in _labels(i)]
+    prs = [i for i in gh.paginate("/repos/%s/pulls?state=open" % repo)
+           if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
+    data = _graphql_status(gh, repo, prs, goals)
+    lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data) + [""]
+    lines += _ticket_lines(tickets, now) + ["", "### Pull requests"]
+    lines += [_pr_line(pr, data["prs"].get(int(pr["number"]))) for pr in prs]
+    lines += ["", "### Needs operator"]
+    lines += ["- #%s %s" % (i["number"], i.get("title", ""))
+              for i in issues if "needs-operator" in _labels(i)]
+    return lines
+
+
+def _lane_status(gh: GitHub, lanes_repo: str) -> str:
+    found = [i for i in _issues(gh, lanes_repo) if "loom:lanes" in _labels(i)]
+    if not found:
+        return "no lane status yet"
+    comments = gh.paginate("/repos/%s/issues/%s/comments" % (lanes_repo, found[0]["number"]))
+    marked = [c for c in comments if c.get("body", "").startswith(LANES_MARKER)]
+    if not marked:
+        return "no lane status yet"
+    return max(marked, key=lambda c: c.get("created_at", ""))["body"]
+
+
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom") -> str:
     now = datetime.now(timezone.utc)
     out: List[str] = ["# Loom status"]
     for repo in repos:
-        issues = _issues(gh, repo)
-        goals = [i for i in issues if "loom:goal" in _labels(i)]
-        tickets = [i for i in issues if "loom:ticket" in _labels(i)]
-        prs = [i for i in gh.paginate("/repos/%s/pulls?state=open" % repo)
-               if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
-        data = _graphql_status(gh, repo, prs, goals)
-        out.extend(["", "## %s" % repo, "", "### Goals"])
-        for issue in goals:
-            node = data["goals"].get(int(issue["number"])) or {}
-            comments = (node.get("comments") or {}).get("nodes") or []
-            latest = [c.get("createdAt", "") for c in comments if JOURNAL_MARKER in c.get("body", "")]
-            out.append("- #%s %s - latest journal %s" % (issue["number"], issue.get("title", ""), max(latest) if latest else "none"))
-        out.extend(["", "### Tickets"])
-        for state in STATES:
-            group = [i for i in tickets if "loom:" + state in _labels(i)]
-            out.append("#### %s" % state)
-            for issue in group:
-                lane = next((x for x in _labels(issue) if x.startswith("lane:")), "none")
-                out.append("- #%s %s - %s - %dh" % (issue["number"], issue.get("title", ""), lane, _age(issue, now)))
-        out.extend(["", "### Pull requests"])
-        for pr in prs:
-            node = data["prs"].get(int(pr["number"])) or {}
-            pull = node or {}
-            commits = (pull.get("commits") or {}).get("nodes") or []
-            rollup = commits[-1].get("commit", {}).get("statusCheckRollup") if commits else None
-            threads = (pull.get("reviewThreads") or {}).get("nodes") or []
-            unresolved = sum(1 for t in threads if not t.get("isResolved"))
-            out.append("- #%s %s - checks %s - %d unresolved threads" % (pr["number"], pr.get("title", ""), (rollup or {}).get("state", "UNKNOWN"), unresolved))
-        out.extend(["", "### Needs operator"])
-        for issue in issues:
-            if "needs-operator" in _labels(issue):
-                out.append("- #%s %s" % (issue["number"], issue.get("title", "")))
-    lanes_issues = [i for i in _issues(gh, lanes_repo) if "loom:lanes" in _labels(i)]
-    out.extend(["", "## Lane status"])
-    if lanes_issues:
-        comments = gh.paginate("/repos/%s/issues/%s/comments" % (lanes_repo, lanes_issues[0]["number"]))
-        marked = [c for c in comments if c.get("body", "").startswith(LANES_MARKER)]
-        out.append(max(marked, key=lambda c: c.get("created_at", ""))["body"] if marked else "no lane status yet")
-    else:
-        out.append("no lane status yet")
+        out += _repo_section(gh, repo, now)
+    out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
 
 
-def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
-          lane: Optional[str] = None, difficulty: Optional[str] = None,
-          model: Optional[str] = None, base: Optional[str] = None) -> str:
+def _check_brief_args(title: str, body: str, lane: Optional[str],
+                      model: Optional[str], base: Optional[str]) -> None:
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
     # The same patterns lanes/run_lane.sh applies, so a header line can never
@@ -128,6 +151,9 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         raise ValueError("title is one line")
     if any(section not in body for section in SECTIONS):
         raise ValueError("body must contain all required sections")
+
+
+def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
     try:
         goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
     except GitHubError as exc:
@@ -140,19 +166,26 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     count = sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i))
     if count >= 5:
         raise ValueError("goal already has 5 open tickets")
-    headers = []
-    if difficulty:
-        headers.append("Difficulty: " + difficulty)
-    if model:
-        headers.append("Model: " + model)
-    if base:
-        headers.append("Base: " + base)
-    full_body = ("\n".join(headers) + "\n\n" if headers else "") + body
+
+
+def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
+                 base: Optional[str]) -> str:
+    headers = ["%s: %s" % (k, v) for k, v in
+               (("Difficulty", difficulty), ("Model", model), ("Base", base)) if v]
+    return ("\n".join(headers) + "\n\n" if headers else "") + body
+
+
+def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
+          lane: Optional[str] = None, difficulty: Optional[str] = None,
+          model: Optional[str] = None, base: Optional[str] = None) -> str:
+    _check_brief_args(title, body, lane, model, base)
+    _check_goal_capacity(gh, repo, goal)
     names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
     if lane:
         names.append("lane:" + lane)
-    issue = gh.rest("POST", "/repos/%s/issues" % repo,
-                    {"title": title, "body": full_body, "labels": names}).data
+    issue = gh.rest("POST", "/repos/%s/issues" % repo, {
+        "title": title, "body": _ticket_body(body, difficulty, model, base),
+        "labels": names}).data
     gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
             {"sub_issue_id": issue["id"]})
     return str(issue.get("html_url", ""))
