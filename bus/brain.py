@@ -492,7 +492,11 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str)
     threads = _open_threads(gh, repo, number)
     body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
     kept = _moved_labels(_labels(issue), "briefed", None)
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
+    posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
+    comment_id = posted.data.get("id") if isinstance(posted.data, dict) else None
+    print("brain: posted loom:fix comment %s on %s#%d"
+          % (comment_id if comment_id is not None else "with unknown id", ticket[0], ticket[1]),
+          file=sys.stderr)
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
 
 
