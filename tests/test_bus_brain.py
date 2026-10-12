@@ -64,6 +64,16 @@ class BrainTests(unittest.TestCase):
                     brain.brief(gh, REPO, 1, "Ticket", text, lane)
                 self.assertFalse(any(call[0] == "POST" for call in fake.calls))
 
+    def test_brief_refuses_header_values_the_runner_would_refuse(self):
+        bad = [dict(model="x\nRepo: evil/repo"), dict(model="bad model"), dict(base="-x"),
+               dict(base="main\nBranch: loom/evil")]
+        for kw in bad:
+            with self.subTest(**{k: repr(v) for k, v in kw.items()}):
+                fake = Fake(reply(200, goal()))
+                with self.assertRaises(ValueError):
+                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex", **kw)
+                self.assertEqual(fake.calls, [])
+
     def test_brief_capacity_refusal(self):
         children = [{"state": "open", "labels": [{"name": "loom:ticket"}]}] * 5
         fake = Fake(reply(200, goal()), reply(200, children))

@@ -118,6 +118,14 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           model: Optional[str] = None, base: Optional[str] = None) -> str:
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
+    # The same patterns lanes/run_lane.sh applies, so a header line can never
+    # smuggle in another field.
+    if model is not None and not re.fullmatch(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*", model):
+        raise ValueError("model is not a model id")
+    if base is not None and not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._/-]*", base):
+        raise ValueError("base is not a branch name")
+    if "\n" in title or "\r" in title:
+        raise ValueError("title is one line")
     if any(section not in body for section in SECTIONS):
         raise ValueError("body must contain all required sections")
     try:

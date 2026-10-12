@@ -13,8 +13,8 @@
    then close the ticket.
 5. Re-brief failed tickets with a reason, or close them. Write new tickets
    with `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
-   Brief up to five open tickets per goal. Hard work never frees a lane. Give
-   unavailable lanes no work.
+   Brief up to five open tickets per goal. Never brief hard work to a free
+   lane (openrouter, zen, zai, workersai). Give unavailable lanes no work.
 6. Write the journal comment to the goal with
    `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`. Every two hours,
    write the five-line report the same way.
