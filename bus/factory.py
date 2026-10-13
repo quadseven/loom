@@ -552,11 +552,17 @@ class Factory:
             self._send_back(repo, full, issue, comments,
                             ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
-            if self._needs_test(repo, number, issue):
-                self._send_back(repo, full, issue, comments,
-                                "code changed without a test", no_test=True)
-            else:
-                self._land(repo, number, full, issue)
+            self._land_or_ask_test(repo, number, full, issue, comments)
+
+    def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
+        """Land a clean, reviewed pull request, or send it back when it
+        changes code without a test."""
+        if self._needs_test(repo, number, issue):
+            self._send_back(repo, full, issue, comments,
+                            "code changed without a test", no_test=True)
+        else:
+            self._land(repo, number, full, issue)
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
