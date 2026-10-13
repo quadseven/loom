@@ -28,6 +28,14 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
 - A pull request whose only fault is a failed Actions job gets that job run
   once more before it is sent back, since one flaky run should not cost a
   lane round.
+- The review bot replies "Fixed in <sha>" on a thread whose flagged code
+  changed, but GitHub does not let its app resolve threads, so the thread
+  stays open. Such a thread, with nobody writing after the bot's reply, is
+  resolved here before the pull request is judged; otherwise it would count
+  as a finding that survived the round (77 of 218 open threads on
+  2026-10-13 were the bot's own "Fixed in" threads).
+- A round where the lane made no change and explained why waits for the
+  review it asked for, up to REVIEW_GRACE, before the round is judged.
 - A failed ticket climbs the ladder, and so does a ticket left briefed for
   BRIEFED_STALL with no lane claiming it.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
@@ -67,6 +75,9 @@ REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
+# The review bot's login as GraphQL reports it (an app, without "[bot]").
+DEFAULT_REVIEW_BOT = "grug-tribe"
+BOT_FIXED_PREFIX = "Fixed in "
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The operator's ladder, 2026-10-12: "sonnet 5.5, or codex sol or opus 5.5
@@ -86,6 +97,14 @@ RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
 FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
 CLAIM_RE = re.compile(r"^Claimed for lane ")
+# bus/station.py's note when a fix round ended without a commit.
+NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved'
+                 ' root: comments(first:1) { nodes { author { __typename login } } }'
+                 ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
+RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
+                    ' { thread { isResolved } } }')
 ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
@@ -161,6 +180,44 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     return checks_failing and bool(FIX_CHECK_RE.search(last))
 
 
+def _by_bot(comment: Dict[str, Any], bot: str) -> bool:
+    """Written by the review bot's app; a person can take the same login
+    without "[bot]", so the author type must be Bot as well."""
+    author = comment.get("author") or {}
+    return (author.get("__typename") == "Bot"
+            and str(author.get("login") or "").lower() == bot.lower())
+
+
+def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
+    nodes = (thread.get(field) or {}).get("nodes") or [{}]
+    return nodes[index] or {}
+
+
+def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
+    """An open thread the review bot opened whose newest comment is its own
+    "Fixed in" reply. A thread a person opened, or any reply after the
+    bot's, stays open for a person or the brain."""
+    last = _end(thread, "comments", -1)
+    return (not thread.get("isResolved") and _by_bot(_end(thread, "root", 0), bot)
+            and _by_bot(last, bot)
+            and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
+
+
+def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
+    return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
+
+
+def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
+    """When the last fix round ended with no commit, 0 when it did not."""
+    for c in reversed(comments):
+        body = str(c.get("body") or "")
+        if body.startswith(FIX_MARKER):
+            return 0.0
+        if NO_CHANGE_RE.match(body):
+            return _ts(c.get("created_at"))
+    return 0.0
+
+
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
     return sum(1 for c in comments if str(c.get("body") or "").startswith(FIX_MARKER))
 
@@ -223,6 +280,7 @@ class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
                  review_check: str = DEFAULT_REVIEW_CHECK,
+                 review_bot: str = DEFAULT_REVIEW_BOT,
                  merge: Callable[..., Any] = brain.merge,
                  fix: Callable[..., Any] = brain.fix,
                  move: Callable[..., Any] = brain.move,
@@ -232,6 +290,7 @@ class Factory:
         self.now = now
         self.trusted = {t.lower() for t in trusted}
         self.review_check = review_check
+        self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
         self.limited = set(limited)
         self.actions = 0
@@ -284,7 +343,25 @@ class Factory:
              % (repo, number, self.review_check))
         return "unreviewed"
 
+    def _reviewed_since(self, sha: str, since: float) -> bool:
+        """Has the review check finished on this commit at or after `since`?"""
+        return any(r.get("name") == self.review_check and _ts(r.get("completed_at")) >= since
+                   for r in self._runs.get(sha, []))
+
     # -- writes ----------------------------------------------------------
+    def _resolve_bot_fixed(self, repo: str, number: int) -> None:
+        owner, name = repo.split("/", 1)
+        data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
+                                               "number": number}) or {}
+        threads = ((((data.get("repository") or {}).get("pullRequest") or {})
+                    .get("reviewThreads") or {}).get("nodes") or [])
+        picked = bot_fixed(threads, self.review_bot)
+        for thread_id in picked:
+            self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
+        if picked:
+            _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
+                 % (len(picked), repo, number))
+
     def _climb(self, repo: str, issue: Dict[str, Any], rung: int, why: str,
                head: str = "Repeatedly stuck") -> Optional[str]:
         """Put the ticket on `rung` (1-based): its Model: line and lane label,
@@ -362,12 +439,18 @@ class Factory:
         review = self._review_state(repo, number, sha, _ts(full.get("updated_at")))
         if review == "wait":
             return
+        comments = self._comments(repo, int(issue["number"]))
+        ended = no_change_at(comments)
+        if (ended and not self._reviewed_since(sha, ended)
+                and self.now - ended <= REVIEW_GRACE):
+            return  # the review the lane asked for has not answered yet
+        self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
         if faults == ["failing checks"] and self._run_again(repo, number, sha):
             return
         if faults:
-            self._send_back(repo, full, issue, self._comments(repo, int(issue["number"])),
+            self._send_back(repo, full, issue, comments,
                             ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
             self._land(repo, number, full, issue)
