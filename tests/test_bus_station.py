@@ -378,6 +378,14 @@ class ClaimTest(Base):
         self.assertEqual(self.listing(), ["example-owner.example-repo-7.md"])
         self.assertIn("loom:briefed", self.fake.names(5))
 
+    def test_a_regression_ticket_is_claimed_before_older_ordinary_ones(self):
+        self.fake.add(7, created="2030-01-01T00:00:00Z")
+        self.fake.add(9, created="2030-01-03T00:00:00Z")
+        self.fake.issues[9]["labels"].append({"name": "loom:regression"})
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+        self.assertIn("loom:briefed", self.fake.names(7))
+
     def test_a_retry_after_failure_gets_a_fresh_branch(self):
         self.fake.add(12)
         self.fake.comments[12].append({"body": "Claimed for lane codex (body sha256 0123456789ab)"})

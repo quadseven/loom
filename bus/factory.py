@@ -24,7 +24,7 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   update-branch), and lands only once its checks and review pass again on
   the new head. Each repo lands at most one pull request a pass, so the
   next one is checked against the base that includes it. Pull requests of
-  loom:urgent tickets land first, then the oldest.
+  loom:urgent and loom:regression tickets land first, then the oldest.
 - A pull request that changes a code file and no test file goes back to its
   lane asking for a test that fails without the change, instead of landing
   (north star 5: on 2026-10-13, 6 of 45 merged lane pull requests changed no
@@ -322,8 +322,9 @@ def held_until(issue: Dict[str, Any]) -> float:
 
 def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
                   linked: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Pull requests of loom:urgent tickets first, then the oldest."""
-    urgent = {n for n, issue in tickets.items() if "loom:urgent" in _labels(issue)}
+    """Pull requests of loom:urgent and loom:regression tickets first, then the oldest."""
+    urgent = {n for n, issue in tickets.items()
+              if {"loom:urgent", "loom:regression"} & set(_labels(issue))}
     ticket_of = {int(pr["number"]): n for n, pr in linked.items()}
     return sorted(prs, key=lambda p: (ticket_of.get(int(p["number"])) not in urgent,
                                       str(p.get("created_at") or "")))
