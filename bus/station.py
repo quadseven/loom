@@ -2198,29 +2198,32 @@ class Station:
         groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
             "merged", "verified", "sent_back", "failed", "aged_pr", "in_flight", "asks")}
         for issue in children:
-            if not isinstance(issue, dict):
-                continue
-            labels = {label.get("name") for label in issue.get("labels", [])}
-            updated = self._epoch(str(issue.get("updated_at") or ""))
-            recent = since is None or (updated is not None and updated >= since)
-            for label, group in (("loom:merged", "merged"),
-                                 ("loom:verified", "verified"),
-                                 ("loom:shipped", "sent_back")):
-                if label in labels and recent:
+            if isinstance(issue, dict):
+                for group in self._standup_groups_of(issue, since):
                     groups[group].append(issue)
-            if issue.get("state") != "open" or "loom:ticket" not in labels:
-                continue
-            if "loom:failed" in labels:
-                groups["failed"].append(issue)
-            if "loom:pr" in labels:
-                created = self._epoch(str(issue.get("created_at") or ""))
-                if created is not None and self.now - created > factory.STUCK_AGE:
-                    groups["aged_pr"].append(issue)
-            if labels.intersection(("loom:queued", "loom:briefed", "loom:running", "loom:pr")):
-                groups["in_flight"].append(issue)
-            if labels.intersection((NEEDS_OPERATOR, HUMAN)):
-                groups["asks"].append(issue)
         return groups
+
+    def _standup_groups_of(self, issue: Dict[str, Any], since: Optional[float]) -> List[str]:
+        """The standup headings one ticket belongs under."""
+        labels = {label.get("name") for label in issue.get("labels", [])}
+        updated = self._epoch(str(issue.get("updated_at") or ""))
+        recent = since is None or (updated is not None and updated >= since)
+        found = [group for label, group in (("loom:merged", "merged"),
+                                            ("loom:verified", "verified"),
+                                            ("loom:shipped", "sent_back"))
+                 if label in labels and recent]
+        if issue.get("state") != "open" or "loom:ticket" not in labels:
+            return found
+        created = self._epoch(str(issue.get("created_at") or ""))
+        aged = created is not None and self.now - created > factory.STUCK_AGE
+        for group, hit in (("failed", "loom:failed" in labels),
+                           ("aged_pr", "loom:pr" in labels and aged),
+                           ("in_flight", bool(labels & {"loom:queued", "loom:briefed",
+                                                        "loom:running", "loom:pr"})),
+                           ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):
+            if hit:
+                found.append(group)
+        return found
 
     @staticmethod
     def _standup_rows(items: List[Dict[str, Any]]) -> str:
