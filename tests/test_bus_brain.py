@@ -33,6 +33,13 @@ def goal():
     return {"number": 1, "id": 101, "state": "open", "title": "Goal", "labels": [{"name": "loom:goal"}]}
 
 
+def ready_node(checks="SUCCESS", reviews=(), threads=()):
+    """One pull request's READY_FIELDS, head committed at 12:45 on 2030-01-01."""
+    return {"commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:45:00Z",
+                                              "statusCheckRollup": {"state": checks}}}]},
+            "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
+
+
 class BrainTests(unittest.TestCase):
     def test_status_sections_and_request_ceiling(self):
         gh = GitHub("t", transport=Fake(
@@ -42,8 +49,8 @@ class BrainTests(unittest.TestCase):
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
             reply(200, []), reply(200, [])))
-        report = brain.status(gh, [REPO], REPO)
-        for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "SUCCESS", "1 unresolved threads"):
+        report = brain.status(gh, [REPO], REPO, env={})
+        for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request; lane repo: issues
         # (no loom:lanes issue here, so no comments read). The fake has no
@@ -56,9 +63,67 @@ class BrainTests(unittest.TestCase):
             reply(200, []), reply(200, []),
             reply(200, [lanes_issue]),
             reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z"}])))
-        report = brain.status(gh, [REPO], REPO)
+        report = brain.status(gh, [REPO], REPO, env={})
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
+
+    def test_merge_ready_names_each_blocker(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        cases = [
+            ({}, "blocked: checks unknown"),
+            (ready_node(), "READY"),
+            (ready_node(checks="FAILURE"), "blocked: checks failure"),
+            (ready_node(reviews=[{"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
+             "blocked: grug changes_requested"),
+            (ready_node(threads=[{"isResolved": False}] * 3), "blocked: 3 unresolved threads"),
+            # A resolved finding posted after the head commit has no fix-up commit.
+            (ready_node(threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T13:00:00Z"}]}}]),
+             "blocked: 1 grug findings with no fix-up commit after them"),
+            # A person with the bot's login is not the bot.
+            (ready_node(reviews=[{"author": {"__typename": "User", "login": "grug-tribe"}, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
+             "READY"),
+            (ready_node(checks="PENDING", threads=[{"isResolved": False}]), "blocked: checks pending, 1 unresolved threads"),
+        ]
+        for node, want in cases:
+            with self.subTest(want=want):
+                self.assertEqual(brain.merge_ready(node, "grug-tribe"), want)
+
+    def test_merge_ready_follows_the_newest_review_and_two_status_runs_agree(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        operator = {"__typename": "User", "login": "example-operator"}
+        node = ready_node(
+            reviews=[{"author": {"__typename": "Bot", "login": "GRUG-TRIBE"}, "state": "COMMENTED", "submittedAt": "2030-01-01T12:30:00Z"},
+                     {"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"},
+                     {"author": operator, "state": "COMMENTED", "submittedAt": "2030-01-01T11:37:00Z"},
+                     {"author": bot, "state": "COMMENTED", "submittedAt": "2030-01-01T12:00:00Z"},
+                     {"author": bot, "state": "PENDING", "submittedAt": None}],
+            threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T08:06:00Z"}]}},
+                     {"isResolved": True, "root": {"nodes": [{"author": operator, "createdAt": "2030-01-01T11:37:00Z"}]}}])
+        pulls = [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]
+
+        def run():
+            gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
+                                            reply(200, {"data": {"repository": {"p4": node}}}),
+                                            reply(200, [])))
+            return [line for line in brain.status(gh, [REPO], REPO, env={}).splitlines()
+                    if line.startswith("- #4 ")]
+
+        first, second = run(), run()
+        self.assertEqual(first, ["- #4 PR - READY"])
+        self.assertEqual(first, second)
+        # Had the stale review been the newest, the same data would block.
+        node["reviews"]["nodes"][0]["state"] = "CHANGES_REQUESTED"
+        self.assertEqual(run(), ["- #4 PR - blocked: grug changes_requested"])
+
+    def test_status_asks_for_every_field_merge_ready_reads(self):
+        fake = Fake(reply(200, []), reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
+                    reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []))
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        self.assertIn("- #4 PR - blocked: checks unknown", report)
+        query = fake.calls[2][2]["query"]
+        for field in ("committedDate", "statusCheckRollup", "reviews(last:100)", "submittedAt",
+                      "reviewThreads(first:100)", "isResolved", "createdAt", "__typename"):
+            self.assertIn(field, query)
 
     def test_brief_refusals_create_nothing(self):
         cases = [
@@ -512,6 +577,260 @@ class ProofTests(unittest.TestCase):
                          ["The probe logs one line per request.", "p95 latency drops below 200 ms."])
         self.assertEqual(proof.contract(TICKET_BODY), proof.contract(UNCHECKED))
 
+class Routed:
+    """A transport answering by method and URL suffix, recording every call."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        path = url.split("api.github.com")[1]
+        self.calls.append((method, path, json.loads(body) if body else None))
+        for (m, suffix), answer in self.routes.items():
+            if m == method and path.split("?")[0].endswith(suffix):
+                return answer
+        if method == "POST" and "/graphql" in path:
+            return reply(200, {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}})
+        return reply(200, [] if method == "GET" else {})
+
+    def sent(self, method, suffix):
+        return [c[2] for c in self.calls if c[0] == method and c[1].split("?")[0].endswith(suffix)]
+
+
+class ModelFlagTests(unittest.TestCase):
+    def test_with_model_rewrites_or_inserts_the_line(self):
+        self.assertEqual(brain._with_model("Difficulty: hard\nModel: old\n\n" + BODY, "new-1"),
+                         "Difficulty: hard\nModel: new-1\n\n" + BODY)
+        self.assertEqual(brain._with_model("Difficulty: hard\n\n" + BODY, "new-1"),
+                         "Difficulty: hard\nModel: new-1\n\n" + BODY)
+        self.assertEqual(brain._with_model(BODY, "new-1"), "Model: new-1\n\n" + BODY)
+        # A body line that merely starts with Model: is not a header.
+        self.assertTrue(brain._with_model("x\nModel: old", "new-1").startswith("Model: new-1\n\nx"))
+
+    def test_move_model_rewrites_the_body_before_the_labels(self):
+        issue = {"state": "open", "body": "Model: old\n\n" + BODY,
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}, {"name": "lane:claude"}]}
+        fake = Fake(reply(200, issue), reply(200, {}), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "codex", model="gpt-6-sol")
+        self.assertEqual([c[0] for c in fake.calls], ["GET", "PATCH", "PUT"])
+        self.assertEqual(fake.calls[1][2], {"body": "Model: gpt-6-sol\n\n" + BODY})
+        self.assertEqual(fake.calls[2][2], {"labels": ["loom:ticket", "loom:briefed", "lane:codex"]})
+
+    def test_move_model_refusals(self):
+        for state, model in (("failed", "gpt-6-sol"), ("briefed", "bad model"), ("briefed", "x\nRepo: a/b")):
+            fake = Fake()
+            with self.assertRaises(ValueError):
+                brain.move(GitHub("t", transport=fake), REPO, 8, state, model=model)
+            self.assertEqual(fake.calls, [])
+
+    def test_fix_model_and_lane_rewrite_the_body_and_swap_the_lane(self):
+        ticket = dict(fix_ticket(), body=BODY)
+        fake = Routed({("GET", "/pulls/8"): reply(200, fix_pr()), ("GET", "/issues/9"): reply(200, ticket),
+                       ("POST", "/issues/9/comments"): reply(201, {"id": 5})})
+        brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "Notes.", "claude", "claude-opus-5-5")
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: claude-opus-5-5\n\n" + BODY}])
+        self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
+                         [{"labels": ["loom:ticket", "custom", "loom:briefed", "lane:claude"]}])
+        order = [c[0] for c in fake.calls if c[0] in ("PATCH", "PUT")]
+        self.assertEqual(order, ["PATCH", "PUT"])
+
+    def test_fix_refuses_an_unknown_lane_or_bad_model(self):
+        for kw in (dict(lane="bogus"), dict(model="bad model")):
+            fake = Fake()
+            with self.assertRaises(ValueError):
+                brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "n", **kw)
+            self.assertEqual(fake.calls, [])
+
+
+LANE_TABLE = "<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n|---|---|---|\n%s"
+
+
+def lanes_routes(free):
+    rows = "\n".join("| %s | %s | - |" % (lane, "yes" if lane in free else "no")
+                     for lane in ("claude", "codex", "codex-2", "anthropic", "anthropic-2"))
+    return {("GET", "/repos/quadseven/loom/issues"): reply(200, [{"number": 99, "labels": [{"name": "loom:lanes"}]}]),
+            ("GET", "/issues/99/comments"): reply(200, [{"body": LANE_TABLE % rows, "created_at": "2030-01-01T00:00:00Z"}])}
+
+
+def event(kind, label, at):
+    return {"event": kind, "label": {"name": label}, "created_at": at}
+
+
+def claim(at, lane="claude"):
+    return {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane, "created_at": at}
+
+
+def fixc(at):
+    return {"body": "<!-- loom:fix v1 -->\nPull request: %s#8, branch loom/9-work\n" % REPO, "created_at": at}
+
+
+def stuck_ticket(*states, body="Model: claude-sonnet-5-5\n\n" + BODY, created="2030-01-01T00:00:00Z"):
+    names = ["loom:ticket", "lane:claude"] + ["loom:" + x for x in states]
+    return {"number": 9, "state": "open", "title": "T", "body": body, "created_at": created,
+            "labels": [{"name": n} for n in names]}
+
+
+NOW = "2030-01-01T01:00:00Z"
+OLD = "2020-01-01T00:00:00Z"
+
+
+def ticket_routes(issue, events, comments, free=("claude", "codex", "codex-2")):
+    routes = lanes_routes(free)
+    routes.update({("GET", "/repos/%s/issues/9" % REPO): reply(200, issue),
+                   ("GET", "/issues/9/events"): reply(200, events),
+                   ("GET", "/issues/9/comments"): reply(200, comments),
+                   ("GET", "/repos/%s/pulls" % REPO): reply(200, [dict(fix_pr(), number=8)]),
+                   ("GET", "/pulls/8"): reply(200, fix_pr())})
+    return routes
+
+
+TWICE = [event("labeled", "loom:failed", "2030-01-01T00:10:00Z"),
+         event("labeled", "loom:failed", "2030-01-01T00:40:00Z")]
+
+
+class EscalateTests(unittest.TestCase):
+    def run_escalate(self, routes):
+        fake = Routed(routes)
+        gh = GitHub("t", transport=fake)
+        return fake, brain.escalate(gh, REPO, 9)
+
+    def stuck_cases(self):
+        sonnet_claim = [claim("2030-01-01T00:11:00Z")]
+        return {
+            "failed twice": (TWICE, sonnet_claim, "failed"),
+            "two fix rounds": ([], [fixc("2030-01-01T00:20:00Z"), fixc("2030-01-01T00:30:00Z")], "pr"),
+            "briefed unclaimed 2h twice": ([event("labeled", "loom:briefed", "2020-01-01T00:00:00Z"),
+                                            event("unlabeled", "loom:briefed", "2020-01-02T00:00:00Z"),
+                                            event("labeled", "loom:briefed", "2020-01-03T00:00:00Z")], [], "briefed"),
+            "failed for 6 hours": ([event("labeled", "loom:failed", OLD)], [], "failed"),
+        }
+
+    def test_status_marks_each_kind_of_repeatedly_stuck_ticket(self):
+        for name, (events, comments, state) in self.stuck_cases().items():
+            with self.subTest(name):
+                routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [stuck_ticket(state)]),
+                    ("GET", "/issues/9/events"): reply(200, events),
+                    ("GET", "/issues/9/comments"): reply(200, comments)}
+                routes.update(lanes_routes(()))
+                routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [])
+                report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO)
+                self.assertIn("REPEATEDLY STUCK", report)
+                self.assertIn("next rung", report)
+
+    def test_status_leaves_an_ordinary_ticket_unmarked(self):
+        issue = dict(stuck_ticket("failed"), created_at="2030-01-01T00:00:00Z")
+        issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:failed"}]
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [issue]),
+                  ("GET", "/issues/9/events"): reply(200, [event("labeled", "loom:failed", "2999-01-01T00:00:00Z")]),
+                  ("GET", "/issues/9/comments"): reply(200, []),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
+        routes.update(lanes_routes(()))
+        self.assertNotIn("REPEATEDLY STUCK", brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO))
+
+    def test_status_shows_attempts_and_the_next_rung(self):
+        issue = stuck_ticket("failed")
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [issue]),
+                  ("GET", "/issues/9/events"): reply(200, TWICE),
+                  ("GET", "/issues/9/comments"): reply(200, [claim("2030-01-01T00:11:00Z"), fixc("2030-01-01T00:50:00Z")]),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO)
+        self.assertIn("failed 2 times", report)
+        self.assertIn("attempts 3", report)
+        self.assertIn("tried claude-sonnet-5-5", report)
+        self.assertIn("next rung 2 gpt-6-sol", report)
+
+    def test_status_reads_at_most_the_capped_number_of_histories(self):
+        older = dict(stuck_ticket("failed"), updated_at="2030-01-01T00:00:00Z")
+        newer = dict(stuck_ticket("failed"), number=10, updated_at="2030-01-02T00:00:00Z")
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [newer, older]),
+                  ("GET", "/issues/9/events"): reply(200, TWICE),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
+        routes.update(lanes_routes(()))
+        fake = Routed(routes)
+        with unittest.mock.patch.object(brain, "STATUS_HISTORY_MAX", 1):
+            report = brain.status(GitHub("t", transport=fake), [REPO], REPO)
+        read = sorted(c[1].split("?")[0] for c in fake.calls
+                      if c[1].split("?")[0].endswith(("/events", "/comments")) and "/issues/99/" not in c[1])
+        self.assertEqual(read, ["/repos/%s/issues/9/comments" % REPO, "/repos/%s/issues/9/events" % REPO])
+        line = {l.split(" ")[1]: l for l in report.splitlines() if l.startswith("- #")}
+        self.assertIn("REPEATEDLY STUCK", line["#9"])
+        self.assertIn("not checked for stuck (status reads 1 histories)", line["#10"])
+
+    def test_escalate_moves_a_failed_ticket_to_the_next_rung(self):
+        fake, outcome = self.run_escalate(ticket_routes(
+            stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")]))
+        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
+        self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
+                         [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("rung 2 of 3", note)
+        self.assertIn("failed 2 times", note)
+        self.assertIn("Rung: 2 gpt-6-sol codex", note)
+
+    def test_escalate_skips_a_busy_lane_for_a_higher_rung(self):
+        fake, outcome = self.run_escalate(ticket_routes(
+            stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=("claude", "anthropic-2")))
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: claude-opus-5-5\n\n" + BODY}])
+
+    def test_escalate_uses_the_codex_standin_and_anthropic_slot(self):
+        _, outcome = self.run_escalate(ticket_routes(
+            stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=("codex-2",)))
+        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex-2")
+        history = [claim("2030-01-01T00:11:00Z"), claim("2030-01-01T00:30:00Z", "codex")]
+        _, outcome = self.run_escalate(ticket_routes(
+            stuck_ticket("failed", body="Model: gpt-6-sol\n\n" + BODY), TWICE, history, free=("anthropic-2",)))
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on anthropic-2")
+
+    def test_escalate_refuses_when_no_untried_rung_has_a_free_lane(self):
+        fake = Routed(ticket_routes(stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=()))
+        with self.assertRaises(ValueError):
+            brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertFalse(fake.sent("PUT", "/issues/9/labels"))
+
+    def test_escalate_sends_an_open_pull_request_back_as_a_fix_brief(self):
+        issue = stuck_ticket("pr")
+        fake, outcome = self.run_escalate(ticket_routes(
+            issue, [], [fixc("2030-01-01T00:20:00Z"), claim("2030-01-01T00:25:00Z"), fixc("2030-01-01T00:30:00Z")]))
+        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
+        comments = [b["body"] for b in fake.sent("POST", "/issues/9/comments")]
+        self.assertTrue(comments[0].startswith("<!-- loom:fix v1 -->\nPull request: %s#8, branch loom/9-work" % REPO))
+        self.assertTrue(comments[1].startswith("<!-- loom:escalate v1 -->"))
+        self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
+                         [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
+
+    def test_escalate_refuses_a_ticket_that_is_not_repeatedly_stuck(self):
+        issue = dict(stuck_ticket("failed"), created_at="2999-01-01T00:00:00Z")
+        fake = Routed(ticket_routes(issue, [event("labeled", "loom:failed", "2999-01-01T00:00:00Z")], []))
+        with self.assertRaises(ValueError) as caught:
+            brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertIn("not repeatedly stuck", str(caught.exception))
+        self.assertFalse([c for c in fake.calls if c[0] in ("PUT", "PATCH") or c[0] == "POST"])
+
+    def test_escalate_past_the_third_rung_adds_needs_brain(self):
+        history = [claim("2030-01-01T00:11:00Z"), claim("2030-01-01T00:20:00Z", "codex"),
+                   {"body": "<!-- loom:escalate v1 -->\nRung: 3 claude-opus-5-5 claude", "created_at": "2030-01-01T00:30:00Z"},
+                   claim("2030-01-01T00:31:00Z")]
+        issue = stuck_ticket("failed", body="Model: claude-opus-5-5\n\n" + BODY)
+        fake, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
+        self.assertEqual(outcome, "needs-brain")
+        self.assertIn("needs-brain", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
+        self.assertFalse(fake.sent("PATCH", "/issues/9"))
+
+    def test_escalate_tracks_the_rewritten_model_per_claim(self):
+        # Sonnet claimed, escalated to codex and claimed again: the next rung is the last.
+        history = [claim("2030-01-01T00:11:00Z"),
+                   {"body": "<!-- loom:escalate v1 -->\nRung: 2 gpt-6-sol codex", "created_at": "2030-01-01T00:20:00Z"},
+                   claim("2030-01-01T00:21:00Z", "codex")]
+        issue = stuck_ticket("failed", body="Model: gpt-6-sol\n\n" + BODY)
+        _, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
+
+
 
 def item(number, body=BODY, labels=(), **extra):
     out = {"number": number, "id": 1000 + number, "state": "open", "body": body,
@@ -849,6 +1168,156 @@ class OnboardTests(unittest.TestCase):
             self.assertEqual(brain.main(["onboard", REPO]), 0)
         printed = "".join(c.args[0] for c in out.write.call_args_list)
         self.assertIn('LOOM_REPOS="%s"' % REPO, printed)
+
+
+class GoalRepo:
+    """Goal #1 and its tickets on GitHub: remembers issues, labels, bodies,
+    sub-issue links and comments written to it."""
+
+    def __init__(self, tickets=()):
+        self.issues = {1: goal()}
+        self.children = []
+        self.comments = []
+        self.calls = []
+        for t in tickets:
+            self.issues[t["number"]] = t
+            self.children.append(t["number"])
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1].split("?")[0][len("/repos/%s/issues" % REPO):]
+        self.calls.append((method, path, payload))
+        parts = path.strip("/").split("/")
+        number = int(parts[0]) if parts[0] else None
+        handler = getattr(self, "_%s_%s" % (method.lower(), parts[1] if len(parts) > 1 else "issue"))
+        return handler(number, payload)
+
+    def _get_issue(self, number, payload):
+        found = self.issues.get(number)
+        return reply(200, found) if found else reply(404, {"message": "Not Found"})
+
+    def _get_sub_issues(self, number, payload):
+        return reply(200, [self.issues[n] for n in self.children])
+
+    def _post_issue(self, number, payload):
+        made = 200 + len(self.issues)
+        self.issues[made] = dict(item(made, payload["body"], payload["labels"]),
+                                 html_url="https://example.com/t/%d" % made)
+        return reply(201, self.issues[made])
+
+    def _post_sub_issues(self, number, payload):
+        self.children.append(payload["sub_issue_id"] - 1000)
+        return reply(201, {})
+
+    def _patch_issue(self, number, payload):
+        self.issues[number]["body"] = payload["body"]
+        return reply(200, self.issues[number])
+
+    def _put_labels(self, number, payload):
+        self.issues[number]["labels"] = [{"name": n} for n in payload["labels"]]
+        return reply(200, [])
+
+    def _post_comments(self, number, payload):
+        self.comments.append((number, payload["body"]))
+        return reply(201, {})
+
+    def names(self, number):
+        return [x["name"] for x in self.issues[number]["labels"]]
+
+    def created(self):
+        return [c for c in self.calls if c[0] == "POST" and c[1] == ""]
+
+
+def evidenced(number, evidence="p95 claim wait rose from 40 s to 900 s after it shipped"):
+    return BODY.replace("## Why\nwhy", "## Why\nRegresses #%d\n%s" % (number, evidence))
+
+
+class RegressionSlotTests(unittest.TestCase):
+    ORDINARY = ["queued", "briefed", "running", "pr"] * 4
+
+    def full_goal(self, *extra):
+        flying = [item(10 + i, labels=["loom:ticket", "loom:" + s])
+                  for i, s in enumerate(self.ORDINARY)]
+        return GoalRepo(flying + list(extra))
+
+    def brief(self, fake, body=BODY, **kw):
+        return brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", body, "codex", **kw)
+
+    def test_a_full_goal_admits_one_shipped_regression_and_refuses_ordinary_work(self):
+        fake = self.full_goal(item(5, labels=["loom:ticket", "loom:shipped", "lane:claude"],
+                                   html_url="https://example.com/t/5"))
+        with self.assertRaisesRegex(ValueError, "16 tickets in flight"):
+            self.brief(fake)
+        url = self.brief(fake, evidenced(5), regresses=5)
+        # The shipped ticket itself is re-briefed: no new issue.
+        self.assertEqual(url, "https://example.com/t/5")
+        self.assertEqual(fake.created(), [])
+        self.assertEqual(sorted(fake.names(5)),
+                         ["lane:codex", "loom:briefed", "loom:regression", "loom:ticket"])
+        self.assertIn("## Regression\n\nTicket\n\nRegresses #5\np95 claim wait",
+                      fake.issues[5]["body"])
+        self.assertEqual(len(fake.comments), 1)
+        on, note = fake.comments[0]
+        self.assertEqual(on, 1)
+        self.assertIn(brain.REGRESSION_MARKER, note)
+        self.assertIn("through the regression slot, with 16 other tickets in flight (cap 16)", note)
+        self.assertIn("p95 claim wait", note)
+        with self.assertRaisesRegex(ValueError, "17 tickets in flight"):
+            self.brief(fake)
+
+    def test_the_same_regression_twice_is_admitted_once_and_the_slot_holds_one(self):
+        fake = self.full_goal(
+            item(5, state="closed", state_reason="completed", labels=["loom:ticket", "loom:verified"]),
+            item(6, labels=["loom:ticket", "loom:shipped"]))
+        first = self.brief(fake, evidenced(5), regresses=5)
+        again = self.brief(fake, evidenced(5, "measured again"), regresses=5)
+        self.assertEqual(first, again)
+        self.assertEqual(len(fake.created()), 1)
+        made = fake.created()[0][2]
+        self.assertIn("loom:regression", made["labels"])
+        self.assertEqual(len(fake.comments), 1)
+        # The slot is held: another regression and ordinary work both wait.
+        with self.assertRaisesRegex(ValueError, "slot is held by #2[0-9]+, with 16 other "
+                                                "tickets in flight \\(cap 16\\)"):
+            self.brief(fake, evidenced(6), regresses=6)
+        with self.assertRaisesRegex(ValueError, "17 tickets in flight"):
+            self.brief(fake)
+        self.assertEqual(len(fake.created()), 1)
+
+    def test_under_the_cap_a_regression_is_labelled_and_records_nothing(self):
+        fake = GoalRepo([item(5, labels=["loom:ticket", "loom:verified"])])
+        self.brief(fake, evidenced(5), regresses=5)
+        self.assertIn("loom:regression", fake.names(5))
+        self.assertEqual(fake.comments, [])
+
+    def test_refusals_write_nothing(self):
+        cases = [
+            (99, evidenced(99), "#99: ticket not found"),
+            (5, evidenced(5), "closed as not planned"),
+            (6, evidenced(6), "only a shipped or verified ticket can regress"),
+            (7, evidenced(7), "#7 is not a loom:ticket"),
+            (8, BODY.replace("## Why\nwhy", "## Why\nRegresses #8\n"), "measured evidence"),
+            (8, BODY, "has the line Regresses #8"),
+        ]
+        for number, body, why in cases:
+            with self.subTest(why=why):
+                fake = self.full_goal(
+                    item(5, state="closed", state_reason="not_planned", labels=["loom:ticket"]),
+                    item(6, labels=["loom:ticket", "loom:pr"]),
+                    item(7, labels=["loom:shipped"]),
+                    item(8, labels=["loom:ticket", "loom:shipped"]))
+                with self.assertRaisesRegex(ValueError, why):
+                    self.brief(fake, body, regresses=number)
+                self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_refs_and_regresses_do_not_go_together(self):
+        with self.assertRaisesRegex(ValueError, "not both"):
+            self.brief(GoalRepo(), evidenced(5), regresses=5, refs=6)
+
+    def test_the_command_line_takes_regresses(self):
+        args = brain.parser().parse_args(["brief", REPO, "--goal", "1", "--title", "T",
+                                          "--file", "b.md", "--regresses", "5"])
+        self.assertEqual(args.regresses, 5)
 
 
 if __name__ == "__main__":

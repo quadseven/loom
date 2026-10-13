@@ -27,6 +27,8 @@
 # in the PR), LOOM_<LANE>_KEY_SSM (API lanes: the SSM parameter holding the
 # provider key, read at run time; never stored in this repo; zen needs none),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
+# LOOM_SKILL_DIRS (colon-separated skill folders the sandboxed lanes get a
+# snapshot of; default ~/.agents/skills:~/.claude/skills),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
@@ -48,6 +50,7 @@ INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
 mkdir -p "$INBOX/done" "$INBOX/failed" "$LOOM_HOME/run"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # The process groups in the tree under pid $1: the agent's job-control
 # subshell and everything below it. `timeout` puts itself in a group of its
@@ -224,6 +227,15 @@ post_replies() {
   rm -f "$REPLIES_FILE"
 }
 
+# Reconcile the generated title/body sections of an existing PR with the
+# approved ticket revision in the brief, preserving reviewer-authored text
+# outside those sections. Scope changes are logged with old/new body hashes.
+# Exit: 0 = updated, 1 = no change needed, 2 = refused, 3 = gh/helper error.
+repair_pr_text() {
+  NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
+    --apply "$FIX_PR" --repo "$REPO" "$BRIEF" "$LANE" "$MODEL" "$TICKET"
+}
+
 # A run that did not end in a PR: say why, park the brief, never retry it.
 # The orchestrator reads failed/ and re-briefs by hand.
 park() {
@@ -234,8 +246,9 @@ park() {
 
 # Seatbelt profile for API-lane agents: no reads or writes anywhere under the
 # real HOME except the worktree, the scratch home and the directory holding
-# the CLI's binary. Inside the worktree, .git stays readable (git diff and git
-# log need it; a fresh clone holds no credentials) but not writable: a planted
+# the CLI's binary, plus read-only access to the skill snapshot. Inside the
+# worktree, .git stays readable (git diff and git log need it; a fresh clone
+# holds no credentials) but not writable: a planted
 # hook or config would run when the runner commits. Also no keychain, no Unix
 # sockets except DNS (an SSH agent's socket would hand over its keys), and no
 # AppleEvents, LaunchServices, osascript, open, launchctl, sudo or su (each can
@@ -248,14 +261,15 @@ sandbox_profile() {
   # only keychain is its own. Every other lane is denied it.
   local keychain_deny='(global-name "com.apple.SecurityServer") '
   [ "$LANE" = agy ] && keychain_deny=""
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" skills="" skills_rules=""
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
+  [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
   cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
   cli_root="$(dirname "$cli_real")"
   # Paths go into the profile's string grammar: refuse any that could close it.
-  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME"; do
+  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$skills"; do
     # shellcheck disable=SC1003 # matching a literal backslash
     case "$p" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
   done
@@ -263,7 +277,11 @@ sandbox_profile() {
   case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
   allow_rw="(subpath \"$tree\") (subpath \"$(cd "$AGENT_HOME" && pwd -P)\")"
   allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")"
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link"; do
+  # The skill snapshot: readable, never writable, wherever LOOM_HOME lives.
+  [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
+(deny file-write* (subpath \"$skills\"))
+"
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"}; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
       meta="$meta (literal \"$p\")"
@@ -271,8 +289,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$(agy_write_rules "$allow_rw")" "$tree" "$allow_ro" "$meta" "$keychain_deny"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
+    "$home" "$allow_rw" "$(agy_write_rules "$allow_rw")" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -348,30 +366,66 @@ agy_forget() {
     done' agy-forget "$s" "${AGY_STATE_KEEP[@]}" -- "${AGY_CACHE_KEEP[@]}"
 }
 
+# agy's CLI settings (settings.json in its state directory, which the sandbox
+# keeps read-only) hold its permission rules. Print mode cannot prompt, so a
+# tool no rule allows is denied and the run ends with no output. Before every
+# run the runner rewrites the file as the lane user from lanes/agy/settings.json:
+# shell commands and the file tools allowed, web fetching denied. Only
+# trustedWorkspaces, the operator's one-time sign-in choice, is carried over
+# from the old file; any other key is dropped. After the run it writes back
+# exactly what it wrote before, so nothing a run did to the file survives.
+# The text travels on stdin (the lane user cannot read this checkout), and a
+# link left in place of the scratch file is removed, never written through.
+# Usage: agy_settings merge|keep < text; prints what it wrote.
+AGY_SETTINGS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/agy/settings.json"
+agy_settings() {
+  # shellcheck disable=SC2016 # expanded by the lane user's shell
+  "${AGY_RUNAS[@]}" /bin/bash -c '
+    s="$1"; f="$s/settings.json"; t="$s/.settings.json.new"
+    mkdir -p "$s" && rm -f "$t" || exit 1
+    (set -C; cat > "$t") || exit 1
+    if [ "$2" = merge ] && [ -f "$f" ] && [ ! -L "$f" ] &&
+      tw="$(plutil -extract trustedWorkspaces json -o - "$f" 2> /dev/null)"; then
+      plutil -replace trustedWorkspaces -json "$tw" "$t" || exit 1
+    fi
+    mv -f "$t" "$f" && cat "$f"' agy-settings "$AGY_HOME/.gemini/antigravity-cli" "$1"
+}
+
 # agy stores its token so that /usr/bin/security may read it without a
 # prompt, and agy itself reads it that way, so the sandbox cannot forbid that
-# tool. Any shell command the agent ran could therefore copy the token out.
-# The lane stays edits-only (never --dangerously-skip-permissions): print mode
-# soft-denies shell commands, and a denied command ends the run with no
-# output, so the brief says so up front. Slash commands and skills stay off.
-AGY_TOOLS_NOTE="Tools on this lane: shell commands are not available here, and asking for one ends the run. Read files with your file viewing and search tools, and change them with your edit tools only."
+# tool, and a shell command could read the token. The settings deny commands
+# that start with security, a speed bump rather than a wall. The lane never
+# passes --dangerously-skip-permissions. Slash commands and skill expansion in
+# the prompt stay off; the agent can still load a skill it decides to use.
+AGY_TOOLS_NOTE="Tools on this lane: run the repo's tests and lint with your shell tool, as the brief asks, and edit files only inside this tree. Web fetching is not available here."
 
 # The agy lane: unlock the lane user's keychain (password on stdin to a shell
 # running as that user, never in this process's argv), then run agy as that
-# user in an emptied environment inside the sandbox, edits only. The runner,
+# user in an emptied environment inside the sandbox. The runner,
 # as this user, commits, pushes and opens the PR from the shared tree.
 agy_agent() {
-  local profile
+  local profile settings
   AGENT_HOME="$AGY_HOME/tmp"
   "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
   agy_forget || { echo "could not clear agy's memory of earlier runs" >&2; return 3; }
+  agy_skills
+  [ -f "$AGY_SETTINGS" ] || { echo "missing $AGY_SETTINGS" >&2; return 3; }
+  # Build the sandbox first: a run that stops here never wrote the settings,
+  # and once they are written nothing may fail before agy runs and the
+  # restore below follows.
   profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
+  settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
     LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
     "$AGY_BIN" -p "$1
 
 $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
+  local rc=$?
+  # A failed restore must fail the run, even if agy itself succeeded. Only the
+  # copy of the file that agy_settings prints goes to /dev/null, not its status.
+  printf '%s\n' "$settings" | agy_settings keep > /dev/null || { echo "could not restore agy's settings" >&2; return 3; }
+  return "$rc"
 }
 
 # The spark lane: a vLLM coder on a machine of the operator's own, serving
@@ -399,6 +453,23 @@ spark_probe() {
   [ "$status" -eq 0 ] && return 0
   READY_REASON="the spark endpoint did not answer (curl exit $status)"
   return 2
+}
+
+# A provider that refused this run for a usage, rate or credit limit, read
+# from the run's own last lines of output. Sets LIMIT_WHY. On 2026-10-13 a
+# codex usage limit read as "agent exited 1" on 21 runs, each costing its
+# ticket a rung of the model ladder and keeping the lane advertised as up.
+# Only the last few non-empty lines count, where the CLIs print the error
+# they exit on: text the model wrote earlier in the run cannot pause a lane.
+# A run that fakes one pauses its own lane for LIMIT_HOLD at most and hands
+# its brief to another lane, which is all a match does.
+LIMIT_LINE_RE='^(error|api error)\b.*(usage limit|rate[ _-]?limit|credit balance|quota|too many requests|overloaded)|usage limit reached|[0-9]+-hour limit reached'
+provider_limit() {
+  local line
+  line="$(tail -c +"$(( ${LOG_START:-0} + 1 ))" "$LOG" 2>/dev/null | grep -v '^[[:space:]]*$' |
+    tail -n 5 | grep -iE "$LIMIT_LINE_RE" | tail -n 1)"
+  [ -n "$line" ] || return 1
+  LIMIT_WHY="lane $SLOT's provider reported a usage or rate limit"
 }
 
 # Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
@@ -490,9 +561,89 @@ archive_transcripts() {
 # A fresh scratch home for every API-lane run. The agent can write inside it,
 # so anything left there (a link into the real HOME, say) must never meet the
 # runner, which is not sandboxed. rm -rf removes links without following them.
+# The skill snapshot is linked in where Claude Code, the cross-tool folder and
+# opencode look for skills; the sandbox lets the agent read it, never write it.
 fresh_agent_home() {
+  local skills d
   rm -rf "$AGENT_HOME"
   mkdir -p "$AGENT_HOME/tmp"
+  skills="$(cd "$SKILLS" 2> /dev/null && pwd -P)" || return 0
+  for d in .claude .agents .config/opencode; do
+    mkdir -p "$AGENT_HOME/$d" && ln -s "$skills" "$AGENT_HOME/$d/skills"
+  done
+}
+
+# The operator's skills, for the lanes that cannot read the operator's home:
+# a snapshot at $LOOM_HOME/skills of every child folder holding a SKILL.md in
+# the folders LOOM_SKILL_DIRS names (the first folder wins a name both hold),
+# links followed, refreshed at most hourly by whichever lane gets there
+# first. It is built beside the snapshot and swapped in only when the whole
+# copy succeeded, so a failed refresh keeps the last good snapshot and logs
+# one line. A missing folder is skipped; with none present nothing changes.
+SKILLS="$LOOM_HOME/skills"
+refresh_skills() {
+  local stamp="$LOOM_HOME/run/skills.stamp" lock="$LOOM_HOME/run/skills.lock"
+  local next="$LOOM_HOME/skills.next" old="$LOOM_HOME/skills.old" src d name found="" err=""
+  local -a dirs
+  [ -n "$(find "$stamp" -mmin -60 2> /dev/null)" ] && return 0
+  if ! mkdir "$lock" 2> /dev/null; then
+    # Another lane is refreshing. A refresher killed mid-copy leaves its lock.
+    [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2> /dev/null)" ] && rm -rf "$lock"
+    return 0
+  fi
+  touch "$stamp"
+  # shellcheck disable=SC2031 # HOME here is this shell's, not api_agent's subshell's
+  IFS=: read -ra dirs <<< "${LOOM_SKILL_DIRS:-$HOME/.agents/skills:$HOME/.claude/skills}"
+  for src in ${dirs[@]+"${dirs[@]}"}; do [ -d "$src" ] && found=1; done
+  if [ -n "$found" ]; then
+    chmod -R u+w "$next" "$old" 2> /dev/null; rm -rf "$next" "$old"
+    mkdir "$next" || err="cannot create $next"
+    for src in ${dirs[@]+"${dirs[@]}"}; do
+      [ -z "$err" ] && [ -d "$src" ] || continue
+      for d in "$src"/*/; do
+        d="${d%/}" name="${d##*/}"
+        [ -f "$d/SKILL.md" ] && [ ! -e "$next/$name" ] || continue
+        rsync -aL --delete "$d/" "$next/$name/" > /dev/null 2>&1 ||
+          { err="copying $name from $src failed"; break; }
+      done
+    done
+    # Read-only all through, top folder included, so nothing can add, rename
+    # or change a skill. The swap renames within $LOOM_HOME and needs no write
+    # on the snapshot; removing an old one takes chmod -R u+w first.
+    if [ -z "$err" ]; then
+      chmod -R a-w "$next" || err="cannot make $next read-only"
+    fi
+    if [ -z "$err" ]; then
+      if ! { { [ ! -e "$SKILLS" ] || mv "$SKILLS" "$old"; } && mv "$next" "$SKILLS"; }; then
+        err="cannot swap in the new snapshot"
+        [ -e "$SKILLS" ] || mv "$old" "$SKILLS" 2> /dev/null
+      fi
+    fi
+    chmod -R u+w "$next" "$old" 2> /dev/null; rm -rf "$next" "$old"
+    if [ -n "$err" ]; then
+      mkdir -p "$LOOM_HOME/logs"
+      echo "[$(date -u +%FT%TZ)] skill refresh failed, keeping the last snapshot: $err" |
+        tee -a "$LOOM_HOME/logs/skills.log" >&2
+    fi
+  fi
+  rm -rf "$lock"
+}
+
+# The agy lane's agent is another user and cannot read the snapshot, so the
+# runner copies it each run into the folder agy reads global skills from
+# (~/.gemini/config/skills), streamed as tar to a shell running as that user.
+# The sandbox keeps ~/.gemini/config read-only for the agent. A failed copy is
+# logged and the run goes on with whatever skills are there.
+agy_skills() {
+  [ -d "$SKILLS" ] || return 0
+  # shellcheck disable=SC2016 # expanded by the lane user's shell
+  tar -C "$SKILLS" -cf - . | "${AGY_RUNAS[@]}" /bin/bash -c '
+    d="$1"; mkdir -p "${d%/*}" || exit 1
+    # Remove a link without following it; make a copy deletable, then delete.
+    if [ -L "$d" ]; then rm -f "$d" || exit 1
+    elif [ -e "$d" ]; then { chmod -R u+w "$d" && rm -rf "$d"; } || exit 1; fi
+    mkdir "$d" && tar -xf - -C "$d" && chmod -R a-w "$d"' agy-skills "$AGY_HOME/.gemini/config/skills" ||
+    echo "could not copy the skill snapshot to the agy lane user" >&2
 }
 
 # Lanes and models whose provider may train on prompts (docs/LANES.md lists
@@ -556,6 +707,54 @@ conflict_list() {
 }
 
 # Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
+# A fix brief's agent may answer a finding instead of fixing it, one file a
+# thread in .loom-answers/ (bus/tickets.py says how). The answers never go in
+# the commit: they move to the inbox, where the station posts each on its
+# thread. The copy opens the folder and each file without following links,
+# through the folder's descriptor, and keeps only a regular file with one
+# link, at most 8 KB, named for a thread: a symlink, a hard link to a file
+# outside the tree, a FIFO or a folder swapped for a link is dropped unread,
+# so an answer cannot carry a file the agent could not read itself.
+keep_answers() {
+  local dir="$TREE/.loom-answers"
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0
+  if [ -n "$FIX_PR" ]; then
+    if ! python3 - "$dir" "$INBOX/answers/$TICKET" <<'PY' >> "$LOG" 2>&1
+import os, re, stat, sys
+src, dst = sys.argv[1], sys.argv[2]
+nofollow = os.O_RDONLY | os.O_NOFOLLOW
+try:
+    folder = os.open(src, nofollow | os.O_DIRECTORY)
+except OSError:
+    sys.exit(0)
+try:
+    for name in os.listdir(folder):
+        if not re.fullmatch(r"PRRT_[A-Za-z0-9_-]{1,100}[.]md", name):
+            continue
+        try:
+            fd = os.open(name, nofollow | os.O_NONBLOCK, dir_fd=folder)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(fd)
+            ok = stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size <= 8192
+            data = os.read(fd, 8193) if ok else b""
+        finally:
+            os.close(fd)
+        if ok and len(data) <= 8192:
+            os.makedirs(dst, exist_ok=True)
+            with open(os.path.join(dst, name), "wb") as out:
+                out.write(data)
+finally:
+    os.close(folder)
+PY
+    then
+      echo "[$(date -u +%FT%TZ)] $TICKET: the answers in .loom-answers could not be kept" >> "$LOG"
+    fi
+  fi
+  rm -rf "$dir"
+}
+
 markers_left() {
   local f left=()
   while IFS= read -r f; do
@@ -620,6 +819,8 @@ anthropic_credit_ok() {
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
 lane_ready() {
   local cli key_ssm
+  # A limit an earlier run hit holds for every lane, not only spark.
+  limit_held && return 1
   if [ "$LANE" = agy ]; then
     command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
     "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
@@ -703,6 +904,11 @@ if ! lane_ready; then
   [ -n "$LIMITED" ] || exit 0
 else
   heartbeat true ""
+fi
+# Only the sandboxed lanes need the snapshot (codex and claude read the
+# operator's own folders), and only when there is work.
+if { is_api_lane || [ "$LANE" = agy ]; } && compgen -G "$INBOX/*.md" > /dev/null; then
+  refresh_skills
 fi
 
 for BRIEF in "$INBOX"/*.md; do
@@ -827,6 +1033,7 @@ for BRIEF in "$INBOX"/*.md; do
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
+  LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
     (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
@@ -834,6 +1041,12 @@ for BRIEF in "$INBOX"/*.md; do
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  # A run the provider refused for a limit is not a failure: the lane steps
+  # out for LIMIT_HOLD and the brief goes back for another lane.
+  if [ "$STATUS" -ne 0 ] && provider_limit; then
+    mark_limit
+    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)"; continue
+  fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
@@ -842,6 +1055,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  keep_answers
   if [ -n "$CONFLICTS" ]; then
     LEFT="$(markers_left)"
     if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
@@ -857,32 +1071,84 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
   fi
-  if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
-    if [ -n "$FIX_PR" ] && [ -n "$REPLIES_FILE" ]; then
-      post_replies
-      echo "[$(date -u +%FT%TZ)] $TICKET done, review replies posted without code changes" >> "$LOG"
-      mv "$BRIEF" "$INBOX/done/"
-      continue
-    fi
-    park "$BRIEF" "agent made no commit on $BRANCH"; continue
+  COMMITTED=0
+  if [ "$(safe_git rev-parse "$BRANCH")" != "$BASE" ]; then
+    COMMITTED=1
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
     park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
   fi
-  # Never forced: a branch that moved on the remote refuses the push.
-  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
-    park "$BRIEF" "push failed"; continue
+  # For fix-mode briefs, reconcile generated PR sections with the approved
+  # ticket revision. A metadata-only repair is a valid outcome.
+  METADATA_CHANGED=0
+  REPAIR_RC=""
+  if [ -n "$FIX_PR" ]; then
+    repair_pr_text >> "$LOG" 2>&1
+    REPAIR_RC=$?
+    case "$REPAIR_RC" in
+      0) METADATA_CHANGED=1 ;;
+      1) ;; # text is current
+      2)
+        # Refused text is parked only when there is no code commit or reply to post.
+        if [ "$COMMITTED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
+          park "$BRIEF" "PR text repair refused on #$FIX_PR"
+          continue
+        fi ;;
+      3)
+        # A helper error is parked only when there is no code commit to push.
+        if [ "$COMMITTED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
+          park "$BRIEF" "PR text repair failed on #$FIX_PR"
+          continue
+        fi ;;
+      *)
+        if [ "$COMMITTED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
+          park "$BRIEF" "PR text repair returned $REPAIR_RC on #$FIX_PR"
+          continue
+        fi ;;
+    esac
+  fi
+  if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
+    park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
+  fi
+  # Never forced: a branch that moved on the remote refuses the push. A fix
+  # brief's branch moved by someone else during the run (another lane's
+  # round, a person's commit) is not this run's failure: it is parked as
+  # "branch moved", and the station hands the new head back to the factory.
+  if [ "$COMMITTED" -eq 1 ]; then
+    if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
+      printf '%s\n' "$PUSH_OUT" >> "$LOG"
+      if [ -n "$FIX_PR" ] && printf '%s\n' "$PUSH_OUT" | grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)'; then
+        NOW_HEAD="$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote origin "refs/heads/$BRANCH" 2>> "$LOG" | cut -f1)"
+        if [ -n "$NOW_HEAD" ] && [ "$NOW_HEAD" != "$BASE" ]; then
+          park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
+        fi
+      fi
+      park "$BRIEF" "push failed"; continue
+    fi
+    [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
   fi
   if [ -n "$FIX_PR" ]; then
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
-    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" \
-         --body "Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}" >> "$LOG" 2>&1; then
+    if [ "$COMMITTED" -eq 1 ]; then
+      COMMENT="Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}"
+    elif [ "$METADATA_CHANGED" -eq 0 ]; then
+      COMMENT="Lane $SLOT answered the review threads for: ${ITEMS:-the findings on the ticket}"
+    else
+      COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
+    fi
+    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" --body "$COMMENT" >> "$LOG" 2>&1; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
-    echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    if [ "$COMMITTED" -eq 1 ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    elif [ "$METADATA_CHANGED" -eq 0 ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET done, review replies posted on #$FIX_PR" >> "$LOG"
+    else
+      echo "[$(date -u +%FT%TZ)] $TICKET done, PR text repaired on #$FIX_PR" >> "$LOG"
+    fi
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
