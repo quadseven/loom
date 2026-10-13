@@ -152,6 +152,7 @@ printf '%s\\n' "$val"
 # that it was used. Production uses sudo to the dedicated macOS user.
 FAKE_RUNAS = """#!/usr/bin/env bash
 printf 'runas %s\\n' "$1" >> "$FAKE_LOG"
+if [ "${FAKE_FAIL_AGY_SETTINGS_KEEP:-}" = 1 ] && [ "${!#}" = keep ]; then exit 1; fi
 exec "$@"
 """
 
@@ -779,6 +780,17 @@ cat > /dev/null
         self.assertFalse((state / ".settings.json.new").exists())
         self.assertIn("set=locked", agy[0])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_fails_when_settings_restore_fails(self):
+        self.write_tool(self.bin / "sandbox-exec", "#!/usr/bin/env bash\nshift 2\nexec \"$@\"\n")
+        inbox, workdir, result, agy = self.agy_lane(FAKE_FAIL_AGY_SETTINGS_KEEP="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, result.stderr)
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("could not restore agy's settings", log)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
     def test_agy_settings_never_write_through_a_link_left_in_their_place(self):

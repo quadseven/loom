@@ -336,6 +336,7 @@ agy_agent() {
 
 $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
   local rc=$?
+  # A failed restore must fail the run, even if agy itself succeeded.
   printf '%s\n' "$settings" | agy_settings keep > /dev/null || { echo "could not restore agy's settings" >&2; return 3; }
   return "$rc"
 }
