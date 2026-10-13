@@ -84,10 +84,14 @@ claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
 `claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
-A rung whose lanes each already hold 2 briefed or running tickets is passed
-over for the next. A fix brief may answer a finding instead of fixing it: the agent writes the
+A climb takes the lowest rung the ticket has not run on since its ladder
+last started; a rung whose lanes each already hold 2 briefed or running
+tickets is passed over for the next untried one, and stays untried, so a
+ticket gives up only once it has run on every rung. A ticket that failed on
+a ladder model (its `Model:` line and lane) has tried that rung.
+A fix brief may answer a finding instead of fixing it: the agent writes the
 reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
-the tree (never committed; symlinks dropped), and the station posts each
+the tree (never committed; links dropped unread), and the station posts each
 answer as the reply on its thread, redacted and text-checked. The station
 resolves the thread only when the round ran on a ladder model and the thread
 is the review bot's own medium or low finding; any other answered thread

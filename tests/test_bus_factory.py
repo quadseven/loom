@@ -15,6 +15,8 @@ NOW = 2_000_000_000.0
 # A loom:fix comment that asked for thread PRRT_1 and a failing check.
 FIX_ASKED = FIX_MARKER + "\nPull request: x#50\n\n### Check: lint\n\n    E1\n\n### Thread PRRT_1 (comment 1) at a.py:1\n\n    rename"
 ME = {"login": "alice-example"}
+# Every rung of the ladder tried since the last restart.
+ALL_RUNGS = [{"body": factory.RUNG_MARKER % n, "user": ME} for n in (1, 2, 3)]
 STRANGER = {"login": "mallory-example"}
 
 
@@ -269,11 +271,29 @@ class PullRequests(Base):
 
     def test_past_the_last_rung_it_is_left_failed_for_the_brain(self):
         self.gh.ticket(5, "pr")
-        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME}, {"body": factory.RUNG_MARKER % 3, "user": ME}]
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.moved, [(5, "failed", None)])
+
+    def test_a_rung_skipped_while_busy_is_still_tried_later(self):
+        # Spilled straight to rung 3 while rungs 1 and 2 were busy: stuck
+        # again, it goes to rung 1, not past the end of the ladder.
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 3, "user": ME},
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual(self.moved, [])
+        self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
+        self.assertEqual(factory.tried_rungs(self.gh.comments[5]), {1, 3})
+
+    def test_a_ticket_that_failed_on_a_ladder_model_does_not_get_it_again(self):
+        self.gh.ticket(6, "failed", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.go()
+        self.assertEqual(self.model(6), "gpt-6-sol")
 
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")
@@ -465,7 +485,7 @@ class Tickets(Base):
 
     def test_a_failed_ticket_past_the_last_rung_is_left_alone(self):
         self.gh.ticket(6, "failed")
-        self.gh.comments[6].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        self.gh.comments[6] += ALL_RUNGS
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
@@ -514,7 +534,7 @@ class Tickets(Base):
 
     def test_a_limited_ticket_past_the_last_rung_stays_for_its_lane(self):
         self.gh.ticket(7, "briefed", lane="spark")
-        self.gh.comments[7].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        self.gh.comments[7] += ALL_RUNGS
         self.go(limited=["spark"])
         self.assertEqual(self.lane(7), "spark")
         self.assertEqual(self.moved, [])
@@ -533,13 +553,21 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.with_model("Difficulty: hard\n\n## Why", "b"),
                          "Model: b\nDifficulty: hard\n\n## Why")
 
-    def test_a_busy_rung_spills_to_the_next(self):
-        self.assertEqual(factory.pick_rung(1, {}), 1)
-        self.assertEqual(factory.pick_rung(1, {"claude": 2}), 2)
-        self.assertEqual(factory.pick_rung(1, {"claude": 2, "codex": 2, "codex-2": 3}), 3)
-        self.assertEqual(factory.pick_rung(2, {"codex": 0}), 2)
-        self.assertEqual(factory.pick_rung(3, {}), 3)
-        self.assertEqual(factory.pick_rung(4, {}), 0)
+    def test_a_busy_rung_spills_to_the_next_untried(self):
+        busy = {"claude": 2, "codex": 2, "codex-2": 3}
+        self.assertEqual(factory.next_rung(set(), {}), 1)
+        self.assertEqual(factory.next_rung(set(), {"claude": 2}), 2)
+        self.assertEqual(factory.next_rung(set(), busy), 3)
+        self.assertEqual(factory.next_rung({1}, {"codex": 0}), 2)
+        self.assertEqual(factory.next_rung({3}, {}), 1)
+        self.assertEqual(factory.next_rung({1, 2, 3}, {}), 0)
+        # Every untried rung busy: wait on the lowest rather than skip it.
+        all_busy = dict(busy, **{lane: 2 for lane in factory.ANTHROPIC})
+        self.assertEqual(factory.next_rung({1}, all_busy), 2)
+
+    def test_tried_rungs_start_again_at_a_rung_zero_marker(self):
+        comments = ALL_RUNGS + [{"body": factory.RUNG_MARKER % 0}, {"body": factory.RUNG_MARKER % 2}]
+        self.assertEqual(factory.tried_rungs(comments), {2})
 
     def test_pick_lane_takes_the_least_loaded(self):
         self.assertEqual(factory.pick_lane(("codex", "codex-2"), {"codex": 2, "codex-2": 1}), "codex-2")
