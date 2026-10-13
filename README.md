@@ -66,7 +66,7 @@ findings back with `bus.brain fix`.
 | Operator | answers asks, edits goals | anywhere |
 
 Lanes: codex, claude, anthropic, opencode-go, openrouter, zen, zai,
-workersai and agy, plus extra slots (anthropic-2 to anthropic-8, codex-2, opencode-go-2)
+workersai, agy and spark (a local vLLM coder you host yourself), plus extra slots (anthropic-2 to anthropic-8, codex-2, opencode-go-2)
 that run in parallel. Hard work goes to paid lanes; providers that train on
 prompts take public repos only.
 

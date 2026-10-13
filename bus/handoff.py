@@ -133,6 +133,8 @@ def stage_lines(found: Sequence[Mark]) -> List[str]:
 
 
 def _parse(value: str) -> Optional[datetime]:
+    # None is not a dropped journal: peer_journals reads an unreadable time as
+    # fresh, so a malformed timestamp keeps broad work closed, never open.
     try:
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
