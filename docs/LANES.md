@@ -88,7 +88,10 @@ A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
 tickets is passed over for the next untried one, and stays untried, so a
 ticket gives up only once it has run on every rung. A ticket that failed on
-a ladder model (its `Model:` line and lane) has tried that rung.
+a ladder model (its `Model:` line and lane) has tried that rung. When every
+untried rung is busy, it waits on the least loaded one, and a ladder ticket
+queued behind more than 2 others on its lane moves to an untried rung with a
+free lane (not a failure).
 A fix brief may answer a finding instead of fixing it: the agent writes the
 reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
 the tree (never committed; links dropped unread), and the station posts each
