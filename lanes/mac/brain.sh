@@ -12,7 +12,8 @@
 #
 # Settings: LOOM_REPOS, LOOM_STATUS_REPO (where the lock lives; default this
 # checkout's origin), LOOM_BRAIN_MODEL, LOOM_BRAIN_HOLDER, LOOM_BRAIN_MINUTES
-# (the agent's hard stop, also the lock's expiry), and LOOM_BRAIN_SCOPE: all
+# (the agent's hard stop, also the lock's expiry), LOOM_BRAIN_WAIT (minutes to
+# wait for a held lock: 25 for a live tick, 0 otherwise), and LOOM_BRAIN_SCOPE: all
 # (the default) or live, which leaves everything but cluster work to Muse.
 set -uo pipefail
 
@@ -24,6 +25,12 @@ MODEL="${LOOM_BRAIN_MODEL:-claude-opus-5-5}"
 HOLDER="${LOOM_BRAIN_HOLDER:-lane-machine}"
 MINUTES="${LOOM_BRAIN_MINUTES:-40}"
 SCOPE="${LOOM_BRAIN_SCOPE:-all}"
+# How long a tick waits for a lock another brain holds before it skips. A
+# live tick is the only one that ships, so by default it waits for Muse's
+# tick to finish rather than skip a whole interval; seconds between tries in
+# LOOM_BRAIN_WAIT_STEP (tests shorten it).
+if [ "$SCOPE" = live ]; then WAIT="${LOOM_BRAIN_WAIT:-25}"; else WAIT="${LOOM_BRAIN_WAIT:-0}"; fi
+WAIT_STEP="${LOOM_BRAIN_WAIT_STEP:-60}"
 ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)"
 LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')}"
 mkdir -p "$WORK" "$(dirname "$LOG")"
@@ -36,8 +43,8 @@ say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 # well, a skip for a held lock included (another brain is acting). A tick that
 # ran the agent also records when it started and its model, so the station
 # can upload that session's transcript. This script never uploads anything
-# itself, so it needs neither LOOM_TRANSCRIPT_URL nor LOOM_TRANSCRIPT_TOKEN_SSM,
-# and lanes/mac/install.sh deliberately keeps both out of the brain's plist.
+# itself. lanes/mac/install.sh gives LOOM_TRANSCRIPT_URL and
+# LOOM_TRANSCRIPT_TOKEN_SSM to the station plist, not the brain plist.
 STATE="$LOOM_HOME/state"
 STARTED=null
 beat() {
@@ -60,10 +67,15 @@ bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 
 # The lock outlives the agent by 5 minutes, so a tick cut off by the timeout
 # still releases it below before anyone else could take it.
-if ! bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$((MINUTES + 5))" >> "$LOG" 2>&1; then
-  beat skipped 0
-  exit 0
-fi
+[[ "$WAIT" =~ ^[0-9]+$ && "$WAIT_STEP" =~ ^[0-9]+$ ]] || { say "LOOM_BRAIN_WAIT and LOOM_BRAIN_WAIT_STEP must be whole numbers"; exit 1; }
+deadline=$(( $(date +%s) + WAIT * 60 ))
+until bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$((MINUTES + 5))" >> "$LOG" 2>&1; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    beat skipped 0
+    exit 0
+  fi
+  sleep "$WAIT_STEP"
+done
 trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1' EXIT
 # launchd stops a job with SIGTERM; exiting on it runs the EXIT trap.
 trap 'exit 143' TERM INT

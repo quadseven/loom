@@ -3,7 +3,7 @@
 #
 #   lanes/mac/install.sh [lane ...]
 #     default: codex claude openrouter opencode-go anthropic zen zai workersai agy,
-#     plus the extra slots anthropic-2 anthropic-3 anthropic-4 codex-2
+#     plus the extra slots anthropic-2 to anthropic-8, codex-2 and opencode-go-2
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
@@ -44,7 +44,8 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy
-  anthropic-2 anthropic-3 anthropic-4 codex-2)
+  anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
+  codex-2 opencode-go-2)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
@@ -113,8 +114,13 @@ done
 # LOOM_DIGEST_HOUR and LOOM_AWS_REGION, and uploads finished transcripts to
 # LOOM_TRANSCRIPT_URL with the token in the SSM parameter named by
 # LOOM_TRANSCRIPT_TOKEN_SSM (both from the installing environment, never this
-# repo; with either empty nothing is uploaded). Runs from this checkout, like
-# the lanes.
+# repo; with either empty nothing is uploaded). It also reads
+# LOOM_DISCORD_CHANNEL_ID,
+# LOOM_DISCORD_BOT_TOKEN_SSM and LOOM_DISCORD_DEFAULT_GOAL (talking to the
+# brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
+# LOOM_ANTHROPIC_BUDGET_SINCE, LOOM_ANTHROPIC_BUDGET_EXPIRES and
+# LOOM_ANTHROPIC_FLOOR_USD (the anthropic spend line; the lanes get them with
+# every other LOOM_* setting). Runs from this checkout, like the lanes.
 LABEL="com.loom.station"
 PLIST="$AGENTS/$LABEL.plist"
 cat > "$PLIST" <<EOF
@@ -151,6 +157,13 @@ cat > "$PLIST" <<EOF
     <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
     <key>LOOM_TRANSCRIPT_URL</key><string>$(xml "${LOOM_TRANSCRIPT_URL:-}")</string>
     <key>LOOM_TRANSCRIPT_TOKEN_SSM</key><string>$(xml "${LOOM_TRANSCRIPT_TOKEN_SSM:-}")</string>
+    <key>LOOM_DISCORD_CHANNEL_ID</key><string>$(xml "${LOOM_DISCORD_CHANNEL_ID:-}")</string>
+    <key>LOOM_DISCORD_BOT_TOKEN_SSM</key><string>$(xml "${LOOM_DISCORD_BOT_TOKEN_SSM:-}")</string>
+    <key>LOOM_DISCORD_DEFAULT_GOAL</key><string>$(xml "${LOOM_DISCORD_DEFAULT_GOAL:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_USD</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_USD:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_SINCE</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_SINCE:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_EXPIRES</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_EXPIRES:-}")</string>
+    <key>LOOM_ANTHROPIC_FLOOR_USD</key><string>$(xml "${LOOM_ANTHROPIC_FLOOR_USD:-}")</string>
   </dict>
 </dict>
 </plist>

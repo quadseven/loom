@@ -48,7 +48,10 @@ that talks to GitHub about tickets.
 | `loom:failed` | The runner gave up; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
-| `loom:verified` | The brain verified it live; the ticket is then closed. |
+| `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
+| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
+| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Refs #<number>`. The issue stays open. |
+| `loom:human` | Only a person can do this; one comment names the exact thing needed (money, hardware, an account, a credential, a decision reserved for the operator). |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -92,6 +95,57 @@ repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 `Refs <owner/name>#<number>` to the pull request body, never a closing
 keyword.
 
+## Triage
+
+`python3 -m bus.brain triage <owner/name> --goal N [--limit 25]` walks the
+repo's open issues oldest first and labels at most `--limit` of them. It
+skips pull requests, epics (an `epic` label or sub-issues), `needs-operator`
+asks and anything with a `loom:` label. A ready issue (Why, What,
+Acceptance criteria with checkboxes, Size and Out of scope, and a body the
+runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
+of goal N, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
+for a later run. Any other issue gets `loom:triage` and one comment naming
+what is missing. Triage writes labels, sub-issue links and that comment
+only: it never closes, retitles or edits an issue, because an automated
+pass over old issues over-calls work as done.
+
+## Proof
+
+A ticket moves to `loom:verified` only with a proof record, and closes as
+completed only with one that still holds; a `not_planned` closure needs none.
+The record is JSON, passed with `move --to verified --proof PROOF.json`:
+
+```json
+{
+  "kind": "runtime",
+  "revision": "<commit SHA on the default branch that is deployed>",
+  "environment": "<where it runs, e.g. production>",
+  "artifact": "<what was deployed, e.g. an image digest>",
+  "observed": {"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T01:00:00Z"},
+  "measure": {"name": "<metric>", "baseline": "<before>", "target": "<goal>", "after": "<observed>"},
+  "sources": ["<log line, dashboard or check run that shows it>"],
+  "criteria": [{"criterion": "<acceptance criterion, verbatim>", "result": "pass", "evidence": "<what showed it>"}]
+}
+```
+
+`kind` is `runtime` or `docs`. Documentation-only work uses `docs`, which
+needs only `revision` (the default-branch commit that carries it),
+`observed`, `sources` and `criteria`, and may be verified once merged;
+runtime work is verified only once shipped. The move refuses when:
+
+- a required field is missing or empty, or `revision` is not a commit on the
+  repo's default branch;
+- `criteria` is not the ticket's acceptance criteria, verbatim and in order,
+  each with `pass` and evidence;
+- any acceptance criterion checkbox in the ticket body is unchecked.
+
+The move posts the record as a `<!-- loom:proof v1 -->` comment with a hash
+of the criteria texts (not their check marks), then sets the label.
+`close` refuses a completed closure unless the ticket is `loom:verified`,
+every criterion is checked, and the newest proof comment from a
+`LOOM_BRIEF_AUTHORS` login matches the criteria as they are now. Rewording,
+adding or removing a criterion after the proof means verifying again.
+
 ## Trust
 
 Briefs become agent prompts, and the runner pushes with the operator's
@@ -130,6 +184,25 @@ empty, it takes the oldest trusted briefed ticket for that lane:
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
+
+A lane pull request with failing checks or review findings goes back to its
+lane, not to the brain: `python3 -m bus.brain fix OWNER/NAME#PR --ticket
+OWNER/NAME#N --file FINDINGS.md` refuses unless the pull request is open, on
+a same-repo `loom/` branch and linked to the ticket (its `Refs` line or its
+branch number), and the ticket is `loom:pr`. It comments the findings on the
+ticket, starting with `<!-- loom:fix v1 -->` and naming the pull request and
+its branch (the failing checks with the last lines of their logs, each
+unresolved review thread with its id, path, line and text), then moves the
+ticket back to `loom:briefed` on the same lane.
+
+When the station claims a ticket whose latest comment from an allowed login
+is such a fix comment, newer than its last claim, the brief keeps the pull
+request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
+section holding the comment. A fix comment edited after it was posted is
+refused, as an untrusted ticket is. The runner then checks out that branch,
+pushes the agent's work onto it (fast-forward only, never forced) and
+comments on the pull request; it never opens a second one. A fix brief whose
+pull request is no longer open is parked as failed.
 
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
@@ -183,7 +256,7 @@ Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review and ship ready pull requests
 (read every diff, green checks and the review bot, answer every thread);
 verify shipped work live and close only then; pick the next problems by
-impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 8)
+impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
 and shipped tickets hold no slot);
 write the journal; report when due; release the lock. No retry loops: a

@@ -15,6 +15,9 @@
 # failed/ (the run did not produce one). A brief is never run twice, so a
 # crash or restart cannot turn into a re-run loop. The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
+# A fix brief (a Fix-PR: <number> line, from the station) instead works on
+# that open PR's existing branch: it pushes fast-forward only and comments on
+# the PR, and never opens a second one.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
@@ -25,7 +28,9 @@
 # provider key, read at run time; never stored in this repo; zen needs none),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
-# LOOM_CLONE_BASE (default git@github.com:).
+# LOOM_CLONE_BASE (default git@github.com:), and for the anthropic lanes
+# LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
+# (docs/LANES.md, "Anthropic spend").
 set -uo pipefail
 
 SLOT="${1:?usage: run_lane.sh <lane>}"
@@ -34,6 +39,9 @@ SLOT="${1:?usage: run_lane.sh <lane>}"
 LANE="$SLOT"
 [[ "$SLOT" =~ -[0-9]+$ ]] && LANE="${SLOT%-*}"
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
+export LOOM_HOME
+# This checkout, for its python helpers (bus/spend.py).
+LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -132,6 +140,26 @@ pr_body() {
   printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s\n' \
     "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
     "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$refs"
+}
+
+# A fix brief's PR must still be open on the brief's branch. Returns 1 with
+# FIX_REASON set when it is not, and with FIX_REASON empty when gh could not
+# say (the brief then waits for the next pass).
+fix_pr_open() {
+  local state
+  FIX_REASON=""
+  state="$(timeout "$NET_TIMEOUT" gh pr view "$FIX_PR" -R "$REPO" --json state,headRefName \
+    --jq '.state + " " + .headRefName')" || return 1
+  [ "$state" = "OPEN $BRANCH" ] && return 0
+  FIX_REASON="pull request #$FIX_PR is no longer open on $BRANCH (${state:-no answer})"
+  return 1
+}
+
+# What a fix brief fixed: the ### headings of its ## Fix section, one line.
+fix_items() {
+  awk '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
+       on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
+       END {print out}' "$1" | cut -c1-500
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
@@ -352,6 +380,64 @@ is_api_lane() {
   return 1
 }
 
+# A fix brief's branch, brought up to date with the repository's default
+# branch before the agent runs, so a lane can resolve a conflict: the agent's
+# sandbox cannot write .git, so it can never fetch or merge itself (#145).
+# A clean merge stays as a commit. A conflict is left in the tree with its
+# markers, CONFLICTS names the files, and the runner completes the merge after
+# the agent. UPDATE_REASON is set when the branch could not be updated.
+# Every git call below, the fetch and the unshallow fetch included, runs under
+# `timeout "$NET_TIMEOUT"`, written on the line before its continuation.
+update_fix_branch() {
+  local default
+  UPDATE_REASON=""; CONFLICTS=""
+  default="${BASE_BRANCH:-$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote --symref origin HEAD 2>> "$LOG" |
+    sed -n 's#^ref: refs/heads/\(.*\)[[:space:]]HEAD$#\1#p')}"
+  if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
+    UPDATE_REASON="could not read the default branch"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
+    UPDATE_REASON="could not fetch $default"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+  fi
+  timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
+  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
+    return 0
+  fi
+  # One path a line, never split on spaces or globbed.
+  CONFLICTS="$(safe_git -c core.quotePath=false diff --name-only --diff-filter=U)"
+  if [ -z "$CONFLICTS" ]; then
+    safe_git merge --abort >> "$LOG" 2>&1 || true
+    UPDATE_REASON="merging $default into $BRANCH failed"; return 1
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET: merging $default conflicts in $(conflict_list); the agent resolves it" >> "$LOG"
+  return 0
+}
+
+# CONFLICTS (one path a line) as one comma-separated line.
+conflict_list() {
+  printf '%s\n' "$CONFLICTS" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g'
+}
+
+# Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
+markers_left() {
+  local f left=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$TREE/$f" ] &&
+      grep -qE '^(<<<<<<<|=======|>>>>>>>)( |$)' -- "$TREE/$f" && left+=("$f")
+  done <<< "$CONFLICTS"
+  [ "${#left[@]}" -gt 0 ] && { local IFS=,; echo "${left[*]}" | sed 's/,/, /g'; }
+  return 0
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
@@ -366,10 +452,40 @@ run_agent() {
     zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_config && api_agent CLOUDFLARE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
+    anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
+}
+
+spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
+
+# The anthropic lanes spend API credits. The CLI's JSON result carries the
+# run's cost: the lane log gets the human-readable result, and
+# state/usage/spend.jsonl one line per run, with cost null (unknown, never
+# zero) when the run left no result.
+anthropic_agent() {
+  local out="$LOGDIR/$TICKET.result" status
+  api_agent ANTHROPIC_API_KEY claude -p --output-format json --model "$MODEL" "$1" > "$out"
+  status=$?
+  if ! spend record --output "$out" --slot "$SLOT" --ticket "$TICKET" --model "$MODEL"; then
+    cat "$out"
+    echo "could not read this run's cost; recording it as unknown" >&2
+    printf '{"at": %s, "slot": "%s", "ticket": "%s", "model": "%s", "cost_usd": null}\n' \
+      "$(date +%s)" "$SLOT" "$TICKET" "$MODEL" >> "$LOOM_HOME/state/usage/spend.jsonl"
+  fi
+  rm -f "$out"
+  return "$status"
+}
+
+# With LOOM_ANTHROPIC_BUDGET_USD set, credit under the floor (or a budget
+# setting that does not parse) makes the anthropic slots unavailable.
+anthropic_credit_ok() {
+  [ -n "${LOOM_ANTHROPIC_BUDGET_USD:-}" ] || return 0
+  local why
+  why="$(spend floor 2>&1)" && return 0
+  READY_REASON="${why:-could not check the anthropic credit}"
+  return 1
 }
 
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
@@ -388,6 +504,7 @@ lane_ready() {
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
+  [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
   case "$LANE" in zen) return 0 ;; esac
@@ -524,32 +641,60 @@ for BRIEF in "$INBOX"/*.md; do
     esac
   fi
 
-  # gh unreachable or hung says nothing about the branch: leave the brief
-  # for the next pass rather than risk a second run.
-  if ! EXISTING="$(timeout "$NET_TIMEOUT" gh pr list -R "$REPO" --head "$BRANCH" --state all --json number --jq '.[0].number // empty')"; then
-    echo "$TICKET: gh pr list failed; will retry next pass" >&2; continue
-  fi
-  if [ -n "$EXISTING" ]; then
-    echo "$TICKET: $REPO#$EXISTING already exists for $BRANCH; retiring brief"
-    mv "$BRIEF" "$INBOX/done/"
-    continue
+  FIX_PR="$(field Fix-PR "$BRIEF" || true)"
+  if [ -n "$FIX_PR" ]; then
+    if ! [[ "$FIX_PR" =~ ^[0-9]+$ ]]; then
+      park "$BRIEF" "brief Fix-PR: is not a pull request number"; continue
+    fi
+    if ! fix_pr_open; then
+      [ -n "$FIX_REASON" ] && { park "$BRIEF" "$FIX_REASON"; continue; }
+      echo "$TICKET: gh pr view failed; will retry next pass" >&2; continue
+    fi
+    # The PR's own branch, as it is on the remote; nothing is created.
+    CLONE_ARGS=(--branch "$BRANCH")
+  else
+    # gh unreachable or hung says nothing about the branch: leave the brief
+    # for the next pass rather than risk a second run.
+    if ! EXISTING="$(timeout "$NET_TIMEOUT" gh pr list -R "$REPO" --head "$BRANCH" --state all --json number --jq '.[0].number // empty')"; then
+      echo "$TICKET: gh pr list failed; will retry next pass" >&2; continue
+    fi
+    if [ -n "$EXISTING" ]; then
+      echo "$TICKET: $REPO#$EXISTING already exists for $BRANCH; retiring brief"
+      mv "$BRIEF" "$INBOX/done/"
+      continue
+    fi
+    CLONE_ARGS=(${BASE_ARGS[@]+"${BASE_ARGS[@]}"})
   fi
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT, model $MODEL" >> "$LOG"
-  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${BASE_ARGS[@]+"${BASE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
-         git -C "$TREE" checkout -q -b "$BRANCH"; } >> "$LOG" 2>&1; then
+  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
+         { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed"; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
+  RUN_BRIEF="$BRIEF"
+  CONFLICTS=""
+  if [ -n "$FIX_PR" ]; then
+    # BASE is taken first, so a clean merge alone counts as a change and an
+    # out-of-date pull request is pushed up to date.
+    if ! update_fix_branch; then park "$BRIEF" "$UPDATE_REASON"; continue; fi
+    if [ -n "$CONFLICTS" ]; then
+      RUN_BRIEF="$WORKDIR/$TICKET.run.md"
+      { cat "$BRIEF"
+        printf '\n## Merge conflicts\n\nThe runner merged the default branch into this branch and it conflicts in: %s\n' "$(conflict_list)"
+        printf 'Resolve every conflict in those files first: keep both sides'"'"' intent, remove every conflict marker, and keep the tests green. Do not run git; the runner completes the merge.\n'
+      } > "$RUN_BRIEF"
+    fi
+  fi
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   ( set -m
-    (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
@@ -557,9 +702,16 @@ for BRIEF in "$INBOX"/*.md; do
   is_api_lane && archive_transcripts
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
+  [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  if [ -n "$CONFLICTS" ]; then
+    LEFT="$(markers_left)"
+    if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
+  fi
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
-  if [ -n "$(safe_git status --porcelain)" ]; then
-    if ! { safe_git checkout -q "$BRANCH" && safe_git add -A &&
+  # During a merge the branch is already checked out, and the commit
+  # completes the merge.
+  if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
+    if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
            safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
@@ -567,8 +719,24 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
     park "$BRIEF" "agent made no commit on $BRANCH"; continue
   fi
+  # A PR closed or merged during the run gets nothing pushed: a push would
+  # bring its deleted branch back.
+  if [ -n "$FIX_PR" ] && ! fix_pr_open; then
+    park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
+  fi
+  # Never forced: a branch that moved on the remote refuses the push.
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
     park "$BRIEF" "push failed"; continue
+  fi
+  if [ -n "$FIX_PR" ]; then
+    ITEMS="$(fix_items "$BRIEF")"
+    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" \
+         --body "Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}" >> "$LOG" 2>&1; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
+    fi
+    echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
   fi
   if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$(pr_body "$BRIEF" "$TICKET")" >> "$LOG" 2>&1; then

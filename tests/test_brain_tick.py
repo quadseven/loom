@@ -16,7 +16,14 @@ SCRIPT = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "brain.sh"
 # exits 0. Every call is appended to $FAKE_LOG.
 FAKE_PYTHON = """#!/usr/bin/env bash
 printf 'python3 %s\\n' "$*" >> "$FAKE_LOG"
-[ "$3" = lock ] && exit "${FAKE_LOCK:-0}"
+if [ "$3" = lock ]; then
+  # FAKE_LOCK_FREE_AFTER=n: the lock is held for the first n tries.
+  if [ -n "${FAKE_LOCK_FREE_AFTER:-}" ]; then
+    n=$(grep -c ' lock ' "$FAKE_LOG")
+    [ "$n" -gt "$FAKE_LOCK_FREE_AFTER" ] && exit 0 || exit 1
+  fi
+  exit "${FAKE_LOCK:-0}"
+fi
 exit 0
 """
 
@@ -153,6 +160,23 @@ class BrainTickTest(unittest.TestCase):
         )
         self.assertEqual(1, run.returncode)
         self.assertFalse(self.log.exists())
+
+    def test_a_live_tick_waits_for_a_held_lock_then_runs(self):
+        run, calls = self.tick(LOOM_BRAIN_SCOPE="live", FAKE_LOCK_FREE_AFTER="2",
+                               LOOM_BRAIN_WAIT_STEP="0")
+        self.assertEqual(0, run.returncode)
+        self.assertEqual(3, sum(1 for c in calls if " -m bus lock " in c))
+        self.assertTrue(any(c.startswith("claude ") for c in calls))
+
+    def test_a_live_tick_skips_after_its_wait(self):
+        run, calls = self.tick(LOOM_BRAIN_SCOPE="live", FAKE_LOCK="1",
+                               LOOM_BRAIN_WAIT="0", LOOM_BRAIN_WAIT_STEP="0")
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(any(c.startswith("claude ") for c in calls))
+
+    def test_a_full_tick_does_not_wait_by_default(self):
+        run, calls = self.tick(FAKE_LOCK="1", LOOM_BRAIN_WAIT_STEP="0")
+        self.assertEqual(1, sum(1 for c in calls if " -m bus lock " in c))
 
     def test_an_unknown_scope_never_takes_the_lock(self):
         run, calls = self.tick(LOOM_BRAIN_SCOPE="some")

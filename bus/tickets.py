@@ -6,7 +6,9 @@ issues", "Trust") is the contract.
 """
 from __future__ import annotations
 
+import calendar
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # The runner's own patterns (lanes/run_lane.sh).
@@ -15,10 +17,13 @@ BASE_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 DIFFICULTIES = ("easy", "medium", "hard")
 
-HEADER_RE = re.compile(r"(Difficulty|Model|Base):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Model|Base|Not before):[ \t]*(.*)")
+# "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
+# earlier than that UTC time, and the brain does not brief it before then.
+NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
-FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base):")
+FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR):")
 SLUG_MAX = 40
 
 
@@ -46,6 +51,25 @@ def ticket_name(repo: str, number: int, attempt: int = 1) -> str:
     return name
 
 
+# Each header's rule: (is the value usable, the message when it is not).
+_HEADER_RULES = {
+    "Difficulty": (lambda v: v in DIFFICULTIES,
+                   lambda v: "Difficulty: must be one of %s" % ", ".join(DIFFICULTIES)),
+    "Model": (lambda v: bool(MODEL_RE.fullmatch(v)),
+              lambda v: "Model: %r is not a model id" % v),
+    "Base": (lambda v: bool(BASE_RE.fullmatch(v)),
+             lambda v: "Base: %r is not a branch name" % v),
+    "Not before": (lambda v: bool(NOT_BEFORE_RE.fullmatch(v)),
+                   lambda v: "Not before: %r is not a UTC time like 2026-10-13T17:00:00Z" % v),
+}
+
+
+def _check_header(key: str, value: str) -> None:
+    ok, message = _HEADER_RULES[key]
+    if not ok(value):
+        raise ValueError(message(value))
+
+
 def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     """Split the leading Difficulty:, Model: and Base: lines from the rest.
 
@@ -63,12 +87,7 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
         key, value = m.group(1), m.group(2).strip()
         if key in headers:
             raise ValueError("%s: given twice" % key)
-        if key == "Difficulty" and value not in DIFFICULTIES:
-            raise ValueError("Difficulty: must be one of %s" % ", ".join(DIFFICULTIES))
-        if key == "Model" and not MODEL_RE.fullmatch(value):
-            raise ValueError("Model: %r is not a model id" % value)
-        if key == "Base" and not BASE_RE.fullmatch(value):
-            raise ValueError("Base: %r is not a branch name" % value)
+        _check_header(key, value)
         headers[key] = value
         i += 1
     rest = lines[i:]
@@ -81,7 +100,40 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     return headers, "\n".join(rest).rstrip("\n")
 
 
-def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1) -> str:
+class Fix:
+    """A loom:fix comment: the lane's open pull request and what to fix on it."""
+
+    def __init__(self, pr: int, branch: str, findings: str) -> None:
+        self.pr = pr
+        self.branch = branch
+        self.findings = findings
+
+
+FIX_MARKER = "<!-- loom:fix v1 -->"
+FIX_PR_RE = re.compile(r"Pull request: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+), "
+                       r"branch (loom/[A-Za-z0-9._/-]+)[ \t]*")
+# Lines in the findings the runner could read as a brief header or a section
+# of the ticket get indented, which makes them plain quoted text.
+_FIX_UNSAFE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Difficulty|Fix-PR):|#{1,2} ")
+
+
+def parse_fix(repo: str, body: Optional[str]) -> Fix:
+    """A loom:fix comment written by bus.brain fix. Raises ValueError when it
+    names another repo or a branch the runner would refuse."""
+    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].strip() != FIX_MARKER:
+        raise ValueError("not a loom:fix comment")
+    m = FIX_PR_RE.fullmatch(lines[1]) if len(lines) > 1 else None
+    if not m:
+        raise ValueError("loom:fix comment names no pull request and branch")
+    if m.group(1) != repo:
+        raise ValueError("loom:fix comment names a pull request in another repo")
+    rest = ["    " + l if _FIX_UNSAFE_RE.match(l) else l for l in lines[2:]]
+    return Fix(int(m.group(2)), m.group(3), "\n".join(rest).strip("\n"))
+
+
+def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
+                 fix: Optional[Fix] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -89,15 +141,21 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1) 
         "# Brief: %s" % ticket_name(repo, number, attempt),
         "",
         "Repo: %s" % repo,
-        "Branch: %s" % branch_for(number, title, attempt),
+        "Branch: %s" % (fix.branch if fix else branch_for(number, title, attempt)),
         "Lane: %s" % lane,
         "Issue: %s#%d" % (repo, number),
     ]
-    out += ["%s: %s" % (k, v) for k, v in headers.items()]
+    if fix:
+        out.append("Fix-PR: %d" % fix.pr)
+    out += ["%s: %s" % (k, v) for k, v in headers.items() if k != "Not before"]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
     if body:
         text += body + "\n"
+    if fix:
+        text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
+                 "Fix what is listed below on that branch: change only what the findings "
+                 "need and keep the rest of the work.\n\n%s\n" % (fix.pr, fix.branch, fix.findings))
     return text
 
 
@@ -156,3 +214,11 @@ def trusted(issue: Dict[str, Any], events: List[Dict[str, Any]],
     if not owner or owner not in {o.lower() for o in owners}:
         return False, "repo owner %s is not in LOOM_REPO_OWNERS" % (owner or "unknown")
     return True, "ok"
+
+
+def not_before(headers: Dict[str, str]) -> Optional[float]:
+    """The ticket's Not before: time as epoch seconds, or None."""
+    value = headers.get("Not before")
+    if not value:
+        return None
+    return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
