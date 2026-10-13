@@ -277,7 +277,7 @@ create it. The tick deletes it when done. Hard limit: 15 minutes.
 someone else).
 
 Order (#35): read lane status; gather events since the last journal entry
-(checks, reviews, comments, outcomes); review and ship ready pull requests
+(checks, reviews, comments, outcomes); review and ship merge-ready pull requests
 (read every diff, green checks and the review bot, answer every thread);
 verify shipped work live and close only then; pick the next problems by
 impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
@@ -285,6 +285,29 @@ tickets in flight per goal (queued, briefed, running, pr or failed; merged
 and shipped tickets hold no slot);
 write the journal; report when due; release the lock. No retry loops: a
 failed step is journalled and left for the next tick.
+
+## Merge-ready
+
+A lane pull request is merge-ready if and only if all four hold:
+
+- its head commit's check rollup is `SUCCESS`;
+- the newest submitted review from the review bot (`LOOM_REVIEW_BOT`, else
+  `grug-tribe`, and an app, not a person with that login) is not
+  `CHANGES_REQUESTED`. Only the newest counts: a `CHANGES_REQUESTED`
+  followed by newer `COMMENTED` reviews no longer blocks, and reviews and
+  replies from anyone else never change the verdict;
+- it has no unresolved review thread;
+- every thread the review bot opened (a finding) is older than the head
+  commit, so a fix-up commit came after each finding.
+
+`python3 -m bus.brain status` prints this per pull request: `READY`, or
+`blocked:` and every blocker that applies, for example `blocked: checks
+failure, grug changes_requested, 3 unresolved threads`. It is computed by
+`bus.brain.merge_ready` from the one GraphQL read status already makes and
+nothing else, so two runs over the same pull request state print the same
+verdict. A tick takes that line as given instead of re-reading the review
+list. `bus.brain merge` keeps its own checks; this signal does not change
+what it accepts.
 
 ## Journal
 
@@ -299,6 +322,21 @@ Tick <UTC time>, <holder>
 - Asks: <links or none>
 - Cost: <GitHub requests>, <minutes>
 ```
+
+A journal may also carry handoff lines (docs/MUSE.md, Handing off stage
+work), each an HTML comment:
+
+```markdown
+<!-- loom:defer v1 stage=merge item=<owner/name>#<number> rev=<revision> holder=<name> -->
+<!-- loom:done v1 stage=merge item=<owner/name>#<number> holder=<name> -->
+```
+
+`python3 -m bus.brain defer` and `done` print them; the revision is the item
+when deferred (a pull request's head commit, an issue's state and comment
+count). Only journals from `LOOM_BRIEF_AUTHORS` logins count. For each stage
+and item the newest line wins; `python3 -m bus.brain resume OWNER/NAME...
+--holder NAME` lists the defers still standing whose item is open and
+unchanged, and refuses unless that holder holds the tick lock.
 
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
