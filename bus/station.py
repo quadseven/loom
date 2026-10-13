@@ -921,6 +921,8 @@ class Station:
         """The first line of the newest loom:human comment from an allowed
         login (the brain's ask), or "" when there is none."""
         allowed = {a.lower() for a in self.s.authors}
+        # paginate asks for 100 a page and follows the next links, so the
+        # newest comment is read however long the thread is.
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
         for c in reversed(comments):
             body = str(c.get("body") or "") if isinstance(c, dict) else ""
@@ -1040,6 +1042,16 @@ class Station:
             sent["digest"] = today
             _write_json(path, sent)
 
+    def _human_section(self, digest: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
+        """The due digest's asks and its "Waiting on you" text. When the
+        loom:human list cannot be read whole, the digest waits (no asks, no
+        text); urgent asks still go."""
+        found = self._gather_human()
+        text = self._human_text(found) if found else ""
+        if found is None or text is None:
+            return [], ""
+        return digest, text
+
     def forward_asks(self) -> None:
         if not self.s.webhook_ssm:
             # Not configured: skip quietly; a line every minute would only grow
@@ -1060,15 +1072,7 @@ class Station:
             return
         todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
         digest = [i for k, _, i in keyed if trust.get(k)] if digest_due else []
-        human = ""
-        if digest_due:
-            found = self._gather_human()
-            text = self._human_text(found) if found else ""
-            if found is None or text is None:
-                # The digest waits for the whole list; urgent asks still go.
-                digest = []
-            else:
-                human = text
+        digest, human = self._human_section(digest) if digest_due else ([], "")
         if not todo and not digest and not human:
             return
         url = self._webhook()
