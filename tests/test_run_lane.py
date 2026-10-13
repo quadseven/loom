@@ -81,6 +81,7 @@ if [ "$1 $2" = "pr view" ]; then
   esac
 fi
 if [ "$1 $2" = "pr edit" ]; then
+  [ -z "${FAKE_GH_EDIT_FAIL:-}" ] || { echo "gh pr edit failed" >&2; exit 1; }
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) printf '%s' "$2" > "${FAKE_PR_TITLE:-/dev/null}"; shift 2 ;;
@@ -547,6 +548,67 @@ class LaneRunnerTest(unittest.TestCase):
         log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
         self.assertIn("proposed text refused", log)
         self.assertIn("review bot", log)
+        self.assertIn("PR text repair refused", log)
+        self.assertNotIn("PR text is current", log)
+        self.assertFalse(new_body_file.exists())
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+
+    def test_a_fix_brief_whose_pr_text_repair_helper_fails_is_parked(self):
+        # The agent makes no code change and the gh pr edit call fails; the
+        # brief is parked rather than treated as "text is current".
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+
+        corrected_issue = {"number": 42, "title": "Fix the thing",
+                           "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                                    "## Acceptance criteria\n- [ ] The thing works\n"
+                                    "- [ ] A test covers the thing\n\n"
+                                    "## Size\nS\n\n"
+                                    "## Out of scope\n- Nothing else\n")}
+        fix = tickets.parse_fix("example/repo", (
+            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "### Check: lint\n\n    E501 line too long\n" % self.FIX_BRANCH))
+        name = tickets.ticket_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md",
+                        tickets.render_brief("example/repo", corrected_issue, "codex", 2, fix))
+
+        old_issue = {"number": 42, "title": "Fix the thing",
+                     "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                              "## Acceptance criteria\n- [ ] The thing works\n\n"
+                              "## Size\nS\n\n"
+                              "## Out of scope\n- Nothing else\n")}
+        old_brief = tickets.render_brief("example/repo", old_issue, "codex", 2)
+        old_body = pr_repair._render_generated(
+            pr_repair._normalise(old_brief), "codex", "gpt-test-default", name)
+
+        pr_title_file = Path(self._tmp.name) / "pr_title"
+        pr_body_file = Path(self._tmp.name) / "pr_body"
+        new_title_file = Path(self._tmp.name) / "new_title"
+        new_body_file = Path(self._tmp.name) / "new_body"
+        pr_title_file.write_text("Fix the thing")
+        pr_body_file.write_text(old_body)
+
+        before = self.remote_head(self.FIX_BRANCH)
+        result = self.run_lane(
+            FAKE_AGENT="noop",
+            FAKE_GH_EXISTING="7",
+            FAKE_GH_PR_TITLE=str(pr_title_file),
+            FAKE_GH_PR_BODY=str(pr_body_file),
+            FAKE_PR_TITLE=str(new_title_file),
+            FAKE_PR_BODY=str(new_body_file),
+            FAKE_GH_EDIT_FAIL="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)  # no code commit
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("PR text repair failed", log)
+        self.assertNotIn("PR text is current", log)
         self.assertFalse(new_body_file.exists())
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
 

@@ -71,12 +71,27 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
         self.assertIn("\nRefs example-owner/example-repo#42", body)
 
+    # A realistic current PR body, matching the runner's pr_body() format.
+    # Kept literal so the test catches drift in _render_generated, rather than
+    # building the 'current' body with the same function that builds the desired one.
+    CURRENT_BODY = (
+        "## Why\nThe thing is broken for every user.\n\n"
+        "## Summary\nMake the thing work.\n\n"
+        "## Acceptance criteria\n- [ ] The thing works\n"
+        "- [ ] A test covers the thing\n"
+        "- [ ] Nothing else changes\n\n"
+        "Size: S\n\n"
+        "## Out of scope\n- Other things\n\n"
+        "---\n"
+        "Loom ticket T42, lane codex, model gpt-test.\n"
+        "Refs example-owner/example-repo#42")
+
     def test_no_change_when_body_and_title_match(self):
-        body = self.generated_body()
         self.write_brief(BRIEF)
-        result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
+        result = pr_repair.reconcile(
+            self.brief, "Fix the thing", self.CURRENT_BODY, "codex", "gpt-test", "T42")
         self.assertFalse(result["changed"])
-        self.assertEqual(result["body"], body)
+        self.assertEqual(result["body"], self.CURRENT_BODY)
         self.assertEqual(result["old_hash"], result["new_hash"])
         self.assertEqual(result["reason"], "")
 
@@ -116,6 +131,14 @@ class ReconcileTest(unittest.TestCase):
         result = pr_repair.reconcile(self.brief, "Fix the thing", "no headings here", "codex", "gpt-test", "T42")
         self.assertFalse(result["changed"])
         self.assertTrue(result["reason"].startswith("cannot reconcile"))
+
+    def test_refuses_body_with_footer_rule_before_generated_sections(self):
+        # A leading rule line is not a footer for the generated sections.
+        body = "---\n## Why\nBroken.\n\n## Summary\nFix it.\n\n## Acceptance criteria\n- [ ] Works\n\nSize: S\n\n## Out of scope\n- Nothing"
+        self.write_brief(BRIEF)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
+        self.assertFalse(result["changed"])
+        self.assertIn("footer rule missing", result["reason"])
 
     def test_refuses_proposed_text_that_mentions_bot(self):
         body = self.generated_body()

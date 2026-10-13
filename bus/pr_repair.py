@@ -101,7 +101,7 @@ def _hash_generated(body: str) -> str:
     start = min((_find_heading(body, h) for h in GENERATED_HEADINGS), default=-1)
     if start < 0:
         raise ValueError("generated headings missing")
-    if ("\n" + FOOTER_RULE + "\n") not in body and not body.startswith(FOOTER_RULE + "\n"):
+    if body.find("\n" + FOOTER_RULE + "\n", start) < 0:
         raise ValueError("footer rule missing")
     return _sha12(body[start:])
 
@@ -121,10 +121,9 @@ def _split_current(body: str) -> Tuple[str, str, str]:
 
     rule_match = None
     for m in re.finditer(r"\n" + re.escape(FOOTER_RULE) + r"\n", body):
-        rule_match = m
-    if rule_match is None and body.startswith(FOOTER_RULE + "\n"):
-        rule_match = type("M", (), {"start": lambda self: 0,
-                                     "end": lambda self: len(FOOTER_RULE) + 1})()
+        if m.start() >= start:
+            rule_match = m
+            break
     if rule_match is None:
         raise ValueError("footer rule missing")
 

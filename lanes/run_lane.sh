@@ -624,10 +624,31 @@ for BRIEF in "$INBOX"/*.md; do
   # For fix-mode briefs, reconcile generated PR sections with the approved
   # ticket revision. A metadata-only repair is a valid outcome.
   METADATA_CHANGED=0
+  REPAIR_RC=""
   if [ -n "$FIX_PR" ]; then
-    if repair_pr_text >> "$LOG" 2>&1; then
-      METADATA_CHANGED=1
-    fi
+    repair_pr_text >> "$LOG" 2>&1
+    REPAIR_RC=$?
+    case "$REPAIR_RC" in
+      0) METADATA_CHANGED=1 ;;
+      1) ;; # text is current
+      2)
+        # Refused text is parked only when there is no code commit to push.
+        if [ "$COMMITTED" -eq 0 ]; then
+          park "$BRIEF" "PR text repair refused on #$FIX_PR"
+          continue
+        fi ;;
+      3)
+        # A helper error is parked only when there is no code commit to push.
+        if [ "$COMMITTED" -eq 0 ]; then
+          park "$BRIEF" "PR text repair failed on #$FIX_PR"
+          continue
+        fi ;;
+      *)
+        if [ "$COMMITTED" -eq 0 ]; then
+          park "$BRIEF" "PR text repair returned $REPAIR_RC on #$FIX_PR"
+          continue
+        fi ;;
+    esac
   fi
   if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ]; then
     park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
