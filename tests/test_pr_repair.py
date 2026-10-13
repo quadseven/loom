@@ -38,6 +38,21 @@ S: one function.
 - Other things
 """
 
+# The body run_lane.sh::pr_body writes for BRIEF. Kept literal so a test that
+# starts from it catches drift in _render_generated, rather than building the
+# 'current' body with the same function that builds the desired one.
+RUNNER_BODY = (
+    "## Why\nThe thing is broken for every user.\n\n"
+    "## Summary\nMake the thing work.\n\n"
+    "## Acceptance criteria\n- [ ] The thing works\n"
+    "- [ ] A test covers the thing\n"
+    "- [ ] Nothing else changes\n\n"
+    "Size: S\n\n"
+    "## Out of scope\n- Other things\n\n"
+    "---\n"
+    "Loom ticket T42, lane codex, model gpt-test.\n"
+    "Refs example-owner/example-repo#42")
+
 BRIEF_CORRECTED = BRIEF.replace(
     "- [ ] A test covers the thing",
     "- [ ] A test covers the thing\n- [ ] The edge case is handled")
@@ -55,14 +70,9 @@ class ReconcileTest(unittest.TestCase):
         with open(self.brief, "w", encoding="utf-8") as fh:
             fh.write(text)
 
-    def generated_body(self, brief_text=BRIEF):
-        self.write_brief(brief_text)
-        with open(self.brief, encoding="utf-8") as fh:
-            brief = fh.read()
-        return pr_repair._render_generated(pr_repair._normalise(brief), "codex", "gpt-test", "T42")
-
     def test_rendered_body_matches_runner_format(self):
-        body = self.generated_body()
+        body = pr_repair._render_generated(pr_repair._normalise(BRIEF), "codex", "gpt-test", "T42")
+        self.assertEqual(body, RUNNER_BODY)
         self.assertIn("## Why\nThe thing is broken for every user.", body)
         self.assertIn("## Summary\nMake the thing work.", body)
         self.assertIn("## Acceptance criteria\n- [ ] The thing works", body)
@@ -71,32 +81,17 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
         self.assertIn("\nRefs example-owner/example-repo#42", body)
 
-    # A realistic current PR body, matching the runner's pr_body() format.
-    # Kept literal so the test catches drift in _render_generated, rather than
-    # building the 'current' body with the same function that builds the desired one.
-    CURRENT_BODY = (
-        "## Why\nThe thing is broken for every user.\n\n"
-        "## Summary\nMake the thing work.\n\n"
-        "## Acceptance criteria\n- [ ] The thing works\n"
-        "- [ ] A test covers the thing\n"
-        "- [ ] Nothing else changes\n\n"
-        "Size: S\n\n"
-        "## Out of scope\n- Other things\n\n"
-        "---\n"
-        "Loom ticket T42, lane codex, model gpt-test.\n"
-        "Refs example-owner/example-repo#42")
-
     def test_no_change_when_body_and_title_match(self):
         self.write_brief(BRIEF)
         result = pr_repair.reconcile(
-            self.brief, "Fix the thing", self.CURRENT_BODY, "codex", "gpt-test", "T42")
+            self.brief, "Fix the thing", RUNNER_BODY, "codex", "gpt-test", "T42")
         self.assertFalse(result["changed"])
-        self.assertEqual(result["body"], self.CURRENT_BODY)
+        self.assertEqual(result["body"], RUNNER_BODY)
         self.assertEqual(result["old_hash"], result["new_hash"])
         self.assertEqual(result["reason"], "")
 
     def test_updates_generated_sections_and_keeps_reviewer_prefix(self):
-        old_body = self.generated_body()
+        old_body = RUNNER_BODY
         current = "A reviewer note at the top.\n\n" + old_body
         self.write_brief(BRIEF_CORRECTED)
         result = pr_repair.reconcile(self.brief, "Fix the thing", current, "codex", "gpt-test", "T42")
@@ -108,7 +103,7 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(result["reason"], "")
 
     def test_updates_generated_sections_and_keeps_reviewer_suffix(self):
-        old_body = self.generated_body()
+        old_body = RUNNER_BODY
         current = old_body + "\n\nA reviewer note at the bottom."
         self.write_brief(BRIEF_CORRECTED)
         result = pr_repair.reconcile(self.brief, "Fix the thing", current, "codex", "gpt-test", "T42")
@@ -119,7 +114,7 @@ class ReconcileTest(unittest.TestCase):
         self.assertNotIn("- [ ] A test covers the thing\n- [ ] Nothing else changes", result["body"])
 
     def test_updates_title_when_ticket_title_changed(self):
-        body = self.generated_body()
+        body = RUNNER_BODY
         corrected = BRIEF.replace("Fix the thing", "Repair the thing")
         self.write_brief(corrected)
         result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
@@ -141,7 +136,7 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("footer rule missing", result["reason"])
 
     def test_refuses_proposed_text_that_mentions_bot(self):
-        body = self.generated_body()
+        body = RUNNER_BODY
         bad = BRIEF.replace("every user", "every user @" + text.REVIEW_BOT_SHORT_NAME)
         self.write_brief(bad)
         result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
@@ -149,7 +144,7 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("review bot", result["reason"])
 
     def test_refuses_proposed_title_that_mentions_bot(self):
-        body = self.generated_body()
+        body = RUNNER_BODY
         bad = BRIEF.replace("# T42: Fix the thing", "# T42: ask @" + text.REVIEW_BOT_SHORT_NAME)
         self.write_brief(bad)
         result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
@@ -157,7 +152,7 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("review bot", result["reason"])
 
     def test_refuses_proposed_text_with_closing_keyword(self):
-        body = self.generated_body()
+        body = RUNNER_BODY
         bad = BRIEF.replace("Make the thing work.", "Fixes #42.")
         self.write_brief(bad)
         result = pr_repair.reconcile(self.brief, "Fix the thing", body, "codex", "gpt-test", "T42")
@@ -177,9 +172,7 @@ class CliTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_cli_outputs_json_result(self):
-        with open(self.brief, encoding="utf-8") as fh:
-            brief = pr_repair._normalise(fh.read())
-        body = pr_repair._render_generated(brief, "codex", "gpt-test", "T42")
+        body = RUNNER_BODY
         with open(self.pr_json, "w", encoding="utf-8") as fh:
             json.dump({"title": "Fix the thing", "body": body}, fh)
         import io
