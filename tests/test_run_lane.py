@@ -1030,7 +1030,7 @@ cat > /dev/null
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_opencode_temp_paths_and_external_directory_denial_keep_the_sandbox_boundary(self):
-        profile_file = self._tmp.name + "/sandbox.profile"
+        profile_file = str(Path(self._tmp.name) / "sandbox.profile")
         self.write_tool(
             self.bin / "sandbox-exec",
             "#!/bin/sh\n[ \"$1\" = -p ] || exit 91\nprintf '%s' \"$2\" > "
@@ -1050,7 +1050,8 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         home = self.loom / "run" / "opencode-go-home"
         calls = self.calls()
-        self.assertIn(f"tempvars={home}|{home}/tmp|{home}/tmp|{home}/tmp", calls)
+        temp_dir = home / "tmp"
+        self.assertIn(f"tempvars={home}|{temp_dir}|{temp_dir}|{temp_dir}", calls)
         config = next(line.removeprefix("config=") for line in calls if line.startswith("config="))
         self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
         profile = Path(profile_file).read_text()
