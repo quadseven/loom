@@ -33,6 +33,13 @@ def goal():
     return {"number": 1, "id": 101, "state": "open", "title": "Goal", "labels": [{"name": "loom:goal"}]}
 
 
+def ready_node(checks="SUCCESS", reviews=(), threads=()):
+    """One pull request's READY_FIELDS, head committed at 12:45 on 2030-01-01."""
+    return {"commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:45:00Z",
+                                              "statusCheckRollup": {"state": checks}}}]},
+            "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
+
+
 class BrainTests(unittest.TestCase):
     def test_status_sections_and_request_ceiling(self):
         gh = GitHub("t", transport=Fake(
@@ -42,8 +49,8 @@ class BrainTests(unittest.TestCase):
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
             reply(200, []), reply(200, [])))
-        report = brain.status(gh, [REPO], REPO)
-        for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "SUCCESS", "1 unresolved threads"):
+        report = brain.status(gh, [REPO], REPO, env={})
+        for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request; lane repo: issues
         # (no loom:lanes issue here, so no comments read). The fake has no
@@ -56,9 +63,124 @@ class BrainTests(unittest.TestCase):
             reply(200, []), reply(200, []),
             reply(200, [lanes_issue]),
             reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z"}])))
-        report = brain.status(gh, [REPO], REPO)
+        report = brain.status(gh, [REPO], REPO, env={})
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
+
+    def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"},
+                 {"number": 2, "title": "Stale", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"}]
+        bot = {"login": "brain-bot"}
+        g1 = [{"body": "<!-- loom:journal v1 -->\n- Measure: p95 2s\n- Shipped: #5", "createdAt": "2030-01-01T19:45:00Z", "author": bot},
+              {"body": "<!-- loom:report v1 -->\n- Measure: p95 2s", "createdAt": "2030-01-01T19:00:00Z", "author": bot}]
+        g2 = [{"body": "<!-- loom:journal v1 -->\n- Shipped: none", "createdAt": "2030-01-01T19:50:00Z", "author": bot},
+              {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T14:26:00Z", "author": bot}]
+        gh = GitHub("t", transport=Fake(
+            reply(200, goals), reply(200, []),
+            reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
+            reply(200, [])))
+        report = brain.status(gh, [REPO], REPO, env={}, now=now, authors=["brain-bot"])
+        self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
+                      "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
+        self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T14:26:00Z, "
+                      "measure none, action none - report overdue (due 2030-01-01T16:26:00Z)", report)
+        owed = report.split("### Reports owed before unlock")[1].split("###")[0]
+        self.assertIn("#2 report OVERDUE since 2030-01-01T16:26:00Z", owed)
+        self.assertNotIn("#1", owed)
+
+    def test_only_a_marked_report_on_the_goal_advances_its_deadline(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        issue = {"number": 3, "created_at": "2030-01-01T17:00:00Z"}
+        bot = {"login": "brain-bot"}
+        ignored = [
+            {"body": "<!-- loom:journal v1 -->\nquoting <!-- loom:report v1 -->", "createdAt": "2030-01-01T19:55:00Z", "author": bot},
+            {"body": "Summary\n<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:56:00Z", "author": bot},
+            {"body": "<!-- loom:report v1 -->\nfrom a stranger", "createdAt": "2030-01-01T19:57:00Z", "author": {"login": "stranger"}},
+        ]
+        led = brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, now, ["brain-bot"])
+        self.assertNotIn("report", led)
+        self.assertEqual((led["state"], led["due"]), ("overdue", "2030-01-01T19:00:00Z"))
+        earlier = brain.datetime(2030, 1, 1, 19, 15, tzinfo=brain.timezone.utc)
+        self.assertEqual(brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, earlier, ["brain-bot"])["state"], "due")
+        marked = ignored + [{"body": "<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:58:00Z", "author": bot}]
+        led = brain.goal_ledger(issue, {"comments": {"nodes": marked}}, now, ["brain-bot"])
+        self.assertEqual((led["report"], led["state"], led["due"]),
+                         ("2030-01-01T19:58:00Z", "ok", "2030-01-01T21:58:00Z"))
+
+    def test_goal_without_any_stamp_is_unknown_not_young(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        led = brain.goal_ledger({"number": 4}, {"comments": {"nodes": []}}, now)
+        self.assertEqual((led["state"], led["due"]), ("unknown", None))
+
+    def test_report_deadline_changes_state_at_due_and_grace(self):
+        last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
+        due = last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        grace = brain.timedelta(seconds=brain.REPORT_GRACE)
+        for now, state in ((due - brain.timedelta(seconds=1), "ok"),
+                           (due, "due"),
+                           (due + grace - brain.timedelta(seconds=1), "due"),
+                           (due + grace, "overdue")):
+            with self.subTest(now=now):
+                self.assertEqual(brain._report_deadline(last, now), (due, state))
+
+    def test_merge_ready_names_each_blocker(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        cases = [
+            ({}, "blocked: checks unknown"),
+            (ready_node(), "READY"),
+            (ready_node(checks="FAILURE"), "blocked: checks failure"),
+            (ready_node(reviews=[{"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
+             "blocked: grug changes_requested"),
+            (ready_node(threads=[{"isResolved": False}] * 3), "blocked: 3 unresolved threads"),
+            # A resolved finding posted after the head commit has no fix-up commit.
+            (ready_node(threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T13:00:00Z"}]}}]),
+             "blocked: 1 grug findings with no fix-up commit after them"),
+            # A person with the bot's login is not the bot.
+            (ready_node(reviews=[{"author": {"__typename": "User", "login": "grug-tribe"}, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
+             "READY"),
+            (ready_node(checks="PENDING", threads=[{"isResolved": False}]), "blocked: checks pending, 1 unresolved threads"),
+        ]
+        for node, want in cases:
+            with self.subTest(want=want):
+                self.assertEqual(brain.merge_ready(node, "grug-tribe"), want)
+
+    def test_merge_ready_follows_the_newest_review_and_two_status_runs_agree(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        operator = {"__typename": "User", "login": "example-operator"}
+        node = ready_node(
+            reviews=[{"author": {"__typename": "Bot", "login": "GRUG-TRIBE"}, "state": "COMMENTED", "submittedAt": "2030-01-01T12:30:00Z"},
+                     {"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"},
+                     {"author": operator, "state": "COMMENTED", "submittedAt": "2030-01-01T11:37:00Z"},
+                     {"author": bot, "state": "COMMENTED", "submittedAt": "2030-01-01T12:00:00Z"},
+                     {"author": bot, "state": "PENDING", "submittedAt": None}],
+            threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T08:06:00Z"}]}},
+                     {"isResolved": True, "root": {"nodes": [{"author": operator, "createdAt": "2030-01-01T11:37:00Z"}]}}])
+        pulls = [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]
+
+        def run():
+            gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
+                                            reply(200, {"data": {"repository": {"p4": node}}}),
+                                            reply(200, [])))
+            return [line for line in brain.status(gh, [REPO], REPO, env={}).splitlines()
+                    if line.startswith("- #4 ")]
+
+        first, second = run(), run()
+        self.assertEqual(first, ["- #4 PR - READY"])
+        self.assertEqual(first, second)
+        # Had the stale review been the newest, the same data would block.
+        node["reviews"]["nodes"][0]["state"] = "CHANGES_REQUESTED"
+        self.assertEqual(run(), ["- #4 PR - blocked: grug changes_requested"])
+
+    def test_status_asks_for_every_field_merge_ready_reads(self):
+        fake = Fake(reply(200, []), reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
+                    reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []))
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        self.assertIn("- #4 PR - blocked: checks unknown", report)
+        query = fake.calls[2][2]["query"]
+        for field in ("committedDate", "statusCheckRollup", "reviews(last:100)", "submittedAt",
+                      "reviewThreads(first:100)", "isResolved", "createdAt", "__typename"):
+            self.assertIn(field, query)
 
     def test_brief_refusals_create_nothing(self):
         cases = [
@@ -1103,6 +1225,156 @@ class OnboardTests(unittest.TestCase):
             self.assertEqual(brain.main(["onboard", REPO]), 0)
         printed = "".join(c.args[0] for c in out.write.call_args_list)
         self.assertIn('LOOM_REPOS="%s"' % REPO, printed)
+
+
+class GoalRepo:
+    """Goal #1 and its tickets on GitHub: remembers issues, labels, bodies,
+    sub-issue links and comments written to it."""
+
+    def __init__(self, tickets=()):
+        self.issues = {1: goal()}
+        self.children = []
+        self.comments = []
+        self.calls = []
+        for t in tickets:
+            self.issues[t["number"]] = t
+            self.children.append(t["number"])
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1].split("?")[0][len("/repos/%s/issues" % REPO):]
+        self.calls.append((method, path, payload))
+        parts = path.strip("/").split("/")
+        number = int(parts[0]) if parts[0] else None
+        handler = getattr(self, "_%s_%s" % (method.lower(), parts[1] if len(parts) > 1 else "issue"))
+        return handler(number, payload)
+
+    def _get_issue(self, number, payload):
+        found = self.issues.get(number)
+        return reply(200, found) if found else reply(404, {"message": "Not Found"})
+
+    def _get_sub_issues(self, number, payload):
+        return reply(200, [self.issues[n] for n in self.children])
+
+    def _post_issue(self, number, payload):
+        made = 200 + len(self.issues)
+        self.issues[made] = dict(item(made, payload["body"], payload["labels"]),
+                                 html_url="https://example.com/t/%d" % made)
+        return reply(201, self.issues[made])
+
+    def _post_sub_issues(self, number, payload):
+        self.children.append(payload["sub_issue_id"] - 1000)
+        return reply(201, {})
+
+    def _patch_issue(self, number, payload):
+        self.issues[number]["body"] = payload["body"]
+        return reply(200, self.issues[number])
+
+    def _put_labels(self, number, payload):
+        self.issues[number]["labels"] = [{"name": n} for n in payload["labels"]]
+        return reply(200, [])
+
+    def _post_comments(self, number, payload):
+        self.comments.append((number, payload["body"]))
+        return reply(201, {})
+
+    def names(self, number):
+        return [x["name"] for x in self.issues[number]["labels"]]
+
+    def created(self):
+        return [c for c in self.calls if c[0] == "POST" and c[1] == ""]
+
+
+def evidenced(number, evidence="p95 claim wait rose from 40 s to 900 s after it shipped"):
+    return BODY.replace("## Why\nwhy", "## Why\nRegresses #%d\n%s" % (number, evidence))
+
+
+class RegressionSlotTests(unittest.TestCase):
+    ORDINARY = ["queued", "briefed", "running", "pr"] * 4
+
+    def full_goal(self, *extra):
+        flying = [item(10 + i, labels=["loom:ticket", "loom:" + s])
+                  for i, s in enumerate(self.ORDINARY)]
+        return GoalRepo(flying + list(extra))
+
+    def brief(self, fake, body=BODY, **kw):
+        return brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", body, "codex", **kw)
+
+    def test_a_full_goal_admits_one_shipped_regression_and_refuses_ordinary_work(self):
+        fake = self.full_goal(item(5, labels=["loom:ticket", "loom:shipped", "lane:claude"],
+                                   html_url="https://example.com/t/5"))
+        with self.assertRaisesRegex(ValueError, "16 tickets in flight"):
+            self.brief(fake)
+        url = self.brief(fake, evidenced(5), regresses=5)
+        # The shipped ticket itself is re-briefed: no new issue.
+        self.assertEqual(url, "https://example.com/t/5")
+        self.assertEqual(fake.created(), [])
+        self.assertEqual(sorted(fake.names(5)),
+                         ["lane:codex", "loom:briefed", "loom:regression", "loom:ticket"])
+        self.assertIn("## Regression\n\nTicket\n\nRegresses #5\np95 claim wait",
+                      fake.issues[5]["body"])
+        self.assertEqual(len(fake.comments), 1)
+        on, note = fake.comments[0]
+        self.assertEqual(on, 1)
+        self.assertIn(brain.REGRESSION_MARKER, note)
+        self.assertIn("through the regression slot, with 16 other tickets in flight (cap 16)", note)
+        self.assertIn("p95 claim wait", note)
+        with self.assertRaisesRegex(ValueError, "17 tickets in flight"):
+            self.brief(fake)
+
+    def test_the_same_regression_twice_is_admitted_once_and_the_slot_holds_one(self):
+        fake = self.full_goal(
+            item(5, state="closed", state_reason="completed", labels=["loom:ticket", "loom:verified"]),
+            item(6, labels=["loom:ticket", "loom:shipped"]))
+        first = self.brief(fake, evidenced(5), regresses=5)
+        again = self.brief(fake, evidenced(5, "measured again"), regresses=5)
+        self.assertEqual(first, again)
+        self.assertEqual(len(fake.created()), 1)
+        made = fake.created()[0][2]
+        self.assertIn("loom:regression", made["labels"])
+        self.assertEqual(len(fake.comments), 1)
+        # The slot is held: another regression and ordinary work both wait.
+        with self.assertRaisesRegex(ValueError, "slot is held by #2[0-9]+, with 16 other "
+                                                "tickets in flight \\(cap 16\\)"):
+            self.brief(fake, evidenced(6), regresses=6)
+        with self.assertRaisesRegex(ValueError, "17 tickets in flight"):
+            self.brief(fake)
+        self.assertEqual(len(fake.created()), 1)
+
+    def test_under_the_cap_a_regression_is_labelled_and_records_nothing(self):
+        fake = GoalRepo([item(5, labels=["loom:ticket", "loom:verified"])])
+        self.brief(fake, evidenced(5), regresses=5)
+        self.assertIn("loom:regression", fake.names(5))
+        self.assertEqual(fake.comments, [])
+
+    def test_refusals_write_nothing(self):
+        cases = [
+            (99, evidenced(99), "#99: ticket not found"),
+            (5, evidenced(5), "closed as not planned"),
+            (6, evidenced(6), "only a shipped or verified ticket can regress"),
+            (7, evidenced(7), "#7 is not a loom:ticket"),
+            (8, BODY.replace("## Why\nwhy", "## Why\nRegresses #8\n"), "measured evidence"),
+            (8, BODY, "has the line Regresses #8"),
+        ]
+        for number, body, why in cases:
+            with self.subTest(why=why):
+                fake = self.full_goal(
+                    item(5, state="closed", state_reason="not_planned", labels=["loom:ticket"]),
+                    item(6, labels=["loom:ticket", "loom:pr"]),
+                    item(7, labels=["loom:shipped"]),
+                    item(8, labels=["loom:ticket", "loom:shipped"]))
+                with self.assertRaisesRegex(ValueError, why):
+                    self.brief(fake, body, regresses=number)
+                self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_refs_and_regresses_do_not_go_together(self):
+        with self.assertRaisesRegex(ValueError, "not both"):
+            self.brief(GoalRepo(), evidenced(5), regresses=5, refs=6)
+
+    def test_the_command_line_takes_regresses(self):
+        args = brain.parser().parse_args(["brief", REPO, "--goal", "1", "--title", "T",
+                                          "--file", "b.md", "--regresses", "5"])
+        self.assertEqual(args.regresses, 5)
 
 
 if __name__ == "__main__":
