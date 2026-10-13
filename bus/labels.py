@@ -12,9 +12,12 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
 # most; claude has none, because it spends the operator's own subscription.
 # opencode-go-3 runs its own model (LOOM_OPENCODE_GO_3_MODEL), a separate
-# allowance on the same subscription.
+# allowance on the same subscription; opencode-go-4 runs Muse Spark
+# Contributor (LOOM_OPENCODE_GO_4_MODEL), which trains on prompts, so it
+# takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
-         "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3"]
+         "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
+         "opencode-go-4"]
 LANES = LANES + SLOTS
 
 # The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
