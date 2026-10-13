@@ -1752,7 +1752,8 @@ class Station:
                         review_check=self.s.review_check,
                         review_bot=self.s.review_bot,
                         limited=self.limited_lanes(),
-                        no_test_repos=self.s.no_test_repos).run()
+                        no_test_repos=self.s.no_test_repos,
+                        available=[x for x in LANES if self._heartbeat_ok(x)]).run()
 
     def prune_trees(self) -> None:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting

@@ -37,6 +37,7 @@ class FakeGitHub:
         self.attempts = {}
         self.update_status = 202
         self.files = {}
+        self.private = True
 
     def ticket(self, number, state, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
         self.issues[number] = {"number": number, "state": "open", "body": body, "user": ME,
@@ -96,6 +97,8 @@ class FakeGitHub:
             m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
             if m:
                 return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
+            if path == "/repos/%s" % REPO:
+                return Response(200, {"private": self.private})
             m = re.search(r"/actions/runs/(\d+)$", path)
             if m:
                 return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})
@@ -134,7 +137,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved = [], [], []
 
-    def go(self, limited=(), no_test_repos=()):
+    def go(self, limited=(), no_test_repos=(), available=None):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes):
@@ -144,7 +147,7 @@ class Base(unittest.TestCase):
             self.moved.append((number, state, lane))
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
                             merge=merge, fix=fix, move=move, limited=limited,
-                            no_test_repos=no_test_repos)
+                            no_test_repos=no_test_repos, available=available)
         f.run()
         return f
 
@@ -589,15 +592,66 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.model(7), self.model(8)), (None, None))
 
-    def test_a_ticket_briefed_on_a_lane_at_a_limit_moves_to_the_next_lane_at_once(self):
+    def limited_easy(self, busy=(), available=None):
+        """An easy ticket briefed on spark at a limit, with a ticket waiting
+        on each lane in `busy`."""
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
                               "created_at": iso(60)}]
-        self.go(limited=["spark"])
-        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+        for n, lane in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.go(limited=["spark"], available=available)
+
+    def test_a_private_easy_ticket_at_a_limit_moves_within_its_tier(self):
+        self.limited_easy()
+        self.assertEqual(self.lane(7), "opencode-go")
+        self.assertEqual(self.model(7), None)  # the lane's own model runs it
         note = self.gh.comments[7][-1]["body"]
         self.assertIn("Not a failure (lane spark is at a limit)", note)
+        self.assertNotIn("loom:rung", note)
         self.assertEqual(self.moved, [])
+
+    def test_a_limit_move_posts_no_rung_marker(self):
+        self.limited_easy()
+        self.assertFalse(any(factory.RUNG_RE.search(c["body"]) for c in self.gh.comments[7]))
+
+    def test_a_private_easy_ticket_never_goes_to_a_public_only_lane(self):
+        self.limited_easy(busy=("opencode-go", "opencode-go-2", "openrouter", "workersai"))
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
+
+    def test_a_public_easy_ticket_may_go_to_zen(self):
+        self.gh.private = False
+        self.limited_easy(busy=("opencode-go", "opencode-go-2", "openrouter", "workersai"))
+        self.assertEqual(self.lane(7), "zen")
+
+    def test_an_easy_ticket_never_goes_to_claude_or_anthropic(self):
+        self.gh.private = False
+        self.limited_easy(busy=factory.TIERS["easy"][1:])
+        self.assertEqual(self.lane(7), "spark")
+        self.assertEqual([c for c in self.gh.comments[7]], [])
+
+    def test_a_lane_without_an_available_heartbeat_is_not_free(self):
+        self.limited_easy(available=["openrouter"])
+        self.assertEqual(self.lane(7), "openrouter")
+
+    def test_a_medium_ticket_takes_an_anthropic_slot_only_when_codex_and_opencode_go_are_full(self):
+        body = "Difficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="codex", body=body)
+        self.gh.ticket(8, "briefed", lane="codex", body=body)
+        self.go(limited=["codex"])
+        self.assertEqual(sorted((self.lane(7), self.lane(8))), ["codex-2", "opencode-go"])
+        self.setUp()
+        self.gh.ticket(7, "briefed", lane="codex", body=body)
+        for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2"), 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.go(limited=["codex"])
+        self.assertEqual(self.lane(7), "anthropic")
+
+    def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
+        body = "Model: claude-opus-5-5\nDifficulty: easy\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.go(limited=["claude"])
+        self.assertEqual((self.lane(7), self.model(7)), ("anthropic", "claude-opus-5-5"))
 
     def test_a_ticket_on_a_lane_that_is_not_limited_waits_as_before(self):
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
@@ -623,13 +677,6 @@ class Tickets(Base):
             self.gh.ticket(n, "briefed", lane="claude")
         self.go()
         self.assertEqual([self.lane(n) for n in range(1, 6)], ["claude"] * 5)
-
-    def test_a_limited_ticket_past_the_last_rung_stays_for_its_lane(self):
-        self.gh.ticket(7, "briefed", lane="spark")
-        self.gh.comments[7] += ALL_RUNGS
-        self.go(limited=["spark"])
-        self.assertEqual(self.lane(7), "spark")
-        self.assertEqual(self.moved, [])
 
     def test_a_pass_stops_after_its_action_cap(self):
         for n in range(1, factory.MAX_ACTIONS + 5):
@@ -657,6 +704,29 @@ class Helpers(unittest.TestCase):
         all_busy = dict(busy, **{lane: 2 for lane in factory.ANTHROPIC})
         self.assertEqual(factory.next_rung({1}, all_busy), 2)
         self.assertEqual(factory.next_rung(set(), dict(all_busy, claude=30)), 2)
+
+    def test_the_tiers_match_the_lane_choice_in_muse_md(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "MUSE.md")) as fh:
+            doc = fh.read()
+        for difficulty, lanes in factory.TIERS.items():
+            m = re.search(r"^- %s:(.*?)(?=^- |^$)" % difficulty.capitalize(), doc, re.M | re.S)
+            bullet = " ".join(m.group(1).split())
+            for lane in lanes:
+                # A slot (anthropic-2, codex-2) is its lane in the doc.
+                self.assertRegex(bullet, r"\b%s\b" % re.sub(r"-\d+$", "", lane),
+                                 "%s lane %s" % (difficulty, lane))
+            if difficulty == "easy":
+                public = re.search(r"\bor ([\w, -]+?) on public repos only", bullet).group(1)
+                for lane in factory.PUBLIC_ONLY:
+                    self.assertIn(lane, public)
+                self.assertFalse([x for x in lanes if x.startswith(("anthropic", "claude"))])
+        self.assertFalse(set(factory.PUBLIC_ONLY) - set(factory.TIERS["easy"]))
+
+    def test_without_model_drops_only_the_header(self):
+        self.assertEqual(factory.without_model("Model: m\nDifficulty: easy\n\nModel: x"),
+                         "Difficulty: easy\n\nModel: x")
+        self.assertEqual(factory.without_model("Difficulty: easy\n\nx"), "Difficulty: easy\n\nx")
 
     def test_tried_rungs_start_again_at_a_rung_zero_marker(self):
         comments = ALL_RUNGS + [{"body": factory.RUNG_MARKER % 0}, {"body": factory.RUNG_MARKER % 2}]
@@ -702,7 +772,7 @@ class Helpers(unittest.TestCase):
 
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
-                         no_test_repos=()):
+                         no_test_repos=(), available=None):
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 
