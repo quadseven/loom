@@ -55,7 +55,8 @@ xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/
 X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")"
 
 # Every LOOM_* setting in the environment, as plist entries. The transcript
-# upload settings are the station's alone: no agent ever sees them.
+# upload settings are the station's alone: no agent ever sees them, and the
+# brain does not need them (the station uploads its ticks from state/brain.json).
 loom_env() {
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
     case "$k" in LOOM_HOME|LOOM_REPO_OWNERS|LOOM_TRANSCRIPT_*) continue ;; LOOM_*) ;; *) continue ;; esac
