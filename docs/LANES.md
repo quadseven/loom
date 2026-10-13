@@ -107,7 +107,12 @@ The station turns trusted
 (`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
 `loom:running`, and later reports the run from `done/` or `failed/` back to the
 ticket, with local paths removed from failure reasons; the runner adds
-`Refs <owner/name>#<number>` to the pull request. It reads `LOOM_REPOS`,
+`Refs <owner/name>#<number>` to the pull request. A limit or transient
+failure moves the ticket to another available lane as a new attempt, at most
+`LOOM_RETRY_MAX` times (default 2); a failed fix round goes back to
+`loom:pr`; a lane that hit its provider limit stays unavailable until the
+provider's reset (else 60 minutes; delete its heartbeat file in
+`state/usage/` to clear it sooner). It reads `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.

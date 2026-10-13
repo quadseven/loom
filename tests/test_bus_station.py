@@ -59,6 +59,7 @@ class FakeGitHub:
         self.page_reply = None
         self.goals = []
         self.goal_error = False
+        self.private = True
         self.threads = {}
         self.reply_fails = set()
         self.replies = []
@@ -127,6 +128,8 @@ class FakeGitHub:
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
+        if method == "GET" and parts.path == "/repos/%s" % REPO:
+            return reply(200, {"full_name": REPO, "private": self.private})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
             return self._post_page(data)
@@ -231,6 +234,9 @@ class FakeGitHub:
             self.comments[n].append({"body": data["body"]})
             return reply(201, {})
         if method == "PUT" and sub == "labels":
+            # The station's own login, which is on the brief authors list.
+            old = set(self.names(n))
+            self.events[n] += [labeled(x, "alice-example") for x in data["labels"] if x not in old]
             self.issues[n]["labels"] = [{"name": x} for x in data["labels"]]
             self.version += 1
             return reply(200, [])
@@ -886,6 +892,11 @@ class FixTest(Base):
         self.assertEqual(again, station.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
+    def test_a_fix_with_nothing_to_change_is_recognised_under_its_failure_class(self):
+        self.failed_fix([
+            "[2030-01-01T00:01:00Z] x failed: [work] agent made no commit on loom/12-fix-the-thing"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.fake.comments[99][-1]["body"], station.REVIEW_AGAIN)
     def test_a_fix_whose_branch_moved_goes_back_to_its_pull_request_not_a_failure(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: branch moved: "
@@ -916,6 +927,213 @@ class FixTest(Base):
             fix_body=None)
         self.assertIn("loom:failed", self.fake.names(12))
         self.assertEqual(self.fake.comments[99], [])
+
+
+PLAIN = "Difficulty: hard\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+EASY = PLAIN.replace("hard", "easy")
+
+
+class RetryTest(Base):
+    """A limit or transient failure moves the ticket to another lane; a work
+    failure, a fix round or a ticket out of retries does not."""
+
+    def failed(self, lane="codex", reason="[transient] agent exited 1", body=PLAIN,
+               attempt=1, fix=None, number=12):
+        self.fake.add(number, lane=lane, body=body, state="running")
+        for _ in range(attempt):
+            self.fake.comments[number].append(
+                {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
+        name = tickets.ticket_name(REPO, number, attempt)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[number], lane, attempt, fix))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: %s\n" % (name, lane, name, reason))
+        return name
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def test_a_transient_failure_moves_to_another_slot_on_a_fresh_branch(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.run_pass()
+        retry = [b for b in self.bodies() if b.startswith("Automatic retry")]
+        self.assertEqual(retry, ["Automatic retry 1 of 2 (transient): moved from lane codex to "
+                                 "lane codex-2. Lane codex failed: [transient] agent exited 1"])
+        # The same pass claims it for codex-2 as a new attempt.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex-2", "loom:running"])
+        name = "example-owner.example-repo-12-r2"
+        self.assertEqual(self.listing("codex-2"), [name + ".md"])
+        with open(self.inbox("codex-2", name + ".md")) as fh:
+            text = fh.read()
+        self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
+        self.assertIn("Lane: codex-2\n", text)
+        self.assertNotIn("loom:failed", self.fake.names(12))
+
+    def test_a_retry_is_reported_once(self):
+        self.heartbeat("codex-2")
+        self.failed()
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic retry")]), 1)
+
+    def test_a_limit_failure_skips_the_providers_other_slots(self):
+        for lane in ("anthropic", "anthropic-3", "codex"):
+            self.heartbeat(lane)
+        self.failed(lane="anthropic-2", reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("moved from lane anthropic-2 to lane codex.", self.bodies()[-2])
+        self.assertIn("lane:codex", self.fake.names(12))
+
+    def test_a_provider_limit_from_the_runner_uses_the_bounded_retry(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+        self.assertIn("Automatic retry 1 of 2 (limit): moved from lane codex to lane anthropic.",
+                      self.bodies()[-2])
+
+    def test_an_unavailable_lane_is_skipped(self):
+        self.heartbeat("codex-2", available=False)
+        self.heartbeat("anthropic", age=3600)
+        self.heartbeat("opencode-go")
+        self.failed()
+        self.run_pass()
+        self.assertIn("lane:opencode-go", self.fake.names(12))
+
+    def test_an_idle_lane_wins_over_a_busy_one(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.write(self.inbox("codex-2", "other.md"), "busy\n")
+        self.failed()
+        self.run_pass()
+        self.assertIn("moved from lane codex to lane anthropic.",
+                      [b for b in self.bodies() if b.startswith("Automatic")][0])
+
+    def test_the_tickets_model_limits_the_lanes(self):
+        # Model: model-x is not a claude model, so no anthropic slot takes it.
+        self.heartbeat("anthropic")
+        self.failed(body=BODY)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+
+    def test_a_ticket_body_that_does_not_parse_is_not_retried(self):
+        # Model: given twice, so no lane's eligibility can be judged.
+        self.heartbeat("anthropic")
+        self.failed(body=BODY)
+        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-sonnet-5-5\n\nWork."
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+
+    def test_free_lanes_take_only_easy_tickets_on_public_repos(self):
+        self.heartbeat("zen")
+        self.failed(body=PLAIN)
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.failed(body=EASY, number=13)
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(13))  # the repo is private
+        self.fake.private = False
+        self.failed(body=EASY, number=14)
+        self.run_pass()
+        self.assertIn("lane:zen", self.fake.names(14))
+
+    def test_the_retry_cap_ends_in_failed(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane opencode-go to lane "
+                     "anthropic. Lane opencode-go failed: [transient] agent exited 1"},
+            {"body": "Automatic retry 2 of 2 (limit): moved from lane anthropic to lane codex. "
+                     "Lane anthropic failed: [limit] agent exited 1"},
+        ]
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
+                                            "Not retried: 2 of 2 automatic retries used.")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_the_cap_comes_from_the_settings(self):
+        self.heartbeat("codex-2")
+        self.settings.retry_max = 0
+        self.failed()
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_lanes_an_earlier_retry_left_are_not_chosen_again(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane codex-2 to lane "
+                     "codex. Lane codex-2 failed: [transient] agent exited 1"}]
+        self.run_pass()
+        self.assertIn("Automatic retry 2 of 2 (transient): moved from lane codex to lane "
+                      "anthropic.", self.bodies()[-2])
+
+    def test_a_failure_the_brain_saw_starts_a_new_count(self):
+        self.heartbeat("codex-2")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane a to lane b. x"},
+            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane codex-2. x"},
+            {"body": "Lane codex-2 failed: [work] agent made no commit on loom/12-x"},
+        ]
+        self.run_pass()
+        self.assertIn("lane:codex-2", self.fake.names(12))
+
+    def test_a_retry_whose_relabel_failed_is_finished_without_a_second_comment(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12].append(
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+                     "anthropic. Lane codex failed: [transient] agent exited 1"})
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+        self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic")]), 1)
+
+    def test_a_work_failure_waits_for_the_brain(self):
+        self.heartbeat("codex-2")
+        self.failed(reason="[work] agent made no commit on loom/12-fix-the-thing")
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.bodies()[-1],
+                         "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_a_reason_without_a_class_is_a_work_failure(self):
+        self.heartbeat("codex-2")
+        self.failed(reason="agent exited 1")
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_a_failed_fix_brief_returns_to_pr_without_a_new_attempt(self):
+        self.heartbeat("codex-2")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[transient] agent exited 1", attempt=2, fix=fix)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
+                         "This was a fix round on pull request #99; the ticket is back at "
+                         "loom:pr and the pull request is unchanged.")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_retry_chain_and_model_rules(self):
+        self.assertEqual(station.failure_class("[limit] x"), "limit")
+        self.assertEqual(station.failure_class("limit x"), "work")
+        self.assertTrue(station.lane_takes_model("anthropic-3", "claude-sonnet-5-5"))
+        self.assertFalse(station.lane_takes_model("codex-2", "claude-sonnet-5-5"))
+        self.assertTrue(station.lane_takes_model("codex", "gpt-x"))
+        self.assertFalse(station.lane_takes_model("zen", "opencode/paid"))
+        self.assertTrue(station.needs_public_repo("agy", ""))
+        self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
+        self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
 
 
 class PruneTest(Base):
@@ -1176,7 +1394,7 @@ class OutcomeTest(Base):
         self.write(self.inbox(lane, "failed", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], lane, 1, fix))
         self.write(os.path.join(self.home, "logs", lane, name + ".log"),
-                   "[t] %s start, lane %s\n[t] %s failed: limit: the spark endpoint refused "
+                   "[t] %s start, lane %s\n[t] %s failed: [limit] limit: the spark endpoint refused "
                    "the connection (agent exited 1)\n" % (name, lane, name, ))
         self.run_pass()
         self.run_pass()
@@ -1261,6 +1479,9 @@ class LockAndCliTest(Base):
         self.assertEqual((s.home, s.repos, s.authors, s.owners),
                          ("/h", ["a/b", "c/d"], ["x", "y"], ["a"]))
         self.assertEqual(station.Settings.from_env({}).repos, [])
+        self.assertEqual(station.Settings.from_env({}).retry_max, 2)
+        self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "5"}).retry_max, 5)
+        self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "x"}).retry_max, 2)
 
     def test_the_station_command_runs_a_pass(self):
         old = {k: os.environ.get(k) for k in ("LOOM_HOME", "LOOM_REPOS")}
