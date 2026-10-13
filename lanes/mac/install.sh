@@ -125,7 +125,9 @@ done
 # brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
 # LOOM_ANTHROPIC_BUDGET_SINCE, LOOM_ANTHROPIC_BUDGET_EXPIRES and
 # LOOM_ANTHROPIC_FLOOR_USD (the anthropic spend line; the lanes get them with
-# every other LOOM_* setting). Runs from this checkout, like the lanes.
+# every other LOOM_* setting). Runs from this checkout, like the lanes, through
+# lanes/mac/station.sh, which first fast-forwards the checkout to its default
+# branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
 LABEL="com.loom.station"
 PLIST="$AGENTS/$LABEL.plist"
 cat > "$PLIST" <<EOF
@@ -136,11 +138,8 @@ cat > "$PLIST" <<EOF
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/env</string>
-    <string>python3</string>
-    <string>-m</string>
-    <string>bus</string>
-    <string>station</string>
+    <string>/bin/bash</string>
+    <string>$X_REPO/lanes/mac/station.sh</string>
   </array>
   <key>WorkingDirectory</key><string>$X_REPO</string>
   <key>StartInterval</key><integer>60</integer>
@@ -153,6 +152,7 @@ cat > "$PLIST" <<EOF
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
     <key>LOOM_REPOS</key><string>$(xml "${LOOM_REPOS:-}")</string>
+    <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
@@ -176,7 +176,7 @@ EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 wait_job_gone "gui/$(id -u)/$LABEL"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "installed $LABEL -> python3 -m bus station (idle unless LOOM_REPOS is set)"
+echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bus station; idle unless LOOM_REPOS is set)"
 
 # The brain tick (lanes/mac/brain.sh): every LOOM_BRAIN_INTERVAL seconds
 # (default 1800), take the brain lock and run one docs/MUSE.md tick with the
