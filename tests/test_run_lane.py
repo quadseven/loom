@@ -853,6 +853,30 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        # The remote did not move: this run's own rewrite is a push failure.
+        self.assertIn("failed: push failed",
+                      (self.loom / "logs" / "codex" / (name + ".log")).read_text())
+        self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
+
+    def test_a_fix_brief_whose_branch_moved_during_the_run_is_parked_as_branch_moved(self):
+        name, before = self.fix_brief()
+        # Another lane pushes to the pull request's branch while this run's
+        # agent works: the push is refused, and that is not this run's failure.
+        work = Path(self._tmp.name) / "pr-work"
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "echo fixed > fix.txt\n",
+            "(cd %s && echo other > other.txt && git add other.txt &&"
+            " git -c user.name=t -c user.email=t@example.invalid commit -qm Other &&"
+            " git push -q origin %s)\necho fixed > fix.txt\n" % (work, self.FIX_BRANCH), 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        moved = self.remote_head(self.FIX_BRANCH)
+        self.assertNotEqual(moved, before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("failed: branch moved: %s is at %s on the remote, not %s"
+                      % (self.FIX_BRANCH, moved[:12], before[:12]), log)
+        self.assertNotIn("failed: push failed", log)
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
 
     def test_a_model_from_another_lanes_family_is_refused(self):
