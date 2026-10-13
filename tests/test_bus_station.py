@@ -123,19 +123,7 @@ class FakeGitHub:
 
     def _issues_and_status(self, method, rest, query, headers, data):
         if method == "GET" and rest == "issues":
-            if "needs-operator" in query:
-                return self._list_asks(headers)
-            if "loom:goal" in query:
-                if self.goal_error:
-                    return reply(500, {"message": "down"})
-                if self.goals:
-                    return reply(200, self.goals)
-                return reply(200, [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
-                                   for i in self.issues.values() if i["state"] == "open"
-                                   and "loom:goal" in self.names(i["number"])])
-            if "loom:lanes" in query:
-                return reply(200, self.lanes_issues)
-            return self._list_briefed(headers)
+            return self._get_issues(query, headers)
         if method == "POST" and rest == "issues":
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
@@ -148,6 +136,28 @@ class FakeGitHub:
         self.status_comments.append({"id": 77, "body": data["body"]})
         self.posts.append(data["body"])
         return reply(201, {"id": 77})
+
+    def _get_issues(self, query, headers):
+        if "labels=loom%3Apr" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:pr" in self.names(i["number"])])
+        if "needs-operator" in query:
+            return self._list_asks(headers)
+        if "loom:goal" in query:
+            return self._get_goals()
+        if "loom:lanes" in query:
+            return reply(200, self.lanes_issues)
+        return self._list_briefed(headers)
+
+    def _get_goals(self):
+        if self.goal_error:
+            return reply(500, {"message": "down"})
+        if self.goals:
+            return reply(200, self.goals)
+        found = [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
+                 for i in self.issues.values() if i["state"] == "open"
+                 and "loom:goal" in self.names(i["number"])]
+        return reply(200, found)
 
     def _graphql(self, data):
         query, variables = data["query"], data.get("variables") or {}
@@ -226,6 +236,67 @@ class Base(unittest.TestCase):
             return sorted(os.listdir(self.inbox(lane)))
         except OSError:
             return []
+
+
+class ReconcilePullRequestTest(Base):
+    def test_merged_pr_repairs_failed_ticket_label_once(self):
+        self.fake.add(12, state="pr")
+        # The list endpoint reconciliation reads returns merged_at, never merged.
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        failed = [False]
+
+        def transport(method, url, headers, body):
+            if method == "PUT" and url.endswith("/issues/12/labels") and not failed[0]:
+                failed[0] = True
+                raise station.GitHubError("temporary failure", 500)
+            return self.fake(method, url, headers, body)
+
+        gh = GitHub("token", transport=transport)
+        runner = station.Station(gh, self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:verified", self.fake.names(12))
+        puts = len([call for call in self.fake.calls if call[0] == "PUT"])
+        runner.reconcile_pull_requests()
+        self.assertEqual(puts, len([call for call in self.fake.calls if call[0] == "PUT"]))
+
+    def test_a_failed_issues_fetch_is_logged_and_the_pass_survives(self):
+        self.fake.add(12, state="pr")
+
+        def transport(method, url, headers, body):
+            raise station.GitHubError("server error", 500)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_a_failed_pulls_fetch_is_logged_and_the_pass_survives(self):
+        self.fake.add(12, state="pr")
+
+        def transport(method, url, headers, body):
+            if "/pulls?" in url:
+                raise station.GitHubError("server error", 500)
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_closed_unmerged_pr_gets_distinct_disposition(self):
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": None,
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:closed-unmerged", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
 
 
 class ReviewFake:
@@ -393,7 +464,7 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        self.assertEqual(self.run_pass().requests, 1)  # PR review polling still runs.
+        self.assertEqual(self.run_pass().requests, 3)  # Reconciliation (2) and PR review polling (1) still run.
 
 
 class TicketsTest(unittest.TestCase):
@@ -567,8 +638,8 @@ class ClaimTest(Base):
         self.run_pass()
         first = len(self.fake.calls)
         gh = self.run_pass()
-        self.assertEqual(len(self.fake.calls), first + 3)
-        self.assertEqual(gh.requests, 3)  # Includes the PR review poll.
+        self.assertEqual(len(self.fake.calls), first + 5)
+        self.assertEqual(gh.requests, 5)  # Includes the reconciliation and PR review polls.
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
     def test_a_304_reuses_the_stored_list(self):
@@ -751,7 +822,8 @@ class FixTest(Base):
         self.assertEqual([c["body"] for c in self.fake.comments[12]],
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
 
     def failed_fix(self, log_lines, fix_body=FIX_BODY):
         self.fake.add(12, state="running")
@@ -1036,7 +1108,9 @@ class OutcomeTest(Base):
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
 
     def test_done_without_a_pull_request_is_retried_not_reported(self):
         self.finished("done")
