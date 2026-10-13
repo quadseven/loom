@@ -128,26 +128,36 @@ def _report_deadline(last: Optional[datetime], now: datetime) -> Tuple[datetime,
     return due, "ok"
 
 
-def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
-                now: datetime, authors: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    """When the goal last had a journal, a valid report, a measurement and a
-    completed action, and where its report deadline stands.
-
-    Comment classification and deadline thresholds live in separate helpers;
-    this function only folds timestamps for one goal.
-
-    Only a comment on this goal that starts with the report marker counts as
-    its report: a marker inside another comment, a journal, or a report on
-    another goal (a parent goal included) does not. With `authors`, only
-    their comments count, as only theirs reach the operator's phone."""
+def _goal_comments(node: Optional[Dict[str, Any]],
+                   authors: Optional[Sequence[str]]) -> List[Tuple[str, str]]:
+    """(createdAt, body) for each timestamped comment on a goal, keeping only
+    those by `authors` when given."""
     allowed = {a.lower() for a in authors} if authors else None
-    seen: Dict[str, str] = {}
+    found = []
     for c in ((node or {}).get("comments") or {}).get("nodes") or []:
         login = str((c.get("author") or {}).get("login") or "").lower()
         at = str(c.get("createdAt") or "")
         if _stamp(at) is None or (allowed is not None and login not in allowed):
             continue
-        for kind in _comment_kinds(str(c.get("body") or "")):
+        found.append((at, str(c.get("body") or "")))
+    return found
+
+
+def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
+                now: datetime, authors: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """When the goal last had a journal, a valid report, a measurement and a
+    completed action, and where its report deadline stands.
+
+    Comment filtering, classification and deadline thresholds live in
+    separate helpers; this function only folds timestamps for one goal.
+
+    Only a comment on this goal that starts with the report marker counts as
+    its report: a marker inside another comment, a journal, or a report on
+    another goal (a parent goal included) does not. With `authors`, only
+    their comments count, as only theirs reach the operator's phone."""
+    seen: Dict[str, str] = {}
+    for at, body in _goal_comments(node, authors):
+        for kind in _comment_kinds(body):
             seen[kind] = max(seen.get(kind, ""), at)
     last = _stamp(seen.get("report", "")) or _stamp(str(issue.get("created_at") or ""))
     due, state = _report_deadline(last, now)
