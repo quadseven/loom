@@ -172,6 +172,10 @@ cat > "$PLIST" <<EOF
 </dict>
 </plist>
 EOF
+# Never boot the station out mid-pass: a report sent but not yet recorded
+# would go to Discord twice (bus/station.py persists the ledger per send).
+# Bounded: after the bound it installs anyway, saying so.
+wait_station_free "$LOOM_HOME/state/station.lock" || true
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 wait_job_gone "gui/$(id -u)/$LABEL"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
