@@ -39,6 +39,8 @@
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CHECK_TIMEOUT (seconds per validation step, default 1800; see
 # load_contract for the repo's .loom/validation.conf),
+# LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
+# from PATH; a 2.x binary runs --standalone --auto),
 # LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
@@ -578,6 +580,28 @@ opencode_config() {
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"$provider}"
 }
 
+# The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
+# PATH. One slot can try a new major version (its installer would overwrite
+# the binary every other opencode lane runs) without moving the rest.
+opencode_bin() {
+  local b
+  b="$(lane_setting OPENCODE)"
+  printf '%s' "${b:-opencode}"
+}
+
+# opencode 2.x `run` talks to a shared background service unless told
+# --standalone; the sandbox denies localhost, and a shared service would mix
+# lanes' sessions. --auto lets it act without prompting, as 1.x run does.
+# Usage: opencode_agent <key_var> <brief text>
+opencode_agent() {
+  local bin flags=()
+  bin="$(opencode_bin)"
+  case "$(timeout "$NET_TIMEOUT" "$bin" --version < /dev/null 2> /dev/null | head -n 1)" in
+    "opencode v2."*) flags=(--standalone --auto) ;;
+  esac
+  opencode_config && api_agent "$1" "$bin" run ${flags[@]+"${flags[@]}"} -m "$MODEL" "$2"
+}
+
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
 # the tree might name, whatever ended up in its config. (`timeout` cannot run
 # a shell function, so the push spells the same options out.)
@@ -1021,13 +1045,13 @@ run_agent() {
   case "$LANE" in
     codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
     claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
-    openrouter) opencode_config && api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    opencode-go) opencode_config && api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    zen) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
-    spark) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
-    zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+    openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
+    opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
+    zen) opencode_agent - "$brief_text" ;;
+    spark) opencode_agent - "$brief_text" ;;
+    zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
-      opencode_config && api_agent CLOUDFLARE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
+      opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
     anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
@@ -1078,7 +1102,7 @@ lane_ready() {
     return
   fi
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark) cli=opencode ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }

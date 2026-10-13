@@ -150,6 +150,7 @@ git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 # agent's environment, so FAKE_LOG does not reach it; it records to TMPDIR,
 # which the runner points at the agent's scratch home.
 FAKE_OPENCODE = """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
 for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY; do
@@ -193,6 +194,9 @@ ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
 (cd "$HOME/.local/share/opencode" && mkdir -p "x"$'\\n'".." && echo decoy > "x"$'\\n'"../outside.json")
 echo fixed > fix.txt
 """
+
+# opencode 2.0 says which major version it is on --version.
+FAKE_OPENCODE_2 = FAKE_OPENCODE.replace('echo "1.18.4"', 'echo "opencode v2.0.28"')
 
 # Fake aws: `ssm get-parameter --name N` prints $FAKE_SECRET_<N with / as _>
 # or fails like a missing parameter.
@@ -1446,11 +1450,11 @@ cat > /dev/null
         self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
-    def slot_run(self, slot):
+    def slot_run(self, slot, **env):
         inbox, result = self.api_lane(
             slot, LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
             LOOM_OPENCODE_GO_MODEL="opencode-go/kimi-k2.7-code",
-            LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash")
+            LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         return [c for c in self.calls() if c.startswith("opencode ")][-1]
@@ -1462,6 +1466,24 @@ cat > /dev/null
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_slot_without_one_runs_its_lanes_model(self):
         self.assertIn("-m opencode-go/kimi-k2.7-code", self.slot_run("opencode-go-2"))
+
+    def opencode_2(self):
+        """A 2.0 binary outside PATH, as one slot's LOOM_<SLOT>_OPENCODE names it."""
+        path = Path(self._tmp.name) / "opencode2" / "bin" / "opencode"
+        self.write_tool(path, FAKE_OPENCODE_2)
+        return str(path)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_slot_on_opencode_2_runs_it_standalone(self):
+        run = self.slot_run("opencode-go-3", LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
+        self.assertIn("run --standalone --auto -m opencode-go/deepseek-v4.1-flash", run)
+        self.assertIn("secret=denied", run)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_sibling_slot_keeps_the_default_opencode(self):
+        run = self.slot_run("opencode-go-2", LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
+        self.assertIn("run -m opencode-go/kimi-k2.7-code", run)
+        self.assertNotIn("--standalone", run)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_zai_lane_hands_its_key_to_a_free_flash_model(self):
