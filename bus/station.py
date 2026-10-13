@@ -794,8 +794,12 @@ class Station:
         """The last brain tick (lanes/mac/brain.sh) and when a tick last ended
         well, or None when no brain tick runs on this machine."""
         state = os.path.join(self.s.home, "state")
-        last = _read_json(os.path.join(state, "brain.json"), None, strict=False)
+        path = os.path.join(state, "brain.json")
+        last = _read_json(path, None, strict=False)
         if not isinstance(last, dict):
+            if os.path.exists(path):
+                _say("not uploading the last brain tick: state/brain.json "
+                     "is unreadable or does not hold an object")
             return None
         try:
             ok_at: Optional[float] = os.path.getmtime(os.path.join(state, "brain-ok"))
@@ -853,8 +857,17 @@ class Station:
             return None
         last = brain[0]
         started, at = last.get("started"), last.get("at")
-        # No start time: the tick never ran the agent (or predates uploads).
-        if last.get("outcome") not in ("ok", "failed") or started is None:
+        outcome = last.get("outcome")
+        # A skipped or pre-agent failed tick has no transcript to upload.
+        if outcome == "skipped" or (outcome == "failed" and started is None):
+            return None
+        if outcome not in ("ok", "failed"):
+            _say("not uploading the last brain tick: state/brain.json "
+                 "has invalid outcome %r" % outcome)
+            return None
+        if started is None:
+            _say("not uploading the last brain tick: state/brain.json "
+                 "has no agent start time")
             return None
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
                    for v in (started, at)) or not 0 < started <= at:

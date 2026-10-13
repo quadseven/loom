@@ -837,10 +837,10 @@ class TranscriptTest(Base):
         self.user = os.path.join(self._tmp.name, "user")
         self.sent = []
         self.secrets = []
-        self.fail = False
+        self.fail_upload = False
 
     def upload(self, url, token, body):
-        if self.fail:
+        if self.fail_upload:
             raise OSError("refused by %s with %s" % (url, token))
         self.sent.append((url, token, body))
 
@@ -886,15 +886,15 @@ class TranscriptTest(Base):
     def test_a_failed_upload_is_retried_then_given_up_with_one_quiet_line(self):
         self.go()
         self.finish()
-        self.fail = True
+        self.fail_upload = True
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.go()
-            self.fail = False
+            self.fail_upload = False
             self.go()
         self.assertEqual(len(self.sent), 1)
         self.finish("T2", kind="failed")
-        self.fail = True
+        self.fail_upload = True
         with contextlib.redirect_stderr(err):
             for _ in range(7):
                 self.go()
@@ -902,7 +902,7 @@ class TranscriptTest(Base):
         self.assertEqual(lines, ["station: gave up uploading the transcript of "
                                  "anthropic-3/T2 after 5 failures (OSError)"])
         self.assertNotIn("SECRET", err.getvalue())
-        self.fail = False
+        self.fail_upload = False
         self.go()
         self.assertEqual(len(self.sent), 1)
 
@@ -957,6 +957,28 @@ class TranscriptTest(Base):
         self.assertEqual(self.sent, [])
         self.assertIn("station: not uploading the last brain tick: state/brain.json "
                       "has started 'soon' and at 1893492060", err.getvalue())
+
+    def test_an_invalid_brain_outcome_is_logged_and_not_sent(self):
+        self.go()
+        self.write(os.path.join(self.home, "state", "brain.json"), json.dumps(
+            {"at": 1893492060, "outcome": "unknown", "exit": 0, "started": 1893492000}))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.go()
+        self.assertEqual(self.sent, [])
+        self.assertIn("station: not uploading the last brain tick: state/brain.json "
+                      "has invalid outcome 'unknown'", err.getvalue())
+
+    def test_an_unreadable_or_non_object_brain_tick_is_logged_and_not_sent(self):
+        self.go()
+        for value in ("[]", "{"):
+            self.write(os.path.join(self.home, "state", "brain.json"), value)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.go()
+            self.assertEqual(self.sent, [])
+            self.assertIn("station: not uploading the last brain tick: state/brain.json "
+                          "is unreadable or does not hold an object", err.getvalue())
 
     def test_the_ledger_keeps_only_runs_still_finished(self):
         self.go()
