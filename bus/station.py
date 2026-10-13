@@ -140,6 +140,9 @@ Poster = Callable[[str, Dict[str, Any]], None]
 DiscordCall = Callable[[str, str, str, Optional[Dict[str, Any]]], Any]
 
 
+MAX_FIX_BODY = 60000
+
+
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
@@ -899,7 +902,10 @@ class Station:
                           threads: List[Any]) -> None:
         branch = str((detail.get("head") or {}).get("ref") or "")
         body = brain._fix_body(repo, pr_number, branch, "", failed, threads)
-        body = body.rstrip() + "\n\n<!-- loom:fix-head %s -->\n" % sha
+        marker = "\n\n<!-- loom:fix-head %s -->\n" % sha
+        if len(body) > MAX_FIX_BODY:  # the API rejects comments over 65536 characters
+            body = body[:MAX_FIX_BODY].rstrip() + "\n\n(findings truncated)"
+        body = body.rstrip() + marker
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
 
     def _move_fix_to_lane(self, repo: str, number: int, lane: str,

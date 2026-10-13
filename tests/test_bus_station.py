@@ -315,6 +315,12 @@ class HandBackTest(unittest.TestCase):
         self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
         self.assertIn("last log line", self.gh.comments[0]["body"])
 
+    def test_a_huge_findings_list_is_truncated_below_the_comment_limit(self):
+        self.run_hand_back(checks=[("lint", "x" * 200000)])
+        body = self.gh.comments[0]["body"]
+        self.assertLess(len(body), 65536)
+        self.assertIn("loom:fix-head " + "a" * 40, body)
+
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
                   "comments": {"nodes": [{"databaseId": 9, "body": "change this",

@@ -205,6 +205,8 @@ PY
   rm -f "$source"
 }
 
+# The reply text reaches gh as a -f field value (a GraphQL variable), never
+# spliced into the query or a shell command line, so it cannot inject anything.
 post_replies() {
   local entry thread body resolve
   [ -n "$REPLIES_FILE" ] && [ -f "$REPLIES_FILE" ] || return 0
