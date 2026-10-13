@@ -48,7 +48,7 @@ that talks to GitHub about tickets.
 | `loom:failed` | The runner gave up; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
-| `loom:verified` | The brain verified it live; the ticket is then closed. |
+| `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -91,6 +91,43 @@ repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 <owner/name>#<number>`, then the header lines and the body. The runner adds
 `Refs <owner/name>#<number>` to the pull request body, never a closing
 keyword.
+
+## Proof
+
+A ticket moves to `loom:verified` only with a proof record, and closes as
+completed only with one that still holds; a `not_planned` closure needs none.
+The record is JSON, passed with `move --to verified --proof PROOF.json`:
+
+```json
+{
+  "kind": "runtime",
+  "revision": "<commit SHA on the default branch that is deployed>",
+  "environment": "<where it runs, e.g. production>",
+  "artifact": "<what was deployed, e.g. an image digest>",
+  "observed": {"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T01:00:00Z"},
+  "measure": {"name": "<metric>", "baseline": "<before>", "target": "<goal>", "after": "<observed>"},
+  "sources": ["<log line, dashboard or check run that shows it>"],
+  "criteria": [{"criterion": "<acceptance criterion, verbatim>", "result": "pass", "evidence": "<what showed it>"}]
+}
+```
+
+`kind` is `runtime` or `docs`. Documentation-only work uses `docs`, which
+needs only `revision` (the default-branch commit that carries it),
+`observed`, `sources` and `criteria`, and may be verified once merged;
+runtime work is verified only once shipped. The move refuses when:
+
+- a required field is missing or empty, or `revision` is not a commit on the
+  repo's default branch;
+- `criteria` is not the ticket's acceptance criteria, verbatim and in order,
+  each with `pass` and evidence;
+- any acceptance criterion checkbox in the ticket body is unchecked.
+
+The move posts the record as a `<!-- loom:proof v1 -->` comment with a hash
+of the criteria texts (not their check marks), then sets the label.
+`close` refuses a completed closure unless the ticket is `loom:verified`,
+every criterion is checked, and the newest proof comment from a
+`LOOM_BRIEF_AUTHORS` login matches the criteria as they are now. Rewording,
+adding or removing a criterion after the proof means verifying again.
 
 ## Trust
 
