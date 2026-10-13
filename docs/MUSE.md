@@ -222,13 +222,25 @@ it, and never a free lane:
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
 The factory applies this ladder on its own (bus/factory.py, recorded as
-`<!-- loom:rung N -->` comments); do it by hand only for work the factory
-cannot see, such as a ticket with no pull request that is stuck in running.
-Set the model with the ticket's `Model:` line (`brief --model`; for a ticket
-already filed, edit the `Model:` line at the top of its body before moving
-it to briefed). Say on the ticket which rung it is on and why. Past the
-third rung, rewrite the brief smaller, or ask the operator with one exact
-ask when only the operator can unblock it.
+`<!-- loom:rung N -->` comments). For work the factory cannot see, such as a
+ticket with no pull request that is stuck in running, do not hand-edit the
+ticket: `python3 -m bus.brain status` marks each repeatedly stuck ticket with
+its attempts, the models it has tried and the rung it takes next. Run
+`python3 -m bus.brain escalate OWNER/NAME#N` for every marked ticket the
+factory has not already moved, in the same tick, whatever the time budget: it
+picks the lowest untried rung whose lane is free, rewrites the ticket's
+`Model:` line, swaps the lane label, comments the rung and the reason, and
+sends an open pull request back as a fix brief (`--file NOTES.md` adds your
+own notes to that brief). It refuses a ticket that is not repeatedly stuck.
+Past the third rung it adds `needs-brain` instead: rewrite the brief smaller,
+or ask the operator with one exact ask when only the operator can unblock it.
+`status` reads the history of at most 20 tickets per repo, the least recently
+updated first; a ticket marked "not checked for stuck" can still be passed to
+`escalate`, which reads its whole history.
+
+To set a model by hand on a first attempt or any other move, use
+`move OWNER/NAME#N --to briefed --lane LANE --model MODEL` or
+`fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md --lane LANE --model MODEL`.
 
 ## Rules
 
