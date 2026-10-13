@@ -17,6 +17,56 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
 
+## Validation contract
+
+A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
+
+```
+# .loom/validation.conf
+interpreter: python3.12
+submodules: yes
+setup: scripts/setup.sh
+check: scripts/check.sh
+```
+
+`interpreter` is a command that must be on the lane machine's PATH,
+`submodules: yes` checks out the pinned submodule revisions, `setup`
+prepares the tree (a venv, locked dependencies, a pinned linter) and `check`
+is the required check. Point the repo's CI at the same two scripts so the
+lane and CI cannot drift apart. Unknown lines are refused.
+
+- The runner reads the file from the base revision before the agent starts
+  (on a fix run, from the base branch, not the pull request's branch);
+  what the agent edits never changes what is checked. `setup` and `check`
+  are shell commands, trusted like a CI workflow's `run:` steps, so they
+  come only from the branch a pull request merges into.
+- Before the agent: interpreter, submodules, `setup`, then `check` on the
+  base. A missing interpreter, a failed submodule checkout or a failed setup
+  parks the brief as `setup failed: ...`; the agent does not run. The base
+  check is recorded but does not stop the run (a ticket may exist to fix
+  it). What setup leaves untracked goes into `.git/info/exclude`, so it is
+  never committed.
+- The agent is told the check and how it did on the base.
+- After the agent: the runner commits, then runs `check` on that commit. It
+  passes only with exit 0 and no tracked file changed (a formatter that has
+  to rewrite the agent's files is a failure). Only then is the branch pushed
+  and the pull request opened, with a `Validation:` line naming the commit.
+- A failed check parks the brief as `validation failed: ...` (exit 125 to
+  127 as `validation environment unavailable: ...`), opens no pull request
+  and pushes nothing to the ticket's branch or an open pull request. The
+  edits go to a side branch `<branch>-unvalidated-<time>` so they can be
+  recovered.
+- Every step runs like an API-lane agent: an emptied environment, a scratch
+  HOME (`run/<lane>-check`), under `sandbox-exec`, with network but no
+  access to the runner's HOME. A machine without `sandbox-exec` fails setup
+  for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
+  (default 1800).
+- `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
+  (`prepare`, `setup`, `baseline`, `final`), command, exit code, tree
+  revision, `ok` and detail (the interpreter's version, the submodule
+  revisions).
+- A repo without the file is not validated by the runner; CI still is.
+
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
@@ -249,7 +299,8 @@ loopback connection; they cannot query the viewer or any other local service.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
-- Logs stay on the lane machine. Nothing is pushed except the ticket branch.
+- Logs stay on the lane machine. Nothing is pushed except the ticket branch,
+  or a side branch holding edits that failed the validation contract.
 - API-lane session transcripts (Claude Code `.jsonl`, opencode's `opencode.db`)
   are copied to `logs/<lane>/<ticket>/` after each run, before the next run
   wipes the scratch home. Links are never followed.

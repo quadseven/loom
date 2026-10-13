@@ -3,6 +3,7 @@ the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import json
 import os
+import re
 import signal
 import shlex
 import shutil
@@ -100,8 +101,9 @@ fi
 """
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
-# only edits it the way a sandboxed codex must ($FAKE_AGENT=edit), makes no
-# file change at all ($FAKE_AGENT=noop), or exits non-zero ($FAKE_AGENT=fail).
+# only edits it ($FAKE_AGENT=edit), makes no file change ($FAKE_AGENT=noop),
+# or exits non-zero ($FAKE_AGENT=fail). The file holds $FAKE_AGENT_TEXT
+# (default "fixed"); $FAKE_AGENT_WEAKEN rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
@@ -124,9 +126,11 @@ if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkfifo .loom-answers/PRRT_4x.md
   echo "scratch" > .loom-answers/notes.txt
 fi
+[ -f vendor/sub/value.txt ] && echo "agent-saw submodule" >> "$FAKE_LOG"
+[ -z "${FAKE_AGENT_WEAKEN:-}" ] || { mkdir -p .loom; echo 'check: true' > .loom/validation.conf; }
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
-echo fixed > fix.txt
+printf '%s\\n' "${FAKE_AGENT_TEXT:-fixed}" > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
 git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
@@ -252,6 +256,26 @@ if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$P" 2>/dev/null; then set
 printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
 echo fixed > fix.txt
+"""
+
+# A repo's validation contract, as its CI would run it: a pinned interpreter,
+# a required submodule, a setup step and a check. check.py needs the
+# submodule at its pinned revision, fails on a "broken" fix.txt, and, like a
+# formatter, strips trailing spaces from fix.txt.
+CONTRACT = """# The same steps CI runs.
+interpreter: python3.12
+submodules: yes
+setup: python3.12 -c 'open(".prepared", "w").write("ok")'
+check: test -f .prepared && python3.12 check.py
+"""
+CHECK_PY = """import pathlib, sys
+assert pathlib.Path("vendor/sub/value.txt").read_text() == "v1\\n", "submodule not at its pin"
+fix = pathlib.Path("fix.txt")
+if fix.exists():
+    text = fix.read_text()
+    fix.write_text(text.rstrip() + "\\n")
+    if "broken" in text:
+        sys.exit("fix.txt is broken")
 """
 
 
@@ -1885,6 +1909,202 @@ exit %d
             ["bash", "-c", 'source "$1"; runner_busy "$2"', "test",
              str(INSTALL_LOCK), str(lock)], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
+
+
+    # The validation contract (.loom/validation.conf).
+
+    def contract_repo(self, contract=CONTRACT):
+        """Give the remote a submodule pinned behind its tip, the contract
+        and check.py. Returns the pinned submodule commit."""
+        root = Path(self._tmp.name)
+        commit = ("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm")
+        sub = root / "sub-seed"
+        git("init", "-q", "-b", "main", str(sub))
+        (sub / "value.txt").write_text("v1\n")
+        git("add", "value.txt", cwd=sub)
+        git(*commit, "v1", cwd=sub)
+        pinned = subprocess.run(["git", "rev-parse", "HEAD"], cwd=sub, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        (sub / "value.txt").write_text("v2\n")
+        git(*commit, "v2", "-a", cwd=sub)
+        git("clone", "-q", "--bare", str(sub), str(self.remote.parent / "sub.git"))
+        work = root / "contract-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("-c", "protocol.file.allow=always", "submodule", "add", "-q", "../sub.git", "vendor/sub", cwd=work)
+        git("checkout", "-q", pinned, cwd=work / "vendor" / "sub")
+        (work / ".loom").mkdir()
+        (work / ".loom" / "validation.conf").write_text(contract)
+        (work / "check.py").write_text(CHECK_PY)
+        git("add", "-A", cwd=work)
+        git(*commit, "contract", cwd=work)
+        git("push", "-q", "origin", "main", cwd=work)
+        return pinned
+
+    def run_contract_lane(self, interpreter=True, **env):
+        """A codex pass that may clone file:// submodules; with interpreter,
+        python3.12 is on PATH."""
+        path = self.lane_env()["PATH"]
+        if interpreter:
+            self.write_tool(Path(self._tmp.name) / "pybin" / "python3.12",
+                            f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+            path = f"{Path(self._tmp.name) / 'pybin'}:{path}"
+        return self.run_lane(PATH=path, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="protocol.file.allow",
+                             GIT_CONFIG_VALUE_0="always", **env)
+
+    def records(self):
+        path = self.loom / "logs" / "codex" / "T042-fix-the-thing.validation.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def remote_heads(self):
+        return subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                              capture_output=True, text=True, check=True).stdout
+
+    def lane_log(self):
+        return (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_an_unprepared_workspace_is_a_setup_failure_and_the_agent_never_runs(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(interpreter=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("setup failed: interpreter python3.12 is not on PATH", self.lane_log())
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_prepared_workspace_checks_the_agents_commit_before_the_pr(self):
+        pinned = self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        # The agent worked in the prepared tree and was told the check.
+        self.assertIn("agent-saw submodule", self.calls())
+        self.assertIn("## Validation environment", self.log.read_text())
+        records = self.records()
+        self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records],
+                         [("prepare", 0, True), ("setup", 0, True), ("baseline", 0, True), ("final", 0, True)])
+        self.assertIn(pinned, records[0]["detail"])
+        self.assertEqual(records[-1]["command"], "test -f .prepared && python3.12 check.py")
+        head = subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", "loom/T042-fix-the-thing"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(records[-1]["revision"], head)
+        self.assertIn(f"Validation: check exited 0 at {head[:12]}", self.body.read_text())
+        # What setup left behind is not committed.
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", head],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("fix.txt", files)
+        self.assertNotIn(".prepared", files)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_zero_exit_agent_with_a_failing_check_opens_no_pr_and_keeps_its_edits(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT="edit", FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("validation failed: the check exited 1", self.lane_log())
+        self.assertFalse(any(r["phase"] == "final" and r["ok"] for r in self.records()))
+        heads = self.remote_heads()
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-unvalidated-" in h]
+        self.assertEqual(len(side), 1, heads)
+        kept = subprocess.run(["git", "--git-dir", str(self.remote), "show", f"{side[0]}:fix.txt"],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(kept, "broken\n")
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_check_that_has_to_reformat_the_agents_files_does_not_pass(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="fixed   ")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("the check changed tracked files", self.lane_log())
+        self.assertEqual(self.records()[-1]["exit"], 0)
+        self.assertFalse(self.records()[-1]["ok"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_the_agent_cannot_weaken_the_contract_it_is_checked_against(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT="edit", FAKE_AGENT_TEXT="broken", FAKE_AGENT_WEAKEN="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertEqual(self.records()[-1]["command"], "test -f .prepared && python3.12 check.py")
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_fix_run_checks_against_the_base_branchs_contract_not_the_pull_requests(self):
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        # An earlier run on the pull request's branch weakened the contract.
+        work = Path(self._tmp.name) / "pr-work"
+        (work / ".loom").mkdir(exist_ok=True)
+        (work / ".loom" / "validation.conf").write_text("check: true\n")
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "weaken", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        before = self.remote_head(self.FIX_BRANCH)
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records[-1]["command"], "test -f .prepared && python3.12 check.py")
+        self.assertFalse(records[-1]["ok"])
+
+    def test_a_contract_with_an_unknown_line_is_a_setup_failure(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertIn("setup failed: .loom/validation.conf has an unknown line 'python: 3.12'", self.lane_log())
+
+    def test_a_contract_command_with_a_control_or_non_ascii_byte_is_a_setup_failure(self):
+        self.contract_repo(contract=CONTRACT + "setup: true\x1b[2K; echo hidden\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertIn("setup: and check: must be printable ASCII", self.lane_log())
+
+    def test_contract_run_itself_refuses_an_unchecked_command(self):
+        # The guard sits at the bash -c call too, not only in load_contract.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run"))
+        tmp = Path(self._tmp.name)
+        marker = tmp / "ran"
+        fakes = tmp / "fakebin"
+        fakes.mkdir()
+        (fakes / "sandbox-exec").write_text('#!/bin/bash\nshift 2\nexec "$@"\n')
+        (fakes / "sandbox-exec").chmod(0o755)
+        (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+        (fakes / "timeout").chmod(0o755)
+        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(tmp / "log"), "TREE": str(tmp),
+               "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30"}
+        result = subprocess.run(["bash", "-c", script, "test", f"true\x1b[2K; touch {marker}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertFalse(marker.exists())
+        result = subprocess.run(["bash", "-c", script, "test", f"touch {marker}\n"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertFalse(marker.exists())
+        result = subprocess.run(["bash", "-c", script, "test", f"touch {marker}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
 
 
 if __name__ == "__main__":
