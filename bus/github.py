@@ -101,6 +101,16 @@ def urllib_transport(method: str, url: str, headers: Dict[str, str],
         raise GitHubError("request failed: %s" % err, 0, "") from None
 
 
+def _json_or_none(text: str) -> Any:
+    """The parsed body, or None for an empty or non-JSON one."""
+    if not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
 class GitHub:
     def __init__(self, token: str, api: str = DEFAULT_API,
                  transport: Optional[Transport] = None,
@@ -133,6 +143,23 @@ class GitHub:
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
         url = self._url(path)
+        # A caller's own ETag means the caller keeps the answer; otherwise
+        # the cache does, when there is one.
+        cached = self._cached(url) if method == "GET" and not etag else None
+        headers, payload = self._request(body, etag or (cached or {}).get("etag"))
+        status, resp_headers, text = self._send(method, url, headers, payload)
+        if not (200 <= status < 300 or status == 304 or status in ok):
+            raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
+        if status == 304 and cached is not None:
+            return self._from_cache(url, cached, resp_headers)
+        data = _json_or_none(text)
+        if method == "GET" and not etag:
+            self._keep_answer(url, status, data, resp_headers)
+        return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    def _request(self, body: Any,
+                 if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
+        """The headers and encoded body for one request."""
         headers = {
             "Authorization": "Bearer " + self._token,
             "Accept": "application/vnd.github+json",
@@ -143,41 +170,43 @@ class GitHub:
         if body is not None:
             payload = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        # A caller's own ETag means the caller keeps the answer; otherwise
-        # the cache does, when there is one.
-        cached = self._cached(url) if method == "GET" and not etag else None
-        if etag:
-            headers["If-None-Match"] = etag
-        elif cached is not None:
-            headers["If-None-Match"] = cached["etag"]
+        if if_none_match:
+            headers["If-None-Match"] = if_none_match
+        return headers, payload
+
+    def _send(self, method: str, url: str, headers: Dict[str, str],
+              payload: Optional[bytes]) -> Tuple[int, Dict[str, str], str]:
+        """One request on the wire, counted: status, lower-cased headers, text."""
         self.requests += 1
         status, raw_headers, raw = self.transport(method, url,
                                                   headers, payload)
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
         # Read before any error is raised: a 403 at the limit carries them.
         self._note_rate(resp_headers)
-        if status == 304:
-            self.not_modified += 1
-        else:
-            kind = request_kind(method, url)
-            self.kinds[kind] = self.kinds.get(kind, 0) + 1
-        text = (raw or b"").decode("utf-8", "replace")
-        if not (200 <= status < 300 or status == 304 or status in ok):
-            raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
-        if status == 304 and cached is not None:
-            self._touch(url)
-            resp_headers.setdefault("link", cached.get("link") or "")
-            return Response(304, cached.get("data"), cached["etag"], resp_headers)
-        data = None
-        if text.strip():
-            try:
-                data = json.loads(text)
-            except ValueError:
-                data = None
-        if method == "GET" and status == 200 and not etag and resp_headers.get("etag"):
+        self._count(method, url, status)
+        return status, resp_headers, (raw or b"").decode("utf-8", "replace")
+
+    def _keep_answer(self, url: str, status: int, data: Any,
+                     resp_headers: Dict[str, str]) -> None:
+        """Keep a full GET answer that carries an ETag for the next read."""
+        if status == 200 and resp_headers.get("etag"):
             self._keep(url, {"etag": resp_headers["etag"], "data": data,
                              "link": resp_headers.get("link", "")})
-        return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    def _count(self, method: str, url: str, status: int) -> None:
+        """Tally one answer: a 304 apart, anything else by its kind."""
+        if status == 304:
+            self.not_modified += 1
+            return
+        kind = request_kind(method, url)
+        self.kinds[kind] = self.kinds.get(kind, 0) + 1
+
+    def _from_cache(self, url: str, cached: Dict[str, Any],
+                    resp_headers: Dict[str, str]) -> Response:
+        """A 304 answered from the kept entry, with its pagination link."""
+        self._touch(url)
+        resp_headers.setdefault("link", cached.get("link") or "")
+        return Response(304, cached.get("data"), cached["etag"], resp_headers)
 
     # -- the rate limit ------------------------------------------------
     def _note_rate(self, headers: Dict[str, str]) -> None:
