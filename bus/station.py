@@ -448,6 +448,8 @@ class Station:
                     self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
                     return False
             except ValueError as err:
+                # Only Finding() raises here, for a malformed ID or disposition;
+                # err names which, so one refusal message covers both.
                 self._refuse(repo, issue, "invalid pre-roll finding: %s" % err)
                 return False
 

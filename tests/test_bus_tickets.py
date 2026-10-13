@@ -22,6 +22,23 @@ class FindingDispositionTest(unittest.TestCase):
         self.assertIn("\nDoes not apply\n", rendered + "\n")
         self.assertEqual(parse_findings(rendered)[0].disposition, "does_not_apply")
 
+    def test_stored_finding_without_disposition_stays_unresolved(self):
+        stored = {"id": "F1", "text": "Review finding"}
+        self.assertIsNone(Finding.from_dict(stored).disposition)
+
+    def test_render_refuses_a_disposition_it_cannot_write_back(self):
+        finding = Finding("F1", "Review finding", location=("test.py", 10, 1),
+                          disposition="new_ticket")
+        with self.assertRaisesRegex(ValueError, "F1 has disposition new_ticket"):
+            render_findings([finding])
+
+    def test_disposition_line_belongs_to_its_own_thread(self):
+        body = ("### Thread F1 (comment 1) at a.py:1\nfirst\nDoes not apply\n"
+                "### Thread F2 (comment 2) at a.py:2\nsecond\n")
+        first, second = parse_findings(body)
+        self.assertEqual((first.text, first.disposition), ("first", "does_not_apply"))
+        self.assertEqual((second.text, second.disposition), ("second", None))
+
 
 def test_finding_creation():
     """Test creating a Finding object."""

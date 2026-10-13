@@ -116,7 +116,9 @@ class Fix:
         return self._findings_list
 
     def has_all_dispositions(self) -> bool:
-        """Return True if all findings have a disposition (any value, including 'does_not_apply')."""
+        """Return True if every finding carries a disposition line. A finding
+        without one stays None (undispositioned); 'does_not_apply' counts only
+        when it was stated."""
         return all(f.disposition for f in self.findings_list)
 
 
@@ -151,7 +153,7 @@ class Finding:
             id=data.get("id", ""),
             text=data.get("text", ""),
             location=tuple(data["location"]) if "location" in data else None,
-            disposition=data.get("disposition", "does_not_apply"),
+            disposition=data.get("disposition"),
             ticket=data.get("ticket")
         )
 
@@ -169,67 +171,58 @@ def _thread_finding(thread: Dict[str, str], comments: List[str],
     return finding
 
 
+_THREAD_RE = re.compile(r"^### Thread(?: ([A-Za-z0-9]+))? \(comment ([0-9]+)\) at (.+):(\d+)$")
+
+
+def _disposition_line(stripped: str) -> Optional[Tuple[str, Optional[str]]]:
+    """The disposition a finding line states: "Fixing: <ticket>" or
+    "Does not apply"; None for an ordinary comment line."""
+    fixing_match = FIXING_DISPOSITION_RE.match(stripped)
+    if fixing_match:
+        return "existing_ticket", fixing_match.group(1)
+    if stripped == "Does not apply":
+        return "does_not_apply", None
+    return None
+
+
 def parse_findings(body: str) -> List[Finding]:
     """Parse findings from a loom:fix comment body.
 
-    A finding without a disposition line remains undispositioned.
+    Each "### Thread [<id>] (comment <id>) at <path>:<line>" header starts a
+    finding; a header without an ID gets the next F<number>. A finding
+    without a disposition line remains undispositioned.
     """
     findings: List[Finding] = []
-    lines = body.split("\n")
-    current_thread = None
-    current_comments = []
-    next_id = 1  # Next auto-assigned ID number
-    pending_disposition = None
-    pending_disposition_value = None
-    
-    for line in lines:
+    current_thread: Optional[Dict[str, str]] = None
+    current_comments: List[str] = []
+    disposition: Optional[Tuple[str, Optional[str]]] = None
+    next_id = 1
+
+    def close_thread() -> None:
+        if current_thread:
+            kind, value = disposition or (None, None)
+            findings.append(_thread_finding(current_thread, current_comments, kind, value))
+
+    for line in body.split("\n"):
         stripped = line.strip()
-        
-        # Look for a thread header: "### Thread <id> (comment <id>) at <path>:<line>"
-        # Thread ID is optional (F1, F2, etc. can be omitted initially)
-        thread_match = re.match(r"^### Thread(?: ([A-Za-z0-9]+))? \(comment ([0-9]+)\) at (.+):(\d+)$", stripped)
+        thread_match = _THREAD_RE.match(stripped)
         if thread_match:
-            # Save the previous thread if any, with its disposition
-            if current_thread:
-                findings.append(_thread_finding(current_thread, current_comments,
-                                                pending_disposition, pending_disposition_value))
-                pending_disposition = None
-                pending_disposition_value = None
-            
+            close_thread()
             thread_id = thread_match.group(1)
             if not thread_id:
                 thread_id = "F%d" % next_id
                 next_id += 1
-            current_thread = {
-                "id": thread_id,
-                "comment_id": thread_match.group(2),
-                "path": thread_match.group(3),
-                "line": thread_match.group(4)
-            }
+            current_thread = {"id": thread_id, "comment_id": thread_match.group(2),
+                              "path": thread_match.group(3), "line": thread_match.group(4)}
             current_comments = []
-            continue
-        
-        # Look for dispositions: "Fixing: <ticket>" or "Does not apply"
-        fixing_match = re.match(r"^Fixing: (.+)$", stripped)
-        if fixing_match and current_thread:
-            pending_disposition = "existing_ticket"
-            pending_disposition_value = fixing_match.group(1)
-            continue
-        
-        # Look for explicit "Does not apply" at the start of a comment
-        if stripped == "Does not apply" and current_thread:
-            pending_disposition = "does_not_apply"
-            continue
-        
-        # If we're inside a thread, add the comment
-        if current_thread:
-            current_comments.append(line)
-    
-    # Don't forget the last thread
-    if current_thread:
-        findings.append(_thread_finding(current_thread, current_comments,
-                                        pending_disposition, pending_disposition_value))
-    
+            disposition = None
+        elif current_thread:
+            stated = _disposition_line(stripped)
+            if stated:
+                disposition = stated
+            else:
+                current_comments.append(line)
+    close_thread()
     return findings
 
 
@@ -281,6 +274,11 @@ def render_findings(findings: List[Finding]) -> str:
                 lines.append("Fixing: fixed in this PR")
             elif f.disposition == "does_not_apply":
                 lines.append("Does not apply")
+            else:
+                # parse_findings could not read it back: the disposition
+                # would vanish from the record rather than survive it.
+                raise ValueError("finding %s has disposition %s without a ticket"
+                                 % (f.id, f.disposition))
         lines.append("")
     return "\n".join(lines).strip("\n")
 
