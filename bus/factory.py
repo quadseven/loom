@@ -13,9 +13,12 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   Without the review check on its head commit it is never merged: every
   change is reviewed (the operator's rule), so it waits for the brain.
 - One with a failing check, an unresolved thread or a conflict goes back to
-  a lane as a fix brief (bus.brain.fix). The first send-back of a young pull
-  request stays on the ticket's lane. Every later one, and any pull request
-  older than STUCK_AGE, climbs the model ladder (docs/MUSE.md).
+  a lane as a fix brief (bus.brain.fix). It stays on the ticket's lane while
+  the rounds make progress. It climbs the model ladder (docs/MUSE.md) only
+  when it is stuck: a review thread survived a fix round, checks still fail
+  after a round that was asked to fix them, or the pull request is older
+  than STUCK_AGE. A review that finds new things is progress, and a conflict
+  is mechanical (the fix brief's runner merges the base), so neither climbs.
 - Landing keeps the default branch green and nothing stale. A ready pull
   request that is behind its base is brought up to date first (GitHub's
   update-branch), and lands only once its checks and review pass again on
@@ -76,6 +79,9 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 RUNG_BUSY = 2
 RUNG_MARKER = "<!-- loom:rung %d -->"
 RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
+# The thread and check headings bus.brain.fix writes into a loom:fix comment.
+FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
+FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
 CLAIM_RE = re.compile(r"^Claimed for lane ")
 ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
@@ -120,10 +126,27 @@ def _lane(issue: Dict[str, Any]) -> str:
 
 
 def rung_of(comments: Sequence[Dict[str, Any]]) -> int:
-    """The highest rung the ticket has climbed to, 0 when none."""
+    """The rung of the ticket's latest rung marker, 0 when none. A marker of
+    0 (posted by the brain or the operator) starts the ladder again."""
     found = [int(m.group(1)) for c in comments
              for m in RUNG_RE.finditer(str(c.get("body") or ""))]
-    return max(found, default=0)
+    return found[-1] if found else 0
+
+
+def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
+          checks_failing: bool, age: float) -> bool:
+    """Did the last fix round fail to move this pull request? True when a
+    thread it was asked to fix is still open, when checks it was asked to fix
+    still fail, or when the pull request is older than STUCK_AGE."""
+    if age > STUCK_AGE:
+        return True
+    last = next((str(c.get("body") or "") for c in reversed(comments)
+                 if str(c.get("body") or "").startswith(FIX_MARKER)), None)
+    if last is None:
+        return False
+    if set(FIX_THREAD_RE.findall(last)) & set(open_threads):
+        return True
+    return checks_failing and bool(FIX_CHECK_RE.search(last))
 
 
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
@@ -145,6 +168,18 @@ def pick_rung(start: int, load: Dict[str, int]) -> int:
         if min(load.get(lane, 0) for lane in lanes) < RUNG_BUSY:
             return rung
     return len(LADDER)
+
+
+def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
+    """What keeps a pull request from landing, in words for its ticket."""
+    return [w for bad, w in ((not brain._checks_green(details), "failing checks"),
+                             (not brain._threads_resolved(details), "open review threads"),
+                             (full.get("mergeable") is False, "a conflict")) if bad]
+
+
+def open_thread_ids(details: Dict[str, Any]) -> List[str]:
+    threads = (details.get("reviewThreads") or {}).get("nodes") or []
+    return [str(t.get("id")) for t in threads if not t.get("isResolved")]
 
 
 def held_until(issue: Dict[str, Any]) -> float:
@@ -227,9 +262,12 @@ class Factory:
             return "wait"
         if any(r.get("name") == self.review_check for r in runs):
             return "reviewed"
-        if self.now - pushed_at > REVIEW_GRACE:
-            _say("%s#%d has no %s on its head commit; it waits for the brain"
-                 % (repo, number, self.review_check))
+        if self.now - pushed_at <= REVIEW_GRACE:
+            # A fresh push: its checks and review may not have started yet,
+            # and the open threads still belong to the last head.
+            return "wait"
+        _say("%s#%d has no %s on its head commit; it waits for the brain"
+             % (repo, number, self.review_check))
         return "unreviewed"
 
     # -- writes ----------------------------------------------------------
@@ -264,10 +302,11 @@ class Factory:
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
 
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
-                   comments: List[Dict[str, Any]], why: str) -> None:
+                   comments: List[Dict[str, Any]], why: str,
+                   open_threads: Sequence[str] = (), checks_failing: bool = False) -> None:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
-        if fixes_of(comments) >= 1 or age > STUCK_AGE:
+        if stuck(comments, open_threads, checks_failing, age):
             rung = rung_of(comments) + 1
             if self._climb(repo, issue, rung, why) is None:
                 self._give_up(repo, issue, why)
@@ -309,14 +348,12 @@ class Factory:
         if review == "wait":
             return
         details = brain._pr_graphql(self.gh, repo, number)
-        faults = [w for bad, w in ((not brain._checks_green(details), "failing checks"),
-                                   (not brain._threads_resolved(details), "open review threads"),
-                                   (full.get("mergeable") is False, "a conflict")) if bad]
+        faults = pr_faults(details, full)
         if faults == ["failing checks"] and self._run_again(repo, number, sha):
             return
         if faults:
             self._send_back(repo, full, issue, self._comments(repo, int(issue["number"])),
-                            ", ".join(faults))
+                            ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
             self._land(repo, number, full, issue)
 
