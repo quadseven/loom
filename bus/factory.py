@@ -16,6 +16,15 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   a lane as a fix brief (bus.brain.fix). The first send-back of a young pull
   request stays on the ticket's lane. Every later one, and any pull request
   older than STUCK_AGE, climbs the model ladder (docs/MUSE.md).
+- Landing keeps the default branch green and nothing stale. A ready pull
+  request that is behind its base is brought up to date first (GitHub's
+  update-branch), and lands only once its checks and review pass again on
+  the new head. Each repo lands at most one pull request a pass, so the
+  next one is checked against the base that includes it. Pull requests of
+  loom:urgent tickets land first, then the oldest.
+- A pull request whose only fault is a failed Actions job gets that job run
+  once more before it is sent back, since one flaky run should not cost a
+  lane round.
 - A failed ticket climbs the ladder, and so does a ticket left briefed for
   BRIEFED_STALL with no lane claiming it.
 - Past the last rung the ticket is left failed for the brain, with a note.
@@ -37,6 +46,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 from . import brain
 from .github import GitHub, GitHubError
@@ -67,6 +77,7 @@ RUNG_BUSY = 2
 RUNG_MARKER = "<!-- loom:rung %d -->"
 RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 CLAIM_RE = re.compile(r"^Claimed for lane ")
+ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
 
@@ -136,6 +147,15 @@ def pick_rung(start: int, load: Dict[str, int]) -> int:
     return len(LADDER)
 
 
+def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
+                  linked: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pull requests of loom:urgent tickets first, then the oldest."""
+    urgent = {n for n, issue in tickets.items() if "loom:urgent" in _labels(issue)}
+    ticket_of = {int(pr["number"]): n for n, pr in linked.items()}
+    return sorted(prs, key=lambda p: (ticket_of.get(int(p["number"])) not in urgent,
+                                      str(p.get("created_at") or "")))
+
+
 def with_model(body: str, model: str) -> str:
     """The ticket body with its Model: header line set to `model`."""
     head, sep, rest = body.partition("\n\n")
@@ -159,6 +179,9 @@ class Factory:
         self.merge, self.fix, self.move = merge, fix, move
         self.actions = 0
         self.load: Dict[str, int] = {}
+        self.landed: set = set()
+        self.updated: set = set()
+        self._runs: Dict[str, List[Dict[str, Any]]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -191,7 +214,7 @@ class Factory:
     def _review_state(self, repo: str, number: int, sha: str, pushed_at: float) -> str:
         """"wait" while any check runs; "reviewed" once the review check has
         run on this commit; else "unreviewed", which never merges."""
-        runs = self._check_runs(repo, sha)
+        runs = self._runs[sha] = self._check_runs(repo, sha)
         if any(r.get("status") != "completed" for r in runs):
             return "wait"
         if any(r.get("name") == self.review_check for r in runs):
@@ -281,20 +304,77 @@ class Factory:
         faults = [w for bad, w in ((not brain._checks_green(details), "failing checks"),
                                    (not brain._threads_resolved(details), "open review threads"),
                                    (full.get("mergeable") is False, "a conflict")) if bad]
+        if faults == ["failing checks"] and self._run_again(repo, number, sha):
+            return
         if faults:
             self._send_back(repo, full, issue, self._comments(repo, int(issue["number"])),
                             ", ".join(faults))
         elif review == "reviewed":
-            self._merge(repo, number, issue)
+            self._land(repo, number, full, issue)
 
-    def _merge(self, repo: str, number: int, issue: Dict[str, Any]) -> None:
+    def _run_again(self, repo: str, number: int, sha: str) -> bool:
+        """Re-run the failed Actions jobs on this commit once. False when a
+        review check failed (its findings are real), when a failed check is
+        not an Actions job, or when the jobs already had their second run."""
+        failed = [r for r in self._runs.get(sha, [])
+                  if r.get("conclusion") in ("failure", "timed_out", "cancelled")]
+        if not failed or any(r.get("name") == self.review_check for r in failed):
+            return False
+        ids = set()
+        for run in failed:
+            m = ACTIONS_RUN_RE.search(str(run.get("details_url") or ""))
+            if not m:
+                return False
+            ids.add(m.group(1))
+        fresh = [i for i in sorted(ids) if int((self.gh.rest(
+            "GET", "/repos/%s/actions/runs/%s" % (repo, i)).data or {}).get("run_attempt") or 1) < 2]
+        if len(fresh) != len(ids):
+            return False
+        for run_id in fresh:
+            self.gh.rest("POST", "/repos/%s/actions/runs/%s/rerun-failed-jobs" % (repo, run_id))
+        self.actions += 1
+        _say("re-ran failed jobs on %s#%d once before sending it back" % (repo, number))
+        return True
+
+    def _behind(self, repo: str, full: Dict[str, Any]) -> int:
+        base = str((full.get("base") or {}).get("ref") or "")
+        head = str((full.get("head") or {}).get("sha") or "")
+        data = self.gh.rest("GET", "/repos/%s/compare/%s...%s"
+                            % (repo, quote(base, safe=""), head)).data or {}
+        return int(data.get("behind_by") or 0)
+
+    def _land(self, repo: str, number: int, full: Dict[str, Any],
+              issue: Dict[str, Any]) -> None:
+        """Merge a ready pull request that is up to date with its base, one a
+        repo a pass; bring one that is behind up to date instead."""
+        if repo in self.landed:
+            return
+        if self._behind(repo, full):
+            if repo in self.updated:
+                return
+            self.updated.add(repo)
+            sha = str((full.get("head") or {}).get("sha") or "")
+            done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
+                                {"expected_head_sha": sha}, ok=(422,))
+            if done.status == 422:
+                _say("could not bring %s#%d up to date; it waits for the next pass" % (repo, number))
+                return
+            self.actions += 1
+            _say("brought %s#%d up to date with its base; it lands once its checks "
+                 "and review pass on the new head" % (repo, number))
+            return
+        if self._merge(repo, number, issue):
+            self.landed.add(repo)
+
+    def _merge(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         try:
             self.merge(self.gh, repo, number, (repo, int(issue["number"])))
         except (ValueError, GitHubError) as err:
             _say("did not merge %s#%d: %s" % (repo, number, err))
-            return
+            return False
         self.actions += 1
         _say("merged %s#%d for #%d" % (repo, number, issue["number"]))
+        return True
 
     def failed(self, repo: str, issue: Dict[str, Any],
                prs: Dict[int, Dict[str, Any]]) -> None:
@@ -353,7 +433,7 @@ class Factory:
         prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
                if isinstance(p, dict) and self._trusted(p)]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
-        for pr in prs:
+        for pr in landing_order(prs, tickets, linked):
             if self.actions >= MAX_ACTIONS:
                 return
             self._guarded(self.pull_request, repo, pr, tickets)

@@ -29,6 +29,9 @@ class FakeGitHub:
         self.runs = {}
         self.details = {}
         self.writes = []
+        self.behind = {}
+        self.attempts = {}
+        self.update_status = 202
 
     def ticket(self, number, state, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
         self.issues[number] = {"number": number, "state": "open", "body": body, "user": ME,
@@ -45,7 +48,7 @@ class FakeGitHub:
             "number": number, "state": "open", "draft": False, "body": "", "user": ME,
             "head": {"ref": "loom/%d-some-title" % ticket, "sha": sha,
                      "repo": {"full_name": REPO}},
-            "base": {"repo": {"full_name": REPO}},
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
             "created_at": iso(created), "updated_at": iso(updated), "mergeable": mergeable}
         self.runs[sha] = [{"name": n, "status": s} for n, s in runs]
         self.details[number] = {
@@ -78,8 +81,16 @@ class FakeGitHub:
             m = re.search(r"/commits/(\w+)/check-runs", path)
             if m:
                 return Response(200, {"check_runs": self.runs[m.group(1)]})
+            m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
+            if m:
+                return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
+            m = re.search(r"/actions/runs/(\d+)$", path)
+            if m:
+                return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})
             raise AssertionError("unexpected GET %s" % path)
         self.writes.append((method, path, body))
+        if path.endswith("/update-branch"):
+            return Response(self.update_status, {})
         m = re.search(r"/issues/(\d+)(/labels|/comments)?$", path)
         if m:
             number = int(m.group(1))
@@ -200,6 +211,66 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.moved, [(5, "failed", None)])
+
+    def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 3
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                       {"expected_head_sha": "sha50"}), self.gh.writes)
+
+    def test_a_refused_update_waits_for_the_next_pass(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 1
+        self.gh.update_status = 422
+        f = self.go()
+        self.assertEqual((self.merged, self.fixed, f.actions), ([], [], 0))
+
+    def test_each_repo_lands_one_pull_request_a_pass_oldest_first(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, created=3600)
+        self.gh.pulls = dict(reversed(list(self.gh.pulls.items())))
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_an_urgent_tickets_pull_request_lands_first(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.ticket(6, "pr")
+        self.gh.issues[6]["labels"].append({"name": "loom:urgent"})
+        self.gh.pull(60, 6, created=3600)
+        self.go()
+        self.assertEqual(self.merged, [(60, (REPO, 6))])
+
+    def test_a_failed_actions_job_is_run_once_more_before_a_send_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": "unittest", "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/77/job/1" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertIn(("POST", "/repos/%s/actions/runs/77/rerun-failed-jobs" % REPO, None),
+                      self.gh.writes)
+        self.gh.attempts["77"] = 2
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_failed_review_is_never_run_again(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/%s/actions/runs/78/job/1" % REPO}]
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
 
     def test_pull_requests_of_tickets_not_in_pr_are_left_alone(self):
         self.gh.ticket(5, "briefed")
