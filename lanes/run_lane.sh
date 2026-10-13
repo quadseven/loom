@@ -398,31 +398,42 @@ update_fix_branch() {
        fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
     UPDATE_REASON="could not fetch $default"; return 1
   fi
-  if ! safe_git merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge-base HEAD "origin/$default" > /dev/null 2>&1; then
     timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
       fetch -q --unshallow origin >> "$LOG" 2>&1 || true
   fi
-  safe_git merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
-  if safe_git merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
+  timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
+  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
     return 0
   fi
-  CONFLICTS="$(safe_git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ *$//')"
+  # One path a line, never split on spaces or globbed.
+  CONFLICTS="$(safe_git -c core.quotePath=false diff --name-only --diff-filter=U)"
   if [ -z "$CONFLICTS" ]; then
     safe_git merge --abort >> "$LOG" 2>&1 || true
     UPDATE_REASON="merging $default into $BRANCH failed"; return 1
   fi
-  echo "[$(date -u +%FT%TZ)] $TICKET: merging $default conflicts in $CONFLICTS; the agent resolves it" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] $TICKET: merging $default conflicts in $(conflict_list); the agent resolves it" >> "$LOG"
   return 0
 }
 
-# Files of CONFLICTS that still hold a conflict marker line.
+# CONFLICTS (one path a line) as one comma-separated line.
+conflict_list() {
+  printf '%s\n' "$CONFLICTS" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g'
+}
+
+# Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
 markers_left() {
-  local f left=""
-  for f in $CONFLICTS; do
-    [ -f "$TREE/$f" ] && grep -qE '^(<<<<<<<|=======|>>>>>>>)( |$)' "$TREE/$f" && left="$left $f"
-  done
-  echo "${left# }"
+  local f left=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$TREE/$f" ] &&
+      grep -qE '^(<<<<<<<|=======|>>>>>>>)( |$)' -- "$TREE/$f" && left+=("$f")
+  done <<< "$CONFLICTS"
+  [ "${#left[@]}" -gt 0 ] && { local IFS=,; echo "${left[*]}" | sed 's/,/, /g'; }
+  return 0
 }
 
 run_agent() {
@@ -670,7 +681,7 @@ for BRIEF in "$INBOX"/*.md; do
     if [ -n "$CONFLICTS" ]; then
       RUN_BRIEF="$WORKDIR/$TICKET.run.md"
       { cat "$BRIEF"
-        printf '\n## Merge conflicts\n\nThe runner merged the default branch into this branch and it conflicts in: %s\n' "$CONFLICTS"
+        printf '\n## Merge conflicts\n\nThe runner merged the default branch into this branch and it conflicts in: %s\n' "$(conflict_list)"
         printf 'Resolve every conflict in those files first: keep both sides'"'"' intent, remove every conflict marker, and keep the tests green. Do not run git; the runner completes the merge.\n'
       } > "$RUN_BRIEF"
     fi

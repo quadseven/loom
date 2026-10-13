@@ -458,6 +458,40 @@ cat > /dev/null
         self.assertEqual(len(self.parents(after)), 2)
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    def test_a_conflict_in_a_path_with_a_space_is_found_whole(self):
+        name, before = self.fix_brief()
+        work = Path(self._tmp.name) / "space-work"
+        git("clone", "-q", "-b", self.FIX_BRANCH, str(self.remote), str(work))
+        (work / "my notes.txt").write_text("branch side\n")
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "notes", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        self.advance_main("my notes.txt", "main side\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        self.run_lane()
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertIn("conflict markers left in my notes.txt",
+                      (self.loom / "logs" / "codex" / (name + ".log")).read_text())
+
+    def test_a_merge_base_past_the_fetch_depth_is_found_by_unshallowing(self):
+        name, before = self.fix_brief()
+        work = Path(self._tmp.name) / "deep-work"
+        git("clone", "-q", str(self.remote), str(work))
+        for i in range(210):
+            git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                "commit", "-q", "--allow-empty", "-m", "main %d" % i, cwd=work)
+        (work / "deep.txt").write_text("deep\n")
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "deep", cwd=work)
+        git("push", "-q", "origin", "main", cwd=work)
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertEqual(self.remote_file(after, "deep.txt"), "deep\n")
+        self.assertIn(before, self.parents(after))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
     def test_conflict_markers_left_by_the_agent_park_the_brief(self):
         name, before = self.fix_brief()
         self.advance_main("first.txt", "main's version\n")
