@@ -13,7 +13,11 @@
 # Run it on a schedule (launchd StartInterval), not as a forever loop. Every
 # brief ends in exactly one place: done/ (a PR exists for its branch) or
 # failed/ (the run did not produce one). A brief is never run twice, so a
-# crash or restart cannot turn into a re-run loop. The agent edits (and
+# crash or restart cannot turn into a re-run loop. Each failure is classed
+# limit, transient or work in its log line; the station may re-brief a limit
+# or transient failure to another lane as a new attempt on a fresh branch.
+# A limit failure also holds this lane unavailable until the provider's reset
+# (else 60 minutes). The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
 # A repo with a validation contract (.loom/validation.conf) is prepared
 # before the agent and checked again on its commit; a failing check parks
@@ -136,14 +140,63 @@ lane_setting() {
 }
 
 # Each pass records whether this lane can take work. The dispatcher routes
-# only to lanes with a fresh, available heartbeat.
+# only to lanes with a fresh, available heartbeat. An optional third argument
+# is the epoch time a provider limit lifts; until then every pass stays
+# unavailable without reading the key or taking a brief.
+BEAT="$LOOM_HOME/state/usage/$SLOT.json"
 heartbeat() {
-  local reason
+  local reason retry=""
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
   reason="$(printf '%s' "$2" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
+  [[ "${3:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $3"
   mkdir -p "$LOOM_HOME/state/usage"
-  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"}\n' \
-    "$SLOT" "$(date +%s)" "$1" "$reason" > "$LOOM_HOME/state/usage/$SLOT.json"
+  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s}\n' \
+    "$SLOT" "$(date +%s)" "$1" "$reason" "$retry" > "$BEAT.tmp" && mv "$BEAT.tmp" "$BEAT"
+}
+
+utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
+
+# What ended a failed run, from the tail of the agent's output. A provider
+# limit: a usage, rate or quota limit, or an HTTP 429 or 402 answer. A
+# transient fault: the network or the provider's servers. The patterns look
+# at the last lines only, so a ticket that is about rate limits does not
+# read as one.
+LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network error|fetch failed|connection (reset|refused|closed)|could not resolve host|overloaded|service unavailable|bad gateway|gateway timeout|internal server error|(http|status|code|error)[^0-9a-z]{0,3}(500|502|503|504|529)([^0-9]|$)'
+# When the provider says its limit lifts: an epoch after "limit reached|" or a
+# "reset" key, or a "retry after" / "try again in" / "resets in" duration.
+EPOCH_RE='(limit reached\||reset[a-z_-]*["'"'"': =]+)([0-9]{10})([^0-9]|$)'
+AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^a-z]|$)'
+LIMIT_WAIT=3600
+LIMIT_WAIT_MAX=86400
+
+# Sets FAIL_CLASS (limit, transient or work) for a run that ended with exit
+# status $1 and output $2, where $3 is "edited" when the agent changed the
+# tree. On limit also sets RETRY_AT. A crash before any edit, a timeout, a
+# signal or a network fault is transient; anything else is work.
+classify_failure() {
+  local status="$1" out="$2" edited="$3" now n
+  FAIL_CLASS=work RETRY_AT=""
+  now="$(date +%s)"
+  shopt -s nocasematch
+  if [[ "$out" =~ $LIMIT_RE ]]; then
+    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
+    if [[ "$out" =~ $EPOCH_RE ]]; then
+      RETRY_AT="${BASH_REMATCH[2]}"
+    elif [[ "$out" =~ $AFTER_RE ]]; then
+      n="${BASH_REMATCH[2]}"
+      case "${BASH_REMATCH[3]}" in h*) n=$((n * 3600)) ;; m*) n=$((n * 60)) ;; esac
+      RETRY_AT=$((now + n))
+    fi
+    [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
+    [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX))
+  elif [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
+       [[ "$out" =~ $NET_RE ]]; then
+      FAIL_CLASS=transient
+    fi
+  fi
+  shopt -u nocasematch
 }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
@@ -256,10 +309,12 @@ repair_pr_text() {
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
-# The orchestrator reads failed/ and re-briefs by hand.
+# The reason starts with the failure's class ($3, default work): the station
+# re-briefs limit and transient failures to another lane as a new attempt,
+# and leaves work failures to the brain.
 park() {
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
-  echo "[$(date -u +%FT%TZ)] $TICKET failed: $2" | tee -a "$LOG" >&2
+  echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
   mv "$1" "$INBOX/failed/"
 }
 
@@ -461,8 +516,6 @@ SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_WHY=""
 
-utc_at() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
-
 # Ask the endpoint for its models. 0: it answered; 1: refused or 503, with
 # LIMIT_WHY set; 2: no answer for another reason, with READY_REASON set.
 spark_probe() {
@@ -476,31 +529,14 @@ spark_probe() {
   return 2
 }
 
-# A provider that refused this run for a usage, rate or credit limit, read
-# from the run's own last lines of output. Sets LIMIT_WHY. On 2026-10-13 a
-# codex usage limit read as "agent exited 1" on 21 runs, each costing its
-# ticket a rung of the model ladder and keeping the lane advertised as up.
-# Only the last few non-empty lines count, where the CLIs print the error
-# they exit on: text the model wrote earlier in the run cannot pause a lane.
-# A run that fakes one pauses its own lane for LIMIT_HOLD at most and hands
-# its brief to another lane, which is all a match does.
-LIMIT_LINE_RE='^(error|api error)\b.*(usage limit|rate[ _-]?limit|credit balance|quota|too many requests|overloaded)|usage limit reached|[0-9]+-hour limit reached'
-provider_limit() {
-  local line
-  line="$(tail -c +"$(( ${LOG_START:-0} + 1 ))" "$LOG" 2>/dev/null | grep -v '^[[:space:]]*$' |
-    tail -n 5 | grep -iE "$LIMIT_LINE_RE" | tail -n 1)"
-  [ -n "$line" ] || return 1
-  LIMIT_WHY="lane $SLOT's provider reported a usage or rate limit"
-}
-
 # Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
 mark_limit() {
   LIMIT_UNTIL=$(( $(date +%s) + LIMIT_HOLD ))
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
   LIMITED=1
-  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc_at "$LIMIT_UNTIL")"
-  heartbeat false "$READY_REASON"
+  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
+  heartbeat false "$READY_REASON" "$LIMIT_UNTIL"
 }
 
 # A limit recorded by an earlier pass that has not run out. A time further
@@ -511,7 +547,7 @@ limit_held() {
   now="$(date +%s)"
   [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
   LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
-  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc_at "$LIMIT_UNTIL")"
+  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
 }
 
 spark_ready() {
@@ -1130,6 +1166,13 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_T
   fi
 done
 
+# A provider limit hit by an earlier pass holds until its retry time.
+LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+if [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
+  heartbeat false "provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" "$LIMIT_UNTIL"
+  exit 0
+fi
+
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
 API_KEY=""
@@ -1162,7 +1205,7 @@ for BRIEF in "$INBOX"/*.md; do
   if ! [[ "$TICKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
     park "$BRIEF" "ticket name must be letters, digits, dot, underscore or dash"; continue
   fi
-  if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY"; continue; fi
+  if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY" limit; continue; fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -1248,7 +1291,7 @@ for BRIEF in "$INBOX"/*.md; do
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
-    park "$BRIEF" "clone or branch failed"; continue
+    park "$BRIEF" "clone or branch failed" transient; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
@@ -1271,6 +1314,7 @@ for BRIEF in "$INBOX"/*.md; do
       } > "$RUN_BRIEF"
     fi
   fi
+  LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
@@ -1284,18 +1328,27 @@ for BRIEF in "$INBOX"/*.md; do
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
-  # A run the provider refused for a limit is not a failure: the lane steps
-  # out for LIMIT_HOLD and the brief goes back for another lane.
-  if [ "$STATUS" -ne 0 ] && provider_limit; then
-    mark_limit
-    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)"; continue
-  fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
-    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)"; continue
+    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
+  EDITED=""
+  { [ -n "$(safe_git status --porcelain)" ] || [ "$(safe_git rev-parse HEAD)" != "$BASE" ]; } && EDITED=edited
+  # Only a run that failed or changed nothing is classed: a finished run's
+  # summary may well mention rate limits.
+  FAIL_CLASS=work
+  if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
+    classify_failure "$STATUS" "$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)" "$EDITED"
+  fi
+  if [ "$FAIL_CLASS" = limit ]; then
+    # Unavailable before the brief is parked, so the station never sends
+    # this lane the retry. The rest of the inbox waits for the reset.
+    heartbeat false "provider limit reached; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    park "$BRIEF" "agent exited $STATUS: provider limit reached; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    break
+  fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
   keep_answers
@@ -1375,7 +1428,7 @@ for BRIEF in "$INBOX"/*.md; do
           park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
         fi
       fi
-      park "$BRIEF" "push failed"; continue
+      park "$BRIEF" "push failed" transient; continue
     fi
     [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
   fi

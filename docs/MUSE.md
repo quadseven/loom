@@ -146,7 +146,30 @@ live regression).
    and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
    refuse a missing proof or an unchecked criterion: never invent evidence to
    get past them; leave the ticket open and say what is missing.
-5. Handle `loom:failed` tickets. Re-brief with a sharper brief or another
+5. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
+   section in `status`: the failed tickets that ran on all three rungs, oldest
+   first, each with its open pull request, its mergeable state, and each
+   unresolved thread's severity, comment ID, first line and the newest lane
+   answer. The factory resolves an answered medium or low finding itself but
+   leaves a high or critical one open by design, so these wait for a ruling.
+   Take up to 3 of them per tick, oldest first; defer the rest (stage
+   `failed`). For each, rule on every open finding against the pull request's
+   head: valid and fixed, invalid (the lane's answer holds), or a real defect.
+   Reply with the ruling and resolve the thread with
+   `python3 -m bus.brain reply OWNER/NAME#PR --comment ID --file RULING.md --resolve`.
+   Never resolve a thread a person opened: reply to it without `--resolve`
+   and leave it for that person; `status` marks such a thread "opened by a
+   person". When every finding is valid and fixed or invalid, move the
+   ticket with `python3 -m bus.brain move OWNER/NAME#N --to pr`, and the
+   factory takes the pull request from there. When the branch conflicts
+   with the default branch across many files, or a finding is a real defect
+   no rung fixed, close the pull request as superseded (a comment saying so,
+   then close it through the REST API), write the rulings into the ticket
+   body through the REST API, and restart the ticket on rung 0 with
+   `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE --model MODEL --note TEXT`
+   (lane and model by Lane choice), where TEXT starts with the line
+   `<!-- loom:rung 0 -->`, which starts its ladder again.
+   Re-brief any other failed ticket with a sharper brief or another
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
    `python3 -m bus.brain close OWNER/NAME#N --reason not_planned --note TEXT`.
@@ -177,8 +200,10 @@ live regression).
    `loom:rewritten` and stays open) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
    the exact thing needed: money, hardware, an account, a credential, or a
-   decision the goal home reserves for the operator. Never close an issue
-   or mark one done from triage: an old issue that looks finished stays
+   decision the goal home reserves for the operator. When an open
+   `loom:human` issue turns out to be work the brain can do after all,
+   remove the label and brief it the same way (`brief --refs M`). Never
+   close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close.
 9. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
@@ -197,7 +222,10 @@ live regression).
      named as stuck or blocked and still is, with how long; say "nothing"
      when the list is empty. Read the previous report to fill this in.
    - Next: what the brain will do before the next report.
-   - Needs you: only what only the operator can do, or "nothing".
+   - Needs you: only what only the operator can do, or "nothing", then the
+     count of open `loom:human` issues by repo (for example "loom:human: 12
+     in OWNER/NAME, 3 in OWNER/OTHER"); the daily digest lists them, so do
+     not list them here.
    Write sentences, not ticket lists: name a ticket only where the operator
    may want to open it, and never more than one or two per line. Numbers
    over adjectives. A goal home may ask for extra lines; add them after

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import calendar
+import contextlib
 import fcntl
+import io
 import json
 import os
 import re
@@ -50,8 +52,14 @@ class FakeGitHub:
         self.edits = []
         self.posts = []
         self.asks = []
+        self.humans = []
+        self.digest_issues = []
+        self.pages = []
+        self.page_error = False
+        self.page_reply = None
         self.goals = []
         self.goal_error = False
+        self.private = True
         self.threads = {}
         self.reply_fails = set()
         self.replies = []
@@ -72,12 +80,22 @@ class FakeGitHub:
         return reply(200, self.asks, {"ETag": etag})
 
     def add_ask(self, number, title="Need a decision", author="alice-example",
-                labeller="alice-example", urgent=False):
+                labeller="alice-example", urgent=False, body="", created="2030-01-01T00:00:00Z"):
         labels = [{"name": "needs-operator"}] + ([{"name": "loom:urgent"}] if urgent else [])
         self.asks.append({"number": number, "title": title, "user": {"login": author},
-                          "labels": labels, "created_at": "2030-01-01T00:00:00Z",
+                          "labels": labels, "created_at": created, "body": body,
                           "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
         self.events[number] = [labeled("needs-operator", labeller)]
+
+    def add_human(self, number, title="Buy the domain", ask="Buy it.", author="alice-example",
+                created="2030-01-01T00:00:00Z", extra=()):
+        """An open loom:human issue with the brain's ask comment by author."""
+        self.humans.append({"number": number, "title": title, "user": {"login": author},
+                            "labels": [{"name": "loom:human"}] + [{"name": x} for x in extra],
+                            "created_at": created,
+                            "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
+        self.comments[number] = [{"body": "<!-- loom:human v1 -->\n%s" % ask,
+                                  "user": {"login": author}}] if ask else []
 
     def add(self, number, title="Fix the thing", lane="codex", body=BODY,
             author="alice-example", created="2030-01-01T00:00:00Z",
@@ -110,7 +128,11 @@ class FakeGitHub:
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
+        if method == "GET" and parts.path == "/repos/%s" % REPO:
+            return reply(200, {"full_name": REPO, "private": self.private})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
+        if rest == "issues/900/comments" and method == "POST":
+            return self._post_page(data)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
@@ -121,9 +143,21 @@ class FakeGitHub:
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
 
+    def _post_page(self, data):
+        if self.page_error:
+            return reply(502, {"message": "down"})
+        self.pages.append(data["body"])
+        n = len(self.pages)
+        made = {"id": n, "html_url": "https://github.com/%s/issues/900#issuecomment-%d" % (REPO, n)}
+        return reply(201, self.page_reply if self.page_reply is not None else made)
+
     def _issues_and_status(self, method, rest, query, headers, data):
         if method == "GET" and rest == "issues":
             return self._get_issues(query, headers)
+        if method == "POST" and rest == "issues" and data["labels"] == ["loom:digest"]:
+            self.created.append(data)
+            self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
+            return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
@@ -143,10 +177,14 @@ class FakeGitHub:
                                and "loom:pr" in self.names(i["number"])])
         if "needs-operator" in query:
             return self._list_asks(headers)
+        if "loom:human" in query:
+            return reply(200, self.humans)
         if "loom:goal" in query:
             return self._get_goals()
         if "loom:lanes" in query:
             return reply(200, self.lanes_issues)
+        if "loom:digest" in query:
+            return reply(200, self.digest_issues)
         return self._list_briefed(headers)
 
     def _get_goals(self):
@@ -196,6 +234,9 @@ class FakeGitHub:
             self.comments[n].append({"body": data["body"]})
             return reply(201, {})
         if method == "PUT" and sub == "labels":
+            # The station's own login, which is on the brief authors list.
+            old = set(self.names(n))
+            self.events[n] += [labeled(x, "alice-example") for x in data["labels"] if x not in old]
             self.issues[n]["labels"] = [{"name": x} for x in data["labels"]]
             self.version += 1
             return reply(200, [])
@@ -851,6 +892,11 @@ class FixTest(Base):
         self.assertEqual(again, station.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
+    def test_a_fix_with_nothing_to_change_is_recognised_under_its_failure_class(self):
+        self.failed_fix([
+            "[2030-01-01T00:01:00Z] x failed: [work] agent made no commit on loom/12-fix-the-thing"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.fake.comments[99][-1]["body"], station.REVIEW_AGAIN)
     def test_a_fix_whose_branch_moved_goes_back_to_its_pull_request_not_a_failure(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: branch moved: "
@@ -881,6 +927,213 @@ class FixTest(Base):
             fix_body=None)
         self.assertIn("loom:failed", self.fake.names(12))
         self.assertEqual(self.fake.comments[99], [])
+
+
+PLAIN = "Difficulty: hard\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+EASY = PLAIN.replace("hard", "easy")
+
+
+class RetryTest(Base):
+    """A limit or transient failure moves the ticket to another lane; a work
+    failure, a fix round or a ticket out of retries does not."""
+
+    def failed(self, lane="codex", reason="[transient] agent exited 1", body=PLAIN,
+               attempt=1, fix=None, number=12):
+        self.fake.add(number, lane=lane, body=body, state="running")
+        for _ in range(attempt):
+            self.fake.comments[number].append(
+                {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
+        name = tickets.ticket_name(REPO, number, attempt)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[number], lane, attempt, fix))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: %s\n" % (name, lane, name, reason))
+        return name
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def test_a_transient_failure_moves_to_another_slot_on_a_fresh_branch(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.run_pass()
+        retry = [b for b in self.bodies() if b.startswith("Automatic retry")]
+        self.assertEqual(retry, ["Automatic retry 1 of 2 (transient): moved from lane codex to "
+                                 "lane codex-2. Lane codex failed: [transient] agent exited 1"])
+        # The same pass claims it for codex-2 as a new attempt.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex-2", "loom:running"])
+        name = "example-owner.example-repo-12-r2"
+        self.assertEqual(self.listing("codex-2"), [name + ".md"])
+        with open(self.inbox("codex-2", name + ".md")) as fh:
+            text = fh.read()
+        self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
+        self.assertIn("Lane: codex-2\n", text)
+        self.assertNotIn("loom:failed", self.fake.names(12))
+
+    def test_a_retry_is_reported_once(self):
+        self.heartbeat("codex-2")
+        self.failed()
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic retry")]), 1)
+
+    def test_a_limit_failure_skips_the_providers_other_slots(self):
+        for lane in ("anthropic", "anthropic-3", "codex"):
+            self.heartbeat(lane)
+        self.failed(lane="anthropic-2", reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("moved from lane anthropic-2 to lane codex.", self.bodies()[-2])
+        self.assertIn("lane:codex", self.fake.names(12))
+
+    def test_a_provider_limit_from_the_runner_uses_the_bounded_retry(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+        self.assertIn("Automatic retry 1 of 2 (limit): moved from lane codex to lane anthropic.",
+                      self.bodies()[-2])
+
+    def test_an_unavailable_lane_is_skipped(self):
+        self.heartbeat("codex-2", available=False)
+        self.heartbeat("anthropic", age=3600)
+        self.heartbeat("opencode-go")
+        self.failed()
+        self.run_pass()
+        self.assertIn("lane:opencode-go", self.fake.names(12))
+
+    def test_an_idle_lane_wins_over_a_busy_one(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.write(self.inbox("codex-2", "other.md"), "busy\n")
+        self.failed()
+        self.run_pass()
+        self.assertIn("moved from lane codex to lane anthropic.",
+                      [b for b in self.bodies() if b.startswith("Automatic")][0])
+
+    def test_the_tickets_model_limits_the_lanes(self):
+        # Model: model-x is not a claude model, so no anthropic slot takes it.
+        self.heartbeat("anthropic")
+        self.failed(body=BODY)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+
+    def test_a_ticket_body_that_does_not_parse_is_not_retried(self):
+        # Model: given twice, so no lane's eligibility can be judged.
+        self.heartbeat("anthropic")
+        self.failed(body=BODY)
+        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-sonnet-5-5\n\nWork."
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+
+    def test_free_lanes_take_only_easy_tickets_on_public_repos(self):
+        self.heartbeat("zen")
+        self.failed(body=PLAIN)
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.failed(body=EASY, number=13)
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(13))  # the repo is private
+        self.fake.private = False
+        self.failed(body=EASY, number=14)
+        self.run_pass()
+        self.assertIn("lane:zen", self.fake.names(14))
+
+    def test_the_retry_cap_ends_in_failed(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane opencode-go to lane "
+                     "anthropic. Lane opencode-go failed: [transient] agent exited 1"},
+            {"body": "Automatic retry 2 of 2 (limit): moved from lane anthropic to lane codex. "
+                     "Lane anthropic failed: [limit] agent exited 1"},
+        ]
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
+                                            "Not retried: 2 of 2 automatic retries used.")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_the_cap_comes_from_the_settings(self):
+        self.heartbeat("codex-2")
+        self.settings.retry_max = 0
+        self.failed()
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_lanes_an_earlier_retry_left_are_not_chosen_again(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane codex-2 to lane "
+                     "codex. Lane codex-2 failed: [transient] agent exited 1"}]
+        self.run_pass()
+        self.assertIn("Automatic retry 2 of 2 (transient): moved from lane codex to lane "
+                      "anthropic.", self.bodies()[-2])
+
+    def test_a_failure_the_brain_saw_starts_a_new_count(self):
+        self.heartbeat("codex-2")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane a to lane b. x"},
+            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane codex-2. x"},
+            {"body": "Lane codex-2 failed: [work] agent made no commit on loom/12-x"},
+        ]
+        self.run_pass()
+        self.assertIn("lane:codex-2", self.fake.names(12))
+
+    def test_a_retry_whose_relabel_failed_is_finished_without_a_second_comment(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12].append(
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+                     "anthropic. Lane codex failed: [transient] agent exited 1"})
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+        self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic")]), 1)
+
+    def test_a_work_failure_waits_for_the_brain(self):
+        self.heartbeat("codex-2")
+        self.failed(reason="[work] agent made no commit on loom/12-fix-the-thing")
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.bodies()[-1],
+                         "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_a_reason_without_a_class_is_a_work_failure(self):
+        self.heartbeat("codex-2")
+        self.failed(reason="agent exited 1")
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_a_failed_fix_brief_returns_to_pr_without_a_new_attempt(self):
+        self.heartbeat("codex-2")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[transient] agent exited 1", attempt=2, fix=fix)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
+                         "This was a fix round on pull request #99; the ticket is back at "
+                         "loom:pr and the pull request is unchanged.")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_retry_chain_and_model_rules(self):
+        self.assertEqual(station.failure_class("[limit] x"), "limit")
+        self.assertEqual(station.failure_class("limit x"), "work")
+        self.assertTrue(station.lane_takes_model("anthropic-3", "claude-sonnet-5-5"))
+        self.assertFalse(station.lane_takes_model("codex-2", "claude-sonnet-5-5"))
+        self.assertTrue(station.lane_takes_model("codex", "gpt-x"))
+        self.assertFalse(station.lane_takes_model("zen", "opencode/paid"))
+        self.assertTrue(station.needs_public_repo("agy", ""))
+        self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
+        self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
 
 
 class PruneTest(Base):
@@ -1141,7 +1394,7 @@ class OutcomeTest(Base):
         self.write(self.inbox(lane, "failed", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], lane, 1, fix))
         self.write(os.path.join(self.home, "logs", lane, name + ".log"),
-                   "[t] %s start, lane %s\n[t] %s failed: limit: the spark endpoint refused "
+                   "[t] %s start, lane %s\n[t] %s failed: [limit] limit: the spark endpoint refused "
                    "the connection (agent exited 1)\n" % (name, lane, name, ))
         self.run_pass()
         self.run_pass()
@@ -1226,6 +1479,9 @@ class LockAndCliTest(Base):
         self.assertEqual((s.home, s.repos, s.authors, s.owners),
                          ("/h", ["a/b", "c/d"], ["x", "y"], ["a"]))
         self.assertEqual(station.Settings.from_env({}).repos, [])
+        self.assertEqual(station.Settings.from_env({}).retry_max, 2)
+        self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "5"}).retry_max, 5)
+        self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "x"}).retry_max, 2)
 
     def test_the_station_command_runs_a_pass(self):
         old = {k: os.environ.get(k) for k in ("LOOM_HOME", "LOOM_REPOS")}
@@ -1400,12 +1656,12 @@ class AsksTest(Base):
         super().setUp()
         self.settings.webhook_ssm = "/example/webhook"
         self.sent = []
-        self.fail = False
+        self.fail_post = False
         self.read = []
 
     def go(self, now=NOON):
         def post(url, payload):
-            if self.fail:
+            if self.fail_post:
                 raise OSError("down")
             self.sent.append((url, payload))
 
@@ -1488,14 +1744,293 @@ class AsksTest(Base):
 
     def test_a_failed_post_is_retried_next_pass(self):
         self.fake.add_ask(5, urgent=True)
-        self.fail = True
+        self.fail_post = True
         self.go()
         self.assertEqual(self.sent, [])
-        self.fail = False
+        self.fail_post = False
         self.go(NOON + 60)
         self.assertEqual(len(self.sent), 2)  # the urgent ask and the digest
         self.go(NOON + 120)
         self.assertEqual(len(self.sent), 2)
+
+    # The audit's size distribution: 56 open asks, 53 of them trusted, with
+    # titles long enough that only 14 fit in one message.
+    def add_many(self):
+        self.fake.add_goal(30)
+        self.fake.goals[0].update(title="Ship the factory")
+        for n in range(100, 156):
+            title = "Grant the %s permission the lane needs %s" % (
+                "x" * (20 + (n * 7) % 30), "y" * (n % 9))
+            self.fake.add_ask(n, title=title, body="Part of #30." if n % 2 else "",
+                              created="2030-01-%02dT00:00:00Z" % (1 + (n - 100) // 2),
+                              author="stranger" if n in (101, 120, 140) else "alice-example")
+        return [n for n in range(100, 156) if n not in (101, 120, 140)]
+
+    def reachable(self, content):
+        """Ask numbers the notification shows or links to."""
+        found = {int(n) for n in re.findall(r"/issues/(\d+)$", content, re.M)}
+        for i in map(int, re.findall(r"issues/900#issuecomment-(\d+)", content)):
+            found |= {int(n) for n in re.findall(r"^- #(\d+) ", self.fake.pages[i - 1], re.M)}
+        return found
+
+    def ledger(self):
+        with open(os.path.join(self.home, "state", "station", "asks.json")) as fh:
+            return json.load(fh)
+
+    def test_every_trusted_ask_is_reachable_from_one_notification(self):
+        trusted = self.add_many()
+        self.assertEqual(len(trusted), 53)
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        content = self.sent[0][1]["content"]
+        self.assertLessEqual(len(content), station.DISCORD_MAX)
+        self.assertIn("- and ", content)
+        self.assertEqual(self.reachable(content), set(trusted))
+        # The newest asks are the ones shown inline.
+        self.assertIn("/issues/155\n", content)
+        self.assertIn("/issues/154\n", content)
+        self.assertNotIn("/issues/100\n", content)
+        page = self.fake.pages[0]
+        self.assertTrue(page.startswith(station.DIGEST_MARKER))
+        self.assertIn("## Ship the factory (#30)", page)
+        self.assertIn("## Not filed under a goal", page)
+        self.assertLess(page.index("- #103 "), page.index("## Not filed"))
+        self.assertGreater(page.index("- #102 "), page.index("## Not filed"))
+        self.assertEqual(self.fake.created[0]["labels"], ["loom:digest"])
+
+    def test_the_ledger_records_what_was_covered(self):
+        trusted = self.add_many()
+        self.go()
+        ledger = self.ledger()
+        self.assertEqual(sorted(ledger["covered"]),
+                         sorted("%s#%d" % (REPO, n) for n in trusted))
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{12}", v) for v in ledger["covered"].values()))
+        self.assertEqual(ledger["pages"], {REPO: "https://github.com/%s/issues/900#issuecomment-1" % REPO})
+        self.assertNotIn("pending", ledger)
+
+    def test_new_and_changed_asks_lead_the_next_digest(self):
+        self.add_many()
+        self.go()
+        self.fake.add_ask(10, title="A fresh ask", created="2029-01-01T00:00:00Z")
+        self.fake.asks[0]["body"] = "Edited."  # ask 100, the oldest
+        self.go(NOON + 86400)
+        lines = self.sent[1][1]["content"].splitlines()
+        self.assertEqual(lines[0], "Asks waiting for you: 54, 2 new since the last digest")
+        self.assertEqual(sorted(line.rsplit("/", 1)[1] for line in lines[1:3]), ["10", "100"])
+        self.assertEqual(len(self.fake.pages), 2)
+
+    def test_a_retry_sends_the_same_digest(self):
+        self.add_many()
+        self.fail_post = True
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.fake.pages), 1)
+        self.assertIn("pending", self.ledger())
+        self.fake.add_ask(10, title="Arrived after the first try")
+        self.fail_post = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.fake.pages), 1)  # the page is not posted twice
+        content = self.sent[0][1]["content"]
+        self.assertNotIn("Arrived after", content)
+        self.assertNotIn("%s#10" % REPO, self.ledger()["covered"])
+        self.go(NOON + 120)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_page_post_holds_the_digest_not_urgent_asks(self):
+        trusted = self.add_many()
+        self.fake.add_ask(9, title="Breaking now", urgent=True)
+        self.fake.page_error = True
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.go()
+        self.assertEqual([p["content"] for _, p in self.sent],
+                         ["Urgent ask: Breaking now https://github.com/%s/issues/9" % REPO])
+        self.assertIn("daily digest pending: could not post its page", out.getvalue())
+        self.assertIn("pending", self.ledger())
+        self.fake.page_error = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.reachable(self.sent[1][1]["content"]), set(trusted) | {9})
+
+    def test_a_non_object_page_reply_holds_the_digest(self):
+        self.add_many()
+        self.fake.page_reply = []
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertIn("pending", self.ledger())
+        self.fake.page_reply = None
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_trust_check_of_an_old_ask_does_not_hold_an_urgent_one(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Old one")
+        self.fake.add_ask(6, title="Breaking now", urgent=True)
+        real = station.Station._ask_trusted
+
+        def flaky(st, repo, issue):
+            if issue["number"] == 5:
+                raise GitHubError("boom", 502)
+            return real(st, repo, issue)
+        with mock.patch.object(station.Station, "_ask_trusted", flaky):
+            self.go()
+        self.assertEqual([p["content"] for _, p in self.sent],
+                         ["Urgent ask: Breaking now https://github.com/%s/issues/6" % REPO])
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_a_small_digest_needs_no_page(self):
+        self.fake.add_ask(5, title="Slow one")
+        self.go()
+        self.assertEqual(self.fake.pages, [])
+        self.assertEqual(self.ledger()["pages"], {})
+
+    def test_a_failed_goal_read_holds_the_digest_until_the_next_pass(self):
+        trusted = self.add_many()
+        ledger_path = os.path.join(self.home, "state", "station", "asks.json")
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"digest": "2030-05-04"}, fh)
+        self.fake.goal_error = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.go()
+        self.assertEqual(self.sent, [])
+        # No plan is fixed on a failed read, so the next pass plans afresh.
+        self.assertTrue(os.path.exists(ledger_path))
+        self.assertNotIn("pending", self.ledger())
+        self.assertIn("could not read the goal homes for the digest", out.getvalue())
+        self.fake.goal_error = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+
+    def test_a_goal_with_an_odd_number_does_not_stop_the_digest(self):
+        trusted = self.add_many()
+        self.fake.goals.append({"number": "abc", "title": "Odd"})
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+        self.assertIn("Ship the factory (#30)", self.fake.pages[0])
+
+
+class HumanDigestTest(AsksTest):
+    """loom:human issues wait in the daily digest, never one message each."""
+
+    def contents(self):
+        return [p["content"] for _, p in self.sent]
+
+    def test_human_issues_are_listed_in_the_digest_with_their_ask(self):
+        self.fake.add_human(7, title="Buy the domain", ask="Buy example.com.\nMore detail.")
+        self.fake.add_human(8, title="Sign the form", ask="",
+                            created="2030-02-01T00:00:00Z")
+        self.go(NOON)
+        self.assertEqual(self.contents(), [
+            "Waiting on you (2):\n%s\n"
+            "- Sign the form https://github.com/%s/issues/8\n"
+            "- Buy the domain https://github.com/%s/issues/7\n"
+            "  Buy example.com." % (REPO, REPO, REPO)])
+        self.assertEqual(self.sent[0][1]["flags"], station.SUPPRESS_EMBEDS)
+
+    def test_a_human_issue_is_never_forwarded_on_its_own(self):
+        self.fake.add_human(7)
+        self.go(EARLY)
+        self.go(EARLY + 60)
+        self.assertEqual(self.sent, [])
+        # Not even when it also carries an urgent ask's labels.
+        self.fake.add_human(9, extra=("needs-operator", "loom:urgent"))
+        self.fake.asks.append(self.fake.humans[-1])
+        self.fake.events[9] = [labeled("needs-operator", "alice-example")]
+        self.go(EARLY + 120)
+        self.assertEqual(self.sent, [])
+        self.go(NOON)
+        self.go(NOON + 600)
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.contents()[0].startswith("Waiting on you (2):"))
+
+    def test_the_list_shows_the_15_newest_and_the_total(self):
+        for n in range(100, 140):
+            self.fake.add_human(n, title="Item %d" % n,
+                                created="2030-01-01T00:00:%02dZ" % (n - 100))
+        self.go(NOON)
+        text = "\n".join(self.contents())
+        self.assertIn("Waiting on you (the 15 newest of 40):", text)
+        listed = re.findall(r"- Item (\d+) ", text)
+        self.assertEqual(listed, [str(n) for n in range(139, 124, -1)])
+        self.assertTrue(all(len(c) + 30 <= station.DISCORD_MAX for c in self.contents()))
+        self.assertEqual(self.fake.paths("GET").count(
+            "/repos/%s/issues/100/comments?per_page=100" % REPO), 0)
+        comment_reads = [p for p in self.fake.paths("GET") if "/comments?" in p]
+        self.assertEqual(len(comment_reads), station.HUMAN_SHOWN)
+        self.assertTrue(all(p.endswith("?per_page=100") for p in comment_reads))
+
+    def test_clipped_human_text_does_not_escape_its_ellipsis(self):
+        title = "T" * (station.HUMAN_TITLE_MAX - 4) + "\\" + "tail"
+        ask = "A" * (station.HUMAN_ASK_MAX - 4) + "\\" + "tail"
+        self.fake.add_human(7, title=title, ask=ask)
+        self.go(NOON)
+        content = self.contents()[0]
+        self.assertIn("- %s... https://" % ("T" * (station.HUMAN_TITLE_MAX - 4)), content)
+        self.assertIn("  %s..." % ("A" * (station.HUMAN_ASK_MAX - 4)), content)
+        self.assertNotIn("\\...", content)
+
+    def test_the_list_follows_the_asks_in_the_same_digest(self):
+        self.settings.mention = "123456"
+        self.fake.add_ask(5, title="Slow one")
+        self.fake.add_human(7, title="Buy the domain")
+        self.go(NOON)
+        self.assertEqual(len(self.sent), 1)
+        lines = self.contents()[0].splitlines()
+        self.assertEqual(lines[:2], ["<@123456> " + station.DIGEST_HEAD +
+                                     " 1, 1 new since the last digest",
+                                     "- Slow one https://github.com/%s/issues/5" % REPO])
+        self.assertEqual(lines[3], "Waiting on you (1):")
+
+    def test_the_list_follows_a_paged_ask_digest(self):
+        self.add_many()
+        self.fake.add_human(7, title="Buy the domain")
+        self.go(NOON)
+        text = "\n".join(self.contents())
+        self.assertIn("Every ask, by goal:", text)
+        self.assertIn("Waiting on you (1):", text)
+        self.assertIn("- Buy the domain https://github.com/%s/issues/7" % REPO, text)
+        self.assertEqual(len(self.fake.pages), 1)
+        self.assertEqual(self.ledger()["digest"], "2030-05-05")
+
+    def test_an_ask_by_a_stranger_is_not_shown(self):
+        self.fake.add_human(7, title="Buy the domain", ask="Send money to me.", author="stranger")
+        self.go(NOON)
+        self.assertNotIn("Send money", self.contents()[0])
+
+    def test_an_unreadable_list_holds_the_digest_but_not_urgent_asks(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        self.fake.add_ask(6, title="Slow one")
+        self.fake.add_human(7)
+        with mock.patch.object(station.Station, "_gather_human", return_value=None):
+            self.go(NOON)
+        self.assertEqual(self.contents(), ["Urgent ask: Pick one https://github.com/%s/issues/5" % REPO])
+        with mock.patch.object(station.Station, "_human_ask", side_effect=GitHubError("boom", 502)):
+            self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+        self.go(NOON + 120)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("Waiting on you (1):", self.contents()[1])
+
+    def test_the_section_groups_by_repo_newest_first(self):
+        other = "example-owner/other-repo"
+        found = [(other, {"number": 3, "title": "C", "html_url": "u3"}),
+                 (REPO, {"number": 2, "title": "B", "html_url": "u2"}),
+                 (other, {"number": 1, "title": "A", "html_url": "u1"})]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=NOON)
+        from unittest import mock
+        with mock.patch.object(station.Station, "_human_ask", return_value="Ask."):
+            text = st._human_text(found)
+        self.assertEqual(text.splitlines(), [
+            "Waiting on you (3):", other, "- C u3", "  Ask.", "- A u1", "  Ask.",
+            REPO, "- B u2", "  Ask."])
 
 
 class ReportsTest(Base):
