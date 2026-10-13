@@ -185,11 +185,20 @@ it, and never a free lane:
 2. the codex lane (or codex-2) with `gpt-6-sol`;
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
-Set the model with the ticket's `Model:` line (`brief --model`; for a ticket
-already filed, edit the `Model:` line at the top of its body before moving
-it to briefed). Say on the ticket which rung it is on and why. Past the
-third rung, rewrite the brief smaller, or ask the operator with one exact
-ask when only the operator can unblock it.
+Do not hand-edit tickets for this. `python3 -m bus.brain status` marks each
+repeatedly stuck ticket with its attempts, the models it has tried and the
+rung it takes next. Run `python3 -m bus.brain escalate OWNER/NAME#N` for
+every marked ticket in the same tick, whatever the time budget: it picks the
+lowest untried rung whose lane is free, rewrites the ticket's `Model:` line,
+swaps the lane label, comments the rung and the reason, and sends an open
+pull request back as a fix brief (`--file NOTES.md` adds your own notes to
+that brief). It refuses a ticket that is not repeatedly stuck. Past the third
+rung it adds `needs-brain` instead: rewrite the brief smaller, or ask the
+operator with one exact ask when only the operator can unblock it.
+
+To set a model by hand on a first attempt or any other move, use
+`move OWNER/NAME#N --to briefed --lane LANE --model MODEL` or
+`fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md --lane LANE --model MODEL`.
 
 ## Rules
 
