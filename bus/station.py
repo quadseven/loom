@@ -735,6 +735,10 @@ class Station:
             self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
+        return self._report_failure(repo, number, lane, text, name)
+
+    def _report_failure(self, repo: str, number: int, lane: str, text: str, name: str) -> bool:
+        """Report a failed brief, keeping fix rounds on their existing pull request."""
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass = failure_class(reason)
