@@ -117,22 +117,7 @@ class FakeGitHub:
 
     def _issues_and_status(self, method, rest, query, headers, data):
         if method == "GET" and rest == "issues":
-            if "labels=loom%3Apr" in query:
-                return reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                                   and "loom:pr" in self.names(i["number"])])
-            if "needs-operator" in query:
-                return self._list_asks(headers)
-            if "loom:goal" in query:
-                if self.goal_error:
-                    return reply(500, {"message": "down"})
-                if self.goals:
-                    return reply(200, self.goals)
-                return reply(200, [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
-                                   for i in self.issues.values() if i["state"] == "open"
-                                   and "loom:goal" in self.names(i["number"])])
-            if "loom:lanes" in query:
-                return reply(200, self.lanes_issues)
-            return self._list_briefed(headers)
+            return self._get_issues(query, headers)
         if method == "POST" and rest == "issues":
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
@@ -145,6 +130,28 @@ class FakeGitHub:
         self.status_comments.append({"id": 77, "body": data["body"]})
         self.posts.append(data["body"])
         return reply(201, {"id": 77})
+
+    def _get_issues(self, query, headers):
+        if "labels=loom%3Apr" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:pr" in self.names(i["number"])])
+        if "needs-operator" in query:
+            return self._list_asks(headers)
+        if "loom:goal" in query:
+            return self._get_goals()
+        if "loom:lanes" in query:
+            return reply(200, self.lanes_issues)
+        return self._list_briefed(headers)
+
+    def _get_goals(self):
+        if self.goal_error:
+            return reply(500, {"message": "down"})
+        if self.goals:
+            return reply(200, self.goals)
+        found = [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
+                 for i in self.issues.values() if i["state"] == "open"
+                 and "loom:goal" in self.names(i["number"])]
+        return reply(200, found)
 
     def _graphql(self, data):
         editor = self.editors[data["variables"]["number"]]

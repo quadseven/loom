@@ -509,44 +509,51 @@ class Station:
                 reported[key] = kind
                 _write_json(path, reported)
 
+    @staticmethod
+    def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
+        body = str(pr.get("body") or "")
+        ref = re.search(r"^Refs %s#([0-9]+)[ \t]*$" % re.escape(repo), body, re.M)
+        head = str((pr.get("head") or {}).get("ref") or "")
+        branch = re.match(r"loom/([0-9]+)(?:-|$)", head)
+        match = ref or branch
+        return int(match.group(1)) if match else None
+
+    def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict) -> None:
+        number = self._pr_ticket_number(repo, pr)
+        ticket = tickets_by_number.get(number) if number is not None else None
+        if ticket is None:
+            return
+        labels = _label_names(ticket)
+        if any(state in labels for state in ("loom:merged", "loom:shipped", "loom:verified")):
+            return
+        merged = bool(pr.get("merged_at")) or pr.get("merged") is True
+        target = "loom:merged" if merged else None
+        if not merged and pr.get("state") == "closed":
+            target = "loom:closed-unmerged"
+        if target is None or target in labels:
+            return
+        state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
+                       "shipped", "verified", "closed-unmerged")
+        states = {"loom:" + state for state in state_names}
+        kept = [name for name in labels if name not in states]
+        kept.append(target)
+        self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
+                     {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state."""
         for repo in self.s.repos:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
                 continue
-            path = "/repos/%s/issues?state=open&labels=loom%%3Apr" % repo
-            issues = self.gh.paginate(path)
+            issues = self.gh.paginate(
+                "/repos/%s/issues?state=open&labels=loom%%3Apr" % repo)
             tickets_by_number = {int(i["number"]): i for i in issues
                                  if "loom:ticket" in _label_names(i)}
             prs = self.gh.paginate("/repos/%s/pulls?state=all" % repo)
             for pr in prs:
-                if not isinstance(pr, dict):
-                    continue
-                body = str(pr.get("body") or "")
-                ref = re.search(r"^Refs %s#([0-9]+)[ \t]*$" % re.escape(repo), body, re.M)
-                head = str((pr.get("head") or {}).get("ref") or "")
-                branch = re.match(r"loom/([0-9]+)(?:-|$)", head)
-                match = ref or branch
-                if not match:
-                    continue
-                ticket = tickets_by_number.get(int(match.group(1)))
-                if ticket is None:
-                    continue
-                labels = _label_names(ticket)
-                if "loom:merged" in labels or "loom:shipped" in labels or "loom:verified" in labels:
-                    continue
-                merged = bool(pr.get("merged_at")) or pr.get("merged") is True
-                target = "loom:merged" if merged else (
-                    "loom:closed-unmerged" if pr.get("state") == "closed" else None)
-                if target and target not in labels:
-                    state_names = ("queued", "briefed", "running", "pr", "failed",
-                                   "merged", "shipped", "verified", "closed-unmerged")
-                    states = {"loom:" + state for state in state_names}
-                    kept = [name for name in labels if name not in states]
-                    kept.append(target)
-                    self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
-                                 {"labels": kept})
-                    ticket["labels"] = [{"name": name} for name in kept]
+                if isinstance(pr, dict):
+                    self._reconcile_pr_ticket(repo, pr, tickets_by_number)
 
     def _field(self, text: str, name: str) -> str:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
