@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain
+from . import brain, tickets
 from .github import GitHub, GitHubError
 from .tickets import FIX_MARKER
 
@@ -145,6 +145,14 @@ def pick_rung(start: int, load: Dict[str, int]) -> int:
         if min(load.get(lane, 0) for lane in lanes) < RUNG_BUSY:
             return rung
     return len(LADDER)
+
+
+def held_until(issue: Dict[str, Any]) -> float:
+    """The ticket's Not before: time, 0 when it has none or it is unreadable."""
+    try:
+        return tickets.not_before(tickets.parse(issue.get("body"))[0]) or 0.0
+    except ValueError:
+        return 0.0
 
 
 def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
@@ -399,10 +407,14 @@ class Factory:
 
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         number = int(issue["number"])
+        hold = held_until(issue)
+        if self.now < hold:
+            return  # held by its Not before: line; nobody is late yet
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
         since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
                      and e.get("event") == "labeled"
                      and (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
+        since = max(since, hold) if since else since
         if not since or self.now - since < BRIEFED_STALL:
             return
         comments = self._comments(repo, number)

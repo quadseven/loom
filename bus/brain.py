@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, token_from_env
-from . import proof, text
+from . import proof, text, tickets
 from .labels import LANES
 from .tickets import FIX_MARKER
 
@@ -187,23 +187,27 @@ def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
 
 
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
-                 base: Optional[str]) -> str:
+                 base: Optional[str], not_before: Optional[str] = None) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
-               (("Difficulty", difficulty), ("Model", model), ("Base", base)) if v]
+               (("Not before", not_before), ("Difficulty", difficulty), ("Model", model),
+                ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
 
 def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
-          model: Optional[str] = None, base: Optional[str] = None) -> str:
+          model: Optional[str] = None, base: Optional[str] = None,
+          not_before: Optional[str] = None) -> str:
     _check_brief_args(title, body, lane, model, base)
+    if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
+        raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     _check_written_text(title + "\n" + body)
     _check_goal_capacity(gh, repo, goal)
     names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
     if lane:
         names.append("lane:" + lane)
     issue = gh.rest("POST", "/repos/%s/issues" % repo, {
-        "title": title, "body": _ticket_body(body, difficulty, model, base),
+        "title": title, "body": _ticket_body(body, difficulty, model, base, not_before),
         "labels": names}).data
     gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
             {"sub_issue_id": issue["id"]})
@@ -605,7 +609,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base")
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before")
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
@@ -635,7 +639,7 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
-                args.lane, args.difficulty, args.model, args.base))
+                args.lane, args.difficulty, args.model, args.base, args.not_before))
 
 
 def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:

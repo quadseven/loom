@@ -335,6 +335,25 @@ class ClaimTest(Base):
         self.assertEqual([c["body"] for c in self.fake.comments[12]],
                          ["Claimed for lane codex (body sha256 %s)" % sha])
 
+    def test_a_ticket_held_by_not_before_waits(self):
+        self.fake.add(12, body="Not before: 2099-01-01T00:00:00Z\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:briefed", self.fake.names(12))
+
+    def test_a_ticket_past_its_not_before_is_claimed_without_the_line(self):
+        self.fake.add(12, body="Not before: 2000-01-01T00:00:00Z\n" + BODY)
+        self.run_pass()
+        name = "example-owner.example-repo-12"
+        self.assertEqual(self.listing(), [name + ".md"])
+        with open(self.inbox("codex", name + ".md")) as fh:
+            self.assertNotIn("Not before", fh.read())
+
+    def test_a_malformed_not_before_is_refused(self):
+        self.fake.add(12, body="Not before: tomorrow\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+
     def test_the_oldest_trusted_ticket_wins_and_untrusted_ones_are_skipped(self):
         self.fake.add(5, author="stranger", created="2030-01-01T00:00:00Z")
         self.fake.add(9, created="2030-01-03T00:00:00Z")

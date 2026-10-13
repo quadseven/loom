@@ -573,9 +573,13 @@ class Station:
         if self._skip_known(repo, issue):
             return False
         try:
-            tickets.parse(issue.get("body"))
+            headers, _ = tickets.parse(issue.get("body"))
         except ValueError as err:
             self._refuse(repo, issue, "unusable brief: %s" % err)
+            return False
+        hold = tickets.not_before(headers)
+        if hold is not None and self.now < hold:
+            _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
         ok, reason = self._check_trust(repo, issue)
         if not ok:
