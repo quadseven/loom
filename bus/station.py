@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import factory
 from . import spend
 from . import text as _text
 from . import tickets
@@ -103,7 +104,9 @@ class Settings:
                  mention: str = "", digest_hour: int = 9,
                  region: str = "us-east-1", channel_id: str = "",
                  bot_token_ssm: str = "", default_goal: str = "",
-                 anthropic: Optional[spend.Budget] = None) -> None:
+                 anthropic: Optional[spend.Budget] = None,
+                 factory_on: bool = False,
+                 review_check: str = factory.DEFAULT_REVIEW_CHECK) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -117,6 +120,10 @@ class Settings:
         self.bot_token_ssm = bot_token_ssm
         self.default_goal = default_goal
         self.anthropic = anthropic or spend.Budget()
+        # Off unless asked for, so a Settings built in code does not start
+        # merging; from_env turns it on unless LOOM_FACTORY=0.
+        self.factory_on = factory_on
+        self.review_check = review_check
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -146,7 +153,10 @@ class Settings:
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
                    bot_token_ssm=env.get("LOOM_DISCORD_BOT_TOKEN_SSM", "").strip(),
                    default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip(),
-                   anthropic=budget)
+                   anthropic=budget,
+                   factory_on=env.get("LOOM_FACTORY", "").strip() not in ("0", "off", "false"),
+                   review_check=(env.get("LOOM_REVIEW_CHECK", "").strip()
+                                 or factory.DEFAULT_REVIEW_CHECK))
 
 
 def _origin_repo() -> str:
@@ -1476,12 +1486,21 @@ class Station:
         ledger["replies_at"] = self.now
 
     # -- one pass --------------------------------------------------------
+    def run_factory(self) -> None:
+        """Merge ready lane pull requests, send the rest back, and move stuck
+        tickets up the model ladder (bus/factory.py), at most every
+        factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
+        if not self.s.factory_on or not factory.due(self.state, self.now):
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        factory.Factory(self.gh, repos, self.now, review_check=self.s.review_check).run()
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
-                     self.watch_brain, self.relay_operator):
+                     self.watch_brain, self.relay_operator, self.run_factory):
             try:
                 step()
             except (GitHubError, OSError) as err:
