@@ -2057,6 +2057,7 @@ class Station:
         for ident, issue, comment in comments:
             if ident <= last_id:
                 continue
+            sent = False
             author = str((comment.get("user") or {}).get("login") or "").lower()
             if author in allowed:
                 if not secret_checked:
@@ -2069,8 +2070,15 @@ class Station:
                 if not send(issue, comment):
                     _write_json(path, ledger)
                     return False
+                sent = True
             ledger[key] = ident
             last_id = ident
+            if sent:
+                # The report is out: persist the position before the next
+                # comment, so a pass killed here (the installer restarted the
+                # station mid-pass, 2026-10-13) re-sends nothing already sent.
+                # The whole file is written atomically by _write_json.
+                _write_json(path, ledger)
         return True
 
     def _report_window(self, checked: Any) -> Optional[str]:
@@ -2719,6 +2727,12 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         except OSError:
             _say("another pass is running")
             return 0
+        # Record this pass's pid in the lock file while we hold it, so the
+        # installer can see a pass is in flight (lanes/mac/lock.sh
+        # station_busy) and wait before booting the station out mid-pass.
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
         if gh is None:
             from .github import token_from_env
             gh = GitHub(token_from_env())
