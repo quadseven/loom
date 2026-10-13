@@ -164,6 +164,7 @@ fix_items() {
         on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
         on && /^Fixing: / {sub(/^Fixing: /, ""); gsub(/[[:cntrl:]]/, ""); out = out " [" $0 "]"}
         on && /^Does not apply/ {out = out " [does not apply]"}
+        on && /^Fixed$/ {out = out " [fixed]"}
         END {print out}' "$1" | cut -c1-500
 }
 

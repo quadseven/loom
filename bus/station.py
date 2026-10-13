@@ -453,15 +453,19 @@ class Station:
 
         # A fix brief goes out only once every finding has a disposition.
         if fix is not None:
+            # Only parsing sits in the try: parse_findings raises ValueError
+            # solely through Finding() (its regexes admit only known
+            # dispositions and numeric lines, so in practice a malformed ID),
+            # and err names the cause. A ValueError from refusing is not
+            # caught here and so cannot be reported as a bad finding.
             try:
-                if not fix.has_all_dispositions():
-                    undispositioned = [f.id for f in fix.findings_list if not f.disposition]
-                    self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
-                    return False
+                findings = fix.findings_list
             except ValueError as err:
-                # Only Finding() raises here, for a malformed ID or disposition;
-                # err names which, so one refusal message covers both.
                 self._refuse(repo, issue, "invalid pre-roll finding: %s" % err)
+                return False
+            undispositioned = [f.id for f in findings if not f.disposition]
+            if undispositioned:
+                self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
                 return False
 
         earlier = sum(1 for c in comments

@@ -22,6 +22,18 @@ class FindingDispositionTest(unittest.TestCase):
         self.assertIn("\nDoes not apply\n", rendered + "\n")
         self.assertEqual(parse_findings(rendered)[0].disposition, "does_not_apply")
 
+    def test_fixed_survives_render_and_parse(self):
+        original = Finding("F1", "Review finding", location=("test.py", 10, 1),
+                           disposition="fixed")
+        parsed = parse_findings(render_findings([original]))[0]
+        self.assertEqual((parsed.disposition, parsed.ticket), ("fixed", None))
+
+    def test_render_refuses_a_ticket_its_disposition_line_drops(self):
+        finding = Finding("F1", "Review finding", location=("test.py", 10, 1),
+                          disposition="does_not_apply", ticket="OWNER.NAME-123")
+        with self.assertRaisesRegex(ValueError, "F1 has disposition does_not_apply"):
+            render_findings([finding])
+
     def test_stored_finding_without_disposition_stays_unresolved(self):
         stored = {"id": "F1", "text": "Review finding"}
         self.assertIsNone(Finding.from_dict(stored).disposition)

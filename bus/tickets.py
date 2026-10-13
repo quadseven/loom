@@ -175,14 +175,26 @@ _THREAD_RE = re.compile(r"^### Thread(?: ([A-Za-z0-9]+))? \(comment ([0-9]+)\) a
 
 
 def _disposition_line(stripped: str) -> Optional[Tuple[str, Optional[str]]]:
-    """The disposition a finding line states: "Fixing: <ticket>" or
+    """The disposition a finding line states: "Fixing: <ticket>", "Fixed" or
     "Does not apply"; None for an ordinary comment line."""
     fixing_match = FIXING_DISPOSITION_RE.match(stripped)
     if fixing_match:
         return "existing_ticket", fixing_match.group(1)
+    if stripped == "Fixed":
+        return "fixed", None
     if stripped == "Does not apply":
         return "does_not_apply", None
     return None
+
+
+def _thread_header(stripped: str) -> Optional[Dict[str, str]]:
+    """The thread a "### Thread" header line opens, or None for any other
+    line. Its "id" is empty when the header names none."""
+    m = _THREAD_RE.match(stripped)
+    if not m:
+        return None
+    return {"id": m.group(1) or "", "comment_id": m.group(2),
+            "path": m.group(3), "line": m.group(4)}
 
 
 def parse_findings(body: str) -> List[Finding]:
@@ -205,17 +217,13 @@ def parse_findings(body: str) -> List[Finding]:
 
     for line in body.split("\n"):
         stripped = line.strip()
-        thread_match = _THREAD_RE.match(stripped)
-        if thread_match:
+        header = _thread_header(stripped)
+        if header:
             close_thread()
-            thread_id = thread_match.group(1)
-            if not thread_id:
-                thread_id = "F%d" % next_id
+            if not header["id"]:
+                header["id"] = "F%d" % next_id
                 next_id += 1
-            current_thread = {"id": thread_id, "comment_id": thread_match.group(2),
-                              "path": thread_match.group(3), "line": thread_match.group(4)}
-            current_comments = []
-            disposition = None
+            current_thread, current_comments, disposition = header, [], None
         elif current_thread:
             stated = _disposition_line(stripped)
             if stated:
@@ -268,17 +276,16 @@ def render_findings(findings: List[Finding]) -> str:
         for line in f.text.split("\n"):
             lines.append(line)
         if f.disposition:
-            if f.ticket:
-                lines.append("Fixing: %s" % f.ticket)
-            elif f.disposition == "fixed":
-                lines.append("Fixing: fixed in this PR")
-            elif f.disposition == "does_not_apply":
-                lines.append("Does not apply")
-            else:
-                # parse_findings could not read it back: the disposition
-                # would vanish from the record rather than survive it.
-                raise ValueError("finding %s has disposition %s without a ticket"
-                                 % (f.id, f.disposition))
+            line = {"existing_ticket": "Fixing: %s" % f.ticket, "fixed": "Fixed",
+                    "does_not_apply": "Does not apply"}.get(f.disposition, "")
+            # The line must read back as this disposition and ticket, or the
+            # record would silently say something other than what was decided.
+            ticket = f.ticket if f.disposition == "existing_ticket" else None
+            if _disposition_line(line) != (f.disposition, ticket) or (f.ticket and not ticket):
+                raise ValueError("finding %s has disposition %s with ticket %s, which "
+                                 "its disposition line cannot carry"
+                                 % (f.id, f.disposition, f.ticket))
+            lines.append(line)
         lines.append("")
     return "\n".join(lines).strip("\n")
 

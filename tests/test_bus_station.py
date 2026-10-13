@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -550,6 +551,22 @@ class FixTest(Base):
     def test_a_fix_comment_with_an_invalid_finding_id_is_refused(self):
         body = FIX_BODY + "\n### Thread X9 (comment 1) at test.py:10\nFinding\nDoes not apply\n"
         self.refused_fix(body)
+
+    def test_a_failure_while_refusing_is_not_reported_as_a_bad_finding(self):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.comment(12, FIX_BODY + "\n### Thread F1 (comment 1) at test.py:10\nFinding\n")
+        reasons = []
+
+        def refuse(st, repo, issue, reason):
+            reasons.append(reason)
+            if "without dispositions" in reason:
+                raise ValueError("refusing failed")
+
+        with mock.patch.object(station.Station, "_refuse", refuse):
+            with self.assertRaisesRegex(ValueError, "refusing failed"):
+                station.Station(GitHub("token", transport=self.fake), self.settings).run_pass()
+        self.assertEqual(reasons, ["pre-roll findings without dispositions: F1"])
 
     def test_a_finished_fix_reports_pushed_fixes(self):
         self.fake.add(12, state="running")
