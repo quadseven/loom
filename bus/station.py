@@ -676,6 +676,7 @@ class Station:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
                 continue
             try:
+                # Both the issues and pulls fetches are covered by this repo guard.
                 self._reconcile_repo(repo)
             except (GitHubError, OSError) as err:
                 _say("could not reconcile pull requests for %s: %s" % (repo, err))

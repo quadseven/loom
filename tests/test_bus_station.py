@@ -225,7 +225,8 @@ class Base(unittest.TestCase):
 class ReconcilePullRequestTest(Base):
     def test_merged_pr_repairs_failed_ticket_label_once(self):
         self.fake.add(12, state="pr")
-        self.fake.pulls = [{"number": 99, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+        self.fake.pulls = [{"number": 99, "state": "closed", "merged": True,
+                            "merged_at": "2030-01-02T00:00:00Z",
                             "body": "Refs %s#12" % REPO,
                             "head": {"ref": "loom/12-fix-the-thing"}}]
         failed = [False]
@@ -248,7 +249,7 @@ class ReconcilePullRequestTest(Base):
         runner.reconcile_pull_requests()
         self.assertEqual(puts, len([call for call in self.fake.calls if call[0] == "PUT"]))
 
-    def test_a_failed_fetch_is_logged_and_the_pass_survives(self):
+    def test_a_failed_issues_fetch_is_logged_and_the_pass_survives(self):
         self.fake.add(12, state="pr")
 
         def transport(method, url, headers, body):
@@ -258,9 +259,22 @@ class ReconcilePullRequestTest(Base):
         runner.reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
 
+    def test_a_failed_pulls_fetch_is_logged_and_the_pass_survives(self):
+        self.fake.add(12, state="pr")
+
+        def transport(method, url, headers, body):
+            if "/pulls?" in url:
+                raise station.GitHubError("server error", 500)
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+
     def test_closed_unmerged_pr_gets_distinct_disposition(self):
         self.fake.add(12, state="pr")
-        self.fake.pulls = [{"number": 99, "state": "closed", "merged_at": None,
+        self.fake.pulls = [{"number": 99, "state": "closed", "merged": False,
+                            "merged_at": None,
                             "body": "Refs %s#12" % REPO,
                             "head": {"ref": "loom/12-fix-the-thing"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
