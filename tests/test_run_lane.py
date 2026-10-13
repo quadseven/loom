@@ -131,6 +131,8 @@ if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkfifo .loom-answers/PRRT_4x.md
   echo "scratch" > .loom-answers/notes.txt
 fi
+if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
+if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
 echo fixed > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
@@ -516,6 +518,40 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
                                    "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
+        self.fix_brief()
+        replies = ('[{"thread":"PRRT_fake","reply":"Addressed","resolve":true},'
+                   '{"thread":"PRRT_keep_open","reply":"Still investigating","resolve":false}]')
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_fake" in c for c in calls))
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_keep_open" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_fake" in c for c in calls))
+        self.assertFalse(any("resolveReviewThread" in c and "PRRT_keep_open" in c for c in calls))
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", "HEAD"],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertNotIn(".loom/replies.json", files)
+
+    def test_fix_runner_ignores_invalid_replies_file(self):
+        self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES='[{"thread":4}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c
+                             for c in self.calls()))
+
+    def test_reply_only_fix_posts_replies_without_a_commit_or_push(self):
+        name, before = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="replies-only",
+                               FAKE_REPLIES='[{"thread":"PRRT_fake","reply":"Not applicable: false positive.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c for c in calls))
+        self.assertFalse(any(c.startswith("git push") for c in calls))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
 
     def test_a_provider_usage_limit_is_a_limit_not_a_failure(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)

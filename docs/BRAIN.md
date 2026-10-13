@@ -45,6 +45,8 @@ that talks to GitHub about tickets.
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
+| `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
+| `needs-brain` | The automatic fix round limit was reached; review this ticket in full. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
@@ -62,7 +64,8 @@ A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
 and `running` and `failed` exist because the
 station and the runner need to say "taken" and "gave up" without the brain
-present.
+present. `loom:ready` is a PR readiness label, and `needs-brain` asks for a
+full review after automatic fix rounds; neither replaces the ticket state.
 
 ## Ticket issues
 
@@ -207,15 +210,14 @@ A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
 
-A lane pull request with failing checks or review findings goes back to its
-lane, not to the brain: `python3 -m bus.brain fix OWNER/NAME#PR --ticket
-OWNER/NAME#N --file FINDINGS.md` refuses unless the pull request is open, on
-a same-repo `loom/` branch and linked to the ticket (its `Refs` line or its
-branch number), and the ticket is `loom:pr`. It comments the findings on the
-ticket, starting with `<!-- loom:fix v1 -->` and naming the pull request and
-its branch (the failing checks with the last lines of their logs, each
-unresolved review thread with its id, path, line and text), then moves the
-ticket back to `loom:briefed` on the same lane.
+The station polls lane PRs once per pass. Once checks finish, failed checks
+and unresolved threads started by `grug-tribe[bot]` are sent back to the same
+lane as a `loom:fix` comment, using the same findings format as
+`python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner
+pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
+per ticket (default 3), after which the station adds `needs-brain`. A clean
+PR receives `loom:ready`; a later push removes that label until the new head
+has finished checks and review again.
 
 When the station claims a ticket whose latest comment from an allowed login
 is such a fix comment, newer than its last claim, the brief keeps the pull
@@ -223,8 +225,11 @@ request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
 section holding the comment. A fix comment edited after it was posted is
 refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
-comments on the pull request; it never opens a second one. A fix brief whose
-pull request is no longer open is parked as failed.
+comments on the pull request; it never opens a second one. The sandboxed agent
+can write `.loom/replies.json` with thread ids, reply text and a resolve
+boolean. The runner posts valid entries after a successful push and resolves
+those marked true; missing or invalid files produce no replies. A fix brief
+whose pull request is no longer open is parked as failed.
 
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
@@ -307,8 +312,10 @@ create it. The tick deletes it when done. Hard limit: 15 minutes.
 someone else).
 
 Order (#35): read lane status; gather events since the last journal entry
-(checks, reviews, comments, outcomes); review and ship merge-ready pull requests
-(read every diff, green checks and the review bot, answer every thread);
+(checks, reviews, comments, outcomes); review `needs-brain` tickets in full
+(every diff, green checks and the review bot, every thread answered); merge
+only `loom:ready` pull requests, after confirming the verdict matches the
+current head and checks are green;
 verify shipped work live and close only then; pick the next problems by
 impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged

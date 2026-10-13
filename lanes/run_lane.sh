@@ -220,6 +220,68 @@ fix_items() {
        END {print out}' "$1" | cut -c1-500
 }
 
+# Keep agent-authored review replies outside the commit. The agent cannot call
+# GitHub from its sandbox; only the runner posts these after the push succeeds.
+capture_replies() {
+  local source="$TREE/.loom/replies.json" target="$LOOM_HOME/run/$SLOT-replies.json"
+  REPLIES_FILE=""
+  [ -e "$source" ] || return 0
+  if [ -L "$source" ] || [ ! -f "$source" ]; then
+    echo "invalid .loom/replies.json; ignoring non-regular file" >&2
+    rm -f "$source" "$target"
+    return 0
+  fi
+  if ! python3 - "$source" "$target" <<'PY'
+import json, os, sys
+source, target = sys.argv[1:]
+try:
+    with open(source, encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, list):
+        raise ValueError("expected a list")
+    for item in value:
+        if (not isinstance(item, dict) or not isinstance(item.get("thread"), str)
+                or not item["thread"] or not isinstance(item.get("reply"), str)
+                or not isinstance(item.get("resolve"), bool)):
+            raise ValueError("invalid reply entry")
+    with open(target, "w", encoding="utf-8") as stream:
+        json.dump(value, stream)
+except (OSError, ValueError, TypeError) as error:
+    print("invalid .loom/replies.json; ignoring it: %s" % error, file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    rm -f "$source" "$target"
+    return 0
+  fi
+  REPLIES_FILE="$target"
+  rm -f "$source"
+}
+
+# The reply text reaches gh as a -f field value (a GraphQL variable), never
+# spliced into the query or a shell command line, so it cannot inject anything.
+post_replies() {
+  local entry thread body resolve
+  [ -n "$REPLIES_FILE" ] && [ -f "$REPLIES_FILE" ] || return 0
+  while IFS= read -r entry; do
+    thread="$(jq -r '.thread' <<< "$entry")"
+    body="$(jq -r '.reply' <<< "$entry")"
+    resolve="$(jq -r '.resolve' <<< "$entry")"
+    if ! timeout "$NET_TIMEOUT" gh api graphql \
+         -f 'query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id}}}' \
+         -f "threadId=$thread" -f "body=$body" >> "$LOG" 2>&1; then
+      echo "reply to review thread $thread failed" >> "$LOG"
+      continue
+    fi
+    if [ "$resolve" = true ] && ! timeout "$NET_TIMEOUT" gh api graphql \
+         -f 'query=mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{isResolved}}}' \
+         -f "threadId=$thread" >> "$LOG" 2>&1; then
+      echo "resolving review thread $thread failed" >> "$LOG"
+    fi
+  done < <(jq -c '.[]' "$REPLIES_FILE")
+  rm -f "$REPLIES_FILE"
+}
+
 # Reconcile the generated title/body sections of an existing PR with the
 # approved ticket revision in the brief, preserving reviewer-authored text
 # outside those sections. Scope changes are logged with old/new body hashes.
@@ -234,6 +296,7 @@ repair_pr_text() {
 # re-briefs limit and transient failures to another lane as a new attempt,
 # and leaves work failures to the brain.
 park() {
+  [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
   echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
   mv "$1" "$INBOX/failed/"
 }
@@ -1053,6 +1116,8 @@ for BRIEF in "$INBOX"/*.md; do
     if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
   fi
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
+  REPLIES_FILE=""
+  if [ -n "$FIX_PR" ]; then capture_replies; else rm -f "$TREE/.loom/replies.json"; fi
   # During a merge the branch is already checked out, and the commit
   # completes the merge.
   if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
@@ -1081,25 +1146,25 @@ for BRIEF in "$INBOX"/*.md; do
       0) METADATA_CHANGED=1 ;;
       1) ;; # text is current
       2)
-        # Refused text is parked only when there is no code commit to push.
-        if [ "$COMMITTED" -eq 0 ]; then
+        # Refused text is parked only when there is no code commit or reply to post.
+        if [ "$COMMITTED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
           park "$BRIEF" "PR text repair refused on #$FIX_PR"
           continue
         fi ;;
       3)
         # A helper error is parked only when there is no code commit to push.
-        if [ "$COMMITTED" -eq 0 ]; then
+        if [ "$COMMITTED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
           park "$BRIEF" "PR text repair failed on #$FIX_PR"
           continue
         fi ;;
       *)
-        if [ "$COMMITTED" -eq 0 ]; then
+        if [ "$COMMITTED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
           park "$BRIEF" "PR text repair returned $REPAIR_RC on #$FIX_PR"
           continue
         fi ;;
     esac
   fi
-  if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ]; then
+  if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
     park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
   fi
   # Never forced: a branch that moved on the remote refuses the push. A fix
@@ -1120,9 +1185,12 @@ for BRIEF in "$INBOX"/*.md; do
     [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
   fi
   if [ -n "$FIX_PR" ]; then
+    post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
       COMMENT="Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}"
+    elif [ "$METADATA_CHANGED" -eq 0 ]; then
+      COMMENT="Lane $SLOT answered the review threads for: ${ITEMS:-the findings on the ticket}"
     else
       COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
     fi
@@ -1131,6 +1199,8 @@ for BRIEF in "$INBOX"/*.md; do
     fi
     if [ "$COMMITTED" -eq 1 ]; then
       echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    elif [ "$METADATA_CHANGED" -eq 0 ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET done, review replies posted on #$FIX_PR" >> "$LOG"
     else
       echo "[$(date -u +%FT%TZ)] $TICKET done, PR text repaired on #$FIX_PR" >> "$LOG"
     fi
