@@ -517,7 +517,7 @@ keep_answers() {
   local dir="$TREE/.loom-answers"
   [ -e "$dir" ] || [ -L "$dir" ] || return 0
   if [ -n "$FIX_PR" ]; then
-    python3 - "$dir" "$INBOX/answers/$TICKET" <<'PY' >> "$LOG" 2>&1 ||
+    if ! python3 - "$dir" "$INBOX/answers/$TICKET" <<'PY' >> "$LOG" 2>&1
 import os, re, stat, sys
 src, dst = sys.argv[1], sys.argv[2]
 nofollow = os.O_RDONLY | os.O_NOFOLLOW
@@ -546,7 +546,9 @@ try:
 finally:
     os.close(folder)
 PY
+    then
       echo "[$(date -u +%FT%TZ)] $TICKET: the answers in .loom-answers could not be kept" >> "$LOG"
+    fi
   fi
   rm -rf "$dir"
 }

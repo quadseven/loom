@@ -278,6 +278,29 @@ class StateError(Exception):
     """A state file that exists but cannot be read."""
 
 
+def _read_answer(path: str) -> str:
+    """An answer file's text, redacted of credentials and local paths; empty
+    unless it is a regular file with one link (never followed through a link)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
+            return ""
+        raw = fh.read(ANSWER_MAX).decode("utf-8", errors="replace")
+    return SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", raw)).strip()
+
+
+def _open_on(node: Dict[str, Any], repo: str, pr: int) -> bool:
+    """An unresolved review thread on this pull request of this repo."""
+    where = node.get("pullRequest") or {}
+    return (not node.get("isResolved")
+            and (where.get("repository") or {}).get("nameWithOwner") == repo
+            and where.get("number") == pr)
+
+
 def _bot_minor(comment: Dict[str, Any], bot: str) -> bool:
     """The review bot's own finding (its app, not a person with its login)
     whose severity, the first field of its first line, is medium or low."""
@@ -755,21 +778,9 @@ class Station:
 
     def _answer(self, repo: str, pr: int, lane: str, thread_id: str, path: str,
                 strong: bool) -> None:
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except OSError:
-            return
-        with os.fdopen(fd, "rb") as fh:
-            st = os.fstat(fh.fileno())
-            if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
-                return
-            raw = fh.read(ANSWER_MAX).decode("utf-8", errors="replace")
-        said = SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", raw)).strip()
+        said = _read_answer(path)
         node = (self.gh.graphql(THREAD_QUERY, {"id": thread_id}) or {}).get("node") or {}
-        where = node.get("pullRequest") or {}
-        if (not said or node.get("isResolved")
-                or (where.get("repository") or {}).get("nameWithOwner") != repo
-                or where.get("number") != pr):
+        if not said or not _open_on(node, repo, pr):
             return
         body = "Lane %s answered this finding instead of changing the code:\n\n%s" % (
             lane, "\n".join("> " + line for line in said.splitlines()))
