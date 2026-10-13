@@ -12,8 +12,8 @@ from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
 from . import proof, text, tickets
-from .labels import LANES
-from .tickets import FIX_MARKER
+from .labels import ESCALATION, LANES, rung_lanes
+from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 # Tickets that hold a lane slot: waiting for a lane, in one, or back from one.
@@ -90,7 +90,8 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> List[str]:
     return lines
 
 
-def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime) -> List[str]:
+def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
+                  marks: Optional[Dict[int, str]] = None) -> List[str]:
     lines = ["### Tickets"]
     for state in STATES:
         lines.append("#### %s" % state)
@@ -98,8 +99,9 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime) -> List[str]:
             if "loom:" + state not in _labels(issue):
                 continue
             lane = next((x for x in _labels(issue) if x.startswith("lane:")), "none")
-            lines.append("- #%s %s - %s - %dh" % (
-                issue["number"], issue.get("title", ""), lane, _age(issue, now)))
+            lines.append("- #%s %s - %s - %dh%s" % (
+                issue["number"], issue.get("title", ""), lane, _age(issue, now),
+                (marks or {}).get(int(issue["number"]), "")))
     return lines
 
 
@@ -121,7 +123,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime) -> List[str]:
            if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
     data = _graphql_status(gh, repo, prs, goals)
     lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data) + [""]
-    lines += _ticket_lines(tickets, now) + ["", "### Pull requests"]
+    lines += _ticket_lines(tickets, now, _stuck_marks(gh, repo, tickets, now)) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"]))) for pr in prs]
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
@@ -149,14 +151,18 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom")
     return "\n".join(out)
 
 
+def _check_model(model: Optional[str]) -> None:
+    if model is not None and not MODEL_RE.fullmatch(model):
+        raise ValueError("model is not a model id")
+
+
 def _check_brief_args(title: str, body: str, lane: Optional[str],
                       model: Optional[str], base: Optional[str]) -> None:
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
     # The same patterns lanes/run_lane.sh applies, so a header line can never
     # smuggle in another field.
-    if model is not None and not re.fullmatch(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*", model):
-        raise ValueError("model is not a model id")
+    _check_model(model)
     if base is not None and not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._/-]*", base):
         raise ValueError("base is not a branch name")
     if "\n" in title or "\r" in title:
@@ -393,11 +399,99 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})
 
 
-def _check_move_args(state: str, lane: Optional[str], note: Optional[str]) -> None:
+BACKLOG_TITLE = "Backlog: every open issue in %s is worked through Loom or handed to a person"
+REVIEW_SAMPLE = 5
+
+
+def _backlog_body(repo: str) -> str:
+    return "\n".join([
+        "## Destination",
+        "",
+        "Every open issue in %s is either a Loom ticket worked by a lane or "
+        "labelled `loom:human` with one comment naming what only a person can do."
+        % repo,
+        "",
+        "## Metric",
+        "",
+        "- Open issues not yet tickets (neither `loom:ticket` nor `loom:human`): "
+        "falls to 0.",
+        "- Open `loom:ticket` issues: rise, then fall as they ship.",
+        "- Open `loom:human` issues: each has its ask.",
+        "",
+        "## Rules",
+        "",
+        "- Triage never closes an issue. It rewrites one as a ticket, marks what "
+        "is missing with `loom:triage`, or hands it to a person with `loom:human`.",
+        "- If this repo is private, its briefs never go to a lane whose provider "
+        "may train on prompts.",
+        "- No pull request merges here without the review check.",
+    ])
+
+
+def _review_check_line(gh: GitHub, repo: str, check: str) -> str:
+    """Whether the review check ran on any of the repo's latest pull requests."""
+    prs = gh.rest("GET", "/repos/%s/pulls?state=all&per_page=%d"
+                  % (repo, REVIEW_SAMPLE)).data or []
+    prs = [p for p in prs if isinstance(p, dict)][:REVIEW_SAMPLE]
+    if not prs:
+        return ("warning: %s has no pull requests yet, so it is unknown whether %s runs "
+                "there; the factory never merges a pull request without it"
+                % (repo, check))
+    for pr in prs:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha:
+            continue
+        runs = gh.rest("GET", "/repos/%s/commits/%s/check-runs?check_name=%s&per_page=1"
+                       % (repo, sha, quote(check, safe=""))).data or {}
+        if int(runs.get("total_count") or 0) > 0:
+            return "review check: %s ran on %s#%s" % (check, repo, pr["number"])
+    return ("warning: %s did not run on the last %d pull requests in %s (%s); the "
+            "factory never merges there without it, so install the review bot first"
+            % (check, len(prs), repo, ", ".join("#%s" % p["number"] for p in prs)))
+
+
+def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
+            env: Optional[Dict[str, str]] = None) -> List[str]:
+    """Make a repo ready for Loom: the labels, one backlog goal home, a check
+    that the review check runs there, and the LOOM_REPOS value with the repo
+    in it. A second run changes nothing. Returns the lines to print."""
+    from . import factory, labels  # factory imports this module
+    env = os.environ if env is None else env
+    check = (review_check or env.get("LOOM_REVIEW_CHECK", "").strip()
+             or factory.DEFAULT_REVIEW_CHECK)
+    info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    lines = ["%s is %s" % (repo, "private: its briefs never go to lanes that train on prompts"
+                           if info.get("private") else "public")]
+    changed = labels.ensure_labels(gh, repo)
+    lines.append("labels: %s" % (", ".join(changed) if changed else "no changes"))
+    title = BACKLOG_TITLE % repo
+    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
+    home = [g for g in goals if "pull_request" not in g and g.get("title") == title]
+    if home:
+        lines.append("backlog goal home: #%s, already open" % home[0]["number"])
+    else:
+        body = _backlog_body(repo)
+        _check_written_text(body)
+        made = gh.rest("POST", "/repos/%s/issues" % repo,
+                       {"title": title, "body": body, "labels": ["loom:goal"]}).data or {}
+        lines.append("backlog goal home: #%s, created" % made.get("number"))
+    lines.append(_review_check_line(gh, repo, check))
+    repos = env.get("LOOM_REPOS", "").replace(",", " ").split()
+    if repo not in repos:
+        repos.append(repo)
+    lines.append('LOOM_REPOS="%s"' % " ".join(repos))
+    return lines
+
+
+def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
+                     model: Optional[str] = None) -> None:
     if state not in STATES:
         raise ValueError("invalid state")
     if lane is not None and (state != "briefed" or lane not in LANES):
         raise ValueError("lane is valid only for briefed and must be known")
+    if model is not None and state != "briefed":
+        raise ValueError("model is valid only for briefed")
+    _check_model(model)
     if note is not None:
         _check_written_text(note)
 
@@ -412,6 +506,33 @@ def _moved_labels(have: List[str], state: str, lane: Optional[str]) -> List[str]
     if state == "briefed" and sum(1 for x in kept if x.startswith("lane:")) != 1:
         raise ValueError("briefed ticket must have exactly one lane label")
     return kept
+
+
+def _with_model(body: str, model: str) -> str:
+    """The body with its Model: header line set, or inserted at the top."""
+    lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    header = 0
+    while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip()):
+        header += 1
+    line = "Model: " + model
+    for i in range(header):
+        if lines[i].startswith("Model:"):
+            lines[i] = line
+            return "\n".join(lines)
+    if header == 0:
+        return "\n".join([line, ""] + lines) if body.strip() else line + "\n"
+    return "\n".join(lines[:header] + [line] + lines[header:])
+
+
+def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
+               model: str) -> None:
+    """Rewrite the ticket body's Model: line; done before the labels change so
+    the station never claims the ticket with the old model."""
+    body = str(issue.get("body") or "")
+    new = _with_model(body, model)
+    _check_written_text(new)
+    if new != body:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
 
 
 def _check_revision(gh: GitHub, repo: str, revision: str) -> None:
@@ -446,10 +567,12 @@ def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
 
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
-         record: Optional[Dict[str, Any]] = None) -> None:
+         record: Optional[Dict[str, Any]] = None,
+         model: Optional[str] = None) -> None:
     """Move a ticket to a state. Verified takes a proof record (bus/proof.py),
-    posted on the ticket before the label changes; no other state takes one."""
-    _check_move_args(state, lane, note)
+    posted on the ticket before the label changes; no other state takes one.
+    A model (briefed only) is written to the body's Model: line first."""
+    _check_move_args(state, lane, note, model)
     if (state == "verified") != (record is not None):
         raise ValueError("verified needs a proof record, and no other state takes one")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
@@ -459,6 +582,8 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     if record is not None:
         comment = _proof_comment(gh, repo, issue, record)
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+    if model is not None:
+        _set_model(gh, repo, number, issue, model)
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
     if note is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
@@ -763,10 +888,15 @@ def _fix_body(repo: str, number: int, branch: str, notes: str,
     return text + "\n"
 
 
-def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str) -> None:
+def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
+        lane: Optional[str] = None, model: Optional[str] = None) -> None:
     """Send a lane's pull request back to the lane: the failing checks and the
     unresolved review threads go on the ticket as a loom:fix comment, and the
-    ticket moves from loom:pr back to loom:briefed on the same lane."""
+    ticket moves from loom:pr back to loom:briefed on the same lane, or on
+    another lane and model when given (the body's Model: line is rewritten)."""
+    if lane is not None and lane not in LANES:
+        raise ValueError("unknown lane")
+    _check_model(model)
     _check_written_text(notes)
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
@@ -775,13 +905,232 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str)
     checks = _failing_checks(gh, repo, sha) if sha else []
     threads = _open_threads(gh, repo, number)
     body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
-    kept = _moved_labels(_labels(issue), "briefed", None)
+    kept = _moved_labels(_labels(issue), "briefed", lane)
+    if model is not None:
+        _set_model(gh, ticket[0], ticket[1], issue, model)
     posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
     comment_id = posted.data.get("id") if isinstance(posted.data, dict) else None
     print("brain: posted loom:fix comment %s on %s#%d"
           % (comment_id if comment_id is not None else "with unknown id", ticket[0], ticket[1]),
           file=sys.stderr)
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
+
+
+STUCK_STATES = ("failed", "briefed", "pr")
+UNCLAIMED_HOURS = 2
+STUCK_HOURS = 6
+# Ticket histories one status call reads per repo; see _stuck_marks.
+STATUS_HISTORY_MAX = 20
+ESCALATE_MARKER = "<!-- loom:escalate v1 -->"
+_RUNG_LINE = re.compile(r"^Rung: ([0-9]+) (\S+) (\S+)[ \t]*$", re.M)
+_CLAIM = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
+
+
+def _when(stamp: Any) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _lane_model(lane: str) -> Optional[str]:
+    """The model a lane runs when a ticket names none: its ladder rung's."""
+    family = "claude" if lane.startswith(("claude", "anthropic")) else lane.split("-2")[0]
+    return next((model for rung, model in ESCALATION if rung == family), None)
+
+
+class History:
+    """What a ticket's own issue history says about its attempts."""
+
+    def __init__(self, failed: int, fixes: int, tried: List[str],
+                 reasons: List[str], rung: Optional[int]) -> None:
+        self.failed = failed
+        self.fixes = fixes
+        self.tried = tried
+        self.reasons = reasons
+        self.rung = rung  # the lowest untried rung, or None past the third
+
+    @property
+    def attempts(self) -> int:
+        return self.failed + self.fixes
+
+    def next_text(self) -> str:
+        if self.rung is None:
+            return "past the ladder, needs-brain"
+        return "next rung %d %s" % (self.rung + 1, ESCALATION[self.rung][1])
+
+
+Labelled = List[Tuple[str, str, Optional[datetime]]]
+
+
+def _bodies(comments: List[Any]) -> List[Tuple[str, Optional[datetime]]]:
+    return [(str(c.get("body") or ""), _when(c.get("created_at")))
+            for c in comments if isinstance(c, dict)]
+
+
+def _first_model(issue: Dict[str, Any], bodies: List[Tuple[str, Optional[datetime]]]) -> Optional[str]:
+    """The model of the first attempt: the body's Model: line, but only while
+    no escalation has rewritten it."""
+    if any(body.startswith(ESCALATE_MARKER) for body, _ in bodies):
+        return None
+    try:
+        return parse_ticket(issue.get("body"))[0].get("Model")
+    except ValueError:
+        return None
+
+
+def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datetime]]]) -> List[str]:
+    """The model in force at each claim, in order, without repeats."""
+    tried: List[str] = []
+    for body, _ in bodies:
+        rung = _RUNG_LINE.search(body) if body.startswith(ESCALATE_MARKER) else None
+        claim = _CLAIM.fullmatch(body.strip())
+        if rung:
+            current = rung.group(2)
+        elif claim:
+            model = current or _lane_model(claim.group(1))
+            if model and model not in tried:
+                tried.append(model)
+    return tried
+
+
+def _slow_briefs(labelled: Labelled, claims: List[datetime], now: datetime) -> int:
+    """Times the ticket sat briefed with no claim for more than UNCLAIMED_HOURS."""
+    slow = 0
+    for i, (kind, name, at) in enumerate(labelled):
+        if kind != "labeled" or name != "loom:briefed" or at is None:
+            continue
+        ends = [t for t in claims if t > at]
+        ends += [t for k, n, t in labelled[i + 1:] if k == "unlabeled" and n == "loom:briefed" and t]
+        if ((min(ends) if ends else now) - at).total_seconds() > UNCLAIMED_HOURS * 3600:
+            slow += 1
+    return slow
+
+
+def _stuck_too_long(issue: Dict[str, Any], labelled: Labelled, now: datetime) -> Optional[str]:
+    """The stuck state the ticket has held for more than STUCK_HOURS, if any."""
+    names = _labels(issue)
+    state = next((x for x in STUCK_STATES if "loom:" + x in names), None)
+    if not state:
+        return None
+    since = [t for k, n, t in labelled if k == "labeled" and n == "loom:" + state and t]
+    began = max(since) if since else _when(issue.get("created_at"))
+    if began is not None and (now - began).total_seconds() > STUCK_HOURS * 3600:
+        return state
+    return None
+
+
+def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes: int,
+                   claims: List[datetime], now: datetime) -> List[str]:
+    reasons = []
+    if failed >= 2:
+        reasons.append("failed %d times" % failed)
+    if fixes >= 2:
+        reasons.append("%d fix rounds" % fixes)
+    slow = _slow_briefs(labelled, claims, now)
+    if slow >= 2:
+        reasons.append("briefed %d times with no claim for %dh" % (slow, UNCLAIMED_HOURS))
+    state = _stuck_too_long(issue, labelled, now)
+    if state:
+        reasons.append("%s for more than %dh" % (state, STUCK_HOURS))
+    return reasons
+
+
+def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime) -> History:
+    number = int(issue["number"])
+    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+    bodies = _bodies(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)))
+    labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
+                for e in events if isinstance(e, dict)]
+    failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
+    fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
+    claims = [at for body, at in bodies if at is not None and _CLAIM.fullmatch(body.strip())]
+    tried = _tried_models(_first_model(issue, bodies), bodies)
+    reasons = _stuck_reasons(issue, labelled, failed, fixes, claims, now)
+    untried = [i for i, (_, model) in enumerate(ESCALATION) if model not in tried]
+    return History(failed, fixes, tried, reasons, untried[0] if untried else None)
+
+
+def _stuck_marks(gh: GitHub, repo: str, found: List[Dict[str, Any]],
+                 now: datetime) -> Dict[int, str]:
+    """Marks for repeatedly stuck tickets. Each history is two paginated reads,
+    so status reads at most STATUS_HISTORY_MAX per repo, the least recently
+    updated first (the likeliest to be stuck), and says which it skipped."""
+    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)),
+                        key=lambda i: str(i.get("updated_at") or ""))
+    marks: Dict[int, str] = {}
+    for issue in candidates[STATUS_HISTORY_MAX:]:
+        marks[int(issue["number"])] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
+    for issue in candidates[:STATUS_HISTORY_MAX]:
+        history = _history(gh, repo, issue, now)
+        if history.reasons:
+            marks[int(issue["number"])] = " - REPEATEDLY STUCK (%s; attempts %d; tried %s; %s)" % (
+                ", ".join(history.reasons), history.attempts,
+                ", ".join(history.tried) or "none", history.next_text())
+    return marks
+
+
+def _available_lanes(gh: GitHub, lanes_repo: str) -> List[str]:
+    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo), re.M)
+    return rows
+
+
+def _pr_for_ticket(gh: GitHub, repo: str, number: int) -> Optional[int]:
+    for pr in gh.paginate("/repos/%s/pulls?state=open" % repo):
+        try:
+            found = _ticket_association(repo, pr)
+        except ValueError:
+            continue
+        if found == (repo, number):
+            return int(pr["number"])
+    return None
+
+
+def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
+             lanes_repo: str = "quadseven/loom") -> str:
+    """Move a repeatedly stuck ticket to the lowest untried rung of the model
+    ladder whose lane is available, and return a one-line outcome."""
+    _check_written_text(notes)
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    names = _labels(issue)
+    if issue.get("state") != "open" or "loom:ticket" not in names:
+        raise ValueError("ticket is not an open loom:ticket")
+    history = _history(gh, repo, issue, datetime.now(timezone.utc))
+    if not history.reasons:
+        raise ValueError("ticket is not repeatedly stuck")
+    if history.rung is None:
+        gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                {"labels": sorted(set(names) | {"needs-brain"})})
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+                "Past the model ladder (tried %s); %s. Needs the brain to rewrite the brief "
+                "smaller or ask the operator." % (", ".join(history.tried), "; ".join(history.reasons))})
+        return "needs-brain"
+    free = _available_lanes(gh, lanes_repo)
+    choice = None
+    for rung in range(history.rung, len(ESCALATION)):
+        if ESCALATION[rung][1] in history.tried:
+            continue
+        lane = next((x for x in rung_lanes(rung) if x in free), None)
+        if lane:
+            choice = (rung, lane)
+            break
+    if choice is None:
+        raise ValueError("no untried rung has an available lane")
+    rung, lane = choice
+    model = ESCALATION[rung][1]
+    reason = "; ".join(history.reasons)
+    comment = "\n".join([ESCALATE_MARKER,
+                         "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(ESCALATION), model, lane),
+                         "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
+                         "Rung: %d %s %s" % (rung + 1, model, lane)])
+    _check_written_text(comment)
+    pr = _pr_for_ticket(gh, repo, number) if "loom:pr" in names else None
+    if pr is not None:
+        fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
+    else:
+        move(gh, repo, number, "briefed", lane, None, None, model)
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+    return "rung %d %s on %s" % (rung + 1, model, lane)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -791,10 +1140,12 @@ def parser() -> argparse.ArgumentParser:
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--refs", type=int)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
-    m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof")
+    m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
-    fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True)
+    fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
+    ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
+    es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
@@ -836,7 +1187,7 @@ def _cmd_human(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     record = json.loads(_read(args.proof)) if args.proof else None
-    move(gh, repo, number, args.to, args.lane, args.note, record)
+    move(gh, repo, number, args.to, args.lane, args.note, record, args.model)
 
 
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
@@ -855,14 +1206,25 @@ def _cmd_reply(gh: GitHub, args: argparse.Namespace) -> None:
     reply_to_review(gh, repo, number, args.comment, _read(args.file), args.resolve)
 
 
+def _cmd_onboard(gh: GitHub, args: argparse.Namespace) -> None:
+    for line in onboard(gh, _repo(args.repo), args.review_check):
+        print(line)
+
+
 def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.pull_request, "pull request")
-    fix(gh, repo, number, _ref(args.ticket, "ticket"), _read(args.file))
+    fix(gh, repo, number, _ref(args.ticket, "ticket"), _read(args.file), args.lane, args.model)
+
+
+def _cmd_escalate(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    print(escalate(gh, repo, number, _read(args.file) if args.file else "", _repo(args.lanes_repo)))
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
-            "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human}
+            "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
+            "onboard": _cmd_onboard, "escalate": _cmd_escalate}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
