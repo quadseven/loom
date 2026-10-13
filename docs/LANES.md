@@ -214,7 +214,8 @@ loopback connection; they cannot query the viewer or any other local service.
   argv, in an otherwise empty environment with a scratch HOME and TMPDIR.
 - The agent runs under a macOS Seatbelt profile (`sandbox-exec`): no reads or
   writes anywhere under the real HOME except its worktree, its scratch home
-  and the directory holding its CLI, and no keychain access. It can edit its
+  and the directory holding its CLI (plus read-only access to the skill
+  snapshot), and no keychain access. It can edit its
   tree but cannot read credentials, push, open, or merge; the runner does
   that with the machine's own credentials. Without `sandbox-exec` an API lane
   reports itself unavailable.
@@ -258,6 +259,33 @@ and named, not guessed. A new run republishes the comment on the next station
 pass. Under the floor (or with a budget setting that does not parse) each
 anthropic slot reports itself unavailable with that reason, and the station
 sends the anthropic slots nothing more.
+
+## Skills on every lane
+
+Every lane has the operator's skills, so a brief may name a skill ("use the
+impeccable skill") on any lane.
+
+- codex and claude run in the operator's own home and read the skill
+  folders there directly.
+- The sandboxed lanes cannot read that home, so the runner keeps a snapshot
+  at `$LOOM_HOME/skills`: every child folder holding a `SKILL.md` in the
+  folders `LOOM_SKILL_DIRS` names (colon-separated; default
+  `~/.agents/skills:~/.claude/skills`; the first folder wins a name both
+  hold), copied with links followed. It is refreshed at most hourly, only
+  when a sandboxed lane has a brief waiting. The new copy is built beside
+  the old one and swapped in only when the whole copy succeeded: a failed
+  refresh keeps the last good snapshot and logs one line to
+  `logs/skills.log`.
+- Each API-lane run links the snapshot into its scratch home at
+  `.claude/skills` (Claude Code), `.agents/skills` (the cross-tool folder)
+  and `.config/opencode/skills` (opencode). The sandbox lets the agent read
+  the snapshot and never write it.
+- The agy lane user cannot read the snapshot either, so before each run the
+  runner streams a copy to that user's `~/.gemini/config/skills`, where agy
+  reads global skills, replacing the last run's copy. The sandbox keeps
+  `~/.gemini/config` read-only for the agent. `--disable-slash-commands`
+  stops skill expansion in the prompt only; agy still loads a skill it
+  decides to use.
 
 ## Public repos only: providers that train on prompts
 
@@ -402,7 +430,8 @@ lookup leaves the brief for the next pass. The rule covers:
   Inside the state directory, `settings.json`, `installation_id`, `bin`,
   and `builtin` stay read-only. Everything else under the lane user's home
   stays read-only as well, including shell startup files, `~/.gemini`
-  config, and MCP servers.
+  config (with the skills copied to `~/.gemini/config/skills`, see Skills
+  on every lane), and MCP servers.
 - Before each run, the runner clears agy's memory of earlier runs
   (`agy_forget`), deleting everything in its state directory except sign-in
   and install state. Kept entries in the state directory are `settings.json`,

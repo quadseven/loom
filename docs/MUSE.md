@@ -198,6 +198,10 @@ ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.
 
+Every lane has the operator's skills (docs/LANES.md, Skills on every lane),
+so a brief may name a skill ("use the impeccable skill") on any lane; a
+skill is no reason to pick one lane over another.
+
 ### Repeatedly stuck work gets a stronger model
 
 The operator, 2026-10-12: repeatedly stuck work "deserves a better model".
