@@ -363,7 +363,8 @@ def is_code(path: str) -> bool:
 
 def is_test(path: str) -> bool:
     folders, _, name = path.lower().rpartition("/")
-    return (bool({"test", "tests"} & set(folders.split("/")))
+    return (bool({"test", "tests", "t", "spec", "__tests__"} & set(folders.split("/")))
+            or name.startswith("test")
             or bool(TEST_NAME_RE.search(name)))
 
 
