@@ -49,14 +49,14 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                     goals: List[Dict[str, Any]]) -> Dict[str, Any]:
     pr_ids = [int(x["number"]) for x in prs]
     goal_ids = [int(x["number"]) for x in goals]
-    # A single query fetches every PR's combined check rollup and review threads,
-    # plus comments on the goal issues for journal timestamps.
+    # A single query fetches every PR's merge-ready data (READY_FIELDS), plus
+    # comments on the goal issues for journal timestamps.
     # GitHub GraphQL does not support a dynamic issue-number list as a top-level
     # node argument. Build aliases from the numbers while retaining one request.
     owner, name = repo.split("/", 1)
     fields = []
     for n in pr_ids:
-        fields.append("p%d: pullRequest(number:%d) { commits(last:1) { nodes { commit { statusCheckRollup { state } } } } reviewThreads(first:100) { nodes { isResolved } } }" % (n, n))
+        fields.append("p%d: pullRequest(number:%d) { %s }" % (n, n, READY_FIELDS))
     for n in goal_ids:
         fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt } } }" % (n, n))
     if not fields:
@@ -67,6 +67,15 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     repo_data = result.get("repository") or {}
     return {"prs": {n: repo_data.get("p%d" % n) for n in pr_ids},
             "goals": {n: repo_data.get("g%d" % n) for n in goal_ids}}
+
+
+# What merge_ready reads for one pull request: the head commit's time and
+# check rollup, the reviews, and each review thread's state and first comment.
+READY_FIELDS = (
+    "commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
+    " reviews(last:100) { nodes { author { __typename login } state submittedAt } }"
+    " reviewThreads(first:100) { nodes { isResolved"
+    " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }")
 
 
 def _gql(value: str) -> str:
@@ -105,17 +114,50 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
     return lines
 
 
-def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]]) -> str:
+def by_bot(comment: Dict[str, Any], bot: str) -> bool:
+    """Written by the review bot's app; a person can take the same login
+    without "[bot]", so the author type must be Bot as well."""
+    author = comment.get("author") or {}
+    return (author.get("__typename") == "Bot"
+            and str(author.get("login") or "").lower() == bot.lower())
+
+
+def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
+    """The canonical merge-ready signal (docs/BRAIN.md): "READY", or
+    "blocked: " and every blocker, from one pull request's READY_FIELDS.
+    It reads nothing else, so the same API data always gives the same verdict."""
     node = node or {}
     commits = (node.get("commits") or {}).get("nodes") or []
-    rollup = commits[-1].get("commit", {}).get("statusCheckRollup") if commits else None
+    head = (commits[-1].get("commit") or {}) if commits else {}
+    blockers = []
+    checks = (head.get("statusCheckRollup") or {}).get("state") or "UNKNOWN"
+    if checks != "SUCCESS":
+        blockers.append("checks %s" % checks.lower())
+    # The newest submitted review decides; an older CHANGES_REQUESTED that a
+    # later review from the bot superseded no longer blocks.
+    reviews = [r for r in (node.get("reviews") or {}).get("nodes") or []
+               if by_bot(r, bot) and r.get("submittedAt")]
+    latest = max(reviews, key=lambda r: str(r["submittedAt"]), default=None)
+    if latest and latest.get("state") == "CHANGES_REQUESTED":
+        blockers.append("grug changes_requested")
     threads = (node.get("reviewThreads") or {}).get("nodes") or []
     unresolved = sum(1 for t in threads if not t.get("isResolved"))
-    return "- #%s %s - checks %s - %d unresolved threads" % (
-        pr["number"], pr.get("title", ""), (rollup or {}).get("state", "UNKNOWN"), unresolved)
+    if unresolved:
+        blockers.append("%d unresolved threads" % unresolved)
+    committed = str(head.get("committedDate") or "")
+    roots = [((t.get("root") or {}).get("nodes") or [{}])[0] or {} for t in threads]
+    unfixed = sum(1 for c in roots
+                  if by_bot(c, bot) and str(c.get("createdAt") or "") >= committed)
+    if unfixed:
+        blockers.append("%d grug findings with no fix-up commit after them" % unfixed)
+    return "blocked: " + ", ".join(blockers) if blockers else "READY"
 
 
-def _repo_section(gh: GitHub, repo: str, now: datetime) -> List[str]:
+def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
+    return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
+
+
+def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str) -> List[str]:
     issues = _issues(gh, repo)
     goals = [i for i in issues if "loom:goal" in _labels(i)]
     tickets = [i for i in issues if "loom:ticket" in _labels(i)]
@@ -124,7 +166,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime) -> List[str]:
     data = _graphql_status(gh, repo, prs, goals)
     lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(gh, repo, tickets, now)) + ["", "### Pull requests"]
-    lines += [_pr_line(pr, data["prs"].get(int(pr["number"]))) for pr in prs]
+    lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "needs-operator" in _labels(i)]
@@ -142,11 +184,15 @@ def _lane_status(gh: GitHub, lanes_repo: str) -> str:
     return max(marked, key=lambda c: c.get("created_at", ""))["body"]
 
 
-def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom") -> str:
+def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
+           env: Optional[Dict[str, str]] = None) -> str:
+    from . import factory  # factory imports this module
+    env = os.environ if env is None else env
+    bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = datetime.now(timezone.utc)
     out: List[str] = ["# Loom status"]
     for repo in repos:
-        out += _repo_section(gh, repo, now)
+        out += _repo_section(gh, repo, now, bot)
     out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
 
