@@ -285,7 +285,7 @@ class Base(unittest.TestCase):
 class ReconcilePullRequestTest(Base):
     def test_merged_pr_repairs_failed_ticket_label_once(self):
         self.fake.add(12, state="pr")
-        # The list endpoint reconciliation reads returns merged_at, never merged.
+        # The /pulls list endpoint returns merged_at but omits merged.
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
                             "body": "Refs %s#12" % REPO,
