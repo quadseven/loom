@@ -220,10 +220,31 @@ G="$HOME/.gemini"
 # What a previous run left in agy's memory, and whether this run can plant
 # config that would steer the next one.
 if [ -e "$G/antigravity-cli/brain/planted.md" ]; then mem=leftover; else mem=clean; fi
+S="$G/config/skills/impeccable/SKILL.md"
+if [ -f "$S" ]; then skill="$(head -1 "$S")"; else skill=none; fi
+if echo x >> "$S" 2>/dev/null || rm -f "$S" 2>/dev/null; then skillw=writable; else skillw=locked; fi
 if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
 if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
-printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" >> "$TMPDIR/agy.log"
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s skill=%s skillw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$skill" "$skillw" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
+echo fixed > fix.txt
+"""
+
+
+# Fake claude for the anthropic lane: for each folder a CLI reads skills
+# from, records the first line of each skill it sees, and whether the agent
+# can change the snapshot through that folder or at its real path.
+FAKE_SKILL_CLAUDE = """#!/usr/bin/env bash
+for f in .claude/skills .agents/skills .config/opencode/skills; do
+  d="$HOME/$f"
+  seen="$(for s in "$d"/*/SKILL.md; do [ -f "$s" ] && printf '%s,' "$(head -1 "$s")"; done)"
+  if echo x >> "$d/impeccable/SKILL.md" 2>/dev/null || touch "$d/impeccable/new" 2>/dev/null \\
+     || rm -f "$d/impeccable/SKILL.md" 2>/dev/null; then w=writable; else w=locked; fi
+  real="$(cd "$d" 2>/dev/null && pwd -P)"
+  if [ -n "$real" ] && { touch "$real/planted" 2>/dev/null || chmod u+w "$real/impeccable" 2>/dev/null; }; then
+    rw=writable; else rw=locked; fi
+  printf 'skills %s seen=%s write=%s realwrite=%s\\n' "$f" "${seen:-none}" "$w" "$rw" >> "$TMPDIR/agent.log"
+done
 echo fixed > fix.txt
 """
 
@@ -901,13 +922,89 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    def operator_skills(self):
+        """The operator's skill folders: links into a skills checkout, as the
+        operator's skill sync leaves them, plus a folder that is not a skill."""
+        checkout = self.home / "skills-checkout"
+        for name in ("impeccable", "tdd"):
+            (checkout / name).mkdir(parents=True)
+            (checkout / name / "SKILL.md").write_text(f"{name} v1\n")
+        (checkout / "notes").mkdir()
+        (checkout / "notes" / "README").write_text("not a skill\n")
+        for folder, names in ((".agents", ("impeccable", "tdd", "notes")), (".claude", ("impeccable",))):
+            skills = self.home / folder / "skills"
+            skills.mkdir(parents=True)
+            for name in names:
+                (skills / name).symlink_to(checkout / name)
+        return checkout
+
+    def anthropic_skill_run(self, name="T042-fix-the-thing.md"):
+        self.write_tool(self.bin / "claude", FAKE_SKILL_CLAUDE)
+        inbox = self.loom / "briefs" / "anthropic"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / name).write_text(BRIEF.replace("Lane: codex", "Lane: anthropic"))
+        result = self.run_lane("anthropic", LOOM_ANTHROPIC_KEY_SSM="/k/an",
+                               FAKE_SECRET__k_an="fake-an-key", LOOM_ANTHROPIC_MODEL="claude-test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return inbox, [c for c in self.calls() if c.startswith("skills ")]
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_api_lane_sees_the_skill_snapshot_read_only_in_each_tools_folder(self):
+        checkout = self.operator_skills()
+        inbox, seen = self.anthropic_skill_run()
+        self.assertEqual(len(seen), 3, self.calls())
+        for folder, line in zip((".claude/skills", ".agents/skills", ".config/opencode/skills"), seen, strict=True):
+            self.assertIn(f"skills {folder} ", line)
+            self.assertIn("impeccable v1,", line)
+            self.assertIn("tdd v1,", line)
+            self.assertIn("write=locked", line)
+            self.assertIn("realwrite=locked", line)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        # The snapshot holds copies (links followed), skills only, unchanged.
+        snapshot = self.loom / "skills"
+        self.assertEqual(sorted(p.name for p in snapshot.iterdir()), ["impeccable", "tdd"])
+        self.assertFalse((snapshot / "impeccable").is_symlink())
+        self.assertEqual((snapshot / "impeccable" / "SKILL.md").read_text(), "impeccable v1\n")
+        self.assertFalse((snapshot / "planted").exists())
+        self.assertEqual((checkout / "impeccable" / "SKILL.md").read_text(), "impeccable v1\n")
+        # Read-only all through, the top folder included.
+        for p in (snapshot, *snapshot.rglob("*")):
+            self.assertFalse(p.stat().st_mode & 0o222, p)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_the_skill_snapshot_refreshes_at_most_hourly_and_a_failed_refresh_keeps_it(self):
+        checkout = self.operator_skills()
+        self.anthropic_skill_run()
+        snapshot = self.loom / "skills" / "impeccable" / "SKILL.md"
+        (checkout / "impeccable" / "SKILL.md").write_text("impeccable v2\n")
+        # Within the hour: no refresh.
+        self.anthropic_skill_run("T043-again.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v1\n")
+        # An hour later, a link with no target makes the copy fail.
+        (checkout / "tdd" / "broken").symlink_to(self.home / "nowhere")
+        stamp = self.loom / "run" / "skills.stamp"
+        old = time.time() - 2 * 3600
+        os.utime(stamp, (old, old))
+        _, seen = self.anthropic_skill_run("T044-once-more.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v1\n")
+        self.assertIn("impeccable v1,", seen[-1])
+        log = (self.loom / "logs" / "skills.log").read_text().splitlines()
+        self.assertEqual(len(log), 1, log)
+        self.assertIn("skill refresh failed", log[0])
+        self.assertFalse((self.loom / "skills.next").exists())
+        # Fixed source, an hour later again: the new version arrives.
+        (checkout / "tdd" / "broken").unlink()
+        os.utime(stamp, (old, old))
+        self.anthropic_skill_run("T045-last.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v2\n")
+
     def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, **env):
         lane_home = Path(self._tmp.name) / "loomuser"
         workdir = lane_home / "lanes"
         (lane_home / "tmp").mkdir(parents=True)
         workdir.mkdir()
         # agy's real state: config, and memory a previous run left behind.
-        (lane_home / ".gemini" / "config").mkdir(parents=True)
+        (lane_home / ".gemini" / "config").mkdir(parents=True, exist_ok=True)
         (lane_home / ".gemini" / "config" / "mcp_config.json").write_text("{}")
         (lane_home / ".gemini" / "antigravity-cli" / "brain").mkdir(parents=True)
         (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
@@ -984,6 +1081,24 @@ cat > /dev/null
         # The wipe itself, checked on disk: the planted memory is gone.
         self.assertFalse((state / "brain" / "planted.md").exists())
         self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_user_gets_the_skills_where_agy_reads_them_read_only(self):
+        self.operator_skills()
+        # A copy an earlier run left, read-only, is replaced, not merged.
+        stale = Path(self._tmp.name) / "loomuser" / ".gemini" / "config" / "skills" / "gone"
+        stale.mkdir(parents=True)
+        (stale / "SKILL.md").write_text("gone\n")
+        stale.chmod(0o555)
+        self.addCleanup(lambda: stale.exists() and stale.chmod(0o755))
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("skill=impeccable v1", agy[0])
+        self.assertIn("skillw=locked", agy[0])
+        copy = workdir.parent / ".gemini" / "config" / "skills"
+        self.assertEqual(sorted(p.name for p in copy.iterdir()), ["impeccable", "tdd"])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):

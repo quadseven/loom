@@ -27,6 +27,8 @@
 # in the PR), LOOM_<LANE>_KEY_SSM (API lanes: the SSM parameter holding the
 # provider key, read at run time; never stored in this repo; zen needs none),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
+# LOOM_SKILL_DIRS (colon-separated skill folders the sandboxed lanes get a
+# snapshot of; default ~/.agents/skills:~/.claude/skills),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
@@ -183,8 +185,9 @@ park() {
 
 # Seatbelt profile for API-lane agents: no reads or writes anywhere under the
 # real HOME except the worktree, the scratch home and the directory holding
-# the CLI's binary. Inside the worktree, .git stays readable (git diff and git
-# log need it; a fresh clone holds no credentials) but not writable: a planted
+# the CLI's binary, plus read-only access to the skill snapshot. Inside the
+# worktree, .git stays readable (git diff and git log need it; a fresh clone
+# holds no credentials) but not writable: a planted
 # hook or config would run when the runner commits. Also no keychain, no Unix
 # sockets except DNS (an SSH agent's socket would hand over its keys), and no
 # AppleEvents, LaunchServices, osascript, open, launchctl, sudo or su (each can
@@ -197,14 +200,15 @@ sandbox_profile() {
   # only keychain is its own. Every other lane is denied it.
   local keychain_deny='(global-name "com.apple.SecurityServer") '
   [ "$LANE" = agy ] && keychain_deny=""
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta=""
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" skills="" skills_rules=""
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
+  [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
   cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
   cli_root="$(dirname "$cli_real")"
   # Paths go into the profile's string grammar: refuse any that could close it.
-  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME"; do
+  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$skills"; do
     # shellcheck disable=SC1003 # matching a literal backslash
     case "$p" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
   done
@@ -212,7 +216,11 @@ sandbox_profile() {
   case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
   allow_rw="(subpath \"$tree\") (subpath \"$(cd "$AGENT_HOME" && pwd -P)\")"
   allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")"
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link"; do
+  # The skill snapshot: readable, never writable, wherever LOOM_HOME lives.
+  [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
+(deny file-write* (subpath \"$skills\"))
+"
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"}; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
       meta="$meta (literal \"$p\")"
@@ -220,8 +228,8 @@ sandbox_profile() {
       p="$(dirname "$p")"
     done
   done
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$(agy_write_rules "$allow_rw")" "$tree" "$allow_ro" "$meta" "$keychain_deny"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
+    "$home" "$allow_rw" "$(agy_write_rules "$allow_rw")" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -302,7 +310,8 @@ agy_forget() {
 # tool. Any shell command the agent ran could therefore copy the token out.
 # The lane stays edits-only (never --dangerously-skip-permissions): print mode
 # soft-denies shell commands, and a denied command ends the run with no
-# output, so the brief says so up front. Slash commands and skills stay off.
+# output, so the brief says so up front. Slash commands and skill expansion
+# in the prompt stay off; the agent can still load a skill it decides to use.
 AGY_TOOLS_NOTE="Tools on this lane: shell commands are not available here, and asking for one ends the run. Read files with your file viewing and search tools, and change them with your edit tools only."
 
 # The agy lane: unlock the lane user's keychain (password on stdin to a shell
@@ -314,6 +323,7 @@ agy_agent() {
   AGENT_HOME="$AGY_HOME/tmp"
   "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
   agy_forget || { echo "could not clear agy's memory of earlier runs" >&2; return 3; }
+  agy_skills
   profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
@@ -439,9 +449,89 @@ archive_transcripts() {
 # A fresh scratch home for every API-lane run. The agent can write inside it,
 # so anything left there (a link into the real HOME, say) must never meet the
 # runner, which is not sandboxed. rm -rf removes links without following them.
+# The skill snapshot is linked in where Claude Code, the cross-tool folder and
+# opencode look for skills; the sandbox lets the agent read it, never write it.
 fresh_agent_home() {
+  local skills d
   rm -rf "$AGENT_HOME"
   mkdir -p "$AGENT_HOME/tmp"
+  skills="$(cd "$SKILLS" 2> /dev/null && pwd -P)" || return 0
+  for d in .claude .agents .config/opencode; do
+    mkdir -p "$AGENT_HOME/$d" && ln -s "$skills" "$AGENT_HOME/$d/skills"
+  done
+}
+
+# The operator's skills, for the lanes that cannot read the operator's home:
+# a snapshot at $LOOM_HOME/skills of every child folder holding a SKILL.md in
+# the folders LOOM_SKILL_DIRS names (the first folder wins a name both hold),
+# links followed, refreshed at most hourly by whichever lane gets there
+# first. It is built beside the snapshot and swapped in only when the whole
+# copy succeeded, so a failed refresh keeps the last good snapshot and logs
+# one line. A missing folder is skipped; with none present nothing changes.
+SKILLS="$LOOM_HOME/skills"
+refresh_skills() {
+  local stamp="$LOOM_HOME/run/skills.stamp" lock="$LOOM_HOME/run/skills.lock"
+  local next="$LOOM_HOME/skills.next" old="$LOOM_HOME/skills.old" src d name found="" err=""
+  local -a dirs
+  [ -n "$(find "$stamp" -mmin -60 2> /dev/null)" ] && return 0
+  if ! mkdir "$lock" 2> /dev/null; then
+    # Another lane is refreshing. A refresher killed mid-copy leaves its lock.
+    [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2> /dev/null)" ] && rm -rf "$lock"
+    return 0
+  fi
+  touch "$stamp"
+  # shellcheck disable=SC2031 # HOME here is this shell's, not api_agent's subshell's
+  IFS=: read -ra dirs <<< "${LOOM_SKILL_DIRS:-$HOME/.agents/skills:$HOME/.claude/skills}"
+  for src in ${dirs[@]+"${dirs[@]}"}; do [ -d "$src" ] && found=1; done
+  if [ -n "$found" ]; then
+    chmod -R u+w "$next" "$old" 2> /dev/null; rm -rf "$next" "$old"
+    mkdir "$next" || err="cannot create $next"
+    for src in ${dirs[@]+"${dirs[@]}"}; do
+      [ -z "$err" ] && [ -d "$src" ] || continue
+      for d in "$src"/*/; do
+        d="${d%/}" name="${d##*/}"
+        [ -f "$d/SKILL.md" ] && [ ! -e "$next/$name" ] || continue
+        rsync -aL --delete "$d/" "$next/$name/" > /dev/null 2>&1 ||
+          { err="copying $name from $src failed"; break; }
+      done
+    done
+    # Read-only all through, top folder included, so nothing can add, rename
+    # or change a skill. The swap renames within $LOOM_HOME and needs no write
+    # on the snapshot; removing an old one takes chmod -R u+w first.
+    if [ -z "$err" ]; then
+      chmod -R a-w "$next" || err="cannot make $next read-only"
+    fi
+    if [ -z "$err" ]; then
+      if ! { { [ ! -e "$SKILLS" ] || mv "$SKILLS" "$old"; } && mv "$next" "$SKILLS"; }; then
+        err="cannot swap in the new snapshot"
+        [ -e "$SKILLS" ] || mv "$old" "$SKILLS" 2> /dev/null
+      fi
+    fi
+    chmod -R u+w "$next" "$old" 2> /dev/null; rm -rf "$next" "$old"
+    if [ -n "$err" ]; then
+      mkdir -p "$LOOM_HOME/logs"
+      echo "[$(date -u +%FT%TZ)] skill refresh failed, keeping the last snapshot: $err" |
+        tee -a "$LOOM_HOME/logs/skills.log" >&2
+    fi
+  fi
+  rm -rf "$lock"
+}
+
+# The agy lane's agent is another user and cannot read the snapshot, so the
+# runner copies it each run into the folder agy reads global skills from
+# (~/.gemini/config/skills), streamed as tar to a shell running as that user.
+# The sandbox keeps ~/.gemini/config read-only for the agent. A failed copy is
+# logged and the run goes on with whatever skills are there.
+agy_skills() {
+  [ -d "$SKILLS" ] || return 0
+  # shellcheck disable=SC2016 # expanded by the lane user's shell
+  tar -C "$SKILLS" -cf - . | "${AGY_RUNAS[@]}" /bin/bash -c '
+    d="$1"; mkdir -p "${d%/*}" || exit 1
+    # Remove a link without following it; make a copy deletable, then delete.
+    if [ -L "$d" ]; then rm -f "$d" || exit 1
+    elif [ -e "$d" ]; then { chmod -R u+w "$d" && rm -rf "$d"; } || exit 1; fi
+    mkdir "$d" && tar -xf - -C "$d" && chmod -R a-w "$d"' agy-skills "$AGY_HOME/.gemini/config/skills" ||
+    echo "could not copy the skill snapshot to the agy lane user" >&2
 }
 
 # Lanes and models whose provider may train on prompts (docs/LANES.md lists
@@ -652,6 +742,11 @@ if ! lane_ready; then
   [ -n "$LIMITED" ] || exit 0
 else
   heartbeat true ""
+fi
+# Only the sandboxed lanes need the snapshot (codex and claude read the
+# operator's own folders), and only when there is work.
+if { is_api_lane || [ "$LANE" = agy ]; } && compgen -G "$INBOX/*.md" > /dev/null; then
+  refresh_skills
 fi
 
 for BRIEF in "$INBOX"/*.md; do
