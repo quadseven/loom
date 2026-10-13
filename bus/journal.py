@@ -1,6 +1,7 @@
 """The journal and report comment formats from docs/BRAIN.md."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Iterable, Union
 
@@ -9,6 +10,9 @@ from .github import GitHub
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 REPORT_MARKER = "<!-- loom:report v1 -->"
+# The brain's answer to an operator note; the station sends it to the
+# Discord message it names (docs/LANES.md, "Talking to the brain").
+REPLY_RE = re.compile(r"<!-- loom:reply v1 discord=([0-9]{1,20}) -->")
 
 
 def _when(value: Any) -> str:
@@ -55,8 +59,8 @@ def render_report(when, holder, measure, shipped, in_flight, blocked,
 
 
 def post(gh: GitHub, repo: str, issue_number: int, text: str):
-    if not text.startswith((JOURNAL_MARKER, REPORT_MARKER)):
-        raise ValueError("comment must start with a loom journal or report marker")
+    if not (text.startswith((JOURNAL_MARKER, REPORT_MARKER)) or REPLY_RE.match(text)):
+        raise ValueError("comment must start with a loom journal, report or reply marker")
     _text.check(text)
     return gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue_number)),
                    {"body": text})

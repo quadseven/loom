@@ -28,7 +28,9 @@
 # provider key, read at run time; never stored in this repo; zen needs none),
 # LOOM_HOME (default ~/loom), LOOM_AGENT_TIMEOUT (seconds, default 3600),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
-# LOOM_CLONE_BASE (default git@github.com:).
+# LOOM_CLONE_BASE (default git@github.com:), and for the anthropic lanes
+# LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
+# (docs/LANES.md, "Anthropic spend").
 set -uo pipefail
 
 SLOT="${1:?usage: run_lane.sh <lane>}"
@@ -37,6 +39,9 @@ SLOT="${1:?usage: run_lane.sh <lane>}"
 LANE="$SLOT"
 [[ "$SLOT" =~ -[0-9]+$ ]] && LANE="${SLOT%-*}"
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
+export LOOM_HOME
+# This checkout, for its python helpers (bus/spend.py).
+LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -385,6 +390,64 @@ is_api_lane() {
   return 1
 }
 
+# A fix brief's branch, brought up to date with the repository's default
+# branch before the agent runs, so a lane can resolve a conflict: the agent's
+# sandbox cannot write .git, so it can never fetch or merge itself (#145).
+# A clean merge stays as a commit. A conflict is left in the tree with its
+# markers, CONFLICTS names the files, and the runner completes the merge after
+# the agent. UPDATE_REASON is set when the branch could not be updated.
+# Every git call below, the fetch and the unshallow fetch included, runs under
+# `timeout "$NET_TIMEOUT"`, written on the line before its continuation.
+update_fix_branch() {
+  local default
+  UPDATE_REASON=""; CONFLICTS=""
+  default="${BASE_BRANCH:-$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote --symref origin HEAD 2>> "$LOG" |
+    sed -n 's#^ref: refs/heads/\(.*\)[[:space:]]HEAD$#\1#p')}"
+  if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
+    UPDATE_REASON="could not read the default branch"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
+    UPDATE_REASON="could not fetch $default"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+  fi
+  timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
+  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
+    return 0
+  fi
+  # One path a line, never split on spaces or globbed.
+  CONFLICTS="$(safe_git -c core.quotePath=false diff --name-only --diff-filter=U)"
+  if [ -z "$CONFLICTS" ]; then
+    safe_git merge --abort >> "$LOG" 2>&1 || true
+    UPDATE_REASON="merging $default into $BRANCH failed"; return 1
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET: merging $default conflicts in $(conflict_list); the agent resolves it" >> "$LOG"
+  return 0
+}
+
+# CONFLICTS (one path a line) as one comma-separated line.
+conflict_list() {
+  printf '%s\n' "$CONFLICTS" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g'
+}
+
+# Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
+markers_left() {
+  local f left=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$TREE/$f" ] &&
+      grep -qE '^(<<<<<<<|=======|>>>>>>>)( |$)' -- "$TREE/$f" && left+=("$f")
+  done <<< "$CONFLICTS"
+  [ "${#left[@]}" -gt 0 ] && { local IFS=,; echo "${left[*]}" | sed 's/,/, /g'; }
+  return 0
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
@@ -399,10 +462,40 @@ run_agent() {
     zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_config && api_agent CLOUDFLARE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
+    anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
+}
+
+spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
+
+# The anthropic lanes spend API credits. The CLI's JSON result carries the
+# run's cost: the lane log gets the human-readable result, and
+# state/usage/spend.jsonl one line per run, with cost null (unknown, never
+# zero) when the run left no result.
+anthropic_agent() {
+  local out="$LOGDIR/$TICKET.result" status
+  api_agent ANTHROPIC_API_KEY claude -p --output-format json --model "$MODEL" "$1" > "$out"
+  status=$?
+  if ! spend record --output "$out" --slot "$SLOT" --ticket "$TICKET" --model "$MODEL"; then
+    cat "$out"
+    echo "could not read this run's cost; recording it as unknown" >&2
+    printf '{"at": %s, "slot": "%s", "ticket": "%s", "model": "%s", "cost_usd": null}\n' \
+      "$(date +%s)" "$SLOT" "$TICKET" "$MODEL" >> "$LOOM_HOME/state/usage/spend.jsonl"
+  fi
+  rm -f "$out"
+  return "$status"
+}
+
+# With LOOM_ANTHROPIC_BUDGET_USD set, credit under the floor (or a budget
+# setting that does not parse) makes the anthropic slots unavailable.
+anthropic_credit_ok() {
+  [ -n "${LOOM_ANTHROPIC_BUDGET_USD:-}" ] || return 0
+  local why
+  why="$(spend floor 2>&1)" && return 0
+  READY_REASON="${why:-could not check the anthropic credit}"
+  return 1
 }
 
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
@@ -421,6 +514,7 @@ lane_ready() {
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
+  [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
   case "$LANE" in zen) return 0 ;; esac
@@ -590,13 +684,27 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "clone or branch failed"; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
+  RUN_BRIEF="$BRIEF"
+  CONFLICTS=""
+  if [ -n "$FIX_PR" ]; then
+    # BASE is taken first, so a clean merge alone counts as a change and an
+    # out-of-date pull request is pushed up to date.
+    if ! update_fix_branch; then park "$BRIEF" "$UPDATE_REASON"; continue; fi
+    if [ -n "$CONFLICTS" ]; then
+      RUN_BRIEF="$WORKDIR/$TICKET.run.md"
+      { cat "$BRIEF"
+        printf '\n## Merge conflicts\n\nThe runner merged the default branch into this branch and it conflicts in: %s\n' "$(conflict_list)"
+        printf 'Resolve every conflict in those files first: keep both sides'"'"' intent, remove every conflict marker, and keep the tests green. Do not run git; the runner completes the merge.\n'
+      } > "$RUN_BRIEF"
+    fi
+  fi
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   ( set -m
-    (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
@@ -605,9 +713,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  if [ -n "$CONFLICTS" ]; then
+    LEFT="$(markers_left)"
+    if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
+  fi
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
-  if [ -n "$(safe_git status --porcelain)" ]; then
-    if ! { safe_git checkout -q "$BRANCH" && safe_git add -A &&
+  # During a merge the branch is already checked out, and the commit
+  # completes the merge.
+  if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
+    if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
            safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
