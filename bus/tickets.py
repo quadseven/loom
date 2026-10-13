@@ -138,10 +138,13 @@ REGRESSION_MARKER = "<!-- loom:regression v1 -->"
 
 def parse_regression(body: Optional[str]) -> str:
     """The evidence in a loom:regression comment written by bus.brain regress,
-    with lines the runner could read as a header or section quoted."""
+    with lines the runner could read as a header or section quoted. Raises
+    ValueError when it carries no Measured: line, as bus.brain regress does."""
     lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if not lines or lines[0].strip() != REGRESSION_MARKER:
         raise ValueError("not a loom:regression comment")
+    if not any(re.match(r"Measured:[ \t]*\S", l) for l in lines[1:]):
+        raise ValueError("loom:regression comment carries no Measured: line")
     rest = ["    " + l if _FIX_UNSAFE_RE.match(l) else l for l in lines[1:]]
     return "\n".join(rest).strip("\n")
 

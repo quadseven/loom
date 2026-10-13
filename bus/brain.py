@@ -475,6 +475,90 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})
 
 
+BACKLOG_TITLE = "Backlog: every open issue in %s is worked through Loom or handed to a person"
+REVIEW_SAMPLE = 5
+
+
+def _backlog_body(repo: str) -> str:
+    return "\n".join([
+        "## Destination",
+        "",
+        "Every open issue in %s is either a Loom ticket worked by a lane or "
+        "labelled `loom:human` with one comment naming what only a person can do."
+        % repo,
+        "",
+        "## Metric",
+        "",
+        "- Open issues not yet tickets (neither `loom:ticket` nor `loom:human`): "
+        "falls to 0.",
+        "- Open `loom:ticket` issues: rise, then fall as they ship.",
+        "- Open `loom:human` issues: each has its ask.",
+        "",
+        "## Rules",
+        "",
+        "- Triage never closes an issue. It rewrites one as a ticket, marks what "
+        "is missing with `loom:triage`, or hands it to a person with `loom:human`.",
+        "- If this repo is private, its briefs never go to a lane whose provider "
+        "may train on prompts.",
+        "- No pull request merges here without the review check.",
+    ])
+
+
+def _review_check_line(gh: GitHub, repo: str, check: str) -> str:
+    """Whether the review check ran on any of the repo's latest pull requests."""
+    prs = gh.rest("GET", "/repos/%s/pulls?state=all&per_page=%d"
+                  % (repo, REVIEW_SAMPLE)).data or []
+    prs = [p for p in prs if isinstance(p, dict)][:REVIEW_SAMPLE]
+    if not prs:
+        return ("warning: %s has no pull requests yet, so it is unknown whether %s runs "
+                "there; the factory never merges a pull request without it"
+                % (repo, check))
+    for pr in prs:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha:
+            continue
+        runs = gh.rest("GET", "/repos/%s/commits/%s/check-runs?check_name=%s&per_page=1"
+                       % (repo, sha, quote(check, safe=""))).data or {}
+        if int(runs.get("total_count") or 0) > 0:
+            return "review check: %s ran on %s#%s" % (check, repo, pr["number"])
+    return ("warning: %s did not run on the last %d pull requests in %s (%s); the "
+            "factory never merges there without it, so install the review bot first"
+            % (check, len(prs), repo, ", ".join("#%s" % p["number"] for p in prs)))
+
+
+def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
+            env: Optional[Dict[str, str]] = None) -> List[str]:
+    """Make a repo ready for Loom: the labels, one backlog goal home, a check
+    that the review check runs there, and the LOOM_REPOS value with the repo
+    in it. A second run changes nothing. Returns the lines to print."""
+    from . import factory, labels  # factory imports this module
+    env = os.environ if env is None else env
+    check = (review_check or env.get("LOOM_REVIEW_CHECK", "").strip()
+             or factory.DEFAULT_REVIEW_CHECK)
+    info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    lines = ["%s is %s" % (repo, "private: its briefs never go to lanes that train on prompts"
+                           if info.get("private") else "public")]
+    changed = labels.ensure_labels(gh, repo)
+    lines.append("labels: %s" % (", ".join(changed) if changed else "no changes"))
+    title = BACKLOG_TITLE % repo
+    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
+    home = [g for g in goals if "pull_request" not in g and g.get("title") == title]
+    if home:
+        lines.append("backlog goal home: #%s, already open" % home[0]["number"])
+    else:
+        body = _backlog_body(repo)
+        _check_written_text(body)
+        made = gh.rest("POST", "/repos/%s/issues" % repo,
+                       {"title": title, "body": body, "labels": ["loom:goal"]}).data or {}
+        lines.append("backlog goal home: #%s, created" % made.get("number"))
+    lines.append(_review_check_line(gh, repo, check))
+    repos = env.get("LOOM_REPOS", "").replace(",", " ").split()
+    if repo not in repos:
+        repos.append(repo)
+    lines.append('LOOM_REPOS="%s"' % " ".join(repos))
+    return lines
+
+
 def _check_move_args(state: str, lane: Optional[str], note: Optional[str]) -> None:
     if state not in STATES:
         raise ValueError("invalid state")
@@ -878,6 +962,7 @@ def parser() -> argparse.ArgumentParser:
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True)
     rg = sub.add_parser("regress"); rg.add_argument("ticket"); rg.add_argument("--goal", type=int, required=True); rg.add_argument("--lane", required=True); rg.add_argument("--file", required=True)
+    ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
@@ -943,6 +1028,11 @@ def _cmd_reply(gh: GitHub, args: argparse.Namespace) -> None:
     reply_to_review(gh, repo, number, args.comment, _read(args.file), args.resolve)
 
 
+def _cmd_onboard(gh: GitHub, args: argparse.Namespace) -> None:
+    for line in onboard(gh, _repo(args.repo), args.review_check):
+        print(line)
+
+
 def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.pull_request, "pull request")
     fix(gh, repo, number, _ref(args.ticket, "ticket"), _read(args.file))
@@ -951,7 +1041,7 @@ def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "regress": _cmd_regress, "triage": _cmd_triage,
-            "human": _cmd_human}
+            "human": _cmd_human, "onboard": _cmd_onboard}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -139,7 +139,8 @@ tickets and pull requests like any other work.
    Other work goes out with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
 8. Triage the backlog. For each backlog goal (the goal home of a repo whose
-   old issues Loom works on), run
+   old issues Loom works on; `python3 -m bus.brain onboard OWNER/NAME`
+   opens one), run
    `python3 -m bus.brain triage OWNER/NAME --goal N` (at most 25 issues a
    run, oldest first). It skips pull requests, epics, asks and anything with
    a `loom:` label; a ready issue (every brief section, checkboxes under
@@ -191,9 +192,13 @@ tickets and pull requests like any other work.
 ## Lane choice
 
 Choose only lanes that lane status shows as available. Hard work goes to
-anthropic, claude or codex, never openrouter, zen, zai or workersai. Zen,
-zai and agy take public repos only. Prefer anthropic while its credits last,
-then codex and opencode-go, then free lanes, and claude last.
+anthropic, claude or codex, never openrouter, zen, zai, workersai or spark.
+Zen, zai and agy take public repos only. Prefer anthropic while its credits
+last, then codex and opencode-go, then free lanes, and claude last. Easy
+tickets on any repo, private ones included, may go to `spark` (the local
+vLLM coder, model `spark/...`) before the hosted free lanes. It takes one
+ticket at a time and steps aside while its box is hot: the factory moves its
+waiting tickets on, so brief it only when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
 anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each takes one

@@ -106,7 +106,17 @@ class FakeGitHub:
         return Response(200, {})
 
     def graphql(self, query, variables=None):
-        number = int(re.search(r"pullRequest\(number:(\d+)\)", query).group(1))
+        if "resolveReviewThread" in query:
+            self.writes.append(("RESOLVE", variables["id"], None))
+            for details in self.details.values():
+                for thread in details["reviewThreads"]["nodes"]:
+                    if thread["id"] == variables["id"]:
+                        thread["isResolved"] = True
+            return {"resolveReviewThread": {"thread": {"isResolved": True}}}
+        if variables and "number" in variables:
+            number = variables["number"]
+        else:
+            number = int(re.search(r"pullRequest\(number:(\d+)\)", query).group(1))
         return {"repository": {"pullRequest": self.details[number]}}
 
 
@@ -115,7 +125,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved = [], [], []
 
-    def go(self):
+    def go(self, limited=()):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes):
@@ -123,7 +133,7 @@ class Base(unittest.TestCase):
         def move(gh, repo, number, state, lane=None, note=None):
             self.moved.append((number, state, lane))
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
-                            merge=merge, fix=fix, move=move)
+                            merge=merge, fix=fix, move=move, limited=limited)
         f.run()
         return f
 
@@ -333,6 +343,81 @@ class PullRequests(Base):
         self.assertEqual((self.merged, self.fixed), ([], []))
 
 
+BOT = {"__typename": "Bot", "login": "grug-tribe"}
+FIXED = "Fixed in 1234567: the flagged code changed and this review does not raise it again."
+NO_CHANGE = "Lane claude made no change for the fix to #50 and said why on the pull request"
+
+
+class ReviewBotThreads(Base):
+    def thread(self, *comments):
+        nodes = [{"author": a, "body": b} for a, b in comments]
+        self.gh.details[50]["reviewThreads"]["nodes"][0].update(
+            comments={"nodes": nodes}, root={"nodes": nodes[:1]})
+
+    def test_a_thread_the_bot_marked_fixed_is_resolved_and_the_pull_request_lands(self):
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.comments[5].append({"body": FIX_ASKED.replace("### Check: lint\n\n    E1\n\n", ""),
+                                    "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "medium finding"), (BOT, FIXED))
+        self.go()
+        self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
+
+    def test_a_person_with_the_bot_login_does_not_resolve_a_thread(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "finding"), ({"__typename": "User", "login": "grug-tribe"}, FIXED))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_thread_a_person_opened_stays_open_even_under_a_bot_fixed_reply(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((ME, "this breaks on an empty list"), (BOT, FIXED))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_reply_after_the_bot_marked_it_fixed_keeps_it_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "finding"), (BOT, FIXED), (ME, "this still breaks when x is empty"))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_no_change_round_waits_for_the_review_it_asked_for(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(600)},
+                                {"body": NO_CHANGE, "user": ME, "created_at": iso(120)}]
+        self.gh.pull(50, 5, resolved=False, green=False)
+        self.gh.runs["sha50"][1]["completed_at"] = iso(900)
+        self.go()
+        self.assertEqual((self.fixed, self.merged), ([], []))
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+
+    def test_a_no_change_round_is_judged_once_the_review_answered(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(600)},
+                                {"body": NO_CHANGE, "user": ME, "created_at": iso(120)}]
+        self.gh.pull(50, 5, resolved=False, green=False)
+        self.gh.runs["sha50"][1]["completed_at"] = iso(30)
+        self.go()
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_no_change_round_with_no_review_is_judged_after_the_grace(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(7200)},
+                                {"body": NO_CHANGE, "user": ME,
+                                 "created_at": iso(factory.REVIEW_GRACE + 60)}]
+        self.gh.pull(50, 5, resolved=False, green=False)
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+
+
 class Trust(Base):
     def test_a_strangers_ticket_or_pull_request_is_never_touched(self):
         self.gh.ticket(5, "pr")
@@ -410,6 +495,30 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.model(7), self.model(8)), (None, None))
 
+    def test_a_ticket_briefed_on_a_lane_at_a_limit_moves_to_the_next_lane_at_once(self):
+        self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        self.go(limited=["spark"])
+        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("Not a failure (lane spark is at a limit)", note)
+        self.assertEqual(self.moved, [])
+
+    def test_a_ticket_on_a_lane_that_is_not_limited_waits_as_before(self):
+        self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        self.go(limited=["zen"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
+
+    def test_a_limited_ticket_past_the_last_rung_stays_for_its_lane(self):
+        self.gh.ticket(7, "briefed", lane="spark")
+        self.gh.comments[7].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        self.go(limited=["spark"])
+        self.assertEqual(self.lane(7), "spark")
+        self.assertEqual(self.moved, [])
+
     def test_a_pass_stops_after_its_action_cap(self):
         for n in range(1, factory.MAX_ACTIONS + 5):
             self.gh.ticket(n, "failed")
@@ -468,8 +577,8 @@ class Helpers(unittest.TestCase):
         calls = []
 
         class Fake:
-            def __init__(self, gh, repos, now, trusted, review_check):
-                calls.append((tuple(repos), tuple(trusted), review_check))
+            def __init__(self, gh, repos, now, trusted, review_check, limited):
+                calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited)))
 
             def run(self):
                 calls.append("ran")
@@ -489,7 +598,7 @@ class Helpers(unittest.TestCase):
                 st.run_factory()
         finally:
             factory.Factory = real
-        self.assertEqual(calls, [((REPO,), ("alice-example",), "Review"), "ran"])
+        self.assertEqual(calls, [((REPO,), ("alice-example",), "Review", ()), "ran"])
 
 
 if __name__ == "__main__":
