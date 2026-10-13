@@ -575,6 +575,17 @@ class DeferredFindings(Base):
         self.go()
         self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
 
+    def test_prose_that_starts_with_low_is_not_a_low_finding(self):
+        self.finding("Low risk, but this list can be empty.", asked=(ASKED_ONCE, ASKED_ONCE))
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged), ([], []))
+
+    def test_a_finding_line_survives_an_empty_or_blank_root(self):
+        for root in ({}, {"body": "   "}):
+            with self.subTest(root=root):
+                line = factory.finding_line({"id": "PRRT_2", "path": "a.py", "root": {"nodes": [root]}})
+                self.assertEqual(line, "- finding in `a.py`: PRRT_2")
+
     def test_a_high_finding_is_never_deferred(self):
         self.finding(HIGH, asked=(ASKED_ONCE, ASKED_ONCE, ASKED_ONCE))
         self.go()

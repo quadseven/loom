@@ -141,7 +141,8 @@ REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadR
 # held only such findings, most past round 8: each round's review found new
 # ones, so requiring every thread resolved never converged. High and critical
 # findings, and every thread a person opened, still hold the merge.
-MINOR_RE = re.compile(r"^\W*(medium|low)\b", re.I)
+# The bot opens each finding with its severity line, "<symbol> medium | ...".
+MINOR_RE = re.compile(r"^\W*(medium|low) \|")
 DEFER_AFTER = 2
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Deferred review findings from %s#%d"
@@ -286,7 +287,8 @@ def finding_line(thread: Dict[str, Any]) -> str:
     """One ASCII line for a deferred finding: its severity line without the
     bot's symbols, its file, and a link to the thread."""
     root = _end(thread, "root", 0)
-    first = str(root.get("body") or "").strip().splitlines()[0] if root.get("body") else ""
+    lines = str(root.get("body") or "").strip().splitlines()
+    first = lines[0] if lines else ""
     words = " ".join(first.encode("ascii", "ignore").decode().split())
     return "- %s in `%s`: %s" % (words or "finding", thread.get("path") or "?",
                                  root.get("url") or thread.get("id"))
