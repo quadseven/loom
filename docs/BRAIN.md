@@ -307,6 +307,11 @@ message, its full list, grouped by goal, is a comment on the `loom:digest`
 issue in each ask's own repo, and the message links to it. To file an ask
 under its goal, name the goal home in its body (`Part of #N`).
 
+Open `loom:human` issues are not asks: the station never posts one on its
+own. They are listed once a day under "Waiting on you" at the end of the
+same digest (the 15 newest, grouped by repo, each with the first line of
+its `loom:human` comment), so hundreds of them still make one message.
+
 ## The tick
 
 One tick at a time, under a lock: a branch `loom-lock/brain` in this repo,

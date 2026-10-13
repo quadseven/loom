@@ -28,6 +28,7 @@ from . import factory
 from . import spend
 from . import text as _text
 from . import tickets
+from .brain import HUMAN_MARKER
 from . import brain
 from .github import GitHub, GitHubError, _OPENER
 from .journal import REPLY_RE
@@ -91,6 +92,12 @@ REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+# Open loom:human issues wait for the daily digest.
+HUMAN = "loom:human"
+HUMAN_HEAD = "Waiting on you"
+HUMAN_SHOWN = 15
+HUMAN_TITLE_MAX = 100
+HUMAN_ASK_MAX = 140
 # When every ask does not fit in the daily notification, the full digest is a
 # comment on this issue in each ask's own repo (so a private repo's asks stay
 # in that repo), and the notification links to it.
@@ -422,6 +429,11 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
     """The one lane the issue names, or None when it names none or several."""
     lanes = [n[len("lane:"):] for n in _label_names(issue) if n.startswith("lane:")]
     return lanes[0] if len(lanes) == 1 and lanes[0] in LANES else None
+
+
+def _clip(text: str, limit: int) -> str:
+    # A trailing backslash would escape the ellipsis in Discord's formatting.
+    return text if len(text) <= limit else text[:limit - 3].rstrip(" \\") + "..."
 
 
 def provider(lane: str) -> str:
@@ -1527,6 +1539,66 @@ class Station:
             return False
         return True
 
+    def _gather_human(self) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
+        """(repo, issue) for every open loom:human issue, newest first; None
+        when any repo could not be read (the digest waits for a whole list)."""
+        found: List[Tuple[str, Dict[str, Any]]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                items = self.gh.paginate(
+                    "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, HUMAN))
+            except GitHubError as err:
+                _say("could not list %s issues in %s: %s" % (HUMAN, repo, err))
+                return None
+            found += [(repo, i) for i in items if isinstance(i, dict)
+                      and "pull_request" not in i and i.get("html_url") and "number" in i]
+        found.sort(key=lambda f: (str(f[1].get("created_at") or ""), int(f[1]["number"])),
+                   reverse=True)
+        return found
+
+    def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The first line of the newest loom:human comment from an allowed
+        login (the brain's ask), or "" when there is none."""
+        allowed = {a.lower() for a in self.s.authors}
+        # paginate follows the next links, so the newest comment is read however
+        # long the thread is. Only the HUMAN_SHOWN listed issues are read, once a
+        # day when the digest is due. A GitHubError is left to _human_text,
+        # which holds the whole digest rather than send a list missing an ask.
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                    % (repo, int(issue["number"])))
+        for c in reversed(comments):
+            body = str(c.get("body") or "") if isinstance(c, dict) else ""
+            if body.startswith(HUMAN_MARKER) and tickets._login(c.get("user")) in allowed:
+                lines = [ln.strip() for ln in body[len(HUMAN_MARKER):].splitlines() if ln.strip()]
+                return _clip(lines[0], HUMAN_ASK_MAX) if lines else ""
+        return ""
+
+    def _human_text(self, found: List[Tuple[str, Dict[str, Any]]]) -> Optional[str]:
+        """The digest's "Waiting on you" section: the newest HUMAN_SHOWN
+        issues grouped by repo, each with its ask; None when it cannot be read."""
+        shown = found[:HUMAN_SHOWN]
+        head = "%s (%d):" % (HUMAN_HEAD, len(found))
+        if len(found) > len(shown):
+            head = "%s (the %d newest of %d):" % (HUMAN_HEAD, len(shown), len(found))
+        lines = [head]
+        for repo in dict.fromkeys(r for r, _ in shown):
+            lines.append(repo)
+            for r, issue in shown:
+                if r != repo:
+                    continue
+                title = _clip(" ".join(str(issue.get("title") or "").split()), HUMAN_TITLE_MAX)
+                lines.append("- %s %s" % (title, issue["html_url"]))
+                try:
+                    ask = self._human_ask(repo, issue)
+                except GitHubError as err:
+                    _say("could not read the ask on %s#%s: %s" % (repo, issue["number"], err))
+                    return None
+                if ask:
+                    lines.append("  %s" % ask)
+        return "\n".join(lines)
+
     def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """(key, repo, issue) for every open ask, oldest first; None when any
         repo could not be read (a partial list must not become a digest)."""
@@ -1539,6 +1611,8 @@ class Station:
             except GitHubError as err:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
+        # A loom:human issue waits in the digest's own list, never alone.
+        asks = [a for a in asks if HUMAN not in _label_names(a[1])]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
 
@@ -1677,7 +1751,8 @@ class Station:
             keep.append(line)
         if len(keep) < len(lines):
             keep.append("- and %d more" % (len(lines) - len(keep)))
-        return "\n".join([head] + keep + tail)
+        asks = "\n".join([head] + keep + tail) if lines else ""
+        return "\n\n".join(part for part in (asks, plan.get("human") or "") if part)
 
     def _digest_issue(self, repo: str) -> int:
         found = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
@@ -1721,21 +1796,34 @@ class Station:
             _write_json(path, sent)
         return True
 
+    def _new_digest_plan(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
+                         covered: Any, today: str) -> Optional[Dict[str, Any]]:
+        """Build the day's fixed plan after every ask and human item can be read."""
+        trust = self._check_asks(keyed, {k for k, _, _ in keyed})
+        if trust is None:
+            return None
+        asks = [a for a in keyed if trust.get(a[0])]
+        found = self._gather_human()
+        if found is None:
+            return None
+        human = self._human_text(found) if found else ""
+        if human is None or (not asks and not human):
+            return None
+        try:
+            plan = self._plan_digest(asks, covered, today)
+        except GitHubError as err:
+            _say("could not read the goal homes for the digest: %s; next pass" % err)
+            return None
+        plan["human"] = human
+        return plan
+
     def _send_digest(self, url: Optional[str], keyed: List[Tuple[str, str, Dict[str, Any]]],
                      ledger: Tuple[str, Dict[str, Any], List[str]], today: str) -> None:
         path, sent, _ = ledger
         plan = sent.get("pending")
         if not (isinstance(plan, dict) and plan.get("day") == today):
-            trust = self._check_asks(keyed, {k for k, _, _ in keyed})
-            if trust is None:
-                return
-            asks = [a for a in keyed if trust.get(a[0])]
-            if not asks:
-                return
-            try:
-                plan = self._plan_digest(asks, sent.get("covered"), today)
-            except GitHubError as err:
-                _say("could not read the goal homes for the digest: %s; next pass" % err)
+            plan = self._new_digest_plan(keyed, sent.get("covered"), today)
+            if plan is None:
                 return
             sent["pending"] = plan
             _write_json(path, sent)
@@ -1743,7 +1831,8 @@ class Station:
             url = self._webhook()
         if url is None or not self._post_pages(plan, ledger):
             return
-        if self._send(url, self._digest_text(plan)):
+        chunks = self._chunks(self._digest_text(plan), DISCORD_MAX - MENTION_ROOM)
+        if all(self._send(url, chunk, mention=n == 0) for n, chunk in enumerate(chunks)):
             # What the operator was sent: each ask's revision and the links.
             sent["digest"] = today
             sent["covered"] = plan["covered"]
@@ -1823,13 +1912,13 @@ class Station:
         return name[:SHORT_NAME_MAX] or "#%s" % issue.get("number")
 
     @staticmethod
-    def _chunks(text: str) -> List[str]:
+    def _chunks(text: str, size: int = DISCORD_MAX) -> List[str]:
         """The text in Discord-sized messages, cut at line breaks."""
         parts = []
-        while len(text) > DISCORD_MAX:
-            cut = text.rfind("\n", 0, DISCORD_MAX + 1)
+        while len(text) > size:
+            cut = text.rfind("\n", 0, size + 1)
             if cut <= 0:
-                cut = DISCORD_MAX
+                cut = size
             parts.append(text[:cut])
             text = text[cut:].lstrip("\n")
         if text.strip():

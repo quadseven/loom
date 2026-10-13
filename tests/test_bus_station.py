@@ -52,6 +52,7 @@ class FakeGitHub:
         self.edits = []
         self.posts = []
         self.asks = []
+        self.humans = []
         self.digest_issues = []
         self.pages = []
         self.page_error = False
@@ -85,6 +86,16 @@ class FakeGitHub:
                           "labels": labels, "created_at": created, "body": body,
                           "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
         self.events[number] = [labeled("needs-operator", labeller)]
+
+    def add_human(self, number, title="Buy the domain", ask="Buy it.", author="alice-example",
+                created="2030-01-01T00:00:00Z", extra=()):
+        """An open loom:human issue with the brain's ask comment by author."""
+        self.humans.append({"number": number, "title": title, "user": {"login": author},
+                            "labels": [{"name": "loom:human"}] + [{"name": x} for x in extra],
+                            "created_at": created,
+                            "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
+        self.comments[number] = [{"body": "<!-- loom:human v1 -->\n%s" % ask,
+                                  "user": {"login": author}}] if ask else []
 
     def add(self, number, title="Fix the thing", lane="codex", body=BODY,
             author="alice-example", created="2030-01-01T00:00:00Z",
@@ -166,6 +177,8 @@ class FakeGitHub:
                                and "loom:pr" in self.names(i["number"])])
         if "needs-operator" in query:
             return self._list_asks(headers)
+        if "loom:human" in query:
+            return reply(200, self.humans)
         if "loom:goal" in query:
             return self._get_goals()
         if "loom:lanes" in query:
@@ -1900,6 +1913,124 @@ class AsksTest(Base):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
         self.assertIn("Ship the factory (#30)", self.fake.pages[0])
+
+
+class HumanDigestTest(AsksTest):
+    """loom:human issues wait in the daily digest, never one message each."""
+
+    def contents(self):
+        return [p["content"] for _, p in self.sent]
+
+    def test_human_issues_are_listed_in_the_digest_with_their_ask(self):
+        self.fake.add_human(7, title="Buy the domain", ask="Buy example.com.\nMore detail.")
+        self.fake.add_human(8, title="Sign the form", ask="",
+                            created="2030-02-01T00:00:00Z")
+        self.go(NOON)
+        self.assertEqual(self.contents(), [
+            "Waiting on you (2):\n%s\n"
+            "- Sign the form https://github.com/%s/issues/8\n"
+            "- Buy the domain https://github.com/%s/issues/7\n"
+            "  Buy example.com." % (REPO, REPO, REPO)])
+        self.assertEqual(self.sent[0][1]["flags"], station.SUPPRESS_EMBEDS)
+
+    def test_a_human_issue_is_never_forwarded_on_its_own(self):
+        self.fake.add_human(7)
+        self.go(EARLY)
+        self.go(EARLY + 60)
+        self.assertEqual(self.sent, [])
+        # Not even when it also carries an urgent ask's labels.
+        self.fake.add_human(9, extra=("needs-operator", "loom:urgent"))
+        self.fake.asks.append(self.fake.humans[-1])
+        self.fake.events[9] = [labeled("needs-operator", "alice-example")]
+        self.go(EARLY + 120)
+        self.assertEqual(self.sent, [])
+        self.go(NOON)
+        self.go(NOON + 600)
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.contents()[0].startswith("Waiting on you (2):"))
+
+    def test_the_list_shows_the_15_newest_and_the_total(self):
+        for n in range(100, 140):
+            self.fake.add_human(n, title="Item %d" % n,
+                                created="2030-01-01T00:00:%02dZ" % (n - 100))
+        self.go(NOON)
+        text = "\n".join(self.contents())
+        self.assertIn("Waiting on you (the 15 newest of 40):", text)
+        listed = re.findall(r"- Item (\d+) ", text)
+        self.assertEqual(listed, [str(n) for n in range(139, 124, -1)])
+        self.assertTrue(all(len(c) + 30 <= station.DISCORD_MAX for c in self.contents()))
+        self.assertEqual(self.fake.paths("GET").count(
+            "/repos/%s/issues/100/comments?per_page=100" % REPO), 0)
+        comment_reads = [p for p in self.fake.paths("GET") if "/comments?" in p]
+        self.assertEqual(len(comment_reads), station.HUMAN_SHOWN)
+        self.assertTrue(all(p.endswith("?per_page=100") for p in comment_reads))
+
+    def test_clipped_human_text_does_not_escape_its_ellipsis(self):
+        title = "T" * (station.HUMAN_TITLE_MAX - 4) + "\\" + "tail"
+        ask = "A" * (station.HUMAN_ASK_MAX - 4) + "\\" + "tail"
+        self.fake.add_human(7, title=title, ask=ask)
+        self.go(NOON)
+        content = self.contents()[0]
+        self.assertIn("- %s... https://" % ("T" * (station.HUMAN_TITLE_MAX - 4)), content)
+        self.assertIn("  %s..." % ("A" * (station.HUMAN_ASK_MAX - 4)), content)
+        self.assertNotIn("\\...", content)
+
+    def test_the_list_follows_the_asks_in_the_same_digest(self):
+        self.settings.mention = "123456"
+        self.fake.add_ask(5, title="Slow one")
+        self.fake.add_human(7, title="Buy the domain")
+        self.go(NOON)
+        self.assertEqual(len(self.sent), 1)
+        lines = self.contents()[0].splitlines()
+        self.assertEqual(lines[:2], ["<@123456> " + station.DIGEST_HEAD +
+                                     " 1, 1 new since the last digest",
+                                     "- Slow one https://github.com/%s/issues/5" % REPO])
+        self.assertEqual(lines[3], "Waiting on you (1):")
+
+    def test_the_list_follows_a_paged_ask_digest(self):
+        self.add_many()
+        self.fake.add_human(7, title="Buy the domain")
+        self.go(NOON)
+        text = "\n".join(self.contents())
+        self.assertIn("Every ask, by goal:", text)
+        self.assertIn("Waiting on you (1):", text)
+        self.assertIn("- Buy the domain https://github.com/%s/issues/7" % REPO, text)
+        self.assertEqual(len(self.fake.pages), 1)
+        self.assertEqual(self.ledger()["digest"], "2030-05-05")
+
+    def test_an_ask_by_a_stranger_is_not_shown(self):
+        self.fake.add_human(7, title="Buy the domain", ask="Send money to me.", author="stranger")
+        self.go(NOON)
+        self.assertNotIn("Send money", self.contents()[0])
+
+    def test_an_unreadable_list_holds_the_digest_but_not_urgent_asks(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        self.fake.add_ask(6, title="Slow one")
+        self.fake.add_human(7)
+        with mock.patch.object(station.Station, "_gather_human", return_value=None):
+            self.go(NOON)
+        self.assertEqual(self.contents(), ["Urgent ask: Pick one https://github.com/%s/issues/5" % REPO])
+        with mock.patch.object(station.Station, "_human_ask", side_effect=GitHubError("boom", 502)):
+            self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+        self.go(NOON + 120)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("Waiting on you (1):", self.contents()[1])
+
+    def test_the_section_groups_by_repo_newest_first(self):
+        other = "example-owner/other-repo"
+        found = [(other, {"number": 3, "title": "C", "html_url": "u3"}),
+                 (REPO, {"number": 2, "title": "B", "html_url": "u2"}),
+                 (other, {"number": 1, "title": "A", "html_url": "u1"})]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=NOON)
+        from unittest import mock
+        with mock.patch.object(station.Station, "_human_ask", return_value="Ask."):
+            text = st._human_text(found)
+        self.assertEqual(text.splitlines(), [
+            "Waiting on you (3):", other, "- C u3", "  Ask.", "- A u1", "  Ask.",
+            REPO, "- B u2", "  Ask."])
 
 
 class ReportsTest(Base):

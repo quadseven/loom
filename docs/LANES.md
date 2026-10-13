@@ -203,7 +203,12 @@ changed since the last digest first. When the asks do not all fit in one
 message, the station posts every ask, grouped by the goal home its body names
 (`#N`), as a comment on the open `loom:digest` issue in the ask's own repo
 (created when missing), and the message links to each repo's comment. The
-digest is fixed in `state/station/asks.json` (`pending`) before it is sent, so
+same digest includes a "Waiting on you" section for open `loom:human` issues
+across `LOOM_REPOS`: the 15 newest grouped by repo, with title, link, and the
+first line of the brain's ask, plus the total count. A `loom:human` issue is
+never posted on its own, even if it also has `needs-operator` or
+`loom:urgent`. A long daily digest may take multiple Discord messages.
+The digest is fixed in `state/station/asks.json` (`pending`) before it is sent, so
 a retry sends the same one; once sent, `covered` holds each ask's revision
 (a hash of its title and body) and `pages` the links. Posts mention nobody
 except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried
