@@ -709,31 +709,40 @@ class FakeRepo:
         payload = json.loads(body) if body else None
         path = url.split("api.github.com")[1]
         self.calls.append((method, path, payload))
-        base = "/repos/%s" % REPO
-        if method == "GET" and path == base:
+        handler = {"GET": self.get, "POST": self.post}.get(method)
+        answer = handler(path[len("/repos/%s" % REPO):], payload) if handler else None
+        if answer is None:
+            raise AssertionError("unexpected %s %s" % (method, path))
+        return answer
+
+    def get(self, path, payload):
+        if path == "":
             return reply(200, {"full_name": REPO, "private": self.private})
-        if method == "GET" and path.startswith(base + "/labels?"):
+        if path.startswith("/labels?"):
             return reply(200, self.labels)
-        if method == "POST" and path == base + "/labels":
-            self.labels.append(payload)
-            return reply(201, payload)
-        if method == "GET" and path.startswith(base + "/issues?"):
+        if path.startswith("/issues?"):
             self.assertIn_("labels=loom%3Agoal", path)
             return reply(200, [i for i in self.issues
                                if any(l["name"] == "loom:goal" for l in i["labels"])])
-        if method == "POST" and path == base + "/issues":
+        if path.startswith("/pulls?"):
+            return reply(200, self.prs)
+        if "/check-runs?" in path:
+            sha = path.split("/commits/")[1].split("/")[0]
+            self.assertIn_("check_name=Grug%20-%20Elder", path)
+            return reply(200, {"total_count": self.runs.get(sha, 0)})
+        return None
+
+    def post(self, path, payload):
+        if path == "/labels":
+            self.labels.append(payload)
+            return reply(201, payload)
+        if path == "/issues":
             issue = {"number": 100 + len(self.issues), "title": payload["title"],
                      "body": payload["body"],
                      "labels": [{"name": n} for n in payload["labels"]]}
             self.issues.append(issue)
             return reply(201, issue)
-        if method == "GET" and path.startswith(base + "/pulls?"):
-            return reply(200, self.prs)
-        if method == "GET" and "/check-runs?" in path:
-            sha = path.split("/commits/")[1].split("/")[0]
-            self.assertIn_("check_name=Grug%20-%20Elder", path)
-            return reply(200, {"total_count": self.runs.get(sha, 0)})
-        raise AssertionError("unexpected %s %s" % (method, path))
+        return None
 
     @staticmethod
     def assertIn_(part, whole):
