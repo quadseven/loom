@@ -235,8 +235,9 @@ on hard work):
   anthropic slots busy with hard work while the credit lasts.
 
 Spark takes one ticket at a time and steps aside while its box is hot: the
-factory moves its waiting tickets on, so brief it only when lane status
-shows it available.
+factory moves its waiting tickets to a free lane in the same tier as above
+(the table `TIERS` in bus/factory.py), never up the ladder, so brief it only
+when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
 anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each takes one

@@ -51,8 +51,10 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
 - A failed ticket climbs the ladder, and so does a ticket left briefed for
   BRIEFED_STALL with no lane claiming it.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
-  spark lane's does while its box is hot) moves to the next lane at once: the
-  next rung of the ladder. A limit is not a failure, so nothing waits for it.
+  spark lane's does while its box is hot) moves at once to a free lane in its
+  difficulty tier (TIERS), or a ladder ticket to a free lane of its own rung.
+  A limit is not a failure, so it never climbs; with no free lane the ticket
+  waits where it is for its lane to come back.
 - Past the last rung the ticket is left failed for the brain, with a note.
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
@@ -99,6 +101,19 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("codex", "codex-2"), "gpt-6-sol"),
     (("claude",) + ANTHROPIC, "claude-opus-5-5"),
 )
+# The lanes a ticket may move to when its lane is at a limit, by its
+# Difficulty: line, best first (docs/MUSE.md, Lane choice; the doc test reads
+# this table). A limit is not a failure, so the move stays in the tier and
+# never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
+# hot spark lane went up the ladder to claude, the operator's subscription.
+TIERS: Dict[str, Tuple[str, ...]] = {
+    "easy": ("spark", "opencode-go", "opencode-go-2", "openrouter", "workersai",
+             "zen", "zai", "agy"),
+    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2") + ANTHROPIC,
+    "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
+}
+# Lanes whose provider may train on prompts: public repos only.
+PUBLIC_ONLY = ("zen", "zai", "agy")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.
@@ -386,6 +401,24 @@ def with_model(body: str, model: str) -> str:
     return "Model: %s\n%s" % (model, body)
 
 
+def without_model(body: str) -> str:
+    """The ticket body without its Model: header line, so the lane's own
+    default model runs it."""
+    head, sep, rest = body.partition("\n\n")
+    return MODEL_LINE.sub("", head + "\n", count=1).rstrip("\n") + sep + rest
+
+
+def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
+    """The lanes of the ticket's difficulty tier it may run on, best first;
+    none when it has no readable Difficulty: line."""
+    try:
+        difficulty = tickets.parse(issue.get("body"))[0].get("Difficulty", "")
+    except ValueError:
+        return ()
+    return tuple(x for x in TIERS.get(difficulty, ())
+                 if not (private and x in PUBLIC_ONLY))
+
+
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
@@ -395,7 +428,8 @@ class Factory:
                  fix: Callable[..., Any] = brain.fix,
                  move: Callable[..., Any] = brain.move,
                  limited: Sequence[str] = (),
-                 no_test_repos: Sequence[str] = ()) -> None:
+                 no_test_repos: Sequence[str] = (),
+                 available: Optional[Sequence[str]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -404,6 +438,10 @@ class Factory:
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
         self.limited = set(limited)
+        # Lanes whose heartbeat says available; None trusts every lane not
+        # at a limit.
+        self.available = None if available is None else set(available)
+        self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         self.actions = 0
         self.load: Dict[str, int] = {}
@@ -426,6 +464,19 @@ class Factory:
         """The ticket's comments from trusted logins only."""
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return [c for c in data if isinstance(c, dict) and self._trusted(c)]
+
+    def _is_private(self, repo: str) -> bool:
+        """Whether the repo is private; unreadable counts as private."""
+        if repo not in self._private:
+            data = self.gh.rest("GET", "/repos/%s" % repo).data
+            self._private[repo] = not isinstance(data, dict) or data.get("private") is not False
+        return self._private[repo]
+
+    def _free(self, lane: str) -> bool:
+        """A lane that is up, not at a limit, and holds no briefed or
+        running ticket."""
+        return (lane not in self.limited and self.load.get(lane, 0) == 0
+                and (self.available is None or lane in self.available))
 
     def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
         """Every check run on the commit, all pages."""
@@ -627,6 +678,12 @@ class Factory:
         if (ended and not self._reviewed_since(sha, ended)
                 and self.now - ended <= REVIEW_GRACE):
             return  # the review the lane asked for has not answered yet
+        self._judge(repo, number, full, issue, comments, review)
+
+    def _judge(self, repo: str, number: int, full: Dict[str, Any], issue: Dict[str, Any],
+               comments: List[Dict[str, Any]], review: str) -> None:
+        """Land, defer minor findings and land, rerun a flaky job, or send back."""
+        sha = str((full.get("head") or {}).get("sha") or "")
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
@@ -795,15 +852,33 @@ class Factory:
         return True
 
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Move a ticket off a lane at a limit to the next rung. Past the last
-        rung it stays where it is, for the lane to take once it is back."""
+        """Move a ticket off a lane at a limit to the first free lane of its
+        difficulty tier, or a ladder ticket to a free lane of its rung, with
+        no rung marker. With none free it stays where it is, for the lane to
+        take once it is back."""
         number = int(issue["number"])
         old = _lane(issue)
-        lane = self._climb(repo, issue, self._comments(repo, number),
-                           "lane %s is at a limit" % old, head="Not a failure",
-                           failed_here=False)
+        rung = current_rung(issue)
+        lanes = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
+        lane = next((x for x in lanes if x != old and self._free(x)), None)
         if lane is None:
+            _say("%s#%d waits on lane %s, at a limit: no free lane in its %s"
+                 % (repo, number, old, "rung" if rung else "tier"))
             return
+        body = str(issue.get("body") or "")
+        if not rung:
+            body = without_model(body)
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+            issue["body"] = body
+        kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+            "body": "Not a failure (lane %s is at a limit): the factory moved this "
+                    "ticket to lane %s, %s." % (
+                        old, lane, "on the same rung" if rung else "in its difficulty tier")})
+        self.load[old] = self.load.get(old, 0) - 1
+        self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
         _say("moved %s#%d off lane %s, at a limit, to %s" % (repo, number, old, lane))
 
