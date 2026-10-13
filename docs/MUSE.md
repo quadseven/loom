@@ -125,20 +125,16 @@ live regression).
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).
    Spend at most a third of the tick on them; defer what is left again.
-3. The station's factory pass (bus/factory.py) already merges every lane
-   pull request that is green, reviewed and free of open threads, sends the
-   rest back to a lane, and moves stuck and failed tickets up the model
-   ladder, every 5 minutes, without a brain. Spend the tick on what it
-   cannot judge: for each lane pull request, read its whole diff against its
-   ticket and acceptance criteria. A lane pull request with failing checks or
-   unresolved findings goes back to the lane that wrote it with
-   `python3 -m bus.brain fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md`
-   (FINDINGS.md says what to change; the command adds the failing check logs
-   and the open review threads itself). Fix it yourself only when the fix is
-   a one-line mechanical change. For each ready one, reply to every review
-   thread using
+3. The station hands failed checks and unresolved review-bot threads back to
+   the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
+   The factory pass (bus/factory.py) moves stuck and failed tickets up the
+   model ladder every 5 minutes. Review in full only tickets labeled
+   `needs-brain`: read the whole diff against the ticket and acceptance
+   criteria, and reply to each thread with
    `python3 -m bus.brain reply OWNER/NAME#PR --comment ID --file BODY.md --resolve`.
-   Then run `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
+   Merge only PRs labeled `loom:ready`: confirm checks are green, no review-bot
+   threads are unresolved, and the verdict applies to the current head SHA. Then run
+   `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
    which moves the ticket to `loom:merged`. Merged is not deployed: the
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
@@ -258,8 +254,9 @@ on hard work):
   anthropic slots busy with hard work while the credit lasts.
 
 Spark takes one ticket at a time and steps aside while its box is hot: the
-factory moves its waiting tickets on, so brief it only when lane status
-shows it available.
+factory moves its waiting tickets to a free lane in the same tier as above
+(the table `TIERS` in bus/factory.py), never up the ladder, so brief it only
+when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
 anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each takes one
