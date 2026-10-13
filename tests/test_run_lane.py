@@ -107,6 +107,12 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = answer ]; then
+  mkdir -p .loom-answers
+  echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
+  ln -s "$FAKE_SECRET_FILE" .loom-answers/PRRT_2.md
+  echo "scratch" > .loom-answers/notes.txt
+fi
 echo fixed > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
@@ -466,6 +472,22 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
                                    "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_briefs_answers_move_to_the_inbox_and_never_into_the_commit(self):
+        name, _ = self.fix_brief()
+        secret = Path(self._tmp.name) / "outside-secret"
+        secret.write_text("do not post me\n")
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_GH_EXISTING="7",
+                               FAKE_SECRET_FILE=str(secret))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        answers = self.inbox / "answers" / name
+        # Only the regular file named for a thread; the symlink is dropped unread.
+        self.assertEqual(sorted(os.listdir(answers)), ["PRRT_1.md"])
+        self.assertEqual((answers / "PRRT_1.md").read_text(), "Not valid: a.py:2 already guards it.\n")
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
+                                self.remote_head(self.FIX_BRANCH)], capture_output=True, text=True).stdout.split()
+        self.assertIn("fix.txt", files)
+        self.assertFalse([f for f in files if f.startswith(".loom-answers")])
 
     def test_a_fix_brief_repairs_stale_pr_text_without_a_code_commit(self):
         # The branch already has one commit and an open PR. The ticket body

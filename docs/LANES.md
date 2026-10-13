@@ -85,7 +85,14 @@ to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
 `claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
 A rung whose lanes each already hold 2 briefed or running tickets is passed
-over for the next. A fix brief that ends with nothing committed (most often
+over for the next. A fix brief may answer a finding instead of fixing it: the agent writes the
+reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
+the tree (never committed; symlinks dropped), and the station posts each
+answer as the reply on its thread, redacted and text-checked. The station
+resolves the thread only when the round ran on a ladder model and the thread
+is the review bot's own medium or low finding; any other answered thread
+stays open, and the factory reads it as a finding that survived.
+A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default

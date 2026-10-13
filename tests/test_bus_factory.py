@@ -577,7 +577,7 @@ class Helpers(unittest.TestCase):
         calls = []
 
         class Fake:
-            def __init__(self, gh, repos, now, trusted, review_check, limited):
+            def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None):
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited)))
 
             def run(self):

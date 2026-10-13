@@ -505,6 +505,24 @@ conflict_list() {
 }
 
 # Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
+# A fix brief's agent may answer a finding instead of fixing it, one file a
+# thread in .loom-answers/ (bus/tickets.py says how). The answers never go in
+# the commit: regular files named for a thread move to the inbox, where the
+# station posts each on its thread. A symlinked folder or file is dropped
+# unread, so an answer cannot carry the contents of a file outside the tree.
+keep_answers() {
+  local dir="$TREE/.loom-answers" f
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0
+  if [ -n "$FIX_PR" ] && [ -d "$dir" ] && [ ! -L "$dir" ]; then
+    mkdir -p "$INBOX/answers/$TICKET"
+    for f in "$dir"/PRRT_*.md; do
+      [ -f "$f" ] && [ ! -L "$f" ] && [ "$(wc -c < "$f")" -le 8192 ] &&
+        cp "$f" "$INBOX/answers/$TICKET/"
+    done
+  fi
+  rm -rf "$dir"
+}
+
 markers_left() {
   local f left=()
   while IFS= read -r f; do
@@ -791,6 +809,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  keep_answers
   if [ -n "$CONFLICTS" ]; then
     LEFT="$(markers_left)"
     if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
