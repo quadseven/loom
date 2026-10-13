@@ -8,6 +8,7 @@ take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
 from __future__ import annotations
 
 import calendar
+from datetime import date, timedelta
 import fcntl
 import hashlib
 import json
@@ -21,6 +22,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import factory
+from . import metrics
 from . import spend
 from . import text as _text
 from . import tickets
@@ -112,7 +114,8 @@ class Settings:
                  bot_token_ssm: str = "", default_goal: str = "",
                  anthropic: Optional[spend.Budget] = None,
                  factory_on: bool = False,
-                 review_check: str = factory.DEFAULT_REVIEW_CHECK) -> None:
+                 review_check: str = factory.DEFAULT_REVIEW_CHECK,
+                 metrics_goal: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -130,6 +133,7 @@ class Settings:
         # merging; from_env turns it on unless LOOM_FACTORY=0.
         self.factory_on = factory_on
         self.review_check = review_check
+        self.metrics_goal = metrics_goal
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -162,7 +166,8 @@ class Settings:
                    anthropic=budget,
                    factory_on=env.get("LOOM_FACTORY", "").strip() not in ("0", "off", "false"),
                    review_check=(env.get("LOOM_REVIEW_CHECK", "").strip()
-                                 or factory.DEFAULT_REVIEW_CHECK))
+                                 or factory.DEFAULT_REVIEW_CHECK),
+                   metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip())
 
 
 def _origin_repo() -> str:
@@ -544,6 +549,7 @@ class Station:
         free = [lane for lane in LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         if not free:
+            self._record_slot_sample(False)
             return
         by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {l: [] for l in free}
         for repo in self.s.repos:
@@ -568,6 +574,16 @@ class Station:
                         break
                 except (GitHubError, OSError) as err:
                     _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
+        self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
+                                     for lane in free))
+
+    def _record_slot_sample(self, idle: bool) -> None:
+        if not self.s.metrics_goal:
+            return
+        path = os.path.join(self.state, "slot-samples.jsonl")
+        os.makedirs(self.state, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"at": self.now, "idle": idle}) + "\n")
 
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         if self._skip_known(repo, issue):
@@ -1552,11 +1568,68 @@ class Station:
         factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                         review_check=self.s.review_check).run()
 
+    def post_metrics(self) -> None:
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)",
+                           self.s.metrics_goal)
+        if not ref or ref.group(1) not in self.s.repos:
+            return
+        today = time.strftime("%Y-%m-%d", time.localtime(self.now))
+        if time.localtime(self.now).tm_hour < self.s.digest_hour:
+            return
+        repo, number = ref.group(1), int(ref.group(2))
+        path = "/repos/%s/issues/%d/comments" % (repo, number)
+        comments = self.gh.paginate(path)
+        dated = {}
+        allowed = {author.lower() for author in self.s.authors}
+        for comment in comments:
+            body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+            author = str((comment.get("user") or {}).get("login") or "").lower()
+            if author not in allowed:
+                continue
+            match = re.match(r"<!-- loom:metrics v1 -->\n(\d{4}-\d{2}-\d{2}): (\d)/9 pass; streak (\d+)", body)
+            if match:
+                dated[match.group(1)] = (int(match.group(2)), int(match.group(3)))
+        if today not in dated:
+            numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
+                                        self.now, self.s.review_check,
+                                        self.s.authors).collect()
+            passed = sum(value.passed for value in numbers)
+            yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+            streak = dated.get(yesterday, (0, 0))[1] + 1 if passed == 9 else 0
+            body = metrics.render(numbers, today, streak)
+            self.gh.rest("POST", path, {"body": body})
+            dated[today] = (passed, streak)
+        ledger_path = os.path.join(self.state, "metrics.json")
+        ledger = _read_json(ledger_path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("metrics ledger is not an object")
+        if ledger.get("discord") == today:
+            return
+        passed, streak = dated[today]
+        line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
+        if self._bot_reports():
+            token = self._bot_token()
+            if token is None:
+                return
+            ok, _ = self._bot(token, "POST", "/channels/%s/messages" % self.s.channel_id,
+                              {"content": line, "allowed_mentions": {"parse": []}})
+        elif self.s.webhook_ssm:
+            url = self._webhook()
+            if url is None:
+                return
+            ok = self._send(url, line, mention=False)
+        else:
+            return
+        if ok:
+            ledger["discord"] = today
+            _write_json(ledger_path, ledger)
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
+                     self.post_metrics,
                      self.watch_brain, self.relay_operator, self.run_factory):
             try:
                 step()
