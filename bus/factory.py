@@ -170,6 +170,18 @@ def pick_rung(start: int, load: Dict[str, int]) -> int:
     return len(LADDER)
 
 
+def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
+    """What keeps a pull request from landing, in words for its ticket."""
+    return [w for bad, w in ((not brain._checks_green(details), "failing checks"),
+                             (not brain._threads_resolved(details), "open review threads"),
+                             (full.get("mergeable") is False, "a conflict")) if bad]
+
+
+def open_thread_ids(details: Dict[str, Any]) -> List[str]:
+    threads = (details.get("reviewThreads") or {}).get("nodes") or []
+    return [str(t.get("id")) for t in threads if not t.get("isResolved")]
+
+
 def held_until(issue: Dict[str, Any]) -> float:
     """The ticket's Not before: time, 0 when it has none or it is unreadable."""
     try:
@@ -336,16 +348,12 @@ class Factory:
         if review == "wait":
             return
         details = brain._pr_graphql(self.gh, repo, number)
-        faults = [w for bad, w in ((not brain._checks_green(details), "failing checks"),
-                                   (not brain._threads_resolved(details), "open review threads"),
-                                   (full.get("mergeable") is False, "a conflict")) if bad]
+        faults = pr_faults(details, full)
         if faults == ["failing checks"] and self._run_again(repo, number, sha):
             return
         if faults:
-            threads = (details.get("reviewThreads") or {}).get("nodes") or []
-            open_threads = [str(t.get("id")) for t in threads if not t.get("isResolved")]
             self._send_back(repo, full, issue, self._comments(repo, int(issue["number"])),
-                            ", ".join(faults), open_threads, "failing checks" in faults)
+                            ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
             self._land(repo, number, full, issue)
 
