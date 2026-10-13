@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
-from . import proof, text, tickets
+from . import handoff, lock, proof, text, tickets
 from .labels import ESCALATION, LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -58,7 +58,7 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     for n in pr_ids:
         fields.append("p%d: pullRequest(number:%d) { %s }" % (n, n, READY_FIELDS))
     for n in goal_ids:
-        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt } } }" % (n, n))
+        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n))
     if not fields:
         return {"prs": {}, "goals": {}}
     q = "query { repository(owner:%s, name:%s) { %s } }" % (
@@ -89,6 +89,7 @@ def _age(issue: Dict[str, Any], now: datetime) -> int:
 
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> List[str]:
     lines = ["### Goals"]
+    authors = trusted_authors()
     for issue in goals:
         node = data["goals"].get(int(issue["number"])) or {}
         comments = (node.get("comments") or {}).get("nodes") or []
@@ -96,6 +97,10 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> List[str]:
                   if JOURNAL_MARKER in c.get("body", "")]
         lines.append("- #%s %s - latest journal %s" % (
             issue["number"], issue.get("title", ""), max(latest) if latest else "none"))
+        found = handoff.journals(
+            [{"body": c.get("body"), "at": c.get("createdAt"),
+              "login": (c.get("author") or {}).get("login")} for c in comments], authors)
+        lines += ["  " + x for x in handoff.stage_lines(handoff.marks(found))]
     return lines
 
 
@@ -983,6 +988,117 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
 
 
+def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:
+    """The item as it is now, for handoff: a pull request's head commit, an
+    issue's state label and comment count; None once it is closed or gone."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number), ok=(404,))
+    data = issue.data or {}
+    if issue.status == 404 or data.get("state") != "open":
+        return None
+    if "pull_request" in data:
+        pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        return "pr-" + sha[:12] if pr.get("state") == "open" and sha else None
+    state = next((x for x in _labels(data) if x.startswith("loom:") and x[5:] in STATES), "open")
+    return "%s-c%d" % (state.replace("loom:", ""), int(data.get("comments") or 0))
+
+
+def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    names = _labels(issue)
+    rules = {
+        "review": ("pull_request" in issue, "a review item is a pull request"),
+        "merge": ("pull_request" in issue, "a merge item is a pull request"),
+        "failed": ("loom:failed" in names, "a failed item is a loom:failed ticket"),
+        "ask": ("needs-operator" in names, "an ask item is a needs-operator issue"),
+        "regression": ("pull_request" not in issue, "a regression item is an issue"),
+    }
+    if stage not in rules:
+        raise ValueError("unknown stage %s; stages are %s" % (stage, ", ".join(handoff.STAGES)))
+    ok, reason = rules[stage]
+    if not ok:
+        raise ValueError(reason)
+
+
+def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str) -> str:
+    """The journal line that yields stage work on an open item to any peer."""
+    handoff.defer_marker(stage, item, "x", holder)
+    _check_stage_item(gh, stage, *item)
+    rev = item_revision(gh, *item)
+    if rev is None:
+        raise ValueError("only an open item is deferred")
+    return handoff.defer_marker(stage, item, rev, holder)
+
+
+def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None:
+    current = lock._read_lock(gh, lock_repo)
+    if current is None or current[0] != holder or current[1] is None or current[1] <= now:
+        raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
+                         % (holder, lock_repo))
+
+
+def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
+                   ) -> List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]:
+    # Nothing is caught here: a GitHubError ends the command through main's
+    # narrow handler, so a fault never reads as a goal with no journals.
+    goals: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]] = []
+    for repo in repos:
+        for issue in _issues(gh, repo):
+            if "loom:goal" not in _labels(issue):
+                continue
+            comments = gh.paginate("/repos/%s/issues/%s/comments" % (repo, issue["number"]))
+            goals.append((repo, issue, handoff.journals(
+                [{"body": c.get("body"), "at": c.get("created_at"),
+                  "login": (c.get("user") or {}).get("login")} for c in comments], authors)))
+    return goals
+
+
+def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
+                       found: List[Dict[str, Any]]) -> List[str]:
+    found_marks = handoff.marks(found)
+    items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
+    current = {m.item: item_revision(gh, *m.item) for m in items}
+    alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
+    out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
+    out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
+    for m in items:
+        if m in alive:
+            out.append("- resume %s %s (deferred by %s at %s)" % (
+                m.stage, handoff.item_ref(m.item), m.holder, m.at))
+        else:
+            out.append("- dropped %s %s: %s since the defer" % (
+                m.stage, handoff.item_ref(m.item),
+                "finished or closed" if current[m.item] is None else "changed"))
+    return out
+
+
+def _freshness_line(peers: List[Dict[str, Any]]) -> str:
+    window = "%g hours" % (handoff.QUIET.total_seconds() / 3600)
+    if not peers:
+        return "No other brain journaled in the last %s: all GitHub stages are open to you." % window
+    newest = max(peers, key=lambda j: str(j.get("at") or ""))
+    return ("Another brain journaled in the last %s (%s at %s): outside your own scope, "
+            "do only the resume items below." % (
+                window, handoff.journal_holder(newest) or "unnamed", newest.get("at") or "unknown time"))
+
+
+def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
+           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> str:
+    """What the lock holder may finish for other brains: the live resume items
+    on every goal, with each goal's stage owners, and whether broad GitHub
+    work is open to it under the freshness rule (handoff.QUIET). Refuses
+    unless `holder` holds the lock, so only the lock holder acts on it."""
+    now = now or datetime.now(timezone.utc)
+    _lock_holder(gh, lock_repo, holder, now)
+    goals = _goal_journals(gh, repos, trusted_authors(env))
+    out = ["# Resume for %s" % holder, "",
+           _freshness_line(handoff.peer_journals(
+               [j for _, _, found in goals for j in found], holder, now))]
+    for repo, issue, found in goals:
+        out += _goal_resume_lines(gh, repo, issue, found)
+    return "\n".join(out)
+
+
 STUCK_STATES = ("failed", "briefed", "pr")
 UNCLAIMED_HOURS = 2
 STUCK_HOURS = 6
@@ -1211,6 +1327,9 @@ def parser() -> argparse.ArgumentParser:
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
+    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True)
+    dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True)
+    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -1288,9 +1407,22 @@ def _cmd_escalate(gh: GitHub, args: argparse.Namespace) -> None:
     print(escalate(gh, repo, number, _read(args.file) if args.file else "", _repo(args.lanes_repo)))
 
 
+def _cmd_defer(gh: GitHub, args: argparse.Namespace) -> None:
+    print(defer(gh, args.stage, _ref(args.item, "item"), args.holder))
+
+
+def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
+    print(handoff.done_marker(args.stage, _ref(args.item, "item"), args.holder))
+
+
+def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
+    print(resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo)))
+
+
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
+            "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate}
 
 
