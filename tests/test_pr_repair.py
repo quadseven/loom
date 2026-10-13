@@ -191,6 +191,26 @@ class CliTest(unittest.TestCase):
         result = json.loads(out.getvalue())
         self.assertFalse(result["changed"])
 
+    def test_cli_reports_missing_pr_json(self):
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = pr_repair.main([self.brief, "--pr-json", self.pr_json, "codex", "gpt-test", "T42"])
+        self.assertEqual(rc, 3)
+        self.assertIn("cannot read pr-json:", out.getvalue())
+
+    def test_cli_reports_invalid_pr_json(self):
+        with open(self.pr_json, "w", encoding="utf-8") as fh:
+            fh.write("not JSON")
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = pr_repair.main([self.brief, "--pr-json", self.pr_json, "codex", "gpt-test", "T42"])
+        self.assertEqual(rc, 3)
+        self.assertIn("cannot read pr-json:", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

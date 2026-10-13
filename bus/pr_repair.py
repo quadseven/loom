@@ -273,8 +273,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("cannot read pull request #%d: %s" % (args.apply, err))
             return 3
     else:
-        with open(args.pr_json, encoding="utf-8") as fh:
-            pr = json.load(fh)
+        try:
+            with open(args.pr_json, encoding="utf-8") as fh:
+                pr = json.load(fh)
+        except (OSError, json.JSONDecodeError) as err:
+            print("cannot read pr-json: %s" % err)
+            return 3
 
     current_title = str(pr.get("title") or "")
     current_body = str(pr.get("body") or "")
