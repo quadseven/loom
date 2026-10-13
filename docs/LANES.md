@@ -82,8 +82,13 @@ every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
 `/grug improve`), and returns the ticket to `loom:pr`.
-Past the last rung the ticket is left `loom:failed` for the brain. At most 12
-actions per pass. `LOOM_FACTORY=0` turns it off.
+Past the last rung the ticket is left `loom:failed` for the brain. Landing
+keeps the default branch green: a ready pull request that is behind its base
+is brought up to date first (GitHub's update-branch) and lands only after its
+checks and review pass again on the new head; each repo lands at most one a
+pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+fault is a failed Actions job gets that job run once more before it is sent
+back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
