@@ -349,6 +349,7 @@ One comment per tick that changed something, on the goal's home issue:
 ```markdown
 <!-- loom:journal v1 -->
 Tick <UTC time>, <holder>
+- Measure: <the goal's metrics read this tick, or none>
 - Shipped: <links or none>
 - Briefed: <links with lanes or none>
 - Waiting: <what is in flight and on whom>
@@ -374,3 +375,22 @@ unchanged, and refuses unless that holder holds the tick lock.
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
+
+### Report deadlines
+
+Each goal owes its own report every 2 hours, counted from its newest valid
+report or, with none, from when the goal was opened. A valid report is a
+comment on that goal's home that starts with the report marker, from a
+`LOOM_BRIEF_AUTHORS` login when that is set. A marker inside another
+comment, a journal, or a report on another goal (a parent goal included)
+does not move the deadline: a parent's report never covers its child goals.
+
+`python3 -m bus.brain status` shows, per goal, when it last had a journal, a
+valid report, a measurement (a journal or report with a `Measure:` line that
+is not none) and a completed action (a `Shipped:` line that is not none),
+and its report state: ok, due (2 hours past), or overdue (one more tick,
+30 minutes, past that). Due and overdue goals are listed under "Reports
+owed before unlock"; the tick posts those reports before it unlocks. An
+overdue report is a missed deadline only: it is separate from a report the
+station could not forward and from a brain that stopped ticking, which the
+station reports on its own.

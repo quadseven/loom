@@ -67,6 +67,63 @@ class BrainTests(unittest.TestCase):
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
 
+    def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"},
+                 {"number": 2, "title": "Stale", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"}]
+        bot = {"login": "brain-bot"}
+        g1 = [{"body": "<!-- loom:journal v1 -->\n- Measure: p95 2s\n- Shipped: #5", "createdAt": "2030-01-01T19:45:00Z", "author": bot},
+              {"body": "<!-- loom:report v1 -->\n- Measure: p95 2s", "createdAt": "2030-01-01T19:00:00Z", "author": bot}]
+        g2 = [{"body": "<!-- loom:journal v1 -->\n- Shipped: none", "createdAt": "2030-01-01T19:50:00Z", "author": bot},
+              {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T14:26:00Z", "author": bot}]
+        gh = GitHub("t", transport=Fake(
+            reply(200, goals), reply(200, []),
+            reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
+            reply(200, [])))
+        report = brain.status(gh, [REPO], REPO, env={}, now=now, authors=["brain-bot"])
+        self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
+                      "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
+        self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T14:26:00Z, "
+                      "measure none, action none - report overdue (due 2030-01-01T16:26:00Z)", report)
+        owed = report.split("### Reports owed before unlock")[1].split("###")[0]
+        self.assertIn("#2 report OVERDUE since 2030-01-01T16:26:00Z", owed)
+        self.assertNotIn("#1", owed)
+
+    def test_only_a_marked_report_on_the_goal_advances_its_deadline(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        issue = {"number": 3, "created_at": "2030-01-01T17:00:00Z"}
+        bot = {"login": "brain-bot"}
+        ignored = [
+            {"body": "<!-- loom:journal v1 -->\nquoting <!-- loom:report v1 -->", "createdAt": "2030-01-01T19:55:00Z", "author": bot},
+            {"body": "Summary\n<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:56:00Z", "author": bot},
+            {"body": "<!-- loom:report v1 -->\nfrom a stranger", "createdAt": "2030-01-01T19:57:00Z", "author": {"login": "stranger"}},
+        ]
+        led = brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, now, ["brain-bot"])
+        self.assertNotIn("report", led)
+        self.assertEqual((led["state"], led["due"]), ("overdue", "2030-01-01T19:00:00Z"))
+        earlier = brain.datetime(2030, 1, 1, 19, 15, tzinfo=brain.timezone.utc)
+        self.assertEqual(brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, earlier, ["brain-bot"])["state"], "due")
+        marked = ignored + [{"body": "<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:58:00Z", "author": bot}]
+        led = brain.goal_ledger(issue, {"comments": {"nodes": marked}}, now, ["brain-bot"])
+        self.assertEqual((led["report"], led["state"], led["due"]),
+                         ("2030-01-01T19:58:00Z", "ok", "2030-01-01T21:58:00Z"))
+
+    def test_goal_without_any_stamp_is_unknown_not_young(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        led = brain.goal_ledger({"number": 4}, {"comments": {"nodes": []}}, now)
+        self.assertEqual((led["state"], led["due"]), ("unknown", None))
+
+    def test_report_deadline_changes_state_at_due_and_grace(self):
+        last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
+        due = last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        grace = brain.timedelta(seconds=brain.REPORT_GRACE)
+        for now, state in ((due - brain.timedelta(seconds=1), "ok"),
+                           (due, "due"),
+                           (due + grace - brain.timedelta(seconds=1), "due"),
+                           (due + grace, "overdue")):
+            with self.subTest(now=now):
+                self.assertEqual(brain._report_deadline(last, now), (due, state))
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
