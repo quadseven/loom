@@ -673,10 +673,10 @@ class Station:
             return
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
-        ready_heads = self._ready_heads(comments)
+        ready = self._ready_marker(comments)
         if self._fix_pending(names, comments, sha):
             return
-        self._clear_stale_ready(repo, number, names, ready_heads, sha)
+        self._clear_stale_ready(repo, number, names, ready, sha)
         if "loom:briefed" in names or "loom:running" in names:
             return
         if not self._checks_finished(repo, sha):
@@ -685,17 +685,25 @@ class Station:
         failed = brain._failing_checks(self.gh, repo, sha)
         threads = self._bot_threads(repo, pr_number)
         if not failed and not threads:
-            self._mark_ready(repo, number, sha, names, ready_heads)
+            self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
 
-    @staticmethod
-    def _ready_heads(comments: List[Any]) -> List[str]:
+    def _ready_marker(self, comments: List[Any]) -> Optional[Tuple[Any, str]]:
+        # The ticket keeps one ready-head comment of ours, edited on each new clean
+        # head, so the markers never pile up; returns its id and the head it names.
+        authors = {author.lower() for author in self.s.authors}
         pattern = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
-        return [match.group(1) for comment in comments if isinstance(comment, dict)
-                for match in [pattern.search(str(comment.get("body") or ""))] if match]
+        found = None
+        for comment in comments:
+            if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
+                continue
+            match = pattern.search(str(comment.get("body") or ""))
+            if match:
+                found = (comment.get("id"), match.group(1))
+        return found
 
     def _fix_pending(self, names: List[str], comments: List[Any], sha: str) -> bool:
         if "loom:briefed" not in names and "loom:running" not in names:
@@ -708,8 +716,8 @@ class Station:
                    and marker in str(comment.get("body") or "") for comment in comments)
 
     def _clear_stale_ready(self, repo: str, number: int, names: List[str],
-                           ready_heads: List[str], sha: str) -> None:
-        if "loom:ready" in names and (not ready_heads or ready_heads[-1] != sha):
+                           ready: Optional[Tuple[Any, str]], sha: str) -> None:
+        if "loom:ready" in names and (not ready or ready[1] != sha):
             self._remove_label(repo, number, "loom:ready")
             names.remove("loom:ready")
 
@@ -734,12 +742,14 @@ class Station:
             self._remove_label(repo, number, "loom:ready")
 
     def _mark_ready(self, repo: str, number: int, sha: str, names: List[str],
-                    ready_heads: List[str]) -> None:
+                    ready: Optional[Tuple[Any, str]]) -> None:
         if "loom:ready" not in names:
             self._add_label(repo, number, "loom:ready")
-        if not ready_heads or ready_heads[-1] != sha:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                         {"body": "<!-- loom:ready-head %s -->" % sha})
+        body = {"body": "<!-- loom:ready-head %s -->" % sha}
+        if not ready:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), body)
+        elif ready[1] != sha:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (repo, ready[0]), body)
 
     @staticmethod
     def _fix_round_count(comments: List[Any], authors: set) -> int:

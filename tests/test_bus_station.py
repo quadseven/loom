@@ -236,6 +236,8 @@ class ReviewFake:
             return self._put_labels(data)
         if method == "POST" and path == "/repos/%s/issues/12/comments" % REPO:
             return self._post_comment(data)
+        if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO):
+            return self._patch_comment(int(path.rsplit("/", 1)[1]), data)
         raise AssertionError("unexpected %s %s" % (method, path))
 
     def _put_labels(self, data):
@@ -244,7 +246,13 @@ class ReviewFake:
         return mock.Mock(data=[])
 
     def _post_comment(self, data):
-        self.comments.append({"body": data["body"], "user": {"login": "alice-example"}})
+        self.comments.append({"id": len(self.comments) + 1, "body": data["body"],
+                              "user": {"login": "alice-example"}})
+        return mock.Mock(data={})
+
+    def _patch_comment(self, comment_id, data):
+        comment = next(c for c in self.comments if c.get("id") == comment_id)
+        comment["body"] = data["body"]
         return mock.Mock(data={})
 
     def _get(self, path):
@@ -340,6 +348,14 @@ class HandBackTest(unittest.TestCase):
         self.gh.check_runs = [{"status": "in_progress"}]
         self.run_hand_back()
         self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_each_new_clean_head_edits_the_one_ready_marker(self):
+        self.run_hand_back()
+        self.gh.pr["head"]["sha"] = "b" * 40
+        self.run_hand_back()
+        self.assertEqual([c["body"] for c in self.gh.comments],
+                         ["<!-- loom:ready-head %s -->" % ("b" * 40)])
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
 
 class CorruptStateTest(Base):
