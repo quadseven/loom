@@ -532,6 +532,24 @@ class Tickets(Base):
         self.go(limited=["zen"])
         self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
 
+    def test_ladder_tickets_queued_on_a_busy_lane_spread_to_free_rungs(self):
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        for n in range(1, 6):
+            self.gh.ticket(n, "briefed", lane="claude", body=body)
+            self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
+        self.go()
+        lanes = sorted(self.lane(n) for n in range(1, 6))
+        # Two may wait on claude (RUNG_BUSY); the rest move to a free rung.
+        self.assertEqual(lanes.count("claude"), factory.RUNG_BUSY)
+        moved = [n for n in range(1, 6) if self.lane(n) != "claude"]
+        self.assertTrue(all(self.model(n) == "gpt-6-sol" for n in moved))
+
+    def test_a_first_brief_is_never_spread(self):
+        for n in range(1, 6):
+            self.gh.ticket(n, "briefed", lane="claude")
+        self.go()
+        self.assertEqual([self.lane(n) for n in range(1, 6)], ["claude"] * 5)
+
     def test_a_limited_ticket_past_the_last_rung_stays_for_its_lane(self):
         self.gh.ticket(7, "briefed", lane="spark")
         self.gh.comments[7] += ALL_RUNGS
@@ -561,9 +579,10 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.next_rung({1}, {"codex": 0}), 2)
         self.assertEqual(factory.next_rung({3}, {}), 1)
         self.assertEqual(factory.next_rung({1, 2, 3}, {}), 0)
-        # Every untried rung busy: wait on the lowest rather than skip it.
+        # Every untried rung busy: wait on the least loaded one.
         all_busy = dict(busy, **{lane: 2 for lane in factory.ANTHROPIC})
         self.assertEqual(factory.next_rung({1}, all_busy), 2)
+        self.assertEqual(factory.next_rung(set(), dict(all_busy, claude=30)), 2)
 
     def test_tried_rungs_start_again_at_a_rung_zero_marker(self):
         comments = ALL_RUNGS + [{"body": factory.RUNG_MARKER % 0}, {"body": factory.RUNG_MARKER % 2}]
@@ -605,7 +624,7 @@ class Helpers(unittest.TestCase):
         calls = []
 
         class Fake:
-            def __init__(self, gh, repos, now, trusted, review_check, limited):
+            def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None):
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited)))
 
             def run(self):

@@ -295,6 +295,8 @@ class Collector:
             self._goal_reports(repo, issues, total)
             for issue in issues:
                 self._issue(repo, issue, total)
+            # Set in the same iteration that may add repo to goal_repos, so
+            # every goal repo has a count once _scan returns.
             total.merged_by_repo[repo] = 0
             for pr in pulls:
                 self._pull(repo, pr, total)

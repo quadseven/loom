@@ -183,20 +183,33 @@ tickets and pull requests like any other work.
 
 ## Lane choice
 
-Choose only lanes that lane status shows as available. Hard work goes to
-anthropic, claude or codex, never openrouter, zen, zai, workersai or spark.
-Zen, zai and agy take public repos only. Prefer anthropic while its credits
-last, then codex and opencode-go, then free lanes, and claude last. Easy
-tickets on any repo, private ones included, may go to `spark` (the local
-vLLM coder, model `spark/...`) before the hosted free lanes. It takes one
-ticket at a time and steps aside while its box is hot: the factory moves its
-waiting tickets on, so brief it only when lane status shows it available.
+Choose only lanes that lane status shows as available, by the ticket's
+`Difficulty:` line (the north star, loom#30: at most half of runs on
+Anthropic credits, easy work on the free lanes and Spark, the credit spent
+on hard work):
+
+- Easy: `spark` (the local vLLM coder, model `spark/...`, any repo, private
+  ones included) when lane status shows it available, else a free lane:
+  opencode-go, openrouter, workersai, or zen, zai and agy on public repos
+  only. Never anthropic or claude for an easy ticket.
+- Medium: codex or opencode-go first; an anthropic slot only when every codex
+  and opencode-go slot already holds work.
+- Hard: anthropic, claude or codex, never a free lane or spark. Keep the
+  anthropic slots busy with hard work while the credit lasts.
+
+Spark takes one ticket at a time and steps aside while its box is hot: the
+factory moves its waiting tickets on, so brief it only when lane status
+shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
 anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each takes one
 ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.
+
+Every lane has the operator's skills (docs/LANES.md, Skills on every lane),
+so a brief may name a skill ("use the impeccable skill") on any lane; a
+skill is no reason to pick one lane over another.
 
 ### Repeatedly stuck work gets a stronger model
 
