@@ -180,24 +180,31 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     return checks_failing and bool(FIX_CHECK_RE.search(last))
 
 
-def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
-    """Open threads the review bot opened whose newest comment is its own
-    "Fixed in" reply. Both authors must be the app (a person can take the
-    same login without "[bot]"); a thread a person opened, or any reply
-    after the bot's, stays open for a person or the brain."""
-    def is_bot(comment: Dict[str, Any]) -> bool:
-        author = comment.get("author") or {}
-        return (author.get("__typename") == "Bot"
-                and str(author.get("login") or "").lower() == bot.lower())
+def _by_bot(comment: Dict[str, Any], bot: str) -> bool:
+    """Written by the review bot's app; a person can take the same login
+    without "[bot]", so the author type must be Bot as well."""
+    author = comment.get("author") or {}
+    return (author.get("__typename") == "Bot"
+            and str(author.get("login") or "").lower() == bot.lower())
 
-    picked = []
-    for thread in threads:
-        root = ((thread.get("root") or {}).get("nodes") or [None])[0] or {}
-        last = ((thread.get("comments") or {}).get("nodes") or [None])[-1] or {}
-        if (not thread.get("isResolved") and is_bot(root) and is_bot(last)
-                and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX)):
-            picked.append(str(thread.get("id")))
-    return picked
+
+def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
+    nodes = (thread.get(field) or {}).get("nodes") or [{}]
+    return nodes[index] or {}
+
+
+def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
+    """An open thread the review bot opened whose newest comment is its own
+    "Fixed in" reply. A thread a person opened, or any reply after the
+    bot's, stays open for a person or the brain."""
+    last = _end(thread, "comments", -1)
+    return (not thread.get("isResolved") and _by_bot(_end(thread, "root", 0), bot)
+            and _by_bot(last, bot)
+            and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
+
+
+def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
+    return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
 
 
 def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
