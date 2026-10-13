@@ -394,6 +394,19 @@ spark_probe() {
   return 2
 }
 
+# A provider that refused this run for a usage, rate or credit limit, read
+# from the run's own last lines of output. Sets LIMIT_WHY. On 2026-10-13 a
+# codex usage limit read as "agent exited 1" on 21 runs, each costing its
+# ticket a rung of the model ladder and keeping the lane advertised as up.
+LIMIT_LINE_RE='^(error|api error)\b.*(usage limit|rate[ _-]?limit|credit balance|quota|too many requests|overloaded)|usage limit reached|[0-9]+-hour limit reached'
+provider_limit() {
+  local line
+  line="$(tail -c +"$(( ${LOG_START:-0} + 1 ))" "$LOG" 2>/dev/null | tail -n 40 |
+    grep -iE "$LIMIT_LINE_RE" | tail -n 1)"
+  [ -n "$line" ] || return 1
+  LIMIT_WHY="lane $SLOT's provider reported a usage or rate limit"
+}
+
 # Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
 mark_limit() {
   LIMIT_UNTIL=$(( $(date +%s) + LIMIT_HOLD ))
@@ -741,6 +754,8 @@ anthropic_credit_ok() {
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
 lane_ready() {
   local cli key_ssm
+  # A limit an earlier run hit holds for every lane, not only spark.
+  limit_held && return 1
   if [ "$LANE" = agy ]; then
     command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
     "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
@@ -953,6 +968,7 @@ for BRIEF in "$INBOX"/*.md; do
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
+  LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
     (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
@@ -960,6 +976,12 @@ for BRIEF in "$INBOX"/*.md; do
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  # A run the provider refused for a limit is not a failure: the lane steps
+  # out for LIMIT_HOLD and the brief goes back for another lane.
+  if [ "$STATUS" -ne 0 ] && provider_limit; then
+    mark_limit
+    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)"; continue
+  fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit

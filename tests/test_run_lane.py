@@ -107,6 +107,10 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = limit ]; then
+  echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
+  exit 1
+fi
 if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkdir -p .loom-answers
   echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
@@ -500,6 +504,31 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
                                    "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_provider_usage_limit_is_a_limit_not_a_failure(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        result = self.run_lane(FAKE_AGENT="limit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: limit: lane codex's provider reported a usage or rate limit "
+                      "(agent exited 1)", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: "), beat)
+        # The next brief is handed on without running the agent.
+        agents = sum(c.startswith("codex ") for c in self.calls())
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        self.run_lane()
+        self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
+        self.assertTrue((self.inbox / "failed" / "T043-next.md").exists())
+
+    def test_a_finding_that_mentions_a_rate_limit_is_not_a_limit(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF + "\nThe client ignores the rate limit header.\n")
+        self.run_lane(FAKE_AGENT="fail")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: agent exited 3", log)
+        self.assertNotIn("failed: limit", log)
 
     def test_a_fix_briefs_answers_move_to_the_inbox_and_never_into_the_commit(self):
         name, _ = self.fix_brief()
