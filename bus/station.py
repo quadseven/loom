@@ -903,7 +903,11 @@ class Station:
             asks = [a for a in keyed if trust.get(a[0])]
             if not asks:
                 return
-            plan = self._plan_digest(asks, sent.get("covered"), today)
+            try:
+                plan = self._plan_digest(asks, sent.get("covered"), today)
+            except GitHubError as err:
+                _say("could not read the goal homes for the digest: %s; next pass" % err)
+                return
             sent["pending"] = plan
             _write_json(path, sent)
         if url is None:
@@ -950,7 +954,7 @@ class Station:
             "/repos/%s/issues?labels=loom:goal&state=open&per_page=100" % repo)
         return [i for i in (data if isinstance(data, list) else [])
                 if isinstance(i, dict) and "pull_request" not in i
-                and "number" in i]
+                and str(i.get("number")).isdigit()]
 
     @staticmethod
     def _report_id(comment: Dict[str, Any]) -> int:

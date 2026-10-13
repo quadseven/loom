@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import io
 import json
 import os
 import re
@@ -124,23 +126,29 @@ class FakeGitHub:
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
 
+    def _list_issues(self, query, headers):
+        if "needs-operator" in query:
+            return self._list_asks(headers)
+        if "loom:goal" in query:
+            return self._list_goals()
+        if "loom:lanes" in query:
+            return reply(200, self.lanes_issues)
+        if "loom:digest" in query:
+            return reply(200, self.digest_issues)
+        return self._list_briefed(headers)
+
+    def _list_goals(self):
+        if self.goal_error:
+            return reply(500, {"message": "down"})
+        if self.goals:
+            return reply(200, self.goals)
+        return reply(200, [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
+                           for i in self.issues.values() if i["state"] == "open"
+                           and "loom:goal" in self.names(i["number"])])
+
     def _issues_and_status(self, method, rest, query, headers, data):
         if method == "GET" and rest == "issues":
-            if "needs-operator" in query:
-                return self._list_asks(headers)
-            if "loom:goal" in query:
-                if self.goal_error:
-                    return reply(500, {"message": "down"})
-                if self.goals:
-                    return reply(200, self.goals)
-                return reply(200, [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
-                                   for i in self.issues.values() if i["state"] == "open"
-                                   and "loom:goal" in self.names(i["number"])])
-            if "loom:lanes" in query:
-                return reply(200, self.lanes_issues)
-            if "loom:digest" in query:
-                return reply(200, self.digest_issues)
-            return self._list_briefed(headers)
+            return self._list_issues(query, headers)
         if method == "POST" and rest == "issues" and data["labels"] == ["loom:digest"]:
             self.created.append(data)
             self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
@@ -988,6 +996,29 @@ class AsksTest(Base):
         self.go()
         self.assertEqual(self.fake.pages, [])
         self.assertEqual(self.ledger()["pages"], {})
+
+    def test_a_failed_goal_read_holds_the_digest_until_the_next_pass(self):
+        trusted = self.add_many()
+        self.fake.goal_error = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.go()
+        self.assertEqual(self.sent, [])
+        self.assertFalse(os.path.exists(os.path.join(self.home, "state", "station", "asks.json"))
+                         and "pending" in self.ledger())
+        self.assertIn("could not read the goal homes for the digest", out.getvalue())
+        self.fake.goal_error = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+
+    def test_a_goal_with_an_odd_number_does_not_stop_the_digest(self):
+        trusted = self.add_many()
+        self.fake.goals.append({"number": "abc", "title": "Odd"})
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+        self.assertIn("Ship the factory (#30)", self.fake.pages[0])
 
 
 class ReportsTest(Base):
