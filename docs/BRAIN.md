@@ -230,6 +230,10 @@ When the runner finishes, the station finds the brief in `done/` or
 - Done: label `loom:pr`, comment with the pull request link.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
+- Limited (a reason starting `limit:`, the lane's provider refusing work for
+  a while): not a failure. Label `loom:briefed` again (`loom:pr` for a fix
+  brief), comment that the lane is unavailable; the factory moves a ticket
+  briefed on a lane whose heartbeat says `limit:` to the next rung at once.
 
 ## Polling budget
 
