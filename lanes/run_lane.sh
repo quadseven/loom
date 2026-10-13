@@ -578,7 +578,7 @@ opencode_config() {
   # OpenAI-compatible provider named spark at LOOM_SPARK_URL (checked in
   # spark_ready), serving the one model after "spark/". No key.
   local provider="" id="${MODEL#spark/}"
-  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\"}}}}"
+  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": 32768, \"output\": 4096}}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"$provider}"
 }
@@ -806,7 +806,8 @@ validation_note() {
 }
 
 # Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
-# session store and older session json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
+# session store, older session json, and diagnostic log directory) in
+# logs/<lane>/<ticket>/ before the next run wipes its scratch home.
 # The agent controls everything in that home, so: enter each parent directory
 # and refuse it unless its real path is the expected one (no link on the way;
 # once inside, a later swap of the name cannot move us), then hand rsync the
@@ -825,7 +826,8 @@ archive_transcripts() {
       mkdir -p "$dest/$parent"
       if ! rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
           --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
-          --include='opencode.db-shm' --exclude='*' "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
+          --include='opencode.db-shm' --include='log/***' --exclude='*' \
+          "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
         echo "[$(date -u +%FT%TZ)] $TICKET: archiving $parent/$leaf failed; transcript may be incomplete" >> "$LOG"
       fi
     )
