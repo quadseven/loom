@@ -60,8 +60,10 @@ Lane status: every pass the station reads each lane's heartbeat (`yes` when
 available and at most 600 seconds old, else `no`) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes and at least hourly, and never publishes the
-heartbeat's reason.
+only when a yes or no changes, when an anthropic run is recorded, and at
+least hourly, and never publishes the heartbeat's reason. With anthropic
+spend recorded or a budget set, it ends with the spend line ("Anthropic
+spend" below).
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
@@ -166,6 +168,32 @@ loopback connection; they cannot query the viewer or any other local service.
   wipes the scratch home. Links are never followed.
 - No background processes: launchd starts a pass every minute and a lock
   keeps one pass per lane.
+
+### Anthropic spend
+
+The anthropic slots spend API credits, so the runner tracks what each run
+costs without an Admin API key: it runs `claude -p --output-format json`,
+writes the result's text to the lane log, and appends one line per run to
+`$LOOM_HOME/state/usage/spend.jsonl` (time, slot, ticket, model,
+`cost_usd` from the result's `total_cost_usd`, and token counts). A run that
+left no result is recorded with `cost_usd` null, never zero. Settings, set at
+install (the lanes and the station both get them):
+
+| setting | meaning |
+|---|---|
+| `LOOM_ANTHROPIC_BUDGET_USD` | credit available, in dollars; unset shows only the spend |
+| `LOOM_ANTHROPIC_BUDGET_SINCE` | when that credit was counted (`YYYY-MM-DD` is 00:00 UTC, or `YYYY-MM-DDTHH:MMZ`); runs before it do not count against it |
+| `LOOM_ANTHROPIC_BUDGET_EXPIRES` | when the credit expires, same format |
+| `LOOM_ANTHROPIC_FLOOR_USD` | stop the anthropic slots when the remaining credit is under this (default 5) |
+
+The lane status comment gains one line: spent today (UTC), spent since
+`LOOM_ANTHROPIC_BUDGET_SINCE`, remaining against `LOOM_ANTHROPIC_BUDGET_USD`,
+the burn over the last 24 hours, and the balance projected at
+`LOOM_ANTHROPIC_BUDGET_EXPIRES` at that burn. Runs of unknown cost are counted
+and named, not guessed. A new run republishes the comment on the next station
+pass. Under the floor (or with a budget setting that does not parse) each
+anthropic slot reports itself unavailable with that reason, and the station
+sends the anthropic slots nothing more.
 
 ## Public repos only: providers that train on prompts
 

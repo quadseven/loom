@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import fcntl
 import json
 import os
@@ -13,7 +14,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import station, tickets  # noqa: E402
+from bus import spend, station, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -754,6 +755,102 @@ class StatusTest(Base):
         self.go()
         self.assertNotIn("secret-reason", self.fake.posts[0])
         self.assertNotIn("/private", self.fake.posts[0])
+
+
+class SpendTest(Base):
+    # 2030-05-05 12:00 UTC; the budget was counted at 2030-05-01 and expires
+    # at 2030-05-10 00:00 UTC, 4.5 days on.
+    NOW = calendar.timegm((2030, 5, 5, 12, 0, 0))
+
+    def setUp(self):
+        super().setUp()
+        self.settings.status_repo = REPO
+        self.settings.anthropic = spend.Budget.from_env({
+            "LOOM_ANTHROPIC_BUDGET_USD": "100", "LOOM_ANTHROPIC_BUDGET_SINCE": "2030-05-01",
+            "LOOM_ANTHROPIC_BUDGET_EXPIRES": "2030-05-10"})
+
+    def runs(self, *rows):
+        """(hours before NOW, slot, cost or None) per run."""
+        path = os.path.join(self.home, "state", "usage", "spend.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            for hours, slot, cost in rows:
+                fh.write(json.dumps({"at": int(self.NOW - hours * 3600), "slot": slot,
+                                     "ticket": "t", "model": "claude-test",
+                                     "cost_usd": cost}) + "\n")
+
+    def station(self, now=None):
+        return station.Station(GitHub("token", transport=self.fake), self.settings,
+                               now=self.NOW if now is None else now)
+
+    def test_the_status_line_shows_spent_remaining_burn_and_projection(self):
+        self.runs((24 * 6, "anthropic", 40.0),   # before the budget was counted
+                  (30, "anthropic-2", 20.0),     # since, but not in the last 24h
+                  (20, "anthropic-3", 6.0),
+                  (2, "anthropic", 3.5),
+                  (1, "anthropic-4", None))      # no result: unknown, not zero
+        with open(os.path.join(self.home, "state", "usage", "spend.jsonl"), "a") as fh:
+            fh.write("{torn\n")
+        self.station().run_pass()
+        body = self.fake.posts[0]
+        # today: 3.5; since 05-01: 29.5; remaining 70.5; burn 9.5/day;
+        # projected: 70.5 - 9.5 * 4.5 = 27.75.
+        self.assertIn("\n\nAnthropic spend: today $3.50; spent since 2030-05-01 $29.50; "
+                      "remaining $70.50 of $100.00; burn $9.50/day (last 24h); "
+                      "projected at expiry 2030-05-10 $27.75; "
+                      "1 run of unknown cost not counted", body)
+        self.assertNotIn("floor", body)
+
+    def test_without_a_budget_only_the_spend_is_shown(self):
+        self.settings.anthropic = spend.Budget()
+        self.runs((2, "anthropic", 1.25), (50, "anthropic", 2.0))
+        self.station().run_pass()
+        line = self.fake.posts[0].splitlines()[-1]
+        self.assertEqual(line, "Anthropic spend: today $1.25; spent in all $3.25")
+
+    def test_no_line_without_a_budget_or_a_run(self):
+        self.settings.anthropic = spend.Budget()
+        self.station().run_pass()
+        self.assertNotIn("Anthropic", self.fake.posts[0])
+
+    def test_a_new_run_republishes_on_the_next_pass(self):
+        self.runs((2, "anthropic", 1.0))
+        self.station().run_pass()
+        self.runs((0, "anthropic-2", 2.0))
+        self.station(self.NOW + 60).run_pass()
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertIn("today $3.00", self.fake.edits[0])
+
+    def test_credit_under_the_floor_stops_the_anthropic_slots(self):
+        self.runs((5, "anthropic", 96.0))
+        for lane in ("anthropic", "anthropic-4"):
+            self.heartbeat(lane)
+        # Heartbeats are stamped with the real clock; with no since date the
+        # run above counts whenever it was.
+        st = self.station(time.time())
+        st.s.anthropic.since = None
+        self.assertFalse(st._heartbeat_ok("anthropic"))
+        self.assertFalse(st._heartbeat_ok("anthropic-4"))
+        self.assertTrue(st._heartbeat_ok("codex"))
+        self.fake.add(12, lane="anthropic-4")
+        st.run_pass()
+        self.assertEqual(self.listing("anthropic-4"), [])
+        self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
+                      self.fake.posts[0])
+        self.assertIn("| anthropic-4 | no |", self.fake.posts[0])
+        # Above the floor, the same heartbeat takes work again.
+        self.settings.anthropic.floor = 3.0
+        self.station(time.time()).run_pass()
+        self.assertEqual(self.listing("anthropic-4"), ["example-owner.example-repo-12.md"])
+
+    def test_budget_settings_come_from_the_environment(self):
+        s = station.Settings.from_env({"LOOM_ANTHROPIC_BUDGET_USD": "197",
+                                       "LOOM_ANTHROPIC_BUDGET_EXPIRES": "2026-10-21T00:00Z",
+                                       "LOOM_ANTHROPIC_FLOOR_USD": "7.5"})
+        self.assertEqual((s.anthropic.usd, s.anthropic.floor), (197.0, 7.5))
+        self.assertEqual(s.anthropic.expires, calendar.timegm((2026, 10, 21, 0, 0, 0)))
+        bad = station.Settings.from_env({"LOOM_ANTHROPIC_BUDGET_USD": "lots"})
+        self.assertIsNone(bad.anthropic.usd)
 
 
 class AsksTest(Base):
