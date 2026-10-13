@@ -133,7 +133,8 @@ tickets and pull requests like any other work.
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
 8. Triage the backlog. For each backlog goal (the goal home of a repo whose
-   old issues Loom works on), run
+   old issues Loom works on; `python3 -m bus.brain onboard OWNER/NAME`
+   opens one), run
    `python3 -m bus.brain triage OWNER/NAME --goal N` (at most 25 issues a
    run, oldest first). It skips pull requests, epics, asks and anything with
    a `loom:` label; a ready issue (every brief section, checkboxes under
