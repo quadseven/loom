@@ -386,6 +386,8 @@ is_api_lane() {
 # A clean merge stays as a commit. A conflict is left in the tree with its
 # markers, CONFLICTS names the files, and the runner completes the merge after
 # the agent. UPDATE_REASON is set when the branch could not be updated.
+# Every git call below, the fetch and the unshallow fetch included, runs under
+# `timeout "$NET_TIMEOUT"`, written on the line before its continuation.
 update_fix_branch() {
   local default
   UPDATE_REASON=""; CONFLICTS=""
