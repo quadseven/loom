@@ -542,6 +542,39 @@ class FixTest(Base):
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
 
+    def failed_fix(self, log_lines, fix_body=FIX_BODY):
+        self.fake.add(12, state="running")
+        self.fake.comments[99] = []
+        fix = tickets.parse_fix(REPO, fix_body) if fix_body else None
+        name = tickets.ticket_name(REPO, 12, 2)
+        self.write(self.inbox("codex", "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"), "\n".join(log_lines) + "\n")
+        self.run_pass()
+
+    def test_a_fix_with_nothing_to_change_asks_for_a_new_review_not_a_failure(self):
+        self.failed_fix([
+            "[2030-01-01T00:00:00Z] example-owner.example-repo-12-r2 start, lane codex",
+            "I didn't change any code: commit abc1234 already fixed this finding.",
+            "The thread is stale; /Users/example/x.py measures 5.",
+            "rsync(1): error: opencode: (l)stat: No such file or directory",
+            "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: agent made no commit on loom/12-fix-the-thing"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        said, again = [c["body"] for c in self.fake.comments[99]]
+        self.assertTrue(said.startswith("Lane codex made no change for this fix. It said:\n\n> I didn't"))
+        self.assertIn("> The thread is stale; <path> measures 5.", said)
+        self.assertNotIn("rsync", said)
+        self.assertNotIn("start, lane", said)
+        self.assertEqual(again, station.REVIEW_AGAIN)
+        self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
+
+    def test_a_plain_brief_with_no_commit_still_fails(self):
+        self.failed_fix([
+            "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"],
+            fix_body=None)
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertEqual(self.fake.comments[99], [])
+
 
 class RefusalTest(Base):
     def refused(self, **kw):

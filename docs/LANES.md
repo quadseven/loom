@@ -76,6 +76,12 @@ lane while the pull request is under 6 hours old; later ones, failed
 tickets, and briefed tickets no lane claimed for 2 hours climb the model
 ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
 `claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
+A rung whose lanes each already hold 2 briefed or running tickets is passed
+over for the next. A fix brief that ends with nothing committed (most often
+every thread was already fixed and the review thread is stale) is not a
+failure: the station posts the lane's explanation on the pull request, asks
+the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
+`/grug improve`), and returns the ticket to `loom:pr`.
 Past the last rung the ticket is left `loom:failed` for the brain. At most 12
 actions per pass. `LOOM_FACTORY=0` turns it off.
 
