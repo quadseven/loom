@@ -207,6 +207,8 @@ class ReviewFake:
         self.writes = []
 
     def rest(self, method, path, data=None):
+        # Writes are only accepted at the exact ticket paths; any other PUT or POST
+        # falls through to the AssertionError below, so a wrong path fails the test.
         if method == "GET":
             response = self._get(path)
             if response is not None:
