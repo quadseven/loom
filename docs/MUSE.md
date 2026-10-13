@@ -150,6 +150,12 @@ tickets and pull requests like any other work.
    must stand on its own.
 9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
+10. End the tick's chat reply in the same standup shape as the reports
+    (one sentence on how things are going, then going well, not going
+    well, still stuck, next, needs you), across all goals. When the tick
+    posted reports, the reply uses the same words, so the Muse app and
+    Discord say the same thing. Leave out tick mechanics (usage
+    percentages, locks, restarts) unless they block a goal.
 
 ## Lane choice
 
@@ -163,6 +169,26 @@ anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each 
 ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.
+
+### Repeatedly stuck work gets a stronger model
+
+The operator, 2026-10-12: repeatedly stuck work "deserves a better model".
+A ticket or pull request is repeatedly stuck when any of these holds: it has
+failed twice; review sent it back twice; it sat briefed with no lane signal
+for 2 hours twice; or it has been stuck, failed or unmerged for more than 6
+hours. This covers every Loom task, fix briefs included. Its next attempt
+takes the next rung it has not tried yet, never the model that already
+failed it, and never a free lane:
+
+1. the claude lane with `claude-sonnet-5-5`;
+2. the codex lane (or codex-2) with `gpt-6-sol`;
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
+
+Set the model with the ticket's `Model:` line (`brief --model`; for a ticket
+already filed, edit the `Model:` line at the top of its body before moving
+it to briefed). Say on the ticket which rung it is on and why. Past the
+third rung, rewrite the brief smaller, or ask the operator with one exact
+ask when only the operator can unblock it.
 
 ## Rules
 
