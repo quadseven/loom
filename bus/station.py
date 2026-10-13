@@ -756,6 +756,67 @@ class Station:
                 reported[key] = kind
                 _write_json(path, reported)
 
+    @staticmethod
+    def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
+        body = str(pr.get("body") or "")
+        ref = re.search(r"^Refs %s#([0-9]+)[ \t]*$" % re.escape(repo), body, re.M)
+        head = str((pr.get("head") or {}).get("ref") or "")
+        branch = re.match(r"loom/([0-9]+)(?:-|$)", head)
+        match = ref or branch
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _terminal_label(pr: dict) -> Optional[str]:
+        # The pulls list endpoint carries merged_at only; merged appears on
+        # the single-PR endpoint, so both are accepted.
+        if bool(pr.get("merged_at")) or pr.get("merged") is True:
+            return "loom:merged"
+        if pr.get("state") == "closed":
+            return "loom:closed-unmerged"
+        return None
+
+    def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict) -> None:
+        number = self._pr_ticket_number(repo, pr)
+        ticket = tickets_by_number.get(number) if number is not None else None
+        if ticket is None:
+            return
+        labels = _label_names(ticket)
+        if any(state in labels for state in ("loom:merged", "loom:shipped", "loom:verified")):
+            return
+        target = self._terminal_label(pr)
+        if target is None or target in labels:
+            return
+        state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
+                       "shipped", "verified", "closed-unmerged")
+        states = {"loom:" + state for state in state_names}
+        kept = [name for name in labels if name not in states]
+        kept.append(target)
+        self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
+                     {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+
+    def _reconcile_repo(self, repo: str) -> None:
+        issues = self.gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Apr" % repo)
+        tickets_by_number = {int(i["number"]): i for i in issues
+                             if "loom:ticket" in _label_names(i)}
+        for pr in self.gh.paginate("/repos/%s/pulls?state=all" % repo):
+            if isinstance(pr, dict):
+                self._reconcile_pr_ticket(repo, pr, tickets_by_number)
+
+    def reconcile_pull_requests(self) -> None:
+        """Repair ticket state from the PR's authoritative terminal state.
+
+        A GitHub failure on one repo is logged and the pass moves on; the
+        next pass retries, since the repair is idempotent."""
+        for repo in self.s.repos:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                continue
+            try:
+                # Both the issues and pulls fetches are covered by this repo guard.
+                self._reconcile_repo(repo)
+            except (GitHubError, OSError) as err:
+                _say("could not reconcile pull requests for %s: %s" % (repo, err))
+
     def hand_back(self) -> None:
         """Return completed lane PRs with failed checks or bot findings."""
         rounds = _fix_round_limit()
@@ -1994,6 +2055,10 @@ class Station:
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
+        try:
+            self.reconcile_pull_requests()
+        except (GitHubError, OSError) as err:
+            _say("pull request reconciliation failed: %s" % err)
         try:
             self.hand_back()
         except (GitHubError, OSError, ValueError) as err:
