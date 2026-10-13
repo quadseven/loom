@@ -85,7 +85,12 @@ over for the next. A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
-`/grug improve`), and returns the ticket to `loom:pr`.
+`/grug improve`), and returns the ticket to `loom:pr`. Before a fix brief's
+agent runs, the runner merges the default branch into the pull request's
+branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
+the agent changes nothing, and a conflict is handed to the agent with the
+file list, its markers in the tree; the runner completes the merge, or parks
+the brief with "conflict markers left in FILES".
 Past the last rung the ticket is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
