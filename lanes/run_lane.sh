@@ -117,8 +117,15 @@ PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bi
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
 # LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
-lane_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$LANE" | tr '[:lower:]-' '[:upper:]_')" "$1"; }
-lane_setting() { local v; v="$(lane_var "$1")"; printf '%s' "${!v:-}"; }
+# A slot's own LOOM_<SLOT>_<SUFFIX> comes first, so one slot can run another
+# model on the same provider (opencode-go-3 -> LOOM_OPENCODE_GO_3_MODEL).
+setting_var() { printf 'LOOM_%s_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')" "$2"; }
+lane_var() { setting_var "$LANE" "$1"; }
+lane_setting() {
+  local s v
+  s="$(setting_var "$SLOT" "$1")" v="$(lane_var "$1")"
+  printf '%s' "${!s:-${!v:-}}"
+}
 
 # Each pass records whether this lane can take work. The dispatcher routes
 # only to lanes with a fresh, available heartbeat.

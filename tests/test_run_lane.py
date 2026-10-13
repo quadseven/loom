@@ -1414,6 +1414,23 @@ cat > /dev/null
         self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def slot_run(self, slot):
+        inbox, result = self.api_lane(
+            slot, LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/kimi-k2.7-code",
+            LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        return [c for c in self.calls() if c.startswith("opencode ")][-1]
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_slot_with_its_own_model_setting_runs_that_model(self):
+        self.assertIn("-m opencode-go/deepseek-v4.1-flash", self.slot_run("opencode-go-3"))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_slot_without_one_runs_its_lanes_model(self):
+        self.assertIn("-m opencode-go/kimi-k2.7-code", self.slot_run("opencode-go-2"))
+
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_zai_lane_hands_its_key_to_a_free_flash_model(self):
         inbox, result = self.api_lane(
