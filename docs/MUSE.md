@@ -40,8 +40,8 @@ not looked hard enough yet. Each tick the brain:
   look at the live system for what is slow, stuck, failing or unnatural, and
   ticket it with the evidence.
 - Finishes before it starts: each tick merges every lane pull request that
-  is ready (checks green, no unresolved threads, a fix-up already pushed
-  for each finding) before it briefs anything new.
+  `bus.brain status` marks `READY` (the merge-ready signal in
+  docs/BRAIN.md) before it briefs anything new.
 - When a goal is at its cap, a brief that fixes a live regression on a
   ticket already shipped may still be filed, past the cap, by setting
   `LOOM_GOAL_CAP` to the cap plus 8 for that one brief command (until a
@@ -96,7 +96,9 @@ live regression).
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
    is held.
 2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
-   each goal's latest journal.
+   each goal's latest journal. Each lane pull request's line ends in `READY`
+   or `blocked:` and its blockers; take that verdict as given rather than
+   re-deriving it from the review list.
    Then read, on each goal home, the operator notes newer than its last
    journal: comments from an allowed login starting with
    `<!-- loom:operator v1 discord=<message id> -->`, relayed by the station
