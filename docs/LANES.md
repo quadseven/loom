@@ -78,7 +78,7 @@ through `bus.brain merge`. One with a failing check, an open thread or a
 conflict goes back to a lane as a fix brief. It stays on its lane while the
 rounds make progress, and climbs the model ladder only when stuck: a review
 thread survived a fix round, checks it was asked to fix still fail, or the
-pull request is over 6 hours old (a review that finds new things, or a
+pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
 conflict alone, never climbs). Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
