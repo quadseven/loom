@@ -7,7 +7,7 @@ import statistics
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, Iterator, List, Sequence
 
 from .github import GitHub
 from .labels import LANES
@@ -106,28 +106,33 @@ class Collector:
         checks = data.get("check_runs", []) if isinstance(data, dict) else []
         return any(c.get("name") == self.review_check for c in checks)
 
+    def _finished(self, lane: str, kind: str) -> Iterator[str]:
+        """Paths of the briefs a lane finished in the window under done/ or failed/."""
+        try:
+            entries = os.scandir(os.path.join(self.home, "briefs", lane, kind))
+        except FileNotFoundError:
+            return
+        with entries:
+            for entry in entries:
+                if (entry.name.endswith(".md") and entry.is_file()
+                        and self.since <= self._completed(entry) <= self.now):
+                    yield entry.path
+
+    @staticmethod
+    def _completed(entry: os.DirEntry) -> float:
+        info = entry.stat()
+        return max(info.st_mtime, info.st_ctime)
+
     def local_runs(self) -> tuple[Dict[str, int], Dict[str, Dict[str, int]], int]:
         counts: Dict[str, int] = {lane: 0 for lane in LANES}
         failures: Dict[str, Dict[str, int]] = {}
         unlinked = 0
         for lane in LANES:
             for kind in ("done", "failed"):
-                folder = os.path.join(self.home, "briefs", lane, kind)
-                try:
-                    entries = os.scandir(folder)
-                except FileNotFoundError:
-                    continue
-                with entries:
-                    for entry in entries:
-                        if not entry.name.endswith(".md") or not entry.is_file():
-                            continue
-                        info = entry.stat()
-                        completed = max(info.st_mtime, info.st_ctime)
-                        if not self.since <= completed <= self.now:
-                            continue
-                        counts[lane] += 1
-                        if kind == "failed":
-                            unlinked += self._failed_run(entry.path, failures)
+                for path in self._finished(lane, kind):
+                    counts[lane] += 1
+                    if kind == "failed":
+                        unlinked += self._failed_run(path, failures)
         return counts, failures, unlinked
 
     @staticmethod
@@ -199,32 +204,45 @@ class Collector:
         return any(REGRESSION.search(body) and self.now - at > 7200
                    for at, body in notes if at)
 
-    def _ticket(self, repo: str, issue: Dict[str, Any], labels: set[str],
-                total: Totals) -> None:
-        number = int(issue["number"])
-        comments = [c for c in self.issue_comments(repo, number) if self.trusted_comment(c)]
+    def _given_up(self, repo: str, number: int, comments: List[Dict[str, Any]]) -> float:
+        """When the ticket was last left past the last rung, or 0 if a later
+        `loom:rung 0` reset it."""
         last_reset = max((stamp(c.get("created_at")) for c in comments
                           if "<!-- loom:rung 0 -->" in str(c.get("body") or "")), default=0)
         given_up = max((stamp(c.get("created_at")) for c in comments
                         if "tried every rung" in str(c.get("body") or "").lower()), default=0)
-        if (given_up > last_reset and self.now - given_up > WINDOW
+        return given_up if given_up > last_reset else 0.0
+
+    @staticmethod
+    def _linked(repo: str, number: int, comments: List[Dict[str, Any]], since: float) -> bool:
+        """True when a comment after `since` refers to some other ticket."""
+        return any(match.group(1) != repo or int(match.group(2)) != number
+                   for c in comments if stamp(c.get("created_at")) >= since
+                   for match in REPAIR_REF.finditer(str(c.get("body") or "")))
+
+    def _ticket(self, repo: str, issue: Dict[str, Any], labels: set[str],
+                total: Totals) -> None:
+        number = int(issue["number"])
+        comments = [c for c in self.issue_comments(repo, number) if self.trusted_comment(c)]
+        given_up = self._given_up(repo, number, comments)
+        if (given_up and self.now - given_up > WINDOW
                 and issue.get("state") == "open" and "loom:failed" in labels):
             total.past_rung += 1
-            if not any(match.group(1) != repo or int(match.group(2)) != number
-                       for c in comments if stamp(c.get("created_at")) >= given_up
-                       for match in REPAIR_REF.finditer(str(c.get("body") or ""))):
-                total.faults += 1
+            total.faults += not self._linked(repo, number, comments, given_up)
         merged = self.label_time(repo, issue, "loom:merged")
         if merged >= self.since:
             total.merged_tickets += 1
             total.verified += "loom:verified" in labels
-            briefed = min((stamp(e.get("created_at"))
-                           for e in self.issue_events(repo, number)
-                           if e.get("event") == "labeled"
-                           and (e.get("label") or {}).get("name") == "loom:briefed"),
-                          default=0.0)
-            if briefed and briefed <= merged:
-                total.merge_times.append((merged - briefed) / 3600)
+            self._merge_time(repo, number, merged, total)
+
+    def _merge_time(self, repo: str, number: int, merged: float, total: Totals) -> None:
+        briefed = min((stamp(e.get("created_at"))
+                       for e in self.issue_events(repo, number)
+                       if e.get("event") == "labeled"
+                       and (e.get("label") or {}).get("name") == "loom:briefed"),
+                      default=0.0)
+        if briefed and briefed <= merged:
+            total.merge_times.append((merged - briefed) / 3600)
 
     def _issue(self, repo: str, issue: Dict[str, Any], total: Totals) -> None:
         if "pull_request" in issue:
@@ -245,9 +263,11 @@ class Collector:
             return
         if pr.get("state") == "open" and self.now - stamp(pr.get("created_at")) > 21600:
             total.pull_old += 1
-        if stamp(pr.get("merged_at")) < self.since:
-            return
-        total.merged_by_repo[repo] += 1
+        if stamp(pr.get("merged_at")) >= self.since:
+            total.merged_by_repo[repo] += 1
+            self._merged_pull(repo, pr, total)
+
+    def _merged_pull(self, repo: str, pr: Dict[str, Any], total: Totals) -> None:
         sha = str((pr.get("head") or {}).get("sha") or "")
         if not sha or not self.passes(repo, sha):
             total.unchecked += 1
@@ -257,8 +277,7 @@ class Collector:
                        and f.get("status") != "removed" for f in files):
                 total.fix_no_test += 1
 
-    def collect(self) -> List[Number]:
-        total = Totals()
+    def _scan(self, total: Totals) -> None:
         for repo in self.repos:
             issues = self.list("/repos/%s/issues?state=all&per_page=100" % repo)
             pulls = self.list("/repos/%s/pulls?state=all&per_page=100" % repo)
@@ -268,42 +287,83 @@ class Collector:
             total.merged_by_repo[repo] = 0
             for pr in pulls:
                 self._pull(repo, pr, total)
+
+    def collect(self) -> List[Number]:
+        total = Totals()
+        self._scan(total)
         runs, failures, parked_without_ticket = self.local_runs()
         total.faults += parked_without_ticket
-        total_runs = sum(runs.values())
-        anthropic = sum(v for lane, v in runs.items() if lane.startswith("anthropic"))
-        repeat = sum(any(n >= 2 for n in models.values()) for models in failures.values())
-        idle, samples = self.slot_samples()
-        generic = self.generic_files()
-        median = statistics.median(total.merge_times) if total.merge_times else float("inf")
-        flow_ok = total.pull_old == 0 and median < 3 and total.past_rung == 0
-        throughput_ok = bool(total.goals) and all(total.merged_by_repo[r] for r in total.goal_repos) \
-            and total.merged_tickets > 0 and total.verified * 2 >= total.merged_tickets
-        spread_ok = total_runs > 0 and anthropic * 2 <= total_runs and samples > 0 and idle == 0
-        max_age = max(total.report_ages.values(), default=float("inf"))
         return [
-            Number("Flow", "%d PRs >6h; median %.1fh (%d tickets); %d past last rung >24h" %
-                   (total.pull_old, median, len(total.merge_times), total.past_rung), "0; <3h; 0", flow_ok),
-            Number("Throughput", "%s; verified %d/%d" %
-                   (", ".join("%s %d" % pair for pair in total.merged_by_repo.items()),
-                    total.verified, total.merged_tickets),
-                   "each goal repo >=1 merge; >=50% verified", throughput_ok),
-            Number("Spread", "%s; Anthropic %d/%d; idle %d/%d passes" %
-                   (", ".join("%s %d" % pair for pair in runs.items()), anthropic, total_runs, idle, samples),
-                   "Anthropic <=50%; idle 0", spread_ok),
-            Number("Escalation", "%d tickets failed twice on one model" % repeat, "0", repeat == 0),
-            Number("Quality", "%d unfixed regressions >2h; %d unreviewed merges; %d fix PRs without tests" %
-                   (total.regressions, total.unchecked, total.fix_no_test), "0; 0; 0",
-                   total.regressions == total.unchecked == total.fix_no_test == 0),
-            Number("Autonomy", "%d asks opened" % total.asks, "<=1/day", total.asks <= 1),
-            Number("Visibility", "%s" % ", ".join("%s %.1fh" % (r, age / 3600)
-                                                 for r, age in total.report_ages.items()),
-                   "each goal report <=2h", bool(total.goals) and max_age <= 7200),
-            Number("Self-repair", "%d un-ticketed factory faults" % total.faults,
-                   "0", total.faults == 0),
-            Number("Generic", "%d files: %s" % (len(generic), ", ".join(generic)),
-                   "0 files", not generic),
+            flow_number(total),
+            throughput_number(total),
+            spread_number(runs, *self.slot_samples()),
+            escalation_number(failures),
+            quality_number(total),
+            autonomy_number(total),
+            visibility_number(total),
+            self_repair_number(total),
+            generic_number(self.generic_files()),
         ]
+
+
+def flow_number(total: Totals) -> Number:
+    median = statistics.median(total.merge_times) if total.merge_times else float("inf")
+    ok = total.pull_old == 0 and median < 3 and total.past_rung == 0
+    return Number("Flow", "%d PRs >6h; median %.1fh (%d tickets); %d past last rung >24h" %
+                  (total.pull_old, median, len(total.merge_times), total.past_rung),
+                  "0; <3h; 0", ok)
+
+
+def throughput_number(total: Totals) -> Number:
+    ok = (bool(total.goals) and all(total.merged_by_repo[r] for r in total.goal_repos)
+          and total.merged_tickets > 0 and total.verified * 2 >= total.merged_tickets)
+    return Number("Throughput", "%s; verified %d/%d" %
+                  (", ".join("%s %d" % pair for pair in total.merged_by_repo.items()),
+                   total.verified, total.merged_tickets),
+                  "each goal repo >=1 merge; >=50% verified", ok)
+
+
+def spread_number(runs: Dict[str, int], idle: int, samples: int) -> Number:
+    total_runs = sum(runs.values())
+    anthropic = sum(v for lane, v in runs.items() if lane.startswith("anthropic"))
+    ok = total_runs > 0 and anthropic * 2 <= total_runs and samples > 0 and idle == 0
+    return Number("Spread", "%s; Anthropic %d/%d; idle %d/%d passes" %
+                  (", ".join("%s %d" % pair for pair in runs.items()),
+                   anthropic, total_runs, idle, samples),
+                  "Anthropic <=50%; idle 0", ok)
+
+
+def escalation_number(failures: Dict[str, Dict[str, int]]) -> Number:
+    repeat = sum(any(n >= 2 for n in models.values()) for models in failures.values())
+    return Number("Escalation", "%d tickets failed twice on one model" % repeat,
+                  "0", repeat == 0)
+
+
+def quality_number(total: Totals) -> Number:
+    return Number("Quality", "%d unfixed regressions >2h; %d unreviewed merges; %d fix PRs without tests" %
+                  (total.regressions, total.unchecked, total.fix_no_test), "0; 0; 0",
+                  total.regressions == total.unchecked == total.fix_no_test == 0)
+
+
+def autonomy_number(total: Totals) -> Number:
+    return Number("Autonomy", "%d asks opened" % total.asks, "<=1/day", total.asks <= 1)
+
+
+def visibility_number(total: Totals) -> Number:
+    max_age = max(total.report_ages.values(), default=float("inf"))
+    return Number("Visibility", "%s" % ", ".join("%s %.1fh" % (r, age / 3600)
+                                                for r, age in total.report_ages.items()),
+                  "each goal report <=2h", bool(total.goals) and max_age <= 7200)
+
+
+def self_repair_number(total: Totals) -> Number:
+    return Number("Self-repair", "%d un-ticketed factory faults" % total.faults,
+                  "0", total.faults == 0)
+
+
+def generic_number(generic: List[str]) -> Number:
+    return Number("Generic", "%d files: %s" % (len(generic), ", ".join(generic)),
+                  "0 files", not generic)
 
 
 def render(numbers: Sequence[Number], today: str, streak: int) -> str:

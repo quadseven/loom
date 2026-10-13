@@ -553,16 +553,20 @@ class Station:
             return
         by_lane = self._claim_candidates(free)
         for lane in free:
-            cands = sorted(by_lane[lane], key=lambda c: (
-                str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
-            for repo, issue in cands:
-                try:
-                    if self._try_ticket(repo, lane, issue):
-                        break
-                except (GitHubError, OSError) as err:
-                    _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
+            self._claim_for_lane(lane, by_lane[lane])
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in free))
+
+    def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]]) -> None:
+        """Claim the oldest ticket for one free lane that can be claimed."""
+        cands = sorted(found, key=lambda c: (
+            str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
+        for repo, issue in cands:
+            try:
+                if self._try_ticket(repo, lane, issue):
+                    return
+            except (GitHubError, OSError) as err:
+                _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
 
     def _claim_candidates(self, free: List[str]) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
         by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {l: [] for l in free}
