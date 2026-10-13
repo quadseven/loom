@@ -303,7 +303,8 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
 
 
 def _clip(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
+    # A trailing backslash would escape the ellipsis in Discord's formatting.
+    return text if len(text) <= limit else text[:limit - 3].rstrip(" \\") + "..."
 
 
 def scrub(reason: str) -> str:
@@ -921,8 +922,9 @@ class Station:
         """The first line of the newest loom:human comment from an allowed
         login (the brain's ask), or "" when there is none."""
         allowed = {a.lower() for a in self.s.authors}
-        # paginate asks for 100 a page and follows the next links, so the
-        # newest comment is read however long the thread is.
+        # paginate adds per_page=100 and follows next links. These reads are
+        # limited to the 15 shown issues; _human_text holds the whole digest
+        # on a GitHubError so it cannot send a partial list.
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
         for c in reversed(comments):
             body = str(c.get("body") or "") if isinstance(c, dict) else ""

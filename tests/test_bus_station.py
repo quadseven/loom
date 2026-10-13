@@ -1067,6 +1067,19 @@ class HumanDigestTest(AsksTest):
         self.assertTrue(all(len(c) + 30 <= station.DISCORD_MAX for c in self.contents()))
         self.assertEqual(self.fake.paths("GET").count(
             "/repos/%s/issues/100/comments?per_page=100" % REPO), 0)
+        comment_reads = [p for p in self.fake.paths("GET") if "/comments?" in p]
+        self.assertEqual(len(comment_reads), station.HUMAN_SHOWN)
+        self.assertTrue(all(p.endswith("?per_page=100") for p in comment_reads))
+
+    def test_clipped_human_text_does_not_escape_its_ellipsis(self):
+        title = "T" * (station.HUMAN_TITLE_MAX - 4) + "\\" + "tail"
+        ask = "A" * (station.HUMAN_ASK_MAX - 4) + "\\" + "tail"
+        self.fake.add_human(7, title=title, ask=ask)
+        self.go(NOON)
+        content = self.contents()[0]
+        self.assertIn("- %s... https://" % ("T" * (station.HUMAN_TITLE_MAX - 4)), content)
+        self.assertIn("  %s..." % ("A" * (station.HUMAN_ASK_MAX - 4)), content)
+        self.assertNotIn("\\...", content)
 
     def test_the_list_follows_the_asks_in_the_same_digest(self):
         self.settings.mention = "123456"
