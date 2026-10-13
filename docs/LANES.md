@@ -75,17 +75,26 @@ ticket is `loom:pr`) whose checks have all finished, whose review check
 (`LOOM_REVIEW_CHECK`, default `Grug - Elder`) has run on its head commit,
 and that is mergeable, green and free of open threads is squash-merged
 through `bus.brain merge`. One with a failing check, an open thread or a
-conflict goes back to a lane as a fix brief. Its first send-back stays on its
-lane while the pull request is under 6 hours old; later ones, failed
-tickets, and briefed tickets no lane claimed for 2 hours climb the model
-ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
+conflict goes back to a lane as a fix brief. It stays on its lane while the
+rounds make progress, and climbs the model ladder only when stuck: a review
+thread survived a fix round, checks it was asked to fix still fail, or the
+pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
+conflict alone, never climbs). Failed tickets and briefed tickets no lane
+claimed for 2 hours climb too. After a push the factory waits for the review
+to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
+starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
 `claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
 A rung whose lanes each already hold 2 briefed or running tickets is passed
 over for the next. A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
-`/grug improve`), and returns the ticket to `loom:pr`.
+`/grug improve`), and returns the ticket to `loom:pr`. Before a fix brief's
+agent runs, the runner merges the default branch into the pull request's
+branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
+the agent changes nothing, and a conflict is handed to the agent with the
+file list, its markers in the tree; the runner completes the merge, or parks
+the brief with "conflict markers left in FILES".
 Past the last rung the ticket is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its

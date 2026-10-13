@@ -12,6 +12,8 @@ from bus.tickets import FIX_MARKER
 
 REPO = "example-org/example-repo"
 NOW = 2_000_000_000.0
+# A loom:fix comment that asked for thread PRRT_1 and a failing check.
+FIX_ASKED = FIX_MARKER + "\nPull request: x#50\n\n### Check: lint\n\n    E1\n\n### Thread PRRT_1 (comment 1) at a.py:1\n\n    rename"
 ME = {"login": "alice-example"}
 STRANGER = {"login": "mallory-example"}
 
@@ -57,7 +59,8 @@ class FakeGitHub:
             "headRepository": {"nameWithOwner": REPO},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {
                 "state": "SUCCESS" if green else "FAILURE"}}}]},
-            "reviewThreads": {"nodes": [{"isResolved": resolved, "comments": {"nodes": []}}]}}
+            "reviewThreads": {"nodes": [{"id": "PRRT_1", "isResolved": resolved,
+                                         "comments": {"nodes": []}}]}}
 
     # -- the GitHub client surface the factory uses --------------------
     def paginate(self, path):
@@ -174,15 +177,65 @@ class PullRequests(Base):
         self.assertEqual((self.lane(5), self.model(5)), ("codex", None))
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
 
-    def test_a_second_send_back_climbs_to_the_first_rung(self):
+    def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
-        self.gh.comments[5].append({"body": FIX_MARKER + "\nfirst round", "user": ME})
-        self.gh.pull(50, 5, green=False)
+        self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
+        self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
         # The lane label changed before the fix brief went out.
         self.assertIn({"name": "lane:claude"}, self.fixed[0][2])
+
+    def test_a_review_round_that_finds_new_things_stays_on_its_lane(self):
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.comments[5].append({"body": FIX_ASKED.replace("PRRT_1", "PRRT_0").replace(
+            "### Check: lint\n\n    E1\n\n", ""), "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual((self.lane(5), self.model(5)), ("codex", None))
+        self.assertEqual(len(self.fixed), 1)
+
+    def test_checks_still_failing_after_a_round_that_asked_for_them_climb(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
+        self.gh.pull(50, 5, green=False)
+        self.go()
+        self.assertEqual(self.model(5), "claude-sonnet-5-5")
+
+    def test_a_conflict_alone_never_climbs(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
+        self.gh.pull(50, 5, mergeable=False)
+        self.go()
+        self.assertEqual(self.model(5), None)
+        self.assertEqual(len(self.fixed), 1)
+
+    def test_a_fresh_push_without_its_review_yet_waits(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False, runs=(), updated=60)
+        self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_rung_zero_marker_starts_the_ladder_again(self):
+        self.gh.ticket(6, "failed")
+        self.gh.comments[6] += [{"body": factory.RUNG_MARKER % 3, "user": ME},
+                                {"body": factory.RUNG_MARKER % 0, "user": ME}]
+        self.go()
+        self.assertEqual(self.model(6), "claude-sonnet-5-5")
+
+    def test_age_climbs_once_per_window_not_every_round(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5].append({"body": factory.RUNG_MARKER % 1, "user": ME,
+                                    "created_at": iso(3600)})
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 2)
+        self.go()
+        self.assertEqual(self.model(5), None, "climbed an hour after the last climb")
+        self.assertEqual(len(self.fixed), 1)
+        self.gh.comments[5][0]["created_at"] = iso(factory.STUCK_AGE + 60)
+        self.gh.issues[5]["labels"] = [{"name": x} for x in ("loom:ticket", "loom:pr", "lane:codex")]
+        self.go()
+        self.assertEqual(self.model(5), "gpt-6-sol")
 
     def test_an_old_pull_request_climbs_on_its_first_send_back(self):
         self.gh.ticket(5, "pr")
@@ -193,7 +246,7 @@ class PullRequests(Base):
 
     def test_the_rungs_go_sonnet_then_sol_then_opus(self):
         self.gh.ticket(5, "pr")
-        self.gh.comments[5].append({"body": FIX_MARKER, "user": ME})
+        self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
         seen = []
         for _ in range(3):
             self.gh.pull(50, 5, resolved=False)
@@ -206,7 +259,7 @@ class PullRequests(Base):
 
     def test_past_the_last_rung_it_is_left_failed_for_the_brain(self):
         self.gh.ticket(5, "pr")
-        self.gh.comments[5] += [{"body": FIX_MARKER, "user": ME}, {"body": factory.RUNG_MARKER % 3, "user": ME}]
+        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME}, {"body": factory.RUNG_MARKER % 3, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual(self.fixed, [])
