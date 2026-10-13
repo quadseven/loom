@@ -116,15 +116,25 @@ the agent changes nothing, and a conflict is handed to the agent with the
 file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
 A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
-does while its box is hot) is not failing: a ticket briefed on it moves to
-the next rung at once, recorded with a rung marker like any climb.
-Past the last rung the ticket is left `loom:failed` for the brain. Landing
+does while its box is hot) is not failing: a ticket briefed on it moves at
+once to a free lane in its difficulty tier (docs/MUSE.md, Lane choice), with
+no rung marker, or a ticket on a ladder rung to a free lane of that rung; with
+none free it waits where it is for its lane to come back. A failed or stalled
+ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
-pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+pass, `loom:urgent` and `loom:regression` tickets first, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
-back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+back. A ready pull request that changes a code file (by extension: `.py`,
+`.js`, `.ts`, `.tsx`, `.jsx`, `.css`, `.cpp`, `.h`, `.hpp`, `.go`, `.rs`,
+`.sh`, `.lua`, `.sql`) and no test file (a `test` or `tests` folder in its
+path, or `test_`, `_test.`, `.test.` or `.spec.` in its name) goes back
+asking for a test that fails without the change, instead of landing; that
+round climbs only if the next one still adds no test. A repo with no test
+harness opts out in `LOOM_NO_TEST_REPOS` (space separated `OWNER/NAME`), and
+a ticket whose body has the line `Tests: none needed (<reason>)` skips the
+check. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`

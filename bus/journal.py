@@ -33,10 +33,11 @@ def _items(value: Union[str, Iterable[str], None]) -> str:
 
 
 def render_journal(when, holder, shipped, briefed, waiting, asks,
-                   requests, minutes) -> str:
-    return "\n".join([
-        JOURNAL_MARKER,
-        "Tick %s, %s" % (_when(when), holder),
+                   requests, minutes, measure=None) -> str:
+    head = [JOURNAL_MARKER, "Tick %s, %s" % (_when(when), holder)]
+    if measure is not None:
+        head.append("- Measure: %s" % _items(measure))
+    return "\n".join(head + [
         "- Shipped: %s" % _items(shipped),
         "- Briefed: %s" % _items(briefed),
         "- Waiting: %s" % _items(waiting),

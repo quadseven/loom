@@ -40,13 +40,14 @@ not looked hard enough yet. Each tick the brain:
   look at the live system for what is slow, stuck, failing or unnatural, and
   ticket it with the evidence.
 - Finishes before it starts: each tick merges every lane pull request that
-  is ready (checks green, no unresolved threads, a fix-up already pushed
-  for each finding) before it briefs anything new.
-- When a goal is at its cap, a brief that fixes a live regression on a
-  ticket already shipped may still be filed, past the cap, by setting
-  `LOOM_GOAL_CAP` to the cap plus 8 for that one brief command (until a
-  reserved regression slot exists, #102). Ordinary new work waits for the
-  cap.
+  `bus.brain status` marks `READY` (the merge-ready signal in
+  docs/BRAIN.md) before it briefs anything new.
+- When a goal is at its cap, a brief that fixes a measured regression of a
+  ticket already shipped still goes in, through the goal's one regression
+  slot: `brief --regresses M`, with `Regresses #M` and the evidence in the
+  brief (docs/BRAIN.md, Regression slot). Never raise `LOOM_GOAL_CAP` for
+  it. Link the next measured result in the goal's journal. Ordinary new
+  work waits for the cap.
 - Proves every change: a ticket is verified only when its proof shows on the
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.
@@ -68,12 +69,40 @@ tickets and pull requests like any other work.
   is already open; add the new evidence there instead.
 - Review the other brains' Loom pull requests like any lane PR.
 
+## Handing off stage work
+
+Every brain may stop short: out of budget, out of time, or out of scope.
+Work it leaves must not wait for that brain's next tick while it keeps
+journaling, so stage work is handed off per goal and stage, not by who
+journaled last. The stages are `review`, `merge`, `failed` (re-brief or
+close a `loom:failed` ticket), `ask` and `regression` (admit a brief for a
+live regression).
+
+- Defer: for each item ready for a stage that you leave undone this tick,
+  run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
+  after your last write on the item, and put the line it prints in your
+  journal. That yields the stage to the next brain holding the lock.
+- Done: for each stage action you finish (a merge, a re-brief or close of a
+  failed ticket, an answered ask, an admitted regression), put the line
+  from `python3 -m bus.brain done OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
+  in your journal.
+- The newest marker for an item wins, and `resume` drops a defer whose
+  item was closed or changed since (new commits, new comments, another
+  state), so no brain repeats finished work. `status` shows, per goal and
+  stage, the brain that last held it and its last done action.
+- Only the lock holder acts: `resume` refuses for anyone else.
+
 ## Tick
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
    is held.
-2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
-   each goal's latest journal.
+2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+   for each goal, its latest journal, report, measurement and completed
+   action, and its report deadline. Every goal under "Reports owed before
+   unlock" gets its report in the report step this tick, whatever else
+   waits: keep time for it. Each lane pull request's line ends in `READY`
+   or `blocked:` and its blockers; take that verdict as given rather than
+   re-deriving it from the review list.
    Then read, on each goal home, the operator notes newer than its last
    journal: comments from an allowed login starting with
    `<!-- loom:operator v1 discord=<message id> -->`, relayed by the station
@@ -90,20 +119,22 @@ tickets and pull requests like any other work.
    followed by the answer: what was done, or the answer to the question.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
-3. The station's factory pass (bus/factory.py) already merges every lane
-   pull request that is green, reviewed and free of open threads, sends the
-   rest back to a lane, and moves stuck and failed tickets up the model
-   ladder, every 5 minutes, without a brain. Spend the tick on what it
-   cannot judge: for each lane pull request, read its whole diff against its
-   ticket and acceptance criteria. A lane pull request with failing checks or
-   unresolved findings goes back to the lane that wrote it with
-   `python3 -m bus.brain fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md`
-   (FINDINGS.md says what to change; the command adds the failing check logs
-   and the open review threads itself). Fix it yourself only when the fix is
-   a one-line mechanical change. For each ready one, reply to every review
-   thread using
+   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
+   refuses unless you hold the lock. Each `resume` line it prints is stage
+   work another brain yielded (Handing off stage work): finish those items
+   first, before measuring anything or starting new work, under the same
+   rules as the steps below (a merge still needs a ready pull request).
+   Spend at most a third of the tick on them; defer what is left again.
+3. The station hands failed checks and unresolved review-bot threads back to
+   the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
+   The factory pass (bus/factory.py) moves stuck and failed tickets up the
+   model ladder every 5 minutes. Review in full only tickets labeled
+   `needs-brain`: read the whole diff against the ticket and acceptance
+   criteria, and reply to each thread with
    `python3 -m bus.brain reply OWNER/NAME#PR --comment ID --file BODY.md --resolve`.
-   Then run `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
+   Merge only PRs labeled `loom:ready`: confirm checks are green, no review-bot
+   threads are unresolved, and the verdict applies to the current head SHA. Then run
+   `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
    which moves the ticket to `loom:merged`. Merged is not deployed: the
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
@@ -154,9 +185,9 @@ tickets and pull requests like any other work.
 9. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
-   goal's measure.
-   Every 2 hours per goal (when the goal's newest report is 2 hours old or
-   there is none), also post the report: a separate comment on the goal
+   goal's measure, then the defer and done lines (Handing off stage work).
+   Every 2 hours per goal (when status lists the goal as due or overdue),
+   also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself, written as a
    standup the operator can read in thirty seconds on a phone:
@@ -176,7 +207,9 @@ tickets and pull requests like any other work.
    may want to open it, and never more than one or two per line. Numbers
    over adjectives. A goal home may ask for extra lines; add them after
    these. The station sends every report to the operator's phone, so it
-   must stand on its own.
+   must stand on its own. Each goal needs its own report on its own home:
+   a report on a parent goal does not cover its child goals, and a journal
+   or a report quoted inside another comment does not count.
 10. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports
@@ -203,8 +236,9 @@ on hard work):
   anthropic slots busy with hard work while the credit lasts.
 
 Spark takes one ticket at a time and steps aside while its box is hot: the
-factory moves its waiting tickets on, so brief it only when lane status
-shows it available.
+factory moves its waiting tickets to a free lane in the same tier as above
+(the table `TIERS` in bus/factory.py), never up the ladder, so brief it only
+when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
 anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each takes one

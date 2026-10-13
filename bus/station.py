@@ -21,13 +21,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import spend
 from . import text as _text
 from . import tickets
 from .brain import HUMAN_MARKER
+from . import brain
 from .github import GitHub, GitHubError, _OPENER
 from .journal import REPLY_RE
 from .labels import LANES
@@ -59,6 +60,10 @@ RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id
 # work for a while (the spark lane's thermal guard). Not a failure: the ticket
 # goes back to briefed, and the factory moves it to the next lane.
 LIMIT = "limit:"
+# The runner's reason when a fix brief's push was refused because another
+# push moved the pull request's branch during the run. Not a failure: the
+# ticket goes back to loom:pr, and the factory judges the new head.
+BRANCH_MOVED = "branch moved:"
 # Asks the review bot to review a pull request's head again; it resolves the
 # threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
 REVIEW_AGAIN = "/grug improve"
@@ -80,6 +85,7 @@ LANES_TITLE = "Loom lane status"
 LANES_REPUBLISH = 3600
 NEEDS_OPERATOR = "needs-operator"
 URGENT = "loom:urgent"
+REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
@@ -90,6 +96,7 @@ HUMAN_HEAD = "Waiting on you"
 HUMAN_SHOWN = 15
 HUMAN_TITLE_MAX = 100
 HUMAN_ASK_MAX = 140
+FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # Reports come every 2 hours, so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
@@ -141,6 +148,9 @@ Poster = Callable[[str, Dict[str, Any]], None]
 DiscordCall = Callable[[str, str, str, Optional[Dict[str, Any]]], Any]
 
 
+MAX_FIX_BODY = 60000
+
+
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
@@ -150,7 +160,8 @@ class Settings:
                  anthropic: Optional[spend.Budget] = None,
                  factory_on: bool = False,
                  review_check: str = factory.DEFAULT_REVIEW_CHECK,
-                 review_bot: str = factory.DEFAULT_REVIEW_BOT) -> None:
+                 review_bot: str = factory.DEFAULT_REVIEW_BOT,
+                 no_test_repos: Sequence[str] = ()) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -169,6 +180,7 @@ class Settings:
         self.factory_on = factory_on
         self.review_check = review_check
         self.review_bot = review_bot
+        self.no_test_repos = list(no_test_repos)
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -203,7 +215,8 @@ class Settings:
                    review_check=(env.get("LOOM_REVIEW_CHECK", "").strip()
                                  or factory.DEFAULT_REVIEW_CHECK),
                    review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
-                               or factory.DEFAULT_REVIEW_BOT))
+                               or factory.DEFAULT_REVIEW_BOT),
+                   no_test_repos=words("LOOM_NO_TEST_REPOS"))
 
 
 def _origin_repo() -> str:
@@ -383,6 +396,21 @@ def scrub(reason: str) -> str:
     return text[:REASON_MAX]
 
 
+def _fix_round_limit() -> int:
+    try:
+        return max(0, int(os.environ.get("LOOM_FIX_ROUNDS", str(FIX_ROUNDS_DEFAULT))))
+    except ValueError:
+        return FIX_ROUNDS_DEFAULT
+
+
+def _linked_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
+    number = int(issue.get("number", 0))
+    return bool(re.search(r"^Refs %s#%d[ \t]*$" % (re.escape(repo), number),
+                          str(pr.get("body") or ""), re.M)
+                or re.match(r"loom/%d(?:-|$)" % number,
+                            str((pr.get("head") or {}).get("ref") or "")))
+
+
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
@@ -514,7 +542,9 @@ class Station:
 
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
-        its fix comment cannot be used (refused, as an untrusted ticket is)."""
+        its fix comment cannot be used (refused, as an untrusted ticket is),
+        or when its newest claim's brief is still waiting or running in a
+        lane inbox (left for the next pass)."""
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
@@ -524,6 +554,16 @@ class Station:
             return False
         earlier = sum(1 for c in comments
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
+        if earlier:
+            # Two lanes on one ticket push to one branch, and the later push
+            # is refused: the newest claim's run must end first.
+            newest = tickets.ticket_name(repo, number, earlier)
+            busy = [l for l in LANES
+                    if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))]
+            if busy:
+                _say("not claiming %s#%d: its brief %s is still in lane %s's inbox; next pass"
+                     % (repo, number, newest, busy[0]))
+                return False
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
         fix, fix_comment_id = fix_source if fix_source else (None, None)
@@ -660,7 +700,9 @@ class Station:
                 if lane in by_lane:
                     by_lane[lane].append((repo, issue))
         for lane in free:
+            # A regression fix (bus.brain brief --regresses) goes first.
             cands = sorted(by_lane[lane], key=lambda c: (
+                REGRESSION not in _label_names(c[1]),
                 str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
             for repo, issue in cands:
                 try:
@@ -727,6 +769,178 @@ class Station:
                 reported[key] = kind
                 _write_json(path, reported)
 
+    def hand_back(self) -> None:
+        """Return completed lane PRs with failed checks or bot findings."""
+        rounds = _fix_round_limit()
+        for repo in self.s.repos:
+            issues = self._pr_tickets(repo)
+            if not issues:
+                continue
+            prs = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data or []
+            for issue in issues:
+                self._hand_back_ticket(repo, issue, prs, rounds)
+
+    def _pr_tickets(self, repo: str) -> List[Dict[str, Any]]:
+        issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % repo).data or []
+        return [i for i in issues if isinstance(i, dict) and "pull_request" not in i]
+
+    def _hand_back_ticket(self, repo: str, issue: Dict[str, Any], prs: List[Dict[str, Any]],
+                          rounds: int) -> None:
+        number = int(issue["number"])
+        lane = _lane_of(issue)
+        pr = next((p for p in prs if _linked_pr(issue, repo, p)), None)
+        if not lane or not pr:
+            return
+        pr_number = int(pr["number"])
+        detail = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+        sha = str((detail.get("head") or {}).get("sha") or "")
+        if not sha:
+            return
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        names = _label_names(issue)
+        ready = self._ready_marker(comments)
+        if self._fix_pending(names, comments, sha):
+            return
+        self._clear_stale_ready(repo, number, names, ready, sha)
+        if "loom:briefed" in names or "loom:running" in names:
+            return
+        if not self._checks_finished(repo, sha):
+            self._remove_ready_if_present(repo, number, names)
+            return
+        failed = brain._failing_checks(self.gh, repo, sha)
+        threads = self._bot_threads(repo, pr_number)
+        if not failed and not threads:
+            self._mark_ready(repo, number, sha, names, ready)
+            return
+        self._remove_ready_if_present(repo, number, names)
+        self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
+                                   comments, names, failed, threads, rounds)
+
+    def _ready_marker(self, comments: List[Any]) -> Optional[Tuple[Any, str]]:
+        # The ticket keeps one ready-head comment of ours, edited on each new clean
+        # head, so the markers never pile up; returns its id and the head it names.
+        authors = {author.lower() for author in self.s.authors}
+        pattern = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
+        found = None
+        for comment in comments:
+            if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
+                continue
+            match = pattern.search(str(comment.get("body") or ""))
+            if match:
+                found = (comment.get("id"), match.group(1))
+        return found
+
+    def _fix_pending(self, names: List[str], comments: List[Any], sha: str) -> bool:
+        if "loom:briefed" not in names and "loom:running" not in names:
+            return False
+        authors = {author.lower() for author in self.s.authors}
+        marker = "<!-- loom:fix-head %s -->" % sha
+        return any(isinstance(comment, dict)
+                   and tickets._login(comment.get("user")) in authors
+                   and str(comment.get("body") or "").startswith(tickets.FIX_MARKER)
+                   and marker in str(comment.get("body") or "") for comment in comments)
+
+    def _clear_stale_ready(self, repo: str, number: int, names: List[str],
+                           ready: Optional[Tuple[Any, str]], sha: str) -> None:
+        if "loom:ready" in names and (not ready or ready[1] != sha):
+            self._remove_label(repo, number, "loom:ready")
+            names.remove("loom:ready")
+
+    def _checks_finished(self, repo: str, sha: str) -> bool:
+        runs = (self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data or {}).get("check_runs") or []
+        statuses = (self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}).get("statuses") or []
+        return not any(run.get("status") != "completed" for run in runs) and not any(
+            status.get("state") == "pending" for status in statuses)
+
+    def _bot_threads(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
+        threads = brain._open_threads(self.gh, repo, pr_number)
+        return [thread for thread in threads if self._thread_starts_with_bot(thread)]
+
+    @staticmethod
+    def _thread_starts_with_bot(thread: Dict[str, Any]) -> bool:
+        comments = (thread.get("comments") or {}).get("nodes") or []
+        return bool(comments and
+                    (comments[0].get("author") or {}).get("login") == "grug-tribe[bot]")
+
+    def _remove_ready_if_present(self, repo: str, number: int, names: List[str]) -> None:
+        if "loom:ready" in names:
+            self._remove_label(repo, number, "loom:ready")
+
+    def _mark_ready(self, repo: str, number: int, sha: str, names: List[str],
+                    ready: Optional[Tuple[Any, str]]) -> None:
+        if "loom:ready" not in names:
+            self._add_label(repo, number, "loom:ready")
+        body = {"body": "<!-- loom:ready-head %s -->" % sha}
+        if not ready:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), body)
+        elif ready[1] != sha:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (repo, ready[0]), body)
+
+    @staticmethod
+    def _fix_round_count(comments: List[Any], authors: set) -> int:
+        rounds_seen = set()
+        for comment in comments:
+            if (not isinstance(comment, dict)
+                    or tickets._login(comment.get("user")) not in authors):
+                continue
+            head = Station._fix_head(str(comment.get("body") or ""))
+            if head:
+                rounds_seen.add(head)
+        return len(rounds_seen)
+
+    @staticmethod
+    def _fix_head(body: str) -> Optional[str]:
+        if not body.startswith(tickets.FIX_MARKER):
+            return None
+        match = re.search(r"<!-- loom:fix-head ([0-9a-f]+) -->", body)
+        return match.group(1) if match else None
+
+    def _post_fix_or_escalate(self, repo: str, number: int, pr_number: int, lane: str,
+                              detail: Dict[str, Any], sha: str, comments: List[Any],
+                              names: List[str], failed: List[Any], threads: List[Any],
+                              rounds: int) -> None:
+        authors = {author.lower() for author in self.s.authors}
+        if self._fix_round_count(comments, authors) >= rounds:
+            self._escalate_fix(repo, number, names)
+            return
+        self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads)
+        self._move_fix_to_lane(repo, number, lane, names)
+
+    def _escalate_fix(self, repo: str, number: int, names: List[str]) -> None:
+        if "needs-brain" not in names:
+            self._add_label(repo, number, "needs-brain")
+
+    def _post_fix_comment(self, repo: str, number: int, pr_number: int,
+                          detail: Dict[str, Any], sha: str, failed: List[Any],
+                          threads: List[Any]) -> None:
+        branch = str((detail.get("head") or {}).get("ref") or "")
+        body = brain._fix_body(repo, pr_number, branch, "", failed, threads)
+        marker = "\n\n<!-- loom:fix-head %s -->\n" % sha
+        if len(body) > MAX_FIX_BODY:  # the API rejects comments over 65536 characters
+            body = body[:MAX_FIX_BODY].rstrip() + "\n\n(findings truncated)"
+        body = body.rstrip() + marker
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+
+    def _move_fix_to_lane(self, repo: str, number: int, lane: str,
+                          names: List[str]) -> None:
+        labels = [name for name in names if name not in (
+            "loom:pr", "loom:ready", "needs-brain", "loom:running", "loom:briefed")
+                  and not name.startswith("lane:")]
+        labels.extend(("loom:briefed", "lane:" + lane))
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+
+    def _add_label(self, repo: str, number: int, label: str) -> None:
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if label not in names:
+            names.append(label)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
+
+    def _remove_label(self, repo: str, number: int, label: str) -> None:
+        issue = self._issue(repo, number)
+        names = [n for n in _label_names(issue) if n != label]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
+
     def _field(self, text: str, name: str) -> str:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
         return m.group(1) if m else ""
@@ -755,19 +969,27 @@ class Station:
             self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
+        self._report_failed(repo, number, lane, name, text)
+        return True
+
+    def _report_failed(self, repo: str, number: int, lane: str, name: str, text: str) -> None:
+        """A brief parked in failed/: a limit, a moved branch or a fix round
+        with nothing to commit is not a failure; anything else is."""
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         if reason.startswith(LIMIT):
             self._limited(repo, number, fix_pr.isdigit(), lane, reason)
-            return True
+            return
+        if fix_pr.isdigit() and reason.startswith(BRANCH_MOVED):
+            self._branch_moved(repo, number, int(fix_pr), lane, reason)
+            return
         if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
             self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
-            return True
+            return
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
-        return True
 
     def _limited(self, repo: str, number: int, fix: bool, lane: str, reason: str) -> None:
         """A run the lane's provider refused (a limit, not a failure). The
@@ -778,6 +1000,17 @@ class Station:
         self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
                       "the ticket goes to the next lane." % (lane, reason))
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _branch_moved(self, repo: str, number: int, pr: int, lane: str, reason: str) -> None:
+        """A fix brief whose push was refused because the pull request's
+        branch moved during the run. The model did nothing wrong, so no rung
+        of the ladder is spent: the ticket returns to loom:pr, where the
+        factory judges the new head and sends it back if it still needs a fix."""
+        self._relabel(repo, number, "loom:pr")
+        self._comment(repo, number, "Lane %s did not push its fix to #%d: the branch moved "
+                      "during the run (%s). This is not a failure: the new head goes back "
+                      "to review." % (lane, pr, reason))
+        _say("reported %s#%d: branch moved on lane %s: %s" % (repo, number, lane, reason))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
         """Post each answer the lane wrote instead of a fix as the reply on its
@@ -1814,7 +2047,9 @@ class Station:
         factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                         review_check=self.s.review_check,
                         review_bot=self.s.review_bot,
-                        limited=self.limited_lanes()).run()
+                        limited=self.limited_lanes(),
+                        no_test_repos=self.s.no_test_repos,
+                        available=[x for x in LANES if self._heartbeat_ok(x)]).run()
 
     def prune_trees(self) -> None:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
@@ -1863,6 +2098,10 @@ class Station:
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
+        try:
+            self.hand_back()
+        except (GitHubError, OSError, ValueError) as err:
+            _say("hand_back failed: %s" % err)
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
                      self.watch_brain, self.relay_operator, self.run_factory,
