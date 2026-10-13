@@ -286,7 +286,7 @@ class Base(unittest.TestCase):
 class ReconcilePullRequestTest(Base):
     def test_merged_pr_repairs_failed_ticket_label_once(self):
         self.fake.add(12, state="pr")
-        # The list endpoint reconciliation reads returns merged_at, never merged.
+        # The /pulls list endpoint returns merged_at but omits merged.
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
                             "body": "Refs %s#12" % REPO,
@@ -313,13 +313,37 @@ class ReconcilePullRequestTest(Base):
 
     def test_a_failed_issues_fetch_is_logged_and_the_pass_survives(self):
         self.fake.add(12, state="pr")
+        next_repo = "second-owner/second-repo"
+        next_ticket = {"number": 13, "labels": [{"name": "loom:ticket"},
+                                                 {"name": "loom:pr"}]}
+        next_pr = {"number": 100, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                   "body": "Refs %s#13" % next_repo, "head": {"ref": "loom/13-fix"}}
+        writes = []
+        requested = []
 
         def transport(method, url, headers, body):
-            raise station.GitHubError("server error", 500)
+            path = urlsplit(url).path
+            requested.append(path)
+            if path == "/repos/%s/issues" % REPO:
+                raise station.GitHubError("server error", 500)
+            if path == "/repos/%s/issues" % next_repo:
+                return reply(200, [next_ticket])
+            if path == "/repos/%s/pulls" % next_repo:
+                return reply(200, [next_pr])
+            if method == "PUT" and path == "/repos/%s/issues/13/labels" % next_repo:
+                writes.append(json.loads(body)["labels"])
+                return reply(200, [])
+            return self.fake(method, url, headers, body)
 
-        runner = station.Station(GitHub("token", transport=transport), self.settings)
-        runner.reconcile_pull_requests()
+        settings = station.Settings(self.home, [REPO, next_repo], list(AUTHORS), list(OWNERS))
+        runner = station.Station(GitHub("token", transport=transport), settings)
+        with mock.patch("bus.station._say") as say:
+            runner.reconcile_pull_requests()
+        say.assert_called_once()
+        self.assertIn(REPO, say.call_args.args[0])
         self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("/repos/%s/pulls" % REPO, requested)
+        self.assertEqual(writes, [["loom:ticket", "loom:merged"]])
 
     def test_a_failed_pulls_fetch_is_logged_and_the_pass_survives(self):
         self.fake.add(12, state="pr")
