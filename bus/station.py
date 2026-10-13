@@ -34,6 +34,12 @@ RUNNING = "loom:running"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
+# The runner's reason when a lane run ends with nothing committed.
+NO_COMMIT = "agent made no commit"
+# Asks the review bot to review a pull request's head again; it resolves the
+# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
+REVIEW_AGAIN = "/grug improve"
+LANE_SAID_MAX = 2500
 # An absolute path: a run of non-space characters starting with a slash (not
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
@@ -644,10 +650,56 @@ class Station:
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         reason = self._failure_reason(lane, name)
+        fix_pr = self._field(text, "Fix-PR")
+        if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
+            self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
+            return True
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
+        """A fix brief that ended with nothing committed. Most often the lane
+        found every thread already fixed (a stale review thread) and said
+        so. Its explanation goes on the pull request, the review bot is asked
+        to review the head again (it resolves what it no longer raises), and
+        the ticket returns to loom:pr. If the review still stands, the factory
+        sends it back a rung up the model ladder (bus/factory.py), so this
+        never loops on one lane."""
+        said = self._lane_said(lane, name)
+        body = "Lane %s made no change for this fix." % lane
+        if said:
+            body = "Lane %s made no change for this fix. It said:\n\n%s" % (
+                lane, "\n".join("> " + line for line in said.splitlines()))
+        try:
+            _text.check(body)
+        except ValueError:
+            body = ("Lane %s made no change for this fix; its explanation did not "
+                    "pass the text checks and is in the lane log." % lane)
+        self._comment(repo, pr, body)
+        self._comment(repo, pr, os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN)
+        self._relabel(repo, number, "loom:pr")
+        self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
+                      "on the pull request; the review bot was asked to review it again."
+                      % (lane, pr))
+        _say("reported %s#%d: no change for #%d; review requested" % (repo, number, pr))
+
+    def _lane_said(self, lane: str, name: str) -> str:
+        """The agent's own words from the run log: every line that is not a
+        runner line, with local paths removed, capped."""
+        log = os.path.join(self.s.home, "logs", lane, name + ".log")
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                lines = [line.rstrip() for line in fh]
+        except OSError:
+            return ""
+        said = [PATH_RE.sub("<path>", line) for line in lines
+                if not re.match(r"^\[\d{4}-\d\d-\d\dT", line) and not line.startswith("rsync(")]
+        text = "\n".join(said).strip()
+        if len(text) > LANE_SAID_MAX:
+            text = text[:LANE_SAID_MAX].rsplit("\n", 1)[0] + "\n(cut; the rest is in the lane log)"
+        return text
 
     def _failure_reason(self, lane: str, name: str) -> str:
         log = os.path.join(self.s.home, "logs", lane, name + ".log")

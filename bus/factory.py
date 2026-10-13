@@ -60,6 +60,10 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("codex", "codex-2"), "gpt-6-sol"),
     (("claude",) + ANTHROPIC, "claude-opus-5-5"),
 )
+# A rung whose least-loaded lane already holds this many briefed or running
+# tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
+# than a wait behind a busy lane"). The last rung takes the work regardless.
+RUNG_BUSY = 2
 RUNG_MARKER = "<!-- loom:rung %d -->"
 RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 CLAIM_RE = re.compile(r"^Claimed for lane ")
@@ -118,6 +122,18 @@ def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
 def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
     """The least-loaded lane of a rung, the first listed on a tie."""
     return min(lanes, key=lambda lane: (load.get(lane, 0), lanes.index(lane)))
+
+
+def pick_rung(start: int, load: Dict[str, int]) -> int:
+    """The first rung from `start` (1-based) with a lane under RUNG_BUSY, else
+    the last rung. 0 past the last rung."""
+    if start > len(LADDER):
+        return 0
+    for rung in range(start, len(LADDER)):
+        lanes = LADDER[rung - 1][0]
+        if min(load.get(lane, 0) for lane in lanes) < RUNG_BUSY:
+            return rung
+    return len(LADDER)
 
 
 def with_model(body: str, model: str) -> str:
@@ -190,7 +206,8 @@ class Factory:
         """Put the ticket on `rung` (1-based): its Model: line and lane label,
         and a rung marker. Returns the lane, or None past the last rung."""
         number = int(issue["number"])
-        if rung > len(LADDER):
+        rung = pick_rung(rung, self.load)
+        if not rung:
             return None
         lanes, model = LADDER[rung - 1]
         lane = pick_lane(lanes, self.load)

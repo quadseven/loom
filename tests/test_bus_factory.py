@@ -240,6 +240,12 @@ class Tickets(Base):
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
         self.assertEqual(self.model(6), "claude-sonnet-5-5")
 
+    def test_failed_tickets_spread_past_a_busy_sonnet_lane(self):
+        for n in (1, 2, 3, 4):
+            self.gh.ticket(n, "failed", lane="zai")
+        self.go()
+        self.assertEqual([m[2] for m in self.moved], ["claude", "claude", "codex", "codex-2"])
+
     def test_a_failed_ticket_with_a_pull_request_gets_a_fix_brief(self):
         self.gh.ticket(6, "failed")
         self.gh.pull(60, 6, runs=(("unittest", "in_progress"),))
@@ -286,6 +292,14 @@ class Helpers(unittest.TestCase):
                          "Difficulty: hard\nModel: b\n\n## Why\nModel: x")
         self.assertEqual(factory.with_model("Difficulty: hard\n\n## Why", "b"),
                          "Model: b\nDifficulty: hard\n\n## Why")
+
+    def test_a_busy_rung_spills_to_the_next(self):
+        self.assertEqual(factory.pick_rung(1, {}), 1)
+        self.assertEqual(factory.pick_rung(1, {"claude": 2}), 2)
+        self.assertEqual(factory.pick_rung(1, {"claude": 2, "codex": 2, "codex-2": 3}), 3)
+        self.assertEqual(factory.pick_rung(2, {"codex": 0}), 2)
+        self.assertEqual(factory.pick_rung(3, {}), 3)
+        self.assertEqual(factory.pick_rung(4, {}), 0)
 
     def test_pick_lane_takes_the_least_loaded(self):
         self.assertEqual(factory.pick_lane(("codex", "codex-2"), {"codex": 2, "codex-2": 1}), "codex-2")
