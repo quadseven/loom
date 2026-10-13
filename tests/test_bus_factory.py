@@ -115,7 +115,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved = [], [], []
 
-    def go(self):
+    def go(self, limited=()):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes):
@@ -123,7 +123,7 @@ class Base(unittest.TestCase):
         def move(gh, repo, number, state, lane=None, note=None):
             self.moved.append((number, state, lane))
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
-                            merge=merge, fix=fix, move=move)
+                            merge=merge, fix=fix, move=move, limited=limited)
         f.run()
         return f
 
@@ -410,6 +410,30 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.model(7), self.model(8)), (None, None))
 
+    def test_a_ticket_briefed_on_a_lane_at_a_limit_moves_to_the_next_lane_at_once(self):
+        self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        self.go(limited=["spark"])
+        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("Not a failure (lane spark is at a limit)", note)
+        self.assertEqual(self.moved, [])
+
+    def test_a_ticket_on_a_lane_that_is_not_limited_waits_as_before(self):
+        self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        self.go(limited=["zen"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
+
+    def test_a_limited_ticket_past_the_last_rung_stays_for_its_lane(self):
+        self.gh.ticket(7, "briefed", lane="spark")
+        self.gh.comments[7].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        self.go(limited=["spark"])
+        self.assertEqual(self.lane(7), "spark")
+        self.assertEqual(self.moved, [])
+
     def test_a_pass_stops_after_its_action_cap(self):
         for n in range(1, factory.MAX_ACTIONS + 5):
             self.gh.ticket(n, "failed")
@@ -468,8 +492,8 @@ class Helpers(unittest.TestCase):
         calls = []
 
         class Fake:
-            def __init__(self, gh, repos, now, trusted, review_check):
-                calls.append((tuple(repos), tuple(trusted), review_check))
+            def __init__(self, gh, repos, now, trusted, review_check, limited):
+                calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited)))
 
             def run(self):
                 calls.append("ran")
@@ -489,7 +513,7 @@ class Helpers(unittest.TestCase):
                 st.run_factory()
         finally:
             factory.Factory = real
-        self.assertEqual(calls, [((REPO,), ("alice-example",), "Review"), "ran"])
+        self.assertEqual(calls, [((REPO,), ("alice-example",), "Review", ()), "ran"])
 
 
 if __name__ == "__main__":
