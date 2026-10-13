@@ -109,7 +109,12 @@ done
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
 # with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
-# LOOM_DIGEST_HOUR and LOOM_AWS_REGION. Runs from this checkout, like the lanes.
+# LOOM_DIGEST_HOUR, LOOM_AWS_REGION, and LOOM_DISCORD_CHANNEL_ID,
+# LOOM_DISCORD_BOT_TOKEN_SSM and LOOM_DISCORD_DEFAULT_GOAL (talking to the
+# brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
+# LOOM_ANTHROPIC_BUDGET_SINCE, LOOM_ANTHROPIC_BUDGET_EXPIRES and
+# LOOM_ANTHROPIC_FLOOR_USD (the anthropic spend line; the lanes get them with
+# every other LOOM_* setting). Runs from this checkout, like the lanes.
 LABEL="com.loom.station"
 PLIST="$AGENTS/$LABEL.plist"
 cat > "$PLIST" <<EOF
@@ -144,6 +149,13 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
+    <key>LOOM_DISCORD_CHANNEL_ID</key><string>$(xml "${LOOM_DISCORD_CHANNEL_ID:-}")</string>
+    <key>LOOM_DISCORD_BOT_TOKEN_SSM</key><string>$(xml "${LOOM_DISCORD_BOT_TOKEN_SSM:-}")</string>
+    <key>LOOM_DISCORD_DEFAULT_GOAL</key><string>$(xml "${LOOM_DISCORD_DEFAULT_GOAL:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_USD</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_USD:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_SINCE</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_SINCE:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_EXPIRES</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_EXPIRES:-}")</string>
+    <key>LOOM_ANTHROPIC_FLOOR_USD</key><string>$(xml "${LOOM_ANTHROPIC_FLOOR_USD:-}")</string>
   </dict>
 </dict>
 </plist>

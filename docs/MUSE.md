@@ -18,6 +18,11 @@ from REST APIs. Never write to a live system. When a step needs a fact no API
 serves, write what is needed on the ticket and leave it; never claim a live
 result you did not read yourself.
 
+Read and write GitHub only from the shell, through the Loom commands or the
+GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
+for GitHub or anything else in a scheduled run: each new web request asks
+the operator for approval, and the run stops until someone answers.
+
 ## The brain's job
 
 A goal is never finished until its home issue says so. Every tick moves it:
@@ -34,6 +39,14 @@ not looked hard enough yet. Each tick the brain:
   top ones, up to the goal's cap. Problems nobody has ticketed yet count:
   look at the live system for what is slow, stuck, failing or unnatural, and
   ticket it with the evidence.
+- Finishes before it starts: each tick merges every lane pull request that
+  is ready (checks green, no unresolved threads, a fix-up already pushed
+  for each finding) before it briefs anything new.
+- When a goal is at its cap, a brief that fixes a live regression on a
+  ticket already shipped may still be filed, past the cap, by setting
+  `LOOM_GOAL_CAP` to the cap plus 8 for that one brief command (until a
+  reserved regression slot exists, #102). Ordinary new work waits for the
+  cap.
 - Proves every change: a ticket is verified only when its proof shows on the
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.
@@ -61,8 +74,28 @@ tickets and pull requests like any other work.
    is held.
 2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
    each goal's latest journal.
-3. For each lane pull request, read its whole diff against its ticket and
-   acceptance criteria. A lane pull request with failing checks or
+   Then read, on each goal home, the operator notes newer than its last
+   journal: comments from an allowed login starting with
+   `<!-- loom:operator v1 discord=<message id> -->`, relayed by the station
+   from the operator's Discord channel. They are the operator's own
+   instructions and questions: act on them first, before the steps below.
+   The station files a note on the goal it names, else on a default goal, so
+   a note may really concern another goal or Loom itself: work out which
+   from its meaning, act on it there, and say where in the reply. A note
+   that is truly ambiguous gets one short question back in the reply, never
+   silence.
+   Answer each one with a comment on the same goal home, written with
+   `python3 -m bus journal OWNER/NAME#N --file REPLY.md`, whose file starts
+   with the line `<!-- loom:reply v1 discord=<message id> -->` (the same id)
+   followed by the answer: what was done, or the answer to the question.
+   The station posts it in the channel as a reply, so it must stand on its
+   own and fit in a phone message.
+3. The station's factory pass (bus/factory.py) already merges every lane
+   pull request that is green, reviewed and free of open threads, sends the
+   rest back to a lane, and moves stuck and failed tickets up the model
+   ladder, every 5 minutes, without a brain. Spend the tick on what it
+   cannot judge: for each lane pull request, read its whole diff against its
+   ticket and acceptance criteria. A lane pull request with failing checks or
    unresolved findings goes back to the lane that wrote it with
    `python3 -m bus.brain fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md`
    (FINDINGS.md says what to change; the command adds the failing check logs
@@ -75,9 +108,13 @@ tickets and pull requests like any other work.
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. Verify shipped tickets against the live system named in the ticket. Then
-   run `python3 -m bus.brain move OWNER/NAME#N --to verified`, then close the
-   ticket with `python3 -m bus.brain close OWNER/NAME#N`.
+4. Verify shipped tickets against the live system named in the ticket. Tick
+   each acceptance criterion in the ticket body only once you have seen it
+   hold, write the proof record (docs/BRAIN.md, Proof), then run
+   `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
+   and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
+   refuse a missing proof or an unchecked criterion: never invent evidence to
+   get past them; leave the ticket open and say what is missing.
 5. Handle `loom:failed` tickets. Re-brief with a sharper brief or another
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
@@ -90,22 +127,58 @@ tickets and pull requests like any other work.
    one exact ask in its body. The station forwards every open ask to the
    operator, so an ask left open is a message to the operator's phone.
 7. Fill every free lane slot with the highest-ranked work (The brain's job),
+   skipping any ticket whose `Not before:` line names a later UTC time (the
+   operator asked for it later; the station will not claim it before then,
+   and `brief --not-before` writes the line),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
-8. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
+8. Triage the backlog. For each backlog goal (the goal home of a repo whose
+   old issues Loom works on), run
+   `python3 -m bus.brain triage OWNER/NAME --goal N` (at most 25 issues a
+   run, oldest first). It skips pull requests, epics, asks and anything with
+   a `loom:` label; a ready issue (every brief section, checkboxes under
+   Acceptance criteria) becomes a `loom:queued` ticket under the goal, the
+   rest get `loom:triage` and a comment naming what is missing. Then take up
+   to 5 `loom:triage` issues and, for each, either write the ticket with
+   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
+   (M is the original; the ticket refs it, the original gets
+   `loom:rewritten` and stays open) or, when only a person can do it, run
+   `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
+   the exact thing needed: money, hardware, an account, a credential, or a
+   decision the goal home reserves for the operator. Never close an issue
+   or mark one done from triage: an old issue that looks finished stays
+   open for a person to close.
+9. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure.
    Every 2 hours per goal (when the goal's newest report is 2 hours old or
    there is none), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
-   `<!-- loom:report v1 -->` followed by the report itself. Use the format
-   the goal home asks for (for example its five report lines); without one,
-   five lines: metric changes, what moved, the top blocker, shipped and
-   verified, next. The station sends every report to the operator's phone,
-   so it must stand on its own: numbers, not references.
-9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
-   failure as well.
+   `<!-- loom:report v1 -->` followed by the report itself, written as a
+   standup the operator can read in thirty seconds on a phone:
+   - First line: one sentence on how the goal is doing since the last report
+     (better, the same, or worse, and the one number that shows it).
+   - Going well: one to three things that moved, in plain words.
+   - Not going well: one to three things that got worse or failed.
+   - Still stuck since last report: anything the previous report already
+     named as stuck or blocked and still is, with how long; say "nothing"
+     when the list is empty. Read the previous report to fill this in.
+   - Next: what the brain will do before the next report.
+   - Needs you: only what only the operator can do, or "nothing".
+   Write sentences, not ticket lists: name a ticket only where the operator
+   may want to open it, and never more than one or two per line. Numbers
+   over adjectives. A goal home may ask for extra lines; add them after
+   these. The station sends every report to the operator's phone, so it
+   must stand on its own.
+10. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
+    failure as well.
+11. End the tick's chat reply in the same standup shape as the reports
+    (one sentence on how things are going, then going well, not going
+    well, still stuck, next, needs you), across all goals. When the tick
+    posted reports, the reply uses the same words, so the Muse app and
+    Discord say the same thing. Leave out tick mechanics (usage
+    percentages, locks, restarts) unless they block a goal.
 
 ## Lane choice
 
@@ -119,6 +192,30 @@ anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each 
 ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.
+
+### Repeatedly stuck work gets a stronger model
+
+The operator, 2026-10-12: repeatedly stuck work "deserves a better model".
+A ticket or pull request is repeatedly stuck when any of these holds: it has
+failed twice; review sent it back twice; it sat briefed with no lane signal
+for 2 hours twice; or it has been stuck, failed or unmerged for more than 6
+hours. This covers every Loom task, fix briefs included. Its next attempt
+takes the lowest rung it has not tried whose lane is free (a higher rung
+rather than a wait behind a busy lane), never the model that already failed
+it, and never a free lane:
+
+1. the claude lane with `claude-sonnet-5-5`;
+2. the codex lane (or codex-2) with `gpt-6-sol`;
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
+
+The factory applies this ladder on its own (bus/factory.py, recorded as
+`<!-- loom:rung N -->` comments); do it by hand only for work the factory
+cannot see, such as a ticket with no pull request that is stuck in running.
+Set the model with the ticket's `Model:` line (`brief --model`; for a ticket
+already filed, edit the `Model:` line at the top of its body before moving
+it to briefed). Say on the ticket which rung it is on and why. Past the
+third rung, rewrite the brief smaller, or ask the operator with one exact
+ask when only the operator can unblock it.
 
 ## Rules
 
