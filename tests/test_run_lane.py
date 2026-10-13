@@ -188,6 +188,8 @@ echo '{"transcript": "the whole conversation"}' > "$HOME/.local/share/opencode/s
 # opencode 1.18 keeps sessions in SQLite.
 echo "sqlite session store" > "$HOME/.local/share/opencode/opencode.db"
 echo "sqlite wal" > "$HOME/.local/share/opencode/opencode.db-wal"
+mkdir -p "$HOME/.local/share/opencode/log"
+echo "request failed: HTTP 400" > "$HOME/.local/share/opencode/log/opencode.log"
 ln -s "$real_home/.ssh/id_planted" "$HOME/.local/share/opencode/storage/session/leak.json" 2>/dev/null
 # A link for a whole directory: .claude -> a directory outside the home.
 ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
@@ -1104,6 +1106,8 @@ cat > /dev/null
         self.assertIn("the whole conversation", files["s1.json"].read_text())
         self.assertIn("opencode.db", files)
         self.assertIn("opencode.db-wal", files)
+        self.assertIn("opencode.log", files)
+        self.assertIn("HTTP 400", files["opencode.log"].read_text())
         for p in (self.loom / "logs").rglob("*"):
             if p.is_file() and not p.is_symlink():
                 self.assertNotIn("private key", p.read_text())
@@ -1611,6 +1615,7 @@ cat > /dev/null
         self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
         self.assertEqual(provider["options"], {"baseURL": "http://spark.example.invalid:8000/v1"})
         self.assertEqual(list(provider["models"]), ["coder-test"])
+        self.assertEqual(provider["models"]["coder-test"]["limit"], {"context": 32768, "output": 4096})
         self.assertIn("lane spark, model spark/coder-test", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.spark_beat()["available"])
