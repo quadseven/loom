@@ -289,6 +289,15 @@ class JournalTests(unittest.TestCase):
         journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nx")
         self.assertTrue(t.calls[0][1].endswith("/repos/%s/issues/7/comments" % REPO))
 
+    def test_post_accepts_a_reply_to_an_operator_note(self):
+        t = Scripted(reply(201, {}))
+        gh = GitHub("tok", transport=t)
+        for bad in ("<!-- loom:reply v1 discord= -->\nx", "<!-- loom:reply v1 -->\nx"):
+            with self.assertRaises(ValueError):
+                journal.post(gh, REPO, 7, bad)
+        journal.post(gh, REPO, 7, "<!-- loom:reply v1 discord=123456789 -->\nDone.")
+        self.assertEqual(gh.requests, 1)
+
 
 class CliTests(unittest.TestCase):
     def run_cli(self, argv, transport):
