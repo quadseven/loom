@@ -35,7 +35,9 @@ say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 # agent's exit code), and state/brain-ok is touched by every tick that ended
 # well, a skip for a held lock included (another brain is acting). A tick that
 # ran the agent also records when it started and its model, so the station
-# can upload that session's transcript.
+# can upload that session's transcript. This script never uploads anything
+# itself, so it needs neither LOOM_TRANSCRIPT_URL nor LOOM_TRANSCRIPT_TOKEN_SSM,
+# and lanes/mac/install.sh deliberately keeps both out of the brain's plist.
 STATE="$LOOM_HOME/state"
 STARTED=null
 beat() {
