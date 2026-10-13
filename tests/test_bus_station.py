@@ -2143,6 +2143,35 @@ class ReportsTest(Base):
         self.go()
         self.assertEqual(len(self.sent), 1)
 
+    def test_a_pass_killed_after_a_send_does_not_send_it_again(self):
+        self.prime()
+        self.comment(40, 100, station.REPORT_MARKER + "\nfirst report")
+        self.comment(40, 101, station.REPORT_MARKER + "\nsecond report")
+
+        # The station is killed hard mid-pass: after the first report is out
+        # and before the pass writes its ledger at the end. A BaseException
+        # is not caught by _send's broad except, as a bootout kill is not.
+        class Killed(BaseException):
+            pass
+
+        def post(url, payload):
+            if self.sent:
+                raise Killed()
+            self.sent.append(payload)
+
+        self.clock += station.REPORT_CHECK + 1
+        gh = GitHub("token", transport=self.fake)
+        with self.assertRaises(Killed):
+            station.Station(gh, self.settings, now=self.clock,
+                            read_secret=lambda n, r: URL, post=post).run_pass()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("first report", self.sent[0]["content"])
+
+        # The next pass sends only the report not yet sent.
+        self.go()
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("second report", self.sent[1]["content"])
+
     def test_an_unreadable_webhook_keeps_the_read_window(self):
         self.prime()
         self.comment(40, 100, station.REPORT_MARKER + "\nreport")
