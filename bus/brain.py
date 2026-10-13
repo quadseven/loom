@@ -653,15 +653,8 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
                          % (holder, lock_repo))
 
 
-def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
-           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> str:
-    """What the lock holder may finish for other brains: the live resume items
-    on every goal, with each goal's stage owners, and whether broad GitHub
-    work is open to it under the freshness rule. Refuses unless `holder`
-    holds the lock, so only the lock holder acts on it."""
-    now = now or datetime.now(timezone.utc)
-    _lock_holder(gh, lock_repo, holder, now)
-    authors = trusted_authors(env)
+def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
+                   ) -> List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]:
     goals: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]] = []
     for repo in repos:
         for issue in _issues(gh, repo):
@@ -671,30 +664,50 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
             goals.append((repo, issue, handoff.journals(
                 [{"body": c.get("body"), "at": c.get("created_at"),
                   "login": (c.get("user") or {}).get("login")} for c in comments], authors)))
+    return goals
+
+
+def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
+                       found: List[Dict[str, Any]]) -> List[str]:
+    found_marks = handoff.marks(found)
+    items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
+    current = {m.item: item_revision(gh, *m.item) for m in items}
+    alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
+    out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
+    out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
+    for m in items:
+        if m in alive:
+            out.append("- resume %s %s (deferred by %s at %s)" % (
+                m.stage, handoff.item_ref(m.item), m.holder, m.at))
+        else:
+            out.append("- dropped %s %s: %s since the defer" % (
+                m.stage, handoff.item_ref(m.item),
+                "finished or closed" if current[m.item] is None else "changed"))
+    return out
+
+
+def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
+           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> str:
+    """What the lock holder may finish for other brains: the live resume items
+    on every goal, with each goal's stage owners, and whether broad GitHub
+    work is open to it under the freshness rule (handoff.QUIET). Refuses
+    unless `holder` holds the lock, so only the lock holder acts on it."""
+    now = now or datetime.now(timezone.utc)
+    _lock_holder(gh, lock_repo, holder, now)
+    goals = _goal_journals(gh, repos, trusted_authors(env))
     peers = handoff.peer_journals([j for _, _, found in goals for j in found], holder, now)
+    window = "%g hours" % (handoff.QUIET.total_seconds() / 3600)
     out = ["# Resume for %s" % holder, ""]
     if peers:
         newest = max(peers, key=lambda j: str(j["at"]))
-        out.append("Another brain journaled in the last 2 hours (%s at %s): outside your "
+        out.append("Another brain journaled in the last %s (%s at %s): outside your "
                    "own scope, do only the resume items below." % (
-                       handoff.journal_holder(newest) or "unnamed", newest["at"]))
+                       window, handoff.journal_holder(newest) or "unnamed", newest["at"]))
     else:
-        out.append("No other brain journaled in the last 2 hours: all GitHub stages are open to you.")
+        out.append("No other brain journaled in the last %s: all GitHub stages are open to you."
+                   % window)
     for repo, issue, found in goals:
-        found_marks = handoff.marks(found)
-        items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
-        current = {m.item: item_revision(gh, *m.item) for m in items}
-        alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
-        out += ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
-        out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
-        for m in items:
-            if m in alive:
-                out.append("- resume %s %s (deferred by %s at %s)" % (
-                    m.stage, handoff.item_ref(m.item), m.holder, m.at))
-            else:
-                out.append("- dropped %s %s: %s since the defer" % (
-                    m.stage, handoff.item_ref(m.item),
-                    "finished or closed" if current[m.item] is None else "changed"))
+        out += _goal_resume_lines(gh, repo, issue, found)
     return "\n".join(out)
 
 
