@@ -381,6 +381,18 @@ class LaneRunnerTest(unittest.TestCase):
             extra += agent.read_text().splitlines()
         return self.log.read_text().splitlines() + extra
 
+    def test_fix_items_ignores_dispositions_before_a_finding(self):
+        brief = Path(self._tmp.name) / "fix-items.md"
+        brief.write_text("## Fix\nFixed\n### Thread F1 (comment 1) at test.py:10\n"
+                         "Fixed\n### Thread F2 (comment 2) at test.py:20\n"
+                         "Fixing: example/repo#12\n")
+        script = 'source <(sed -n "/^fix_items() {/,/^}/p" "$1"); fix_items "$2"'
+        result = subprocess.run(["bash", "-c", script, "bash", str(RUNNER), str(brief)],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(),
+                         "Thread F1 (comment 1) at test.py:10 [fixed]; "
+                         "Thread F2 (comment 2) at test.py:20 [example/repo#12]")
+
     def test_brief_with_an_existing_pr_is_retired_without_running(self):
         self.drop_brief()
         result = self.run_lane(FAKE_GH_EXISTING="852")

@@ -103,15 +103,143 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
 class Fix:
     """A loom:fix comment: the lane's open pull request and what to fix on it."""
 
-    def __init__(self, pr: int, branch: str, findings: str) -> None:
+    def __init__(self, pr: int, branch: str, findings: str = "") -> None:
         self.pr = pr
         self.branch = branch
         self.findings = findings
+        self._findings_list: Optional[List[Finding]] = None
+
+    @property
+    def findings_list(self) -> List[Finding]:
+        if self._findings_list is None:
+            self._findings_list = parse_findings(self.findings)
+        return self._findings_list
+
+    def has_all_dispositions(self) -> bool:
+        """Return True if every finding carries a disposition line. A finding
+        without one stays None (undispositioned); 'does_not_apply' counts only
+        when it was stated."""
+        return all(f.disposition for f in self.findings_list)
+
+
+class Finding:
+    """A single pre-roll finding with a stable ID and disposition."""
+
+    DISPOSITIONS = ("fixed", "existing_ticket", "does_not_apply")
+    
+    def __init__(self, id: str, text: str, location: Optional[Tuple[str, int, int]] = None,
+                 disposition: Optional[str] = None, ticket: Optional[str] = None) -> None:
+        if not re.fullmatch(r"F[0-9]+", id):
+            raise ValueError("Finding ID must be F<number>")
+        if disposition is not None and disposition not in self.DISPOSITIONS:
+            raise ValueError("Disposition must be one of %s" % ", ".join(self.DISPOSITIONS))
+        self.id = id
+        self.text = text
+        self.location = location
+        self.disposition = disposition
+        self.ticket = ticket
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {"id": self.id, "text": self.text, "disposition": self.disposition}
+        if self.location:
+            result["location"] = [self.location[0], self.location[1], self.location[2]]
+        if self.ticket:
+            result["ticket"] = self.ticket
+        return result
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "Finding":
+        return Finding(
+            id=data.get("id", ""),
+            text=data.get("text", ""),
+            location=tuple(data["location"]) if "location" in data else None,
+            disposition=data.get("disposition"),
+            ticket=data.get("ticket")
+        )
+
+
+def _thread_finding(thread: Dict[str, str], comments: List[str],
+                    disposition: Optional[str], value: Optional[str]) -> Finding:
+    finding = Finding(
+        id=thread["id"],
+        text="\n".join(comments).rstrip("\n"),
+        location=(thread["path"], int(thread["line"]), int(thread["comment_id"])),
+        disposition=disposition,
+    )
+    if disposition == "existing_ticket" and value:
+        finding.ticket = value
+    return finding
+
+
+_THREAD_RE = re.compile(r"^### Thread(?: ([A-Za-z0-9]+))? \(comment ([0-9]+)\) at (.+):(\d+)$")
+
+
+def _disposition_line(stripped: str) -> Optional[Tuple[str, Optional[str]]]:
+    """The disposition a finding line states: "Fixing: <ticket>", "Fixed" or
+    "Does not apply"; None for an ordinary comment line."""
+    fixing_match = FIXING_DISPOSITION_RE.match(stripped)
+    if fixing_match:
+        return "existing_ticket", fixing_match.group(1)
+    if stripped == "Fixed":
+        return "fixed", None
+    if stripped == "Does not apply":
+        return "does_not_apply", None
+    return None
+
+
+def _thread_header(stripped: str) -> Optional[Dict[str, str]]:
+    """The thread a "### Thread" header line opens, or None for any other
+    line. Its "id" is empty when the header names none."""
+    m = _THREAD_RE.match(stripped)
+    if not m:
+        return None
+    return {"id": m.group(1) or "", "comment_id": m.group(2),
+            "path": m.group(3), "line": m.group(4)}
+
+
+def _append_thread(findings: List[Finding], thread: Optional[Dict[str, str]],
+                   comments: List[str], disposition: Optional[Tuple[str, Optional[str]]]) -> None:
+    if thread:
+        kind, value = disposition or (None, None)
+        findings.append(_thread_finding(thread, comments, kind, value))
+
+
+def parse_findings(body: str) -> List[Finding]:
+    """Parse findings from a loom:fix comment body.
+
+    Each "### Thread [<id>] (comment <id>) at <path>:<line>" header starts a
+    finding; a header without an ID gets the next F<number>. A finding
+    without a disposition line remains undispositioned.
+    """
+    findings: List[Finding] = []
+    current_thread: Optional[Dict[str, str]] = None
+    current_comments: List[str] = []
+    disposition: Optional[Tuple[str, Optional[str]]] = None
+    next_id = 1
+
+    for line in body.split("\n"):
+        stripped = line.strip()
+        header = _thread_header(stripped)
+        if header:
+            _append_thread(findings, current_thread, current_comments, disposition)
+            if not header["id"]:
+                header["id"] = "F%d" % next_id
+                next_id += 1
+            current_thread, current_comments, disposition = header, [], None
+        elif current_thread:
+            stated = _disposition_line(stripped)
+            if stated:
+                disposition = stated
+            else:
+                current_comments.append(line)
+    _append_thread(findings, current_thread, current_comments, disposition)
+    return findings
 
 
 FIX_MARKER = "<!-- loom:fix v1 -->"
 FIX_PR_RE = re.compile(r"Pull request: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+), "
                        r"branch (loom/[A-Za-z0-9._/-]+)[ \t]*")
+FIXING_DISPOSITION_RE = re.compile(r"^Fixing: (.+)$")
 # Lines in the findings the runner could read as a brief header or a section
 # of the ticket get indented, which makes them plain quoted text.
 _FIX_UNSAFE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Difficulty|Fix-PR):|#{1,2} ")
@@ -132,6 +260,40 @@ def parse_fix(repo: str, body: Optional[str]) -> Fix:
     return Fix(int(m.group(2)), m.group(3), "\n".join(rest).strip("\n"))
 
 
+def render_findings(findings: List[Finding]) -> str:
+    """Render findings with their dispositions for a loom:fix comment.
+    
+    Format:
+    ### Thread <id> (comment <id>) at <path>:<line>
+    <comment text>
+    <comment text>
+    <disposition line if any>
+    """
+    lines = []
+    for f in findings:
+        lines.append("### Thread %s (comment %s) at %s:%s" % (
+            f.id, f.location[2] if f.location else "?",
+            f.location[0] if f.location else "?",
+            f.location[1] if f.location else "?"))
+        for line in f.text.split("\n"):
+            lines.append(line)
+        if f.disposition:
+            if f.disposition == "existing_ticket" and not f.ticket:
+                raise ValueError("finding %s has existing_ticket with no ticket" % f.id)
+            line = {"existing_ticket": "Fixing: %s" % f.ticket, "fixed": "Fixed",
+                    "does_not_apply": "Does not apply"}.get(f.disposition, "")
+            # The line must read back as this disposition and ticket, or the
+            # record would silently say something other than what was decided.
+            ticket = f.ticket if f.disposition == "existing_ticket" else None
+            if _disposition_line(line) != (f.disposition, ticket) or (f.ticket and not ticket):
+                raise ValueError("finding %s has disposition %s with ticket %s, which "
+                                 "its disposition line cannot carry"
+                                 % (f.id, f.disposition, f.ticket))
+            lines.append(line)
+        lines.append("")
+    return "\n".join(lines).strip("\n")
+
+
 # How a fix brief's agent answers a finding it judges invalid. The runner
 # moves the folder out of the tree (lanes/run_lane.sh keep_answers) and the
 # station posts each answer on its thread (bus/station.py).
@@ -146,7 +308,7 @@ ANSWER_NOTE = (
 
 
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
-                 fix: Optional[Fix] = None) -> str:
+                  fix: Optional[Fix] = None) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -160,6 +322,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     ]
     if fix:
         out.append("Fix-PR: %d" % fix.pr)
+        for f in fix.findings_list:
+            # Flatten review text so it cannot introduce a brief header or section.
+            # The Finding-<id> prefix also prevents a field() match in the runner.
+            summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
+            out.append("Finding-%s: %s" % (f.id, summary))
     out += ["%s: %s" % (k, v) for k, v in headers.items() if k != "Not before"]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
