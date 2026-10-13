@@ -8,6 +8,7 @@ take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
 from __future__ import annotations
 
 import calendar
+import errno
 import fcntl
 import hashlib
 import json
@@ -283,7 +284,11 @@ def _read_answer(path: str) -> str:
     unless it is a regular file with one link (never followed through a link)."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+    except OSError as err:
+        # ELOOP is O_NOFOLLOW refusing a link, which is the point; anything
+        # else (permissions, I/O) is worth a line in the log.
+        if err.errno not in (errno.ENOENT, errno.ELOOP):
+            _say("could not read answer %s: %s" % (os.path.basename(path), err))
         return ""
     with os.fdopen(fd, "rb") as fh:
         st = os.fstat(fh.fileno())
@@ -770,11 +775,20 @@ class Station:
             return
         asked = set(factory.FIX_THREAD_RE.findall(brief))
         strong = self._field(brief, "Model") in STRONG_MODELS
-        for entry in entries:
-            m = ANSWER_FILE_RE.match(entry)
-            if m and m.group(1) in asked:
-                self._answer(repo, pr, lane, m.group(1), os.path.join(folder, entry), strong)
-        shutil.rmtree(folder, ignore_errors=True)
+        try:
+            for entry in entries:
+                m = ANSWER_FILE_RE.match(entry)
+                if not (m and m.group(1) in asked):
+                    continue
+                try:
+                    self._answer(repo, pr, lane, m.group(1), os.path.join(folder, entry), strong)
+                except GitHubError as err:
+                    # One thread's failure must not stop the rest, and the
+                    # report must still be recorded: a retried report would
+                    # post the answers already posted a second time.
+                    _say("answer to %s on %s#%d failed: %s" % (m.group(1), repo, pr, err))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
 
     def _answer(self, repo: str, pr: int, lane: str, thread_id: str, path: str,
                 strong: bool) -> None:
@@ -793,7 +807,13 @@ class Station:
         root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
         settled = strong and _bot_minor(root, self.s.review_bot)
         if settled:
-            self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
+            try:
+                self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
+            except GitHubError as err:
+                # The reply is posted; an open thread is read by the factory
+                # as a finding that survived, which is the safe side.
+                settled = False
+                _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
         _say("posted lane %s's answer on %s#%d thread %s%s" % (
             lane, repo, pr, thread_id, " and resolved it" if settled else ""))
 

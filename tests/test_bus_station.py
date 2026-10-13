@@ -52,6 +52,7 @@ class FakeGitHub:
         self.goals = []
         self.goal_error = False
         self.threads = {}
+        self.reply_fails = set()
         self.replies = []
         self.resolved = []
 
@@ -150,6 +151,8 @@ class FakeGitHub:
     def _graphql(self, data):
         query, variables = data["query"], data.get("variables") or {}
         if "addPullRequestReviewThreadReply" in query:
+            if variables["id"] in self.reply_fails:
+                return reply(502, {"message": "bad gateway"})
             self.replies.append((variables["id"], variables["body"]))
             return reply(200, {"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "c"}}}})
         if "resolveReviewThread" in query:
@@ -700,6 +703,19 @@ class AnswerTest(Base):
         self.assertNotIn("ghp_", body)
         self.assertNotIn("/Users/", body)
         self.assertIn("<redacted>", body)
+
+    def test_one_failed_reply_neither_stops_the_others_nor_repeats_on_the_next_pass(self):
+        self.thread("PRRT_abcd1")
+        self.thread("PRRT_abcd2")
+        self.fake.reply_fails.add("PRRT_abcd1")
+        fix = THREAD_FIX + "\n### Thread PRRT_abcd2 (comment 6) at a.py:4\n\n    medium finding\n"
+        name = self.finish({"PRRT_abcd1": "Not valid.", "PRRT_abcd2": "Not valid either."},
+                           fix_body=fix)
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd2"])
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.run_pass()
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd2"])
 
     def test_an_answer_file_that_is_a_link_is_not_read(self):
         self.thread()
