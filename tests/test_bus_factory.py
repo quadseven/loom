@@ -12,6 +12,8 @@ from bus.tickets import FIX_MARKER
 
 REPO = "example-org/example-repo"
 NOW = 2_000_000_000.0
+ME = {"login": "alice-example"}
+STRANGER = {"login": "mallory-example"}
 
 
 def iso(seconds_ago):
@@ -29,7 +31,7 @@ class FakeGitHub:
         self.writes = []
 
     def ticket(self, number, state, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
-        self.issues[number] = {"number": number, "state": "open", "body": body,
+        self.issues[number] = {"number": number, "state": "open", "body": body, "user": ME,
                                "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state},
                                           {"name": "lane:" + lane}]}
         self.comments[number] = []
@@ -40,7 +42,7 @@ class FakeGitHub:
              updated=3600):
         sha = "sha%d" % number
         self.pulls[number] = {
-            "number": number, "state": "open", "draft": False, "body": "",
+            "number": number, "state": "open", "draft": False, "body": "", "user": ME,
             "head": {"ref": "loom/%d-some-title" % ticket, "sha": sha,
                      "repo": {"full_name": REPO}},
             "base": {"repo": {"full_name": REPO}},
@@ -84,7 +86,7 @@ class FakeGitHub:
             if m.group(2) == "/labels":
                 self.issues[number]["labels"] = [{"name": x} for x in body["labels"]]
             elif m.group(2) == "/comments":
-                self.comments[number].append({"body": body["body"], "created_at": iso(0)})
+                self.comments[number].append({"body": body["body"], "created_at": iso(0), "user": ME})
             elif method == "PATCH":
                 self.issues[number]["body"] = body["body"]
         return Response(200, {})
@@ -106,7 +108,8 @@ class Base(unittest.TestCase):
             self.fixed.append((number, ticket, gh.issues[ticket[1]]["labels"][:]))
         def move(gh, repo, number, state, lane=None, note=None):
             self.moved.append((number, state, lane))
-        f = factory.Factory(self.gh, [REPO], NOW, merge=merge, fix=fix, move=move)
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
+                            merge=merge, fix=fix, move=move)
         f.run()
         return f
 
@@ -133,14 +136,18 @@ class PullRequests(Base):
         self.go()
         self.assertEqual((self.merged, self.fixed), ([], []))
 
-    def test_it_waits_for_the_review_on_a_fresh_push_and_not_forever(self):
+    def test_it_never_merges_without_the_review_on_the_head_commit(self):
         self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5, runs=(("unittest", "completed"),), updated=60)
+        for updated in (60, factory.REVIEW_GRACE + 60):
+            self.gh.pull(50, 5, runs=(("unittest", "completed"),), updated=updated)
+            self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_an_unreviewed_failing_pull_request_still_goes_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False, runs=(("unittest", "completed"),))
         self.go()
-        self.assertEqual(self.merged, [])
-        self.gh.pull(50, 5, runs=(("unittest", "completed"),), updated=factory.REVIEW_GRACE + 60)
-        self.go()
-        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
 
     def test_unknown_mergeability_waits(self):
         self.gh.ticket(5, "pr")
@@ -158,7 +165,7 @@ class PullRequests(Base):
 
     def test_a_second_send_back_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
-        self.gh.comments[5].append({"body": FIX_MARKER + "\nfirst round"})
+        self.gh.comments[5].append({"body": FIX_MARKER + "\nfirst round", "user": ME})
         self.gh.pull(50, 5, green=False)
         self.go()
         self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
@@ -175,7 +182,7 @@ class PullRequests(Base):
 
     def test_the_rungs_go_sonnet_then_sol_then_opus(self):
         self.gh.ticket(5, "pr")
-        self.gh.comments[5].append({"body": FIX_MARKER})
+        self.gh.comments[5].append({"body": FIX_MARKER, "user": ME})
         seen = []
         for _ in range(3):
             self.gh.pull(50, 5, resolved=False)
@@ -188,7 +195,7 @@ class PullRequests(Base):
 
     def test_past_the_last_rung_it_is_left_failed_for_the_brain(self):
         self.gh.ticket(5, "pr")
-        self.gh.comments[5] += [{"body": FIX_MARKER}, {"body": factory.RUNG_MARKER % 3}]
+        self.gh.comments[5] += [{"body": FIX_MARKER, "user": ME}, {"body": factory.RUNG_MARKER % 3, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual(self.fixed, [])
@@ -200,6 +207,30 @@ class PullRequests(Base):
         self.gh.pulls[51] = dict(self.gh.pulls[50], number=51, head={"ref": "feature/x"})
         self.go()
         self.assertEqual((self.merged, self.fixed), ([], []))
+
+
+class Trust(Base):
+    def test_a_strangers_ticket_or_pull_request_is_never_touched(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5]["user"] = STRANGER
+        self.gh.pull(50, 5)
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6)
+        self.gh.pulls[60]["user"] = STRANGER
+        self.gh.ticket(7, "failed")
+        self.gh.issues[7]["user"] = STRANGER
+        self.go()
+        self.assertEqual((self.merged, self.fixed, self.moved), ([], [], []))
+
+    def test_a_strangers_rung_or_fix_comment_does_not_move_the_ladder(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5] += [{"body": FIX_MARKER, "user": STRANGER},
+                                {"body": factory.RUNG_MARKER % 3, "user": STRANGER}]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        # Treated as a first send-back on its own lane, not past the last rung.
+        self.assertEqual(len(self.fixed), 1)
+        self.assertEqual((self.lane(5), self.model(5)), ("codex", None))
 
 
 class Tickets(Base):
@@ -219,7 +250,7 @@ class Tickets(Base):
 
     def test_a_failed_ticket_past_the_last_rung_is_left_alone(self):
         self.gh.ticket(6, "failed")
-        self.gh.comments[6].append({"body": factory.RUNG_MARKER % 3})
+        self.gh.comments[6].append({"body": factory.RUNG_MARKER % 3, "user": ME})
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
@@ -235,7 +266,7 @@ class Tickets(Base):
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
                               "created_at": iso(factory.BRIEFED_STALL + 600)}]
         self.gh.comments[7].append({"body": "Claimed for lane codex (body sha256 0123456789ab)",
-                                    "created_at": iso(600)})
+                                    "created_at": iso(600), "user": ME})
         self.gh.ticket(8, "briefed")
         self.gh.events[8] = [{"event": "labeled", "label": {"name": "loom:briefed"},
                               "created_at": iso(600)}]
@@ -264,7 +295,22 @@ class Helpers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertTrue(factory.due(d, NOW))
             self.assertFalse(factory.due(d, NOW + 10))
+            self.assertFalse(factory.due(d, NOW - 10), "a clock stepped back still waits")
             self.assertTrue(factory.due(d, NOW + factory.FACTORY_CHECK + 1))
+            # A stored time far in the future does not shut the factory out.
+            self.assertTrue(factory.due(d, NOW - 10 * factory.FACTORY_CHECK))
+
+    def test_check_runs_are_read_across_pages(self):
+        gh = FakeGitHub()
+        pages = {1: [{"name": "c%d" % i, "status": "completed"} for i in range(100)],
+                 2: [{"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed"}]}
+
+        def rest(method, path, body=None, etag=None, ok=()):
+            page = int(re.search(r"page=(\d+)$", path).group(1))
+            return Response(200, {"check_runs": pages.get(page, [])})
+        gh.rest = rest
+        f = factory.Factory(gh, [REPO], NOW, trusted=["alice-example"])
+        self.assertEqual(f._review_state(REPO, 1, "sha", NOW), "reviewed")
 
     def test_the_station_setting_turns_it_off(self):
         self.assertFalse(station.Settings.from_env({"LOOM_FACTORY": "0"}).factory_on)
@@ -277,8 +323,8 @@ class Helpers(unittest.TestCase):
         calls = []
 
         class Fake:
-            def __init__(self, gh, repos, now, review_check):
-                calls.append((tuple(repos), review_check))
+            def __init__(self, gh, repos, now, trusted, review_check):
+                calls.append((tuple(repos), tuple(trusted), review_check))
 
             def run(self):
                 calls.append("ran")
@@ -287,7 +333,7 @@ class Helpers(unittest.TestCase):
         factory.Factory = Fake
         try:
             with tempfile.TemporaryDirectory() as home:
-                settings = station.Settings(home, [REPO, "not a repo"], [], [],
+                settings = station.Settings(home, [REPO, "not a repo"], ["alice-example"], [],
                                             factory_on=True, review_check="Review")
                 st = station.Station(FakeGitHub(), settings, now=NOW)
                 os.makedirs(st.state, exist_ok=True)
@@ -298,7 +344,7 @@ class Helpers(unittest.TestCase):
                 st.run_factory()
         finally:
             factory.Factory = real
-        self.assertEqual(calls, [((REPO,), "Review"), "ran"])
+        self.assertEqual(calls, [((REPO,), ("alice-example",), "Review"), "ran"])
 
 
 if __name__ == "__main__":

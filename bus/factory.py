@@ -10,6 +10,8 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   (LOOM_REVIEW_CHECK) has run on its head commit, and that is mergeable,
   green and free of unresolved threads is merged with bus.brain.merge (all
   of that function's own checks apply), and its ticket moves to loom:merged.
+  Without the review check on its head commit it is never merged: every
+  change is reviewed (the operator's rule), so it waits for the brain.
 - One with a failing check, an unresolved thread or a conflict goes back to
   a lane as a fix brief (bus.brain.fix). The first send-back of a young pull
   request stays on the ticket's lane. Every later one, and any pull request
@@ -20,6 +22,12 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
 survives restarts and any brain can read where a ticket stands.
+
+Trust: the factory acts only on tickets and pull requests opened by a
+LOOM_BRIEF_AUTHORS login, and reads rung, fix and claim comments only from
+those logins. On a public repo anyone can comment; a stranger's comment must
+not move a ticket up or down the ladder, and a stranger's issue must not be
+turned into a trusted brief by the factory editing it.
 """
 
 from __future__ import annotations
@@ -37,8 +45,8 @@ from .tickets import FIX_MARKER
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
-# A head commit with no review check this long after its push is treated as
-# reviewed, so a repo without the review bot is not held forever.
+# A head commit with no review check this long after its push is logged once
+# per pass as waiting on a review that may never come; it is never merged.
 REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
@@ -122,6 +130,7 @@ def with_model(body: str, model: str) -> str:
 
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
+                 trusted: Sequence[str] = (),
                  review_check: str = DEFAULT_REVIEW_CHECK,
                  merge: Callable[..., Any] = brain.merge,
                  fix: Callable[..., Any] = brain.fix,
@@ -129,32 +138,52 @@ class Factory:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
+        self.trusted = {t.lower() for t in trusted}
         self.review_check = review_check
         self.merge, self.fix, self.move = merge, fix, move
         self.actions = 0
         self.load: Dict[str, int] = {}
 
     # -- reads -----------------------------------------------------------
+    def _trusted(self, item: Dict[str, Any]) -> bool:
+        login = str((item.get("user") or {}).get("login") or "").lower()
+        return bool(login) and login in self.trusted
+
     def _tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         data = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return {int(i["number"]): i for i in data
-                if isinstance(i, dict) and "pull_request" not in i and "number" in i}
+                if isinstance(i, dict) and "pull_request" not in i and "number" in i
+                and self._trusted(i)}
 
     def _comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
+        """The ticket's comments from trusted logins only."""
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        return [c for c in data if isinstance(c, dict)]
+        return [c for c in data if isinstance(c, dict) and self._trusted(c)]
 
-    def _review_state(self, repo: str, sha: str, pushed_at: float) -> str:
-        """"wait" while any check runs or the review has not run on this
-        commit; else "done"."""
-        data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
-                            % (repo, sha)).data or {}
-        runs = [r for r in data.get("check_runs") or [] if isinstance(r, dict)]
+    def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
+        """Every check run on the commit, all pages."""
+        runs: List[Dict[str, Any]] = []
+        for page in range(1, 11):
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
+                                % (repo, sha, page)).data or {}
+            batch = [r for r in data.get("check_runs") or [] if isinstance(r, dict)]
+            runs += batch
+            if len(batch) < 100:
+                break
+        return runs
+
+    def _review_state(self, repo: str, number: int, sha: str, pushed_at: float) -> str:
+        """"wait" while any check runs; "reviewed" once the review check has
+        run on this commit; else "unreviewed", which never merges."""
+        runs = self._check_runs(repo, sha)
         if any(r.get("status") != "completed" for r in runs):
             return "wait"
         if any(r.get("name") == self.review_check for r in runs):
-            return "done"
-        return "done" if self.now - pushed_at > REVIEW_GRACE else "wait"
+            return "reviewed"
+        if self.now - pushed_at > REVIEW_GRACE:
+            _say("%s#%d has no %s on its head commit; it waits for the brain"
+                 % (repo, number, self.review_check))
+        return "unreviewed"
 
     # -- writes ----------------------------------------------------------
     def _climb(self, repo: str, issue: Dict[str, Any], rung: int, why: str) -> Optional[str]:
@@ -200,41 +229,55 @@ class Factory:
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
     # -- the three kinds of stuck ----------------------------------------
+    def _lane_pr_ticket(self, repo: str, pr: Dict[str, Any],
+                        tickets: Dict[int, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The loom:pr ticket of a trusted, non-draft lane pull request."""
+        if pr.get("draft") or not self._trusted(pr):
+            return None
+        if not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
+            return None
+        association = self._association(repo, pr)
+        issue = tickets.get(association[1]) if association else None
+        return issue if issue is not None and _state(issue) == "pr" else None
+
+    def _association(self, repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+        try:
+            return brain._ticket_association(repo, pr)
+        except ValueError as err:
+            _say("no ticket for %s#%s: %s" % (repo, pr.get("number"), err))
+            return None
+
     def pull_request(self, repo: str, pr: Dict[str, Any],
                      tickets: Dict[int, Dict[str, Any]]) -> None:
-        if pr.get("draft") or not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
-            return
-        try:
-            association = brain._ticket_association(repo, pr)
-        except ValueError:
-            return
-        issue = tickets.get(association[1]) if association else None
-        if issue is None or _state(issue) != "pr":
+        issue = self._lane_pr_ticket(repo, pr, tickets)
+        if issue is None:
             return
         number = int(pr["number"])
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
-        if self._review_state(repo, sha, _ts(full.get("updated_at"))) == "wait":
+        review = self._review_state(repo, number, sha, _ts(full.get("updated_at")))
+        if review == "wait":
             return
         details = brain._pr_graphql(self.gh, repo, number)
-        green = brain._checks_green(details)
-        resolved = brain._threads_resolved(details)
-        if full.get("mergeable") is True and green and resolved:
-            try:
-                self.merge(self.gh, repo, number, (repo, int(issue["number"])))
-            except (ValueError, GitHubError) as err:
-                _say("did not merge %s#%d: %s" % (repo, number, err))
-                return
-            self.actions += 1
-            _say("merged %s#%d for #%d" % (repo, number, issue["number"]))
+        faults = [w for bad, w in ((not brain._checks_green(details), "failing checks"),
+                                   (not brain._threads_resolved(details), "open review threads"),
+                                   (full.get("mergeable") is False, "a conflict")) if bad]
+        if faults:
+            self._send_back(repo, full, issue, self._comments(repo, int(issue["number"])),
+                            ", ".join(faults))
+        elif review == "reviewed":
+            self._merge(repo, number, issue)
+
+    def _merge(self, repo: str, number: int, issue: Dict[str, Any]) -> None:
+        try:
+            self.merge(self.gh, repo, number, (repo, int(issue["number"])))
+        except (ValueError, GitHubError) as err:
+            _say("did not merge %s#%d: %s" % (repo, number, err))
             return
-        why = ", ".join(w for ok, w in ((not green, "failing checks"),
-                                        (not resolved, "open review threads"),
-                                        (full.get("mergeable") is False, "a conflict"))
-                        if ok) or "not mergeable"
-        self._send_back(repo, full, issue, self._comments(repo, int(issue["number"])), why)
+        self.actions += 1
+        _say("merged %s#%d for #%d" % (repo, number, issue["number"]))
 
     def failed(self, repo: str, issue: Dict[str, Any],
                prs: Dict[int, Dict[str, Any]]) -> None:
@@ -281,35 +324,29 @@ class Factory:
 
     # -- the pass --------------------------------------------------------
     def run(self) -> None:
-        tickets = {}
+        tickets = {repo: self._tickets(repo) for repo in self.repos}
+        for issue in (i for found in tickets.values() for i in found.values()):
+            if _state(issue) in ("briefed", "running"):
+                self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
         for repo in self.repos:
-            tickets[repo] = self._tickets(repo)
-            for issue in tickets[repo].values():
-                if _state(issue) in ("briefed", "running"):
-                    self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
-        for repo in self.repos:
-            prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
-                   if isinstance(p, dict)]
-            linked: Dict[int, Dict[str, Any]] = {}
-            for pr in prs:
-                try:
-                    association = brain._ticket_association(repo, pr)
-                except ValueError:
-                    continue
-                if association:
-                    linked[association[1]] = pr
-            for pr in prs:
-                if self.actions >= MAX_ACTIONS:
-                    return
-                self._guarded(self.pull_request, repo, pr, tickets[repo])
-            for issue in list(tickets[repo].values()):
-                if self.actions >= MAX_ACTIONS:
-                    return
-                state = _state(issue)
-                if state == "failed":
-                    self._guarded(self.failed, repo, issue, linked)
-                elif state == "briefed":
-                    self._guarded(self.briefed, repo, issue)
+            self._repo_pass(repo, tickets[repo])
+
+    def _repo_pass(self, repo: str, tickets: Dict[int, Dict[str, Any]]) -> None:
+        # GitHub.paginate asks for 100 a page and follows every page.
+        prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+               if isinstance(p, dict) and self._trusted(p)]
+        linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
+        for pr in prs:
+            if self.actions >= MAX_ACTIONS:
+                return
+            self._guarded(self.pull_request, repo, pr, tickets)
+        steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed}
+        for issue in list(tickets.values()):
+            step = steps.get(_state(issue))
+            if self.actions >= MAX_ACTIONS:
+                return
+            if step is not None:
+                self._guarded(step, repo, issue)
 
     @staticmethod
     def _guarded(step: Callable[..., None], repo: str, item: Dict[str, Any], *rest: Any) -> None:
@@ -317,7 +354,8 @@ class Factory:
         try:
             step(repo, item, *rest)
         except (GitHubError, ValueError, KeyError, TypeError) as err:
-            _say("%s on %s#%s failed: %s" % (step.__name__, repo, item.get("number"), err))
+            _say("%s on %s#%s failed: %s" % (getattr(step, "__name__", "step"), repo,
+                                             item.get("number"), err))
 
 
 def due(state_dir: str, now: float) -> bool:
@@ -328,7 +366,10 @@ def due(state_dir: str, now: float) -> bool:
             last = float(json.load(fh).get("ran", 0))
     except (OSError, ValueError, AttributeError, TypeError):
         last = 0.0
-    if 0 <= now - last < FACTORY_CHECK:
+    # A small negative age (the clock stepped back) still waits; a stored time
+    # far in the future (a clock that was wrong) is ignored, so the factory
+    # is never shut out until that time comes round.
+    if -FACTORY_CHECK < now - last < FACTORY_CHECK:
         return False
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:

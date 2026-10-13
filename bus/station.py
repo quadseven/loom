@@ -1493,7 +1493,8 @@ class Station:
         if not self.s.factory_on or not factory.due(self.state, self.now):
             return
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
-        factory.Factory(self.gh, repos, self.now, review_check=self.s.review_check).run()
+        factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                        review_check=self.s.review_check).run()
 
     def run_pass(self) -> None:
         self.finish_claims()
