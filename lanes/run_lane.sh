@@ -2,7 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
-#                               | zen | zai | workersai | agy
+#                               | zen | zai | workersai | agy | spark
 #                               | <lane>-<n> (an extra slot of that lane)
 #
 # A slot such as anthropic-2 is a second copy of the anthropic lane: its own
@@ -33,9 +33,11 @@
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CHECK_TIMEOUT (seconds per validation step, default 1800; see
 # load_contract for the repo's .loom/validation.conf),
-# LOOM_CLONE_BASE (default git@github.com:), and for the anthropic lanes
+# LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
-# (docs/LANES.md, "Anthropic spend").
+# (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
+# (the OpenAI-compatible base URL of the local vLLM coder, e.g.
+# http://your-spark.internal:8000/v1; no key).
 set -uo pipefail
 
 SLOT="${1:?usage: run_lane.sh <lane>}"
@@ -321,6 +323,66 @@ agy_agent() {
 $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
 }
 
+# The spark lane: a vLLM coder on a machine of the operator's own, serving
+# one stream at a time behind a thermal guard that refuses new connections
+# (or answers 503) while the box is hot. That is a limit, not a failure: the
+# lane says unavailable for LIMIT_HOLD seconds, and every brief it holds is
+# parked with a "limit:" reason, which the station hands to the next lane.
+LIMIT_HOLD=900
+LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
+SPARK_URL="${LOOM_SPARK_URL:-}"
+SPARK_PROBE_TIMEOUT=15
+LIMITED=""
+LIMIT_WHY=""
+
+utc_at() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
+
+# Ask the endpoint for its models. 0: it answered; 1: refused or 503, with
+# LIMIT_WHY set; 2: no answer for another reason, with READY_REASON set.
+spark_probe() {
+  local code status
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
+  status=$?
+  if [ "$status" -eq 7 ]; then LIMIT_WHY="the spark endpoint refused the connection"; return 1; fi
+  if [ "$code" = 503 ]; then LIMIT_WHY="the spark endpoint answered 503"; return 1; fi
+  [ "$status" -eq 0 ] && return 0
+  READY_REASON="the spark endpoint did not answer (curl exit $status)"
+  return 2
+}
+
+# Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
+mark_limit() {
+  LIMIT_UNTIL=$(( $(date +%s) + LIMIT_HOLD ))
+  mkdir -p "$LOOM_HOME/state/usage"
+  printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
+  LIMITED=1
+  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc_at "$LIMIT_UNTIL")"
+  heartbeat false "$READY_REASON"
+}
+
+# A limit recorded by an earlier pass that has not run out. A time further
+# ahead than LIMIT_HOLD (a clock that was wrong) is ignored.
+limit_held() {
+  local ends why now
+  read -r ends why < "$LIMIT_FILE" 2>/dev/null || return 1
+  now="$(date +%s)"
+  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
+  LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
+  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc_at "$LIMIT_UNTIL")"
+}
+
+spark_ready() {
+  [[ "$SPARK_URL" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] ||
+    { READY_REASON="LOOM_SPARK_URL is not set to an http(s) base URL"; return 1; }
+  limit_held && return 1
+  spark_probe
+  case $? in
+    0) return 0 ;;
+    1) mark_limit; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
 # opencode runs helper agents (session titles) on its own default small model,
 # which can be a paid one; pin every opencode model to the lane's model so the
 # free lane stays free and the subscription lane stays in its catalogue. The
@@ -330,8 +392,13 @@ opencode_config() {
   # MODEL already passed the allowlist; refuse JSON-breaking characters here too.
   # shellcheck disable=SC1003 # matching a literal backslash
   case "$MODEL" in *'"'*|*'\'*) echo "refusing model with a quote or backslash" >&2; return 1 ;; esac
+  # The spark lane's provider is the local endpoint, declared here: an
+  # OpenAI-compatible provider named spark at LOOM_SPARK_URL (checked in
+  # spark_ready), serving the one model after "spark/". No key.
+  local provider="" id="${MODEL#spark/}"
+  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\"}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
-}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"}"
+}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"$provider}"
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
@@ -383,14 +450,20 @@ load_contract() {
   case "$C_SUBMODULES" in yes|no) ;; *) SETUP_REASON="$CONTRACT_FILE submodules: must be yes or no"; return 1 ;; esac
   [ -z "$C_INTERP" ] || [[ "$C_INTERP" =~ ^[A-Za-z0-9._+-]+$ ]] ||
     { SETUP_REASON="$CONTRACT_FILE interpreter: must be a command name"; return 1; }
-  # setup and check are shell by design (like a CI run: step), so their content
-  # is trusted as the base branch's; what is pinned is the shape: one line of
-  # printable ASCII, of bounded length, so no control byte or odd encoding
-  # hides part of the command from the record, the log or a reader.
   for val in "$C_SETUP" "$C_CHECK"; do
-    [ "${#val}" -le 1000 ] && [ -z "$(printf '%s' "$val" | LC_ALL=C tr -d ' -~')" ] ||
+    contract_command_ok "$val" ||
       { SETUP_REASON="$CONTRACT_FILE setup: and check: must be printable ASCII, at most 1000 characters"; return 1; }
   done
+}
+
+# setup and check are shell by design (like a CI run: step), so their content
+# is trusted as the base branch's; what is pinned is the shape: one line of
+# printable ASCII, of bounded length, so no control byte or odd encoding
+# hides part of the command from the record, the log or a reader.
+# load_contract applies it when reading the file, and contract_run again
+# right before bash -c, so no caller can hand it an unchecked string.
+contract_command_ok() {
+  [ "${#1}" -le 1000 ] && [ -z "$(printf '%s' "$1" | LC_ALL=C tr -d ' -~')" ]
 }
 
 # One line of $RECORD per step: phase, command, exit code, the tree revision
@@ -413,9 +486,11 @@ record() {
 # runner's HOME, keys or SSH agent. Output goes through a pipe to the log.
 # The command passed to bash -c is deliberately shell syntax: load_contract
 # reads it from the base branch's trusted CI contract, never the agent's
-# branch, and rejects hidden control bytes before this call.
+# branch, and contract_command_ok refuses (exit 125, nothing run) any string
+# that is not one bounded line of printable ASCII.
 contract_run() {
   local profile
+  contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   profile="$(AGENT_HOME="$CHECK_HOME" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
   # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
   (
@@ -568,7 +643,7 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark) return 0 ;; esac
   return 1
 }
 
@@ -641,6 +716,7 @@ run_agent() {
     openrouter) opencode_config && api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     opencode-go) opencode_config && api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     zen) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
+    spark) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
     zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_config && api_agent CLOUDFLARE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
@@ -692,14 +768,14 @@ lane_ready() {
     return
   fi
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai) cli=opencode ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark) cli=opencode ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
-  case "$LANE" in zen) return 0 ;; esac
+  case "$LANE" in zen) return 0 ;; spark) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
@@ -763,9 +839,11 @@ LANE_ACCOUNT=""
 READY_REASON=""
 if ! lane_ready; then
   heartbeat false "$READY_REASON"
-  exit 0
+  # A limited lane still passes over its inbox, to hand every brief on.
+  [ -n "$LIMITED" ] || exit 0
+else
+  heartbeat true ""
 fi
-heartbeat true ""
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
@@ -781,6 +859,7 @@ for BRIEF in "$INBOX"/*.md; do
   if ! [[ "$TICKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
     park "$BRIEF" "ticket name must be letters, digits, dot, underscore or dash"; continue
   fi
+  if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY"; continue; fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -814,6 +893,8 @@ for BRIEF in "$INBOX"/*.md; do
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
     zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
     workersai:cloudflare-workers-ai/@cf/*) ;;
+    spark:spark/?*) ;;
+    spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
     agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
     agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
@@ -899,6 +980,11 @@ for BRIEF in "$INBOX"/*.md; do
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  # A spark run that ended because the box went hot is a limit, not a failure.
+  if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
+    mark_limit
+    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)"; continue
+  fi
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
