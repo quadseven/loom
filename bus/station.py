@@ -1104,7 +1104,9 @@ class Station:
                 made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                                     {"body": page["body"]}).data
             except GitHubError as err:
-                _say("could not post the digest page in %s: %s; next pass" % (repo, err))
+                # Leave the fixed plan pending; forward_asks has already sent urgent asks.
+                _say("daily digest pending: could not post its page in %s: %s; next pass"
+                     % (repo, err))
                 return False
             # A successful HTTP status can still carry an unusable reply.
             url = made.get("html_url") if isinstance(made, dict) else None

@@ -1173,9 +1173,13 @@ class AsksTest(Base):
         trusted = self.add_many()
         self.fake.add_ask(9, title="Breaking now", urgent=True)
         self.fake.page_error = True
-        self.go()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.go()
         self.assertEqual([p["content"] for _, p in self.sent],
                          ["Urgent ask: Breaking now https://github.com/%s/issues/9" % REPO])
+        self.assertIn("daily digest pending: could not post its page", out.getvalue())
+        self.assertIn("pending", self.ledger())
         self.fake.page_error = False
         self.go(NOON + 60)
         self.assertEqual(len(self.sent), 2)
