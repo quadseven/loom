@@ -1310,18 +1310,22 @@ def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes
     return reasons
 
 
+def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
+    """The rungs a ticket ran on, from rung markers by a trusted login only,
+    as in the factory: anyone can comment on a public repo."""
+    from . import factory  # factory imports this module
+    trusted = {a.lower() for a in authors}
+    return factory.tried_rungs([c for c in comments if isinstance(c, dict) and str(
+        (c.get("user") or {}).get("login") or "").lower() in trusted])
+
+
 def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
              authors: Sequence[str] = ()) -> History:
-    from . import factory  # factory imports this module
     number = int(issue["number"])
     events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
     bodies = _bodies(comments)
-    # Only a trusted login's rung marker counts, as in the factory: anyone
-    # can comment on a public repo.
-    trusted = {a.lower() for a in authors}
-    rungs = factory.tried_rungs([c for c in comments if isinstance(c, dict) and str(
-        (c.get("user") or {}).get("login") or "").lower() in trusted])
+    rungs = _trusted_rungs(comments, authors)
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
