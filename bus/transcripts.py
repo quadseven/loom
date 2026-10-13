@@ -9,7 +9,9 @@ parser the local viewer uses. Every text is scrubbed before it leaves the
 machine: key shapes become [redacted], the run's worktree becomes ".", and
 any other absolute path becomes <path> (bus/scrub.py). Each event is
 capped at EVENT_MAX characters and the body at BODY_MAX bytes of JSON, which
-drops the oldest tool results first.
+drops the oldest tool results first. The JSON is ASCII (json.dumps escapes
+every other character, here and in the station's post), so its length in
+characters is its length in bytes.
 """
 from __future__ import annotations
 
@@ -108,7 +110,8 @@ def fit(body: Dict[str, Any], limit: int = BODY_MAX) -> Dict[str, Any]:
     """Drop events, oldest tool results first, then the oldest of the rest,
     until the body's JSON is at most `limit` bytes."""
     events = body["events"]
-    # json.dumps separates list items with ", ".
+    # json.dumps separates list items with ", ". Its output is ASCII (the
+    # default ensure_ascii, as in station._post_json), so len() counts bytes.
     sizes = [len(json.dumps(e)) + 2 for e in events]
     total = len(json.dumps(dict(body, events=[]))) + sum(sizes)
     if total <= limit:

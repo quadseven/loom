@@ -205,6 +205,15 @@ class Limits(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(body)), transcripts.BODY_MAX)
         self.assertEqual(sum(e["kind"] == "tool_use" for e in body["events"]), 600)
 
+    def test_the_cap_counts_bytes_of_non_ascii_text(self):
+        events = [{"ts": "t", "role": "assistant", "kind": "text", "text": "\u00e9\u4e2d" * 500}
+                  for _ in range(10)]
+        full = transcripts.make_body("T", "s", "m", "done", None, None, events)
+        limit = len(json.dumps(full).encode("utf-8")) - 100
+        body = transcripts.fit(dict(full), limit=limit)
+        self.assertLess(len(body["events"]), 10)
+        self.assertLessEqual(len(json.dumps(body).encode("utf-8")), limit)
+
 
 class BrainTick(Fixture):
     def test_a_brain_tick_reads_its_new_sessions_and_its_log_lines(self):

@@ -1665,7 +1665,10 @@ class Station:
 
     def _finished_runs(self) -> Dict[str, Any]:
         """Every finished run by its ledger key, the last brain tick included."""
-        runs: Dict[str, Any] = {"%s/%s" % (r[0], r[3]): r for r in self._finished_briefs()}
+        runs: Dict[str, Any] = {}
+        for run in self._finished_briefs():
+            lane, _kind, _brief, name = run  # the key report_outcomes uses
+            runs["%s/%s" % (lane, name)] = run
         tick = self._brain_tick()
         if tick is not None:
             runs[tick[0]] = tick[1]
