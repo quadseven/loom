@@ -636,6 +636,14 @@ class Station:
         match = ref or branch
         return int(match.group(1)) if match else None
 
+    @staticmethod
+    def _terminal_label(pr: dict) -> Optional[str]:
+        if bool(pr.get("merged_at")) or pr.get("merged") is True:
+            return "loom:merged"
+        if pr.get("state") == "closed":
+            return "loom:closed-unmerged"
+        return None
+
     def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict) -> None:
         number = self._pr_ticket_number(repo, pr)
         ticket = tickets_by_number.get(number) if number is not None else None
@@ -644,10 +652,7 @@ class Station:
         labels = _label_names(ticket)
         if any(state in labels for state in ("loom:merged", "loom:shipped", "loom:verified")):
             return
-        merged = bool(pr.get("merged_at")) or pr.get("merged") is True
-        target = "loom:merged" if merged else None
-        if not merged and pr.get("state") == "closed":
-            target = "loom:closed-unmerged"
+        target = self._terminal_label(pr)
         if target is None or target in labels:
             return
         state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
