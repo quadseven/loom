@@ -125,7 +125,7 @@ class Fix:
 class Finding:
     """A single pre-roll finding with a stable ID and disposition."""
 
-    DISPOSITIONS = ("fixed", "existing_ticket", "new_ticket", "does_not_apply")
+    DISPOSITIONS = ("fixed", "existing_ticket", "does_not_apply")
     
     def __init__(self, id: str, text: str, location: Optional[Tuple[str, int, int]] = None,
                  disposition: Optional[str] = None, ticket: Optional[str] = None) -> None:
@@ -197,6 +197,13 @@ def _thread_header(stripped: str) -> Optional[Dict[str, str]]:
             "path": m.group(3), "line": m.group(4)}
 
 
+def _append_thread(findings: List[Finding], thread: Optional[Dict[str, str]],
+                   comments: List[str], disposition: Optional[Tuple[str, Optional[str]]]) -> None:
+    if thread:
+        kind, value = disposition or (None, None)
+        findings.append(_thread_finding(thread, comments, kind, value))
+
+
 def parse_findings(body: str) -> List[Finding]:
     """Parse findings from a loom:fix comment body.
 
@@ -210,16 +217,11 @@ def parse_findings(body: str) -> List[Finding]:
     disposition: Optional[Tuple[str, Optional[str]]] = None
     next_id = 1
 
-    def close_thread() -> None:
-        if current_thread:
-            kind, value = disposition or (None, None)
-            findings.append(_thread_finding(current_thread, current_comments, kind, value))
-
     for line in body.split("\n"):
         stripped = line.strip()
         header = _thread_header(stripped)
         if header:
-            close_thread()
+            _append_thread(findings, current_thread, current_comments, disposition)
             if not header["id"]:
                 header["id"] = "F%d" % next_id
                 next_id += 1
@@ -230,7 +232,7 @@ def parse_findings(body: str) -> List[Finding]:
                 disposition = stated
             else:
                 current_comments.append(line)
-    close_thread()
+    _append_thread(findings, current_thread, current_comments, disposition)
     return findings
 
 
@@ -276,6 +278,8 @@ def render_findings(findings: List[Finding]) -> str:
         for line in f.text.split("\n"):
             lines.append(line)
         if f.disposition:
+            if f.disposition == "existing_ticket" and not f.ticket:
+                raise ValueError("finding %s has existing_ticket with no ticket" % f.id)
             line = {"existing_ticket": "Fixing: %s" % f.ticket, "fixed": "Fixed",
                     "does_not_apply": "Does not apply"}.get(f.disposition, "")
             # The line must read back as this disposition and ticket, or the
@@ -306,7 +310,10 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if fix:
         out.append("Fix-PR: %d" % fix.pr)
         for f in fix.findings_list:
-            out.append("Finding-%s: %s" % (f.id, " ".join(f.text.split())[:200]))
+            # Flatten review text so it cannot introduce a brief header or section.
+            # The Finding-<id> prefix also prevents a field() match in the runner.
+            summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
+            out.append("Finding-%s: %s" % (f.id, summary))
     out += ["%s: %s" % (k, v) for k, v in headers.items() if k != "Not before"]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"

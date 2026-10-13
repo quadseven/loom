@@ -5,7 +5,6 @@
 Implemented a system to track dispositions for every pre-roll finding before a ship handoff. Findings now have stable IDs and can be marked as:
 - fixed
 - existing_ticket (linked to an existing ticket)
-- new_ticket (will be created)
 - does_not_apply (finding doesn't apply)
 
 ### Changes Made
@@ -13,8 +12,8 @@ Implemented a system to track dispositions for every pre-roll finding before a s
 #### 1. bus/tickets.py
 - Added `Finding` class with:
   - `id`: stable ID (F1, F2, etc.)
-  - `disposition`: one of ("fixed", "existing_ticket", "new_ticket", "does_not_apply")
-  - `ticket`: for existing/new tickets
+  - `disposition`: one of ("fixed", "existing_ticket", "does_not_apply")
+  - `ticket`: for existing tickets
   - `location`: (path, line, comment_id)
 - Added `parse_findings()` function to parse findings from loom:fix comments
 - Added `render_findings()` function to render findings with dispositions
