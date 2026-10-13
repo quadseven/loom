@@ -124,7 +124,15 @@ is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
 pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
-back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+back. A ready pull request that changes a code file (by extension: `.py`,
+`.js`, `.ts`, `.tsx`, `.jsx`, `.css`, `.cpp`, `.h`, `.hpp`, `.go`, `.rs`,
+`.sh`, `.lua`, `.sql`) and no test file (a `test` or `tests` folder in its
+path, or `test_`, `_test.`, `.test.` or `.spec.` in its name) goes back
+asking for a test that fails without the change, instead of landing; that
+round climbs only if the next one still adds no test. A repo with no test
+harness opts out in `LOOM_NO_TEST_REPOS` (space separated `OWNER/NAME`), and
+a ticket whose body has the line `Tests: none needed (<reason>)` skips the
+check. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
