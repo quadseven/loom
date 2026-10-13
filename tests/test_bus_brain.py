@@ -108,6 +108,11 @@ class BrainTests(unittest.TestCase):
         self.assertEqual((led["report"], led["state"], led["due"]),
                          ("2030-01-01T19:58:00Z", "ok", "2030-01-01T21:58:00Z"))
 
+    def test_goal_without_any_stamp_is_unknown_not_young(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        led = brain.goal_ledger({"number": 4}, {"comments": {"nodes": []}}, now)
+        self.assertEqual((led["state"], led["due"]), ("unknown", None))
+
     def test_report_deadline_changes_state_at_due_and_grace(self):
         last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
         due = last + brain.timedelta(seconds=brain.REPORT_EVERY)

@@ -130,10 +130,10 @@ def _comment_kinds(body: str) -> List[str]:
     return kinds
 
 
-def _report_deadline(last: Optional[datetime], now: datetime) -> Tuple[datetime, str]:
+def _report_deadline(last: datetime, now: datetime) -> Tuple[datetime, str]:
     """The next report deadline counted from `last`, and whether it is ok,
     due, or overdue at `now`."""
-    due = (last or now) + timedelta(seconds=REPORT_EVERY)
+    due = last + timedelta(seconds=REPORT_EVERY)
     if now >= due + timedelta(seconds=REPORT_GRACE):
         return due, "overdue"
     if now >= due:
@@ -173,6 +173,10 @@ def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
         for kind in _comment_kinds(body):
             seen[kind] = max(seen.get(kind, ""), at)
     last = _stamp(seen.get("report", "")) or _stamp(str(issue.get("created_at") or ""))
+    if last is None:
+        # No report and no creation stamp: the deadline cannot be counted, and
+        # counting it from now would make an ancient goal look young.
+        return dict(seen, due=None, state="unknown")
     due, state = _report_deadline(last, now)
     return dict(seen, due=_iso(due), state=state)
 
@@ -189,9 +193,10 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                          issue["number"], issue.get("title", ""),
                          led.get("journal", "none"), led.get("report", "none"),
                          led.get("measure", "none"), led.get("action", "none"),
-                         led["state"], led["due"]))
+                         led["state"], led["due"] or "unknown"))
         if led["state"] != "ok":
-            owed.append("- #%s report %s since %s" % (issue["number"], led["state"].upper(), led["due"]))
+            owed.append("- #%s report %s since %s" % (
+                issue["number"], led["state"].upper(), led["due"] or "an unknown time"))
         comments = (node.get("comments") or {}).get("nodes") or []
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
