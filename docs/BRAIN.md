@@ -49,7 +49,10 @@ that talks to GitHub about tickets.
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
-| `loom:verified` | The brain verified it live; the ticket is then closed. |
+| `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
+| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
+| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Refs #<number>`. The issue stays open. |
+| `loom:human` | Only a person can do this; one comment names the exact thing needed (money, hardware, an account, a credential, a decision reserved for the operator). |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -95,6 +98,57 @@ keyword. The station checks those references and the conventional branch
 number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
+
+## Triage
+
+`python3 -m bus.brain triage <owner/name> --goal N [--limit 25]` walks the
+repo's open issues oldest first and labels at most `--limit` of them. It
+skips pull requests, epics (an `epic` label or sub-issues), `needs-operator`
+asks and anything with a `loom:` label. A ready issue (Why, What,
+Acceptance criteria with checkboxes, Size and Out of scope, and a body the
+runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
+of goal N, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
+for a later run. Any other issue gets `loom:triage` and one comment naming
+what is missing. Triage writes labels, sub-issue links and that comment
+only: it never closes, retitles or edits an issue, because an automated
+pass over old issues over-calls work as done.
+
+## Proof
+
+A ticket moves to `loom:verified` only with a proof record, and closes as
+completed only with one that still holds; a `not_planned` closure needs none.
+The record is JSON, passed with `move --to verified --proof PROOF.json`:
+
+```json
+{
+  "kind": "runtime",
+  "revision": "<commit SHA on the default branch that is deployed>",
+  "environment": "<where it runs, e.g. production>",
+  "artifact": "<what was deployed, e.g. an image digest>",
+  "observed": {"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T01:00:00Z"},
+  "measure": {"name": "<metric>", "baseline": "<before>", "target": "<goal>", "after": "<observed>"},
+  "sources": ["<log line, dashboard or check run that shows it>"],
+  "criteria": [{"criterion": "<acceptance criterion, verbatim>", "result": "pass", "evidence": "<what showed it>"}]
+}
+```
+
+`kind` is `runtime` or `docs`. Documentation-only work uses `docs`, which
+needs only `revision` (the default-branch commit that carries it),
+`observed`, `sources` and `criteria`, and may be verified once merged;
+runtime work is verified only once shipped. The move refuses when:
+
+- a required field is missing or empty, or `revision` is not a commit on the
+  repo's default branch;
+- `criteria` is not the ticket's acceptance criteria, verbatim and in order,
+  each with `pass` and evidence;
+- any acceptance criterion checkbox in the ticket body is unchecked.
+
+The move posts the record as a `<!-- loom:proof v1 -->` comment with a hash
+of the criteria texts (not their check marks), then sets the label.
+`close` refuses a completed closure unless the ticket is `loom:verified`,
+every criterion is checked, and the newest proof comment from a
+`LOOM_BRIEF_AUTHORS` login matches the criteria as they are now. Rewording,
+adding or removing a criterion after the proof means verifying again.
 
 ## Trust
 
