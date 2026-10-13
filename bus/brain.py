@@ -840,6 +840,8 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
 
 def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
                    ) -> List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]:
+    # Nothing is caught here: a GitHubError ends the command through main's
+    # narrow handler, so a fault never reads as a goal with no journals.
     goals: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]] = []
     for repo in repos:
         for issue in _issues(gh, repo):
