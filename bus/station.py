@@ -665,6 +665,8 @@ class Station:
 
     @staticmethod
     def _terminal_label(pr: dict) -> Optional[str]:
+        # The pulls list endpoint carries merged_at only; merged appears on
+        # the single-PR endpoint, so both are accepted.
         if bool(pr.get("merged_at")) or pr.get("merged") is True:
             return "loom:merged"
         if pr.get("state") == "closed":

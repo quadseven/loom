@@ -225,7 +225,8 @@ class Base(unittest.TestCase):
 class ReconcilePullRequestTest(Base):
     def test_merged_pr_repairs_failed_ticket_label_once(self):
         self.fake.add(12, state="pr")
-        self.fake.pulls = [{"number": 99, "state": "closed", "merged": True,
+        # The list endpoint reconciliation reads returns merged_at, never merged.
+        self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
                             "body": "Refs %s#12" % REPO,
                             "head": {"ref": "loom/12-fix-the-thing"}}]
@@ -273,7 +274,7 @@ class ReconcilePullRequestTest(Base):
 
     def test_closed_unmerged_pr_gets_distinct_disposition(self):
         self.fake.add(12, state="pr")
-        self.fake.pulls = [{"number": 99, "state": "closed", "merged": False,
+        self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": None,
                             "body": "Refs %s#12" % REPO,
                             "head": {"ref": "loom/12-fix-the-thing"}}]
