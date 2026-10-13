@@ -98,8 +98,13 @@ if [ "$SCOPE" = live ]; then
 REST APIs, but has no cluster or database access. Do only what needs this \
 machine: ships and rolls where a goal's rules make them the brain's, and \
 checks or measurements that need cluster or database access; put what you \
-find on the ticket. Review, merge, brief and answer asks only when no other \
-brain has journaled on any goal in the last 2 hours."
+find on the ticket. Before any measurement, run timeout 120 python3 -m bus.brain \
+resume \$LOOM_REPOS --holder $HOLDER --lock-repo $LOCK_REPO (it walks every goal on GitHub, so a stall must not eat the tick) and finish every resume item it lists: work \
+another brain yielded, yours however fresh its journals are. Spend at most \
+$((MINUTES / 3)) minutes on them. Review, merge, brief and answer asks beyond \
+those items only when resume says all GitHub stages are open to you (no other \
+brain journaled in the last 2 hours). Defer and done markers go in your \
+journal as MUSE.md says."
 fi
 
 STARTED="$(date +%s)"

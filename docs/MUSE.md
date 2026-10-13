@@ -40,8 +40,8 @@ not looked hard enough yet. Each tick the brain:
   look at the live system for what is slow, stuck, failing or unnatural, and
   ticket it with the evidence.
 - Finishes before it starts: each tick merges every lane pull request that
-  is ready (checks green, no unresolved threads, a fix-up already pushed
-  for each finding) before it briefs anything new.
+  `bus.brain status` marks `READY` (the merge-ready signal in
+  docs/BRAIN.md) before it briefs anything new.
 - When a goal is at its cap, a brief that fixes a live regression on a
   ticket already shipped may still be filed, past the cap, by setting
   `LOOM_GOAL_CAP` to the cap plus 8 for that one brief command (until a
@@ -68,12 +68,37 @@ tickets and pull requests like any other work.
   is already open; add the new evidence there instead.
 - Review the other brains' Loom pull requests like any lane PR.
 
+## Handing off stage work
+
+Every brain may stop short: out of budget, out of time, or out of scope.
+Work it leaves must not wait for that brain's next tick while it keeps
+journaling, so stage work is handed off per goal and stage, not by who
+journaled last. The stages are `review`, `merge`, `failed` (re-brief or
+close a `loom:failed` ticket), `ask` and `regression` (admit a brief for a
+live regression).
+
+- Defer: for each item ready for a stage that you leave undone this tick,
+  run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
+  after your last write on the item, and put the line it prints in your
+  journal. That yields the stage to the next brain holding the lock.
+- Done: for each stage action you finish (a merge, a re-brief or close of a
+  failed ticket, an answered ask, an admitted regression), put the line
+  from `python3 -m bus.brain done OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
+  in your journal.
+- The newest marker for an item wins, and `resume` drops a defer whose
+  item was closed or changed since (new commits, new comments, another
+  state), so no brain repeats finished work. `status` shows, per goal and
+  stage, the brain that last held it and its last done action.
+- Only the lock holder acts: `resume` refuses for anyone else.
+
 ## Tick
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
    is held.
 2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and
-   each goal's latest journal.
+   each goal's latest journal. Each lane pull request's line ends in `READY`
+   or `blocked:` and its blockers; take that verdict as given rather than
+   re-deriving it from the review list.
    Then read, on each goal home, the operator notes newer than its last
    journal: comments from an allowed login starting with
    `<!-- loom:operator v1 discord=<message id> -->`, relayed by the station
@@ -90,6 +115,12 @@ tickets and pull requests like any other work.
    followed by the answer: what was done, or the answer to the question.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
+   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
+   refuses unless you hold the lock. Each `resume` line it prints is stage
+   work another brain yielded (Handing off stage work): finish those items
+   first, before measuring anything or starting new work, under the same
+   rules as the steps below (a merge still needs a ready pull request).
+   Spend at most a third of the tick on them; defer what is left again.
 3. The station's factory pass (bus/factory.py) already merges every lane
    pull request that is green, reviewed and free of open threads, sends the
    rest back to a lane, and moves stuck and failed tickets up the model
@@ -152,7 +183,7 @@ tickets and pull requests like any other work.
 9. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
-   goal's measure.
+   goal's measure, then the defer and done lines (Handing off stage work).
    Every 2 hours per goal (when the goal's newest report is 2 hours old or
    there is none), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line

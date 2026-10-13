@@ -189,6 +189,12 @@ class BrainTickTest(unittest.TestCase):
         _, calls = self.tick(LOOM_BRAIN_SCOPE="live")
         claude = [c for c in calls if c.startswith("claude ")][0]
         self.assertIn("Do only what needs this machine", claude)
+        # Finish-work comes first and is bounded; the freshness rule no longer
+        # holds back work another brain yielded.
+        # resume checks the tick's own lock, not the parser's default repo.
+        self.assertIn("run timeout 120 python3 -m bus.brain resume $LOOM_REPOS --holder lane-machine "
+                      "--lock-repo example/loom", claude)
+        self.assertIn("Spend at most 13 minutes on them", claude)
         _, calls = self.tick()
         claude = [c for c in calls if c.startswith("claude ")][-1]
         self.assertNotIn("Do only what needs this machine", claude)
