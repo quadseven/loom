@@ -39,6 +39,10 @@ ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
+# A lane tree (lanes/run_lane.sh clones one a brief attempt) whose brief is no
+# longer waiting or running is removed once it is this old. On 2026-10-13 the
+# 385 left behind held 7.8 GB and the disk filled.
+TREE_KEEP = 3600
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
@@ -1708,12 +1712,57 @@ class Station:
                         review_bot=self.s.review_bot,
                         limited=self.limited_lanes()).run()
 
+    def prune_trees(self) -> None:
+        """Remove lane trees whose brief is no longer in a lane inbox (waiting
+        or running) and that have not changed for TREE_KEEP seconds. A
+        finished run's log stays in logs/; its tree is a clone the next
+        attempt makes again."""
+        root = os.path.join(self.s.home, "worktrees")
+        try:
+            names = os.listdir(root)
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
+            return
+        live = set()
+        for lane in LANES:
+            try:
+                live |= {e[:-3] for e in os.listdir(self.inbox(lane)) if e.endswith(".md")}
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                # An inbox that cannot be read may hold a running brief:
+                # remove nothing rather than a tree still in use.
+                _say("cannot list lane %s's inbox, so no lane tree is removed: %s" % (lane, err))
+                return
+        removed = 0
+        for name in names:
+            path = os.path.join(root, name)
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot stat lane tree %s: %s" % (name, err))
+                continue
+            if name in live or self.now - st.st_mtime < TREE_KEEP:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+            removed += 1
+        if removed:
+            _say("removed %d finished lane tree(s)" % removed)
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
-                     self.watch_brain, self.relay_operator, self.run_factory):
+                     self.watch_brain, self.relay_operator, self.run_factory,
+                     self.prune_trees):
             try:
                 step()
             except (GitHubError, OSError) as err:

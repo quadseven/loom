@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -621,6 +622,53 @@ class FixTest(Base):
         self.assertEqual(self.fake.comments[99], [])
 
 
+class PruneTest(Base):
+    def tree(self, name, age):
+        path = os.path.join(self.home, "worktrees", name)
+        os.makedirs(os.path.join(path, ".git"))
+        self.write(os.path.join(path, "a.py"), "x\n")
+        old = time.time() - age
+        os.utime(path, (old, old))
+        return path
+
+    def test_a_finished_lane_tree_is_removed_and_a_live_or_fresh_one_kept(self):
+        done = self.tree("example.repo-1", station.TREE_KEEP + 60)
+        running = self.tree("example.repo-2", station.TREE_KEEP + 60)
+        fresh = self.tree("example.repo-3", 60)
+        self.write(self.inbox("codex", "example.repo-2.md"), "brief\n")
+        self.run_pass()
+        self.assertFalse(os.path.exists(done))
+        self.assertTrue(os.path.exists(running))
+        self.assertTrue(os.path.exists(fresh))
+
+    def test_an_unreadable_inbox_stops_the_prune(self):
+        done = self.tree("example.repo-1", station.TREE_KEEP + 60)
+        unreadable = self.inbox("claude")
+        real = os.listdir
+
+        def listdir(path="."):
+            # Raised directly, not by chmod, which a root runner ignores.
+            if path == unreadable:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path)
+
+        with mock.patch.object(station.os, "listdir", listdir):
+            self.run_pass()
+        self.assertTrue(os.path.exists(done))
+
+    def test_a_link_in_the_worktrees_folder_is_removed_without_following_it(self):
+        outside = os.path.join(self._tmp.name, "keep-me")
+        os.makedirs(outside)
+        self.write(os.path.join(outside, "f"), "x\n")
+        root = os.path.join(self.home, "worktrees")
+        os.makedirs(root)
+        link = os.path.join(root, "example.repo-9")
+        os.symlink(outside, link)
+        old = time.time() - station.TREE_KEEP - 60
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.run_pass()
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(os.path.exists(os.path.join(outside, "f")))
 BOT = {"__typename": "Bot", "login": "grug-tribe"}
 THREAD_FIX = FIX_BODY + "\n### Thread PRRT_abcd1 (comment 5) at a.py:3\n\n    medium finding\n"
 
