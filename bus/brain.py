@@ -236,6 +236,33 @@ def _regression_comment(repo: str, goal: int, count: int, cap: int, evidence: st
                       evidence.strip(), ""])
 
 
+def _check_regressable(issue: Dict[str, Any]) -> None:
+    names = _labels(issue)
+    if "loom:ticket" not in names or not ("loom:shipped" in names or "loom:verified" in names):
+        raise ValueError("only a shipped or verified ticket can regress")
+    if issue.get("state") != "open" and issue.get("state_reason") == "not_planned":
+        raise ValueError("a ticket closed as not planned cannot regress")
+
+
+def _check_regression_slot(others: List[Dict[str, Any]], cap: int) -> None:
+    count = len(others)
+    held = any(REGRESSION in _labels(c) for c in others)
+    if count >= cap and (held or count > cap):
+        raise ValueError("goal already has %d tickets in flight (cap %d) and its "
+                         "regression slot is %s" % (count, cap, "taken" if held else "past the cap"))
+
+
+def _rebrief_regression(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
+                        lane: str, body: str) -> None:
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+    kept = _moved_labels(_labels(issue), "briefed", lane)
+    if REGRESSION not in kept:
+        kept.append(REGRESSION)
+    if issue.get("state") != "open":
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+
+
 def regress(gh: GitHub, repo: str, goal: int, number: int, lane: str, evidence: str) -> str:
     """Send a shipped ticket that regressed live back to a lane. Each goal has
     one slot past its cap for this, held while a loom:regression ticket is in
@@ -245,28 +272,15 @@ def regress(gh: GitHub, repo: str, goal: int, number: int, lane: str, evidence: 
     if not any(int(c.get("number", 0)) == number for c in children):
         raise ValueError("ticket is not a sub-issue of the goal")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
-    names = _labels(issue)
     url = str(issue.get("html_url", ""))
-    if REGRESSION in names and _in_flight(issue):
+    if REGRESSION in _labels(issue) and _in_flight(issue):
         return "%s already admitted as a regression" % url
-    if "loom:ticket" not in names or not ("loom:shipped" in names or "loom:verified" in names):
-        raise ValueError("only a shipped or verified ticket can regress")
-    if issue.get("state") != "open" and issue.get("state_reason") == "not_planned":
-        raise ValueError("a ticket closed as not planned cannot regress")
+    _check_regressable(issue)
     others = [c for c in children if int(c.get("number", 0)) != number and _in_flight(c)]
     count, cap = len(others), goal_cap()
-    held = any(REGRESSION in _labels(c) for c in others)
-    if count >= cap and (held or count > cap):
-        raise ValueError("goal already has %d tickets in flight (cap %d) and its "
-                         "regression slot is %s" % (count, cap, "taken" if held else "past the cap"))
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-            {"body": _regression_comment(repo, goal, count, cap, evidence)})
-    kept = _moved_labels(names, "briefed", lane)
-    if REGRESSION not in kept:
-        kept.append(REGRESSION)
-    if issue.get("state") != "open":
-        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
-    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+    _check_regression_slot(others, cap)
+    _rebrief_regression(gh, repo, number, issue, lane,
+                        _regression_comment(repo, goal, count, cap, evidence))
     return "%s re-briefed for lane %s as a regression (%d in flight, cap %d)" % (
         url, lane, count + 1, cap)
 
