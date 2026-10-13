@@ -620,7 +620,7 @@ class LaneRunnerTest(unittest.TestCase):
         checkout = self.operator_skills()
         inbox, seen = self.anthropic_skill_run()
         self.assertEqual(len(seen), 3, self.calls())
-        for folder, line in zip((".claude/skills", ".agents/skills", ".config/opencode/skills"), seen):
+        for folder, line in zip((".claude/skills", ".agents/skills", ".config/opencode/skills"), seen, strict=True):
             self.assertIn(f"skills {folder} ", line)
             self.assertIn("impeccable v1,", line)
             self.assertIn("tdd v1,", line)
