@@ -335,6 +335,25 @@ class ClaimTest(Base):
         self.assertEqual([c["body"] for c in self.fake.comments[12]],
                          ["Claimed for lane codex (body sha256 %s)" % sha])
 
+    def test_a_ticket_held_by_not_before_waits(self):
+        self.fake.add(12, body="Not before: 2099-01-01T00:00:00Z\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:briefed", self.fake.names(12))
+
+    def test_a_ticket_past_its_not_before_is_claimed_without_the_line(self):
+        self.fake.add(12, body="Not before: 2000-01-01T00:00:00Z\n" + BODY)
+        self.run_pass()
+        name = "example-owner.example-repo-12"
+        self.assertEqual(self.listing(), [name + ".md"])
+        with open(self.inbox("codex", name + ".md")) as fh:
+            self.assertNotIn("Not before", fh.read())
+
+    def test_a_malformed_not_before_is_refused(self):
+        self.fake.add(12, body="Not before: tomorrow\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+
     def test_the_oldest_trusted_ticket_wins_and_untrusted_ones_are_skipped(self):
         self.fake.add(5, author="stranger", created="2030-01-01T00:00:00Z")
         self.fake.add(9, created="2030-01-03T00:00:00Z")
@@ -541,6 +560,39 @@ class FixTest(Base):
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+
+    def failed_fix(self, log_lines, fix_body=FIX_BODY):
+        self.fake.add(12, state="running")
+        self.fake.comments[99] = []
+        fix = tickets.parse_fix(REPO, fix_body) if fix_body else None
+        name = tickets.ticket_name(REPO, 12, 2)
+        self.write(self.inbox("codex", "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 2, fix))
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"), "\n".join(log_lines) + "\n")
+        self.run_pass()
+
+    def test_a_fix_with_nothing_to_change_asks_for_a_new_review_not_a_failure(self):
+        self.failed_fix([
+            "[2030-01-01T00:00:00Z] example-owner.example-repo-12-r2 start, lane codex",
+            "I didn't change any code: commit abc1234 already fixed this finding.",
+            "The thread is stale; /Users/example/x.py measures 5.",
+            "rsync(1): error: opencode: (l)stat: No such file or directory",
+            "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: agent made no commit on loom/12-fix-the-thing"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        said, again = [c["body"] for c in self.fake.comments[99]]
+        self.assertTrue(said.startswith("Lane codex made no change for this fix. It said:\n\n> I didn't"))
+        self.assertIn("> The thread is stale; <path> measures 5.", said)
+        self.assertNotIn("rsync", said)
+        self.assertNotIn("start, lane", said)
+        self.assertEqual(again, station.REVIEW_AGAIN)
+        self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
+
+    def test_a_plain_brief_with_no_commit_still_fails(self):
+        self.failed_fix([
+            "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"],
+            fix_body=None)
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertEqual(self.fake.comments[99], [])
 
 
 class RefusalTest(Base):
@@ -1005,6 +1057,7 @@ class ReportsTest(Base):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0]["content"], "Goal title\nFive report lines\nhttps://github.com/%s/issues/40#issuecomment-100" % REPO)
         self.assertEqual(self.sent[0]["allowed_mentions"], {"parse": []})
+        self.assertEqual(self.sent[0]["flags"], station.SUPPRESS_EMBEDS)
 
     def test_untrusted_and_journal_comments_are_ignored(self):
         self.prime()
@@ -1216,11 +1269,16 @@ class FakeDiscord:
         self.calls = []
         self.sent = []
         self.reactions = []
+        self.threads = []
+        self.in_thread = []
         self.fail_post = False
+        self.fail_thread = False
 
-    def add(self, ident, content, author=OPERATOR, bot=False):
+    def add(self, ident, content, author=OPERATOR, bot=False, attachments=()):
         self.messages.append({"id": str(ident), "content": content,
-                              "author": {"id": author, "bot": bot}})
+                              "author": {"id": author, "bot": bot},
+                              "attachments": [{"url": u, "filename": "f.png"}
+                                              for u in attachments]})
 
     def __call__(self, method, path, token, body):
         assert token == BOT_TOKEN
@@ -1237,7 +1295,16 @@ class FakeDiscord:
             if self.fail_post:
                 raise station.DiscordError("discord POST answered 500")
             self.sent.append(body)
-            return {"id": "1"}
+            return {"id": str(1000 + len(self.sent))}
+        m = re.match(r"/channels/555/messages/(\d+)/threads$", path)
+        if method == "POST" and m:
+            if self.fail_thread:
+                raise station.DiscordError("discord POST answered 403")
+            self.threads.append((m.group(1), body))
+            return {"id": "9001"}
+        if method == "POST" and path == "/channels/9001/messages":
+            self.in_thread.append(body)
+            return {"id": "9002"}
         raise AssertionError("unexpected discord call %s %s" % (method, path))
 
 
@@ -1288,6 +1355,7 @@ class OperatorTest(Base):
         self.assertIn("%s#41" % REPO, ack["content"])
         self.assertEqual(ack["message_reference"]["message_id"], mine)
         self.assertEqual(ack["allowed_mentions"], {"parse": []})
+        self.assertEqual(ack["flags"], station.SUPPRESS_EMBEDS)
 
     def test_a_message_the_text_checks_refuse_is_not_noted(self):
         self.say(2, "%s#41 this fixes #3" % REPO)
@@ -1380,6 +1448,7 @@ class OperatorTest(Base):
                          "%s/issues/40#issuecomment-900" % REPO)
         self.assertEqual(sent["message_reference"]["message_id"], "777")
         self.assertEqual(sent["allowed_mentions"], {"parse": [], "replied_user": True})
+        self.assertEqual(sent["flags"], station.SUPPRESS_EMBEDS)
 
     def test_a_failed_reply_is_sent_on_a_later_pass(self):
         self.go()
@@ -1439,3 +1508,110 @@ class OperatorTest(Base):
             "LOOM_DISCORD_DEFAULT_GOAL": "a/b#3"})
         self.assertEqual((s.channel_id, s.bot_token_ssm, s.default_goal),
                          ("555", "/x/bot", "a/b#3"))
+
+    def test_attachments_are_linked_in_the_note(self):
+        shot = "https://cdn.example.com/attachments/1/2/shot.png"
+        mine = self.say(1, "#40 change these", attachments=[shot])
+        self.go()
+        self.assertEqual(self.notes(40), ["<!-- loom:operator v1 discord=%s -->\n"
+                                          "#40 change these\n\nAttachments:\n- %s"
+                                          % (mine, shot)])
+
+    def test_an_attachment_only_message_is_relayed_and_the_ack_names_no_goal(self):
+        self.settings.default_goal = "%s#41" % REPO
+        shot = "https://cdn.example.com/attachments/1/2/shot.png"
+        mine = self.say(1, "", attachments=[shot])
+        self.go()
+        self.assertEqual(self.notes(41), ["<!-- loom:operator v1 discord=%s -->\n"
+                                          "Attachments:\n- %s" % (mine, shot)])
+        ack = self.discord.sent[-1]
+        self.assertTrue(ack["content"].startswith("Noted for the brain https://"))
+        self.assertNotIn("#41", ack["content"].split(" https://")[0])
+        self.assertEqual(ack["flags"], station.SUPPRESS_EMBEDS)
+
+
+class BotReportsTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.settings.channel_id = "555"
+        self.settings.bot_token_ssm = "/example/bot-token"
+        self.discord = FakeDiscord()
+        self.fake.add(40, title="Members find events faster than ever before",
+                      body="## Why\nBecause.\n\nShort name: Events\n", state="goal")
+        self.fake.issues[40]["labels"] = [{"name": "loom:goal"}]
+        self.fake.add(41, title="Loom ships tickets quicker", state="goal")
+        self.fake.issues[41]["labels"] = [{"name": "loom:goal"}]
+        self.clock = time.time()
+        self.go()
+
+    def go(self):
+        self.clock += station.REPORT_CHECK + 1
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=self.clock,
+                        read_secret=lambda n, r: BOT_TOKEN, discord=self.discord,
+                        post=lambda u, p: self.fail("the webhook was used")).run_pass()
+
+    def comment(self, number, ident, body):
+        self.fake.comments[number].append({
+            "id": ident, "body": station.REPORT_MARKER + "\n" + body,
+            "user": {"login": "alice-example"},
+            "html_url": "https://github.com/%s/issues/%d#issuecomment-%d"
+                        % (REPO, number, ident)})
+
+    def test_a_report_is_a_short_line_with_a_thread_holding_the_full_report(self):
+        self.comment(40, 100, "## Shipped the search page\nDetail one\nDetail two")
+        self.comment(41, 101, "Two tickets merged\nMore")
+        self.go()
+        self.go()
+        self.assertEqual([m["content"] for m in self.discord.sent],
+                         ["**Events** Shipped the search page",
+                          "**Loom ships tickets quicker** Two tickets merged"])
+        self.assertEqual([t[0] for t in self.discord.threads], ["1001", "1002"])
+        self.assertTrue(self.discord.threads[0][1]["name"].startswith("Events 20"))
+        link = "https://github.com/%s/issues/40#issuecomment-100" % REPO
+        self.assertEqual(self.discord.in_thread[0]["content"],
+                         "## Shipped the search page\nDetail one\nDetail two\n" + link)
+        for body in self.discord.sent + self.discord.in_thread:
+            self.assertEqual(body["flags"], station.SUPPRESS_EMBEDS)
+            self.assertEqual(body["allowed_mentions"], {"parse": []})
+
+    def test_a_long_report_fills_several_thread_messages(self):
+        self.comment(40, 100, "line\n" * 700)
+        self.go()
+        parts = [m["content"] for m in self.discord.in_thread]
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(p) <= station.DISCORD_MAX for p in parts))
+        self.assertEqual("\n".join(parts).count("line"), 700)
+        self.assertTrue(parts[-1].endswith("#issuecomment-100"))
+
+    def test_a_failed_line_is_retried_and_a_failed_thread_is_not(self):
+        self.comment(40, 100, "report")
+        self.discord.fail_post = True
+        self.go()
+        self.assertEqual(self.discord.sent, [])
+        self.discord.fail_post = False
+        self.go()
+        self.assertEqual(len(self.discord.sent), 1)
+        self.assertEqual(len(self.discord.threads), 1)
+        # Once the line is out, a failed thread does not post it again, and
+        # the full report goes in the channel instead.
+        self.comment(41, 101, "second report")
+        self.discord.fail_thread = True
+        self.go()
+        self.go()
+        self.assertEqual([m["content"].split("\n")[0] for m in self.discord.sent],
+                         ["**Events** report", "**Loom ships tickets quicker** second report",
+                          "second report"])
+        self.assertEqual(self.discord.in_thread[-1]["content"].split("\n")[0], "report")
+
+    def test_markdown_in_the_short_name_is_dropped(self):
+        self.fake.issues[41]["body"] = "Short name: **Big** _win_ `x` ~~y~~ ||z||\n"
+        self.comment(41, 101, "status")
+        self.go()
+        self.assertEqual(self.discord.sent[0]["content"], "**Big win x y z** status")
+
+    def test_a_report_on_an_issue_without_the_goal_label_is_not_forwarded(self):
+        self.fake.add(42, title="Not a goal", body="Short name: Nope\n", state="briefed")
+        self.comment(42, 102, "should stay on GitHub")
+        self.go()
+        self.assertEqual(self.discord.sent, [])

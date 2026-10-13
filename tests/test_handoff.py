@@ -51,6 +51,13 @@ class HandoffRuleTests(unittest.TestCase):
         self.assertFalse(handoff.may_act("merge", (REPO, 8), "lane-machine", found, NOW, current))
         self.assertFalse(handoff.may_act("review", PR, "lane-machine", found, NOW, current))
 
+    def test_a_journal_with_an_unreadable_time_counts_as_fresh(self):
+        # An undatable journal must not open broad work to the live brain.
+        odd = {"body": "\n".join([handoff.JOURNAL_MARKER, "Tick later, muse"]),
+               "at": "not-a-time", "login": "allowed-bot"}
+        self.assertEqual([odd], handoff.peer_journals([odd], "lane-machine", NOW))
+        self.assertEqual([], handoff.peer_journals([odd], "muse", NOW))
+
     def test_quiet_peers_leave_every_stage_open_as_before(self):
         found = handoff.journals([journal(180, "muse"), journal(10, "lane-machine")], AUTHORS)
         self.assertTrue(handoff.may_act("merge", PR, "lane-machine", found, NOW, {}))
@@ -176,6 +183,11 @@ class ResumeCommandTests(unittest.TestCase):
                          "holder=muse -->" % REPO, line)
         line = brain.defer(GitHub("t", transport=Routes(routes)), "failed", TICKET, "muse")
         self.assertIn("rev=failed-c2", line)
+
+    def test_defer_refuses_an_unknown_stage_with_a_value_error(self):
+        with self.assertRaises(ValueError) as caught:
+            brain._check_stage_item(GitHub("t", transport=Routes(self.routes())), "ship", *PR)
+        self.assertIn("unknown stage ship", str(caught.exception))
 
     def test_defer_refuses_an_item_of_the_wrong_kind(self):
         with self.assertRaises(ValueError):

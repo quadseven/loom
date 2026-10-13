@@ -179,7 +179,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("Do only what needs this machine", claude)
         # Finish-work comes first and is bounded; the freshness rule no longer
         # holds back work another brain yielded.
-        self.assertIn("run python3 -m bus.brain resume $LOOM_REPOS --holder lane-machine", claude)
+        self.assertIn("run timeout 120 python3 -m bus.brain resume $LOOM_REPOS --holder lane-machine", claude)
         self.assertIn("Spend at most 13 minutes on them", claude)
         _, calls = self.tick()
         claude = [c for c in calls if c.startswith("claude ")][-1]

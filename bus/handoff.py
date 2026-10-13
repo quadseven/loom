@@ -148,11 +148,13 @@ def journal_holder(comment: Dict[str, Any]) -> str:
 def peer_journals(found: Iterable[Dict[str, Any]], holder: str,
                   now: datetime) -> List[Dict[str, Any]]:
     """Journals from any other brain within QUIET of now. A journal naming no
-    holder counts as another brain's."""
+    holder counts as another brain's, and so does one whose time cannot be
+    read: GitHub always stamps a comment, so an unreadable time is a fault,
+    and the safe reading is "fresh", which keeps broad work closed."""
     out = []
     for comment in found:
         at = _parse(str(comment.get("at") or ""))
-        if at is not None and now - at <= QUIET and journal_holder(comment) != holder:
+        if journal_holder(comment) != holder and (at is None or now - at <= QUIET):
             out.append(comment)
     return out
 

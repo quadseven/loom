@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import factory
 from . import spend
 from . import text as _text
 from . import tickets
@@ -33,6 +34,12 @@ RUNNING = "loom:running"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
+# The runner's reason when a lane run ends with nothing committed.
+NO_COMMIT = "agent made no commit"
+# Asks the review bot to review a pull request's head again; it resolves the
+# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
+REVIEW_AGAIN = "/grug improve"
+LANE_SAID_MAX = 2500
 # An absolute path: a run of non-space characters starting with a slash (not
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
@@ -53,6 +60,15 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 REPORT_CHECK = 300
 REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
+# Through the bot, a report is one short line (the goal's short name and the
+# report's first line) with a thread on it holding the full report.
+SHORT_NAME_RE = re.compile(r"^[ \t]*Short name:[ \t]*(\S.*?)[ \t]*$", re.M | re.I)
+SHORT_NAME_MAX = 60
+SHORT_LINE_MAX = 300
+THREAD_NAME_MAX = 100
+THREAD_ARCHIVE_MINUTES = 1440
+# The message flag that keeps Discord from unfurling links into preview cards.
+SUPPRESS_EMBEDS = 1 << 2
 # A brain tick runs every 30 minutes; no tick ending well for this long means
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
@@ -94,7 +110,9 @@ class Settings:
                  mention: str = "", digest_hour: int = 9,
                  region: str = "us-east-1", channel_id: str = "",
                  bot_token_ssm: str = "", default_goal: str = "",
-                 anthropic: Optional[spend.Budget] = None) -> None:
+                 anthropic: Optional[spend.Budget] = None,
+                 factory_on: bool = False,
+                 review_check: str = factory.DEFAULT_REVIEW_CHECK) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -108,6 +126,10 @@ class Settings:
         self.bot_token_ssm = bot_token_ssm
         self.default_goal = default_goal
         self.anthropic = anthropic or spend.Budget()
+        # Off unless asked for, so a Settings built in code does not start
+        # merging; from_env turns it on unless LOOM_FACTORY=0.
+        self.factory_on = factory_on
+        self.review_check = review_check
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -137,7 +159,10 @@ class Settings:
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
                    bot_token_ssm=env.get("LOOM_DISCORD_BOT_TOKEN_SSM", "").strip(),
                    default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip(),
-                   anthropic=budget)
+                   anthropic=budget,
+                   factory_on=env.get("LOOM_FACTORY", "").strip() not in ("0", "off", "false"),
+                   review_check=(env.get("LOOM_REVIEW_CHECK", "").strip()
+                                 or factory.DEFAULT_REVIEW_CHECK))
 
 
 def _origin_repo() -> str:
@@ -548,9 +573,13 @@ class Station:
         if self._skip_known(repo, issue):
             return False
         try:
-            tickets.parse(issue.get("body"))
+            headers, _ = tickets.parse(issue.get("body"))
         except ValueError as err:
             self._refuse(repo, issue, "unusable brief: %s" % err)
+            return False
+        hold = tickets.not_before(headers)
+        if hold is not None and self.now < hold:
+            _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
         ok, reason = self._check_trust(repo, issue)
         if not ok:
@@ -625,10 +654,56 @@ class Station:
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         reason = self._failure_reason(lane, name)
+        fix_pr = self._field(text, "Fix-PR")
+        if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
+            self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
+            return True
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
+        """A fix brief that ended with nothing committed. Most often the lane
+        found every thread already fixed (a stale review thread) and said
+        so. Its explanation goes on the pull request, the review bot is asked
+        to review the head again (it resolves what it no longer raises), and
+        the ticket returns to loom:pr. If the review still stands, the factory
+        sends it back a rung up the model ladder (bus/factory.py), so this
+        never loops on one lane."""
+        said = self._lane_said(lane, name)
+        body = "Lane %s made no change for this fix." % lane
+        if said:
+            body = "Lane %s made no change for this fix. It said:\n\n%s" % (
+                lane, "\n".join("> " + line for line in said.splitlines()))
+        try:
+            _text.check(body)
+        except ValueError:
+            body = ("Lane %s made no change for this fix; its explanation did not "
+                    "pass the text checks and is in the lane log." % lane)
+        self._comment(repo, pr, body)
+        self._comment(repo, pr, os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN)
+        self._relabel(repo, number, "loom:pr")
+        self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
+                      "on the pull request; the review bot was asked to review it again."
+                      % (lane, pr))
+        _say("reported %s#%d: no change for #%d; review requested" % (repo, number, pr))
+
+    def _lane_said(self, lane: str, name: str) -> str:
+        """The agent's own words from the run log: every line that is not a
+        runner line, with local paths removed, capped."""
+        log = os.path.join(self.s.home, "logs", lane, name + ".log")
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                lines = [line.rstrip() for line in fh]
+        except OSError:
+            return ""
+        said = [PATH_RE.sub("<path>", line) for line in lines
+                if not re.match(r"^\[\d{4}-\d\d-\d\dT", line) and not line.startswith("rsync(")]
+        text = "\n".join(said).strip()
+        if len(text) > LANE_SAID_MAX:
+            text = text[:LANE_SAID_MAX].rsplit("\n", 1)[0] + "\n(cut; the rest is in the lane log)"
+        return text
 
     def _failure_reason(self, lane: str, name: str) -> str:
         log = os.path.join(self.s.home, "logs", lane, name + ".log")
@@ -788,7 +863,8 @@ class Station:
             content = "<@%s> %s" % (self.s.mention, content)
             allowed["users"] = [self.s.mention]
         try:
-            self.post(url, {"content": content[:DISCORD_MAX], "allowed_mentions": allowed})
+            self.post(url, {"content": content[:DISCORD_MAX], "allowed_mentions": allowed,
+                            "flags": SUPPRESS_EMBEDS})
         # Deliberately broad: urllib's errors (a ValueError for a malformed
         # URL, for one) can carry the URL, which is a secret, and anything
         # this does not catch would reach the log with its message. Only the
@@ -929,10 +1005,18 @@ class Station:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _report_body(comment: Dict[str, Any]) -> str:
+        return str(comment.get("body") or "")[len(REPORT_MARKER):].lstrip("\r\n ")
+
+    @staticmethod
+    def _report_link(issue: Dict[str, Any], comment: Dict[str, Any]) -> str:
+        return str(comment.get("html_url") or issue.get("html_url") or "")
+
     def _report_text(self, issue: Dict[str, Any], comment: Dict[str, Any]) -> str:
         title = " ".join(str(issue.get("title") or "").split())
-        body = str(comment.get("body") or "")[len(REPORT_MARKER):].lstrip("\r\n ")
-        link = str(comment.get("html_url") or issue.get("html_url") or "")
+        body = self._report_body(comment)
+        link = self._report_link(issue, comment)
         prefix = title + "\n"
         suffix = "\n" + link if link else ""
         room = DISCORD_MAX - len(prefix) - len(suffix)
@@ -940,6 +1024,92 @@ class Station:
             # Keep whole report lines and reserve the comment link at the end.
             body = body[:max(0, room)].rsplit("\n", 1)[0]
         return (prefix + body + suffix)[:DISCORD_MAX]
+
+    @staticmethod
+    def _short_name(issue: Dict[str, Any]) -> str:
+        """A "Short name:" line in the goal home body, else its title."""
+        m = SHORT_NAME_RE.search(str(issue.get("body") or ""))
+        name = " ".join((m.group(1) if m else str(issue.get("title") or "")).split())
+        # Anyone who can edit the goal home writes this text: keep its
+        # markdown out of the bold it is shown in.
+        name = re.sub(r"[*_`~|\\]", "", name).strip()
+        return name[:SHORT_NAME_MAX] or "#%s" % issue.get("number")
+
+    @staticmethod
+    def _chunks(text: str) -> List[str]:
+        """The text in Discord-sized messages, cut at line breaks."""
+        parts = []
+        while len(text) > DISCORD_MAX:
+            cut = text.rfind("\n", 0, DISCORD_MAX + 1)
+            if cut <= 0:
+                cut = DISCORD_MAX
+            parts.append(text[:cut])
+            text = text[cut:].lstrip("\n")
+        if text.strip():
+            parts.append(text)
+        return parts
+
+    def _bot_reports(self) -> bool:
+        return self.s.channel_id.isdigit() and bool(self.s.bot_token_ssm)
+
+    def _report_sender(self) -> Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]]:
+        """A function that sends one report and says whether it went out: as
+        the bot when its settings are set, else through the webhook. None
+        when the secret could not be read."""
+        if self._bot_reports():
+            token = self._bot_token()
+            if token is None:
+                return None
+            return lambda issue, comment: self._report_by_bot(token, issue, comment)
+        url = self._webhook()
+        if url is None:
+            return None
+        return lambda issue, comment: self._send(
+            url, self._report_text(issue, comment), mention=False)
+
+    def _report_by_bot(self, token: str, issue: Dict[str, Any],
+                       comment: Dict[str, Any]) -> bool:
+        """One short line in the channel, then a thread on it holding the full
+        report and the comment link, so tapping the line expands it."""
+        chan = self.s.channel_id
+        name = self._short_name(issue)
+        body = self._report_body(comment)
+        first = next((line.lstrip("#").strip() for line in body.splitlines()
+                      if line.lstrip("#").strip()), "")
+        line = ("**%s** %s" % (name, first)).strip()
+        if len(line) > SHORT_LINE_MAX:
+            line = line[:SHORT_LINE_MAX - 4].rstrip() + " ..."
+        ok, made = self._bot(token, "POST", "/channels/%s/messages" % chan, {
+            "content": line, "allowed_mentions": {"parse": []}})
+        if not ok:
+            return False
+        # The line is out: from here a failure is logged and not retried, so
+        # the line is never posted twice.
+        msg_id = str(made.get("id") or "") if isinstance(made, dict) else ""
+        where = self._report_thread(token, msg_id, name) if msg_id.isdigit() else ""
+        if not where:
+            # No thread: the full report goes in the channel, so it is never
+            # lost behind a line that does not expand.
+            _say("no thread for the report line; the full report goes in the channel")
+            where = chan
+        link = self._report_link(issue, comment)
+        for part in self._chunks(body + ("\n" + link if link else "")):
+            ok, _ = self._bot(token, "POST", "/channels/%s/messages" % where, {
+                "content": part, "allowed_mentions": {"parse": []}})
+            if not ok:
+                break
+        return True
+
+    def _report_thread(self, token: str, msg_id: str, name: str) -> str:
+        """The id of a new thread on the report line, or "" when Discord
+        would not make one."""
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(self.now))
+        ok, thread = self._bot(token, "POST", "/channels/%s/messages/%s/threads"
+                               % (self.s.channel_id, msg_id), {
+                                   "name": ("%s %s" % (name, when))[:THREAD_NAME_MAX],
+                                   "auto_archive_duration": THREAD_ARCHIVE_MINUTES})
+        thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
+        return thread_id if ok and thread_id.isdigit() else ""
 
     def _report_comments(self, repo: str, issues: List[Dict[str, Any]], since: str
                          ) -> List[Tuple[int, Dict[str, Any], Dict[str, Any]]]:
@@ -964,42 +1134,48 @@ class Station:
             last_id = int(ledger[key])
         except (TypeError, ValueError):
             last_id = 0
-        url = None
-        webhook_checked = False
+        send = None
+        secret_checked = False
         for ident, issue, comment in comments:
             if ident <= last_id:
                 continue
             author = str((comment.get("user") or {}).get("login") or "").lower()
             if author in allowed:
-                if not webhook_checked:
-                    url = self._webhook()
-                    webhook_checked = True
-                if url is None:
-                    # Unreadable webhook: keep the position and the read time,
+                if not secret_checked:
+                    send = self._report_sender()
+                    secret_checked = True
+                if send is None:
+                    # Unreadable secret: keep the position and the read time,
                     # so the next pass reads this window again.
                     return False
-                if not self._send(url, self._report_text(issue, comment), mention=False):
+                if not send(issue, comment):
                     _write_json(path, ledger)
                     return False
             ledger[key] = ident
             last_id = ident
         return True
 
+    def _report_window(self, checked: Any) -> Optional[str]:
+        """The time to read reports from, or None when the last read is too
+        recent to read again."""
+        if not isinstance(checked, (int, float)) or isinstance(checked, bool):
+            start = self.now - REPORT_FIRST_LOOKBACK
+        elif 0 <= self.now - checked < REPORT_CHECK:
+            return None
+        else:
+            start = checked - REPORT_OVERLAP
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+
     def forward_reports(self) -> None:
-        if not self.s.webhook_ssm:
+        if not (self.s.webhook_ssm or self._bot_reports()):
             return
         path = os.path.join(self.state, "reports.json")
         ledger = _read_json(path, {})
         if not isinstance(ledger, dict):
             raise StateError("state file %s does not hold an object" % path)
-        checked = ledger.get("_checked")
-        if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
-                and 0 <= self.now - checked < REPORT_CHECK):
+        since = self._report_window(ledger.get("_checked"))
+        if since is None:
             return
-        start = (checked - REPORT_OVERLAP
-                 if isinstance(checked, (int, float)) and not isinstance(checked, bool)
-                 else self.now - REPORT_FIRST_LOOKBACK)
-        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
         allowed = {a.lower() for a in self.s.authors}
         # Forget repos that left LOOM_REPOS, so the ledger stays their size.
         keep = {r.replace("/", ".") for r in self.s.repos} | {"_checked"}
@@ -1187,7 +1363,10 @@ class Station:
     def _bot(self, token: str, method: str, path: str,
              body: Optional[Dict[str, Any]] = None) -> Tuple[bool, Any]:
         """(ok, reply) for one Discord call. A DiscordError's text is ours and
-        never carries the token; any other error is logged by type only."""
+        never carries the token; any other error is logged by type only.
+        Every message the bot posts suppresses link previews."""
+        if method == "POST" and body is not None and "content" in body:
+            body = dict(body, flags=SUPPRESS_EMBEDS)
         try:
             return True, self.discord(method, path, token, body)
         except Exception as err:  # noqa: BLE001
@@ -1205,14 +1384,14 @@ class Station:
                            for issue in self._goal_issues(repo)]
         return self._goals
 
-    def _goal_for(self, text: str) -> Optional[Tuple[str, int, str]]:
-        """(repo, number, link) of the goal the message names: an
+    def _goal_for(self, text: str) -> Optional[Tuple[str, int, str, bool]]:
+        """(repo, number, link, named) of the goal the message names: an
         owner/name#N or a #N of a goal home in LOOM_REPOS, else a word found
-        in one goal title only, else LOOM_DISCORD_DEFAULT_GOAL."""
+        in one goal title only, else LOOM_DISCORD_DEFAULT_GOAL (not named)."""
         goals = {(repo, int(i["number"])): i for repo, i in self._goal_homes()}
 
-        def found(key: Tuple[str, int]) -> Tuple[str, int, str]:
-            return key[0], key[1], str((goals.get(key) or {}).get("html_url") or "")
+        def found(key: Tuple[str, int], named: bool = True) -> Tuple[str, int, str, bool]:
+            return key[0], key[1], str((goals.get(key) or {}).get("html_url") or ""), named
         for m in GOAL_REF_RE.finditer(text):
             if (m.group(1), int(m.group(2))) in goals:
                 return found((m.group(1), int(m.group(2))))
@@ -1231,7 +1410,7 @@ class Station:
             return found(named.pop())
         m = GOAL_REF_RE.fullmatch(self.s.default_goal)
         if m and m.group(1) in self.s.repos and tickets.REPO_RE.fullmatch(m.group(1)):
-            return found((m.group(1), int(m.group(2))))
+            return found((m.group(1), int(m.group(2))), named=False)
         return None
 
     def _relay_messages(self, token: str, ledger: Dict[str, Any], path: str) -> None:
@@ -1251,18 +1430,30 @@ class Station:
                            and int(m["id"]) > int(after)),
                           key=lambda m: int(m["id"]))
         for msg in messages:
-            author = msg.get("author") if isinstance(msg.get("author"), dict) else {}
-            text = str(msg.get("content") or "").strip()
-            if str(author.get("id") or "") == self.s.mention and not author.get("bot") and text:
-                self._relay_one(token, str(msg["id"]), text)
+            said = self._operator_said(msg)
+            if said is not None:
+                self._relay_one(token, str(msg["id"]), *said)
             ledger["after"] = str(msg["id"])
             _write_json(path, ledger)
 
-    def _relay_one(self, token: str, msg_id: str, text: str) -> None:
-        """Note one operator message on its goal home, then acknowledge it in
-        the channel. A GitHub error propagates before the ledger moves, so the
-        message is tried again next pass; the acknowledgements are best
-        effort once the note is posted."""
+    def _operator_said(self, msg: Dict[str, Any]) -> Optional[Tuple[str, List[str]]]:
+        """(text, attachment links) of a message the operator wrote, or None
+        for anyone else's message and for an empty one."""
+        author = msg.get("author") if isinstance(msg.get("author"), dict) else {}
+        if str(author.get("id") or "") != self.s.mention or author.get("bot"):
+            return None
+        text = str(msg.get("content") or "").strip()
+        files = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
+        urls = [str(f.get("url")) for f in files if isinstance(f, dict)
+                and str(f.get("url") or "").startswith("https://")]
+        return (text, urls) if text or urls else None
+
+    def _relay_one(self, token: str, msg_id: str, text: str, urls: List[str]) -> None:
+        """Note one operator message, with a link to each attachment, on its
+        goal home, then acknowledge it in the channel. A GitHub error
+        propagates before the ledger moves, so the message is tried again
+        next pass; the acknowledgements are best effort once the note is
+        posted."""
         chan = self.s.channel_id
         goal = self._goal_for(text)
         if goal is None:
@@ -1272,11 +1463,16 @@ class Station:
                 "allowed_mentions": {"parse": []}})
             _say("operator message %s names no goal; not noted" % msg_id)
             return
-        repo, number, goal_link = goal
+        repo, number, goal_link, named = goal
+        note = text
+        if urls:
+            # Discord's attachment links, so the brain can open a screenshot.
+            note = (text + "\n\n" if text else "") + "Attachments:\n" + "\n".join(
+                "- " + url for url in urls)
         try:
             # The note lands on GitHub as written: the shared checks keep out
             # the review bot's at-handle and closing keywords next to issues.
-            _text.check(text)
+            _text.check(note)
         except ValueError as err:
             self._bot(token, "POST", "/channels/%s/messages" % chan, {
                 "content": "Not noted: %s. Reword it and send again." % err,
@@ -1285,14 +1481,15 @@ class Station:
             _say("operator message %s refused by the text checks" % msg_id)
             return
         made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                            {"body": OPERATOR_MARKER % msg_id + "\n" + text}).data
+                            {"body": OPERATOR_MARKER % msg_id + "\n" + note}).data
         link = str((made or {}).get("html_url") or "") if isinstance(made, dict) else ""
         link = link or goal_link
         _say("noted operator message %s on %s#%d" % (msg_id, repo, number))
         self._bot(token, "PUT", "/channels/%s/messages/%s/reactions/%s/@me"
                   % (chan, msg_id, CHECKMARK))
         self._bot(token, "POST", "/channels/%s/messages" % chan, {
-            "content": ("Noted for the brain on %s#%d %s" % (repo, number, link)).strip(),
+            "content": " ".join(filter(None, [
+                "Noted for the brain", "on %s#%d" % (repo, number) if named else "", link])),
             "message_reference": {"message_id": msg_id, "fail_if_not_exists": False},
             "allowed_mentions": {"parse": []}})
 
@@ -1345,12 +1542,22 @@ class Station:
         ledger["replies_at"] = self.now
 
     # -- one pass --------------------------------------------------------
+    def run_factory(self) -> None:
+        """Merge ready lane pull requests, send the rest back, and move stuck
+        tickets up the model ladder (bus/factory.py), at most every
+        factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
+        if not self.s.factory_on or not factory.due(self.state, self.now):
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                        review_check=self.s.review_check).run()
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
-                     self.watch_brain, self.relay_operator):
+                     self.watch_brain, self.relay_operator, self.run_factory):
             try:
                 step()
             except (GitHubError, OSError) as err:

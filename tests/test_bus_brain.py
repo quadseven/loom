@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -510,6 +511,186 @@ class ProofTests(unittest.TestCase):
         self.assertEqual([t for _, t in proof.criteria(TICKET_BODY)],
                          ["The probe logs one line per request.", "p95 latency drops below 200 ms."])
         self.assertEqual(proof.contract(TICKET_BODY), proof.contract(UNCHECKED))
+
+
+def item(number, body=BODY, labels=(), **extra):
+    out = {"number": number, "id": 1000 + number, "state": "open", "body": body,
+           "labels": [{"name": name} for name in labels]}
+    out.update(extra)
+    return out
+
+
+class Routes:
+    """Replies by method and path; records every call. The issue list is
+    served in pages of `page` items with Link headers."""
+
+    def __init__(self, issues, goal_children=(), page=100, refuse_sub_issue=()):
+        self.issues = list(issues)
+        self.goal_children = list(goal_children)
+        self.page = page
+        self.refuse_sub_issue = set(refuse_sub_issue)
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1]
+        self.calls.append((method, path, payload))
+        if method == "GET" and path == "/repos/%s/issues/1" % REPO:
+            return reply(200, goal())
+        if method == "GET" and "/issues/1/sub_issues" in path:
+            return reply(200, self.goal_children)
+        if method == "GET" and path.startswith("/repos/%s/issues?" % REPO):
+            start = int(path.split("&page=")[1]) if "&page=" in path else 0
+            chunk = self.issues[start:start + self.page]
+            headers = {}
+            if start + self.page < len(self.issues):
+                headers["Link"] = '<https://api.github.com%s&page=%d>; rel="next"' % (
+                    path.split("&page=")[0], start + self.page)
+            return 200, headers, json.dumps(chunk).encode()
+        if method == "POST" and path.endswith("/sub_issues"):
+            if payload["sub_issue_id"] in self.refuse_sub_issue:
+                return reply(422, {"message": "already has a parent"})
+            return reply(201, {})
+        if method == "POST":
+            return reply(201, {})
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def writes(self):
+        return [c for c in self.calls if c[0] != "GET"]
+
+    def labelled(self):
+        return {int(c[1].split("/issues/")[1].split("/")[0]): c[2]["labels"]
+                for c in self.calls if c[0] == "POST" and c[1].endswith("/labels")}
+
+
+class TriageTests(unittest.TestCase):
+    def run_triage(self, routes, limit=25):
+        return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
+
+    def assert_never_edited(self, routes):
+        # Only labels, sub-issue links and comments: no PATCH (close, retitle,
+        # rewrite) and no other write of any kind.
+        for method, path, _ in routes.writes():
+            self.assertEqual(method, "POST", path)
+            self.assertTrue(path.endswith(("/labels", "/comments", "/sub_issues")), path)
+
+    def test_ready_issue_becomes_a_queued_ticket_under_the_goal(self):
+        routes = Routes([item(5)])
+        lines = self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
+        self.assertIn(("POST", "/repos/%s/issues/1/sub_issues" % REPO, {"sub_issue_id": 1005}),
+                      routes.calls)
+        self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
+        self.assertEqual(lines, ["#5 queued under #1"])
+        self.assert_never_edited(routes)
+
+    def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
+        no_boxes = BODY.replace("- [ ] done", "done")
+        routes = Routes([item(6, body="It is slow.\n## Why\nusers wait"), item(7, body=no_boxes),
+                         item(8, body=None)])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {6: ["loom:triage"], 7: ["loom:triage"], 8: ["loom:triage"]})
+        comments = {int(c[1].split("/issues/")[1].split("/")[0]): c[2]["body"]
+                    for c in routes.calls if c[1].endswith("/comments")}
+        self.assertIn("Missing: What, Acceptance criteria, Size, Out of scope.", comments[6])
+        self.assertNotIn("Why", comments[6].split("Missing:")[1].split(".")[0])
+        self.assertIn("Missing: checkboxes under Acceptance criteria.", comments[7])
+        self.assertIn("Missing: Why, What", comments[8])
+        for body in comments.values():
+            self.assertTrue(body.startswith(brain.TRIAGE_MARKER))
+            text.check(body)
+        self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST" for c in routes.calls))
+        self.assert_never_edited(routes)
+
+    def test_a_body_the_runner_would_refuse_is_not_ready(self):
+        routes = Routes([item(9, body=BODY + "\nRepo: other/repo")])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {9: ["loom:triage"]})
+
+    def test_pull_requests_epics_and_labelled_issues_are_skipped(self):
+        routes = Routes([
+            item(2, pull_request={"url": "x"}),
+            item(3, labels=["Epic"]),
+            item(4, sub_issues_summary={"total": 3, "completed": 0}),
+            item(5, labels=["loom:triage"]),
+            item(6, labels=["loom:human"]),
+            item(7, labels=["needs-operator"]),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
+    def test_the_limit_holds_and_stops_reading_pages(self):
+        routes = Routes([item(n, body="old issue") for n in range(10, 40)], page=10)
+        lines = self.run_triage(routes, limit=12)
+        self.assertEqual(sorted(routes.labelled()), list(range(10, 22)))
+        self.assertEqual(len(lines), 12)
+        pages = [c for c in routes.calls if c[1].startswith("/repos/%s/issues?" % REPO)]
+        self.assertEqual(len(pages), 2)
+        self.assertIn("sort=created&direction=asc", pages[0][1])
+        self.assert_never_edited(routes)
+
+    def test_ready_issues_wait_while_the_goal_is_at_its_cap(self):
+        full = [item(50 + n, labels=["loom:ticket", "loom:queued"]) for n in range(2)]
+        routes = Routes([item(5), item(6, body="vague")], goal_children=full)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "2"}):
+            lines = self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {6: ["loom:triage"]})
+        self.assertTrue(lines[0].startswith("#5 held"))
+
+    def test_an_issue_github_refuses_as_a_sub_issue_is_left_alone(self):
+        routes = Routes([item(5)], refuse_sub_issue={1005})
+        lines = self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {})
+        self.assertIn("skipped", lines[0])
+
+    def test_bad_limit_and_bad_goal_write_nothing(self):
+        routes = Routes([item(5)])
+        with self.assertRaises(ValueError):
+            self.run_triage(routes, limit=0)
+        fake = Fake(reply(200, {"state": "open", "labels": []}))
+        with self.assertRaises(ValueError):
+            brain.triage(GitHub("t", transport=fake), REPO, 1)
+        self.assertEqual(routes.writes() + [c for c in fake.calls if c[0] != "GET"], [])
+
+
+class HumanAndRefsTests(unittest.TestCase):
+    def test_human_posts_one_comment_and_swaps_triage_for_human(self):
+        fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(201, {}), reply(200, []), reply(200, []))
+        brain.human(GitHub("t", transport=fake), REPO, 6, "Buy a test phone.\n")
+        self.assertEqual(fake.calls[1][2], {"body": brain.HUMAN_MARKER + "\nBuy a test phone."})
+        self.assertEqual(fake.calls[2][0], "DELETE")
+        self.assertTrue(fake.calls[2][1].endswith("/issues/6/labels/loom%3Atriage"))
+        self.assertEqual(fake.calls[3][2], {"labels": ["loom:human"]})
+
+    def test_human_refusals_write_nothing(self):
+        cases = [(item(6, labels=["loom:human"]), "Buy it."), (item(6, state="closed"), "Buy it."),
+                 (item(6, pull_request={}), "Buy it."), (item(6), "  ")]
+        for issue, ask in cases:
+            with self.subTest(ask=ask, issue=issue):
+                fake = Fake(reply(200, issue))
+                with self.assertRaises(ValueError):
+                    brain.human(GitHub("t", transport=fake), REPO, 6, ask)
+                self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_brief_refs_rewrites_without_touching_the_original(self):
+        fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t"}),
+                    reply(201, {}), reply(201, {}), reply(200, []), reply(200, []))
+        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
+        self.assertTrue(fake.calls[3][2]["body"].endswith("\n\nRefs #6\n"))
+        self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
+        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
+        self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+        self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
+
+    def test_brief_refs_refuses_a_ticket_or_closed_original(self):
+        for issue in (item(6, labels=["loom:ticket"]), item(6, state="closed")):
+            fake = Fake(reply(200, issue))
+            with self.assertRaises(ValueError):
+                brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
+            self.assertTrue(all(c[0] == "GET" for c in fake.calls))
 
 
 if __name__ == "__main__":
