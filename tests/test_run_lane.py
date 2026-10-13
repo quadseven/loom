@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bus import tickets  # noqa: E402
+from bus import pr_repair, text, tickets  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
@@ -54,7 +54,9 @@ S: one function.
 # Like real gh, `pr list` shows it only when asked for all states.
 # `pr create` prints a URL. `api repos/O/N --jq .private` prints
 # $FAKE_GH_PRIVATE (default false). `pr view` prints "$FAKE_GH_PR_STATE
-# $FAKE_GH_PR_HEAD" (default OPEN on loom/42-fix-the-thing).
+# $FAKE_GH_PR_HEAD" (default OPEN on loom/42-fix-the-thing), or JSON with
+# title/body when asked for it. `pr edit --title T --body-file F` records the
+# new title in $FAKE_PR_TITLE and copies the body file to $FAKE_PR_BODY.
 # Every call is appended to $FAKE_LOG.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
@@ -68,7 +70,28 @@ if [ "$1 $2" = "pr list" ]; then
   case " $* " in *" --state all "*) printf '%s' "${FAKE_GH_EXISTING:-}" ;; esac
 fi
 if [ "$1 $2" = "pr view" ]; then
-  printf '%s %s\n' "${FAKE_GH_PR_STATE:-OPEN}" "${FAKE_GH_PR_HEAD:-loom/42-fix-the-thing}"
+  case " $* " in
+    *" --json title,body "*)
+      title=$(cat "${FAKE_GH_PR_TITLE:-/dev/null}" 2>/dev/null || true)
+      body=$(cat "${FAKE_GH_PR_BODY:-/dev/null}" 2>/dev/null || true)
+      printf '{"title":%s,"body":%s}\n' "$(printf '%s' "$title" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()), end="")')" "$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()), end="")')"
+      ;;
+    *)
+      printf '%s %s\n' "${FAKE_GH_PR_STATE:-OPEN}" "${FAKE_GH_PR_HEAD:-loom/42-fix-the-thing}"
+      ;;
+  esac
+fi
+if [ "$1 $2" = "pr edit" ]; then
+  [ -z "${FAKE_GH_EDIT_FAIL:-}" ] || { echo "gh pr edit failed" >&2; exit 1; }
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) printf '%s' "$2" > "${FAKE_PR_TITLE:-/dev/null}"; shift 2 ;;
+      --body-file) cp "$2" "${FAKE_PR_BODY:-/dev/null}"; shift 2 ;;
+      --body) printf '%s' "$2" > "${FAKE_PR_BODY:-/dev/null}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  exit 0
 fi
 if [ "$1 $2" = "pr create" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY"; shift; done
@@ -77,12 +100,21 @@ fi
 """
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
-# only edits it the way a sandboxed codex must ($FAKE_AGENT=edit), or exits
-# non-zero ($FAKE_AGENT=fail).
+# only edits it the way a sandboxed codex must ($FAKE_AGENT=edit), makes no
+# file change at all ($FAKE_AGENT=noop), or exits non-zero ($FAKE_AGENT=fail).
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
+if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = answer ]; then
+  mkdir -p .loom-answers
+  echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
+  ln -s "$FAKE_SECRET_FILE" .loom-answers/PRRT_2.md
+  ln "$FAKE_SECRET_FILE" .loom-answers/PRRT_3x.md
+  mkfifo .loom-answers/PRRT_4x.md
+  echo "scratch" > .loom-answers/notes.txt
+fi
 echo fixed > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
@@ -117,6 +149,10 @@ printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secr
 if printf '#!/bin/sh\\ntouch "%s/hooked"\\n' "$real_home" > .git/hooks/pre-commit 2>/dev/null \\
    && chmod +x .git/hooks/pre-commit 2>/dev/null; then hook=planted; else hook=denied; fi
 printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
+printf 'config=%s\\n' "${OPENCODE_CONFIG_CONTENT:-none}" >> "$TMPDIR/agent.log"
+# A brief carrying AGENT_FAIL=1 ends the run with an error, as a dropped
+# connection would.
+case "$args" in *AGENT_FAIL=1*) exit 3 ;; esac
 # Real CLIs fstat their stdout and stderr (Bun does on start).
 if /usr/bin/perl -e 'exit((stat(STDOUT) && stat(STDERR)) ? 0 : 1)'; then
   fds=ok; else fds=denied; fi
@@ -145,6 +181,21 @@ var="FAKE_SECRET_$(printf '%s' "$name" | tr '/-' '__')"
 val="${!var:-}"
 [ -n "$val" ] || { echo "ParameterNotFound" >&2; exit 254; }
 printf '%s\\n' "$val"
+"""
+
+
+# Fake curl: the spark lane's probe of its endpoint. $FAKE_CURL lists one
+# answer per call (an HTTP code, "refused" for a refused connection, curl
+# exit 7, or "timeout", curl exit 28); the last answer repeats. Every call is appended to $FAKE_LOG.
+FAKE_CURL = """#!/usr/bin/env bash
+printf 'curl %s\\n' "$*" >> "$FAKE_LOG"
+n="$(grep -c '^curl ' "$FAKE_LOG")"
+set -- ${FAKE_CURL:-200}
+[ "$n" -le "$#" ] || n="$#"
+answer="${!n}"
+if [ "$answer" = refused ]; then printf '000'; exit 7; fi
+if [ "$answer" = timeout ]; then printf '000'; exit 28; fi
+printf '%s' "$answer"
 """
 
 
@@ -178,14 +229,35 @@ G="$HOME/.gemini"
 # What a previous run left in agy's memory, and whether this run can plant
 # config that would steer the next one.
 if [ -e "$G/antigravity-cli/brain/planted.md" ]; then mem=leftover; else mem=clean; fi
+S="$G/config/skills/impeccable/SKILL.md"
+if [ -f "$S" ]; then skill="$(head -1 "$S")"; else skill=none; fi
+if echo x >> "$S" 2>/dev/null || rm -f "$S" 2>/dev/null; then skillw=writable; else skillw=locked; fi
 if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
 if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
 # The permission rules this run got, and whether it can widen them for the next.
-S="$G/antigravity-cli/settings.json"
-cp "$S" "$TMPDIR/agy-settings-seen.json"
-if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$S" 2>/dev/null; then set=writable; else set=locked; fi
-printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" >> "$TMPDIR/agy.log"
+P="$G/antigravity-cli/settings.json"
+cp "$P" "$TMPDIR/agy-settings-seen.json"
+if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$P" 2>/dev/null; then set=writable; else set=locked; fi
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
+echo fixed > fix.txt
+"""
+
+
+# Fake claude for the anthropic lane: for each folder a CLI reads skills
+# from, records the first line of each skill it sees, and whether the agent
+# can change the snapshot through that folder or at its real path.
+FAKE_SKILL_CLAUDE = """#!/usr/bin/env bash
+for f in .claude/skills .agents/skills .config/opencode/skills; do
+  d="$HOME/$f"
+  seen="$(for s in "$d"/*/SKILL.md; do [ -f "$s" ] && printf '%s,' "$(head -1 "$s")"; done)"
+  if echo x >> "$d/impeccable/SKILL.md" 2>/dev/null || touch "$d/impeccable/new" 2>/dev/null \\
+     || rm -f "$d/impeccable/SKILL.md" 2>/dev/null; then w=writable; else w=locked; fi
+  real="$(cd "$d" 2>/dev/null && pwd -P)"
+  if [ -n "$real" ] && { touch "$real/planted" 2>/dev/null || chmod u+w "$real/impeccable" 2>/dev/null; }; then
+    rw=writable; else rw=locked; fi
+  printf 'skills %s seen=%s write=%s realwrite=%s\\n' "$f" "${seen:-none}" "$w" "$rw" >> "$TMPDIR/agent.log"
+done
 echo fixed > fix.txt
 """
 
@@ -224,6 +296,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "codex", FAKE_AGENT)
         self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
         self.write_tool(self.bin / "aws", FAKE_AWS)
+        self.write_tool(self.bin / "curl", FAKE_CURL)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -286,6 +359,20 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("\nSize: S\n", body)
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_body_the_runner_wrote_is_current_to_the_pr_repair_helper(self):
+        # The body comes from run_lane.sh::pr_body, not from pr_repair's own
+        # renderer, so a drift between the two shows up as a spurious repair.
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        done = self.inbox / "done" / "T042-fix-the-thing.md"
+        title = pr_repair._brief_title(done.read_text())
+        repaired = pr_repair.reconcile(str(done), title or "", self.body.read_text(),
+                                       "codex", "gpt-test-default", "T042-fix-the-thing")
+        self.assertEqual(repaired["reason"], "")
+        self.assertFalse(repaired["changed"], repaired)
+        self.assertEqual(repaired["old_hash"], repaired["new_hash"])
 
     def test_uncommitted_agent_edits_are_committed_by_the_runner(self):
         self.drop_brief()
@@ -414,6 +501,203 @@ class LaneRunnerTest(unittest.TestCase):
                                    "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    def test_a_fix_briefs_answers_move_to_the_inbox_and_never_into_the_commit(self):
+        name, _ = self.fix_brief()
+        secret = Path(self._tmp.name) / "outside-secret"
+        secret.write_text("do not post me\n")
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_GH_EXISTING="7",
+                               FAKE_SECRET_FILE=str(secret))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        answers = self.inbox / "answers" / name
+        # Only the regular file named for a thread; the symlink, the hard link
+        # to a file outside the tree and the FIFO are dropped unread.
+        self.assertEqual(sorted(os.listdir(answers)), ["PRRT_1.md"])
+        self.assertEqual((answers / "PRRT_1.md").read_text(), "Not valid: a.py:2 already guards it.\n")
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
+                                self.remote_head(self.FIX_BRANCH)], capture_output=True, text=True).stdout.split()
+        self.assertIn("fix.txt", files)
+        self.assertFalse([f for f in files if f.startswith(".loom-answers")])
+
+    def test_a_fix_brief_repairs_stale_pr_text_without_a_code_commit(self):
+        # The branch already has one commit and an open PR. The ticket body
+        # was corrected after the PR was opened, so the generated PR sections
+        # are stale. The agent makes no code change: only the PR text is
+        # repaired.
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+
+        old_issue = {"number": 42, "title": "Fix the thing",
+                     "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                              "## Acceptance criteria\n- [ ] The thing works\n\n"
+                              "## Size\nS\n\n"
+                              "## Out of scope\n- Nothing else\n")}
+        corrected_issue = {"number": 42, "title": "Fix the thing",
+                           "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                                    "## Acceptance criteria\n- [ ] The thing works\n"
+                                    "- [ ] A test covers the thing\n\n"
+                                    "## Size\nS\n\n"
+                                    "## Out of scope\n- Nothing else\n")}
+        fix = tickets.parse_fix("example/repo", (
+            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "### Check: lint\n\n    E501 line too long\n" % self.FIX_BRANCH))
+        name = tickets.ticket_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md",
+                        tickets.render_brief("example/repo", corrected_issue, "codex", 2, fix))
+
+        old_brief = tickets.render_brief("example/repo", old_issue, "codex", 2)
+        old_body = "A reviewer note at the top.\n\n" + pr_repair._render_generated(
+            pr_repair._normalise(old_brief), "codex", "gpt-test-default", name)
+
+        pr_title_file = Path(self._tmp.name) / "pr_title"
+        pr_body_file = Path(self._tmp.name) / "pr_body"
+        new_title_file = Path(self._tmp.name) / "new_title"
+        new_body_file = Path(self._tmp.name) / "new_body"
+        pr_title_file.write_text("Fix the thing")
+        pr_body_file.write_text(old_body)
+
+        before = self.remote_head(self.FIX_BRANCH)
+        result = self.run_lane(
+            FAKE_AGENT="noop",
+            FAKE_GH_EXISTING="7",
+            FAKE_GH_PR_TITLE=str(pr_title_file),
+            FAKE_GH_PR_BODY=str(pr_body_file),
+            FAKE_PR_TITLE=str(new_title_file),
+            FAKE_PR_BODY=str(new_body_file),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)  # no code commit
+        calls = self.calls()
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertFalse(any(c.startswith("gh pr create") for c in calls))
+        self.assertIn("repaired PR text", log)
+        new_body = new_body_file.read_text()
+        self.assertIn("A reviewer note at the top.", new_body)
+        self.assertIn("- [ ] A test covers the thing", new_body)
+        self.assertIn("Loom ticket %s, lane codex, model gpt-test-default." % name, new_body)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_brief_refuses_invalid_pr_text_with_a_reason(self):
+        # The agent makes no code change and the corrected ticket text fails
+        # validation; the repair is refused and the reason is logged.
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+
+        bad_issue = {"number": 42, "title": "Fix the thing",
+                     "body": ("Difficulty: medium\n\n## Why\nBroken, ask @" + text.REVIEW_BOT_SHORT_NAME + ".\n\n## What\nFix it.\n\n"
+                              "## Acceptance criteria\n- [ ] The thing works\n\n"
+                              "## Size\nS\n\n"
+                              "## Out of scope\n- Nothing else\n")}
+        fix = tickets.parse_fix("example/repo", (
+            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "### Check: lint\n\n    E501 line too long\n" % self.FIX_BRANCH))
+        name = tickets.ticket_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md",
+                        tickets.render_brief("example/repo", bad_issue, "codex", 2, fix))
+
+        old_issue = {"number": 42, "title": "Fix the thing",
+                     "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                              "## Acceptance criteria\n- [ ] The thing works\n\n"
+                              "## Size\nS\n\n"
+                              "## Out of scope\n- Nothing else\n")}
+        old_brief = tickets.render_brief("example/repo", old_issue, "codex", 2)
+        old_body = pr_repair._render_generated(
+            pr_repair._normalise(old_brief), "codex", "gpt-test-default", name)
+
+        pr_title_file = Path(self._tmp.name) / "pr_title"
+        pr_body_file = Path(self._tmp.name) / "pr_body"
+        new_title_file = Path(self._tmp.name) / "new_title"
+        new_body_file = Path(self._tmp.name) / "new_body"
+        pr_title_file.write_text("Fix the thing")
+        pr_body_file.write_text(old_body)
+
+        result = self.run_lane(
+            FAKE_AGENT="noop",
+            FAKE_GH_EXISTING="7",
+            FAKE_GH_PR_TITLE=str(pr_title_file),
+            FAKE_GH_PR_BODY=str(pr_body_file),
+            FAKE_PR_TITLE=str(new_title_file),
+            FAKE_PR_BODY=str(new_body_file),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("proposed text refused", log)
+        self.assertIn("review bot", log)
+        self.assertIn("PR text repair refused", log)
+        self.assertNotIn("PR text is current", log)
+        self.assertFalse(new_body_file.exists())
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+
+    def test_a_fix_brief_whose_pr_text_repair_helper_fails_is_parked(self):
+        # The agent makes no code change and the gh pr edit call fails; the
+        # brief is parked rather than treated as "text is current".
+        work = Path(self._tmp.name) / "pr-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
+        (work / "first.txt").write_text("first try\n")
+        git("add", "first.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "First try", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+
+        corrected_issue = {"number": 42, "title": "Fix the thing",
+                           "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                                    "## Acceptance criteria\n- [ ] The thing works\n"
+                                    "- [ ] A test covers the thing\n\n"
+                                    "## Size\nS\n\n"
+                                    "## Out of scope\n- Nothing else\n")}
+        fix = tickets.parse_fix("example/repo", (
+            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "### Check: lint\n\n    E501 line too long\n" % self.FIX_BRANCH))
+        name = tickets.ticket_name("example/repo", 42, 2)
+        self.drop_brief(name + ".md",
+                        tickets.render_brief("example/repo", corrected_issue, "codex", 2, fix))
+
+        old_issue = {"number": 42, "title": "Fix the thing",
+                     "body": ("Difficulty: medium\n\n## Why\nBroken.\n\n## What\nFix it.\n\n"
+                              "## Acceptance criteria\n- [ ] The thing works\n\n"
+                              "## Size\nS\n\n"
+                              "## Out of scope\n- Nothing else\n")}
+        old_brief = tickets.render_brief("example/repo", old_issue, "codex", 2)
+        old_body = pr_repair._render_generated(
+            pr_repair._normalise(old_brief), "codex", "gpt-test-default", name)
+
+        pr_title_file = Path(self._tmp.name) / "pr_title"
+        pr_body_file = Path(self._tmp.name) / "pr_body"
+        new_title_file = Path(self._tmp.name) / "new_title"
+        new_body_file = Path(self._tmp.name) / "new_body"
+        pr_title_file.write_text("Fix the thing")
+        pr_body_file.write_text(old_body)
+
+        before = self.remote_head(self.FIX_BRANCH)
+        result = self.run_lane(
+            FAKE_AGENT="noop",
+            FAKE_GH_EXISTING="7",
+            FAKE_GH_PR_TITLE=str(pr_title_file),
+            FAKE_GH_PR_BODY=str(pr_body_file),
+            FAKE_PR_TITLE=str(new_title_file),
+            FAKE_PR_BODY=str(new_body_file),
+            FAKE_GH_EDIT_FAIL="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)  # no code commit
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("PR text repair failed", log)
+        self.assertNotIn("PR text is current", log)
+        self.assertFalse(new_body_file.exists())
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+
     def advance_main(self, name, text):
         """A commit on the remote's default branch after the PR branch left it."""
         work = Path(self._tmp.name) / "main-work"
@@ -536,7 +820,7 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
-    def api_lane(self, lane, **env):
+    def api_lane(self, lane, extra="", **env):
         planted = self.home / ".ssh" / "id_planted"
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_text("private key\n")
@@ -554,7 +838,7 @@ cat > /dev/null
         self.addCleanup(self.local_service.close)
         port = self.local_service.getsockname()[1]
         (inbox / "T042-fix-the-thing.md").write_text(
-            BRIEF.replace("Lane: codex", f"Lane: {lane}") + f"\nPROBE_PORT={port}\n")
+            BRIEF.replace("Lane: codex", f"Lane: {lane}") + f"\nPROBE_PORT={port}\n{extra}")
         result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
         return inbox, result
 
@@ -668,13 +952,89 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    def operator_skills(self):
+        """The operator's skill folders: links into a skills checkout, as the
+        operator's skill sync leaves them, plus a folder that is not a skill."""
+        checkout = self.home / "skills-checkout"
+        for name in ("impeccable", "tdd"):
+            (checkout / name).mkdir(parents=True)
+            (checkout / name / "SKILL.md").write_text(f"{name} v1\n")
+        (checkout / "notes").mkdir()
+        (checkout / "notes" / "README").write_text("not a skill\n")
+        for folder, names in ((".agents", ("impeccable", "tdd", "notes")), (".claude", ("impeccable",))):
+            skills = self.home / folder / "skills"
+            skills.mkdir(parents=True)
+            for name in names:
+                (skills / name).symlink_to(checkout / name)
+        return checkout
+
+    def anthropic_skill_run(self, name="T042-fix-the-thing.md"):
+        self.write_tool(self.bin / "claude", FAKE_SKILL_CLAUDE)
+        inbox = self.loom / "briefs" / "anthropic"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / name).write_text(BRIEF.replace("Lane: codex", "Lane: anthropic"))
+        result = self.run_lane("anthropic", LOOM_ANTHROPIC_KEY_SSM="/k/an",
+                               FAKE_SECRET__k_an="fake-an-key", LOOM_ANTHROPIC_MODEL="claude-test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return inbox, [c for c in self.calls() if c.startswith("skills ")]
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_api_lane_sees_the_skill_snapshot_read_only_in_each_tools_folder(self):
+        checkout = self.operator_skills()
+        inbox, seen = self.anthropic_skill_run()
+        self.assertEqual(len(seen), 3, self.calls())
+        for folder, line in zip((".claude/skills", ".agents/skills", ".config/opencode/skills"), seen, strict=True):
+            self.assertIn(f"skills {folder} ", line)
+            self.assertIn("impeccable v1,", line)
+            self.assertIn("tdd v1,", line)
+            self.assertIn("write=locked", line)
+            self.assertIn("realwrite=locked", line)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        # The snapshot holds copies (links followed), skills only, unchanged.
+        snapshot = self.loom / "skills"
+        self.assertEqual(sorted(p.name for p in snapshot.iterdir()), ["impeccable", "tdd"])
+        self.assertFalse((snapshot / "impeccable").is_symlink())
+        self.assertEqual((snapshot / "impeccable" / "SKILL.md").read_text(), "impeccable v1\n")
+        self.assertFalse((snapshot / "planted").exists())
+        self.assertEqual((checkout / "impeccable" / "SKILL.md").read_text(), "impeccable v1\n")
+        # Read-only all through, the top folder included.
+        for p in (snapshot, *snapshot.rglob("*")):
+            self.assertFalse(p.stat().st_mode & 0o222, p)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_the_skill_snapshot_refreshes_at_most_hourly_and_a_failed_refresh_keeps_it(self):
+        checkout = self.operator_skills()
+        self.anthropic_skill_run()
+        snapshot = self.loom / "skills" / "impeccable" / "SKILL.md"
+        (checkout / "impeccable" / "SKILL.md").write_text("impeccable v2\n")
+        # Within the hour: no refresh.
+        self.anthropic_skill_run("T043-again.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v1\n")
+        # An hour later, a link with no target makes the copy fail.
+        (checkout / "tdd" / "broken").symlink_to(self.home / "nowhere")
+        stamp = self.loom / "run" / "skills.stamp"
+        old = time.time() - 2 * 3600
+        os.utime(stamp, (old, old))
+        _, seen = self.anthropic_skill_run("T044-once-more.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v1\n")
+        self.assertIn("impeccable v1,", seen[-1])
+        log = (self.loom / "logs" / "skills.log").read_text().splitlines()
+        self.assertEqual(len(log), 1, log)
+        self.assertIn("skill refresh failed", log[0])
+        self.assertFalse((self.loom / "skills.next").exists())
+        # Fixed source, an hour later again: the new version arrives.
+        (checkout / "tdd" / "broken").unlink()
+        os.utime(stamp, (old, old))
+        self.anthropic_skill_run("T045-last.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v2\n")
+
     def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, agy_bin=None, **env):
         lane_home = Path(self._tmp.name) / "loomuser"
         workdir = lane_home / "lanes"
         (lane_home / "tmp").mkdir(parents=True)
         workdir.mkdir()
         # agy's real state: config, and memory a previous run left behind.
-        (lane_home / ".gemini" / "config").mkdir(parents=True)
+        (lane_home / ".gemini" / "config").mkdir(parents=True, exist_ok=True)
         (lane_home / ".gemini" / "config" / "mcp_config.json").write_text("{}")
         (lane_home / ".gemini" / "antigravity-cli" / "brain").mkdir(parents=True)
         (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
@@ -823,6 +1183,23 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(victim.read_text(), "keep")
         self.assertIn("command(*)", json.loads((state / "settings.json").read_text())["permissions"]["allow"])
+
+    def test_agy_lane_user_gets_the_skills_where_agy_reads_them_read_only(self):
+        self.operator_skills()
+        # A copy an earlier run left, read-only, is replaced, not merged.
+        stale = Path(self._tmp.name) / "loomuser" / ".gemini" / "config" / "skills" / "gone"
+        stale.mkdir(parents=True)
+        (stale / "SKILL.md").write_text("gone\n")
+        stale.chmod(0o555)
+        self.addCleanup(lambda: stale.exists() and stale.chmod(0o755))
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("skill=impeccable v1", agy[0])
+        self.assertIn("skillw=locked", agy[0])
+        copy = workdir.parent / ".gemini" / "config" / "skills"
+        self.assertEqual(sorted(p.name for p in copy.iterdir()), ["impeccable", "tdd"])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):
         inbox, _, result, agy = self.agy_lane(FAKE_KC_PW="some-other-password")
@@ -978,6 +1355,117 @@ cat > /dev/null
         beat = json.loads((self.loom / "state" / "usage" / "zai.json").read_text())
         self.assertFalse(beat["available"])
         self.assertIn("LOOM_ZAI_KEY_SSM", beat["reason"])
+
+    SPARK = {"LOOM_SPARK_URL": "http://spark.example.invalid:8000/v1",
+             "LOOM_SPARK_MODEL": "spark/coder-test"}
+
+    def spark_beat(self):
+        return json.loads((self.loom / "state" / "usage" / "spark.json").read_text())
+
+    def spark_log(self):
+        return (self.loom / "logs" / "spark" / "T042-fix-the-thing.log").read_text()
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
+        # The local coder trains on nothing: no privacy lookup, private is fine.
+        inbox, result = self.api_lane("spark", FAKE_GH_PRIVATE="true", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any(c.startswith("gh api ") for c in calls), calls)
+        self.assertTrue(any(c.startswith("curl ") and "http://spark.example.invalid:8000/v1/models" in c
+                            for c in calls), calls)
+        agent = [c for c in calls if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, calls)
+        self.assertIn("-m spark/coder-test", agent[0])
+        self.assertIn("keyvar=none", agent[0])
+        self.assertIn("secret=denied", agent[0])
+        self.assertIn("small=spark/coder-test", agent[0])
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["model"], "spark/coder-test")
+        provider = config["provider"]["spark"]
+        self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
+        self.assertEqual(provider["options"], {"baseURL": "http://spark.example.invalid:8000/v1"})
+        self.assertEqual(list(provider["models"]), ["coder-test"])
+        self.assertIn("lane spark, model spark/coder-test", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.spark_beat()["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_takes_the_brief_model_line(self):
+        brief = BRIEF.replace("Lane: codex", "Lane: spark\nModel: spark/other-coder")
+        inbox = self.loom / "briefs" / "spark"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(brief)
+        self.run_lane("spark", **self.SPARK)
+        agent = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("-m spark/other-coder", agent[0])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_refused_spark_endpoint_is_a_limit_that_hands_the_brief_on(self):
+        inbox, result = self.api_lane("spark", FAKE_CURL="refused", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertFalse((self.loom / "worktrees" / "T042-fix-the-thing").exists())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: limit: the spark endpoint refused the connection", self.spark_log())
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: "), beat)
+        # The limit holds for 15 minutes, without asking the endpoint again.
+        ends = int((self.loom / "state" / "usage" / "spark.limit").read_text().split()[0])
+        self.assertAlmostEqual(ends - time.time(), 900, delta=30)
+        probes = sum(c.startswith("curl ") for c in self.calls())
+        (inbox / "T043-next.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark"))
+        self.run_lane("spark", FAKE_CURL="200", **self.SPARK)
+        self.assertEqual(sum(c.startswith("curl ") for c in self.calls()), probes)
+        self.assertFalse(self.spark_beat()["available"])
+        self.assertTrue((inbox / "failed" / "T043-next.md").exists())
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
+        inbox, result = self.api_lane("spark", extra="AGENT_FAIL=1\n", FAKE_CURL="200 503", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: limit: the spark endpoint answered 503 (agent exited 3)", self.spark_log())
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: "), beat)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_spark_run_that_fails_while_the_endpoint_answers_is_an_ordinary_failure(self):
+        inbox, _ = self.api_lane("spark", extra="AGENT_FAIL=1\n", **self.SPARK)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: agent exited 3", self.spark_log())
+        self.assertNotIn("limit:", self.spark_log())
+        self.assertTrue(self.spark_beat()["available"])
+        self.assertFalse((self.loom / "state" / "usage" / "spark.limit").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_refuses_a_model_from_elsewhere(self):
+        inbox, _ = self.api_lane("spark", LOOM_SPARK_URL=self.SPARK["LOOM_SPARK_URL"],
+                                 LOOM_SPARK_MODEL="opencode/space-bunny-free")
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_without_its_url_reports_unavailable_and_keeps_its_briefs(self):
+        inbox, result = self.api_lane("spark", LOOM_SPARK_MODEL="spark/coder-test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertIn("LOOM_SPARK_URL", beat["reason"])
+        self.assertFalse(beat["reason"].startswith("limit"))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_an_unreachable_spark_endpoint_is_not_a_limit_and_keeps_its_briefs(self):
+        inbox, _ = self.api_lane("spark", FAKE_CURL="timeout", **self.SPARK)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse(self.spark_beat()["available"])
+        self.assertFalse(self.spark_beat()["reason"].startswith("limit"))
 
     def test_lane_without_its_credential_reports_unavailable_and_keeps_its_briefs(self):
         inbox, result = self.api_lane(
