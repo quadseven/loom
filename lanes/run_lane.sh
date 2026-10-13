@@ -1049,11 +1049,22 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ]; then
     park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
   fi
-  # Never forced: a branch that moved on the remote refuses the push.
+  # Never forced: a branch that moved on the remote refuses the push. A fix
+  # brief's branch moved by someone else during the run (another lane's
+  # round, a person's commit) is not this run's failure: it is parked as
+  # "branch moved", and the station hands the new head back to the factory.
   if [ "$COMMITTED" -eq 1 ]; then
-    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
+    if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
+      printf '%s\n' "$PUSH_OUT" >> "$LOG"
+      if [ -n "$FIX_PR" ] && printf '%s\n' "$PUSH_OUT" | grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)'; then
+        NOW_HEAD="$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote origin "refs/heads/$BRANCH" 2>> "$LOG" | cut -f1)"
+        if [ -n "$NOW_HEAD" ] && [ "$NOW_HEAD" != "$BASE" ]; then
+          park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
+        fi
+      fi
       park "$BRIEF" "push failed"; continue
     fi
+    [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
   fi
   if [ -n "$FIX_PR" ]; then
     ITEMS="$(fix_items "$BRIEF")"

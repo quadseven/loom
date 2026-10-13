@@ -58,6 +58,10 @@ RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id
 # work for a while (the spark lane's thermal guard). Not a failure: the ticket
 # goes back to briefed, and the factory moves it to the next lane.
 LIMIT = "limit:"
+# The runner's reason when a fix brief's push was refused because another
+# push moved the pull request's branch during the run. Not a failure: the
+# ticket goes back to loom:pr, and the factory judges the new head.
+BRANCH_MOVED = "branch moved:"
 # Asks the review bot to review a pull request's head again; it resolves the
 # threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
 REVIEW_AGAIN = "/grug improve"
@@ -501,7 +505,9 @@ class Station:
 
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
-        its fix comment cannot be used (refused, as an untrusted ticket is)."""
+        its fix comment cannot be used (refused, as an untrusted ticket is),
+        or when its newest claim's brief is still waiting or running in a
+        lane inbox (left for the next pass)."""
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
@@ -511,6 +517,16 @@ class Station:
             return False
         earlier = sum(1 for c in comments
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
+        if earlier:
+            # Two lanes on one ticket push to one branch, and the later push
+            # is refused: the newest claim's run must end first.
+            newest = tickets.ticket_name(repo, number, earlier)
+            busy = [l for l in LANES
+                    if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))]
+            if busy:
+                _say("not claiming %s#%d: its brief %s is still in lane %s's inbox; next pass"
+                     % (repo, number, newest, busy[0]))
+                return False
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
         fix, fix_comment_id = fix_source if fix_source else (None, None)
@@ -742,19 +758,27 @@ class Station:
             self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
+        self._report_failed(repo, number, lane, name, text)
+        return True
+
+    def _report_failed(self, repo: str, number: int, lane: str, name: str, text: str) -> None:
+        """A brief parked in failed/: a limit, a moved branch or a fix round
+        with nothing to commit is not a failure; anything else is."""
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         if reason.startswith(LIMIT):
             self._limited(repo, number, fix_pr.isdigit(), lane, reason)
-            return True
+            return
+        if fix_pr.isdigit() and reason.startswith(BRANCH_MOVED):
+            self._branch_moved(repo, number, int(fix_pr), lane, reason)
+            return
         if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
             self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
-            return True
+            return
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
-        return True
 
     def _limited(self, repo: str, number: int, fix: bool, lane: str, reason: str) -> None:
         """A run the lane's provider refused (a limit, not a failure). The
@@ -765,6 +789,17 @@ class Station:
         self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
                       "the ticket goes to the next lane." % (lane, reason))
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _branch_moved(self, repo: str, number: int, pr: int, lane: str, reason: str) -> None:
+        """A fix brief whose push was refused because the pull request's
+        branch moved during the run. The model did nothing wrong, so no rung
+        of the ladder is spent: the ticket returns to loom:pr, where the
+        factory judges the new head and sends it back if it still needs a fix."""
+        self._relabel(repo, number, "loom:pr")
+        self._comment(repo, number, "Lane %s did not push its fix to #%d: the branch moved "
+                      "during the run (%s). This is not a failure: the new head goes back "
+                      "to review." % (lane, pr, reason))
+        _say("reported %s#%d: branch moved on lane %s: %s" % (repo, number, lane, reason))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
         """Post each answer the lane wrote instead of a fix as the reply on its
