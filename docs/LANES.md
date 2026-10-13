@@ -191,7 +191,9 @@ station pass uploads every run that newly finished in a slot's `done/` or
 `failed/`, and each brain tick that ran the agent (as ticket
 `brain/<UTC start>`), as one JSON body: `{ticket, slot, model, outcome,
 started_at, finished_at, events: [{ts, role, kind, text}]}`, with kind `text`,
-`tool_use`, `tool_result` or `log`. `bus/transcripts.py` builds it from the
+`tool_use`, `tool_result` or `log` and role `user`, `assistant`, `thinking`,
+`tool` or `runner` (a `log` event is the lane log's, role `runner`; a
+`tool_result` has role `tool`). `bus/transcripts.py` builds it from the
 agent's own session record and the lane log, read by `bus/sessions.py`, the
 one parser the viewer below uses too. Before anything leaves the machine,
 key shapes (GitHub, Anthropic, OpenAI, AWS, Cloudflare, bearer tokens) become
