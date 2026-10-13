@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -675,6 +676,23 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("tried claude-sonnet-5-5", report)
         self.assertIn("next rung 2 gpt-6-sol", report)
 
+    def test_status_reads_at_most_the_capped_number_of_histories(self):
+        older = dict(stuck_ticket("failed"), updated_at="2030-01-01T00:00:00Z")
+        newer = dict(stuck_ticket("failed"), number=10, updated_at="2030-01-02T00:00:00Z")
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [newer, older]),
+                  ("GET", "/issues/9/events"): reply(200, TWICE),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
+        routes.update(lanes_routes(()))
+        fake = Routed(routes)
+        with unittest.mock.patch.object(brain, "STATUS_HISTORY_MAX", 1):
+            report = brain.status(GitHub("t", transport=fake), [REPO], REPO)
+        read = sorted(c[1].split("?")[0] for c in fake.calls
+                      if c[1].split("?")[0].endswith(("/events", "/comments")) and "/issues/99/" not in c[1])
+        self.assertEqual(read, ["/repos/%s/issues/9/comments" % REPO, "/repos/%s/issues/9/events" % REPO])
+        line = {l.split(" ")[1]: l for l in report.splitlines() if l.startswith("- #")}
+        self.assertIn("REPEATEDLY STUCK", line["#9"])
+        self.assertIn("not checked for stuck (status reads 1 histories)", line["#10"])
+
     def test_escalate_moves_a_failed_ticket_to_the_next_rung(self):
         fake, outcome = self.run_escalate(ticket_routes(
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")]))
@@ -747,6 +765,344 @@ class EscalateTests(unittest.TestCase):
         _, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
 
+
+
+def item(number, body=BODY, labels=(), **extra):
+    out = {"number": number, "id": 1000 + number, "state": "open", "body": body,
+           "labels": [{"name": name} for name in labels]}
+    out.update(extra)
+    return out
+
+
+class Routes:
+    """Replies by method and path; records every call. The issue list is
+    served in pages of `page` items with Link headers."""
+
+    def __init__(self, issues, goal_children=(), page=100, refuse_sub_issue=()):
+        self.issues = list(issues)
+        self.goal_children = list(goal_children)
+        self.page = page
+        self.refuse_sub_issue = set(refuse_sub_issue)
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1]
+        self.calls.append((method, path, payload))
+        if method == "GET" and path == "/repos/%s/issues/1" % REPO:
+            return reply(200, goal())
+        if method == "GET" and "/issues/1/sub_issues" in path:
+            return reply(200, self.goal_children)
+        if method == "GET" and path.startswith("/repos/%s/issues?" % REPO):
+            start = int(path.split("&page=")[1]) if "&page=" in path else 0
+            chunk = self.issues[start:start + self.page]
+            headers = {}
+            if start + self.page < len(self.issues):
+                headers["Link"] = '<https://api.github.com%s&page=%d>; rel="next"' % (
+                    path.split("&page=")[0], start + self.page)
+            return 200, headers, json.dumps(chunk).encode()
+        if method == "POST" and path.endswith("/sub_issues"):
+            if payload["sub_issue_id"] in self.refuse_sub_issue:
+                return reply(422, {"message": "already has a parent"})
+            return reply(201, {})
+        if method == "POST":
+            return reply(201, {})
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def writes(self):
+        return [c for c in self.calls if c[0] != "GET"]
+
+    def labelled(self):
+        return {int(c[1].split("/issues/")[1].split("/")[0]): c[2]["labels"]
+                for c in self.calls if c[0] == "POST" and c[1].endswith("/labels")}
+
+
+class TriageTests(unittest.TestCase):
+    def run_triage(self, routes, limit=25):
+        return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
+
+    def assert_never_edited(self, routes):
+        # Only labels, sub-issue links and comments: no PATCH (close, retitle,
+        # rewrite) and no other write of any kind.
+        for method, path, _ in routes.writes():
+            self.assertEqual(method, "POST", path)
+            self.assertTrue(path.endswith(("/labels", "/comments", "/sub_issues")), path)
+
+    def test_ready_issue_becomes_a_queued_ticket_under_the_goal(self):
+        routes = Routes([item(5)])
+        lines = self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
+        self.assertIn(("POST", "/repos/%s/issues/1/sub_issues" % REPO, {"sub_issue_id": 1005}),
+                      routes.calls)
+        self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
+        self.assertEqual(lines, ["#5 queued under #1"])
+        self.assert_never_edited(routes)
+
+    def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
+        no_boxes = BODY.replace("- [ ] done", "done")
+        routes = Routes([item(6, body="It is slow.\n## Why\nusers wait"), item(7, body=no_boxes),
+                         item(8, body=None)])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {6: ["loom:triage"], 7: ["loom:triage"], 8: ["loom:triage"]})
+        comments = {int(c[1].split("/issues/")[1].split("/")[0]): c[2]["body"]
+                    for c in routes.calls if c[1].endswith("/comments")}
+        self.assertIn("Missing: What, Acceptance criteria, Size, Out of scope.", comments[6])
+        self.assertNotIn("Why", comments[6].split("Missing:")[1].split(".")[0])
+        self.assertIn("Missing: checkboxes under Acceptance criteria.", comments[7])
+        self.assertIn("Missing: Why, What", comments[8])
+        for body in comments.values():
+            self.assertTrue(body.startswith(brain.TRIAGE_MARKER))
+            text.check(body)
+        self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST" for c in routes.calls))
+        self.assert_never_edited(routes)
+
+    def test_a_body_the_runner_would_refuse_is_not_ready(self):
+        routes = Routes([item(9, body=BODY + "\nRepo: other/repo")])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {9: ["loom:triage"]})
+
+    def test_pull_requests_epics_and_labelled_issues_are_skipped(self):
+        routes = Routes([
+            item(2, pull_request={"url": "x"}),
+            item(3, labels=["Epic"]),
+            item(4, sub_issues_summary={"total": 3, "completed": 0}),
+            item(5, labels=["loom:triage"]),
+            item(6, labels=["loom:human"]),
+            item(7, labels=["needs-operator"]),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
+    def test_the_limit_holds_and_stops_reading_pages(self):
+        routes = Routes([item(n, body="old issue") for n in range(10, 40)], page=10)
+        lines = self.run_triage(routes, limit=12)
+        self.assertEqual(sorted(routes.labelled()), list(range(10, 22)))
+        self.assertEqual(len(lines), 12)
+        pages = [c for c in routes.calls if c[1].startswith("/repos/%s/issues?" % REPO)]
+        self.assertEqual(len(pages), 2)
+        self.assertIn("sort=created&direction=asc", pages[0][1])
+        self.assert_never_edited(routes)
+
+    def test_ready_issues_wait_while_the_goal_is_at_its_cap(self):
+        full = [item(50 + n, labels=["loom:ticket", "loom:queued"]) for n in range(2)]
+        routes = Routes([item(5), item(6, body="vague")], goal_children=full)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "2"}):
+            lines = self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {6: ["loom:triage"]})
+        self.assertTrue(lines[0].startswith("#5 held"))
+
+    def test_an_issue_github_refuses_as_a_sub_issue_is_left_alone(self):
+        routes = Routes([item(5)], refuse_sub_issue={1005})
+        lines = self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {})
+        self.assertIn("skipped", lines[0])
+
+    def test_bad_limit_and_bad_goal_write_nothing(self):
+        routes = Routes([item(5)])
+        with self.assertRaises(ValueError):
+            self.run_triage(routes, limit=0)
+        fake = Fake(reply(200, {"state": "open", "labels": []}))
+        with self.assertRaises(ValueError):
+            brain.triage(GitHub("t", transport=fake), REPO, 1)
+        self.assertEqual(routes.writes() + [c for c in fake.calls if c[0] != "GET"], [])
+
+
+class HumanAndRefsTests(unittest.TestCase):
+    def test_human_posts_one_comment_and_swaps_triage_for_human(self):
+        fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(201, {}), reply(200, []), reply(200, []))
+        brain.human(GitHub("t", transport=fake), REPO, 6, "Buy a test phone.\n")
+        self.assertEqual(fake.calls[1][2], {"body": brain.HUMAN_MARKER + "\nBuy a test phone."})
+        self.assertEqual(fake.calls[2][0], "DELETE")
+        self.assertTrue(fake.calls[2][1].endswith("/issues/6/labels/loom%3Atriage"))
+        self.assertEqual(fake.calls[3][2], {"labels": ["loom:human"]})
+
+    def test_human_refusals_write_nothing(self):
+        cases = [(item(6, labels=["loom:human"]), "Buy it."), (item(6, state="closed"), "Buy it."),
+                 (item(6, pull_request={}), "Buy it."), (item(6), "  ")]
+        for issue, ask in cases:
+            with self.subTest(ask=ask, issue=issue):
+                fake = Fake(reply(200, issue))
+                with self.assertRaises(ValueError):
+                    brain.human(GitHub("t", transport=fake), REPO, 6, ask)
+                self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_brief_refs_rewrites_without_touching_the_original(self):
+        fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t"}),
+                    reply(201, {}), reply(201, {}), reply(200, []), reply(200, []))
+        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
+        self.assertTrue(fake.calls[3][2]["body"].endswith("\n\nRefs #6\n"))
+        self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
+        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
+        self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+        self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
+
+    def test_brief_refs_refuses_a_ticket_or_closed_original(self):
+        for issue in (item(6, labels=["loom:ticket"]), item(6, state="closed")):
+            fake = Fake(reply(200, issue))
+            with self.assertRaises(ValueError):
+                brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
+            self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+
+class FakeRepo:
+    """A repo on GitHub that remembers labels and issues written to it, so a
+    second onboard run sees what the first one made."""
+
+    def __init__(self, labels=(), issues=(), prs=(), runs=None, private=False):
+        self.labels = [dict(x) for x in labels]
+        self.issues = [dict(x) for x in issues]
+        self.prs = list(prs)
+        self.runs = dict(runs or {})
+        self.private = private
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1]
+        self.calls.append((method, path, payload))
+        handler = {"GET": self.get, "POST": self.post}.get(method)
+        answer = handler(path[len("/repos/%s" % REPO):], payload) if handler else None
+        if answer is None:
+            raise AssertionError("unexpected %s %s" % (method, path))
+        return answer
+
+    def get(self, path, payload):
+        if path == "":
+            return reply(200, {"full_name": REPO, "private": self.private})
+        if path.startswith("/labels?"):
+            return reply(200, self.labels)
+        if path.startswith("/issues?"):
+            self.assertIn_("labels=loom%3Agoal", path)
+            return reply(200, [i for i in self.issues
+                               if any(l["name"] == "loom:goal" for l in i["labels"])])
+        if path.startswith("/pulls?"):
+            return reply(200, self.prs)
+        if "/check-runs?" in path:
+            sha = path.split("/commits/")[1].split("/")[0]
+            self.assertIn_("check_name=Grug%20-%20Elder", path)
+            return reply(200, {"total_count": self.runs.get(sha, 0)})
+        return None
+
+    def post(self, path, payload):
+        if path == "/labels":
+            self.labels.append(payload)
+            return reply(201, payload)
+        if path == "/issues":
+            issue = {"number": 100 + len(self.issues), "title": payload["title"],
+                     "body": payload["body"],
+                     "labels": [{"name": n} for n in payload["labels"]]}
+            self.issues.append(issue)
+            return reply(201, issue)
+        return None
+
+    @staticmethod
+    def assertIn_(part, whole):
+        if part not in whole:
+            raise AssertionError("%r not in %r" % (part, whole))
+
+    def writes(self):
+        return [c for c in self.calls if c[0] != "GET"]
+
+
+def pr(number, sha):
+    return {"number": number, "head": {"sha": sha}}
+
+
+class OnboardTests(unittest.TestCase):
+    ENV = {"LOOM_REPOS": "example-owner/other"}
+
+    def run_onboard(self, repo_fake, env=None):
+        return brain.onboard(GitHub("t", transport=repo_fake), REPO,
+                             env=self.ENV if env is None else env)
+
+    def test_creates_missing_labels_and_one_goal_home_then_is_a_no_op(self):
+        from bus import labels
+        fake = FakeRepo(labels=[dict(labels.LABELS["loom:ticket"], name="loom:ticket"),
+                                {"name": "bug", "color": "ffffff", "description": ""}],
+                        prs=[pr(7, "abc")], runs={"abc": 1})
+        lines = self.run_onboard(fake)
+        made = [c[2]["name"] for c in fake.writes() if c[1].endswith("/labels")]
+        self.assertEqual(sorted(made), sorted(n for n in labels.LABELS if n != "loom:ticket"))
+        for name in ("loom:queued", "loom:human", "loom:triage", "loom:urgent",
+                     "needs-operator", "lane:anthropic-7"):
+            self.assertIn(name, made)
+        posted = [c for c in fake.writes() if c[1].endswith("/issues")]
+        self.assertEqual(len(posted), 1)
+        issue = posted[0][2]
+        self.assertEqual(issue["title"], "Backlog: every open issue in %s is worked "
+                         "through Loom or handed to a person" % REPO)
+        self.assertEqual(issue["labels"], ["loom:goal"])
+        for part in ("## Destination", "## Metric", "## Rules", "loom:human",
+                     "never closes an issue", "train on prompts"):
+            self.assertIn(part, issue["body"])
+        self.assertIn("backlog goal home: #100, created", lines)
+
+        fake.calls = []
+        again = self.run_onboard(fake)
+        self.assertEqual(fake.writes(), [])
+        self.assertIn("labels: no changes", again)
+        self.assertIn("backlog goal home: #100, already open", again)
+
+    def test_other_goal_homes_do_not_count_as_the_backlog_home(self):
+        other = {"number": 3, "title": "Ship the thing", "labels": [{"name": "loom:goal"}]}
+        fake = FakeRepo(issues=[other], prs=[pr(7, "abc")], runs={"abc": 1})
+        self.run_onboard(fake)
+        self.assertEqual(len([c for c in fake.writes() if c[1].endswith("/issues")]), 1)
+
+    def test_warns_when_the_review_check_never_ran(self):
+        fake = FakeRepo(prs=[pr(9, "s9"), pr(8, "s8")])
+        lines = self.run_onboard(fake)
+        warning = [l for l in lines if l.startswith("warning:")]
+        self.assertEqual(len(warning), 1)
+        self.assertIn("Grug - Elder did not run", warning[0])
+        self.assertIn("#9, #8", warning[0])
+        self.assertIn("never merges", warning[0])
+
+    def test_warns_when_there_are_no_pull_requests(self):
+        lines = self.run_onboard(FakeRepo())
+        self.assertTrue(any(l.startswith("warning:") and "no pull requests" in l
+                            for l in lines))
+
+    def test_no_warning_when_the_review_check_ran_on_a_recent_pull_request(self):
+        fake = FakeRepo(prs=[pr(9, "s9"), pr(8, "s8"), pr(7, "s7")], runs={"s8": 1})
+        lines = self.run_onboard(fake)
+        self.assertFalse(any(l.startswith("warning:") for l in lines))
+        self.assertIn("review check: Grug - Elder ran on %s#8" % REPO, lines)
+        # It stops at the first pull request that has it.
+        self.assertFalse(any("/commits/s7/" in c[1] for c in fake.calls))
+
+    def test_review_check_name_comes_from_the_environment(self):
+        fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
+        fake.assertIn_ = lambda part, whole: None
+        brain.onboard(GitHub("t", transport=fake), REPO,
+                      env={"LOOM_REVIEW_CHECK": "My Review"})
+        checked = [c[1] for c in fake.calls if "/check-runs?" in c[1]]
+        self.assertTrue(checked and "check_name=My%20Review" in checked[0])
+
+    def test_prints_loom_repos_with_the_repo_added_once(self):
+        lines = self.run_onboard(FakeRepo())
+        self.assertEqual(lines[-1], 'LOOM_REPOS="example-owner/other %s"' % REPO)
+        lines = self.run_onboard(FakeRepo(), env={"LOOM_REPOS": "%s,example-owner/other" % REPO})
+        self.assertEqual(lines[-1], 'LOOM_REPOS="%s example-owner/other"' % REPO)
+        lines = self.run_onboard(FakeRepo(), env={})
+        self.assertEqual(lines[-1], 'LOOM_REPOS="%s"' % REPO)
+
+    def test_says_when_the_repo_is_private(self):
+        self.assertIn("private", self.run_onboard(FakeRepo(private=True))[0])
+        self.assertTrue(self.run_onboard(FakeRepo())[0].endswith("public"))
+
+    def test_command_line_prints_the_lines(self):
+        fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
+        with unittest.mock.patch.object(brain, "GitHub", lambda token: GitHub(token, transport=fake)), \
+                unittest.mock.patch.object(brain, "token_from_env", lambda: "t"), \
+                unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""}), \
+                unittest.mock.patch("sys.stdout") as out:
+            self.assertEqual(brain.main(["onboard", REPO]), 0)
+        printed = "".join(c.args[0] for c in out.write.call_args_list)
+        self.assertIn('LOOM_REPOS="%s"' % REPO, printed)
 
 
 if __name__ == "__main__":

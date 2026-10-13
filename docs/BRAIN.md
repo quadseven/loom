@@ -49,6 +49,9 @@ that talks to GitHub about tickets.
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
+| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
+| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Refs #<number>`. The issue stays open. |
+| `loom:human` | Only a person can do this; one comment names the exact thing needed (money, hardware, an account, a credential, a decision reserved for the operator). |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
@@ -91,6 +94,40 @@ repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 <owner/name>#<number>`, then the header lines and the body. The runner adds
 `Refs <owner/name>#<number>` to the pull request body, never a closing
 keyword.
+
+## Onboarding a repo
+
+`python3 -m bus.brain onboard <owner/name> [--review-check NAME]` readies a
+repo for Loom in one step, and a second run changes nothing:
+
+- creates the labels above that are missing (the same as `python3 -m bus
+  labels`);
+- opens the repo's backlog goal home when none is open: `loom:goal`, titled
+  "Backlog: every open issue in <owner/name> is worked through Loom or
+  handed to a person", with the destination, the metric (open issues not
+  yet tickets, tickets, `loom:human`) and the rules (triage never closes an
+  issue; a private repo's briefs never go to lanes that train on prompts);
+- checks whether the review check (`--review-check`, else
+  `LOOM_REVIEW_CHECK`, else `Grug - Elder`) ran on any of the repo's last 5
+  pull requests, and prints a `warning:` line when it did not, because the
+  factory never merges a pull request without it;
+- says whether the repo is private, and prints the `LOOM_REPOS` value with
+  the repo added. It does not edit any config. Copy that line into the
+  brain's and the station's settings yourself.
+
+## Triage
+
+`python3 -m bus.brain triage <owner/name> --goal N [--limit 25]` walks the
+repo's open issues oldest first and labels at most `--limit` of them. It
+skips pull requests, epics (an `epic` label or sub-issues), `needs-operator`
+asks and anything with a `loom:` label. A ready issue (Why, What,
+Acceptance criteria with checkboxes, Size and Out of scope, and a body the
+runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
+of goal N, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
+for a later run. Any other issue gets `loom:triage` and one comment naming
+what is missing. Triage writes labels, sub-issue links and that comment
+only: it never closes, retitles or edits an issue, because an automated
+pass over old issues over-calls work as done.
 
 ## Proof
 
@@ -193,6 +230,10 @@ When the runner finishes, the station finds the brief in `done/` or
 - Done: label `loom:pr`, comment with the pull request link.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
+- Limited (a reason starting `limit:`, the lane's provider refusing work for
+  a while): not a failure. Label `loom:briefed` again (`loom:pr` for a fix
+  brief), comment that the lane is unavailable; the factory moves a ticket
+  briefed on a lane whose heartbeat says `limit:` to the next rung at once.
 
 ## Polling budget
 

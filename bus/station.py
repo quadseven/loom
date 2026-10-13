@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import factory
 from . import spend
 from . import text as _text
 from . import tickets
@@ -33,9 +34,26 @@ RUNNING = "loom:running"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
+# The runner's reason when a lane run ends with nothing committed.
+NO_COMMIT = "agent made no commit"
+# The runner's reason, and its heartbeat's, when a lane's provider refused
+# work for a while (the spark lane's thermal guard). Not a failure: the ticket
+# goes back to briefed, and the factory moves it to the next lane.
+LIMIT = "limit:"
+# Asks the review bot to review a pull request's head again; it resolves the
+# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
+REVIEW_AGAIN = "/grug improve"
+LANE_SAID_MAX = 2500
 # An absolute path: a run of non-space characters starting with a slash (not
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
+# Credential shapes that must not reach a public comment: provider key
+# prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
+SECRET_RE = re.compile(
+    r"(?i)\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat|xox[a-z]|glpat|AKIA|ASIA)[-_A-Za-z0-9]{12,}"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+"
+    r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
 REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
@@ -103,7 +121,9 @@ class Settings:
                  mention: str = "", digest_hour: int = 9,
                  region: str = "us-east-1", channel_id: str = "",
                  bot_token_ssm: str = "", default_goal: str = "",
-                 anthropic: Optional[spend.Budget] = None) -> None:
+                 anthropic: Optional[spend.Budget] = None,
+                 factory_on: bool = False,
+                 review_check: str = factory.DEFAULT_REVIEW_CHECK) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -117,6 +137,10 @@ class Settings:
         self.bot_token_ssm = bot_token_ssm
         self.default_goal = default_goal
         self.anthropic = anthropic or spend.Budget()
+        # Off unless asked for, so a Settings built in code does not start
+        # merging; from_env turns it on unless LOOM_FACTORY=0.
+        self.factory_on = factory_on
+        self.review_check = review_check
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -146,7 +170,10 @@ class Settings:
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
                    bot_token_ssm=env.get("LOOM_DISCORD_BOT_TOKEN_SSM", "").strip(),
                    default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip(),
-                   anthropic=budget)
+                   anthropic=budget,
+                   factory_on=env.get("LOOM_FACTORY", "").strip() not in ("0", "off", "false"),
+                   review_check=(env.get("LOOM_REVIEW_CHECK", "").strip()
+                                 or factory.DEFAULT_REVIEW_CHECK))
 
 
 def _origin_repo() -> str:
@@ -517,6 +544,22 @@ class Station:
             return False
         return -60 <= self.now - at <= HEARTBEAT_MAX_AGE
 
+    def limited_lanes(self) -> List[str]:
+        """Lanes whose fresh heartbeat says unavailable at a limit."""
+        out = []
+        for lane in LANES:
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            if not isinstance(beat, dict) or beat.get("available") is not False:
+                continue
+            at = beat.get("at")
+            if isinstance(at, bool) or not isinstance(at, (int, float)):
+                continue
+            if (-60 <= self.now - at <= HEARTBEAT_MAX_AGE
+                    and str(beat.get("reason") or "").startswith(LIMIT)):
+                out.append(lane)
+        return out
+
     def _inbox_empty(self, lane: str) -> bool:
         try:
             names = os.listdir(self.inbox(lane))
@@ -557,9 +600,13 @@ class Station:
         if self._skip_known(repo, issue):
             return False
         try:
-            tickets.parse(issue.get("body"))
+            headers, _ = tickets.parse(issue.get("body"))
         except ValueError as err:
             self._refuse(repo, issue, "unusable brief: %s" % err)
+            return False
+        hold = tickets.not_before(headers)
+        if hold is not None and self.now < hold:
+            _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
         ok, reason = self._check_trust(repo, issue)
         if not ok:
@@ -634,10 +681,69 @@ class Station:
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
         reason = self._failure_reason(lane, name)
+        fix_pr = self._field(text, "Fix-PR")
+        if reason.startswith(LIMIT):
+            self._limited(repo, number, fix_pr.isdigit(), lane, reason)
+            return True
+        if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
+            self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
+            return True
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _limited(self, repo: str, number: int, fix: bool, lane: str, reason: str) -> None:
+        """A run the lane's provider refused (a limit, not a failure). The
+        ticket goes back to briefed, where the factory moves it to the next
+        lane; a fix brief's goes back to loom:pr, where the factory sends its
+        pull request back again."""
+        self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
+        self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
+                      "the ticket goes to the next lane." % (lane, reason))
+        _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
+        """A fix brief that ended with nothing committed. Most often the lane
+        found every thread already fixed (a stale review thread) and said
+        so. Its explanation goes on the pull request, the review bot is asked
+        to review the head again (it resolves what it no longer raises), and
+        the ticket returns to loom:pr. If the review still stands, the factory
+        sends it back a rung up the model ladder (bus/factory.py), so this
+        never loops on one lane."""
+        said = self._lane_said(lane, name)
+        body = "Lane %s made no change for this fix." % lane
+        if said:
+            body = "Lane %s made no change for this fix. It said:\n\n%s" % (
+                lane, "\n".join("> " + line for line in said.splitlines()))
+        try:
+            _text.check(body)
+        except ValueError:
+            body = ("Lane %s made no change for this fix; its explanation did not "
+                    "pass the text checks and is in the lane log." % lane)
+        self._comment(repo, pr, body)
+        self._comment(repo, pr, os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN)
+        self._relabel(repo, number, "loom:pr")
+        self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
+                      "on the pull request; the review bot was asked to review it again."
+                      % (lane, pr))
+        _say("reported %s#%d: no change for #%d; review requested" % (repo, number, pr))
+
+    def _lane_said(self, lane: str, name: str) -> str:
+        """The agent's own words from the run log: every line that is not a
+        runner line, with local paths and credential shapes removed, capped."""
+        log = os.path.join(self.s.home, "logs", lane, name + ".log")
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                lines = [line.rstrip() for line in fh]
+        except OSError:
+            return ""
+        said = [SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", line)) for line in lines
+                if not re.match(r"^\[\d{4}-\d\d-\d\dT", line) and not line.startswith("rsync(")]
+        text = "\n".join(said).strip()
+        if len(text) > LANE_SAID_MAX:
+            text = text[:LANE_SAID_MAX].rsplit("\n", 1)[0] + "\n(cut; the rest is in the lane log)"
+        return text
 
     def _failure_reason(self, lane: str, name: str) -> str:
         log = os.path.join(self.s.home, "logs", lane, name + ".log")
@@ -1476,12 +1582,23 @@ class Station:
         ledger["replies_at"] = self.now
 
     # -- one pass --------------------------------------------------------
+    def run_factory(self) -> None:
+        """Merge ready lane pull requests, send the rest back, and move stuck
+        tickets up the model ladder (bus/factory.py), at most every
+        factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
+        if not self.s.factory_on or not factory.due(self.state, self.now):
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                        review_check=self.s.review_check,
+                        limited=self.limited_lanes()).run()
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
-                     self.watch_brain, self.relay_operator):
+                     self.watch_brain, self.relay_operator, self.run_factory):
             try:
                 step()
             except (GitHubError, OSError) as err:

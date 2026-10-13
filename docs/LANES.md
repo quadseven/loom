@@ -65,6 +65,47 @@ least hourly, and never publishes the heartbeat's reason. With anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
+Hold: a ticket whose header has `Not before: 2026-10-13T17:00:00Z` (UTC) is
+not claimed before that time, and the factory does not count it as stalled
+until then; the line is left out of the brief the lane reads.
+
+Factory: at most every 5 minutes the station runs `bus/factory.py` over
+`LOOM_REPOS`, with no model. A lane pull request (a `loom/` branch whose
+ticket is `loom:pr`) whose checks have all finished, whose review check
+(`LOOM_REVIEW_CHECK`, default `Grug - Elder`) has run on its head commit,
+and that is mergeable, green and free of open threads is squash-merged
+through `bus.brain merge`. One with a failing check, an open thread or a
+conflict goes back to a lane as a fix brief. It stays on its lane while the
+rounds make progress, and climbs the model ladder only when stuck: a review
+thread survived a fix round, checks it was asked to fix still fail, or the
+pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
+conflict alone, never climbs). Failed tickets and briefed tickets no lane
+claimed for 2 hours climb too. After a push the factory waits for the review
+to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
+starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
+`claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
+A rung whose lanes each already hold 2 briefed or running tickets is passed
+over for the next. A fix brief that ends with nothing committed (most often
+every thread was already fixed and the review thread is stale) is not a
+failure: the station posts the lane's explanation on the pull request, asks
+the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
+`/grug improve`), and returns the ticket to `loom:pr`. Before a fix brief's
+agent runs, the runner merges the default branch into the pull request's
+branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
+the agent changes nothing, and a conflict is handed to the agent with the
+file list, its markers in the tree; the runner completes the merge, or parks
+the brief with "conflict markers left in FILES".
+A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
+does while its box is hot) is not failing: a ticket briefed on it moves to
+the next rung at once, recorded with a rung marker like any climb.
+Past the last rung the ticket is left `loom:failed` for the brain. Landing
+keeps the default branch green: a ready pull request that is behind its base
+is brought up to date first (GitHub's update-branch) and lands only after its
+checks and review pass again on the new head; each repo lands at most one a
+pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+fault is a failed Actions job gets that job run once more before it is sent
+back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
@@ -283,6 +324,28 @@ lookup leaves the brief for the next pass. The rule covers:
   newer models (glm-5.3-flash) are paid-plan only.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
+
+## spark: a local vLLM coder, one stream at a time
+
+- opencode against a vLLM server you run yourself, through a custom
+  OpenAI-compatible provider named `spark`. `LOOM_SPARK_URL` is its base URL
+  (e.g. `http://your-spark.internal:8000/v1`, reachable from the lane machine
+  but not on its loopback, which the sandbox denies); it takes no key.
+  Models are `spark/<served model id>`, from the brief's `Model:` line or
+  `LOOM_SPARK_MODEL`.
+- One slot: the server serves one stream at a time.
+- Nothing leaves your own machines and nothing trains on prompts, so private
+  repos are allowed.
+- The server sits behind a thermal guard that refuses new connections, or
+  answers 503, while the box is hot. Each pass asks `$LOOM_SPARK_URL/models`
+  first, and asks again after a run that failed. A refused connection or a
+  503 is a limit, not a failure: the heartbeat says unavailable, with a
+  reason starting `limit:`, for 15 minutes; every brief in the inbox is
+  parked with that reason; the station puts its ticket back to briefed (a
+  fix brief's back to `loom:pr`), and the factory moves a ticket briefed on a
+  limited lane to the next rung of the model ladder at once. Any other
+  failure to answer (a timeout, a name that does not resolve) only makes the
+  lane unavailable; its briefs wait.
 
 ## agy: the Google plan, as a separate macOS user
 

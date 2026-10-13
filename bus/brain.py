@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, token_from_env
-from . import proof, text
+from .github import GitHub, GitHubError, _next_link, token_from_env
+from . import proof, text, tickets
 from .labels import ESCALATION, LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -24,6 +24,9 @@ DEFAULT_GOAL_CAP = 16
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
+TRIAGE_MARKER = "<!-- loom:triage v1 -->"
+HUMAN_MARKER = "<!-- loom:human v1 -->"
+TRIAGE_LIMIT = 25
 _check_written_text = text.check
 
 
@@ -175,7 +178,8 @@ def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
 
 
-def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
+def _goal_in_flight(gh: GitHub, repo: str, goal: int) -> int:
+    """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
     try:
         goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
     except GitHubError as exc:
@@ -185,35 +189,298 @@ def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
     if goal_issue.get("state") != "open" or "loom:goal" not in _labels(goal_issue):
         raise ValueError("goal must be an open loom:goal issue")
     children = gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
-    count = sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i)
-                and any(state in _labels(i) for state in IN_FLIGHT))
+    return sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i)
+               and any(state in _labels(i) for state in IN_FLIGHT))
+
+
+def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
+    count = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
     if count >= cap:
         raise ValueError("goal already has %d tickets in flight (cap %d)" % (count, cap))
 
 
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
-                 base: Optional[str]) -> str:
+                 base: Optional[str], not_before: Optional[str] = None) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
-               (("Difficulty", difficulty), ("Model", model), ("Base", base)) if v]
+               (("Not before", not_before), ("Difficulty", difficulty), ("Model", model),
+                ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
 
 def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
-          model: Optional[str] = None, base: Optional[str] = None) -> str:
+          model: Optional[str] = None, base: Optional[str] = None,
+          not_before: Optional[str] = None, refs: Optional[int] = None) -> str:
+    """File a ticket under the goal. With refs, the ticket is a rewrite of that
+    open issue: its body ends with "Refs #M", and the original gets a comment
+    naming the ticket and loom:rewritten in place of loom:triage. The original
+    is never closed, retitled or edited."""
     _check_brief_args(title, body, lane, model, base)
+    if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
+        raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
+    if refs is not None:
+        body = body.rstrip("\n") + "\n\nRefs #%d\n" % refs
     _check_written_text(title + "\n" + body)
+    if refs is not None:
+        _check_rewritable(gh, repo, refs)
     _check_goal_capacity(gh, repo, goal)
     names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
     if lane:
         names.append("lane:" + lane)
     issue = gh.rest("POST", "/repos/%s/issues" % repo, {
-        "title": title, "body": _ticket_body(body, difficulty, model, base),
+        "title": title, "body": _ticket_body(body, difficulty, model, base, not_before),
         "labels": names}).data
     gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
             {"sub_issue_id": issue["id"]})
+    if refs is not None:
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
+                {"body": "%s\nRewritten as ticket #%d, which refs this issue. This issue "
+                         "stays open as it is." % (TRIAGE_MARKER, issue["number"])})
+        _remove_label(gh, repo, refs, "loom:triage")
+        gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
+                {"labels": ["loom:rewritten"]})
     return str(issue.get("html_url", ""))
+
+
+def _open_issue(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    if issue.get("state") != "open" or "pull_request" in issue:
+        raise ValueError("#%d is not an open issue" % number)
+    return issue
+
+
+def _check_rewritable(gh: GitHub, repo: str, number: int) -> None:
+    names = _labels(_open_issue(gh, repo, number))
+    if "loom:ticket" in names or "loom:rewritten" in names:
+        raise ValueError("#%d is already a ticket or already rewritten" % number)
+
+
+def _remove_label(gh: GitHub, repo: str, number: int, name: str) -> None:
+    gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s" % (repo, number, quote(name, safe="")),
+            ok=(404,))
+
+
+_HEADING = re.compile(r"##[ \t]+(.*?)[ \t#]*")
+_CHECKBOX = re.compile(r"[ \t]*[-*+][ \t]+\[[ xX]\][ \t]")
+
+
+def missing_sections(body: Optional[str]) -> List[str]:
+    """What an issue body lacks to be a ticket as it stands: the brief
+    sections by name, checkboxes under Acceptance criteria, and a body the
+    runner accepts. Empty when it is ready."""
+    found: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        m = _HEADING.fullmatch(line.rstrip())
+        if m:
+            current = m.group(1).strip().lower()
+            found.setdefault(current, [])
+        elif current is not None:
+            found[current].append(line)
+    names = [section[3:] for section in SECTIONS]
+    missing = [name for name in names if name.lower() not in found]
+    criteria = found.get("acceptance criteria")
+    if criteria is not None and not any(_CHECKBOX.match(line) for line in criteria):
+        missing.append("checkboxes under Acceptance criteria")
+    if not missing:
+        try:
+            tickets.parse(body)
+        except ValueError as exc:
+            missing.append("a body the runner accepts (%s)" % exc)
+    return missing
+
+
+def _is_epic(issue: Dict[str, Any]) -> bool:
+    summary = issue.get("sub_issues_summary") or {}
+    return ("epic" in [name.lower() for name in _labels(issue)]
+            or int(summary.get("total") or 0) > 0)
+
+
+def _triage_skip(issue: Dict[str, Any]) -> Optional[str]:
+    if "pull_request" in issue:
+        return "pull request"
+    names = _labels(issue)
+    if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
+        return "already labelled"
+    if _is_epic(issue):
+        return "epic"
+    return None
+
+
+def _oldest_open_issues(gh: GitHub, repo: str):
+    """Open issues and pull requests, oldest first, one page at a time, so a
+    run that reaches its limit early reads no further."""
+    url: Optional[str] = ("/repos/%s/issues?state=open&sort=created&direction=asc&per_page=100"
+                          % repo)
+    while url:
+        resp = gh.rest("GET", url)
+        for item in resp.data if isinstance(resp.data, list) else []:
+            yield item
+        url = _next_link(resp.headers.get("link", ""))
+
+
+def _triage_comment(missing: List[str]) -> str:
+    return ("%s\nLoom triage: this issue is not a ticket yet. Missing: %s.\n\n"
+            "The brain will write a ticket from it that refs this issue, or label it "
+            "loom:human if only a person can do it. This issue stays open as it is."
+            % (TRIAGE_MARKER, ", ".join(missing)))
+
+
+def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
+    """Label at most limit open issues that Loom has not seen, oldest first.
+
+    Skips pull requests, epics (an epic label or sub-issues), asks and
+    anything with a loom: label. A ready issue (every brief section,
+    checkboxes under Acceptance criteria) becomes a loom:queued ticket under
+    the goal, while the goal has room; the rest get loom:triage and one
+    comment naming what is missing. Only labels, sub-issue links and that
+    comment are written: an issue is never closed, retitled or edited.
+    Returns one line per issue looked at.
+    """
+    if limit < 1:
+        raise ValueError("limit is at least 1")
+    in_flight = _goal_in_flight(gh, repo, goal)
+    cap = goal_cap()
+    lines: List[str] = []
+    done = 0
+    for issue in _oldest_open_issues(gh, repo):
+        if done >= limit:
+            break
+        number = int(issue["number"])
+        skip = _triage_skip(issue)
+        if skip:
+            continue
+        missing = missing_sections(issue.get("body"))
+        if not missing:
+            if in_flight >= cap:
+                lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
+                             % (number, in_flight, cap))
+                continue
+            try:
+                gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
+                        {"sub_issue_id": issue["id"]})
+            except GitHubError as exc:
+                if exc.status != 422:
+                    raise
+                lines.append("#%d skipped: GitHub refused it as a sub-issue of #%d"
+                             % (number, goal))
+                continue
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": ["loom:ticket", "loom:queued"]})
+            in_flight += 1
+            lines.append("#%d queued under #%d" % (number, goal))
+        else:
+            comment = _triage_comment(missing)
+            _check_written_text(comment)
+            gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": ["loom:triage"]})
+            lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
+        done += 1
+    return lines
+
+
+def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
+    """Mark an open issue loom:human: only a person can do it. One comment
+    names the exact thing needed (money, hardware, an account, a credential,
+    a decision reserved for the operator); loom:triage, if any, comes off."""
+    ask = ask.strip()
+    if not ask:
+        raise ValueError("the ask must name the exact thing a person has to do")
+    _check_written_text(ask)
+    names = _labels(_open_issue(gh, repo, number))
+    if "loom:human" in names:
+        raise ValueError("#%d is already loom:human" % number)
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+            {"body": "%s\n%s" % (HUMAN_MARKER, ask)})
+    if "loom:triage" in names:
+        _remove_label(gh, repo, number, "loom:triage")
+    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})
+
+
+BACKLOG_TITLE = "Backlog: every open issue in %s is worked through Loom or handed to a person"
+REVIEW_SAMPLE = 5
+
+
+def _backlog_body(repo: str) -> str:
+    return "\n".join([
+        "## Destination",
+        "",
+        "Every open issue in %s is either a Loom ticket worked by a lane or "
+        "labelled `loom:human` with one comment naming what only a person can do."
+        % repo,
+        "",
+        "## Metric",
+        "",
+        "- Open issues not yet tickets (neither `loom:ticket` nor `loom:human`): "
+        "falls to 0.",
+        "- Open `loom:ticket` issues: rise, then fall as they ship.",
+        "- Open `loom:human` issues: each has its ask.",
+        "",
+        "## Rules",
+        "",
+        "- Triage never closes an issue. It rewrites one as a ticket, marks what "
+        "is missing with `loom:triage`, or hands it to a person with `loom:human`.",
+        "- If this repo is private, its briefs never go to a lane whose provider "
+        "may train on prompts.",
+        "- No pull request merges here without the review check.",
+    ])
+
+
+def _review_check_line(gh: GitHub, repo: str, check: str) -> str:
+    """Whether the review check ran on any of the repo's latest pull requests."""
+    prs = gh.rest("GET", "/repos/%s/pulls?state=all&per_page=%d"
+                  % (repo, REVIEW_SAMPLE)).data or []
+    prs = [p for p in prs if isinstance(p, dict)][:REVIEW_SAMPLE]
+    if not prs:
+        return ("warning: %s has no pull requests yet, so it is unknown whether %s runs "
+                "there; the factory never merges a pull request without it"
+                % (repo, check))
+    for pr in prs:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha:
+            continue
+        runs = gh.rest("GET", "/repos/%s/commits/%s/check-runs?check_name=%s&per_page=1"
+                       % (repo, sha, quote(check, safe=""))).data or {}
+        if int(runs.get("total_count") or 0) > 0:
+            return "review check: %s ran on %s#%s" % (check, repo, pr["number"])
+    return ("warning: %s did not run on the last %d pull requests in %s (%s); the "
+            "factory never merges there without it, so install the review bot first"
+            % (check, len(prs), repo, ", ".join("#%s" % p["number"] for p in prs)))
+
+
+def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
+            env: Optional[Dict[str, str]] = None) -> List[str]:
+    """Make a repo ready for Loom: the labels, one backlog goal home, a check
+    that the review check runs there, and the LOOM_REPOS value with the repo
+    in it. A second run changes nothing. Returns the lines to print."""
+    from . import factory, labels  # factory imports this module
+    env = os.environ if env is None else env
+    check = (review_check or env.get("LOOM_REVIEW_CHECK", "").strip()
+             or factory.DEFAULT_REVIEW_CHECK)
+    info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    lines = ["%s is %s" % (repo, "private: its briefs never go to lanes that train on prompts"
+                           if info.get("private") else "public")]
+    changed = labels.ensure_labels(gh, repo)
+    lines.append("labels: %s" % (", ".join(changed) if changed else "no changes"))
+    title = BACKLOG_TITLE % repo
+    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
+    home = [g for g in goals if "pull_request" not in g and g.get("title") == title]
+    if home:
+        lines.append("backlog goal home: #%s, already open" % home[0]["number"])
+    else:
+        body = _backlog_body(repo)
+        _check_written_text(body)
+        made = gh.rest("POST", "/repos/%s/issues" % repo,
+                       {"title": title, "body": body, "labels": ["loom:goal"]}).data or {}
+        lines.append("backlog goal home: #%s, created" % made.get("number"))
+    lines.append(_review_check_line(gh, repo, check))
+    repos = env.get("LOOM_REPOS", "").replace(",", " ").split()
+    if repo not in repos:
+        repos.append(repo)
+    lines.append('LOOM_REPOS="%s"' % " ".join(repos))
+    return lines
 
 
 def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
@@ -652,6 +919,8 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
 STUCK_STATES = ("failed", "briefed", "pr")
 UNCLAIMED_HOURS = 2
 STUCK_HOURS = 6
+# Ticket histories one status call reads per repo; see _stuck_marks.
+STATUS_HISTORY_MAX = 20
 ESCALATE_MARKER = "<!-- loom:escalate v1 -->"
 _RUNG_LINE = re.compile(r"^Rung: ([0-9]+) (\S+) (\S+)[ \t]*$", re.M)
 _CLAIM = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
@@ -691,28 +960,29 @@ class History:
         return "next rung %d %s" % (self.rung + 1, ESCALATION[self.rung][1])
 
 
-def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime) -> History:
-    number = int(issue["number"])
-    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
-    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-    labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
-                for e in events if isinstance(e, dict)]
-    failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
-    fixes = sum(1 for c in comments if isinstance(c, dict)
-                and str(c.get("body") or "").startswith(FIX_MARKER))
-    claims = [_when(c.get("created_at")) for c in comments
-              if isinstance(c, dict) and _CLAIM.fullmatch(str(c.get("body") or "").strip())]
-    # Models tried: the model in force at each claim. The body's Model: line is
-    # the first one only while no escalation has rewritten it.
-    escalations = [c for c in comments if isinstance(c, dict)
-                   and str(c.get("body") or "").startswith(ESCALATE_MARKER)]
+Labelled = List[Tuple[str, str, Optional[datetime]]]
+
+
+def _bodies(comments: List[Any]) -> List[Tuple[str, Optional[datetime]]]:
+    return [(str(c.get("body") or ""), _when(c.get("created_at")))
+            for c in comments if isinstance(c, dict)]
+
+
+def _first_model(issue: Dict[str, Any], bodies: List[Tuple[str, Optional[datetime]]]) -> Optional[str]:
+    """The model of the first attempt: the body's Model: line, but only while
+    no escalation has rewritten it."""
+    if any(body.startswith(ESCALATE_MARKER) for body, _ in bodies):
+        return None
     try:
-        current = None if escalations else parse_ticket(issue.get("body"))[0].get("Model")
+        return parse_ticket(issue.get("body"))[0].get("Model")
     except ValueError:
-        current = None
+        return None
+
+
+def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datetime]]]) -> List[str]:
+    """The model in force at each claim, in order, without repeats."""
     tried: List[str] = []
-    for c in comments:
-        body = str(c.get("body") or "") if isinstance(c, dict) else ""
+    for body, _ in bodies:
         rung = _RUNG_LINE.search(body) if body.startswith(ESCALATE_MARKER) else None
         claim = _CLAIM.fullmatch(body.strip())
         if rung:
@@ -721,39 +991,77 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime) -> His
             model = current or _lane_model(claim.group(1))
             if model and model not in tried:
                 tried.append(model)
+    return tried
+
+
+def _slow_briefs(labelled: Labelled, claims: List[datetime], now: datetime) -> int:
+    """Times the ticket sat briefed with no claim for more than UNCLAIMED_HOURS."""
+    slow = 0
+    for i, (kind, name, at) in enumerate(labelled):
+        if kind != "labeled" or name != "loom:briefed" or at is None:
+            continue
+        ends = [t for t in claims if t > at]
+        ends += [t for k, n, t in labelled[i + 1:] if k == "unlabeled" and n == "loom:briefed" and t]
+        if ((min(ends) if ends else now) - at).total_seconds() > UNCLAIMED_HOURS * 3600:
+            slow += 1
+    return slow
+
+
+def _stuck_too_long(issue: Dict[str, Any], labelled: Labelled, now: datetime) -> Optional[str]:
+    """The stuck state the ticket has held for more than STUCK_HOURS, if any."""
+    names = _labels(issue)
+    state = next((x for x in STUCK_STATES if "loom:" + x in names), None)
+    if not state:
+        return None
+    since = [t for k, n, t in labelled if k == "labeled" and n == "loom:" + state and t]
+    began = max(since) if since else _when(issue.get("created_at"))
+    if began is not None and (now - began).total_seconds() > STUCK_HOURS * 3600:
+        return state
+    return None
+
+
+def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes: int,
+                   claims: List[datetime], now: datetime) -> List[str]:
     reasons = []
     if failed >= 2:
         reasons.append("failed %d times" % failed)
     if fixes >= 2:
         reasons.append("%d fix rounds" % fixes)
-    slow = 0
-    for i, (kind, name, at) in enumerate(labelled):
-        if kind != "labeled" or name != "loom:briefed" or at is None:
-            continue
-        ends = [t for t in claims if t is not None and t > at]
-        ends += [t for k, n, t in labelled[i + 1:] if k == "unlabeled" and n == "loom:briefed" and t]
-        end = min(ends) if ends else now
-        if (end - at).total_seconds() > UNCLAIMED_HOURS * 3600:
-            slow += 1
+    slow = _slow_briefs(labelled, claims, now)
     if slow >= 2:
         reasons.append("briefed %d times with no claim for %dh" % (slow, UNCLAIMED_HOURS))
-    names = _labels(issue)
-    state = next((x for x in STUCK_STATES if "loom:" + x in names), None)
+    state = _stuck_too_long(issue, labelled, now)
     if state:
-        since = [t for k, n, t in labelled if k == "labeled" and n == "loom:" + state and t]
-        began = max(since) if since else _when(issue.get("created_at"))
-        if began is not None and (now - began).total_seconds() > STUCK_HOURS * 3600:
-            reasons.append("%s for more than %dh" % (state, STUCK_HOURS))
+        reasons.append("%s for more than %dh" % (state, STUCK_HOURS))
+    return reasons
+
+
+def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime) -> History:
+    number = int(issue["number"])
+    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+    bodies = _bodies(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)))
+    labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
+                for e in events if isinstance(e, dict)]
+    failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
+    fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
+    claims = [at for body, at in bodies if at is not None and _CLAIM.fullmatch(body.strip())]
+    tried = _tried_models(_first_model(issue, bodies), bodies)
+    reasons = _stuck_reasons(issue, labelled, failed, fixes, claims, now)
     untried = [i for i, (_, model) in enumerate(ESCALATION) if model not in tried]
     return History(failed, fixes, tried, reasons, untried[0] if untried else None)
 
 
 def _stuck_marks(gh: GitHub, repo: str, found: List[Dict[str, Any]],
                  now: datetime) -> Dict[int, str]:
+    """Marks for repeatedly stuck tickets. Each history is two paginated reads,
+    so status reads at most STATUS_HISTORY_MAX per repo, the least recently
+    updated first (the likeliest to be stuck), and says which it skipped."""
+    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)),
+                        key=lambda i: str(i.get("updated_at") or ""))
     marks: Dict[int, str] = {}
-    for issue in found:
-        if not any("loom:" + x in _labels(issue) for x in STUCK_STATES):
-            continue
+    for issue in candidates[STATUS_HISTORY_MAX:]:
+        marks[int(issue["number"])] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
+    for issue in candidates[:STATUS_HISTORY_MAX]:
         history = _history(gh, repo, issue, now)
         if history.reasons:
             marks[int(issue["number"])] = " - REPEATEDLY STUCK (%s; attempts %d; tried %s; %s)" % (
@@ -829,11 +1137,14 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base")
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--refs", type=int)
+    tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
+    hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
+    ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
@@ -860,7 +1171,17 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
-                args.lane, args.difficulty, args.model, args.base))
+                args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs))
+
+
+def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:
+    for line in triage(gh, _repo(args.repo), args.goal, args.limit):
+        print(line)
+
+
+def _cmd_human(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.issue, "issue")
+    human(gh, repo, number, _read(args.file))
 
 
 def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
@@ -885,6 +1206,11 @@ def _cmd_reply(gh: GitHub, args: argparse.Namespace) -> None:
     reply_to_review(gh, repo, number, args.comment, _read(args.file), args.resolve)
 
 
+def _cmd_onboard(gh: GitHub, args: argparse.Namespace) -> None:
+    for line in onboard(gh, _repo(args.repo), args.review_check):
+        print(line)
+
+
 def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.pull_request, "pull request")
     fix(gh, repo, number, _ref(args.ticket, "ticket"), _read(args.file), args.lane, args.model)
@@ -897,7 +1223,8 @@ def _cmd_escalate(gh: GitHub, args: argparse.Namespace) -> None:
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
-            "fix": _cmd_fix, "escalate": _cmd_escalate}
+            "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
+            "onboard": _cmd_onboard, "escalate": _cmd_escalate}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

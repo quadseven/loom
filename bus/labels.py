@@ -7,7 +7,7 @@ from urllib.parse import quote
 from .github import GitHub
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
-         "zai", "workersai", "agy"]
+         "zai", "workersai", "agy", "spark"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
 # most; claude has none, because it spends the operator's own subscription.
@@ -42,6 +42,9 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
     "loom:shipped": {"color": "2ea44f", "description": "Deployed by the project's ship owner"},
     "loom:verified": {"color": "006b75", "description": "Verified live"},
+    "loom:triage": {"color": "f9d0c4", "description": "Open issue not yet a ticket; the brain rewrites it"},
+    "loom:rewritten": {"color": "ededed", "description": "Rewritten as a ticket that refs this issue"},
+    "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must rewrite or ask"},
