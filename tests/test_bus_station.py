@@ -207,21 +207,26 @@ class ReviewFake:
         self.writes = []
 
     def rest(self, method, path, data=None):
-        response = self._get(method, path)
-        if response is not None:
-            return response
+        if method == "GET":
+            response = self._get(path)
+            if response is not None:
+                return response
         if method == "PUT" and path == "/repos/%s/issues/12/labels" % REPO:
-            self.issue["labels"] = [{"name": x} for x in data["labels"]]
-            self.writes.append((method, path, data))
-            return mock.Mock(data=[])
+            return self._put_labels(data)
         if method == "POST" and path == "/repos/%s/issues/12/comments" % REPO:
-            self.comments.append({"body": data["body"], "user": {"login": "alice-example"}})
-            return mock.Mock(data={})
+            return self._post_comment(data)
         raise AssertionError("unexpected %s %s" % (method, path))
 
-    def _get(self, method, path):
-        if method != "GET":
-            return None
+    def _put_labels(self, data):
+        self.issue["labels"] = [{"name": x} for x in data["labels"]]
+        self.writes.append(("PUT", "/repos/%s/issues/12/labels" % REPO, data))
+        return mock.Mock(data=[])
+
+    def _post_comment(self, data):
+        self.comments.append({"body": data["body"], "user": {"login": "alice-example"}})
+        return mock.Mock(data={})
+
+    def _get(self, path):
         if path.startswith("/repos/%s/issues?labels=loom:pr" % REPO):
             return mock.Mock(data=[dict(self.issue)])
         if path.startswith("/repos/%s/pulls?" % REPO):

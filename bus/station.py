@@ -617,13 +617,17 @@ class Station:
             if (not isinstance(comment, dict)
                     or tickets._login(comment.get("user")) not in authors):
                 continue
-            body = str(comment.get("body") or "")
-            if not body.startswith(tickets.FIX_MARKER):
-                continue
-            match = re.search(r"<!-- loom:fix-head ([0-9a-f]+) -->", body)
-            if match:
-                rounds_seen.add(match.group(1))
+            head = Station._fix_head(str(comment.get("body") or ""))
+            if head:
+                rounds_seen.add(head)
         return len(rounds_seen)
+
+    @staticmethod
+    def _fix_head(body: str) -> Optional[str]:
+        if not body.startswith(tickets.FIX_MARKER):
+            return None
+        match = re.search(r"<!-- loom:fix-head ([0-9a-f]+) -->", body)
+        return match.group(1) if match else None
 
     def _post_fix_or_escalate(self, repo: str, number: int, pr_number: int, lane: str,
                               detail: Dict[str, Any], sha: str, comments: List[Any],
@@ -631,13 +635,25 @@ class Station:
                               rounds: int) -> None:
         authors = {author.lower() for author in self.s.authors}
         if self._fix_round_count(comments, authors) >= rounds:
-            if "needs-brain" not in names:
-                self._add_label(repo, number, "needs-brain")
+            self._escalate_fix(repo, number, names)
             return
+        self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads)
+        self._move_fix_to_lane(repo, number, lane, names)
+
+    def _escalate_fix(self, repo: str, number: int, names: List[str]) -> None:
+        if "needs-brain" not in names:
+            self._add_label(repo, number, "needs-brain")
+
+    def _post_fix_comment(self, repo: str, number: int, pr_number: int,
+                          detail: Dict[str, Any], sha: str, failed: List[Any],
+                          threads: List[Any]) -> None:
         branch = str((detail.get("head") or {}).get("ref") or "")
         body = brain._fix_body(repo, pr_number, branch, "", failed, threads)
         body = body.rstrip() + "\n\n<!-- loom:fix-head %s -->\n" % sha
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": body})
+
+    def _move_fix_to_lane(self, repo: str, number: int, lane: str,
+                          names: List[str]) -> None:
         labels = [name for name in names if name not in (
             "loom:pr", "loom:ready", "needs-brain", "loom:running", "loom:briefed")
                   and not name.startswith("lane:")]
