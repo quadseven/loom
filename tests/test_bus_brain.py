@@ -1170,5 +1170,155 @@ class OnboardTests(unittest.TestCase):
         self.assertIn('LOOM_REPOS="%s"' % REPO, printed)
 
 
+class GoalRepo:
+    """Goal #1 and its tickets on GitHub: remembers issues, labels, bodies,
+    sub-issue links and comments written to it."""
+
+    def __init__(self, tickets=()):
+        self.issues = {1: goal()}
+        self.children = []
+        self.comments = []
+        self.calls = []
+        for t in tickets:
+            self.issues[t["number"]] = t
+            self.children.append(t["number"])
+
+    def __call__(self, method, url, headers, body):
+        payload = json.loads(body) if body else None
+        path = url.split("api.github.com")[1].split("?")[0][len("/repos/%s/issues" % REPO):]
+        self.calls.append((method, path, payload))
+        parts = path.strip("/").split("/")
+        number = int(parts[0]) if parts[0] else None
+        handler = getattr(self, "_%s_%s" % (method.lower(), parts[1] if len(parts) > 1 else "issue"))
+        return handler(number, payload)
+
+    def _get_issue(self, number, payload):
+        found = self.issues.get(number)
+        return reply(200, found) if found else reply(404, {"message": "Not Found"})
+
+    def _get_sub_issues(self, number, payload):
+        return reply(200, [self.issues[n] for n in self.children])
+
+    def _post_issue(self, number, payload):
+        made = 200 + len(self.issues)
+        self.issues[made] = dict(item(made, payload["body"], payload["labels"]),
+                                 html_url="https://example.com/t/%d" % made)
+        return reply(201, self.issues[made])
+
+    def _post_sub_issues(self, number, payload):
+        self.children.append(payload["sub_issue_id"] - 1000)
+        return reply(201, {})
+
+    def _patch_issue(self, number, payload):
+        self.issues[number]["body"] = payload["body"]
+        return reply(200, self.issues[number])
+
+    def _put_labels(self, number, payload):
+        self.issues[number]["labels"] = [{"name": n} for n in payload["labels"]]
+        return reply(200, [])
+
+    def _post_comments(self, number, payload):
+        self.comments.append((number, payload["body"]))
+        return reply(201, {})
+
+    def names(self, number):
+        return [x["name"] for x in self.issues[number]["labels"]]
+
+    def created(self):
+        return [c for c in self.calls if c[0] == "POST" and c[1] == ""]
+
+
+def evidenced(number, evidence="p95 claim wait rose from 40 s to 900 s after it shipped"):
+    return BODY.replace("## Why\nwhy", "## Why\nRegresses #%d\n%s" % (number, evidence))
+
+
+class RegressionSlotTests(unittest.TestCase):
+    ORDINARY = ["queued", "briefed", "running", "pr"] * 4
+
+    def full_goal(self, *extra):
+        flying = [item(10 + i, labels=["loom:ticket", "loom:" + s])
+                  for i, s in enumerate(self.ORDINARY)]
+        return GoalRepo(flying + list(extra))
+
+    def brief(self, fake, body=BODY, **kw):
+        return brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", body, "codex", **kw)
+
+    def test_a_full_goal_admits_one_shipped_regression_and_refuses_ordinary_work(self):
+        fake = self.full_goal(item(5, labels=["loom:ticket", "loom:shipped", "lane:claude"],
+                                   html_url="https://example.com/t/5"))
+        with self.assertRaisesRegex(ValueError, "16 tickets in flight"):
+            self.brief(fake)
+        url = self.brief(fake, evidenced(5), regresses=5)
+        # The shipped ticket itself is re-briefed: no new issue.
+        self.assertEqual(url, "https://example.com/t/5")
+        self.assertEqual(fake.created(), [])
+        self.assertEqual(sorted(fake.names(5)),
+                         ["lane:codex", "loom:briefed", "loom:regression", "loom:ticket"])
+        self.assertIn("## Regression\n\nTicket\n\nRegresses #5\np95 claim wait",
+                      fake.issues[5]["body"])
+        self.assertEqual(len(fake.comments), 1)
+        on, note = fake.comments[0]
+        self.assertEqual(on, 1)
+        self.assertIn(brain.REGRESSION_MARKER, note)
+        self.assertIn("through the regression slot, with 16 other tickets in flight (cap 16)", note)
+        self.assertIn("p95 claim wait", note)
+        with self.assertRaisesRegex(ValueError, "17 tickets in flight"):
+            self.brief(fake)
+
+    def test_the_same_regression_twice_is_admitted_once_and_the_slot_holds_one(self):
+        fake = self.full_goal(
+            item(5, state="closed", state_reason="completed", labels=["loom:ticket", "loom:verified"]),
+            item(6, labels=["loom:ticket", "loom:shipped"]))
+        first = self.brief(fake, evidenced(5), regresses=5)
+        again = self.brief(fake, evidenced(5, "measured again"), regresses=5)
+        self.assertEqual(first, again)
+        self.assertEqual(len(fake.created()), 1)
+        made = fake.created()[0][2]
+        self.assertIn("loom:regression", made["labels"])
+        self.assertEqual(len(fake.comments), 1)
+        # The slot is held: another regression and ordinary work both wait.
+        with self.assertRaisesRegex(ValueError, "slot is held by #2[0-9]+, with 16 other "
+                                                "tickets in flight \\(cap 16\\)"):
+            self.brief(fake, evidenced(6), regresses=6)
+        with self.assertRaisesRegex(ValueError, "17 tickets in flight"):
+            self.brief(fake)
+        self.assertEqual(len(fake.created()), 1)
+
+    def test_under_the_cap_a_regression_is_labelled_and_records_nothing(self):
+        fake = GoalRepo([item(5, labels=["loom:ticket", "loom:verified"])])
+        self.brief(fake, evidenced(5), regresses=5)
+        self.assertIn("loom:regression", fake.names(5))
+        self.assertEqual(fake.comments, [])
+
+    def test_refusals_write_nothing(self):
+        cases = [
+            (99, evidenced(99), "#99: ticket not found"),
+            (5, evidenced(5), "closed as not planned"),
+            (6, evidenced(6), "only a shipped or verified ticket can regress"),
+            (7, evidenced(7), "#7 is not a loom:ticket"),
+            (8, BODY.replace("## Why\nwhy", "## Why\nRegresses #8\n"), "measured evidence"),
+            (8, BODY, "has the line Regresses #8"),
+        ]
+        for number, body, why in cases:
+            with self.subTest(why=why):
+                fake = self.full_goal(
+                    item(5, state="closed", state_reason="not_planned", labels=["loom:ticket"]),
+                    item(6, labels=["loom:ticket", "loom:pr"]),
+                    item(7, labels=["loom:shipped"]),
+                    item(8, labels=["loom:ticket", "loom:shipped"]))
+                with self.assertRaisesRegex(ValueError, why):
+                    self.brief(fake, body, regresses=number)
+                self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_refs_and_regresses_do_not_go_together(self):
+        with self.assertRaisesRegex(ValueError, "not both"):
+            self.brief(GoalRepo(), evidenced(5), regresses=5, refs=6)
+
+    def test_the_command_line_takes_regresses(self):
+        args = brain.parser().parse_args(["brief", REPO, "--goal", "1", "--title", "T",
+                                          "--file", "b.md", "--regresses", "5"])
+        self.assertEqual(args.regresses, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

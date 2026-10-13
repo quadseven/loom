@@ -85,6 +85,7 @@ LANES_TITLE = "Loom lane status"
 LANES_REPUBLISH = 3600
 NEEDS_OPERATOR = "needs-operator"
 URGENT = "loom:urgent"
+REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
@@ -665,7 +666,9 @@ class Station:
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]]) -> None:
         """Claim the oldest ticket for one free lane that can be claimed."""
+        # A regression fix (bus.brain brief --regresses) goes first.
         cands = sorted(found, key=lambda c: (
+            REGRESSION not in _label_names(c[1]),
             str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
         for repo, issue in cands:
             try:

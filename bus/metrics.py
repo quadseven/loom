@@ -105,6 +105,9 @@ class Collector:
     def passes(self, repo: str, sha: str) -> bool:
         # rest() returns a Response or raises GitHubError, never None; only
         # .data can be None (an empty or non-JSON body), hence the dict check.
+        # A GitHubError is left to propagate on purpose: counting a failed
+        # lookup as "no review check" would fail the Quality number on an API
+        # blip. Station._post_metrics_comment catches it and retries the pass.
         data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs" % (repo, sha)).data
         checks = data.get("check_runs", []) if isinstance(data, dict) else []
         return any(c.get("name") == self.review_check for c in checks)
