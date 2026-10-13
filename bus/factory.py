@@ -133,12 +133,21 @@ def rung_of(comments: Sequence[Dict[str, Any]]) -> int:
     return found[-1] if found else 0
 
 
+def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
+    """When the ticket last moved on the ladder (its newest rung marker), 0
+    when never."""
+    return max((_ts(c.get("created_at")) for c in comments
+                if RUNG_RE.search(str(c.get("body") or ""))), default=0.0)
+
+
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
-          checks_failing: bool, age: float) -> bool:
+          checks_failing: bool, age: float, now: float = 0.0) -> bool:
     """Did the last fix round fail to move this pull request? True when a
     thread it was asked to fix is still open, when checks it was asked to fix
-    still fail, or when the pull request is older than STUCK_AGE."""
-    if age > STUCK_AGE:
+    still fail, or when the pull request is older than STUCK_AGE and has not
+    moved on the ladder for STUCK_AGE (age alone climbs once per window, not
+    on every round)."""
+    if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
         return True
     last = next((str(c.get("body") or "") for c in reversed(comments)
                  if str(c.get("body") or "").startswith(FIX_MARKER)), None)
@@ -306,7 +315,7 @@ class Factory:
                    open_threads: Sequence[str] = (), checks_failing: bool = False) -> None:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
-        if stuck(comments, open_threads, checks_failing, age):
+        if stuck(comments, open_threads, checks_failing, age, self.now):
             rung = rung_of(comments) + 1
             if self._climb(repo, issue, rung, why) is None:
                 self._give_up(repo, issue, why)

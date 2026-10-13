@@ -224,6 +224,19 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.model(6), "claude-sonnet-5-5")
 
+    def test_age_climbs_once_per_window_not_every_round(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5].append({"body": factory.RUNG_MARKER % 1, "user": ME,
+                                    "created_at": iso(3600)})
+        self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 2)
+        self.go()
+        self.assertEqual(self.model(5), None, "climbed an hour after the last climb")
+        self.assertEqual(len(self.fixed), 1)
+        self.gh.comments[5][0]["created_at"] = iso(factory.STUCK_AGE + 60)
+        self.gh.issues[5]["labels"] = [{"name": x} for x in ("loom:ticket", "loom:pr", "lane:codex")]
+        self.go()
+        self.assertEqual(self.model(5), "gpt-6-sol")
+
     def test_an_old_pull_request_climbs_on_its_first_send_back(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE + 60)
