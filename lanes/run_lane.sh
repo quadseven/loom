@@ -343,16 +343,25 @@ safe_git() {
 #   setup: <shell command>      prepares the tree (a venv, locked deps, lint)
 #   check: <shell command>      the required check; exit 0 and no tracked
 #                               file changed means it passed
-# It is read from the base revision before the agent starts, so nothing the
-# agent edits changes what is checked. A repo without the file is not
+# setup and check run as shell commands, like the run: steps of a CI
+# workflow, so they are only ever read from the branch the pull request
+# merges into: the base revision of a new run, and the base branch (fetched
+# for it) of a fix run, whose own branch holds unmerged agent edits. Nothing
+# an agent edits changes what is checked. A repo without the file is not
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
 load_contract() {
-  local f="$TREE/$CONTRACT_FILE" line key val
+  local rev="$BASE" mode line key val
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
-  [ -e "$f" ] || [ -L "$f" ] || return 0
+  if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+       -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
+       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
+    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"; return 1
+  fi
+  mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
+  [ -n "$mode" ] || return 0
   HAS_CONTRACT=1
-  { [ -f "$f" ] && [ ! -L "$f" ]; } || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
+  [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -364,7 +373,7 @@ load_contract() {
       check) C_CHECK="$val" ;;
       *) SETUP_REASON="$CONTRACT_FILE has an unknown line '${line:0:40}'"; return 1 ;;
     esac
-  done < "$f"
+  done < <(safe_git cat-file blob "$rev:$CONTRACT_FILE")
   [ -n "$C_CHECK" ] || { SETUP_REASON="$CONTRACT_FILE has no check: line"; return 1; }
   case "$C_SUBMODULES" in yes|no) ;; *) SETUP_REASON="$CONTRACT_FILE submodules: must be yes or no"; return 1 ;; esac
   [ -z "$C_INTERP" ] || [[ "$C_INTERP" =~ ^[A-Za-z0-9._+-]+$ ]] ||

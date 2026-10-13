@@ -1174,6 +1174,27 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertEqual(self.records()[-1]["command"], "test -f .prepared && python3.12 check.py")
 
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_fix_run_checks_against_the_base_branchs_contract_not_the_pull_requests(self):
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        # An earlier run on the pull request's branch weakened the contract.
+        work = Path(self._tmp.name) / "pr-work"
+        (work / ".loom").mkdir(exist_ok=True)
+        (work / ".loom" / "validation.conf").write_text("check: true\n")
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "weaken", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        before = self.remote_head(self.FIX_BRANCH)
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records[-1]["command"], "test -f .prepared && python3.12 check.py")
+        self.assertFalse(records[-1]["ok"])
+
     def test_a_contract_with_an_unknown_line_is_a_setup_failure(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
         self.drop_brief()

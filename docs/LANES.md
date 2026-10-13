@@ -35,8 +35,11 @@ prepares the tree (a venv, locked dependencies, a pinned linter) and `check`
 is the required check. Point the repo's CI at the same two scripts so the
 lane and CI cannot drift apart. Unknown lines are refused.
 
-- The runner reads the file from the base revision before the agent starts;
-  what the agent edits never changes what is checked.
+- The runner reads the file from the base revision before the agent starts
+  (on a fix run, from the base branch, not the pull request's branch);
+  what the agent edits never changes what is checked. `setup` and `check`
+  are shell commands, trusted like a CI workflow's `run:` steps, so they
+  come only from the branch a pull request merges into.
 - Before the agent: interpreter, submodules, `setup`, then `check` on the
   base. A missing interpreter, a failed submodule checkout or a failed setup
   parks the brief as `setup failed: ...`; the agent does not run. The base
