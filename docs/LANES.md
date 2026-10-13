@@ -65,6 +65,20 @@ least hourly, and never publishes the heartbeat's reason. With anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
+Factory: at most every 5 minutes the station runs `bus/factory.py` over
+`LOOM_REPOS`, with no model. A lane pull request (a `loom/` branch whose
+ticket is `loom:pr`) whose checks have all finished, whose review check
+(`LOOM_REVIEW_CHECK`, default `Grug - Elder`) has run on its head commit,
+and that is mergeable, green and free of open threads is squash-merged
+through `bus.brain merge`. One with a failing check, an open thread or a
+conflict goes back to a lane as a fix brief. Its first send-back stays on its
+lane while the pull request is under 6 hours old; later ones, failed
+tickets, and briefed tickets no lane claimed for 2 hours climb the model
+ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
+`claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
+Past the last rung the ticket is left `loom:failed` for the brain. At most 12
+actions per pass. `LOOM_FACTORY=0` turns it off.
+
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads

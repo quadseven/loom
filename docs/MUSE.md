@@ -90,8 +90,12 @@ tickets and pull requests like any other work.
    followed by the answer: what was done, or the answer to the question.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
-3. For each lane pull request, read its whole diff against its ticket and
-   acceptance criteria. A lane pull request with failing checks or
+3. The station's factory pass (bus/factory.py) already merges every lane
+   pull request that is green, reviewed and free of open threads, sends the
+   rest back to a lane, and moves stuck and failed tickets up the model
+   ladder, every 5 minutes, without a brain. Spend the tick on what it
+   cannot judge: for each lane pull request, read its whole diff against its
+   ticket and acceptance criteria. A lane pull request with failing checks or
    unresolved findings goes back to the lane that wrote it with
    `python3 -m bus.brain fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md`
    (FINDINGS.md says what to change; the command adds the failing check logs
@@ -185,6 +189,9 @@ it, and never a free lane:
 2. the codex lane (or codex-2) with `gpt-6-sol`;
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
+The factory applies this ladder on its own (bus/factory.py, recorded as
+`<!-- loom:rung N -->` comments); do it by hand only for work the factory
+cannot see, such as a ticket with no pull request that is stuck in running.
 Set the model with the ticket's `Model:` line (`brief --model`; for a ticket
 already filed, edit the `Model:` line at the top of its body before moving
 it to briefed). Say on the ticket which rung it is on and why. Past the
