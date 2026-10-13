@@ -75,10 +75,14 @@ ticket is `loom:pr`) whose checks have all finished, whose review check
 (`LOOM_REVIEW_CHECK`, default `Grug - Elder`) has run on its head commit,
 and that is mergeable, green and free of open threads is squash-merged
 through `bus.brain merge`. One with a failing check, an open thread or a
-conflict goes back to a lane as a fix brief. Its first send-back stays on its
-lane while the pull request is under 6 hours old; later ones, failed
-tickets, and briefed tickets no lane claimed for 2 hours climb the model
-ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
+conflict goes back to a lane as a fix brief. It stays on its lane while the
+rounds make progress, and climbs the model ladder only when stuck: a review
+thread survived a fix round, checks it was asked to fix still fail, or the
+pull request is over 6 hours old (a review that finds new things, or a
+conflict alone, never climbs). Failed tickets and briefed tickets no lane
+claimed for 2 hours climb too. After a push the factory waits for the review
+to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
+starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
 `claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
 A rung whose lanes each already hold 2 briefed or running tickets is passed
 over for the next. A fix brief that ends with nothing committed (most often
