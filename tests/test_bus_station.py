@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -642,10 +643,17 @@ class PruneTest(Base):
 
     def test_an_unreadable_inbox_stops_the_prune(self):
         done = self.tree("example.repo-1", station.TREE_KEEP + 60)
-        os.makedirs(self.inbox("claude"))
-        os.chmod(self.inbox("claude"), 0)
-        self.addCleanup(os.chmod, self.inbox("claude"), 0o755)
-        self.run_pass()
+        unreadable = self.inbox("claude")
+        real = os.listdir
+
+        def listdir(path="."):
+            # Raised directly, not by chmod, which a root runner ignores.
+            if path == unreadable:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path)
+
+        with mock.patch.object(station.os, "listdir", listdir):
+            self.run_pass()
         self.assertTrue(os.path.exists(done))
 
     def test_a_link_in_the_worktrees_folder_is_removed_without_following_it(self):
