@@ -61,8 +61,12 @@ class Fake:
         raise AssertionError(path)
 
     def rest(self, method, path, body=None):
-        if method == "GET" and path.endswith("/check-runs"):
-            return type("Response", (), {"data": {"check_runs": self.checks}})()
+        if method == "GET" and "/check-runs" in path:
+            # GitHub's paging: 30 a page unless per_page says otherwise.
+            query = dict(kv.split("=") for kv in path.partition("?")[2].split("&") if "=" in kv)
+            size, page = int(query.get("per_page", 30)), int(query.get("page", 1))
+            batch = self.checks[(page - 1) * size:page * size]
+            return type("Response", (), {"data": {"check_runs": batch}})()
         if method == "POST" and path.endswith("/issues/1/comments"):
             self.posts.append(body["body"])
             self.comments[1].append({"body": body["body"], "created_at": iso(NOW),
@@ -117,6 +121,12 @@ class MetricsTest(unittest.TestCase):
                     self.gh.issues.append({"number": 5, "labels": [label("needs-operator")],
                                            "created_at": iso(NOW - 1000)})
                 self.assertFalse(self.numbers()[index].passed)
+
+    def test_a_review_check_past_the_first_page_still_counts(self):
+        self.gh.checks = [{"name": "unittest (%d)" % n} for n in range(120)] + [{"name": "Review"}]
+        self.assertTrue(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
+        self.gh.checks = [{"name": "unittest (%d)" % n} for n in range(120)]
+        self.assertFalse(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
 
     def test_check_runs_reply_without_a_body_counts_as_no_review(self):
         self.gh.rest = lambda method, path, body=None: Response(200, None)
