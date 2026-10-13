@@ -49,6 +49,7 @@ that talks to GitHub about tickets.
 | `needs-brain` | The automatic fix round limit was reached; review this ticket in full. |
 | `loom:failed` | The runner gave up; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
+| `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
@@ -98,7 +99,10 @@ The station renders the local brief from the issue: `Repo` is the issue's
 repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 <owner/name>#<number>`, then the header lines and the body. The runner adds
 `Refs <owner/name>#<number>` to the pull request body, never a closing
-keyword.
+keyword. The station checks those references and the conventional branch
+number on every pass against all pull request states. A merged pull request
+repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
+`loom:closed-unmerged`. Neither outcome occupies a lane slot.
 
 ## Onboarding a repo
 

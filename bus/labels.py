@@ -11,8 +11,10 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
 # most; claude has none, because it spends the operator's own subscription.
+# opencode-go-3 runs its own model (LOOM_OPENCODE_GO_3_MODEL), a separate
+# allowance on the same subscription.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
-         "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2"]
+         "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3"]
 LANES = LANES + SLOTS
 
 # The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
@@ -41,6 +43,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:ready": {"color": "0e8a16", "description": "Checks passed and review-bot threads are resolved"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
+    "loom:closed-unmerged": {"color": "d93f0b", "description": "Linked pull request closed without merging"},
     "loom:shipped": {"color": "2ea44f", "description": "Deployed by the project's ship owner"},
     "loom:verified": {"color": "006b75", "description": "Verified live"},
     "loom:triage": {"color": "f9d0c4", "description": "Open issue not yet a ticket; the brain rewrites it"},
