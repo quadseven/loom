@@ -273,6 +273,11 @@ class JournalTests(unittest.TestCase):
             "- Cost: 42 requests, 3 minutes",
         ])
 
+    def test_render_journal_with_a_measure(self):
+        lines = journal.render_journal(NOW, "tick-1", [], [], [], [], 1, 1,
+                                       measure="p95 2s").splitlines()
+        self.assertEqual(lines[2], "- Measure: p95 2s")
+
     def test_render_report(self):
         lines = journal.render_report(NOW, "tick-1", "m", [], "f", "none", "n").splitlines()
         self.assertEqual(lines[0], journal.REPORT_MARKER)
