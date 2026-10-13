@@ -36,6 +36,10 @@ ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
+# The runner's reason, and its heartbeat's, when a lane's provider refused
+# work for a while (the spark lane's thermal guard). Not a failure: the ticket
+# goes back to briefed, and the factory moves it to the next lane.
+LIMIT = "limit:"
 # Asks the review bot to review a pull request's head again; it resolves the
 # threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
 REVIEW_AGAIN = "/grug improve"
@@ -43,6 +47,13 @@ LANE_SAID_MAX = 2500
 # An absolute path: a run of non-space characters starting with a slash (not
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
+# Credential shapes that must not reach a public comment: provider key
+# prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
+SECRET_RE = re.compile(
+    r"(?i)\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat|xox[a-z]|glpat|AKIA|ASIA)[-_A-Za-z0-9]{12,}"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+"
+    r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
 REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
@@ -542,6 +553,22 @@ class Station:
             return False
         return -60 <= self.now - at <= HEARTBEAT_MAX_AGE
 
+    def limited_lanes(self) -> List[str]:
+        """Lanes whose fresh heartbeat says unavailable at a limit."""
+        out = []
+        for lane in LANES:
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            if not isinstance(beat, dict) or beat.get("available") is not False:
+                continue
+            at = beat.get("at")
+            if isinstance(at, bool) or not isinstance(at, (int, float)):
+                continue
+            if (-60 <= self.now - at <= HEARTBEAT_MAX_AGE
+                    and str(beat.get("reason") or "").startswith(LIMIT)):
+                out.append(lane)
+        return out
+
     def _inbox_empty(self, lane: str) -> bool:
         try:
             names = os.listdir(self.inbox(lane))
@@ -664,6 +691,9 @@ class Station:
             return True
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
+        if reason.startswith(LIMIT):
+            self._limited(repo, number, fix_pr.isdigit(), lane, reason)
+            return True
         if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
             return True
@@ -671,6 +701,16 @@ class Station:
         self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _limited(self, repo: str, number: int, fix: bool, lane: str, reason: str) -> None:
+        """A run the lane's provider refused (a limit, not a failure). The
+        ticket goes back to briefed, where the factory moves it to the next
+        lane; a fix brief's goes back to loom:pr, where the factory sends its
+        pull request back again."""
+        self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
+        self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
+                      "the ticket goes to the next lane." % (lane, reason))
+        _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
 
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane
@@ -700,14 +740,14 @@ class Station:
 
     def _lane_said(self, lane: str, name: str) -> str:
         """The agent's own words from the run log: every line that is not a
-        runner line, with local paths removed, capped."""
+        runner line, with local paths and credential shapes removed, capped."""
         log = os.path.join(self.s.home, "logs", lane, name + ".log")
         try:
             with open(log, encoding="utf-8", errors="replace") as fh:
                 lines = [line.rstrip() for line in fh]
         except OSError:
             return ""
-        said = [PATH_RE.sub("<path>", line) for line in lines
+        said = [SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", line)) for line in lines
                 if not re.match(r"^\[\d{4}-\d\d-\d\dT", line) and not line.startswith("rsync(")]
         text = "\n".join(said).strip()
         if len(text) > LANE_SAID_MAX:
@@ -1691,7 +1731,8 @@ class Station:
             return
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
-                        review_check=self.s.review_check).run()
+                        review_check=self.s.review_check,
+                        limited=self.limited_lanes()).run()
 
     def run_pass(self) -> None:
         self.finish_claims()

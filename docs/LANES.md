@@ -84,8 +84,11 @@ claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
 `claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
-A rung whose lanes each already hold 2 briefed or running tickets is passed
-over for the next. A fix brief that ends with nothing committed (most often
+A climb takes the lowest rung the ticket has not run on since its ladder
+last started; a rung whose lanes each already hold 2 briefed or running
+tickets is passed over for the next untried one, and stays untried, so a
+ticket gives up only once it has run on every rung. A ticket that failed on
+a ladder model (its `Model:` line and lane) has tried that rung. A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
@@ -95,6 +98,9 @@ branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
 the agent changes nothing, and a conflict is handed to the agent with the
 file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
+A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
+does while its box is hot) is not failing: a ticket briefed on it moves to
+the next rung at once, recorded with a rung marker like any climb.
 Past the last rung the ticket is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
@@ -329,6 +335,28 @@ lookup leaves the brief for the next pass. The rule covers:
   newer models (glm-5.3-flash) are paid-plan only.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
+
+## spark: a local vLLM coder, one stream at a time
+
+- opencode against a vLLM server you run yourself, through a custom
+  OpenAI-compatible provider named `spark`. `LOOM_SPARK_URL` is its base URL
+  (e.g. `http://your-spark.internal:8000/v1`, reachable from the lane machine
+  but not on its loopback, which the sandbox denies); it takes no key.
+  Models are `spark/<served model id>`, from the brief's `Model:` line or
+  `LOOM_SPARK_MODEL`.
+- One slot: the server serves one stream at a time.
+- Nothing leaves your own machines and nothing trains on prompts, so private
+  repos are allowed.
+- The server sits behind a thermal guard that refuses new connections, or
+  answers 503, while the box is hot. Each pass asks `$LOOM_SPARK_URL/models`
+  first, and asks again after a run that failed. A refused connection or a
+  503 is a limit, not a failure: the heartbeat says unavailable, with a
+  reason starting `limit:`, for 15 minutes; every brief in the inbox is
+  parked with that reason; the station puts its ticket back to briefed (a
+  fix brief's back to `loom:pr`), and the factory moves a ticket briefed on a
+  limited lane to the next rung of the model ladder at once. Any other
+  failure to answer (a timeout, a name that does not resolve) only makes the
+  lane unavailable; its briefs wait.
 
 ## agy: the Google plan, as a separate macOS user
 

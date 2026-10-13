@@ -615,6 +615,17 @@ class FixTest(Base):
         self.assertEqual(again, station.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
+    def test_a_lane_explanation_is_redacted_of_credentials_before_it_is_posted(self):
+        self.failed_fix([
+            "I checked it. api_key=abc123 and Authorization: Bearer abcdefghijklmnop1234",
+            "also ghp_" + "a1B2c3D4e5F6g7H8i9J0 leaked, plus " + "x" * 40,
+            "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"])
+        said = self.fake.comments[99][0]["body"]
+        self.assertIn("I checked it.", said)
+        for secret in ("abc123", "abcdefghijklmnop1234", "ghp_", "x" * 32):
+            self.assertNotIn(secret, said)
+        self.assertIn("<redacted>", said)
+
     def test_a_plain_brief_with_no_commit_still_fails(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"],
@@ -710,6 +721,46 @@ class OutcomeTest(Base):
         self.assertIn("could not open <path> (in <path> now", body)
         self.assertNotIn("example", body)
         self.assertNotIn("agent exited 1", body)
+
+    def limited(self, lane="spark", fix_body=None):
+        self.fake.add(12, state="running", lane=lane)
+        self.fake.comments[99] = []
+        fix = tickets.parse_fix(REPO, fix_body) if fix_body else None
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], lane, 1, fix))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: limit: the spark endpoint refused "
+                   "the connection (agent exited 1)\n" % (name, lane, name, ))
+        self.run_pass()
+        self.run_pass()
+
+    def test_a_limit_is_not_a_failure_and_the_ticket_goes_back_to_briefed(self):
+        self.limited()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:spark", "loom:briefed"])
+        self.assertEqual(len(self.fake.comments[12]), 1)
+        body = self.fake.comments[12][0]["body"]
+        self.assertIn("Lane spark is unavailable (limit: the spark endpoint refused", body)
+        self.assertIn("not a failure", body)
+        self.assertNotIn("failed", body)
+
+    def test_a_limited_fix_brief_goes_back_to_its_pull_request(self):
+        self.limited(fix_body=FIX_BODY)
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:spark", "loom:pr"])
+
+    def test_limited_lanes_are_those_with_a_fresh_limit_heartbeat(self):
+        d = os.path.join(self.home, "state", "usage")
+        for lane, available, reason, age in (
+                ("spark", False, "limit: the spark endpoint answered 503; unavailable until x", 0),
+                ("zen", False, "opencode not on PATH", 0),
+                ("zai", False, "limit: old", station.HEARTBEAT_MAX_AGE + 60),
+                ("codex", True, "limit: nonsense", 0)):
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, lane + ".json"), "w") as fh:
+                json.dump({"lane": lane, "at": int(time.time()) - age,
+                           "available": available, "reason": reason}, fh)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertEqual(st.limited_lanes(), ["spark"])
 
     def test_failed_without_a_log_line_says_so(self):
         self.finished("failed")
