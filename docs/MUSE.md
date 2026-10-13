@@ -136,7 +136,8 @@ tickets and pull requests like any other work.
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
 8. Triage the backlog. For each backlog goal (the goal home of a repo whose
-   old issues Loom works on), run
+   old issues Loom works on; `python3 -m bus.brain onboard OWNER/NAME`
+   opens one), run
    `python3 -m bus.brain triage OWNER/NAME --goal N` (at most 25 issues a
    run, oldest first). It skips pull requests, epics, asks and anything with
    a `loom:` label; a ready issue (every brief section, checkboxes under
@@ -188,15 +189,23 @@ tickets and pull requests like any other work.
 ## Lane choice
 
 Choose only lanes that lane status shows as available. Hard work goes to
-anthropic, claude or codex, never openrouter, zen, zai or workersai. Zen,
-zai and agy take public repos only. Prefer anthropic while its credits last,
-then codex and opencode-go, then free lanes, and claude last.
+anthropic, claude or codex, never openrouter, zen, zai, workersai or spark.
+Zen, zai and agy take public repos only. Prefer anthropic while its credits
+last, then codex and opencode-go, then free lanes, and claude last. Easy
+tickets on any repo, private ones included, may go to `spark` (the local
+vLLM coder, model `spark/...`) before the hosted free lanes. It takes one
+ticket at a time and steps aside while its box is hot: the factory moves its
+waiting tickets on, so brief it only when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
 anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each takes one
 ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.
+
+Every lane has the operator's skills (docs/LANES.md, Skills on every lane),
+so a brief may name a skill ("use the impeccable skill") on any lane; a
+skill is no reason to pick one lane over another.
 
 ### Repeatedly stuck work gets a stronger model
 
@@ -214,13 +223,25 @@ it, and never a free lane:
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
 The factory applies this ladder on its own (bus/factory.py, recorded as
-`<!-- loom:rung N -->` comments); do it by hand only for work the factory
-cannot see, such as a ticket with no pull request that is stuck in running.
-Set the model with the ticket's `Model:` line (`brief --model`; for a ticket
-already filed, edit the `Model:` line at the top of its body before moving
-it to briefed). Say on the ticket which rung it is on and why. Past the
-third rung, rewrite the brief smaller, or ask the operator with one exact
-ask when only the operator can unblock it.
+`<!-- loom:rung N -->` comments). For work the factory cannot see, such as a
+ticket with no pull request that is stuck in running, do not hand-edit the
+ticket: `python3 -m bus.brain status` marks each repeatedly stuck ticket with
+its attempts, the models it has tried and the rung it takes next. Run
+`python3 -m bus.brain escalate OWNER/NAME#N` for every marked ticket the
+factory has not already moved, in the same tick, whatever the time budget: it
+picks the lowest untried rung whose lane is free, rewrites the ticket's
+`Model:` line, swaps the lane label, comments the rung and the reason, and
+sends an open pull request back as a fix brief (`--file NOTES.md` adds your
+own notes to that brief). It refuses a ticket that is not repeatedly stuck.
+Past the third rung it adds `needs-brain` instead: rewrite the brief smaller,
+or ask the operator with one exact ask when only the operator can unblock it.
+`status` reads the history of at most 20 tickets per repo, the least recently
+updated first; a ticket marked "not checked for stuck" can still be passed to
+`escalate`, which reads its whole history.
+
+To set a model by hand on a first attempt or any other move, use
+`move OWNER/NAME#N --to briefed --lane LANE --model MODEL` or
+`fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md --lane LANE --model MODEL`.
 
 ## Rules
 
