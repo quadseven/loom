@@ -233,8 +233,11 @@ fix_pr_open() {
 # What a fix brief fixed: the ### headings of its ## Fix section, one line.
 fix_items() {
   awk '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
-       on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
-       END {print out}' "$1" | cut -c1-500
+        on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
+        on && n && /^Fixing: / {sub(/^Fixing: /, ""); gsub(/[[:cntrl:]]/, ""); out = out " [" $0 "]"}
+        on && n && /^Does not apply/ {out = out " [does not apply]"}
+        on && n && /^Fixed$/ {out = out " [fixed]"}
+        END {print out}' "$1" | cut -c1-500
 }
 
 # Keep agent-authored review replies outside the commit. The agent cannot call
