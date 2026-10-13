@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import spend
 from . import text as _text
 from . import tickets
 from .github import GitHub, GitHubError, _OPENER
@@ -101,7 +102,8 @@ class Settings:
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
                  mention: str = "", digest_hour: int = 9,
                  region: str = "us-east-1", channel_id: str = "",
-                 bot_token_ssm: str = "", default_goal: str = "") -> None:
+                 bot_token_ssm: str = "", default_goal: str = "",
+                 anthropic: Optional[spend.Budget] = None) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -114,6 +116,7 @@ class Settings:
         self.channel_id = channel_id
         self.bot_token_ssm = bot_token_ssm
         self.default_goal = default_goal
+        self.anthropic = anthropic or spend.Budget()
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -128,6 +131,11 @@ class Settings:
             hour = 9
         if not 0 <= hour <= 23:
             hour = 9
+        try:
+            budget = spend.Budget.from_env(env)
+        except ValueError as err:
+            _say("ignoring the anthropic budget: %s" % err)
+            budget = spend.Budget()
         return cls(home, words("LOOM_REPOS"), words("LOOM_BRIEF_AUTHORS"),
                    words("LOOM_REPO_OWNERS"),
                    status_repo=env.get("LOOM_STATUS_REPO", "").strip() or _origin_repo(),
@@ -137,7 +145,8 @@ class Settings:
                    region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
                    bot_token_ssm=env.get("LOOM_DISCORD_BOT_TOKEN_SSM", "").strip(),
-                   default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip())
+                   default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip(),
+                   anthropic=budget)
 
 
 def _origin_repo() -> str:
@@ -288,6 +297,7 @@ class Station:
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
+        self._spend: Optional[spend.Summary] = None
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -380,28 +390,27 @@ class Station:
         os.replace(tmp, path)
         return path
 
-    def _fix_for(self, repo: str, comments: List[Any]) -> Optional[tickets.Fix]:
-        """The loom:fix comment to render, when the latest trusted comment is
-        one and came after the last claim. Raises ValueError for a fix
-        comment that cannot be used (edited, or naming another repo)."""
+    def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
+        """Return the newest trusted fix after the last claim, regardless of
+        later non-fix comments. Raises ValueError for an unusable fix."""
         allowed = {a.lower() for a in self.s.authors}
-        last_claim, latest = -1, None
+        last_claim, newest_fix = -1, None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
             body = str(c.get("body") or "")
             if CLAIM_RE.fullmatch(body.strip()):
                 last_claim = i
-            if tickets._login(c.get("user")) in allowed:
-                latest = (i, c, body)
-        if latest is None or latest[0] < last_claim \
-                or not latest[2].startswith(tickets.FIX_MARKER):
+            if (tickets._login(c.get("user")) in allowed
+                    and body.startswith(tickets.FIX_MARKER)):
+                newest_fix = (i, c, body)
+        if newest_fix is None or newest_fix[0] < last_claim:
             return None
         # GitHub keeps no editor for comments: one changed after it was
         # posted may carry someone else's words.
-        if latest[1].get("updated_at") != latest[1].get("created_at"):
+        if newest_fix[1].get("updated_at") != newest_fix[1].get("created_at"):
             raise ValueError("the loom:fix comment was edited after it was posted")
-        return tickets.parse_fix(repo, latest[2])
+        return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1].get("id")
 
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
@@ -409,7 +418,7 @@ class Station:
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
-            fix = self._fix_for(repo, comments)
+            fix_source = self._fix_for(repo, comments)
         except ValueError as err:
             self._refuse(repo, issue, str(err))
             return False
@@ -417,6 +426,7 @@ class Station:
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
+        fix, fix_comment_id = fix_source if fix_source else (None, None)
         text = tickets.render_brief(repo, issue, lane, attempt, fix)
         claiming = self._write_brief(lane, name, text)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
@@ -428,6 +438,9 @@ class Station:
                      {"body": "Claimed for lane %s (body sha256 %s)"
                       % (lane, _sha12(issue.get("body")))})
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        if fix:
+            _say("rendered %s#%d fix brief from loom:fix comment %s"
+                 % (repo, number, fix_comment_id if fix_comment_id is not None else "with unknown id"))
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
         return True
 
@@ -485,7 +498,16 @@ class Station:
         if not self._claim(repo, lane, issue):
             os.remove(path)
 
+    def _anthropic_spend(self) -> spend.Summary:
+        if self._spend is None:
+            self._spend = spend.summarize(self.s.home, self.s.anthropic, self.now)
+        return self._spend
+
     def _heartbeat_ok(self, lane: str) -> bool:
+        # Credit under the floor stops the anthropic slots even before their
+        # runner next reports it.
+        if lane.split("-")[0] == "anthropic" and self._anthropic_spend().under_floor():
+            return False
         beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                           None, strict=False)
         if not isinstance(beat, dict) or beat.get("available") is not True:
@@ -690,11 +712,20 @@ class Station:
         return (saved.get("repo") == repo and saved.get("values") == values
                 and 0 <= self.now - last_at <= LANES_REPUBLISH)
 
+    def _spend_shown(self) -> Optional[spend.Summary]:
+        """The anthropic spend, once there is a budget or a recorded run."""
+        summary = self._anthropic_spend()
+        if summary.runs or summary.today or self.s.anthropic.usd is not None:
+            return summary
+        return None
+
     def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
+        summary = self._spend_shown()
         return "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now), "",
              "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
-            + ["| %s | %s | %s |" % row for row in rows])
+            + ["| %s | %s | %s |" % row for row in rows]
+            + (["", summary.line()] if summary is not None else []))
 
     def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
         for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)):
@@ -715,6 +746,12 @@ class Station:
             return
         rows = self._lane_rows()
         values = {lane: yn for lane, yn, _ in rows}
+        summary = self._spend_shown()
+        if summary is not None:
+            # A new run (or a budget change) republishes; the clock alone waits
+            # for the hourly republish.
+            values["anthropic spend"] = "%d runs, $%.2f, budget %s" % (
+                summary.runs, summary.spent, self.s.anthropic.usd)
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)

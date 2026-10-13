@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -10,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, token_from_env
-from . import text
+from . import proof, text
 from .labels import LANES
 from .tickets import FIX_MARKER
 
@@ -230,13 +231,51 @@ def _moved_labels(have: List[str], state: str, lane: Optional[str]) -> List[str]
     return kept
 
 
+def _check_revision(gh: GitHub, repo: str, revision: str) -> None:
+    """The proven revision is a commit on the repo's default branch."""
+    branch = str((gh.rest("GET", "/repos/%s" % repo).data or {}).get("default_branch") or "")
+    if not branch:
+        raise ValueError("the repository has no default branch")
+    found = gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, quote(branch, safe="/"), revision),
+                    ok=(404,))
+    if found.status == 404 or (found.data or {}).get("status") not in ("identical", "behind"):
+        raise ValueError("proof revision %s is not on %s" % (revision, branch))
+
+
+def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
+                   record: Dict[str, Any]) -> str:
+    """Check a proof record against the ticket and return the comment for it.
+    Runtime work is verified once shipped; documentation once merged."""
+    names = _labels(issue)
+    if "loom:ticket" not in names:
+        raise ValueError("only a loom:ticket is verified")
+    body = str(issue.get("body") or "")
+    proof.check(record, body)
+    ready = ["loom:shipped", "loom:verified"] + (["loom:merged"] if record["kind"] == "docs" else [])
+    if not any(x in names for x in ready):
+        raise ValueError("a %s ticket is verified only from %s" % (
+            record["kind"], " or ".join(x.split(":")[1] for x in ready)))
+    _check_revision(gh, repo, record["revision"])
+    comment = proof.render(record, body)
+    _check_written_text(comment)
+    return comment
+
+
 def move(gh: GitHub, repo: str, number: int, state: str,
-         lane: Optional[str] = None, note: Optional[str] = None) -> None:
+         lane: Optional[str] = None, note: Optional[str] = None,
+         record: Optional[Dict[str, Any]] = None) -> None:
+    """Move a ticket to a state. Verified takes a proof record (bus/proof.py),
+    posted on the ticket before the label changes; no other state takes one."""
     _check_move_args(state, lane, note)
+    if (state == "verified") != (record is not None):
+        raise ValueError("verified needs a proof record, and no other state takes one")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
     kept = _moved_labels(_labels(issue), state, lane)
+    if record is not None:
+        comment = _proof_comment(gh, repo, issue, record)
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
     if note is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
@@ -254,10 +293,11 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
 
 
 def merge(gh: GitHub, repo: str, number: int,
-          ticket: Optional[Tuple[str, int]] = None) -> None:
+          ticket: Optional[Tuple[str, int]] = None) -> Dict[str, Any]:
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     details = _pr_graphql(gh, repo, number)
     _validate_merge_pr(repo, pr, details)
+    association = _validate_ticket_association(gh, repo, number, pr, ticket, "pr")
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -269,8 +309,10 @@ def merge(gh: GitHub, repo: str, number: int,
     # GitHub's own auto-delete may have removed it already: still merged.
     gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
             ok=(404, 422))
-    if ticket:
-        move(gh, ticket[0], ticket[1], "merged")
+    if association:
+        move(gh, association[0], association[1], "merged")
+    return {"merged": True, "pull_request": (repo, number),
+            "ticket": association, "head_sha": sha}
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
@@ -329,10 +371,36 @@ def _thread_for_comment(details: Dict[str, Any], comment_id: int) -> str:
     raise ValueError("review comment thread was not found")
 
 
+def trusted_authors(env: Optional[Dict[str, str]] = None) -> List[str]:
+    raw = (os.environ if env is None else env).get("LOOM_BRIEF_AUTHORS", "")
+    return raw.replace(",", " ").split()
+
+
+def _check_proven(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
+                  env: Optional[Dict[str, str]]) -> None:
+    """A completed closure needs every criterion checked and a proof comment,
+    from a LOOM_BRIEF_AUTHORS login, made against the criteria as they are now."""
+    body = str(issue.get("body") or "")
+    proof.check_criteria(body)
+    authors = trusted_authors(env)
+    if not authors:
+        raise ValueError("LOOM_BRIEF_AUTHORS is empty, so no proof comment can be trusted")
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    records = [proof.read(str(c.get("body") or "")) for c in comments
+               if (c.get("user") or {}).get("login") in authors]
+    records = [r for r in records if r is not None]
+    if not records:
+        raise ValueError("the ticket has no loom:proof comment; move it to verified with --proof")
+    if records[-1].get("contract") != proof.contract(body):
+        raise ValueError("the acceptance criteria changed after the proof; verify it again")
+    proof.check(records[-1], body)
+
+
 def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
-          note: Optional[str] = None) -> None:
-    """Close a ticket. Completed only once it is verified (never close before
-    live verification); not_planned for tickets the brain drops."""
+          note: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> None:
+    """Close a ticket. Completed only once it is verified with a proof that
+    still matches its criteria, all checked (never close before live
+    verification); not_planned for tickets the brain drops, with no proof."""
     if reason not in ("completed", "not_planned"):
         raise ValueError("reason is completed or not_planned")
     if note is not None:
@@ -343,6 +411,8 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
         raise ValueError("only open loom:ticket issues are closed here")
     if reason == "completed" and "loom:verified" not in names:
         raise ValueError("a ticket is closed as completed only after loom:verified")
+    if reason == "completed":
+        _check_proven(gh, repo, number, issue, env)
     if note is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
@@ -424,13 +494,44 @@ def _open_threads(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
     return [t for t in threads if not t.get("isResolved")]
 
 
-def _linked(ticket: Tuple[str, int], pr: Dict[str, Any]) -> bool:
-    """The PR carries the runner's `Refs OWNER/NAME#N` line, or its branch is
-    the station's for that ticket number."""
-    refs = re.search(r"^Refs %s#%d[ \t]*$" % (re.escape(ticket[0]), ticket[1]),
-                     str(pr.get("body") or ""), re.M)
-    branch = re.match(r"loom/%d(?:-|$)" % ticket[1], str((pr.get("head") or {}).get("ref") or ""))
-    return bool(refs or branch)
+_TICKET_REF = re.compile(r"^Refs ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)[ \t]*$", re.M)
+_BRANCH_TICKET = re.compile(r"^loom/([0-9]+)(?:-[A-Za-z0-9._/-]+)?$")
+
+
+def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Resolve the PR's ticket from its runner reference and/or Loom branch."""
+    refs = {(match.group(1), int(match.group(2)))
+            for match in _TICKET_REF.finditer(str(pr.get("body") or ""))}
+    branch = _BRANCH_TICKET.fullmatch(str((pr.get("head") or {}).get("ref") or ""))
+    if branch:
+        refs.add((repo, int(branch.group(1))))
+    if len(refs) > 1:
+        raise ValueError("pull request has conflicting ticket references")
+    if not refs:
+        return None
+    association = next(iter(refs))
+    if association[0] != repo:
+        raise ValueError("ticket and pull request must be in the same repository")
+    return association
+
+
+def _validate_ticket_association(gh: GitHub, repo: str, number: int,
+                                 pr: Dict[str, Any], supplied: Optional[Tuple[str, int]],
+                                 expected_state: str) -> Optional[Tuple[str, int]]:
+    association = _ticket_association(repo, pr)
+    if supplied is not None and supplied != association:
+        raise ValueError("supplied ticket does not match pull request")
+    if association is None:
+        if supplied is not None:
+            raise ValueError("pull request is not linked to the supplied ticket")
+        return None
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % association).data or {}
+    names = _labels(issue)
+    if issue.get("state") != "open" or "loom:ticket" not in names:
+        raise ValueError("ticket is not an open loom:ticket")
+    if "loom:" + expected_state not in names:
+        raise ValueError("ticket is not loom:" + expected_state)
+    return association
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
@@ -443,7 +544,7 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
          "pull request head is not a loom branch"),
         (_same_repo(repo, pr, {}), "pull request must use the same repository"),
         (ticket[0] == repo, "ticket and pull request must be in the same repository"),
-        (_linked(ticket, pr), "pull request is not linked to the ticket"),
+        (_ticket_association(repo, pr) == ticket, "pull request is not linked to the ticket"),
         (issue.get("state") == "open" and "loom:ticket" in names, "ticket is not an open loom:ticket"),
         ("loom:pr" in names, "ticket is not loom:pr"),
         (sum(1 for x in names if x.startswith("lane:")) == 1, "ticket must have exactly one lane label"),
@@ -492,7 +593,11 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str)
     threads = _open_threads(gh, repo, number)
     body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
     kept = _moved_labels(_labels(issue), "briefed", None)
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
+    posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
+    comment_id = posted.data.get("id") if isinstance(posted.data, dict) else None
+    print("brain: posted loom:fix comment %s on %s#%d"
+          % (comment_id if comment_id is not None else "with unknown id", ticket[0], ticket[1]),
+          file=sys.stderr)
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
 
 
@@ -501,7 +606,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base")
-    m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note")
+    m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True)
@@ -535,7 +640,8 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
-    move(gh, repo, number, args.to, args.lane, args.note)
+    record = json.loads(_read(args.proof)) if args.proof else None
+    move(gh, repo, number, args.to, args.lane, args.note, record)
 
 
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:

@@ -18,6 +18,11 @@ from REST APIs. Never write to a live system. When a step needs a fact no API
 serves, write what is needed on the ticket and leave it; never claim a live
 result you did not read yourself.
 
+Read and write GitHub only from the shell, through the Loom commands or the
+GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
+for GitHub or anything else in a scheduled run: each new web request asks
+the operator for approval, and the run stops until someone answers.
+
 ## The brain's job
 
 A goal is never finished until its home issue says so. Every tick moves it:
@@ -34,6 +39,14 @@ not looked hard enough yet. Each tick the brain:
   top ones, up to the goal's cap. Problems nobody has ticketed yet count:
   look at the live system for what is slow, stuck, failing or unnatural, and
   ticket it with the evidence.
+- Finishes before it starts: each tick merges every lane pull request that
+  is ready (checks green, no unresolved threads, a fix-up already pushed
+  for each finding) before it briefs anything new.
+- When a goal is at its cap, a brief that fixes a live regression on a
+  ticket already shipped may still be filed, past the cap, by setting
+  `LOOM_GOAL_CAP` to the cap plus 8 for that one brief command (until a
+  reserved regression slot exists, #102). Ordinary new work waits for the
+  cap.
 - Proves every change: a ticket is verified only when its proof shows on the
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.
@@ -91,9 +104,13 @@ tickets and pull requests like any other work.
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. Verify shipped tickets against the live system named in the ticket. Then
-   run `python3 -m bus.brain move OWNER/NAME#N --to verified`, then close the
-   ticket with `python3 -m bus.brain close OWNER/NAME#N`.
+4. Verify shipped tickets against the live system named in the ticket. Tick
+   each acceptance criterion in the ticket body only once you have seen it
+   hold, write the proof record (docs/BRAIN.md, Proof), then run
+   `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
+   and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
+   refuse a missing proof or an unchecked criterion: never invent evidence to
+   get past them; leave the ticket open and say what is missing.
 5. Handle `loom:failed` tickets. Re-brief with a sharper brief or another
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
@@ -115,11 +132,22 @@ tickets and pull requests like any other work.
    Every 2 hours per goal (when the goal's newest report is 2 hours old or
    there is none), also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
-   `<!-- loom:report v1 -->` followed by the report itself. Use the format
-   the goal home asks for (for example its five report lines); without one,
-   five lines: metric changes, what moved, the top blocker, shipped and
-   verified, next. The station sends every report to the operator's phone,
-   so it must stand on its own: numbers, not references.
+   `<!-- loom:report v1 -->` followed by the report itself, written as a
+   standup the operator can read in thirty seconds on a phone:
+   - First line: one sentence on how the goal is doing since the last report
+     (better, the same, or worse, and the one number that shows it).
+   - Going well: one to three things that moved, in plain words.
+   - Not going well: one to three things that got worse or failed.
+   - Still stuck since last report: anything the previous report already
+     named as stuck or blocked and still is, with how long; say "nothing"
+     when the list is empty. Read the previous report to fill this in.
+   - Next: what the brain will do before the next report.
+   - Needs you: only what only the operator can do, or "nothing".
+   Write sentences, not ticket lists: name a ticket only where the operator
+   may want to open it, and never more than one or two per line. Numbers
+   over adjectives. A goal home may ask for extra lines; add them after
+   these. The station sends every report to the operator's phone, so it
+   must stand on its own.
 9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
    failure as well.
 
