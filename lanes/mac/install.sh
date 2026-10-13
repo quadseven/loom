@@ -2,7 +2,7 @@
 # Install the lanes (and the station) as launchd agents on the login machine.
 #
 #   lanes/mac/install.sh [lane ...]
-#     default: codex claude openrouter opencode-go anthropic zen zai workersai agy,
+#     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark,
 #     plus the extra slots anthropic-2 to anthropic-8, codex-2 and opencode-go-2
 #
 # API lanes read their provider key from SSM at run time. Name each
@@ -10,7 +10,10 @@
 # LOOM_OPENCODE_GO_KEY_SSM, LOOM_ANTHROPIC_KEY_SSM, LOOM_ZAI_KEY_SSM, optional
 # LOOM_AWS_REGION; zen needs no key); they are written into the local plists
 # only, never into this repo. A lane whose key is missing reports itself
-# unavailable and receives no work.
+# unavailable and receives no work. The spark lane needs no key: set
+# LOOM_SPARK_URL (your vLLM server's OpenAI-compatible base URL, e.g.
+# http://your-spark.internal:8000/v1) and LOOM_SPARK_MODEL (spark/<model id>);
+# without LOOM_SPARK_URL it reports itself unavailable like a lane with no key.
 #
 # Each agent runs lanes/run_lane.sh from THIS checkout once a minute, so the
 # code that runs is the code in git. No KeepAlive: a pass that exits is done,
@@ -31,8 +34,10 @@ LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/space-bunny-free}"
 LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
 LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwen3.8-27b}"
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
+LOOM_SPARK_URL="${LOOM_SPARK_URL:-}"
+LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
 export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_ANTHROPIC_MODEL \
-  LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL
+  LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_MODEL
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
 # Checked before anything is installed.
@@ -43,7 +48,7 @@ AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
 LANES=("$@")
-[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy
+[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
   codex-2 opencode-go-2)
 
@@ -109,7 +114,12 @@ done
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
 # with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
-# LOOM_DIGEST_HOUR and LOOM_AWS_REGION. Runs from this checkout, like the lanes.
+# LOOM_DIGEST_HOUR, LOOM_AWS_REGION, and LOOM_DISCORD_CHANNEL_ID,
+# LOOM_DISCORD_BOT_TOKEN_SSM and LOOM_DISCORD_DEFAULT_GOAL (talking to the
+# brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
+# LOOM_ANTHROPIC_BUDGET_SINCE, LOOM_ANTHROPIC_BUDGET_EXPIRES and
+# LOOM_ANTHROPIC_FLOOR_USD (the anthropic spend line; the lanes get them with
+# every other LOOM_* setting). Runs from this checkout, like the lanes.
 LABEL="com.loom.station"
 PLIST="$AGENTS/$LABEL.plist"
 cat > "$PLIST" <<EOF
@@ -144,6 +154,13 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
+    <key>LOOM_DISCORD_CHANNEL_ID</key><string>$(xml "${LOOM_DISCORD_CHANNEL_ID:-}")</string>
+    <key>LOOM_DISCORD_BOT_TOKEN_SSM</key><string>$(xml "${LOOM_DISCORD_BOT_TOKEN_SSM:-}")</string>
+    <key>LOOM_DISCORD_DEFAULT_GOAL</key><string>$(xml "${LOOM_DISCORD_DEFAULT_GOAL:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_USD</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_USD:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_SINCE</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_SINCE:-}")</string>
+    <key>LOOM_ANTHROPIC_BUDGET_EXPIRES</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_EXPIRES:-}")</string>
+    <key>LOOM_ANTHROPIC_FLOOR_USD</key><string>$(xml "${LOOM_ANTHROPIC_FLOOR_USD:-}")</string>
   </dict>
 </dict>
 </plist>

@@ -2,7 +2,7 @@
 # Loom lane runner: one pass over a lane's inbox, one brief at a time.
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
-#                               | zen | zai | workersai | agy
+#                               | zen | zai | workersai | agy | spark
 #                               | <lane>-<n> (an extra slot of that lane)
 #
 # A slot such as anthropic-2 is a second copy of the anthropic lane: its own
@@ -30,7 +30,11 @@
 # LOOM_SKILL_DIRS (colon-separated skill folders the sandboxed lanes get a
 # snapshot of; default ~/.agents/skills:~/.claude/skills),
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
-# LOOM_CLONE_BASE (default git@github.com:).
+# LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
+# LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
+# (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
+# (the OpenAI-compatible base URL of the local vLLM coder, e.g.
+# http://your-spark.internal:8000/v1; no key).
 set -uo pipefail
 
 SLOT="${1:?usage: run_lane.sh <lane>}"
@@ -39,10 +43,14 @@ SLOT="${1:?usage: run_lane.sh <lane>}"
 LANE="$SLOT"
 [[ "$SLOT" =~ -[0-9]+$ ]] && LANE="${SLOT%-*}"
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
+export LOOM_HOME
+# This checkout, for its python helpers (bus/spend.py).
+LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
 mkdir -p "$INBOX/done" "$INBOX/failed" "$LOOM_HOME/run"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # The process groups in the tree under pid $1: the agent's job-control
 # subshell and everything below it. `timeout` puts itself in a group of its
@@ -157,6 +165,15 @@ fix_items() {
   awk '$0 == "## Fix" {on=1; next} on && /^## / {on=0}
        on && /^### / {sub(/^### /, ""); gsub(/[[:cntrl:]]/, ""); out = out (n++ ? "; " : "") $0}
        END {print out}' "$1" | cut -c1-500
+}
+
+# Reconcile the generated title/body sections of an existing PR with the
+# approved ticket revision in the brief, preserving reviewer-authored text
+# outside those sections. Scope changes are logged with old/new body hashes.
+# Exit: 0 = updated, 1 = no change needed, 2 = refused, 3 = gh/helper error.
+repair_pr_text() {
+  NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
+    --apply "$FIX_PR" --repo "$REPO" "$BRIEF" "$LANE" "$MODEL" "$TICKET"
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
@@ -316,6 +333,66 @@ agy_agent() {
 $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
 }
 
+# The spark lane: a vLLM coder on a machine of the operator's own, serving
+# one stream at a time behind a thermal guard that refuses new connections
+# (or answers 503) while the box is hot. That is a limit, not a failure: the
+# lane says unavailable for LIMIT_HOLD seconds, and every brief it holds is
+# parked with a "limit:" reason, which the station hands to the next lane.
+LIMIT_HOLD=900
+LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
+SPARK_URL="${LOOM_SPARK_URL:-}"
+SPARK_PROBE_TIMEOUT=15
+LIMITED=""
+LIMIT_WHY=""
+
+utc_at() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
+
+# Ask the endpoint for its models. 0: it answered; 1: refused or 503, with
+# LIMIT_WHY set; 2: no answer for another reason, with READY_REASON set.
+spark_probe() {
+  local code status
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
+  status=$?
+  if [ "$status" -eq 7 ]; then LIMIT_WHY="the spark endpoint refused the connection"; return 1; fi
+  if [ "$code" = 503 ]; then LIMIT_WHY="the spark endpoint answered 503"; return 1; fi
+  [ "$status" -eq 0 ] && return 0
+  READY_REASON="the spark endpoint did not answer (curl exit $status)"
+  return 2
+}
+
+# Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
+mark_limit() {
+  LIMIT_UNTIL=$(( $(date +%s) + LIMIT_HOLD ))
+  mkdir -p "$LOOM_HOME/state/usage"
+  printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
+  LIMITED=1
+  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc_at "$LIMIT_UNTIL")"
+  heartbeat false "$READY_REASON"
+}
+
+# A limit recorded by an earlier pass that has not run out. A time further
+# ahead than LIMIT_HOLD (a clock that was wrong) is ignored.
+limit_held() {
+  local ends why now
+  read -r ends why < "$LIMIT_FILE" 2>/dev/null || return 1
+  now="$(date +%s)"
+  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
+  LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
+  READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc_at "$LIMIT_UNTIL")"
+}
+
+spark_ready() {
+  [[ "$SPARK_URL" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] ||
+    { READY_REASON="LOOM_SPARK_URL is not set to an http(s) base URL"; return 1; }
+  limit_held && return 1
+  spark_probe
+  case $? in
+    0) return 0 ;;
+    1) mark_limit; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
 # opencode runs helper agents (session titles) on its own default small model,
 # which can be a paid one; pin every opencode model to the lane's model so the
 # free lane stays free and the subscription lane stays in its catalogue. The
@@ -325,8 +402,13 @@ opencode_config() {
   # MODEL already passed the allowlist; refuse JSON-breaking characters here too.
   # shellcheck disable=SC1003 # matching a literal backslash
   case "$MODEL" in *'"'*|*'\'*) echo "refusing model with a quote or backslash" >&2; return 1 ;; esac
+  # The spark lane's provider is the local endpoint, declared here: an
+  # OpenAI-compatible provider named spark at LOOM_SPARK_URL (checked in
+  # spark_ready), serving the one model after "spark/". No key.
+  local provider="" id="${MODEL#spark/}"
+  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\"}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
-}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"}"
+}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"$provider}"
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
@@ -413,8 +495,11 @@ refresh_skills() {
           { err="copying $name from $src failed"; break; }
       done
     done
+    # Read-only all through, top folder included, so nothing can add, rename
+    # or change a skill. The swap renames within $LOOM_HOME and needs no write
+    # on the snapshot; removing an old one takes chmod -R u+w first.
     if [ -z "$err" ]; then
-      chmod -R a-w "$next" && chmod u+w "$next" || err="cannot make $next read-only"
+      chmod -R a-w "$next" || err="cannot make $next read-only"
     fi
     if [ -z "$err" ]; then
       if ! { { [ ! -e "$SKILLS" ] || mv "$SKILLS" "$old"; } && mv "$next" "$SKILLS"; }; then
@@ -458,8 +543,66 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark) return 0 ;; esac
   return 1
+}
+
+# A fix brief's branch, brought up to date with the repository's default
+# branch before the agent runs, so a lane can resolve a conflict: the agent's
+# sandbox cannot write .git, so it can never fetch or merge itself (#145).
+# A clean merge stays as a commit. A conflict is left in the tree with its
+# markers, CONFLICTS names the files, and the runner completes the merge after
+# the agent. UPDATE_REASON is set when the branch could not be updated.
+# Every git call below, the fetch and the unshallow fetch included, runs under
+# `timeout "$NET_TIMEOUT"`, written on the line before its continuation.
+update_fix_branch() {
+  local default
+  UPDATE_REASON=""; CONFLICTS=""
+  default="${BASE_BRANCH:-$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote --symref origin HEAD 2>> "$LOG" |
+    sed -n 's#^ref: refs/heads/\(.*\)[[:space:]]HEAD$#\1#p')}"
+  if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
+    UPDATE_REASON="could not read the default branch"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
+    UPDATE_REASON="could not fetch $default"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+  fi
+  timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
+  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
+    return 0
+  fi
+  # One path a line, never split on spaces or globbed.
+  CONFLICTS="$(safe_git -c core.quotePath=false diff --name-only --diff-filter=U)"
+  if [ -z "$CONFLICTS" ]; then
+    safe_git merge --abort >> "$LOG" 2>&1 || true
+    UPDATE_REASON="merging $default into $BRANCH failed"; return 1
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET: merging $default conflicts in $(conflict_list); the agent resolves it" >> "$LOG"
+  return 0
+}
+
+# CONFLICTS (one path a line) as one comma-separated line.
+conflict_list() {
+  printf '%s\n' "$CONFLICTS" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g'
+}
+
+# Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
+markers_left() {
+  local f left=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$TREE/$f" ] &&
+      grep -qE '^(<<<<<<<|=======|>>>>>>>)( |$)' -- "$TREE/$f" && left+=("$f")
+  done <<< "$CONFLICTS"
+  [ "${#left[@]}" -gt 0 ] && { local IFS=,; echo "${left[*]}" | sed 's/,/, /g'; }
+  return 0
 }
 
 run_agent() {
@@ -473,13 +616,44 @@ run_agent() {
     openrouter) opencode_config && api_agent OPENROUTER_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     opencode-go) opencode_config && api_agent OPENCODE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     zen) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
+    spark) opencode_config && api_agent - opencode run -m "$MODEL" "$brief_text" ;;
     zai) opencode_config && api_agent ZHIPU_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_config && api_agent CLOUDFLARE_API_KEY opencode run -m "$MODEL" "$brief_text" ;;
-    anthropic) api_agent ANTHROPIC_API_KEY claude -p --model "$MODEL" "$brief_text" ;;
+    anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
+}
+
+spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
+
+# The anthropic lanes spend API credits. The CLI's JSON result carries the
+# run's cost: the lane log gets the human-readable result, and
+# state/usage/spend.jsonl one line per run, with cost null (unknown, never
+# zero) when the run left no result.
+anthropic_agent() {
+  local out="$LOGDIR/$TICKET.result" status
+  api_agent ANTHROPIC_API_KEY claude -p --output-format json --model "$MODEL" "$1" > "$out"
+  status=$?
+  if ! spend record --output "$out" --slot "$SLOT" --ticket "$TICKET" --model "$MODEL"; then
+    cat "$out"
+    echo "could not read this run's cost; recording it as unknown" >&2
+    printf '{"at": %s, "slot": "%s", "ticket": "%s", "model": "%s", "cost_usd": null}\n' \
+      "$(date +%s)" "$SLOT" "$TICKET" "$MODEL" >> "$LOOM_HOME/state/usage/spend.jsonl"
+  fi
+  rm -f "$out"
+  return "$status"
+}
+
+# With LOOM_ANTHROPIC_BUDGET_USD set, credit under the floor (or a budget
+# setting that does not parse) makes the anthropic slots unavailable.
+anthropic_credit_ok() {
+  [ -n "${LOOM_ANTHROPIC_BUDGET_USD:-}" ] || return 0
+  local why
+  why="$(spend floor 2>&1)" && return 0
+  READY_REASON="${why:-could not check the anthropic credit}"
+  return 1
 }
 
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
@@ -494,13 +668,14 @@ lane_ready() {
     return
   fi
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai) cli=opencode ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark) cli=opencode ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
+  [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
-  case "$LANE" in zen) return 0 ;; esac
+  case "$LANE" in zen) return 0 ;; spark) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
@@ -563,9 +738,11 @@ LANE_ACCOUNT=""
 READY_REASON=""
 if ! lane_ready; then
   heartbeat false "$READY_REASON"
-  exit 0
+  # A limited lane still passes over its inbox, to hand every brief on.
+  [ -n "$LIMITED" ] || exit 0
+else
+  heartbeat true ""
 fi
-heartbeat true ""
 # Only the sandboxed lanes need the snapshot (codex and claude read the
 # operator's own folders), and only when there is work.
 if { is_api_lane || [ "$LANE" = agy ]; } && compgen -G "$INBOX/*.md" > /dev/null; then
@@ -586,6 +763,7 @@ for BRIEF in "$INBOX"/*.md; do
   if ! [[ "$TICKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
     park "$BRIEF" "ticket name must be letters, digits, dot, underscore or dash"; continue
   fi
+  if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY"; continue; fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -619,6 +797,8 @@ for BRIEF in "$INBOX"/*.md; do
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
     zai:*) park "$BRIEF" "zai lane runs the free Flash models only (zai/glm-4.7-flash, zai/glm-4.5-flash), not $MODEL"; continue ;;
     workersai:cloudflare-workers-ai/@cf/*) ;;
+    spark:spark/?*) ;;
+    spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
     agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
     agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
@@ -672,47 +852,115 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "clone or branch failed"; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
+  RUN_BRIEF="$BRIEF"
+  CONFLICTS=""
+  if [ -n "$FIX_PR" ]; then
+    # BASE is taken first, so a clean merge alone counts as a change and an
+    # out-of-date pull request is pushed up to date.
+    if ! update_fix_branch; then park "$BRIEF" "$UPDATE_REASON"; continue; fi
+    if [ -n "$CONFLICTS" ]; then
+      RUN_BRIEF="$WORKDIR/$TICKET.run.md"
+      { cat "$BRIEF"
+        printf '\n## Merge conflicts\n\nThe runner merged the default branch into this branch and it conflicts in: %s\n' "$(conflict_list)"
+        printf 'Resolve every conflict in those files first: keep both sides'"'"' intent, remove every conflict marker, and keep the tests green. Do not run git; the runner completes the merge.\n'
+      } > "$RUN_BRIEF"
+    fi
+  fi
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   ( set -m
-    (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  # A spark run that ended because the box went hot is a limit, not a failure.
+  if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
+    mark_limit
+    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)"; continue
+  fi
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  if [ -n "$CONFLICTS" ]; then
+    LEFT="$(markers_left)"
+    if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
+  fi
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
-  if [ -n "$(safe_git status --porcelain)" ]; then
-    if ! { safe_git checkout -q "$BRANCH" && safe_git add -A &&
+  # During a merge the branch is already checked out, and the commit
+  # completes the merge.
+  if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
+    if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
            safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
   fi
-  if [ "$(safe_git rev-parse "$BRANCH")" = "$BASE" ]; then
-    park "$BRIEF" "agent made no commit on $BRANCH"; continue
+  COMMITTED=0
+  if [ "$(safe_git rev-parse "$BRANCH")" != "$BASE" ]; then
+    COMMITTED=1
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
     park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
   fi
+  # For fix-mode briefs, reconcile generated PR sections with the approved
+  # ticket revision. A metadata-only repair is a valid outcome.
+  METADATA_CHANGED=0
+  REPAIR_RC=""
+  if [ -n "$FIX_PR" ]; then
+    repair_pr_text >> "$LOG" 2>&1
+    REPAIR_RC=$?
+    case "$REPAIR_RC" in
+      0) METADATA_CHANGED=1 ;;
+      1) ;; # text is current
+      2)
+        # Refused text is parked only when there is no code commit to push.
+        if [ "$COMMITTED" -eq 0 ]; then
+          park "$BRIEF" "PR text repair refused on #$FIX_PR"
+          continue
+        fi ;;
+      3)
+        # A helper error is parked only when there is no code commit to push.
+        if [ "$COMMITTED" -eq 0 ]; then
+          park "$BRIEF" "PR text repair failed on #$FIX_PR"
+          continue
+        fi ;;
+      *)
+        if [ "$COMMITTED" -eq 0 ]; then
+          park "$BRIEF" "PR text repair returned $REPAIR_RC on #$FIX_PR"
+          continue
+        fi ;;
+    esac
+  fi
+  if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ]; then
+    park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
+  fi
   # Never forced: a branch that moved on the remote refuses the push.
-  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
-    park "$BRIEF" "push failed"; continue
+  if [ "$COMMITTED" -eq 1 ]; then
+    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
+      park "$BRIEF" "push failed"; continue
+    fi
   fi
   if [ -n "$FIX_PR" ]; then
     ITEMS="$(fix_items "$BRIEF")"
-    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" \
-         --body "Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}" >> "$LOG" 2>&1; then
+    if [ "$COMMITTED" -eq 1 ]; then
+      COMMENT="Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}"
+    else
+      COMMENT="Lane $SLOT repaired the PR text for: ${ITEMS:-the findings on the ticket}"
+    fi
+    if ! timeout "$NET_TIMEOUT" gh pr comment "$FIX_PR" -R "$REPO" --body "$COMMENT" >> "$LOG" 2>&1; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
-    echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    if [ "$COMMITTED" -eq 1 ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET done, fixes pushed to #$FIX_PR" >> "$LOG"
+    else
+      echo "[$(date -u +%FT%TZ)] $TICKET done, PR text repaired on #$FIX_PR" >> "$LOG"
+    fi
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
