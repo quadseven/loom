@@ -466,6 +466,10 @@ prepare_validation() {
   CHECK_CLI="${C_INTERP:-bash}"
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
+  # C_SETUP and C_CHECK are shell on purpose, like a CI run: step. They are
+  # validated in load_contract: read only from the base branch (never the
+  # agent's), one line of printable ASCII, at most 1000 characters; and
+  # contract_run runs them sandboxed with an emptied environment.
   if [ -n "$C_SETUP" ]; then
     contract_run "$C_SETUP"; rc=$?
     record setup "$C_SETUP" "$rc" "$BASE" "$([ "$rc" -eq 0 ] && echo true || echo false)"
