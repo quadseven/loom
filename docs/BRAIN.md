@@ -240,6 +240,11 @@ lane machine, never on Muse's VM): `loom:urgent` asks within a minute, the
 rest as one daily digest. Asks in private repos stay private on GitHub; the
 digest carries only titles and links.
 
+Open `loom:human` issues are not asks: the station never posts one on its
+own. They are listed once a day under "Waiting on you" at the end of the
+same digest (the 15 newest, grouped by repo, each with the first line of
+its `loom:human` comment), so hundreds of them still make one message.
+
 ## The tick
 
 One tick at a time, under a lock: a branch `loom-lock/brain` in this repo,

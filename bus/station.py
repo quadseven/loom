@@ -24,6 +24,7 @@ from . import factory
 from . import spend
 from . import text as _text
 from . import tickets
+from .brain import HUMAN_MARKER
 from .github import GitHub, GitHubError, _OPENER
 from .journal import REPLY_RE
 from .labels import LANES
@@ -53,6 +54,13 @@ URGENT = "loom:urgent"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+# Open loom:human issues (only a person can do them) are never sent one by
+# one: the daily digest lists the newest few under this heading.
+HUMAN = "loom:human"
+HUMAN_HEAD = "Waiting on you"
+HUMAN_SHOWN = 15
+HUMAN_TITLE_MAX = 100
+HUMAN_ASK_MAX = 140
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # Reports come every 2 hours, so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
@@ -292,6 +300,10 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
     """The one lane the issue names, or None when it names none or several."""
     lanes = [n[len("lane:"):] for n in _label_names(issue) if n.startswith("lane:")]
     return lanes[0] if len(lanes) == 1 and lanes[0] in LANES else None
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
 def scrub(reason: str) -> str:
@@ -886,6 +898,61 @@ class Station:
             keep.append("- and %d more" % (len(lines) - len(keep)))
         return DIGEST_HEAD + "\n" + "\n".join(keep)
 
+    def _gather_human(self) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
+        """(repo, issue) for every open loom:human issue, newest first; None
+        when any repo could not be read (the digest waits for a whole list)."""
+        found: List[Tuple[str, Dict[str, Any]]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                items = self.gh.paginate(
+                    "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, HUMAN))
+            except GitHubError as err:
+                _say("could not list %s issues in %s: %s" % (HUMAN, repo, err))
+                return None
+            found += [(repo, i) for i in items if isinstance(i, dict)
+                      and "pull_request" not in i and i.get("html_url") and "number" in i]
+        found.sort(key=lambda f: (str(f[1].get("created_at") or ""), int(f[1]["number"])),
+                   reverse=True)
+        return found
+
+    def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The first line of the newest loom:human comment from an allowed
+        login (the brain's ask), or "" when there is none."""
+        allowed = {a.lower() for a in self.s.authors}
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
+        for c in reversed(comments):
+            body = str(c.get("body") or "") if isinstance(c, dict) else ""
+            if body.startswith(HUMAN_MARKER) and tickets._login(c.get("user")) in allowed:
+                lines = [ln.strip() for ln in body[len(HUMAN_MARKER):].splitlines() if ln.strip()]
+                return _clip(lines[0], HUMAN_ASK_MAX) if lines else ""
+        return ""
+
+    def _human_text(self, found: List[Tuple[str, Dict[str, Any]]]) -> Optional[str]:
+        """The digest's "Waiting on you" section: the newest HUMAN_SHOWN
+        issues grouped by repo, each with its ask; None when it cannot be read."""
+        shown = found[:HUMAN_SHOWN]
+        head = "%s (%d):" % (HUMAN_HEAD, len(found))
+        if len(found) > len(shown):
+            head = "%s (the %d newest of %d):" % (HUMAN_HEAD, len(shown), len(found))
+        lines = [head]
+        for repo in dict.fromkeys(r for r, _ in shown):
+            lines.append(repo)
+            for r, issue in shown:
+                if r != repo:
+                    continue
+                title = _clip(" ".join(str(issue.get("title") or "").split()), HUMAN_TITLE_MAX)
+                lines.append("- %s %s" % (title, issue["html_url"]))
+                try:
+                    ask = self._human_ask(repo, issue)
+                except GitHubError as err:
+                    _say("could not read the ask on %s#%s: %s" % (repo, issue["number"], err))
+                    return None
+                if ask:
+                    lines.append("  %s" % ask)
+        return "\n".join(lines)
+
     def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """(key, repo, issue) for every open ask, oldest first; None when any
         repo could not be read (a partial list must not become a digest)."""
@@ -898,6 +965,8 @@ class Station:
             except GitHubError as err:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
+        # A loom:human issue waits in the digest's own list, never alone.
+        asks = [a for a in asks if HUMAN not in _label_names(a[1])]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
 
@@ -951,8 +1020,8 @@ class Station:
         return today, local.tm_hour >= self.s.digest_hour and sent.get("digest") != today
 
     def _deliver(self, url: str, todo: List[Tuple[str, Dict[str, Any]]],
-                 digest: List[Dict[str, Any]], ledger: Tuple[str, Dict[str, Any], List[str]],
-                 today: str) -> None:
+                 digest: List[Dict[str, Any]], human: str,
+                 ledger: Tuple[str, Dict[str, Any], List[str]], today: str) -> None:
         path, sent, urgent_sent = ledger
         for key, issue in todo:
             title = " ".join(str(issue.get("title") or "").split())
@@ -960,7 +1029,14 @@ class Station:
                 urgent_sent.append(key)
                 sent["urgent"] = urgent_sent
                 _write_json(path, sent)
-        if digest and self._send(url, self._digest_text([self._line(i) for i in digest])):
+        parts = ([self._digest_text([self._line(i) for i in digest])] if digest else []) \
+            + ([human] if human else [])
+        if not parts:
+            return
+        # One digest; a long one goes out in Discord-sized parts, the mention
+        # on the first only (room is left for it).
+        chunks = self._chunks("\n\n".join(parts), DISCORD_MAX - 40)
+        if all(self._send(url, c, mention=n == 0) for n, c in enumerate(chunks)):
             sent["digest"] = today
             _write_json(path, sent)
 
@@ -984,11 +1060,20 @@ class Station:
             return
         todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
         digest = [i for k, _, i in keyed if trust.get(k)] if digest_due else []
-        if not todo and not digest:
+        human = ""
+        if digest_due:
+            found = self._gather_human()
+            text = self._human_text(found) if found else ""
+            if found is None or text is None:
+                # The digest waits for the whole list; urgent asks still go.
+                digest = []
+            else:
+                human = text
+        if not todo and not digest and not human:
             return
         url = self._webhook()
         if url is not None:
-            self._deliver(url, todo, digest, ledger, today)
+            self._deliver(url, todo, digest, human, ledger, today)
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
@@ -1036,13 +1121,13 @@ class Station:
         return name[:SHORT_NAME_MAX] or "#%s" % issue.get("number")
 
     @staticmethod
-    def _chunks(text: str) -> List[str]:
+    def _chunks(text: str, size: int = DISCORD_MAX) -> List[str]:
         """The text in Discord-sized messages, cut at line breaks."""
         parts = []
-        while len(text) > DISCORD_MAX:
-            cut = text.rfind("\n", 0, DISCORD_MAX + 1)
+        while len(text) > size:
+            cut = text.rfind("\n", 0, size + 1)
             if cut <= 0:
-                cut = DISCORD_MAX
+                cut = size
             parts.append(text[:cut])
             text = text[cut:].lstrip("\n")
         if text.strip():

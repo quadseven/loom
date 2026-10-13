@@ -145,8 +145,10 @@ tickets and pull requests like any other work.
    `loom:rewritten` and stays open) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
    the exact thing needed: money, hardware, an account, a credential, or a
-   decision the goal home reserves for the operator. Never close an issue
-   or mark one done from triage: an old issue that looks finished stays
+   decision the goal home reserves for the operator. When an open
+   `loom:human` issue turns out to be work the brain can do after all,
+   remove the label and brief it the same way (`brief --refs M`). Never
+   close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close.
 9. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
@@ -165,7 +167,10 @@ tickets and pull requests like any other work.
      named as stuck or blocked and still is, with how long; say "nothing"
      when the list is empty. Read the previous report to fill this in.
    - Next: what the brain will do before the next report.
-   - Needs you: only what only the operator can do, or "nothing".
+   - Needs you: only what only the operator can do, or "nothing", then the
+     count of open `loom:human` issues by repo (for example "loom:human: 12
+     in OWNER/NAME, 3 in OWNER/OTHER"); the daily digest lists them, so do
+     not list them here.
    Write sentences, not ticket lists: name a ticket only where the operator
    may want to open it, and never more than one or two per line. Numbers
    over adjectives. A goal home may ask for extra lines; add them after

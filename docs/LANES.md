@@ -101,8 +101,13 @@ from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
 empty nothing is forwarded). A `loom:urgent` ask is posted at once, once; all
 open asks go in one digest per day after `LOOM_DIGEST_HOUR` (local hour,
-default 9). Posts mention nobody except the numeric user id in
-`LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
+default 9). The same digest ends with "Waiting on you": open `loom:human`
+issues across `LOOM_REPOS`, grouped by repo, newest first, each with its
+title, link and the first line of the brain's `loom:human` comment (shown
+only when an allowed login wrote it); over 15 it shows the 15 newest and the
+total. A `loom:human` issue is never posted on its own, even with
+`needs-operator` or `loom:urgent`, and a long digest goes out in parts.
+Posts mention nobody except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
 
 Reports: the station also reads comments on open `loom:goal` issues in each
 `LOOM_REPOS` repo. On first run it records the newest report comment per repo
