@@ -547,6 +547,10 @@ class FixTest(Base):
     def test_a_fix_comment_for_a_branch_the_runner_refuses_is_refused(self):
         self.refused_fix(FIX_BODY.replace("branch loom/12-fix-the-thing", "branch main"))
 
+    def test_a_fix_comment_with_an_invalid_finding_id_is_refused(self):
+        body = FIX_BODY + "\n### Thread X9 (comment 1) at test.py:10\nFinding\nDoes not apply\n"
+        self.refused_fix(body)
+
     def test_a_finished_fix_reports_pushed_fixes(self):
         self.fake.add(12, state="running")
         fix = tickets.parse_fix(REPO, FIX_BODY)

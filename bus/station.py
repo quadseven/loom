@@ -441,10 +441,15 @@ class Station:
         fix, fix_comment_id = fix_source if fix_source else (None, None)
 
         # A fix brief goes out only once every finding has a disposition.
-        if fix is not None and not fix.has_all_dispositions():
-            undispositioned = [f.id for f in fix.findings_list if not f.disposition]
-            self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
-            return False
+        if fix is not None:
+            try:
+                if not fix.has_all_dispositions():
+                    undispositioned = [f.id for f in fix.findings_list if not f.disposition]
+                    self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
+                    return False
+            except ValueError as err:
+                self._refuse(repo, issue, "invalid pre-roll finding: %s" % err)
+                return False
 
         earlier = sum(1 for c in comments
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))

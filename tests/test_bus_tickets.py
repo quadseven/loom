@@ -1,5 +1,26 @@
 """Test the Finding class and related functions in bus.tickets."""
+import unittest
+
 from bus.tickets import Finding, parse_findings, Fix, render_findings, render_brief
+
+
+class FindingDispositionTest(unittest.TestCase):
+    def test_empty_id_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Finding ID"):
+            Finding("", "text")
+
+    def test_missing_disposition_stays_unresolved(self):
+        body = "### Thread F1 (comment 1) at test.py:10\nReview finding\n"
+        finding = parse_findings(body)[0]
+        self.assertIsNone(finding.disposition)
+        self.assertFalse(Fix(1, "loom/1-fix", body).has_all_dispositions())
+
+    def test_does_not_apply_survives_render_and_parse(self):
+        original = Finding("F1", "Review finding", location=("test.py", 10, 1),
+                           disposition="does_not_apply")
+        rendered = render_findings([original])
+        self.assertIn("\nDoes not apply\n", rendered + "\n")
+        self.assertEqual(parse_findings(rendered)[0].disposition, "does_not_apply")
 
 
 def test_finding_creation():

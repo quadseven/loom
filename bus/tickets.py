@@ -127,7 +127,7 @@ class Finding:
     
     def __init__(self, id: str, text: str, location: Optional[Tuple[str, int, int]] = None,
                  disposition: Optional[str] = None, ticket: Optional[str] = None) -> None:
-        if id and not re.match(r"^F[0-9]+$", id):
+        if not re.fullmatch(r"F[0-9]+", id):
             raise ValueError("Finding ID must be F<number>")
         if disposition is not None and disposition not in self.DISPOSITIONS:
             raise ValueError("Disposition must be one of %s" % ", ".join(self.DISPOSITIONS))
@@ -156,11 +156,23 @@ class Finding:
         )
 
 
+def _thread_finding(thread: Dict[str, str], comments: List[str],
+                    disposition: Optional[str], value: Optional[str]) -> Finding:
+    finding = Finding(
+        id=thread["id"],
+        text="\n".join(comments).rstrip("\n"),
+        location=(thread["path"], int(thread["line"]), int(thread["comment_id"])),
+        disposition=disposition,
+    )
+    if disposition == "existing_ticket" and value:
+        finding.ticket = value
+    return finding
+
+
 def parse_findings(body: str) -> List[Finding]:
     """Parse findings from a loom:fix comment body.
-    
-    Returns a list of Finding objects. Findings without a dispositions
-    line are assumed to be 'does_not_apply'.
+
+    A finding without a disposition line remains undispositioned.
     """
     findings: List[Finding] = []
     lines = body.split("\n")
@@ -179,15 +191,8 @@ def parse_findings(body: str) -> List[Finding]:
         if thread_match:
             # Save the previous thread if any, with its disposition
             if current_thread:
-                finding = Finding(
-                    id=current_thread["id"],
-                    text="\n".join(current_comments).rstrip("\n"),
-                    location=(current_thread["path"], int(current_thread["line"]), int(current_thread["comment_id"])),
-                    disposition=pending_disposition
-                )
-                if pending_disposition == "existing_ticket" and pending_disposition_value:
-                    finding.ticket = pending_disposition_value
-                findings.append(finding)
+                findings.append(_thread_finding(current_thread, current_comments,
+                                                pending_disposition, pending_disposition_value))
                 pending_disposition = None
                 pending_disposition_value = None
             
@@ -222,15 +227,8 @@ def parse_findings(body: str) -> List[Finding]:
     
     # Don't forget the last thread
     if current_thread:
-        finding = Finding(
-            id=current_thread["id"],
-            text="\n".join(current_comments).rstrip("\n"),
-            location=(current_thread["path"], int(current_thread["line"]), int(current_thread["comment_id"])),
-            disposition=pending_disposition
-        )
-        if pending_disposition == "existing_ticket" and pending_disposition_value:
-            finding.ticket = pending_disposition_value
-        findings.append(finding)
+        findings.append(_thread_finding(current_thread, current_comments,
+                                        pending_disposition, pending_disposition_value))
     
     return findings
 
@@ -281,6 +279,8 @@ def render_findings(findings: List[Finding]) -> str:
                 lines.append("Fixing: %s" % f.ticket)
             elif f.disposition == "fixed":
                 lines.append("Fixing: fixed in this PR")
+            elif f.disposition == "does_not_apply":
+                lines.append("Does not apply")
         lines.append("")
     return "\n".join(lines).strip("\n")
 
