@@ -33,6 +33,13 @@ def goal():
     return {"number": 1, "id": 101, "state": "open", "title": "Goal", "labels": [{"name": "loom:goal"}]}
 
 
+def ready_node(checks="SUCCESS", reviews=(), threads=()):
+    """One pull request's READY_FIELDS, head committed at 12:45 on 2030-01-01."""
+    return {"commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:45:00Z",
+                                              "statusCheckRollup": {"state": checks}}}]},
+            "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
+
+
 class BrainTests(unittest.TestCase):
     def test_status_sections_and_request_ceiling(self):
         gh = GitHub("t", transport=Fake(
@@ -42,8 +49,8 @@ class BrainTests(unittest.TestCase):
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
             reply(200, []), reply(200, [])))
-        report = brain.status(gh, [REPO], REPO)
-        for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "SUCCESS", "1 unresolved threads"):
+        report = brain.status(gh, [REPO], REPO, env={})
+        for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request; lane repo: issues
         # (no loom:lanes issue here, so no comments read). The fake has no
@@ -56,9 +63,67 @@ class BrainTests(unittest.TestCase):
             reply(200, []), reply(200, []),
             reply(200, [lanes_issue]),
             reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z"}])))
-        report = brain.status(gh, [REPO], REPO)
+        report = brain.status(gh, [REPO], REPO, env={})
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
+
+    def test_merge_ready_names_each_blocker(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        cases = [
+            ({}, "blocked: checks unknown"),
+            (ready_node(), "READY"),
+            (ready_node(checks="FAILURE"), "blocked: checks failure"),
+            (ready_node(reviews=[{"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
+             "blocked: grug changes_requested"),
+            (ready_node(threads=[{"isResolved": False}] * 3), "blocked: 3 unresolved threads"),
+            # A resolved finding posted after the head commit has no fix-up commit.
+            (ready_node(threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T13:00:00Z"}]}}]),
+             "blocked: 1 grug findings with no fix-up commit after them"),
+            # A person with the bot's login is not the bot.
+            (ready_node(reviews=[{"author": {"__typename": "User", "login": "grug-tribe"}, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
+             "READY"),
+            (ready_node(checks="PENDING", threads=[{"isResolved": False}]), "blocked: checks pending, 1 unresolved threads"),
+        ]
+        for node, want in cases:
+            with self.subTest(want=want):
+                self.assertEqual(brain.merge_ready(node, "grug-tribe"), want)
+
+    def test_merge_ready_follows_the_newest_review_and_two_status_runs_agree(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        operator = {"__typename": "User", "login": "example-operator"}
+        node = ready_node(
+            reviews=[{"author": {"__typename": "Bot", "login": "GRUG-TRIBE"}, "state": "COMMENTED", "submittedAt": "2030-01-01T12:30:00Z"},
+                     {"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"},
+                     {"author": operator, "state": "COMMENTED", "submittedAt": "2030-01-01T11:37:00Z"},
+                     {"author": bot, "state": "COMMENTED", "submittedAt": "2030-01-01T12:00:00Z"},
+                     {"author": bot, "state": "PENDING", "submittedAt": None}],
+            threads=[{"isResolved": True, "root": {"nodes": [{"author": bot, "createdAt": "2030-01-01T08:06:00Z"}]}},
+                     {"isResolved": True, "root": {"nodes": [{"author": operator, "createdAt": "2030-01-01T11:37:00Z"}]}}])
+        pulls = [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]
+
+        def run():
+            gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
+                                            reply(200, {"data": {"repository": {"p4": node}}}),
+                                            reply(200, [])))
+            return [line for line in brain.status(gh, [REPO], REPO, env={}).splitlines()
+                    if line.startswith("- #4 ")]
+
+        first, second = run(), run()
+        self.assertEqual(first, ["- #4 PR - READY"])
+        self.assertEqual(first, second)
+        # Had the stale review been the newest, the same data would block.
+        node["reviews"]["nodes"][0]["state"] = "CHANGES_REQUESTED"
+        self.assertEqual(run(), ["- #4 PR - blocked: grug changes_requested"])
+
+    def test_status_asks_for_every_field_merge_ready_reads(self):
+        fake = Fake(reply(200, []), reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
+                    reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []))
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        self.assertIn("- #4 PR - blocked: checks unknown", report)
+        query = fake.calls[2][2]["query"]
+        for field in ("committedDate", "statusCheckRollup", "reviews(last:100)", "submittedAt",
+                      "reviewThreads(first:100)", "isResolved", "createdAt", "__typename"):
+            self.assertIn(field, query)
 
     def test_brief_refusals_create_nothing(self):
         cases = [
