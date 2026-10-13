@@ -411,6 +411,9 @@ record() {
 # second argument is the interpreter, whose directory stays readable). The
 # check after the agent runs the agent's code, so it must never see the
 # runner's HOME, keys or SSH agent. Output goes through a pipe to the log.
+# The command passed to bash -c is deliberately shell syntax: load_contract
+# reads it from the base branch's trusted CI contract, never the agent's
+# branch, and rejects hidden control bytes before this call.
 contract_run() {
   local profile
   profile="$(AGENT_HOME="$CHECK_HOME" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
