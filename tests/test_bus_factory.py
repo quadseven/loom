@@ -350,8 +350,9 @@ NO_CHANGE = "Lane claude made no change for the fix to #50 and said why on the p
 
 class ReviewBotThreads(Base):
     def thread(self, *comments):
-        self.gh.details[50]["reviewThreads"]["nodes"][0]["comments"] = {
-            "nodes": [{"author": a, "body": b} for a, b in comments]}
+        nodes = [{"author": a, "body": b} for a, b in comments]
+        self.gh.details[50]["reviewThreads"]["nodes"][0].update(
+            comments={"nodes": nodes}, root={"nodes": nodes[:1]})
 
     def test_a_thread_the_bot_marked_fixed_is_resolved_and_the_pull_request_lands(self):
         self.gh.ticket(5, "pr", lane="codex")
@@ -368,6 +369,14 @@ class ReviewBotThreads(Base):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, resolved=False)
         self.thread((BOT, "finding"), ({"__typename": "User", "login": "grug-tribe"}, FIXED))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_thread_a_person_opened_stays_open_even_under_a_bot_fixed_reply(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((ME, "this breaks on an empty list"), (BOT, FIXED))
         self.go()
         self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [])

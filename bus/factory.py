@@ -101,6 +101,7 @@ CLAIM_RE = re.compile(r"^Claimed for lane ")
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
                  ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved'
+                 ' root: comments(first:1) { nodes { author { __typename login } } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
                     ' { thread { isResolved } } }')
@@ -180,15 +181,20 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
 
 
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
-    """Open threads whose newest comment is the review bot's own "Fixed in"
-    reply. The author must be an app (a person can take the same login
-    without "[bot]"), and a reply after it from anyone keeps the thread open."""
+    """Open threads the review bot opened whose newest comment is its own
+    "Fixed in" reply. Both authors must be the app (a person can take the
+    same login without "[bot]"); a thread a person opened, or any reply
+    after the bot's, stays open for a person or the brain."""
+    def is_bot(comment: Dict[str, Any]) -> bool:
+        author = comment.get("author") or {}
+        return (author.get("__typename") == "Bot"
+                and str(author.get("login") or "").lower() == bot.lower())
+
     picked = []
     for thread in threads:
+        root = ((thread.get("root") or {}).get("nodes") or [None])[0] or {}
         last = ((thread.get("comments") or {}).get("nodes") or [None])[-1] or {}
-        author = last.get("author") or {}
-        if (not thread.get("isResolved") and author.get("__typename") == "Bot"
-                and str(author.get("login") or "").lower() == bot.lower()
+        if (not thread.get("isResolved") and is_bot(root) and is_bot(last)
                 and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX)):
             picked.append(str(thread.get("id")))
     return picked
