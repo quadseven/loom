@@ -141,6 +141,10 @@ printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secr
 if printf '#!/bin/sh\\ntouch "%s/hooked"\\n' "$real_home" > .git/hooks/pre-commit 2>/dev/null \\
    && chmod +x .git/hooks/pre-commit 2>/dev/null; then hook=planted; else hook=denied; fi
 printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
+printf 'config=%s\\n' "${OPENCODE_CONFIG_CONTENT:-none}" >> "$TMPDIR/agent.log"
+# A brief carrying AGENT_FAIL=1 ends the run with an error, as a dropped
+# connection would.
+case "$args" in *AGENT_FAIL=1*) exit 3 ;; esac
 # Real CLIs fstat their stdout and stderr (Bun does on start).
 if /usr/bin/perl -e 'exit((stat(STDOUT) && stat(STDERR)) ? 0 : 1)'; then
   fds=ok; else fds=denied; fi
@@ -169,6 +173,21 @@ var="FAKE_SECRET_$(printf '%s' "$name" | tr '/-' '__')"
 val="${!var:-}"
 [ -n "$val" ] || { echo "ParameterNotFound" >&2; exit 254; }
 printf '%s\\n' "$val"
+"""
+
+
+# Fake curl: the spark lane's probe of its endpoint. $FAKE_CURL lists one
+# answer per call (an HTTP code, "refused" for a refused connection, curl
+# exit 7, or "timeout", curl exit 28); the last answer repeats. Every call is appended to $FAKE_LOG.
+FAKE_CURL = """#!/usr/bin/env bash
+printf 'curl %s\\n' "$*" >> "$FAKE_LOG"
+n="$(grep -c '^curl ' "$FAKE_LOG")"
+set -- ${FAKE_CURL:-200}
+[ "$n" -le "$#" ] || n="$#"
+answer="${!n}"
+if [ "$answer" = refused ]; then printf '000'; exit 7; fi
+if [ "$answer" = timeout ]; then printf '000'; exit 28; fi
+printf '%s' "$answer"
 """
 
 
@@ -243,6 +262,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "codex", FAKE_AGENT)
         self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
         self.write_tool(self.bin / "aws", FAKE_AWS)
+        self.write_tool(self.bin / "curl", FAKE_CURL)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -749,7 +769,7 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
-    def api_lane(self, lane, **env):
+    def api_lane(self, lane, extra="", **env):
         planted = self.home / ".ssh" / "id_planted"
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_text("private key\n")
@@ -767,7 +787,7 @@ cat > /dev/null
         self.addCleanup(self.local_service.close)
         port = self.local_service.getsockname()[1]
         (inbox / "T042-fix-the-thing.md").write_text(
-            BRIEF.replace("Lane: codex", f"Lane: {lane}") + f"\nPROBE_PORT={port}\n")
+            BRIEF.replace("Lane: codex", f"Lane: {lane}") + f"\nPROBE_PORT={port}\n{extra}")
         result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
         return inbox, result
 
@@ -1120,6 +1140,117 @@ cat > /dev/null
         beat = json.loads((self.loom / "state" / "usage" / "zai.json").read_text())
         self.assertFalse(beat["available"])
         self.assertIn("LOOM_ZAI_KEY_SSM", beat["reason"])
+
+    SPARK = {"LOOM_SPARK_URL": "http://spark.example.invalid:8000/v1",
+             "LOOM_SPARK_MODEL": "spark/coder-test"}
+
+    def spark_beat(self):
+        return json.loads((self.loom / "state" / "usage" / "spark.json").read_text())
+
+    def spark_log(self):
+        return (self.loom / "logs" / "spark" / "T042-fix-the-thing.log").read_text()
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
+        # The local coder trains on nothing: no privacy lookup, private is fine.
+        inbox, result = self.api_lane("spark", FAKE_GH_PRIVATE="true", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any(c.startswith("gh api ") for c in calls), calls)
+        self.assertTrue(any(c.startswith("curl ") and "http://spark.example.invalid:8000/v1/models" in c
+                            for c in calls), calls)
+        agent = [c for c in calls if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, calls)
+        self.assertIn("-m spark/coder-test", agent[0])
+        self.assertIn("keyvar=none", agent[0])
+        self.assertIn("secret=denied", agent[0])
+        self.assertIn("small=spark/coder-test", agent[0])
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["model"], "spark/coder-test")
+        provider = config["provider"]["spark"]
+        self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
+        self.assertEqual(provider["options"], {"baseURL": "http://spark.example.invalid:8000/v1"})
+        self.assertEqual(list(provider["models"]), ["coder-test"])
+        self.assertIn("lane spark, model spark/coder-test", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.spark_beat()["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_takes_the_brief_model_line(self):
+        brief = BRIEF.replace("Lane: codex", "Lane: spark\nModel: spark/other-coder")
+        inbox = self.loom / "briefs" / "spark"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(brief)
+        self.run_lane("spark", **self.SPARK)
+        agent = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("-m spark/other-coder", agent[0])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_refused_spark_endpoint_is_a_limit_that_hands_the_brief_on(self):
+        inbox, result = self.api_lane("spark", FAKE_CURL="refused", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertFalse((self.loom / "worktrees" / "T042-fix-the-thing").exists())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: limit: the spark endpoint refused the connection", self.spark_log())
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: "), beat)
+        # The limit holds for 15 minutes, without asking the endpoint again.
+        ends = int((self.loom / "state" / "usage" / "spark.limit").read_text().split()[0])
+        self.assertAlmostEqual(ends - time.time(), 900, delta=30)
+        probes = sum(c.startswith("curl ") for c in self.calls())
+        (inbox / "T043-next.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark"))
+        self.run_lane("spark", FAKE_CURL="200", **self.SPARK)
+        self.assertEqual(sum(c.startswith("curl ") for c in self.calls()), probes)
+        self.assertFalse(self.spark_beat()["available"])
+        self.assertTrue((inbox / "failed" / "T043-next.md").exists())
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
+        inbox, result = self.api_lane("spark", extra="AGENT_FAIL=1\n", FAKE_CURL="200 503", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: limit: the spark endpoint answered 503 (agent exited 3)", self.spark_log())
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: "), beat)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_spark_run_that_fails_while_the_endpoint_answers_is_an_ordinary_failure(self):
+        inbox, _ = self.api_lane("spark", extra="AGENT_FAIL=1\n", **self.SPARK)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: agent exited 3", self.spark_log())
+        self.assertNotIn("limit:", self.spark_log())
+        self.assertTrue(self.spark_beat()["available"])
+        self.assertFalse((self.loom / "state" / "usage" / "spark.limit").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_refuses_a_model_from_elsewhere(self):
+        inbox, _ = self.api_lane("spark", LOOM_SPARK_URL=self.SPARK["LOOM_SPARK_URL"],
+                                 LOOM_SPARK_MODEL="opencode/space-bunny-free")
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_without_its_url_reports_unavailable_and_keeps_its_briefs(self):
+        inbox, result = self.api_lane("spark", LOOM_SPARK_MODEL="spark/coder-test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertIn("LOOM_SPARK_URL", beat["reason"])
+        self.assertFalse(beat["reason"].startswith("limit"))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_an_unreachable_spark_endpoint_is_not_a_limit_and_keeps_its_briefs(self):
+        inbox, _ = self.api_lane("spark", FAKE_CURL="timeout", **self.SPARK)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse(self.spark_beat()["available"])
+        self.assertFalse(self.spark_beat()["reason"].startswith("limit"))
 
     def test_lane_without_its_credential_reports_unavailable_and_keeps_its_briefs(self):
         inbox, result = self.api_lane(
