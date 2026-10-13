@@ -398,11 +398,15 @@ spark_probe() {
 # from the run's own last lines of output. Sets LIMIT_WHY. On 2026-10-13 a
 # codex usage limit read as "agent exited 1" on 21 runs, each costing its
 # ticket a rung of the model ladder and keeping the lane advertised as up.
+# Only the last few non-empty lines count, where the CLIs print the error
+# they exit on: text the model wrote earlier in the run cannot pause a lane.
+# A run that fakes one pauses its own lane for LIMIT_HOLD at most and hands
+# its brief to another lane, which is all a match does.
 LIMIT_LINE_RE='^(error|api error)\b.*(usage limit|rate[ _-]?limit|credit balance|quota|too many requests|overloaded)|usage limit reached|[0-9]+-hour limit reached'
 provider_limit() {
   local line
-  line="$(tail -c +"$(( ${LOG_START:-0} + 1 ))" "$LOG" 2>/dev/null | tail -n 40 |
-    grep -iE "$LIMIT_LINE_RE" | tail -n 1)"
+  line="$(tail -c +"$(( ${LOG_START:-0} + 1 ))" "$LOG" 2>/dev/null | grep -v '^[[:space:]]*$' |
+    tail -n 5 | grep -iE "$LIMIT_LINE_RE" | tail -n 1)"
   [ -n "$line" ] || return 1
   LIMIT_WHY="lane $SLOT's provider reported a usage or rate limit"
 }

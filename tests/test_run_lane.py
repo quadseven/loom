@@ -111,6 +111,11 @@ if [ "${FAKE_AGENT:-commit}" = limit ]; then
   echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
   exit 1
 fi
+if [ "${FAKE_AGENT:-commit}" = early-limit ]; then
+  echo "ERROR: rate limit exceeded"
+  for i in 1 2 3 4 5 6; do echo "working on step $i"; done
+  exit 1
+fi
 if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkdir -p .loom-answers
   echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
@@ -522,6 +527,13 @@ class LaneRunnerTest(unittest.TestCase):
         self.run_lane()
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "failed" / "T043-next.md").exists())
+
+    def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="early-limit")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: agent exited 1", log)
+        self.assertNotIn("failed: limit", log)
 
     def test_a_finding_that_mentions_a_rate_limit_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF + "\nThe client ignores the rate limit header.\n")
