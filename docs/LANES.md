@@ -352,9 +352,10 @@ LOOM_OPENCODE_GO_3_OPENCODE=/path/to/opencode2/bin/opencode lanes/mac/install.sh
 `LOOM_<SLOT>_OPENCODE` (or `LOOM_<LANE>_OPENCODE` for every slot of a lane)
 names the opencode binary; without it a lane runs `opencode` from PATH. Before
 each run the runner asks the binary for `--version`; when it prints
-`opencode v2.` the run adds `--standalone --auto`, because 2.0's `run`
-otherwise talks to a shared background service, which the sandbox (no
-loopback) refuses and which would mix lanes' sessions. The sandbox lets the
+`opencode v2.` the run adds `--standalone --auto` and chooses a free localhost
+port for its private server. The sandbox allows that port for this run only;
+other localhost connections remain denied. This avoids the shared background
+service, which would mix lanes' sessions. The sandbox lets the
 agent read the named binary's real directory, exactly as it does the default
 one; a binary that needs files outside that directory will not start there.
 The transcript is archived and shown on the viewer like a 1.x one. To go

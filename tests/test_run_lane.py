@@ -395,6 +395,37 @@ class LaneRunnerTest(unittest.TestCase):
                          "Thread F1 (comment 1) at test.py:10 [fixed]; "
                          "Thread F2 (comment 2) at test.py:20 [example/repo#12]")
 
+    def sandbox_network_rules(self, port=""):
+        root = Path(self._tmp.name)
+        bindir = root / "bin"
+        bindir.mkdir(exist_ok=True)
+        cli = bindir / "cli"
+        cli.write_text("#!/bin/sh\nexit 0\n")
+        cli.chmod(0o755)
+        function = re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        script = function + 'sandbox_profile "$1" "$2"'
+        env = {"HOME": str(self.home), "AGENT_HOME": str(self.loom / "agent-home"),
+               "SKILLS": str(self.loom / "skills"), "LANE": "opencode-go",
+               "PATH": f"{bindir}:/usr/bin:/bin", "OPENCODE_STANDALONE_PORT": port}
+        self.loom.mkdir(parents=True, exist_ok=True)
+        self.home.mkdir(exist_ok=True)
+        (self.loom / "agent-home").mkdir(exist_ok=True)
+        (self.loom / "skills").mkdir(exist_ok=True)
+        result = subprocess.run(["bash", "-c", script, "bash", str(root), str(cli)],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line for line in result.stdout.splitlines() if "network-outbound (remote ip" in line]
+
+    def test_opencode_2_profile_allows_only_its_standalone_port(self):
+        rules = self.sandbox_network_rules("43210")
+        self.assertEqual(rules, ['(deny network-outbound (remote ip "localhost:*"))',
+                                 '(allow network-outbound (remote ip "localhost:43210"))'])
+
+    def test_opencode_1_profile_keeps_its_original_loopback_rule(self):
+        self.assertEqual(self.sandbox_network_rules(),
+                         ['(deny network-outbound (remote ip "localhost:*"))'])
+
     def test_brief_with_an_existing_pr_is_retired_without_running(self):
         self.drop_brief()
         result = self.run_lane(FAKE_GH_EXISTING="852")
@@ -1492,8 +1523,16 @@ cat > /dev/null
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_slot_on_opencode_2_runs_it_standalone(self):
         run = self.slot_run("opencode-go-3", LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
-        self.assertIn("run --standalone --auto -m opencode-go/deepseek-v4.1-flash", run)
+        self.assertRegex(run, r"run --standalone --auto --port [1-9][0-9]* -m opencode-go/deepseek-v4.1-flash")
         self.assertIn("secret=denied", run)
+        self.assertIn("lo=denied", run)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_opencode_1_profile_does_not_gain_a_loopback_exception(self):
+        run = self.slot_run("opencode-go-3")
+        self.assertIn("run -m opencode-go/deepseek-v4.1-flash", run)
+        self.assertNotIn("--port", run)
+        self.assertIn("lo=denied", run)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_sibling_slot_keeps_the_default_opencode(self):

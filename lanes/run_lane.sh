@@ -368,8 +368,14 @@ sandbox_profile() {
     done
   done
   [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny"
+  local loopback_port="${OPENCODE_STANDALONE_PORT:-}"
+  local loopback_rule='(deny network-outbound (remote ip "localhost:*"))'
+  if [[ "$loopback_port" =~ ^[0-9]+$ ]] && [ "$loopback_port" -ge 1 ] && [ "$loopback_port" -le 65535 ]; then
+    local newline=$'\n'
+    loopback_rule="(deny network-outbound (remote ip \"localhost:*\"))${newline}(allow network-outbound (remote ip \"localhost:$loopback_port\"))"
+  fi
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n%s\n' \
+    "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny" "$loopback_rule"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -597,11 +603,15 @@ opencode_bin() {
 # lanes' sessions. --auto lets it act without prompting, as 1.x run does.
 # Usage: opencode_agent <key_var> <brief text>
 opencode_agent() {
-  local bin flags=()
+  local bin flags=() standalone_port="" OPENCODE_STANDALONE_PORT=""
   bin="$(opencode_bin)"
   case "$(timeout "$NET_TIMEOUT" "$bin" --version < /dev/null 2> /dev/null | head -n 1)" in
-    "opencode v2."*) flags=(--standalone --auto) ;;
+    "opencode v2."*)
+      standalone_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')" || return 3
+      flags=(--standalone --auto --port "$standalone_port")
+      ;;
   esac
+  OPENCODE_STANDALONE_PORT="$standalone_port"
   opencode_config && api_agent "$1" "$bin" run ${flags[@]+"${flags[@]}"} -m "$MODEL" "$2"
 }
 
