@@ -87,8 +87,13 @@ branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
 the agent changes nothing, and a conflict is handed to the agent with the
 file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
-Past the last rung the ticket is left `loom:failed` for the brain. At most 12
-actions per pass. `LOOM_FACTORY=0` turns it off.
+Past the last rung the ticket is left `loom:failed` for the brain. Landing
+keeps the default branch green: a ready pull request that is behind its base
+is brought up to date first (GitHub's update-branch) and lands only after its
+checks and review pass again on the new head; each repo lands at most one a
+pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+fault is a failed Actions job gets that job run once more before it is sent
+back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
