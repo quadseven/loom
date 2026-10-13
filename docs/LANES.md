@@ -46,7 +46,13 @@ counts as stale; that pass makes no decision.
 ## The station
 
 `lanes/mac/install.sh` also installs `com.loom.station`, which runs
-`python3 -m bus station` from this checkout every 60 seconds. It turns trusted
+`lanes/mac/station.sh` from this checkout every 60 seconds. That script first
+deploys Loom itself: it fast-forwards this checkout (which the lanes and the
+brain run from too) to its default branch once that head's `unittest` check
+passed, never over local changes and never off the default branch
+(`LOOM_DEPLOY=0` turns it off), and then runs `python3 -m bus station`. A
+merged Loom pull request is running a minute after its CI passes on main.
+The station turns trusted
 `loom:briefed` ticket issues into briefs in the lane inboxes
 (`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
 `loom:running`, and later reports the run from `done/` or `failed/` back to the
@@ -88,7 +94,18 @@ A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
 tickets is passed over for the next untried one, and stays untried, so a
 ticket gives up only once it has run on every rung. A ticket that failed on
-a ladder model (its `Model:` line and lane) has tried that rung. A fix brief that ends with nothing committed (most often
+a ladder model (its `Model:` line and lane) has tried that rung. When every
+untried rung is busy, it waits on the least loaded one, and a ladder ticket
+queued behind more than 2 others on its lane moves to an untried rung with a
+free lane (not a failure).
+A fix brief may answer a finding instead of fixing it: the agent writes the
+reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
+the tree (never committed; links dropped unread), and the station posts each
+answer as the reply on its thread, redacted and text-checked. The station
+resolves the thread only when the round ran on a ladder model and the thread
+is the review bot's own medium or low finding; any other answered thread
+stays open, and the factory reads it as a finding that survived.
+A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
@@ -99,15 +116,25 @@ the agent changes nothing, and a conflict is handed to the agent with the
 file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
 A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
-does while its box is hot) is not failing: a ticket briefed on it moves to
-the next rung at once, recorded with a rung marker like any climb.
-Past the last rung the ticket is left `loom:failed` for the brain. Landing
+does while its box is hot) is not failing: a ticket briefed on it moves at
+once to a free lane in its difficulty tier (docs/MUSE.md, Lane choice), with
+no rung marker, or a ticket on a ladder rung to a free lane of that rung; with
+none free it waits where it is for its lane to come back. A failed or stalled
+ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
-pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+pass, `loom:urgent` and `loom:regression` tickets first, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
-back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+back. A ready pull request that changes a code file (by extension: `.py`,
+`.js`, `.ts`, `.tsx`, `.jsx`, `.css`, `.cpp`, `.h`, `.hpp`, `.go`, `.rs`,
+`.sh`, `.lua`, `.sql`) and no test file (a `test` or `tests` folder in its
+path, or `test_`, `_test.`, `.test.` or `.spec.` in its name) goes back
+asking for a test that fails without the change, instead of landing; that
+round climbs only if the next one still adds no test. A repo with no test
+harness opts out in `LOOM_NO_TEST_REPOS` (space separated `OWNER/NAME`), and
+a ticket whose body has the line `Tests: none needed (<reason>)` skips the
+check. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
@@ -209,7 +236,8 @@ loopback connection; they cannot query the viewer or any other local service.
   argv, in an otherwise empty environment with a scratch HOME and TMPDIR.
 - The agent runs under a macOS Seatbelt profile (`sandbox-exec`): no reads or
   writes anywhere under the real HOME except its worktree, its scratch home
-  and the directory holding its CLI, and no keychain access. It can edit its
+  and the directory holding its CLI (plus read-only access to the skill
+  snapshot), and no keychain access. It can edit its
   tree but cannot read credentials, push, open, or merge; the runner does
   that with the machine's own credentials. Without `sandbox-exec` an API lane
   reports itself unavailable.
@@ -253,6 +281,33 @@ and named, not guessed. A new run republishes the comment on the next station
 pass. Under the floor (or with a budget setting that does not parse) each
 anthropic slot reports itself unavailable with that reason, and the station
 sends the anthropic slots nothing more.
+
+## Skills on every lane
+
+Every lane has the operator's skills, so a brief may name a skill ("use the
+impeccable skill") on any lane.
+
+- codex and claude run in the operator's own home and read the skill
+  folders there directly.
+- The sandboxed lanes cannot read that home, so the runner keeps a snapshot
+  at `$LOOM_HOME/skills`: every child folder holding a `SKILL.md` in the
+  folders `LOOM_SKILL_DIRS` names (colon-separated; default
+  `~/.agents/skills:~/.claude/skills`; the first folder wins a name both
+  hold), copied with links followed. It is refreshed at most hourly, only
+  when a sandboxed lane has a brief waiting. The new copy is built beside
+  the old one and swapped in only when the whole copy succeeded: a failed
+  refresh keeps the last good snapshot and logs one line to
+  `logs/skills.log`.
+- Each API-lane run links the snapshot into its scratch home at
+  `.claude/skills` (Claude Code), `.agents/skills` (the cross-tool folder)
+  and `.config/opencode/skills` (opencode). The sandbox lets the agent read
+  the snapshot and never write it.
+- The agy lane user cannot read the snapshot either, so before each run the
+  runner streams a copy to that user's `~/.gemini/config/skills`, where agy
+  reads global skills, replacing the last run's copy. The sandbox keeps
+  `~/.gemini/config` read-only for the agent. `--disable-slash-commands`
+  stops skill expansion in the prompt only; agy still loads a skill it
+  decides to use.
 
 ## Public repos only: providers that train on prompts
 
@@ -363,13 +418,25 @@ lookup leaves the brief for the next pass. The rule covers:
   `loom`) instead: the runner starts it with `sudo -n -u loom`, in that user's
   emptied environment, inside the sandbox (keychain server allowed, loopback
   and everything else denied as for the other API lanes).
-- Edits only. agy stores its token so that `/usr/bin/security` can read it
+- Runs commands inside its sandbox. Print mode cannot prompt, so a tool no
+  rule allows is denied and the run ends with no output. Before each run the
+  runner writes agy's settings (`~/.gemini/antigravity-cli/settings.json`)
+  as the lane user from `lanes/agy/settings.json`: `permissions.allow` lets
+  through shell commands and the file tools, and `permissions.deny` blocks
+  web fetching (`read_url`, `execute_url`). Of the old file, only
+  `trustedWorkspaces` (set at sign-in) is kept. After the run the runner
+  writes back exactly what it wrote before, and the sandbox keeps the file
+  read-only during the run, so a run cannot leave a wider rule behind. The
+  brief tells agy to run the repo's tests and lint and to edit only inside
+  its tree, as the other lanes do.
+- Commands run as the lane user, inside the same sandbox and emptied
+  environment as agy itself, so they can write only where the agent can (see
+  below). agy stores its token so that `/usr/bin/security` can read it
   without a prompt, and reads it that way itself, so the sandbox cannot block
-  that tool; a shell command from the agent could copy the token out. The
-  runner never passes `--dangerously-skip-permissions`, passes
-  `--disable-slash-commands`, and tells agy in the brief that shell commands
-  are unavailable (print mode soft-denies them, and a denied command ends the
-  run with no output).
+  that tool, and a command could read the token. The settings deny commands
+  starting with `security`, which slows that down but does not stop it. The
+  runner never passes `--dangerously-skip-permissions` and passes
+  `--disable-slash-commands`.
 - Public repos only: whether the plan trains on prompts is not established.
 - One-time setup, done by the operator:
   1. Create the standard user, hidden, and store its password in SSM.
@@ -397,7 +464,8 @@ lookup leaves the brief for the next pass. The rule covers:
   Inside the state directory, `settings.json`, `installation_id`, `bin`,
   and `builtin` stay read-only. Everything else under the lane user's home
   stays read-only as well, including shell startup files, `~/.gemini`
-  config, and MCP servers.
+  config (with the skills copied to `~/.gemini/config/skills`, see Skills
+  on every lane), and MCP servers.
 - Before each run, the runner clears agy's memory of earlier runs
   (`agy_forget`), deleting everything in its state directory except sign-in
   and install state. Kept entries in the state directory are `settings.json`,

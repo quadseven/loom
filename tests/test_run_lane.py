@@ -107,6 +107,25 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = limit ]; then
+  echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
+  exit 1
+fi
+if [ "${FAKE_AGENT:-commit}" = early-limit ]; then
+  echo "ERROR: rate limit exceeded"
+  for i in 1 2 3 4 5 6; do echo "working on step $i"; done
+  exit 1
+fi
+if [ "${FAKE_AGENT:-commit}" = answer ]; then
+  mkdir -p .loom-answers
+  echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
+  ln -s "$FAKE_SECRET_FILE" .loom-answers/PRRT_2.md
+  ln "$FAKE_SECRET_FILE" .loom-answers/PRRT_3x.md
+  mkfifo .loom-answers/PRRT_4x.md
+  echo "scratch" > .loom-answers/notes.txt
+fi
+if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
+if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
 echo fixed > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
@@ -195,6 +214,7 @@ printf '%s' "$answer"
 # that it was used. Production uses sudo to the dedicated macOS user.
 FAKE_RUNAS = """#!/usr/bin/env bash
 printf 'runas %s\\n' "$1" >> "$FAKE_LOG"
+if [ "${FAKE_FAIL_AGY_SETTINGS_KEEP:-}" = 1 ] && [ "${!#}" = keep ]; then exit 1; fi
 exec "$@"
 """
 
@@ -220,10 +240,35 @@ G="$HOME/.gemini"
 # What a previous run left in agy's memory, and whether this run can plant
 # config that would steer the next one.
 if [ -e "$G/antigravity-cli/brain/planted.md" ]; then mem=leftover; else mem=clean; fi
+S="$G/config/skills/impeccable/SKILL.md"
+if [ -f "$S" ]; then skill="$(head -1 "$S")"; else skill=none; fi
+if echo x >> "$S" 2>/dev/null || rm -f "$S" 2>/dev/null; then skillw=writable; else skillw=locked; fi
 if echo '{"mcpServers":{}}' > "$G/config/mcp_config.json" 2>/dev/null; then cfg=writable; else cfg=locked; fi
 if echo x >> "$HOME/.zshrc" 2>/dev/null; then rc=writable; else rc=locked; fi
-printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" >> "$TMPDIR/agy.log"
+# The permission rules this run got, and whether it can widen them for the next.
+P="$G/antigravity-cli/settings.json"
+cp "$P" "$TMPDIR/agy-settings-seen.json"
+if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$P" 2>/dev/null; then set=writable; else set=locked; fi
+printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
+echo fixed > fix.txt
+"""
+
+
+# Fake claude for the anthropic lane: for each folder a CLI reads skills
+# from, records the first line of each skill it sees, and whether the agent
+# can change the snapshot through that folder or at its real path.
+FAKE_SKILL_CLAUDE = """#!/usr/bin/env bash
+for f in .claude/skills .agents/skills .config/opencode/skills; do
+  d="$HOME/$f"
+  seen="$(for s in "$d"/*/SKILL.md; do [ -f "$s" ] && printf '%s,' "$(head -1 "$s")"; done)"
+  if echo x >> "$d/impeccable/SKILL.md" 2>/dev/null || touch "$d/impeccable/new" 2>/dev/null \\
+     || rm -f "$d/impeccable/SKILL.md" 2>/dev/null; then w=writable; else w=locked; fi
+  real="$(cd "$d" 2>/dev/null && pwd -P)"
+  if [ -n "$real" ] && { touch "$real/planted" 2>/dev/null || chmod u+w "$real/impeccable" 2>/dev/null; }; then
+    rw=writable; else rw=locked; fi
+  printf 'skills %s seen=%s write=%s realwrite=%s\\n' "$f" "${seen:-none}" "$w" "$rw" >> "$TMPDIR/agent.log"
+done
 echo fixed > fix.txt
 """
 
@@ -466,6 +511,89 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
                                    "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
+        self.fix_brief()
+        replies = ('[{"thread":"PRRT_fake","reply":"Addressed","resolve":true},'
+                   '{"thread":"PRRT_keep_open","reply":"Still investigating","resolve":false}]')
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_fake" in c for c in calls))
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c and "PRRT_keep_open" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c and "PRRT_fake" in c for c in calls))
+        self.assertFalse(any("resolveReviewThread" in c and "PRRT_keep_open" in c for c in calls))
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", "HEAD"],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertNotIn(".loom/replies.json", files)
+
+    def test_fix_runner_ignores_invalid_replies_file(self):
+        self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES='[{"thread":4}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c or "resolveReviewThread" in c
+                             for c in self.calls()))
+
+    def test_reply_only_fix_posts_replies_without_a_commit_or_push(self):
+        name, before = self.fix_brief()
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="replies-only",
+                               FAKE_REPLIES='[{"thread":"PRRT_fake","reply":"Not applicable: false positive.","resolve":true}]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c for c in calls))
+        self.assertFalse(any(c.startswith("git push") for c in calls))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    def test_a_provider_usage_limit_is_a_limit_not_a_failure(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        result = self.run_lane(FAKE_AGENT="limit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: limit: lane codex's provider reported a usage or rate limit "
+                      "(agent exited 1)", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: "), beat)
+        # The next brief is handed on without running the agent.
+        agents = sum(c.startswith("codex ") for c in self.calls())
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        self.run_lane()
+        self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
+        self.assertTrue((self.inbox / "failed" / "T043-next.md").exists())
+
+    def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="early-limit")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: agent exited 1", log)
+        self.assertNotIn("failed: limit", log)
+
+    def test_a_finding_that_mentions_a_rate_limit_is_not_a_limit(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF + "\nThe client ignores the rate limit header.\n")
+        self.run_lane(FAKE_AGENT="fail")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: agent exited 3", log)
+        self.assertNotIn("failed: limit", log)
+
+    def test_a_fix_briefs_answers_move_to_the_inbox_and_never_into_the_commit(self):
+        name, _ = self.fix_brief()
+        secret = Path(self._tmp.name) / "outside-secret"
+        secret.write_text("do not post me\n")
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_GH_EXISTING="7",
+                               FAKE_SECRET_FILE=str(secret))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        answers = self.inbox / "answers" / name
+        # Only the regular file named for a thread; the symlink, the hard link
+        # to a file outside the tree and the FIFO are dropped unread.
+        self.assertEqual(sorted(os.listdir(answers)), ["PRRT_1.md"])
+        self.assertEqual((answers / "PRRT_1.md").read_text(), "Not valid: a.py:2 already guards it.\n")
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
+                                self.remote_head(self.FIX_BRANCH)], capture_output=True, text=True).stdout.split()
+        self.assertIn("fix.txt", files)
+        self.assertFalse([f for f in files if f.startswith(".loom-answers")])
 
     def test_a_fix_brief_repairs_stale_pr_text_without_a_code_commit(self):
         # The branch already has one commit and an open PR. The ticket body
@@ -761,6 +889,30 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        # The remote did not move: this run's own rewrite is a push failure.
+        self.assertIn("failed: push failed",
+                      (self.loom / "logs" / "codex" / (name + ".log")).read_text())
+        self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
+
+    def test_a_fix_brief_whose_branch_moved_during_the_run_is_parked_as_branch_moved(self):
+        name, before = self.fix_brief()
+        # Another lane pushes to the pull request's branch while this run's
+        # agent works: the push is refused, and that is not this run's failure.
+        work = Path(self._tmp.name) / "pr-work"
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "echo fixed > fix.txt\n",
+            "(cd %s && echo other > other.txt && git add other.txt &&"
+            " git -c user.name=t -c user.email=t@example.invalid commit -qm Other &&"
+            " git push -q origin %s)\necho fixed > fix.txt\n" % (work, self.FIX_BRANCH), 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        moved = self.remote_head(self.FIX_BRANCH)
+        self.assertNotEqual(moved, before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("failed: branch moved: %s is at %s on the remote, not %s"
+                      % (self.FIX_BRANCH, moved[:12], before[:12]), log)
+        self.assertNotIn("failed: push failed", log)
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
 
     def test_a_model_from_another_lanes_family_is_refused(self):
@@ -901,18 +1053,98 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
-    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, **env):
+    def operator_skills(self):
+        """The operator's skill folders: links into a skills checkout, as the
+        operator's skill sync leaves them, plus a folder that is not a skill."""
+        checkout = self.home / "skills-checkout"
+        for name in ("impeccable", "tdd"):
+            (checkout / name).mkdir(parents=True)
+            (checkout / name / "SKILL.md").write_text(f"{name} v1\n")
+        (checkout / "notes").mkdir()
+        (checkout / "notes" / "README").write_text("not a skill\n")
+        for folder, names in ((".agents", ("impeccable", "tdd", "notes")), (".claude", ("impeccable",))):
+            skills = self.home / folder / "skills"
+            skills.mkdir(parents=True)
+            for name in names:
+                (skills / name).symlink_to(checkout / name)
+        return checkout
+
+    def anthropic_skill_run(self, name="T042-fix-the-thing.md"):
+        self.write_tool(self.bin / "claude", FAKE_SKILL_CLAUDE)
+        inbox = self.loom / "briefs" / "anthropic"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / name).write_text(BRIEF.replace("Lane: codex", "Lane: anthropic"))
+        result = self.run_lane("anthropic", LOOM_ANTHROPIC_KEY_SSM="/k/an",
+                               FAKE_SECRET__k_an="fake-an-key", LOOM_ANTHROPIC_MODEL="claude-test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return inbox, [c for c in self.calls() if c.startswith("skills ")]
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_api_lane_sees_the_skill_snapshot_read_only_in_each_tools_folder(self):
+        checkout = self.operator_skills()
+        inbox, seen = self.anthropic_skill_run()
+        self.assertEqual(len(seen), 3, self.calls())
+        for folder, line in zip((".claude/skills", ".agents/skills", ".config/opencode/skills"), seen, strict=True):
+            self.assertIn(f"skills {folder} ", line)
+            self.assertIn("impeccable v1,", line)
+            self.assertIn("tdd v1,", line)
+            self.assertIn("write=locked", line)
+            self.assertIn("realwrite=locked", line)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        # The snapshot holds copies (links followed), skills only, unchanged.
+        snapshot = self.loom / "skills"
+        self.assertEqual(sorted(p.name for p in snapshot.iterdir()), ["impeccable", "tdd"])
+        self.assertFalse((snapshot / "impeccable").is_symlink())
+        self.assertEqual((snapshot / "impeccable" / "SKILL.md").read_text(), "impeccable v1\n")
+        self.assertFalse((snapshot / "planted").exists())
+        self.assertEqual((checkout / "impeccable" / "SKILL.md").read_text(), "impeccable v1\n")
+        # Read-only all through, the top folder included.
+        for p in (snapshot, *snapshot.rglob("*")):
+            self.assertFalse(p.stat().st_mode & 0o222, p)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_the_skill_snapshot_refreshes_at_most_hourly_and_a_failed_refresh_keeps_it(self):
+        checkout = self.operator_skills()
+        self.anthropic_skill_run()
+        snapshot = self.loom / "skills" / "impeccable" / "SKILL.md"
+        (checkout / "impeccable" / "SKILL.md").write_text("impeccable v2\n")
+        # Within the hour: no refresh.
+        self.anthropic_skill_run("T043-again.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v1\n")
+        # An hour later, a link with no target makes the copy fail.
+        (checkout / "tdd" / "broken").symlink_to(self.home / "nowhere")
+        stamp = self.loom / "run" / "skills.stamp"
+        old = time.time() - 2 * 3600
+        os.utime(stamp, (old, old))
+        _, seen = self.anthropic_skill_run("T044-once-more.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v1\n")
+        self.assertIn("impeccable v1,", seen[-1])
+        log = (self.loom / "logs" / "skills.log").read_text().splitlines()
+        self.assertEqual(len(log), 1, log)
+        self.assertIn("skill refresh failed", log[0])
+        self.assertFalse((self.loom / "skills.next").exists())
+        # Fixed source, an hour later again: the new version arrives.
+        (checkout / "tdd" / "broken").unlink()
+        os.utime(stamp, (old, old))
+        self.anthropic_skill_run("T045-last.md")
+        self.assertEqual(snapshot.read_text(), "impeccable v2\n")
+
+    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, agy_bin=None, **env):
         lane_home = Path(self._tmp.name) / "loomuser"
         workdir = lane_home / "lanes"
         (lane_home / "tmp").mkdir(parents=True)
         workdir.mkdir()
         # agy's real state: config, and memory a previous run left behind.
-        (lane_home / ".gemini" / "config").mkdir(parents=True)
+        (lane_home / ".gemini" / "config").mkdir(parents=True, exist_ok=True)
         (lane_home / ".gemini" / "config" / "mcp_config.json").write_text("{}")
         (lane_home / ".gemini" / "antigravity-cli" / "brain").mkdir(parents=True)
         (lane_home / ".gemini" / "antigravity-cli" / "brain" / "planted.md").write_text("do evil next run")
         (lane_home / ".zshrc").write_text("# lane user shell\n")
         (lane_home / ".gemini" / "antigravity-cli" / "installation_id").write_text("install-1")
+        # The operator's sign-in trusted the work folder; an older file also
+        # carries a wider rule that no run may keep.
+        (lane_home / ".gemini" / "antigravity-cli" / "settings.json").write_text(json.dumps(
+            {"trustedWorkspaces": [str(workdir)], "permissions": {"allow": ["read_url(*)"]}, "toolPermission": "always-proceed"}))
         if cache_link is None:
             (lane_home / ".gemini" / "antigravity-cli" / "cache").mkdir()
         else:
@@ -932,7 +1164,7 @@ cat > /dev/null
             LOOM_AGY_RUNAS=str(runas),
             LOOM_AGY_HOME=str(lane_home),
             LOOM_AGY_WORKDIR=str(workdir),
-            LOOM_AGY_BIN=str(agy),
+            LOOM_AGY_BIN=str(agy_bin or agy),
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
             LOOM_AGY_MODEL=model,
@@ -964,11 +1196,12 @@ cat > /dev/null
         self.assertEqual(len(agy), 1, (calls, result.stderr))
         self.assertIn("-p # Brief: T042-fix-the-thing", agy[0])
         self.assertIn("--mode accept-edits", agy[0])
-        # Edits only: no shell commands (the lane user's keychain hands agy's
-        # token to /usr/bin/security without a prompt), no skill expansion.
+        # Shell commands come from settings rules, never from skipping
+        # permissions; no skill expansion. The brief says to run the tests.
         self.assertIn("--disable-slash-commands", agy[0])
         self.assertNotIn("--dangerously-skip-permissions", agy[0])
-        self.assertIn("shell commands are not available", agy[0])
+        self.assertNotIn("shell commands are not available", agy[0])
+        self.assertIn("run the repo's tests and lint with your shell tool", agy[0])
         self.assertIn("--model gemini-3.8-flash-high", agy[0])
         self.assertIn(f"cwd={workdir.resolve()}/T042-fix-the-thing", agy[0])
         # Nothing from a previous run reaches this one, and this run cannot
@@ -976,6 +1209,7 @@ cat > /dev/null
         self.assertIn("mem=clean", agy[0])
         self.assertIn("cfg=locked", agy[0])
         self.assertIn("rc=locked", agy[0])
+        self.assertIn("set=locked", agy[0])
         # Sign-in and install state survive the wipe; conversation lists do not.
         state = workdir.parent / ".gemini" / "antigravity-cli"
         self.assertEqual((state / "installation_id").read_text(), "install-1")
@@ -984,6 +1218,88 @@ cat > /dev/null
         # The wipe itself, checked on disk: the planted memory is gone.
         self.assertFalse((state / "brain" / "planted.md").exists())
         self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_rewrites_its_settings_to_allow_commands_and_deny_web_fetching(self):
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, result.stderr)
+        state = workdir.parent / ".gemini" / "antigravity-cli"
+        template = json.loads((RUNNER.parent / "agy" / "settings.json").read_text())
+        expected = {**template, "trustedWorkspaces": [str(workdir)]}
+        # What the run saw: the template's rules, the operator's trusted work
+        # folder kept, the older file's wider rule and other keys gone.
+        seen = json.loads((workdir.parent / "tmp" / "agy-settings-seen.json").read_text())
+        self.assertEqual(seen, expected)
+        self.assertIn("command(*)", seen["permissions"]["allow"])
+        self.assertIn("read_url(*)", seen["permissions"]["deny"])
+        self.assertNotIn("read_url(*)", seen["permissions"]["allow"])
+        # The file is restored after the run, whatever it did, and the
+        # sandbox kept the run from widening it in the first place.
+        self.assertEqual(json.loads((state / "settings.json").read_text()), expected)
+        self.assertFalse((state / ".settings.json.new").exists())
+        self.assertIn("set=locked", agy[0])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_fails_when_settings_restore_fails(self):
+        self.write_tool(self.bin / "sandbox-exec", "#!/usr/bin/env bash\nshift 2\nexec \"$@\"\n")
+        inbox, workdir, result, agy = self.agy_lane(FAKE_FAIL_AGY_SETTINGS_KEEP="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, result.stderr)
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("could not restore agy's settings", log)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_leaves_its_settings_alone_when_the_sandbox_cannot_be_built(self):
+        # The sandbox is built before the settings are written, so a run that
+        # never starts leaves no rewritten file without its restore.
+        lane_home = Path(self._tmp.name) / "loomuser"
+        lane_home.mkdir()
+        quoted = lane_home / 'a"gy'
+        quoted.symlink_to(lane_home / "agy")
+        inbox, workdir, result, agy = self.agy_lane(agy_bin=quoted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        state = workdir.parent / ".gemini" / "antigravity-cli"
+        self.assertEqual(json.loads((state / "settings.json").read_text())["permissions"], {"allow": ["read_url(*)"]})
+        self.assertFalse((state / ".settings.json.new").exists())
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("refusing sandbox: unsafe path", log)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_settings_never_write_through_a_link_left_in_their_place(self):
+        # A link at the scratch file's name would send the template into
+        # whatever it points at; the runner removes it and writes a fresh file.
+        victim = Path(self._tmp.name) / "victim.txt"
+        victim.write_text("keep")
+        state = Path(self._tmp.name) / "loomuser" / ".gemini" / "antigravity-cli"
+        state.mkdir(parents=True)
+        (state / ".settings.json.new").symlink_to(victim)
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertIn("command(*)", json.loads((state / "settings.json").read_text())["permissions"]["allow"])
+
+    def test_agy_lane_user_gets_the_skills_where_agy_reads_them_read_only(self):
+        self.operator_skills()
+        # A copy an earlier run left, read-only, is replaced, not merged.
+        stale = Path(self._tmp.name) / "loomuser" / ".gemini" / "config" / "skills" / "gone"
+        stale.mkdir(parents=True)
+        (stale / "SKILL.md").write_text("gone\n")
+        stale.chmod(0o555)
+        self.addCleanup(lambda: stale.exists() and stale.chmod(0o755))
+        inbox, workdir, result, agy = self.agy_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("skill=impeccable v1", agy[0])
+        self.assertIn("skillw=locked", agy[0])
+        copy = workdir.parent / ".gemini" / "config" / "skills"
+        self.assertEqual(sorted(p.name for p in copy.iterdir()), ["impeccable", "tdd"])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_agy_lane_is_unavailable_when_its_keychain_will_not_unlock(self):

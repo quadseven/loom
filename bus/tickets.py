@@ -132,6 +132,19 @@ def parse_fix(repo: str, body: Optional[str]) -> Fix:
     return Fix(int(m.group(2)), m.group(3), "\n".join(rest).strip("\n"))
 
 
+# How a fix brief's agent answers a finding it judges invalid. The runner
+# moves the folder out of the tree (lanes/run_lane.sh keep_answers) and the
+# station posts each answer on its thread (bus/station.py).
+ANSWER_NOTE = (
+    "A review thread whose finding is not valid against the current code can be "
+    "answered instead of fixed: write the reason, in a few plain sentences that "
+    "point at the code, to `.loom-answers/<thread id>.md` at the top of the tree "
+    "(the id after `### Thread`, for example `.loom-answers/PRRT_abc123.md`), and "
+    "change nothing for it. The runner posts each answer as the reply on its "
+    "thread and never commits that folder. An answer settles a medium or low "
+    "finding on a strong model's round; anything else still needs a fix.")
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                  fix: Optional[Fix] = None) -> str:
     number = int(issue["number"])
@@ -155,7 +168,12 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if fix:
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
-                 "need and keep the rest of the work.\n\n%s\n" % (fix.pr, fix.branch, fix.findings))
+                 "need and keep the rest of the work.\n\n%s\n\n"
+                 "You may also write .loom/replies.json as a JSON array of "
+                 "{\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
+                 "objects; the runner posts these after pushing and resolves threads marked "
+                 "true.\n\n%s\n"
+                 % (fix.pr, fix.branch, ANSWER_NOTE, fix.findings))
     return text
 
 
