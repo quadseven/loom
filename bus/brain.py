@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, token_from_env
+from .github import GitHub, GitHubError, _next_link, token_from_env
 from . import proof, text, tickets
 from .labels import LANES
 from .tickets import FIX_MARKER
@@ -24,6 +24,9 @@ DEFAULT_GOAL_CAP = 16
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
+TRIAGE_MARKER = "<!-- loom:triage v1 -->"
+HUMAN_MARKER = "<!-- loom:human v1 -->"
+TRIAGE_LIMIT = 25
 _check_written_text = text.check
 
 
@@ -169,7 +172,8 @@ def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
 
 
-def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
+def _goal_in_flight(gh: GitHub, repo: str, goal: int) -> int:
+    """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
     try:
         goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
     except GitHubError as exc:
@@ -179,8 +183,12 @@ def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
     if goal_issue.get("state") != "open" or "loom:goal" not in _labels(goal_issue):
         raise ValueError("goal must be an open loom:goal issue")
     children = gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
-    count = sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i)
-                and any(state in _labels(i) for state in IN_FLIGHT))
+    return sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i)
+               and any(state in _labels(i) for state in IN_FLIGHT))
+
+
+def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
+    count = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
     if count >= cap:
         raise ValueError("goal already has %d tickets in flight (cap %d)" % (count, cap))
@@ -197,11 +205,19 @@ def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
 def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
           model: Optional[str] = None, base: Optional[str] = None,
-          not_before: Optional[str] = None) -> str:
+          not_before: Optional[str] = None, refs: Optional[int] = None) -> str:
+    """File a ticket under the goal. With refs, the ticket is a rewrite of that
+    open issue: its body ends with "Refs #M", and the original gets a comment
+    naming the ticket and loom:rewritten in place of loom:triage. The original
+    is never closed, retitled or edited."""
     _check_brief_args(title, body, lane, model, base)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
+    if refs is not None:
+        body = body.rstrip("\n") + "\n\nRefs #%d\n" % refs
     _check_written_text(title + "\n" + body)
+    if refs is not None:
+        _check_rewritable(gh, repo, refs)
     _check_goal_capacity(gh, repo, goal)
     names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
     if lane:
@@ -211,7 +227,170 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         "labels": names}).data
     gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
             {"sub_issue_id": issue["id"]})
+    if refs is not None:
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
+                {"body": "%s\nRewritten as ticket #%d, which refs this issue. This issue "
+                         "stays open as it is." % (TRIAGE_MARKER, issue["number"])})
+        _remove_label(gh, repo, refs, "loom:triage")
+        gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
+                {"labels": ["loom:rewritten"]})
     return str(issue.get("html_url", ""))
+
+
+def _open_issue(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    if issue.get("state") != "open" or "pull_request" in issue:
+        raise ValueError("#%d is not an open issue" % number)
+    return issue
+
+
+def _check_rewritable(gh: GitHub, repo: str, number: int) -> None:
+    names = _labels(_open_issue(gh, repo, number))
+    if "loom:ticket" in names or "loom:rewritten" in names:
+        raise ValueError("#%d is already a ticket or already rewritten" % number)
+
+
+def _remove_label(gh: GitHub, repo: str, number: int, name: str) -> None:
+    gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s" % (repo, number, quote(name, safe="")),
+            ok=(404,))
+
+
+_HEADING = re.compile(r"##[ \t]+(.*?)[ \t#]*")
+_CHECKBOX = re.compile(r"[ \t]*[-*+][ \t]+\[[ xX]\][ \t]")
+
+
+def missing_sections(body: Optional[str]) -> List[str]:
+    """What an issue body lacks to be a ticket as it stands: the brief
+    sections by name, checkboxes under Acceptance criteria, and a body the
+    runner accepts. Empty when it is ready."""
+    found: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        m = _HEADING.fullmatch(line.rstrip())
+        if m:
+            current = m.group(1).strip().lower()
+            found.setdefault(current, [])
+        elif current is not None:
+            found[current].append(line)
+    names = [section[3:] for section in SECTIONS]
+    missing = [name for name in names if name.lower() not in found]
+    criteria = found.get("acceptance criteria")
+    if criteria is not None and not any(_CHECKBOX.match(line) for line in criteria):
+        missing.append("checkboxes under Acceptance criteria")
+    if not missing:
+        try:
+            tickets.parse(body)
+        except ValueError as exc:
+            missing.append("a body the runner accepts (%s)" % exc)
+    return missing
+
+
+def _is_epic(issue: Dict[str, Any]) -> bool:
+    summary = issue.get("sub_issues_summary") or {}
+    return ("epic" in [name.lower() for name in _labels(issue)]
+            or int(summary.get("total") or 0) > 0)
+
+
+def _triage_skip(issue: Dict[str, Any]) -> Optional[str]:
+    if "pull_request" in issue:
+        return "pull request"
+    names = _labels(issue)
+    if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
+        return "already labelled"
+    if _is_epic(issue):
+        return "epic"
+    return None
+
+
+def _oldest_open_issues(gh: GitHub, repo: str):
+    """Open issues and pull requests, oldest first, one page at a time, so a
+    run that reaches its limit early reads no further."""
+    url: Optional[str] = ("/repos/%s/issues?state=open&sort=created&direction=asc&per_page=100"
+                          % repo)
+    while url:
+        resp = gh.rest("GET", url)
+        for item in resp.data if isinstance(resp.data, list) else []:
+            yield item
+        url = _next_link(resp.headers.get("link", ""))
+
+
+def _triage_comment(missing: List[str]) -> str:
+    return ("%s\nLoom triage: this issue is not a ticket yet. Missing: %s.\n\n"
+            "The brain will write a ticket from it that refs this issue, or label it "
+            "loom:human if only a person can do it. This issue stays open as it is."
+            % (TRIAGE_MARKER, ", ".join(missing)))
+
+
+def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
+    """Label at most limit open issues that Loom has not seen, oldest first.
+
+    Skips pull requests, epics (an epic label or sub-issues), asks and
+    anything with a loom: label. A ready issue (every brief section,
+    checkboxes under Acceptance criteria) becomes a loom:queued ticket under
+    the goal, while the goal has room; the rest get loom:triage and one
+    comment naming what is missing. Only labels, sub-issue links and that
+    comment are written: an issue is never closed, retitled or edited.
+    Returns one line per issue looked at.
+    """
+    if limit < 1:
+        raise ValueError("limit is at least 1")
+    in_flight = _goal_in_flight(gh, repo, goal)
+    cap = goal_cap()
+    lines: List[str] = []
+    done = 0
+    for issue in _oldest_open_issues(gh, repo):
+        if done >= limit:
+            break
+        number = int(issue["number"])
+        skip = _triage_skip(issue)
+        if skip:
+            continue
+        missing = missing_sections(issue.get("body"))
+        if not missing:
+            if in_flight >= cap:
+                lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
+                             % (number, in_flight, cap))
+                continue
+            try:
+                gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
+                        {"sub_issue_id": issue["id"]})
+            except GitHubError as exc:
+                if exc.status != 422:
+                    raise
+                lines.append("#%d skipped: GitHub refused it as a sub-issue of #%d"
+                             % (number, goal))
+                continue
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": ["loom:ticket", "loom:queued"]})
+            in_flight += 1
+            lines.append("#%d queued under #%d" % (number, goal))
+        else:
+            comment = _triage_comment(missing)
+            _check_written_text(comment)
+            gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": ["loom:triage"]})
+            lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
+        done += 1
+    return lines
+
+
+def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
+    """Mark an open issue loom:human: only a person can do it. One comment
+    names the exact thing needed (money, hardware, an account, a credential,
+    a decision reserved for the operator); loom:triage, if any, comes off."""
+    ask = ask.strip()
+    if not ask:
+        raise ValueError("the ask must name the exact thing a person has to do")
+    _check_written_text(ask)
+    names = _labels(_open_issue(gh, repo, number))
+    if "loom:human" in names:
+        raise ValueError("#%d is already loom:human" % number)
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+            {"body": "%s\n%s" % (HUMAN_MARKER, ask)})
+    if "loom:triage" in names:
+        _remove_label(gh, repo, number, "loom:triage")
+    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})
 
 
 def _check_move_args(state: str, lane: Optional[str], note: Optional[str]) -> None:
@@ -609,7 +788,9 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before")
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--refs", type=int)
+    tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
+    hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
@@ -639,7 +820,17 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
-                args.lane, args.difficulty, args.model, args.base, args.not_before))
+                args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs))
+
+
+def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:
+    for line in triage(gh, _repo(args.repo), args.goal, args.limit):
+        print(line)
+
+
+def _cmd_human(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.issue, "issue")
+    human(gh, repo, number, _read(args.file))
 
 
 def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
@@ -671,7 +862,7 @@ def _cmd_fix(gh: GitHub, args: argparse.Namespace) -> None:
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
-            "fix": _cmd_fix}
+            "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

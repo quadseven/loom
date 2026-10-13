@@ -132,7 +132,23 @@ tickets and pull requests like any other work.
    and `brief --not-before` writes the line),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
-8. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
+8. Triage the backlog. For each backlog goal (the goal home of a repo whose
+   old issues Loom works on), run
+   `python3 -m bus.brain triage OWNER/NAME --goal N` (at most 25 issues a
+   run, oldest first). It skips pull requests, epics, asks and anything with
+   a `loom:` label; a ready issue (every brief section, checkboxes under
+   Acceptance criteria) becomes a `loom:queued` ticket under the goal, the
+   rest get `loom:triage` and a comment naming what is missing. Then take up
+   to 5 `loom:triage` issues and, for each, either write the ticket with
+   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
+   (M is the original; the ticket refs it, the original gets
+   `loom:rewritten` and stays open) or, when only a person can do it, run
+   `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
+   the exact thing needed: money, hardware, an account, a credential, or a
+   decision the goal home reserves for the operator. Never close an issue
+   or mark one done from triage: an old issue that looks finished stays
+   open for a person to close.
+9. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure.
@@ -155,9 +171,9 @@ tickets and pull requests like any other work.
    over adjectives. A goal home may ask for extra lines; add them after
    these. The station sends every report to the operator's phone, so it
    must stand on its own.
-9. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
-   failure as well.
-10. End the tick's chat reply in the same standup shape as the reports
+10. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
+    failure as well.
+11. End the tick's chat reply in the same standup shape as the reports
     (one sentence on how things are going, then going well, not going
     well, still stuck, next, needs you), across all goals. When the tick
     posted reports, the reply uses the same words, so the Muse app and
