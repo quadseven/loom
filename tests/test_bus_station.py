@@ -614,6 +614,17 @@ class FixTest(Base):
         self.assertEqual(again, station.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
+    def test_a_lane_explanation_is_redacted_of_credentials_before_it_is_posted(self):
+        self.failed_fix([
+            "I checked it. api_key=abc123 and Authorization: Bearer abcdefghijklmnop1234",
+            "also ghp_" + "a1B2c3D4e5F6g7H8i9J0 leaked, plus " + "x" * 40,
+            "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"])
+        said = self.fake.comments[99][0]["body"]
+        self.assertIn("I checked it.", said)
+        for secret in ("abc123", "abcdefghijklmnop1234", "ghp_", "x" * 32):
+            self.assertNotIn(secret, said)
+        self.assertIn("<redacted>", said)
+
     def test_a_plain_brief_with_no_commit_still_fails(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"],
