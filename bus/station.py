@@ -8,6 +8,7 @@ take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
 from __future__ import annotations
 
 import calendar
+from datetime import date, timedelta
 import errno
 import fcntl
 import fnmatch
@@ -25,6 +26,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
+from . import metrics
 from . import spend
 from . import text as _text
 from . import tickets
@@ -199,7 +201,8 @@ class Settings:
                  factory_on: bool = False,
                  review_check: str = factory.DEFAULT_REVIEW_CHECK,
                  review_bot: str = factory.DEFAULT_REVIEW_BOT,
-                 no_test_repos: Sequence[str] = ()) -> None:
+                 no_test_repos: Sequence[str] = (),
+                 metrics_goal: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -220,6 +223,7 @@ class Settings:
         self.review_check = review_check
         self.review_bot = review_bot
         self.no_test_repos = list(no_test_repos)
+        self.metrics_goal = metrics_goal
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -261,7 +265,8 @@ class Settings:
                                  or factory.DEFAULT_REVIEW_CHECK),
                    review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
                                or factory.DEFAULT_REVIEW_BOT),
-                   no_test_repos=words("LOOM_NO_TEST_REPOS"))
+                   no_test_repos=words("LOOM_NO_TEST_REPOS"),
+                   metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip())
 
 
 def _origin_repo() -> str:
@@ -776,7 +781,28 @@ class Station:
         free = [lane for lane in LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         if not free:
+            self._record_slot_sample(False)
             return
+        by_lane = self._claim_candidates(free)
+        for lane in free:
+            self._claim_for_lane(lane, by_lane[lane])
+        self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
+                                     for lane in free))
+
+    def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]]) -> None:
+        """Claim the oldest ticket for one free lane that can be claimed."""
+        # A regression fix (bus.brain brief --regresses) goes first.
+        cands = sorted(found, key=lambda c: (
+            REGRESSION not in _label_names(c[1]),
+            str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
+        for repo, issue in cands:
+            try:
+                if self._try_ticket(repo, lane, issue):
+                    return
+            except (GitHubError, OSError) as err:
+                _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
+
+    def _claim_candidates(self, free: List[str]) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
         by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {l: [] for l in free}
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
@@ -791,17 +817,15 @@ class Station:
                 lane = _lane_of(issue)
                 if lane in by_lane:
                     by_lane[lane].append((repo, issue))
-        for lane in free:
-            # A regression fix (bus.brain brief --regresses) goes first.
-            cands = sorted(by_lane[lane], key=lambda c: (
-                REGRESSION not in _label_names(c[1]),
-                str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
-            for repo, issue in cands:
-                try:
-                    if self._try_ticket(repo, lane, issue):
-                        break
-                except (GitHubError, OSError) as err:
-                    _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
+        return by_lane
+
+    def _record_slot_sample(self, idle: bool) -> None:
+        if not self.s.metrics_goal:
+            return
+        path = os.path.join(self.state, "slot-samples.jsonl")
+        os.makedirs(self.state, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"at": self.now, "idle": idle}) + "\n")
 
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         if self._skip_known(repo, issue):
@@ -2111,40 +2135,49 @@ class Station:
         state[key] = self.now
 
     def _overdue_standup_body(self, children: List[Any]) -> str:
-        children = [i for i in children if isinstance(i, dict)]
-        active = [i for i in children if i.get("state") == "open"
-                  and "loom:ticket" in [x.get("name") for x in i.get("labels", [])]]
-        failed = [i for i in active if "loom:failed" in
-                  [x.get("name") for x in i.get("labels", [])]]
-        aged_pr = [i for i in active if "loom:pr" in
-                   [x.get("name") for x in i.get("labels", [])]
-                   and (self._epoch(str(i.get("created_at") or "")) is not None)
-                   and self.now - self._epoch(str(i.get("created_at") or ""))
-                   > factory.STUCK_AGE]
-        in_flight = [i for i in active if any(x in
-                     [y.get("name") for y in i.get("labels", [])]
-                     for x in ("loom:queued", "loom:briefed", "loom:running", "loom:pr"))]
-        asks = [i for i in active if any(x in
-                [y.get("name") for y in i.get("labels", [])]
-                for x in (NEEDS_OPERATOR, HUMAN))]
-        merged = [i for i in children if "loom:merged" in
-                  [x.get("name") for x in i.get("labels", [])]]
-        verified = [i for i in children if "loom:verified" in
-                    [x.get("name") for x in i.get("labels", [])]]
-        sent_back = [i for i in children if "loom:shipped" in
-                     [x.get("name") for x in i.get("labels", [])]]
-
-        def rows(items: List[Dict[str, Any]]) -> str:
-            return ", ".join("#%s %s" % (i.get("number"),
-                " ".join(str(i.get("title") or "").split())) for i in items) or "none"
+        groups = self._standup_ticket_groups(children)
+        rows = self._standup_rows
 
         return "\n".join([REPORT_MARKER, "Written by the station from ticket data.",
             "", "### Going well", "Merged: %s. Verified: %s. Sent back: %s." %
-            (rows(merged), rows(verified), rows(sent_back)), "",
-            "### Not going well", "Failed: %s." % rows(failed), "",
-            "### Still stuck", "Past the stuck age in PR: %s." % rows(aged_pr), "",
-            "### Next", "In flight: %s." % rows(in_flight), "",
-            "### Needs you", "Open asks: %s." % rows(asks)])
+            (rows(groups["merged"]), rows(groups["verified"]),
+             rows(groups["sent_back"])), "",
+            "### Not going well", "Failed: %s." % rows(groups["failed"]), "",
+            "### Still stuck", "Past the stuck age in PR: %s." %
+            rows(groups["aged_pr"]), "",
+            "### Next", "In flight: %s." % rows(groups["in_flight"]), "",
+            "### Needs you", "Open asks: %s." % rows(groups["asks"])])
+
+    def _standup_ticket_groups(self, children: List[Any]) -> Dict[str, List[Dict[str, Any]]]:
+        groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
+            "merged", "verified", "sent_back", "failed", "aged_pr", "in_flight", "asks")}
+        for issue in children:
+            if not isinstance(issue, dict):
+                continue
+            labels = {label.get("name") for label in issue.get("labels", [])}
+            for label, group in (("loom:merged", "merged"),
+                                 ("loom:verified", "verified"),
+                                 ("loom:shipped", "sent_back")):
+                if label in labels:
+                    groups[group].append(issue)
+            if issue.get("state") != "open" or "loom:ticket" not in labels:
+                continue
+            if "loom:failed" in labels:
+                groups["failed"].append(issue)
+            if "loom:pr" in labels:
+                created = self._epoch(str(issue.get("created_at") or ""))
+                if created is not None and self.now - created > factory.STUCK_AGE:
+                    groups["aged_pr"].append(issue)
+            if labels.intersection(("loom:queued", "loom:briefed", "loom:running", "loom:pr")):
+                groups["in_flight"].append(issue)
+            if labels.intersection((NEEDS_OPERATOR, HUMAN)):
+                groups["asks"].append(issue)
+        return groups
+
+    @staticmethod
+    def _standup_rows(items: List[Dict[str, Any]]) -> str:
+        return ", ".join("#%s %s" % (issue.get("number"),
+            " ".join(str(issue.get("title") or "").split())) for issue in items) or "none"
 
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
@@ -2511,6 +2544,83 @@ class Station:
                         no_test_repos=self.s.no_test_repos,
                         available=[x for x in LANES if self._heartbeat_ok(x)]).run()
 
+    def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
+        dated = {}
+        allowed = {author.lower() for author in self.s.authors}
+        for comment in self.gh.paginate(path):
+            body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+            author = str((comment.get("user") or {}).get("login") or "").lower()
+            if author not in allowed:
+                continue
+            match = re.match(r"<!-- loom:metrics v1 -->\n(\d{4}-\d{2}-\d{2}): (\d)/9 pass; streak (\d+)", body)
+            if match:
+                dated[match.group(1)] = (int(match.group(2)), int(match.group(3)))
+        return dated
+
+    def _post_metrics_comment(self, path: str, today: str,
+                              dated: Dict[str, Tuple[int, int]]) -> None:
+        try:
+            numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
+                                        self.now, self.s.review_check,
+                                        self.s.authors).collect()
+        except (GitHubError, OSError) as err:
+            _say("metrics collection failed: %s" % err)
+            self._metrics_notice(today, "failure",
+                                 "Loom metrics %s: collection failed; retrying." % today)
+            return
+        passed = sum(value.passed for value in numbers)
+        yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+        streak = dated.get(yesterday, (0, 0))[1] + 1 if passed == 9 else 0
+        body = metrics.render(numbers, today, streak)
+        # Outside the try above: a refused POST reaches run_pass, which logs
+        # "post_metrics failed", and today stays unposted for the next pass.
+        self.gh.rest("POST", path, {"body": body})
+        dated[today] = (passed, streak)
+
+    def _metrics_notice(self, today: str, key: str, line: str) -> None:
+        ledger_path = os.path.join(self.state, "metrics.json")
+        ledger = _read_json(ledger_path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("metrics ledger is not an object")
+        if ledger.get(key) == today:
+            return
+        if self._bot_reports():
+            token = self._bot_token()
+            if token is None:
+                return
+            ok, _ = self._bot(token, "POST", "/channels/%s/messages" % self.s.channel_id,
+                              {"content": line, "allowed_mentions": {"parse": []}})
+        elif self.s.webhook_ssm:
+            url = self._webhook()
+            if url is None:
+                return
+            ok = self._send(url, line, mention=False)
+        else:
+            return
+        if ok:
+            ledger[key] = today
+            _write_json(ledger_path, ledger)
+
+    def post_metrics(self) -> None:
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)",
+                           self.s.metrics_goal)
+        if not ref or ref.group(1) not in self.s.repos:
+            return
+        today = time.strftime("%Y-%m-%d", time.localtime(self.now))
+        if time.localtime(self.now).tm_hour < self.s.digest_hour:
+            return
+        path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        # Read-then-post is safe: run() holds station.lock (flock) for the
+        # whole pass, so no second pass can read the same day's comments
+        # before this one has posted.
+        dated = self._dated_metrics(path)
+        if today not in dated:
+            self._post_metrics_comment(path, today, dated)
+        if today in dated:
+            passed, streak = dated[today]
+            line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
+            self._metrics_notice(today, "discord", line)
+
     def prune_trees(self) -> None:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
         or running) and that have not changed for TREE_KEEP seconds. A
@@ -2568,7 +2678,7 @@ class Station:
             _say("hand_back failed: %s" % err)
         self.claim_new()
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports,
+                     self.forward_reports, self.post_metrics,
                      self.watch_brain, self.relay_operator, self.run_factory,
                      self.prune_trees):
             try:

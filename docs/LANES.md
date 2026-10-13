@@ -214,6 +214,16 @@ a retry sends the same one; once sent, `covered` holds each ask's revision
 except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried
 on the next pass.
 
+Metrics: set `LOOM_METRICS_GOAL=owner/name#N` to name a goal home in
+`LOOM_REPOS`. Once a day after `LOOM_DIGEST_HOUR`, the station measures the
+last 24 hours, comments with `<!-- loom:metrics v1 -->`, and sends a short
+pass count and streak line to Discord. It samples idle slots on each pass
+and reads completed runs from `briefs/<lane>/done` and `failed`. The first
+day's slot sample may cover less than 24 hours; missing samples fail the
+spread target. Use the keys in `.env.example` as setup placeholders.
+The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
+its previous metrics comments can be trusted for the streak.
+
 Reports: the station also reads comments on open `loom:goal` issues in each
 `LOOM_REPOS` repo. On first run it records the newest report comment per repo
 without sending old reports; later `<!-- loom:report v1 -->` comments from

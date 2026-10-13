@@ -508,7 +508,8 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        self.assertEqual(self.run_pass().requests, 3)  # Reconciliation (2) and PR review polling (1) still run.
+        # Reconciliation, PR review polling, and the goal scan still run.
+        self.assertEqual(self.run_pass().requests, 4)
 
 
 class TicketsTest(unittest.TestCase):
@@ -2069,8 +2070,9 @@ class ReportsTest(Base):
         self.go(step=10)
         self.assertFalse(any("comments" in c[1] for c in self.fake.calls))
         self.go()
-        reads = [c[1] for c in self.fake.calls if "/issues/40/comments" in c[1]]
-        self.assertTrue(reads and all("since=" in r for r in reads))
+        reads = [c[1] for c in self.fake.calls if "/issues/40/comments" in c[1]
+                 and "since=" in c[1]]
+        self.assertTrue(reads)
 
     def prime(self, number=40):
         self.add_goal(number)
@@ -2159,6 +2161,8 @@ class ReportsTest(Base):
         self.add_goal()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
             time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        stuck_old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - station.factory.STUCK_AGE - 60))
         self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
         self.fake.comments[40][0]["created_at"] = old
         self.fake.sub_issues[40] = [
@@ -2166,6 +2170,16 @@ class ReportsTest(Base):
              "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]},
             {"number": 42, "title": "Open task", "state": "open",
              "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
+            {"number": 43, "title": "Verified task", "state": "closed",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]},
+            {"number": 44, "title": "Sent back task", "state": "closed",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]},
+            {"number": 45, "title": "Failed task", "state": "open",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]},
+            {"number": 46, "title": "Stuck task", "state": "open", "created_at": stuck_old,
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
+            {"number": 47, "title": "Decision task", "state": "open",
+             "labels": [{"name": "loom:ticket"}, {"name": station.NEEDS_OPERATOR}]},
         ]
         self.clock = time.time()
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -2179,8 +2193,11 @@ class ReportsTest(Base):
         for heading in ("### Going well", "### Not going well", "### Still stuck",
                         "### Next", "### Needs you"):
             self.assertIn(heading, body)
-        self.assertIn("#41 Merged task", body)
-        self.assertIn("#42 Open task", body)
+        for number, title in ((41, "Merged task"), (42, "Open task"),
+                              (43, "Verified task"), (44, "Sent back task"),
+                              (45, "Failed task"), (46, "Stuck task"),
+                              (47, "Decision task")):
+            self.assertIn("#%d %s" % (number, title), body)
         brain._check_written_text(body)
 
     def test_station_standup_says_nothing_in_flight_without_tickets(self):

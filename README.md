@@ -89,6 +89,9 @@ Briefs, logs and keys never go to GitHub: this repo is public.
    lane's key parameter in the environment (they go only into local launchd
    files): `bash lanes/mac/install.sh`. See docs/LANES.md.
 2. Give each project a goal home issue labelled `loom:goal`.
+   Set `LOOM_METRICS_GOAL=owner/name#N` to post the nine factory numbers on
+   Loom's goal home once a day after `LOOM_DIGEST_HOUR`. The station uses
+   `LOOM_REPOS` and its existing Discord bot or webhook configuration.
 3. Point a brain at it: the installed brain tick, or Muse with docs/MUSE.md.
 4. Test: `python -B -m unittest discover -s tests -v`.
 
