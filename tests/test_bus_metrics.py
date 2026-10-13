@@ -114,6 +114,10 @@ class MetricsTest(unittest.TestCase):
                                            "created_at": iso(NOW - 1000)})
                 self.assertFalse(self.numbers()[index].passed)
 
+    def test_check_runs_reply_without_a_body_counts_as_no_review(self):
+        self.gh.rest = lambda method, path, body=None: type("Response", (), {"data": None})()
+        self.assertFalse(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
+
     def _idle_slot(self):
         path = os.path.join(self.home, "state", "station", "slot-samples.jsonl")
         with open(path, "w") as fh:

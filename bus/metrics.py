@@ -102,6 +102,8 @@ class Collector:
         return max(found, default=0.0)
 
     def passes(self, repo: str, sha: str) -> bool:
+        # rest() returns a Response or raises GitHubError, never None; only
+        # .data can be None (an empty or non-JSON body), hence the dict check.
         data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs" % (repo, sha)).data
         checks = data.get("check_runs", []) if isinstance(data, dict) else []
         return any(c.get("name") == self.review_check for c in checks)
