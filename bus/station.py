@@ -2109,6 +2109,94 @@ class Station:
         ledger["_checked"] = self.now
         _write_json(path, ledger)
 
+    def post_overdue_standups(self) -> None:
+        """Post a data-only report when an open goal has gone overdue."""
+        now = brain.datetime.fromtimestamp(self.now, brain.timezone.utc)
+        authors = [a.lower() for a in self.s.authors]
+        state_path = os.path.join(self.state, "standups.json")
+        state = _read_json(state_path, {})
+        if not isinstance(state, dict):
+            raise StateError("state file %s does not hold an object" % state_path)
+        checked = state.get("_checked")
+        if isinstance(checked, (int, float)) and not isinstance(checked, bool) \
+                and 0 <= self.now - checked < REPORT_CHECK:
+            return
+        state["_checked"] = self.now
+        for repo, goal in self._goal_homes():
+            self._post_overdue_goal_standup(repo, goal, state, authors, now)
+        _write_json(state_path, state)
+
+    def _post_overdue_goal_standup(self, repo: str, goal: Dict[str, Any],
+                                   state: Dict[str, Any], authors: List[str],
+                                   now: Any) -> None:
+        number = int(goal["number"])
+        key = "%s#%d" % (repo, number)
+        sent = state.get(key)
+        if isinstance(sent, (int, float)) and not isinstance(sent, bool) \
+                and 0 <= self.now - sent < brain.REPORT_EVERY:
+            return
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" %
+                                    (repo, number))
+        node = {"comments": {"nodes": [
+            {"body": c.get("body"), "createdAt": c.get("created_at"),
+             "author": {"login": tickets._login(c.get("user"))}}
+            for c in comments if isinstance(c, dict)]}}
+        ledger = brain.goal_ledger(goal, node, now, authors)
+        if ledger["state"] != "overdue":
+            return
+        children = self.gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" %
+                                    (repo, number))
+        body = self._overdue_standup_body(children)
+        brain._check_written_text(body)
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                     {"body": body})
+        state[key] = self.now
+
+    def _overdue_standup_body(self, children: List[Any]) -> str:
+        groups = self._standup_ticket_groups(children)
+        rows = self._standup_rows
+
+        return "\n".join([REPORT_MARKER, "Written by the station from ticket data.",
+            "", "### Going well", "Merged: %s. Verified: %s. Sent back: %s." %
+            (rows(groups["merged"]), rows(groups["verified"]),
+             rows(groups["sent_back"])), "",
+            "### Not going well", "Failed: %s." % rows(groups["failed"]), "",
+            "### Still stuck", "Past the stuck age in PR: %s." %
+            rows(groups["aged_pr"]), "",
+            "### Next", "In flight: %s." % rows(groups["in_flight"]), "",
+            "### Needs you", "Open asks: %s." % rows(groups["asks"])])
+
+    def _standup_ticket_groups(self, children: List[Any]) -> Dict[str, List[Dict[str, Any]]]:
+        groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
+            "merged", "verified", "sent_back", "failed", "aged_pr", "in_flight", "asks")}
+        for issue in children:
+            if not isinstance(issue, dict):
+                continue
+            labels = {label.get("name") for label in issue.get("labels", [])}
+            for label, group in (("loom:merged", "merged"),
+                                 ("loom:verified", "verified"),
+                                 ("loom:shipped", "sent_back")):
+                if label in labels:
+                    groups[group].append(issue)
+            if issue.get("state") != "open" or "loom:ticket" not in labels:
+                continue
+            if "loom:failed" in labels:
+                groups["failed"].append(issue)
+            if "loom:pr" in labels:
+                created = self._epoch(str(issue.get("created_at") or ""))
+                if created is not None and self.now - created > factory.STUCK_AGE:
+                    groups["aged_pr"].append(issue)
+            if labels.intersection(("loom:queued", "loom:briefed", "loom:running", "loom:pr")):
+                groups["in_flight"].append(issue)
+            if labels.intersection((NEEDS_OPERATOR, HUMAN)):
+                groups["asks"].append(issue)
+        return groups
+
+    @staticmethod
+    def _standup_rows(items: List[Dict[str, Any]]) -> str:
+        return ", ".join("#%s %s" % (issue.get("number"),
+            " ".join(str(issue.get("title") or "").split())) for issue in items) or "none"
+
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
         """The last brain tick (lanes/mac/brain.sh) and when a tick last ended
@@ -2607,8 +2695,8 @@ class Station:
         except (GitHubError, OSError, ValueError) as err:
             _say("hand_back failed: %s" % err)
         self.claim_new()
-        for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
-                     self.post_metrics,
+        for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+                     self.forward_reports, self.post_metrics,
                      self.watch_brain, self.relay_operator, self.run_factory,
                      self.prune_trees):
             try:
