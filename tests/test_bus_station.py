@@ -238,8 +238,7 @@ class ReconcilePullRequestTest(Base):
 
         gh = GitHub("token", transport=transport)
         runner = station.Station(gh, self.settings)
-        with self.assertRaises(station.GitHubError):
-            runner.reconcile_pull_requests()
+        runner.reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
         runner.reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
@@ -248,6 +247,16 @@ class ReconcilePullRequestTest(Base):
         puts = len([call for call in self.fake.calls if call[0] == "PUT"])
         runner.reconcile_pull_requests()
         self.assertEqual(puts, len([call for call in self.fake.calls if call[0] == "PUT"]))
+
+    def test_a_failed_fetch_is_logged_and_the_pass_survives(self):
+        self.fake.add(12, state="pr")
+
+        def transport(method, url, headers, body):
+            raise station.GitHubError("server error", 500)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
 
     def test_closed_unmerged_pr_gets_distinct_disposition(self):
         self.fake.add(12, state="pr")

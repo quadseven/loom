@@ -659,19 +659,26 @@ class Station:
                      {"labels": kept})
         ticket["labels"] = [{"name": name} for name in kept]
 
+    def _reconcile_repo(self, repo: str) -> None:
+        issues = self.gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Apr" % repo)
+        tickets_by_number = {int(i["number"]): i for i in issues
+                             if "loom:ticket" in _label_names(i)}
+        for pr in self.gh.paginate("/repos/%s/pulls?state=all" % repo):
+            if isinstance(pr, dict):
+                self._reconcile_pr_ticket(repo, pr, tickets_by_number)
+
     def reconcile_pull_requests(self) -> None:
-        """Repair ticket state from the PR's authoritative terminal state."""
+        """Repair ticket state from the PR's authoritative terminal state.
+
+        A GitHub failure on one repo is logged and the pass moves on; the
+        next pass retries, since the repair is idempotent."""
         for repo in self.s.repos:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
                 continue
-            issues = self.gh.paginate(
-                "/repos/%s/issues?state=open&labels=loom%%3Apr" % repo)
-            tickets_by_number = {int(i["number"]): i for i in issues
-                                 if "loom:ticket" in _label_names(i)}
-            prs = self.gh.paginate("/repos/%s/pulls?state=all" % repo)
-            for pr in prs:
-                if isinstance(pr, dict):
-                    self._reconcile_pr_ticket(repo, pr, tickets_by_number)
+            try:
+                self._reconcile_repo(repo)
+            except (GitHubError, OSError) as err:
+                _say("could not reconcile pull requests for %s: %s" % (repo, err))
 
     def _field(self, text: str, name: str) -> str:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
