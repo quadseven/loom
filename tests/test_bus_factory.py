@@ -36,6 +36,7 @@ class FakeGitHub:
         self.behind = {}
         self.attempts = {}
         self.update_status = 202
+        self.files = {}
 
     def ticket(self, number, state, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
         self.issues[number] = {"number": number, "state": "open", "body": body, "user": ME,
@@ -46,8 +47,9 @@ class FakeGitHub:
 
     def pull(self, number, ticket, created=3600, mergeable=True, green=True,
              resolved=True, runs=(("unittest", "completed"), (factory.DEFAULT_REVIEW_CHECK, "completed")),
-             updated=3600):
+             updated=3600, files=("bus/a.py", "tests/test_a.py")):
         sha = "sha%d" % number
+        self.files[number] = list(files)
         self.pulls[number] = {
             "number": number, "state": "open", "draft": False, "body": "", "user": ME,
             "head": {"ref": "loom/%d-some-title" % ticket, "sha": sha,
@@ -83,6 +85,11 @@ class FakeGitHub:
             m = re.search(r"/pulls/(\d+)$", path)
             if m:
                 return Response(200, self.pulls[int(m.group(1))])
+            m = re.search(r"/pulls/(\d+)/files\?per_page=100&page=(\d+)$", path)
+            if m:
+                page = int(m.group(2))
+                names = self.files[int(m.group(1))][(page - 1) * 100:page * 100]
+                return Response(200, [{"filename": n} for n in names])
             m = re.search(r"/commits/(\w+)/check-runs", path)
             if m:
                 return Response(200, {"check_runs": self.runs[m.group(1)]})
@@ -127,15 +134,17 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved = [], [], []
 
-    def go(self, limited=()):
+    def go(self, limited=(), no_test_repos=()):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes):
+            f.notes = notes
             self.fixed.append((number, ticket, gh.issues[ticket[1]]["labels"][:]))
         def move(gh, repo, number, state, lane=None, note=None):
             self.moved.append((number, state, lane))
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
-                            merge=merge, fix=fix, move=move, limited=limited)
+                            merge=merge, fix=fix, move=move, limited=limited,
+                            no_test_repos=no_test_repos)
         f.run()
         return f
 
@@ -154,6 +163,62 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [(50, (REPO, 5))])
         self.assertEqual(self.fixed, [])
+
+    def test_code_without_a_test_goes_back_for_a_failing_test(self):
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.pull(50, 5, files=("src/app.css", "README.md"))
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertIn("fails without the change", f.notes)
+        # A finding round: the first one stays on its lane.
+        self.assertEqual((self.lane(5), factory.rung_of(self.gh.comments[5])), ("codex", 0))
+
+    def test_a_second_round_still_without_a_test_climbs(self):
+        self.gh.ticket(5, "pr", lane="opencode-go")
+        self.gh.comments[5].append({"body": FIX_MARKER + "\n\n" + factory.TEST_NOTES, "user": ME})
+        self.gh.pull(50, 5, files=("src/main.cpp",))
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_code_with_a_test_on_a_later_page_lands(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, files=["src/m%d.go" % n for n in range(150)] + ["src/m_test.go"])
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_doc_and_config_only_changes_land_without_a_test(self):
+        for number, files in ((50, ("README.md", "docs/x.md")),
+                              (51, (".github/workflows/ci.yml", "config.json", "Dockerfile"))):
+            self.setUp()
+            self.gh.ticket(5, "pr")
+            self.gh.pull(number, 5, files=files)
+            self.go()
+            self.assertEqual(self.merged, [(number, (REPO, 5))], files)
+
+    def test_an_opted_out_repo_lands_code_without_a_test(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, files=("src/a.lua",))
+        self.go(no_test_repos=[REPO.upper()])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_ticket_marked_tests_none_needed_lands_code_without_a_test(self):
+        self.gh.ticket(5, "pr", body="Difficulty: medium\nTests: none needed (style only)\n\n## Why\nx\n")
+        self.gh.pull(50, 5, files=("src/a.css",))
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_what_counts_as_code_and_as_a_test(self):
+        for path in ("a/b.PY", "x.tsx", "m.hpp", "q.sql", "run.sh"):
+            self.assertTrue(factory.is_code(path), path)
+        for path in ("README.md", "a.yml", "a.json", "Makefile"):
+            self.assertFalse(factory.is_code(path), path)
+        for path in ("tests/x.py", "src/test/Foo.cpp", "test_x.py", "x_test.go",
+                     "a.test.ts", "a.spec.js"):
+            self.assertTrue(factory.is_test(path), path)
+        for path in ("src/latest.py", "src/latest_x.py", "contest/a.py", "testing.py"):
+            self.assertFalse(factory.is_test(path), path)
 
     def test_it_waits_while_a_check_runs(self):
         self.gh.ticket(5, "pr")
@@ -618,14 +683,19 @@ class Helpers(unittest.TestCase):
         on = station.Settings.from_env({})
         self.assertTrue(on.factory_on)
         self.assertEqual(on.review_check, factory.DEFAULT_REVIEW_CHECK)
+        self.assertEqual(on.no_test_repos, [])
+        self.assertEqual(station.Settings.from_env(
+            {"LOOM_NO_TEST_REPOS": "a/b c/d"}).no_test_repos, ["a/b", "c/d"])
 
 
     def test_the_station_runs_the_factory_when_on_and_throttles_it(self):
         calls = []
 
         class Fake:
-            def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None):
-                calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited)))
+            def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
+                         no_test_repos=()):
+                calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
+                              tuple(no_test_repos)))
 
             def run(self):
                 calls.append("ran")
@@ -635,7 +705,8 @@ class Helpers(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as home:
                 settings = station.Settings(home, [REPO, "not a repo"], ["alice-example"], [],
-                                            factory_on=True, review_check="Review")
+                                            factory_on=True, review_check="Review",
+                                            no_test_repos=["example-org/no-tests"])
                 st = station.Station(FakeGitHub(), settings, now=NOW)
                 os.makedirs(st.state, exist_ok=True)
                 st.run_factory()
@@ -645,7 +716,8 @@ class Helpers(unittest.TestCase):
                 st.run_factory()
         finally:
             factory.Factory = real
-        self.assertEqual(calls, [((REPO,), ("alice-example",), "Review", ()), "ran"])
+        self.assertEqual(calls, [((REPO,), ("alice-example",), "Review", (),
+                                  ("example-org/no-tests",)), "ran"])
 
 
 if __name__ == "__main__":
