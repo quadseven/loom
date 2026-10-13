@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import calendar
+import contextlib
 import fcntl
+import io
 import json
 import os
 import re
@@ -50,8 +52,18 @@ class FakeGitHub:
         self.edits = []
         self.posts = []
         self.asks = []
+        self.humans = []
+        self.digest_issues = []
+        self.pages = []
+        self.page_error = False
+        self.page_reply = None
         self.goals = []
         self.goal_error = False
+        self.private = True
+        self.threads = {}
+        self.reply_fails = set()
+        self.replies = []
+        self.resolved = []
 
     def add_goal(self, number, journals=()):
         """journals: (login, age in seconds) pairs, posted as journal comments."""
@@ -68,12 +80,22 @@ class FakeGitHub:
         return reply(200, self.asks, {"ETag": etag})
 
     def add_ask(self, number, title="Need a decision", author="alice-example",
-                labeller="alice-example", urgent=False):
+                labeller="alice-example", urgent=False, body="", created="2030-01-01T00:00:00Z"):
         labels = [{"name": "needs-operator"}] + ([{"name": "loom:urgent"}] if urgent else [])
         self.asks.append({"number": number, "title": title, "user": {"login": author},
-                          "labels": labels, "created_at": "2030-01-01T00:00:00Z",
+                          "labels": labels, "created_at": created, "body": body,
                           "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
         self.events[number] = [labeled("needs-operator", labeller)]
+
+    def add_human(self, number, title="Buy the domain", ask="Buy it.", author="alice-example",
+                created="2030-01-01T00:00:00Z", extra=()):
+        """An open loom:human issue with the brain's ask comment by author."""
+        self.humans.append({"number": number, "title": title, "user": {"login": author},
+                            "labels": [{"name": "loom:human"}] + [{"name": x} for x in extra],
+                            "created_at": created,
+                            "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
+        self.comments[number] = [{"body": "<!-- loom:human v1 -->\n%s" % ask,
+                                  "user": {"login": author}}] if ask else []
 
     def add(self, number, title="Fix the thing", lane="codex", body=BODY,
             author="alice-example", created="2030-01-01T00:00:00Z",
@@ -106,7 +128,11 @@ class FakeGitHub:
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
+        if method == "GET" and parts.path == "/repos/%s" % REPO:
+            return reply(200, {"full_name": REPO, "private": self.private})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
+        if rest == "issues/900/comments" and method == "POST":
+            return self._post_page(data)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
@@ -117,21 +143,21 @@ class FakeGitHub:
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
 
+    def _post_page(self, data):
+        if self.page_error:
+            return reply(502, {"message": "down"})
+        self.pages.append(data["body"])
+        n = len(self.pages)
+        made = {"id": n, "html_url": "https://github.com/%s/issues/900#issuecomment-%d" % (REPO, n)}
+        return reply(201, self.page_reply if self.page_reply is not None else made)
+
     def _issues_and_status(self, method, rest, query, headers, data):
         if method == "GET" and rest == "issues":
-            if "needs-operator" in query:
-                return self._list_asks(headers)
-            if "loom:goal" in query:
-                if self.goal_error:
-                    return reply(500, {"message": "down"})
-                if self.goals:
-                    return reply(200, self.goals)
-                return reply(200, [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
-                                   for i in self.issues.values() if i["state"] == "open"
-                                   and "loom:goal" in self.names(i["number"])])
-            if "loom:lanes" in query:
-                return reply(200, self.lanes_issues)
-            return self._list_briefed(headers)
+            return self._get_issues(query, headers)
+        if method == "POST" and rest == "issues" and data["labels"] == ["loom:digest"]:
+            self.created.append(data)
+            self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
+            return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
@@ -145,7 +171,44 @@ class FakeGitHub:
         self.posts.append(data["body"])
         return reply(201, {"id": 77})
 
+    def _get_issues(self, query, headers):
+        if "labels=loom%3Apr" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:pr" in self.names(i["number"])])
+        if "needs-operator" in query:
+            return self._list_asks(headers)
+        if "loom:human" in query:
+            return reply(200, self.humans)
+        if "loom:goal" in query:
+            return self._get_goals()
+        if "loom:lanes" in query:
+            return reply(200, self.lanes_issues)
+        if "loom:digest" in query:
+            return reply(200, self.digest_issues)
+        return self._list_briefed(headers)
+
+    def _get_goals(self):
+        if self.goal_error:
+            return reply(500, {"message": "down"})
+        if self.goals:
+            return reply(200, self.goals)
+        found = [dict(i, html_url="https://github.com/%s/issues/%d" % (REPO, i["number"]))
+                 for i in self.issues.values() if i["state"] == "open"
+                 and "loom:goal" in self.names(i["number"])]
+        return reply(200, found)
+
     def _graphql(self, data):
+        query, variables = data["query"], data.get("variables") or {}
+        if "addPullRequestReviewThreadReply" in query:
+            if variables["id"] in self.reply_fails:
+                return reply(502, {"message": "bad gateway"})
+            self.replies.append((variables["id"], variables["body"]))
+            return reply(200, {"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "c"}}}})
+        if "resolveReviewThread" in query:
+            self.resolved.append(variables["id"])
+            return reply(200, {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}})
+        if "PullRequestReviewThread" in query:
+            return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
         editor = self.editors[data["variables"]["number"]]
         return reply(200, {"data": {"repository": {"issue": {
             "editor": {"login": editor} if editor and editor != "<ghost>" else None,
@@ -171,6 +234,9 @@ class FakeGitHub:
             self.comments[n].append({"body": data["body"]})
             return reply(201, {})
         if method == "PUT" and sub == "labels":
+            # The station's own login, which is on the brief authors list.
+            old = set(self.names(n))
+            self.events[n] += [labeled(x, "alice-example") for x in data["labels"] if x not in old]
             self.issues[n]["labels"] = [{"name": x} for x in data["labels"]]
             self.version += 1
             return reply(200, [])
@@ -213,6 +279,218 @@ class Base(unittest.TestCase):
             return []
 
 
+class ReconcilePullRequestTest(Base):
+    def test_merged_pr_repairs_failed_ticket_label_once(self):
+        self.fake.add(12, state="pr")
+        # The list endpoint reconciliation reads returns merged_at, never merged.
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        failed = [False]
+
+        def transport(method, url, headers, body):
+            if method == "PUT" and url.endswith("/issues/12/labels") and not failed[0]:
+                failed[0] = True
+                raise station.GitHubError("temporary failure", 500)
+            return self.fake(method, url, headers, body)
+
+        gh = GitHub("token", transport=transport)
+        runner = station.Station(gh, self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:verified", self.fake.names(12))
+        puts = len([call for call in self.fake.calls if call[0] == "PUT"])
+        runner.reconcile_pull_requests()
+        self.assertEqual(puts, len([call for call in self.fake.calls if call[0] == "PUT"]))
+
+    def test_a_failed_issues_fetch_is_logged_and_the_pass_survives(self):
+        self.fake.add(12, state="pr")
+
+        def transport(method, url, headers, body):
+            raise station.GitHubError("server error", 500)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_a_failed_pulls_fetch_is_logged_and_the_pass_survives(self):
+        self.fake.add(12, state="pr")
+
+        def transport(method, url, headers, body):
+            if "/pulls?" in url:
+                raise station.GitHubError("server error", 500)
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_closed_unmerged_pr_gets_distinct_disposition(self):
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": None,
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:closed-unmerged", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
+
+class ReviewFake:
+    def __init__(self):
+        self.api = "https://api.github.com"
+        self.issue = {"number": 12, "state": "open", "body": "", "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:pr"}, {"name": "lane:codex"}]}
+        self.pr = {"number": 7, "body": "Refs %s#12" % REPO,
+                   "head": {"ref": "loom/12-fix", "sha": "a" * 40}}
+        self.check_runs = [{"status": "completed", "conclusion": "success"}]
+        self.statuses = []
+        self.comments = []
+        self.writes = []
+
+    def rest(self, method, path, data=None):
+        # Writes are only accepted at the exact ticket paths; any other PUT or POST
+        # falls through to the AssertionError below, so a wrong path fails the test.
+        if method == "GET":
+            response = self._get(path)
+            if response is not None:
+                return response
+        if method == "PUT" and path == "/repos/%s/issues/12/labels" % REPO:
+            return self._put_labels(data)
+        if method == "POST" and path == "/repos/%s/issues/12/comments" % REPO:
+            return self._post_comment(data)
+        if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO):
+            return self._patch_comment(int(path.rsplit("/", 1)[1]), data)
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def _put_labels(self, data):
+        self.issue["labels"] = [{"name": x} for x in data["labels"]]
+        self.writes.append(("PUT", "/repos/%s/issues/12/labels" % REPO, data))
+        return mock.Mock(data=[])
+
+    def _post_comment(self, data):
+        self.comments.append({"id": len(self.comments) + 1, "body": data["body"],
+                              "user": {"login": "alice-example"}})
+        return mock.Mock(data={})
+
+    def _patch_comment(self, comment_id, data):
+        comment = next(c for c in self.comments if c.get("id") == comment_id)
+        comment["body"] = data["body"]
+        return mock.Mock(data={})
+
+    def _get(self, path):
+        if path.startswith("/repos/%s/issues?labels=loom:pr" % REPO):
+            return mock.Mock(data=[dict(self.issue)])
+        if path.startswith("/repos/%s/pulls?" % REPO):
+            return mock.Mock(data=[self.pr])
+        if path == "/repos/%s/pulls/7" % REPO:
+            return mock.Mock(data=self.pr)
+        if path.endswith("/check-runs?per_page=100"):
+            return mock.Mock(data={"check_runs": self.check_runs})
+        if path.endswith("/status"):
+            return mock.Mock(data={"statuses": self.statuses})
+        if path == "/repos/%s/issues/12" % REPO:
+            return mock.Mock(data=self.issue)
+        return None
+
+    def paginate(self, path):
+        if path == "/repos/%s/issues/12/comments" % REPO:
+            return self.comments
+        raise AssertionError(path)
+
+
+class HandBackTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = ReviewFake()
+        self.station = station.Station(self.gh, station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS))
+
+    def run_hand_back(self, checks=None, threads=None):
+        with mock.patch("bus.brain._failing_checks", return_value=checks or []), \
+             mock.patch("bus.brain._open_threads", return_value=threads or []):
+            self.station.hand_back()
+
+    def test_review_fake_rejects_writes_to_other_ticket_paths(self):
+        for method, suffix, data in (("PUT", "labels", {"labels": []}),
+                                     ("POST", "comments", {"body": "reply"})):
+            with self.subTest(method=method):
+                with self.assertRaises(AssertionError):
+                    self.gh.rest(method, "/repos/%s/issues/13/%s" % (REPO, suffix), data)
+
+    def test_failed_check_is_sent_back_to_its_lane(self):
+        self.run_hand_back(checks=[("lint", "last log line")])
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertIn("last log line", self.gh.comments[0]["body"])
+
+    def test_a_huge_findings_list_is_truncated_below_the_comment_limit(self):
+        self.run_hand_back(checks=[("lint", "x" * 200000)])
+        body = self.gh.comments[0]["body"]
+        self.assertLess(len(body), 65536)
+        self.assertIn("loom:fix-head " + "a" * 40, body)
+
+    def test_unresolved_review_bot_thread_is_sent_back(self):
+        thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
+                  "comments": {"nodes": [{"databaseId": 9, "body": "change this",
+                                             "author": {"login": "grug-tribe[bot]"}}]}}
+        self.run_hand_back(threads=[thread])
+        self.assertIn("PRRT_fake", self.gh.comments[0]["body"])
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_unresolved_thread_not_started_by_the_review_bot_is_ignored(self):
+        thread = {"id": "PRRT_user", "path": "a.py", "line": 4,
+                  "comments": {"nodes": [{"databaseId": 9, "body": "ignore this",
+                                             "author": {"login": "someone-else"}}]}}
+        self.run_hand_back(threads=[thread])
+        self.assertEqual(self.gh.comments[-1]["body"], "<!-- loom:ready-head %s -->" % ("a" * 40))
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_fix_pending_for_current_head_is_not_handed_back_twice(self):
+        self.gh.issue["labels"].append({"name": "loom:running"})
+        self.gh.comments.append({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head " + "a" * 40 + " -->"})
+        self.run_hand_back(checks=[("lint", "failed")])
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_fix_round_cap_adds_needs_brain(self):
+        self.gh.comments.extend({"user": {"login": "alice-example"},
+                                 "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
+                                for i in range(1, 4))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(len(self.gh.comments), 3)
+
+    def test_markerless_fix_comments_do_not_consume_rounds(self):
+        self.gh.comments.extend({"user": {"login": "alice-example"}, "body": tickets.FIX_MARKER}
+                                for _ in range(3))
+        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": "3"}):
+            self.run_hand_back(checks=[("lint", "failed")])
+        self.assertNotIn("needs-brain", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertEqual(len(self.gh.comments), 4)
+
+    def test_clean_pr_gets_ready_and_a_new_head_removes_it_while_checks_run(self):
+        self.run_hand_back()
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+        self.gh.pr["head"]["sha"] = "b" * 40
+        self.gh.check_runs = [{"status": "in_progress"}]
+        self.run_hand_back()
+        self.assertNotIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_each_new_clean_head_edits_the_one_ready_marker(self):
+        self.run_hand_back()
+        self.gh.pr["head"]["sha"] = "b" * 40
+        self.run_hand_back()
+        self.assertEqual([c["body"] for c in self.gh.comments],
+                         ["<!-- loom:ready-head %s -->" % ("b" * 40)])
+        self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+
 class CorruptStateTest(Base):
     def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
         self.fake.add(12, state="running")
@@ -227,7 +505,7 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        self.assertEqual(self.run_pass().requests, 0)
+        self.assertEqual(self.run_pass().requests, 3)  # Reconciliation (2) and PR review polling (1) still run.
 
 
 class TicketsTest(unittest.TestCase):
@@ -363,6 +641,14 @@ class ClaimTest(Base):
         self.assertEqual(self.listing(), ["example-owner.example-repo-7.md"])
         self.assertIn("loom:briefed", self.fake.names(5))
 
+    def test_a_regression_ticket_is_claimed_before_older_ordinary_ones(self):
+        self.fake.add(7, created="2030-01-01T00:00:00Z")
+        self.fake.add(9, created="2030-01-03T00:00:00Z")
+        self.fake.issues[9]["labels"].append({"name": "loom:regression"})
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+        self.assertIn("loom:briefed", self.fake.names(7))
+
     def test_a_retry_after_failure_gets_a_fresh_branch(self):
         self.fake.add(12)
         self.fake.comments[12].append({"body": "Claimed for lane codex (body sha256 0123456789ab)"})
@@ -371,13 +657,30 @@ class ClaimTest(Base):
         with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
             self.assertIn("Branch: loom/12-fix-the-thing-r2\n", fh.read())
 
-    def test_a_second_pass_after_a_304_makes_one_call(self):
+    def test_a_ticket_whose_newest_brief_is_still_in_a_lane_inbox_is_not_claimed_again(self):
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane claude (body sha256 0123456789ab)"})
+        # The first claim's run has not ended: its brief waits or runs on claude.
+        self.write(self.inbox("claude", "example-owner.example-repo-12.md"), "running\n")
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.fake.paths("PUT"), [])
+        self.assertEqual(len(self.fake.comments[12]), 1)
+        self.assertIn("loom:briefed", self.fake.names(12))
+        # Once that run has ended, the next pass claims it.
+        os.makedirs(self.inbox("claude", "failed"))
+        os.replace(self.inbox("claude", "example-owner.example-repo-12.md"),
+                   self.inbox("claude", "failed", "example-owner.example-repo-12.md"))
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12-r2.md"])
+
+    def test_a_second_pass_after_a_304_also_polls_for_pr_reviews(self):
         self.fake.add(12, author="stranger")
         self.run_pass()
         first = len(self.fake.calls)
         gh = self.run_pass()
-        self.assertEqual(len(self.fake.calls), first + 1)
-        self.assertEqual(gh.requests, 1)
+        self.assertEqual(len(self.fake.calls), first + 5)
+        self.assertEqual(gh.requests, 5)  # Includes the reconciliation and PR review polls.
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
     def test_a_304_reuses_the_stored_list(self):
@@ -580,7 +883,8 @@ class FixTest(Base):
         self.assertEqual([c["body"] for c in self.fake.comments[12]],
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
 
     def failed_fix(self, log_lines, fix_body=FIX_BODY):
         self.fake.add(12, state="running")
@@ -608,6 +912,24 @@ class FixTest(Base):
         self.assertEqual(again, station.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
+    def test_a_fix_with_nothing_to_change_is_recognised_under_its_failure_class(self):
+        self.failed_fix([
+            "[2030-01-01T00:01:00Z] x failed: [work] agent made no commit on loom/12-fix-the-thing"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.fake.comments[99][-1]["body"], station.REVIEW_AGAIN)
+    def test_a_fix_whose_branch_moved_goes_back_to_its_pull_request_not_a_failure(self):
+        self.failed_fix([
+            "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: branch moved: "
+            "loom/12-fix-the-thing is at 0123456789ab on the remote, not ba9876543210 as when "
+            "the run started"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        body = self.fake.comments[12][-1]["body"]
+        self.assertIn("Lane codex did not push its fix to #99: the branch moved during the run "
+                      "(branch moved: loom/12-fix-the-thing is at 0123456789ab", body)
+        self.assertIn("not a failure", body)
+        self.assertNotIn("failed", body)
+        self.assertEqual(self.fake.comments[99], [])
+
     def test_a_lane_explanation_is_redacted_of_credentials_before_it_is_posted(self):
         self.failed_fix([
             "I checked it. api_key=abc123 and Authorization: Bearer abcdefghijklmnop1234",
@@ -625,6 +947,373 @@ class FixTest(Base):
             fix_body=None)
         self.assertIn("loom:failed", self.fake.names(12))
         self.assertEqual(self.fake.comments[99], [])
+
+
+PLAIN = "Difficulty: hard\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+EASY = PLAIN.replace("hard", "easy")
+
+
+class RetryTest(Base):
+    """A limit or transient failure moves the ticket to another lane; a work
+    failure, a fix round or a ticket out of retries does not."""
+
+    def failed(self, lane="codex", reason="[transient] agent exited 1", body=PLAIN,
+               attempt=1, fix=None, number=12):
+        self.fake.add(number, lane=lane, body=body, state="running")
+        for _ in range(attempt):
+            self.fake.comments[number].append(
+                {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
+        name = tickets.ticket_name(REPO, number, attempt)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[number], lane, attempt, fix))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: %s\n" % (name, lane, name, reason))
+        return name
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def test_a_transient_failure_moves_to_another_slot_on_a_fresh_branch(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.run_pass()
+        retry = [b for b in self.bodies() if b.startswith("Automatic retry")]
+        self.assertEqual(retry, ["Automatic retry 1 of 2 (transient): moved from lane codex to "
+                                 "lane codex-2. Lane codex failed: [transient] agent exited 1"])
+        # The same pass claims it for codex-2 as a new attempt.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex-2", "loom:running"])
+        name = "example-owner.example-repo-12-r2"
+        self.assertEqual(self.listing("codex-2"), [name + ".md"])
+        with open(self.inbox("codex-2", name + ".md")) as fh:
+            text = fh.read()
+        self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
+        self.assertIn("Lane: codex-2\n", text)
+        self.assertNotIn("loom:failed", self.fake.names(12))
+
+    def test_a_retry_is_reported_once(self):
+        self.heartbeat("codex-2")
+        self.failed()
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic retry")]), 1)
+
+    def test_a_limit_failure_skips_the_providers_other_slots(self):
+        for lane in ("anthropic", "anthropic-3", "codex"):
+            self.heartbeat(lane)
+        self.failed(lane="anthropic-2", reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("moved from lane anthropic-2 to lane codex.", self.bodies()[-2])
+        self.assertIn("lane:codex", self.fake.names(12))
+
+    def test_a_provider_limit_from_the_runner_uses_the_bounded_retry(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+        self.assertIn("Automatic retry 1 of 2 (limit): moved from lane codex to lane anthropic.",
+                      self.bodies()[-2])
+
+    def test_an_unavailable_lane_is_skipped(self):
+        self.heartbeat("codex-2", available=False)
+        self.heartbeat("anthropic", age=3600)
+        self.heartbeat("opencode-go")
+        self.failed()
+        self.run_pass()
+        self.assertIn("lane:opencode-go", self.fake.names(12))
+
+    def test_an_idle_lane_wins_over_a_busy_one(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.write(self.inbox("codex-2", "other.md"), "busy\n")
+        self.failed()
+        self.run_pass()
+        self.assertIn("moved from lane codex to lane anthropic.",
+                      [b for b in self.bodies() if b.startswith("Automatic")][0])
+
+    def test_the_tickets_model_limits_the_lanes(self):
+        # Model: model-x is not a claude model, so no anthropic slot takes it.
+        self.heartbeat("anthropic")
+        self.failed(body=BODY)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+
+    def test_a_ticket_body_that_does_not_parse_is_not_retried(self):
+        # Model: given twice, so no lane's eligibility can be judged.
+        self.heartbeat("anthropic")
+        self.failed(body=BODY)
+        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-sonnet-5-5\n\nWork."
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+
+    def test_free_lanes_take_only_easy_tickets_on_public_repos(self):
+        self.heartbeat("zen")
+        self.failed(body=PLAIN)
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.failed(body=EASY, number=13)
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(13))  # the repo is private
+        self.fake.private = False
+        self.failed(body=EASY, number=14)
+        self.run_pass()
+        self.assertIn("lane:zen", self.fake.names(14))
+
+    def test_the_retry_cap_ends_in_failed(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane opencode-go to lane "
+                     "anthropic. Lane opencode-go failed: [transient] agent exited 1"},
+            {"body": "Automatic retry 2 of 2 (limit): moved from lane anthropic to lane codex. "
+                     "Lane anthropic failed: [limit] agent exited 1"},
+        ]
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
+                                            "Not retried: 2 of 2 automatic retries used.")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_the_cap_comes_from_the_settings(self):
+        self.heartbeat("codex-2")
+        self.settings.retry_max = 0
+        self.failed()
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_lanes_an_earlier_retry_left_are_not_chosen_again(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane codex-2 to lane "
+                     "codex. Lane codex-2 failed: [transient] agent exited 1"}]
+        self.run_pass()
+        self.assertIn("Automatic retry 2 of 2 (transient): moved from lane codex to lane "
+                      "anthropic.", self.bodies()[-2])
+
+    def test_a_failure_the_brain_saw_starts_a_new_count(self):
+        self.heartbeat("codex-2")
+        self.failed()
+        self.fake.comments[12][:0] = [
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane a to lane b. x"},
+            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane codex-2. x"},
+            {"body": "Lane codex-2 failed: [work] agent made no commit on loom/12-x"},
+        ]
+        self.run_pass()
+        self.assertIn("lane:codex-2", self.fake.names(12))
+
+    def test_a_retry_whose_relabel_failed_is_finished_without_a_second_comment(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
+        self.failed()
+        self.fake.comments[12].append(
+            {"body": "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+                     "anthropic. Lane codex failed: [transient] agent exited 1"})
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+        self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic")]), 1)
+
+    def test_a_work_failure_waits_for_the_brain(self):
+        self.heartbeat("codex-2")
+        self.failed(reason="[work] agent made no commit on loom/12-fix-the-thing")
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.bodies()[-1],
+                         "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_a_reason_without_a_class_is_a_work_failure(self):
+        self.heartbeat("codex-2")
+        self.failed(reason="agent exited 1")
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+
+    def test_a_failed_fix_brief_returns_to_pr_without_a_new_attempt(self):
+        self.heartbeat("codex-2")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[transient] agent exited 1", attempt=2, fix=fix)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.bodies()[-1], "Lane codex failed: [transient] agent exited 1. "
+                         "This was a fix round on pull request #99; the ticket is back at "
+                         "loom:pr and the pull request is unchanged.")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_retry_chain_and_model_rules(self):
+        self.assertEqual(station.failure_class("[limit] x"), "limit")
+        self.assertEqual(station.failure_class("limit x"), "work")
+        self.assertTrue(station.lane_takes_model("anthropic-3", "claude-sonnet-5-5"))
+        self.assertFalse(station.lane_takes_model("codex-2", "claude-sonnet-5-5"))
+        self.assertTrue(station.lane_takes_model("codex", "gpt-x"))
+        self.assertFalse(station.lane_takes_model("zen", "opencode/paid"))
+        self.assertTrue(station.needs_public_repo("agy", ""))
+        self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
+        self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
+
+
+class PruneTest(Base):
+    def tree(self, name, age):
+        path = os.path.join(self.home, "worktrees", name)
+        os.makedirs(os.path.join(path, ".git"))
+        self.write(os.path.join(path, "a.py"), "x\n")
+        old = time.time() - age
+        os.utime(path, (old, old))
+        return path
+
+    def test_a_finished_lane_tree_is_removed_and_a_live_or_fresh_one_kept(self):
+        done = self.tree("example.repo-1", station.TREE_KEEP + 60)
+        running = self.tree("example.repo-2", station.TREE_KEEP + 60)
+        fresh = self.tree("example.repo-3", 60)
+        self.write(self.inbox("codex", "example.repo-2.md"), "brief\n")
+        self.run_pass()
+        self.assertFalse(os.path.exists(done))
+        self.assertTrue(os.path.exists(running))
+        self.assertTrue(os.path.exists(fresh))
+
+    def test_an_unreadable_inbox_stops_the_prune(self):
+        done = self.tree("example.repo-1", station.TREE_KEEP + 60)
+        unreadable = self.inbox("claude")
+        real = os.listdir
+
+        def listdir(path="."):
+            # Raised directly, not by chmod, which a root runner ignores.
+            if path == unreadable:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path)
+
+        with mock.patch.object(station.os, "listdir", listdir):
+            self.run_pass()
+        self.assertTrue(os.path.exists(done))
+
+    def test_a_link_in_the_worktrees_folder_is_removed_without_following_it(self):
+        outside = os.path.join(self._tmp.name, "keep-me")
+        os.makedirs(outside)
+        self.write(os.path.join(outside, "f"), "x\n")
+        root = os.path.join(self.home, "worktrees")
+        os.makedirs(root)
+        link = os.path.join(root, "example.repo-9")
+        os.symlink(outside, link)
+        old = time.time() - station.TREE_KEEP - 60
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.run_pass()
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(os.path.exists(os.path.join(outside, "f")))
+BOT = {"__typename": "Bot", "login": "grug-tribe"}
+THREAD_FIX = FIX_BODY + "\n### Thread PRRT_abcd1 (comment 5) at a.py:3\n\n    medium finding\n"
+
+
+class AnswerTest(Base):
+    """A fix brief's answers to findings (lanes/run_lane.sh keep_answers)."""
+
+    def thread(self, tid="PRRT_abcd1", pr=99, severity="medium", author=BOT):
+        self.fake.threads[tid] = {
+            "isResolved": False,
+            "pullRequest": {"number": pr, "repository": {"nameWithOwner": REPO}},
+            "comments": {"nodes": [{"author": author,
+                                    "body": "%s | _correctness_ | `null-deref`\n\nx" % severity}]}}
+
+    def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX):
+        body = BODY.replace("Model: model-x", "Model: " + model)
+        self.fake.add(12, state="running", body=body)
+        self.fake.comments[99] = []
+        name = tickets.ticket_name(REPO, 12, 2)
+        brief = tickets.render_brief(REPO, self.fake.issues[12], "codex", 2,
+                                     tickets.parse_fix(REPO, fix_body))
+        self.write(self.inbox("codex", kind, name + ".md"), brief)
+        for tid, text in answers.items():
+            self.write(self.inbox("codex", "answers", name, tid + ".md"), text)
+        if kind == "failed":
+            self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                       "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing\n")
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        return name
+
+    def test_the_brief_tells_the_agent_how_to_answer(self):
+        brief = tickets.render_brief(REPO, {"number": 12, "title": "t", "body": BODY}, "codex", 2,
+                                     tickets.parse_fix(REPO, THREAD_FIX))
+        self.assertIn(".loom-answers/<thread id>.md", brief)
+
+    def test_a_strong_models_answer_to_a_medium_bot_finding_is_posted_and_resolved(self):
+        self.thread()
+        name = self.finish({"PRRT_abcd1": "The guard on a.py:2 returns before x is read."})
+        self.assertEqual(len(self.fake.replies), 1)
+        tid, body = self.fake.replies[0]
+        self.assertEqual(tid, "PRRT_abcd1")
+        self.assertIn("Lane codex answered this finding instead of changing the code", body)
+        self.assertIn("> The guard on a.py:2 returns before x is read.", body)
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+
+    def test_an_answer_on_a_no_change_round_is_posted_too(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Already guarded at a.py:2."}, kind="failed")
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_a_model_off_the_ladder_answers_but_does_not_resolve(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Not valid."}, model="model-x")
+        self.assertEqual(len(self.fake.replies), 1)
+        self.assertEqual(self.fake.resolved, [])
+
+    def test_a_high_finding_is_answered_but_stays_open(self):
+        self.thread(severity="high")
+        self.finish({"PRRT_abcd1": "Not valid."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def test_a_persons_thread_is_answered_but_stays_open(self):
+        self.thread(author={"__typename": "User", "login": "grug-tribe"})
+        self.finish({"PRRT_abcd1": "Not valid."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def test_a_thread_the_brief_did_not_ask_about_or_on_another_pull_request_is_ignored(self):
+        self.thread("PRRT_other9")
+        self.thread(pr=98)
+        self.finish({"PRRT_other9": "Not valid.", "PRRT_abcd1": "Not valid."})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_an_answer_is_redacted_of_credentials_and_local_paths(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "token ghp_" + "a1B2c3D4e5F6g7H8i9J0 in /Users/example/x.py"})
+        body = self.fake.replies[0][1]
+        self.assertNotIn("ghp_", body)
+        self.assertNotIn("/Users/", body)
+        self.assertIn("<redacted>", body)
+
+    def test_one_failed_reply_neither_stops_the_others_nor_repeats_on_the_next_pass(self):
+        self.thread("PRRT_abcd1")
+        self.thread("PRRT_abcd2")
+        self.fake.reply_fails.add("PRRT_abcd1")
+        fix = THREAD_FIX + "\n### Thread PRRT_abcd2 (comment 6) at a.py:4\n\n    medium finding\n"
+        name = self.finish({"PRRT_abcd1": "Not valid.", "PRRT_abcd2": "Not valid either."},
+                           fix_body=fix)
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd2"])
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.run_pass()
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd2"])
+
+    def test_an_answer_file_that_is_a_link_is_not_read(self):
+        self.thread()
+        outside = os.path.join(self._tmp.name, "outside.md")
+        self.write(outside, "secret words\n")
+        name = tickets.ticket_name(REPO, 12, 2)
+        folder = self.inbox("codex", "answers", name)
+        os.makedirs(folder)
+        os.symlink(outside, os.path.join(folder, "PRRT_abcd1.md"))
+        self.finish({})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_an_answer_that_fails_the_text_checks_is_not_posted(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Fixes #12 already."})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
 
 
 class RefusalTest(Base):
@@ -692,7 +1381,9 @@ class OutcomeTest(Base):
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO])
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO,
+                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
 
     def test_done_without_a_pull_request_is_retried_not_reported(self):
         self.finished("done")
@@ -723,7 +1414,7 @@ class OutcomeTest(Base):
         self.write(self.inbox(lane, "failed", name + ".md"),
                    tickets.render_brief(REPO, self.fake.issues[12], lane, 1, fix))
         self.write(os.path.join(self.home, "logs", lane, name + ".log"),
-                   "[t] %s start, lane %s\n[t] %s failed: limit: the spark endpoint refused "
+                   "[t] %s start, lane %s\n[t] %s failed: [limit] limit: the spark endpoint refused "
                    "the connection (agent exited 1)\n" % (name, lane, name, ))
         self.run_pass()
         self.run_pass()
@@ -808,6 +1499,9 @@ class LockAndCliTest(Base):
         self.assertEqual((s.home, s.repos, s.authors, s.owners),
                          ("/h", ["a/b", "c/d"], ["x", "y"], ["a"]))
         self.assertEqual(station.Settings.from_env({}).repos, [])
+        self.assertEqual(station.Settings.from_env({}).retry_max, 2)
+        self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "5"}).retry_max, 5)
+        self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "x"}).retry_max, 2)
 
     def test_the_station_command_runs_a_pass(self):
         old = {k: os.environ.get(k) for k in ("LOOM_HOME", "LOOM_REPOS")}
@@ -982,12 +1676,12 @@ class AsksTest(Base):
         super().setUp()
         self.settings.webhook_ssm = "/example/webhook"
         self.sent = []
-        self.fail = False
+        self.fail_post = False
         self.read = []
 
     def go(self, now=NOON):
         def post(url, payload):
-            if self.fail:
+            if self.fail_post:
                 raise OSError("down")
             self.sent.append((url, payload))
 
@@ -1070,14 +1764,293 @@ class AsksTest(Base):
 
     def test_a_failed_post_is_retried_next_pass(self):
         self.fake.add_ask(5, urgent=True)
-        self.fail = True
+        self.fail_post = True
         self.go()
         self.assertEqual(self.sent, [])
-        self.fail = False
+        self.fail_post = False
         self.go(NOON + 60)
         self.assertEqual(len(self.sent), 2)  # the urgent ask and the digest
         self.go(NOON + 120)
         self.assertEqual(len(self.sent), 2)
+
+    # The audit's size distribution: 56 open asks, 53 of them trusted, with
+    # titles long enough that only 14 fit in one message.
+    def add_many(self):
+        self.fake.add_goal(30)
+        self.fake.goals[0].update(title="Ship the factory")
+        for n in range(100, 156):
+            title = "Grant the %s permission the lane needs %s" % (
+                "x" * (20 + (n * 7) % 30), "y" * (n % 9))
+            self.fake.add_ask(n, title=title, body="Part of #30." if n % 2 else "",
+                              created="2030-01-%02dT00:00:00Z" % (1 + (n - 100) // 2),
+                              author="stranger" if n in (101, 120, 140) else "alice-example")
+        return [n for n in range(100, 156) if n not in (101, 120, 140)]
+
+    def reachable(self, content):
+        """Ask numbers the notification shows or links to."""
+        found = {int(n) for n in re.findall(r"/issues/(\d+)$", content, re.M)}
+        for i in map(int, re.findall(r"issues/900#issuecomment-(\d+)", content)):
+            found |= {int(n) for n in re.findall(r"^- #(\d+) ", self.fake.pages[i - 1], re.M)}
+        return found
+
+    def ledger(self):
+        with open(os.path.join(self.home, "state", "station", "asks.json")) as fh:
+            return json.load(fh)
+
+    def test_every_trusted_ask_is_reachable_from_one_notification(self):
+        trusted = self.add_many()
+        self.assertEqual(len(trusted), 53)
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        content = self.sent[0][1]["content"]
+        self.assertLessEqual(len(content), station.DISCORD_MAX)
+        self.assertIn("- and ", content)
+        self.assertEqual(self.reachable(content), set(trusted))
+        # The newest asks are the ones shown inline.
+        self.assertIn("/issues/155\n", content)
+        self.assertIn("/issues/154\n", content)
+        self.assertNotIn("/issues/100\n", content)
+        page = self.fake.pages[0]
+        self.assertTrue(page.startswith(station.DIGEST_MARKER))
+        self.assertIn("## Ship the factory (#30)", page)
+        self.assertIn("## Not filed under a goal", page)
+        self.assertLess(page.index("- #103 "), page.index("## Not filed"))
+        self.assertGreater(page.index("- #102 "), page.index("## Not filed"))
+        self.assertEqual(self.fake.created[0]["labels"], ["loom:digest"])
+
+    def test_the_ledger_records_what_was_covered(self):
+        trusted = self.add_many()
+        self.go()
+        ledger = self.ledger()
+        self.assertEqual(sorted(ledger["covered"]),
+                         sorted("%s#%d" % (REPO, n) for n in trusted))
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{12}", v) for v in ledger["covered"].values()))
+        self.assertEqual(ledger["pages"], {REPO: "https://github.com/%s/issues/900#issuecomment-1" % REPO})
+        self.assertNotIn("pending", ledger)
+
+    def test_new_and_changed_asks_lead_the_next_digest(self):
+        self.add_many()
+        self.go()
+        self.fake.add_ask(10, title="A fresh ask", created="2029-01-01T00:00:00Z")
+        self.fake.asks[0]["body"] = "Edited."  # ask 100, the oldest
+        self.go(NOON + 86400)
+        lines = self.sent[1][1]["content"].splitlines()
+        self.assertEqual(lines[0], "Asks waiting for you: 54, 2 new since the last digest")
+        self.assertEqual(sorted(line.rsplit("/", 1)[1] for line in lines[1:3]), ["10", "100"])
+        self.assertEqual(len(self.fake.pages), 2)
+
+    def test_a_retry_sends_the_same_digest(self):
+        self.add_many()
+        self.fail_post = True
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.fake.pages), 1)
+        self.assertIn("pending", self.ledger())
+        self.fake.add_ask(10, title="Arrived after the first try")
+        self.fail_post = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.fake.pages), 1)  # the page is not posted twice
+        content = self.sent[0][1]["content"]
+        self.assertNotIn("Arrived after", content)
+        self.assertNotIn("%s#10" % REPO, self.ledger()["covered"])
+        self.go(NOON + 120)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_page_post_holds_the_digest_not_urgent_asks(self):
+        trusted = self.add_many()
+        self.fake.add_ask(9, title="Breaking now", urgent=True)
+        self.fake.page_error = True
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.go()
+        self.assertEqual([p["content"] for _, p in self.sent],
+                         ["Urgent ask: Breaking now https://github.com/%s/issues/9" % REPO])
+        self.assertIn("daily digest pending: could not post its page", out.getvalue())
+        self.assertIn("pending", self.ledger())
+        self.fake.page_error = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.reachable(self.sent[1][1]["content"]), set(trusted) | {9})
+
+    def test_a_non_object_page_reply_holds_the_digest(self):
+        self.add_many()
+        self.fake.page_reply = []
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertIn("pending", self.ledger())
+        self.fake.page_reply = None
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_trust_check_of_an_old_ask_does_not_hold_an_urgent_one(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Old one")
+        self.fake.add_ask(6, title="Breaking now", urgent=True)
+        real = station.Station._ask_trusted
+
+        def flaky(st, repo, issue):
+            if issue["number"] == 5:
+                raise GitHubError("boom", 502)
+            return real(st, repo, issue)
+        with mock.patch.object(station.Station, "_ask_trusted", flaky):
+            self.go()
+        self.assertEqual([p["content"] for _, p in self.sent],
+                         ["Urgent ask: Breaking now https://github.com/%s/issues/6" % REPO])
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_a_small_digest_needs_no_page(self):
+        self.fake.add_ask(5, title="Slow one")
+        self.go()
+        self.assertEqual(self.fake.pages, [])
+        self.assertEqual(self.ledger()["pages"], {})
+
+    def test_a_failed_goal_read_holds_the_digest_until_the_next_pass(self):
+        trusted = self.add_many()
+        ledger_path = os.path.join(self.home, "state", "station", "asks.json")
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"digest": "2030-05-04"}, fh)
+        self.fake.goal_error = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.go()
+        self.assertEqual(self.sent, [])
+        # No plan is fixed on a failed read, so the next pass plans afresh.
+        self.assertTrue(os.path.exists(ledger_path))
+        self.assertNotIn("pending", self.ledger())
+        self.assertIn("could not read the goal homes for the digest", out.getvalue())
+        self.fake.goal_error = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+
+    def test_a_goal_with_an_odd_number_does_not_stop_the_digest(self):
+        trusted = self.add_many()
+        self.fake.goals.append({"number": "abc", "title": "Odd"})
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+        self.assertIn("Ship the factory (#30)", self.fake.pages[0])
+
+
+class HumanDigestTest(AsksTest):
+    """loom:human issues wait in the daily digest, never one message each."""
+
+    def contents(self):
+        return [p["content"] for _, p in self.sent]
+
+    def test_human_issues_are_listed_in_the_digest_with_their_ask(self):
+        self.fake.add_human(7, title="Buy the domain", ask="Buy example.com.\nMore detail.")
+        self.fake.add_human(8, title="Sign the form", ask="",
+                            created="2030-02-01T00:00:00Z")
+        self.go(NOON)
+        self.assertEqual(self.contents(), [
+            "Waiting on you (2):\n%s\n"
+            "- Sign the form https://github.com/%s/issues/8\n"
+            "- Buy the domain https://github.com/%s/issues/7\n"
+            "  Buy example.com." % (REPO, REPO, REPO)])
+        self.assertEqual(self.sent[0][1]["flags"], station.SUPPRESS_EMBEDS)
+
+    def test_a_human_issue_is_never_forwarded_on_its_own(self):
+        self.fake.add_human(7)
+        self.go(EARLY)
+        self.go(EARLY + 60)
+        self.assertEqual(self.sent, [])
+        # Not even when it also carries an urgent ask's labels.
+        self.fake.add_human(9, extra=("needs-operator", "loom:urgent"))
+        self.fake.asks.append(self.fake.humans[-1])
+        self.fake.events[9] = [labeled("needs-operator", "alice-example")]
+        self.go(EARLY + 120)
+        self.assertEqual(self.sent, [])
+        self.go(NOON)
+        self.go(NOON + 600)
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.contents()[0].startswith("Waiting on you (2):"))
+
+    def test_the_list_shows_the_15_newest_and_the_total(self):
+        for n in range(100, 140):
+            self.fake.add_human(n, title="Item %d" % n,
+                                created="2030-01-01T00:00:%02dZ" % (n - 100))
+        self.go(NOON)
+        text = "\n".join(self.contents())
+        self.assertIn("Waiting on you (the 15 newest of 40):", text)
+        listed = re.findall(r"- Item (\d+) ", text)
+        self.assertEqual(listed, [str(n) for n in range(139, 124, -1)])
+        self.assertTrue(all(len(c) + 30 <= station.DISCORD_MAX for c in self.contents()))
+        self.assertEqual(self.fake.paths("GET").count(
+            "/repos/%s/issues/100/comments?per_page=100" % REPO), 0)
+        comment_reads = [p for p in self.fake.paths("GET") if "/comments?" in p]
+        self.assertEqual(len(comment_reads), station.HUMAN_SHOWN)
+        self.assertTrue(all(p.endswith("?per_page=100") for p in comment_reads))
+
+    def test_clipped_human_text_does_not_escape_its_ellipsis(self):
+        title = "T" * (station.HUMAN_TITLE_MAX - 4) + "\\" + "tail"
+        ask = "A" * (station.HUMAN_ASK_MAX - 4) + "\\" + "tail"
+        self.fake.add_human(7, title=title, ask=ask)
+        self.go(NOON)
+        content = self.contents()[0]
+        self.assertIn("- %s... https://" % ("T" * (station.HUMAN_TITLE_MAX - 4)), content)
+        self.assertIn("  %s..." % ("A" * (station.HUMAN_ASK_MAX - 4)), content)
+        self.assertNotIn("\\...", content)
+
+    def test_the_list_follows_the_asks_in_the_same_digest(self):
+        self.settings.mention = "123456"
+        self.fake.add_ask(5, title="Slow one")
+        self.fake.add_human(7, title="Buy the domain")
+        self.go(NOON)
+        self.assertEqual(len(self.sent), 1)
+        lines = self.contents()[0].splitlines()
+        self.assertEqual(lines[:2], ["<@123456> " + station.DIGEST_HEAD +
+                                     " 1, 1 new since the last digest",
+                                     "- Slow one https://github.com/%s/issues/5" % REPO])
+        self.assertEqual(lines[3], "Waiting on you (1):")
+
+    def test_the_list_follows_a_paged_ask_digest(self):
+        self.add_many()
+        self.fake.add_human(7, title="Buy the domain")
+        self.go(NOON)
+        text = "\n".join(self.contents())
+        self.assertIn("Every ask, by goal:", text)
+        self.assertIn("Waiting on you (1):", text)
+        self.assertIn("- Buy the domain https://github.com/%s/issues/7" % REPO, text)
+        self.assertEqual(len(self.fake.pages), 1)
+        self.assertEqual(self.ledger()["digest"], "2030-05-05")
+
+    def test_an_ask_by_a_stranger_is_not_shown(self):
+        self.fake.add_human(7, title="Buy the domain", ask="Send money to me.", author="stranger")
+        self.go(NOON)
+        self.assertNotIn("Send money", self.contents()[0])
+
+    def test_an_unreadable_list_holds_the_digest_but_not_urgent_asks(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Pick one", urgent=True)
+        self.fake.add_ask(6, title="Slow one")
+        self.fake.add_human(7)
+        with mock.patch.object(station.Station, "_gather_human", return_value=None):
+            self.go(NOON)
+        self.assertEqual(self.contents(), ["Urgent ask: Pick one https://github.com/%s/issues/5" % REPO])
+        with mock.patch.object(station.Station, "_human_ask", side_effect=GitHubError("boom", 502)):
+            self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+        self.go(NOON + 120)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("Waiting on you (1):", self.contents()[1])
+
+    def test_the_section_groups_by_repo_newest_first(self):
+        other = "example-owner/other-repo"
+        found = [(other, {"number": 3, "title": "C", "html_url": "u3"}),
+                 (REPO, {"number": 2, "title": "B", "html_url": "u2"}),
+                 (other, {"number": 1, "title": "A", "html_url": "u1"})]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=NOON)
+        from unittest import mock
+        with mock.patch.object(station.Station, "_human_ask", return_value="Ask."):
+            text = st._human_text(found)
+        self.assertEqual(text.splitlines(), [
+            "Waiting on you (3):", other, "- C u3", "  Ask.", "- A u1", "  Ask.",
+            REPO, "- B u2", "  Ask."])
 
 
 class ReportsTest(Base):

@@ -112,6 +112,29 @@ class LoadEvents(Fixture):
         self.assertEqual([e["kind"] for e in events], ["user", "thinking", "tool", "assistant"])
         self.assertEqual(events[2]["output"], "README")
 
+    def test_opencode_lane_reads_an_opencode_2_store(self):
+        db = self.loom / "logs/opencode-go/T3/.local/share/opencode/opencode.db"
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(db)
+        con.execute("create table session_message (id text, session_id text, type text, seq int, data text)")
+        rows = [(3, "assistant", {"content": [
+                    {"type": "reasoning", "text": "I will list"},
+                    {"type": "tool", "name": "bash", "state": {"input": {"command": "ls"}, "content": "README"}},
+                    {"type": "step-finish"},
+                    {"type": "text", "text": "Listed."}]}),
+                (1, "user", {"text": "Run ls"}),
+                (2, "system", {"text": "not a chat turn"})]
+        for seq, kind, data in rows:
+            con.execute("insert into session_message values (?, 's', ?, ?, ?)",
+                        (f"r{seq}", kind, seq, json.dumps(data)))
+        con.commit(); con.close()
+        events = transcripts.load_events("opencode-go", "T3", self.loom, self.claude_projects, self.codex_sessions)
+        self.assertEqual([e["kind"] for e in events], ["user", "thinking", "tool", "assistant"])
+        self.assertEqual(events[0]["text"], "Run ls")
+        self.assertEqual((events[2]["tool"], events[2]["input"], events[2]["output"]),
+                         ("bash", {"command": "ls"}, "README"))
+        self.assertEqual(events[3]["text"], "Listed.")
+
     def test_codex_lane_reads_the_rollout_whose_cwd_is_the_ticket_tree(self):
         tree = self.loom / "worktrees" / "T1"
         self.write_jsonl(self.codex_sessions / "2026/10/11/rollout-other.jsonl", [
@@ -134,7 +157,8 @@ class LoadEvents(Fixture):
         self.assertEqual(events, [{"kind": "log", "text": "agent printed this\n"}])
 
     def test_unsafe_lane_or_ticket_names_are_refused(self):
-        for lane, ticket in (("codex", "../x"), ("bogus", "T1"), ("codex", "T1/../../x")):
+        for lane, ticket in (("codex", "../x"), ("bogus", "T1"), ("bogus-2", "T1"), ("codex-x", "T1"),
+                             ("../codex", "T1"), ("codex", "T1/../../x")):
             with self.assertRaises(ValueError):
                 transcripts.load_events(lane, ticket, self.loom, self.claude_projects, self.codex_sessions)
 
@@ -168,6 +192,20 @@ class Server(Fixture):
         got = {(r["lane"], r["ticket"], r["status"]) for r in serve.rows(self.loom)}
         self.assertEqual(got, {("codex", "T1", "done"), ("anthropic", "T2", "failed"),
                                ("openrouter", "T3", "queued")})
+
+    def test_a_slots_briefs_and_transcript_show_under_the_slot(self):
+        brief = self.loom / "briefs/opencode-go-3/done/T4.md"
+        brief.parent.mkdir(parents=True)
+        brief.write_text("brief")
+        (self.loom / "briefs/bogus-2/done").mkdir(parents=True)
+        (self.loom / "briefs/bogus-2/done/T5.md").write_text("brief")
+        self.assertEqual({(r["lane"], r["ticket"]) for r in serve.rows(self.loom)}, {("opencode-go-3", "T4")})
+        log = self.loom / "logs/opencode-go-3/T4.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("printed\n")
+        self.assertTrue(serve.ROUTE.match("/t/opencode-go-3/T4"))
+        events = transcripts.load_events("opencode-go-3", "T4", self.loom, self.claude_projects, self.codex_sessions)
+        self.assertEqual(events, [{"kind": "log", "text": "printed\n"}])
 
     def test_only_localhost_host_headers_are_served(self):
         self.assertTrue(serve.allowed_host("localhost:8765", 8765))

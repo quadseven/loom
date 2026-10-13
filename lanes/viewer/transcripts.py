@@ -6,8 +6,9 @@ Sources, per lane:
               the project directory named after the ticket's worktree.
   anthropic   Claude Code .jsonl archived to logs/anthropic/<ticket>/.
   openrouter,
-  opencode-go opencode's SQLite store archived to logs/<lane>/<ticket>/.
+  opencode-go opencode's SQLite store (1.x or 2.0) archived to logs/<lane>/<ticket>/.
   codex       the codex rollout .jsonl whose session cwd is the worktree.
+A slot (opencode-go-3) reads as its lane, from its own logs/<slot>/.
 Without a transcript, the lane log (what the CLI printed) is the record.
 
 Transcript files are written by agents, so they are untrusted: names are
@@ -23,13 +24,22 @@ from pathlib import Path
 
 LANES = ("codex", "claude", "openrouter", "opencode-go", "anthropic")
 TICKET = re.compile(r"^[A-Za-z0-9._-]+$")
+SLOT = re.compile(r"^(?P<lane>[a-z][a-z-]*[a-z])(-[0-9]+)?$")
 
 
-def load_events(lane: str, ticket: str, loom: Path, claude_projects: Path,
+def provider(slot: str) -> str | None:
+    """The lane a slot belongs to (opencode-go-3 -> opencode-go), or None."""
+    m = SLOT.match(slot)
+    return m["lane"] if m and m["lane"] in LANES else None
+
+
+def load_events(slot: str, ticket: str, loom: Path, claude_projects: Path,
                 codex_sessions: Path) -> list[dict]:
-    if lane not in LANES or not TICKET.match(ticket) or ticket in (".", ".."):
-        raise ValueError(f"unsafe lane or ticket: {lane!r} {ticket!r}")
-    archive = loom / "logs" / lane / ticket
+    """Events for one ticket of a lane or one of its slots (logs/<slot>/)."""
+    lane = provider(slot)
+    if lane is None or not TICKET.match(ticket) or ticket in (".", ".."):
+        raise ValueError(f"unsafe lane or ticket: {slot!r} {ticket!r}")
+    archive = loom / "logs" / slot / ticket
     events: list[dict] = []
     if lane == "claude":
         tree = str(loom / "worktrees" / ticket)
@@ -49,7 +59,7 @@ def load_events(lane: str, ticket: str, loom: Path, claude_projects: Path,
         if rollout:
             events = codex_events(rollout.read_text(errors="replace").splitlines())
     if not events:
-        log = loom / "logs" / lane / f"{ticket}.log"
+        log = loom / "logs" / slot / f"{ticket}.log"
         if log.is_file():
             events = [{"kind": "log", "text": log.read_text(errors="replace")}]
     return events
@@ -137,13 +147,17 @@ def claude_events(lines: list[str]) -> list[dict]:
 
 
 def opencode_events(db: Path) -> list[dict]:
-    """opencode 1.18 SQLite store -> events, oldest first."""
+    """opencode SQLite store (1.18 message/part, or 2.0 session_message) -> events, oldest first."""
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
     except sqlite3.Error:
         return []
     try:
         con.execute("PRAGMA trusted_schema=OFF")
+        tables = {r[0] for r in con.execute("select name from sqlite_master where type = 'table'")}
+        if "session_message" in tables and "part" not in tables:
+            return _opencode2_events(con.execute(
+                "select type, data from session_message order by seq").fetchall())
         rows = con.execute(
             "select m.data, p.data from part p join message m on m.id = p.message_id "
             "order by p.time_created, p.id").fetchall()
@@ -169,6 +183,45 @@ def opencode_events(db: Path) -> list[dict]:
                            "input": state.get("input") or {},
                            "output": state.get("output") or state.get("error") or ""})
     return events
+
+
+def _opencode2_events(rows: list) -> list[dict]:
+    """opencode 2.0 session_message rows (type, data): a user row's data.text,
+    an assistant row's data.content[] of text, reasoning and tool items."""
+    events: list[dict] = []
+    for kind, raw in rows:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if kind == "user":
+            text = data.get("text")
+            if isinstance(text, str) and text.strip():
+                events.append({"kind": "user", "text": text})
+        elif kind == "assistant":
+            for c in data.get("content") or []:
+                ev = _opencode2_item(c) if isinstance(c, dict) else None
+                if ev:
+                    events.append(ev)
+    return events
+
+
+def _opencode2_item(c: dict) -> dict | None:
+    t, text = c.get("type"), c.get("text")
+    if t == "text" and isinstance(text, str) and text.strip():
+        return {"kind": "assistant", "text": text}
+    if t == "reasoning" and isinstance(text, str) and text.strip():
+        return {"kind": "thinking", "text": text}
+    if t == "tool":
+        state = c.get("state") if isinstance(c.get("state"), dict) else {}
+        out = state.get("content") or state.get("error") or ""
+        if not isinstance(out, str):
+            out = _text(out) if isinstance(out, list) else json.dumps(out)
+        return {"kind": "tool", "tool": c.get("name", "?"), "input": state.get("input") or {},
+                "output": out}
+    return None
 
 
 def _codex_rollout(sessions: Path, tree: Path) -> Path | None:

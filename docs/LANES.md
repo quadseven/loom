@@ -17,6 +17,56 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
 
+## Validation contract
+
+A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
+
+```
+# .loom/validation.conf
+interpreter: python3.12
+submodules: yes
+setup: scripts/setup.sh
+check: scripts/check.sh
+```
+
+`interpreter` is a command that must be on the lane machine's PATH,
+`submodules: yes` checks out the pinned submodule revisions, `setup`
+prepares the tree (a venv, locked dependencies, a pinned linter) and `check`
+is the required check. Point the repo's CI at the same two scripts so the
+lane and CI cannot drift apart. Unknown lines are refused.
+
+- The runner reads the file from the base revision before the agent starts
+  (on a fix run, from the base branch, not the pull request's branch);
+  what the agent edits never changes what is checked. `setup` and `check`
+  are shell commands, trusted like a CI workflow's `run:` steps, so they
+  come only from the branch a pull request merges into.
+- Before the agent: interpreter, submodules, `setup`, then `check` on the
+  base. A missing interpreter, a failed submodule checkout or a failed setup
+  parks the brief as `setup failed: ...`; the agent does not run. The base
+  check is recorded but does not stop the run (a ticket may exist to fix
+  it). What setup leaves untracked goes into `.git/info/exclude`, so it is
+  never committed.
+- The agent is told the check and how it did on the base.
+- After the agent: the runner commits, then runs `check` on that commit. It
+  passes only with exit 0 and no tracked file changed (a formatter that has
+  to rewrite the agent's files is a failure). Only then is the branch pushed
+  and the pull request opened, with a `Validation:` line naming the commit.
+- A failed check parks the brief as `validation failed: ...` (exit 125 to
+  127 as `validation environment unavailable: ...`), opens no pull request
+  and pushes nothing to the ticket's branch or an open pull request. The
+  edits go to a side branch `<branch>-unvalidated-<time>` so they can be
+  recovered.
+- Every step runs like an API-lane agent: an emptied environment, a scratch
+  HOME (`run/<lane>-check`), under `sandbox-exec`, with network but no
+  access to the runner's HOME. A machine without `sandbox-exec` fails setup
+  for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
+  (default 1800).
+- `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
+  (`prepare`, `setup`, `baseline`, `final`), command, exit code, tree
+  revision, `ok` and detail (the interpreter's version, the submodule
+  revisions).
+- A repo without the file is not validated by the runner; CI still is.
+
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
@@ -46,12 +96,23 @@ counts as stale; that pass makes no decision.
 ## The station
 
 `lanes/mac/install.sh` also installs `com.loom.station`, which runs
-`python3 -m bus station` from this checkout every 60 seconds. It turns trusted
+`lanes/mac/station.sh` from this checkout every 60 seconds. That script first
+deploys Loom itself: it fast-forwards this checkout (which the lanes and the
+brain run from too) to its default branch once that head's `unittest` check
+passed, never over local changes and never off the default branch
+(`LOOM_DEPLOY=0` turns it off), and then runs `python3 -m bus station`. A
+merged Loom pull request is running a minute after its CI passes on main.
+The station turns trusted
 `loom:briefed` ticket issues into briefs in the lane inboxes
 (`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
 `loom:running`, and later reports the run from `done/` or `failed/` back to the
 ticket, with local paths removed from failure reasons; the runner adds
-`Refs <owner/name>#<number>` to the pull request. It reads `LOOM_REPOS`,
+`Refs <owner/name>#<number>` to the pull request. A limit or transient
+failure moves the ticket to another available lane as a new attempt, at most
+`LOOM_RETRY_MAX` times (default 2); a failed fix round goes back to
+`loom:pr`; a lane that hit its provider limit stays unavailable until the
+provider's reset (else 60 minutes; delete its heartbeat file in
+`state/usage/` to clear it sooner). It reads `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
@@ -88,7 +149,18 @@ A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
 tickets is passed over for the next untried one, and stays untried, so a
 ticket gives up only once it has run on every rung. A ticket that failed on
-a ladder model (its `Model:` line and lane) has tried that rung. A fix brief that ends with nothing committed (most often
+a ladder model (its `Model:` line and lane) has tried that rung. When every
+untried rung is busy, it waits on the least loaded one, and a ladder ticket
+queued behind more than 2 others on its lane moves to an untried rung with a
+free lane (not a failure).
+A fix brief may answer a finding instead of fixing it: the agent writes the
+reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
+the tree (never committed; links dropped unread), and the station posts each
+answer as the reply on its thread, redacted and text-checked. The station
+resolves the thread only when the round ran on a ladder model and the thread
+is the review bot's own medium or low finding; any other answered thread
+stays open, and the factory reads it as a finding that survived.
+A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
@@ -99,25 +171,58 @@ the agent changes nothing, and a conflict is handed to the agent with the
 file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
 A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
-does while its box is hot) is not failing: a ticket briefed on it moves to
-the next rung at once, recorded with a rung marker like any climb.
-Past the last rung the ticket is left `loom:failed` for the brain. Landing
+does while its box is hot) is not failing: a ticket briefed on it moves at
+once to a free lane in its difficulty tier (docs/MUSE.md, Lane choice), with
+no rung marker, or a ticket on a ladder rung to a free lane of that rung; with
+none free it waits where it is for its lane to come back. A failed or stalled
+ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
-pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+pass, `loom:urgent` and `loom:regression` tickets first, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
-back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
+back. A ready pull request that changes a code file (by extension: `.py`,
+`.js`, `.ts`, `.tsx`, `.jsx`, `.css`, `.cpp`, `.h`, `.hpp`, `.go`, `.rs`,
+`.sh`, `.lua`, `.sql`) and no test file (a `test` or `tests` folder in its
+path, or `test_`, `_test.`, `.test.` or `.spec.` in its name) goes back
+asking for a test that fails without the change, instead of landing; that
+round climbs only if the next one still adds no test. A repo with no test
+harness opts out in `LOOM_NO_TEST_REPOS` (space separated `OWNER/NAME`), and
+a ticket whose body has the line `Tests: none needed (<reason>)` skips the
+check. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
 labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
-empty nothing is forwarded). A `loom:urgent` ask is posted at once, once; all
-open asks go in one digest per day after `LOOM_DIGEST_HOUR` (local hour,
-default 9). Posts mention nobody except the numeric user id in
-`LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
+empty nothing is forwarded). A `loom:urgent` ask is posted at once, once, and
+nothing the digest needs can hold it; all open asks go in one digest per day
+after `LOOM_DIGEST_HOUR` (local hour, default 9). The digest lists asks new or
+changed since the last digest first. When the asks do not all fit in one
+message, the station posts every ask, grouped by the goal home its body names
+(`#N`), as a comment on the open `loom:digest` issue in the ask's own repo
+(created when missing), and the message links to each repo's comment. The
+same digest includes a "Waiting on you" section for open `loom:human` issues
+across `LOOM_REPOS`: the 15 newest grouped by repo, with title, link, and the
+first line of the brain's ask, plus the total count. A `loom:human` issue is
+never posted on its own, even if it also has `needs-operator` or
+`loom:urgent`. A long daily digest may take multiple Discord messages.
+The digest is fixed in `state/station/asks.json` (`pending`) before it is sent, so
+a retry sends the same one; once sent, `covered` holds each ask's revision
+(a hash of its title and body) and `pages` the links. Posts mention nobody
+except the numeric user id in `LOOM_DISCORD_MENTION`; a failed post is retried
+on the next pass.
+
+Metrics: set `LOOM_METRICS_GOAL=owner/name#N` to name a goal home in
+`LOOM_REPOS`. Once a day after `LOOM_DIGEST_HOUR`, the station measures the
+last 24 hours, comments with `<!-- loom:metrics v1 -->`, and sends a short
+pass count and streak line to Discord. It samples idle slots on each pass
+and reads completed runs from `briefs/<lane>/done` and `failed`. The first
+day's slot sample may cover less than 24 hours; missing samples fail the
+spread target. Use the keys in `.env.example` as setup placeholders.
+The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
+its previous metrics comments can be trusted for the streak.
 
 Reports: the station also reads comments on open `loom:goal` issues in each
 `LOOM_REPOS` repo. On first run it records the newest report comment per repo
@@ -195,7 +300,9 @@ One-time bot setup:
 every lane's agent session as a chat at `http://localhost:7340/`: the brief,
 the agent's messages, each tool call with its output, edits as diffs. It reads
 Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
-(openrouter, opencode-go) and codex rollouts. It binds localhost only and
+(openrouter, opencode-go; the 1.x `message`/`part` tables or the 2.0
+`session_message` table) and codex rollouts. A slot such as `opencode-go-3`
+lists under its own name and reads as its lane. It binds localhost only and
 answers only localhost Host headers; transcripts never leave the machine.
 API-lane agents run on the same machine, so their sandbox denies every
 loopback connection; they cannot query the viewer or any other local service.
@@ -222,12 +329,36 @@ loopback connection; they cannot query the viewer or any other local service.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
-- Logs stay on the lane machine. Nothing is pushed except the ticket branch.
+- Logs stay on the lane machine. Nothing is pushed except the ticket branch,
+  or a side branch holding edits that failed the validation contract.
 - API-lane session transcripts (Claude Code `.jsonl`, opencode's `opencode.db`)
   are copied to `logs/<lane>/<ticket>/` after each run, before the next run
   wipes the scratch home. Links are never followed.
 - No background processes: launchd starts a pass every minute and a lock
   keeps one pass per lane.
+
+### One slot on opencode 2.0
+
+opencode 2.0's installer overwrites the one binary every opencode lane runs,
+so try it on one slot. Install it somewhere of its own (outside the repo, not
+over the 1.x binary on PATH) and name it for that slot only:
+
+```sh
+LOOM_OPENCODE_GO_3_OPENCODE=/path/to/opencode2/bin/opencode lanes/mac/install.sh opencode-go-3
+```
+
+(the installer writes every `LOOM_*` setting into the slot's plist).
+
+`LOOM_<SLOT>_OPENCODE` (or `LOOM_<LANE>_OPENCODE` for every slot of a lane)
+names the opencode binary; without it a lane runs `opencode` from PATH. Before
+each run the runner asks the binary for `--version`; when it prints
+`opencode v2.` the run adds `--standalone --auto`, because 2.0's `run`
+otherwise talks to a shared background service, which the sandbox (no
+loopback) refuses and which would mix lanes' sessions. The sandbox lets the
+agent read the named binary's real directory, exactly as it does the default
+one; a binary that needs files outside that directory will not start there.
+The transcript is archived and shown on the viewer like a 1.x one. To go
+back, re-run the installer for that slot without the variable.
 
 ### Anthropic spend
 
@@ -391,13 +522,25 @@ lookup leaves the brief for the next pass. The rule covers:
   `loom`) instead: the runner starts it with `sudo -n -u loom`, in that user's
   emptied environment, inside the sandbox (keychain server allowed, loopback
   and everything else denied as for the other API lanes).
-- Edits only. agy stores its token so that `/usr/bin/security` can read it
+- Runs commands inside its sandbox. Print mode cannot prompt, so a tool no
+  rule allows is denied and the run ends with no output. Before each run the
+  runner writes agy's settings (`~/.gemini/antigravity-cli/settings.json`)
+  as the lane user from `lanes/agy/settings.json`: `permissions.allow` lets
+  through shell commands and the file tools, and `permissions.deny` blocks
+  web fetching (`read_url`, `execute_url`). Of the old file, only
+  `trustedWorkspaces` (set at sign-in) is kept. After the run the runner
+  writes back exactly what it wrote before, and the sandbox keeps the file
+  read-only during the run, so a run cannot leave a wider rule behind. The
+  brief tells agy to run the repo's tests and lint and to edit only inside
+  its tree, as the other lanes do.
+- Commands run as the lane user, inside the same sandbox and emptied
+  environment as agy itself, so they can write only where the agent can (see
+  below). agy stores its token so that `/usr/bin/security` can read it
   without a prompt, and reads it that way itself, so the sandbox cannot block
-  that tool; a shell command from the agent could copy the token out. The
-  runner never passes `--dangerously-skip-permissions`, passes
-  `--disable-slash-commands`, and tells agy in the brief that shell commands
-  are unavailable (print mode soft-denies them, and a denied command ends the
-  run with no output).
+  that tool, and a command could read the token. The settings deny commands
+  starting with `security`, which slows that down but does not stop it. The
+  runner never passes `--dangerously-skip-permissions` and passes
+  `--disable-slash-commands`.
 - Public repos only: whether the plan trains on prompts is not established.
 - One-time setup, done by the operator:
   1. Create the standard user, hidden, and store its password in SSM.
