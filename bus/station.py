@@ -8,6 +8,7 @@ take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
 from __future__ import annotations
 
 import calendar
+import errno
 import fcntl
 import hashlib
 import json
@@ -42,6 +43,17 @@ NO_COMMIT = "agent made no commit"
 # longer waiting or running is removed once it is this old. On 2026-10-13 the
 # 385 left behind held 7.8 GB and the disk filled.
 TREE_KEEP = 3600
+# A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
+ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
+ANSWER_MAX = 3000
+STRONG_MODELS = frozenset(model for _, model in factory.LADDER)
+THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
+                ' pullRequest { number repository { nameWithOwner } }'
+                ' comments(first:1) { nodes { body author { __typename login } } } } } }')
+REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadReply('
+                  'input:{pullRequestReviewThreadId:$id,body:$body}) { comment { id } } }')
+RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
+                    ' { thread { isResolved } } }')
 # The runner's reason, and its heartbeat's, when a lane's provider refused
 # work for a while (the spark lane's thermal guard). Not a failure: the ticket
 # goes back to briefed, and the factory moves it to the next lane.
@@ -129,7 +141,8 @@ class Settings:
                  bot_token_ssm: str = "", default_goal: str = "",
                  anthropic: Optional[spend.Budget] = None,
                  factory_on: bool = False,
-                 review_check: str = factory.DEFAULT_REVIEW_CHECK) -> None:
+                 review_check: str = factory.DEFAULT_REVIEW_CHECK,
+                 review_bot: str = factory.DEFAULT_REVIEW_BOT) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -147,6 +160,7 @@ class Settings:
         # merging; from_env turns it on unless LOOM_FACTORY=0.
         self.factory_on = factory_on
         self.review_check = review_check
+        self.review_bot = review_bot
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -179,7 +193,9 @@ class Settings:
                    anthropic=budget,
                    factory_on=env.get("LOOM_FACTORY", "").strip() not in ("0", "off", "false"),
                    review_check=(env.get("LOOM_REVIEW_CHECK", "").strip()
-                                 or factory.DEFAULT_REVIEW_CHECK))
+                                 or factory.DEFAULT_REVIEW_CHECK),
+                   review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
+                               or factory.DEFAULT_REVIEW_BOT))
 
 
 def _origin_repo() -> str:
@@ -265,6 +281,44 @@ def _say(msg: str) -> None:
 
 class StateError(Exception):
     """A state file that exists but cannot be read."""
+
+
+def _read_answer(path: str) -> str:
+    """An answer file's text, redacted of credentials and local paths; empty
+    unless it is a regular file with one link (never followed through a link)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as err:
+        # ELOOP is O_NOFOLLOW refusing a link, which is the point; anything
+        # else (permissions, I/O) is worth a line in the log.
+        if err.errno not in (errno.ENOENT, errno.ELOOP):
+            _say("could not read answer %s: %s" % (os.path.basename(path), err))
+        return ""
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
+            return ""
+        raw = fh.read(ANSWER_MAX).decode("utf-8", errors="replace")
+    return SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", raw)).strip()
+
+
+def _open_on(node: Dict[str, Any], repo: str, pr: int) -> bool:
+    """An unresolved review thread on this pull request of this repo."""
+    where = node.get("pullRequest") or {}
+    return (not node.get("isResolved")
+            and (where.get("repository") or {}).get("nameWithOwner") == repo
+            and where.get("number") == pr)
+
+
+def _bot_minor(comment: Dict[str, Any], bot: str) -> bool:
+    """The review bot's own finding (its app, not a person with its login)
+    whose severity, the first field of its first line, is medium or low."""
+    author = comment.get("author") or {}
+    if author.get("__typename") != "Bot" or str(author.get("login") or "").lower() != bot.lower():
+        return False
+    severity = str(comment.get("body") or "").split("\n", 1)[0].split("|", 1)[0].lower()
+    return bool(re.search(r"\b(medium|low)\b", severity)) and not re.search(
+        r"\b(critical|high)\b", severity)
 
 
 def _read_json(path: str, default: Any, strict: bool = True) -> Any:
@@ -682,6 +736,8 @@ class Station:
                 _say("no pull request found yet for %s (%s)" % (name, branch))
                 return False
             self._relabel(repo, number, "loom:pr")
+            if self._field(text, "Fix-PR").isdigit():
+                self._post_answers(repo, int(self._field(text, "Fix-PR")), lane, name, text)
             verb = "pushed fixes to" if self._field(text, "Fix-PR") else "opened"
             self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
@@ -692,6 +748,7 @@ class Station:
             self._limited(repo, number, fix_pr.isdigit(), lane, reason)
             return True
         if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
+            self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
             return True
         self._relabel(repo, number, "loom:failed")
@@ -708,6 +765,61 @@ class Station:
         self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
                       "the ticket goes to the next lane." % (lane, reason))
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
+        """Post each answer the lane wrote instead of a fix as the reply on its
+        thread. Only a thread the brief asked about, on this pull request,
+        gets one. It is resolved when the round ran on a ladder model and the
+        thread is the review bot's own medium or low finding; otherwise it
+        stays open, and the factory reads it as a finding that survived."""
+        folder = os.path.join(self.inbox(lane), "answers", name)
+        try:
+            entries = sorted(os.listdir(folder))
+        except OSError:
+            return
+        asked = set(factory.FIX_THREAD_RE.findall(brief))
+        strong = self._field(brief, "Model") in STRONG_MODELS
+        try:
+            for entry in entries:
+                m = ANSWER_FILE_RE.match(entry)
+                if not (m and m.group(1) in asked):
+                    continue
+                try:
+                    self._answer(repo, pr, lane, m.group(1), os.path.join(folder, entry), strong)
+                except GitHubError as err:
+                    # One thread's failure must not stop the rest, and the
+                    # report must still be recorded: a retried report would
+                    # post the answers already posted a second time.
+                    _say("answer to %s on %s#%d failed: %s" % (m.group(1), repo, pr, err))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def _answer(self, repo: str, pr: int, lane: str, thread_id: str, path: str,
+                strong: bool) -> None:
+        said = _read_answer(path)
+        node = (self.gh.graphql(THREAD_QUERY, {"id": thread_id}) or {}).get("node") or {}
+        if not said or not _open_on(node, repo, pr):
+            return
+        body = "Lane %s answered this finding instead of changing the code:\n\n%s" % (
+            lane, "\n".join("> " + line for line in said.splitlines()))
+        try:
+            _text.check(body)
+        except ValueError as err:
+            _say("answer to %s on %s#%d not posted: %s" % (thread_id, repo, pr, err))
+            return
+        self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
+        root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
+        settled = strong and _bot_minor(root, self.s.review_bot)
+        if settled:
+            try:
+                self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
+            except GitHubError as err:
+                # The reply is posted; an open thread is read by the factory
+                # as a finding that survived, which is the safe side.
+                settled = False
+                _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
+        _say("posted lane %s's answer on %s#%d thread %s%s" % (
+            lane, repo, pr, thread_id, " and resolved it" if settled else ""))
 
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane
@@ -1597,6 +1709,7 @@ class Station:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                         review_check=self.s.review_check,
+                        review_bot=self.s.review_bot,
                         limited=self.limited_lanes()).run()
 
     def prune_trees(self) -> None:

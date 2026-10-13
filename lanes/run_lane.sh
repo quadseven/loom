@@ -595,6 +595,54 @@ conflict_list() {
 }
 
 # Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
+# A fix brief's agent may answer a finding instead of fixing it, one file a
+# thread in .loom-answers/ (bus/tickets.py says how). The answers never go in
+# the commit: they move to the inbox, where the station posts each on its
+# thread. The copy opens the folder and each file without following links,
+# through the folder's descriptor, and keeps only a regular file with one
+# link, at most 8 KB, named for a thread: a symlink, a hard link to a file
+# outside the tree, a FIFO or a folder swapped for a link is dropped unread,
+# so an answer cannot carry a file the agent could not read itself.
+keep_answers() {
+  local dir="$TREE/.loom-answers"
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0
+  if [ -n "$FIX_PR" ]; then
+    if ! python3 - "$dir" "$INBOX/answers/$TICKET" <<'PY' >> "$LOG" 2>&1
+import os, re, stat, sys
+src, dst = sys.argv[1], sys.argv[2]
+nofollow = os.O_RDONLY | os.O_NOFOLLOW
+try:
+    folder = os.open(src, nofollow | os.O_DIRECTORY)
+except OSError:
+    sys.exit(0)
+try:
+    for name in os.listdir(folder):
+        if not re.fullmatch(r"PRRT_[A-Za-z0-9_-]{1,100}[.]md", name):
+            continue
+        try:
+            fd = os.open(name, nofollow | os.O_NONBLOCK, dir_fd=folder)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(fd)
+            ok = stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size <= 8192
+            data = os.read(fd, 8193) if ok else b""
+        finally:
+            os.close(fd)
+        if ok and len(data) <= 8192:
+            os.makedirs(dst, exist_ok=True)
+            with open(os.path.join(dst, name), "wb") as out:
+                out.write(data)
+finally:
+    os.close(folder)
+PY
+    then
+      echo "[$(date -u +%FT%TZ)] $TICKET: the answers in .loom-answers could not be kept" >> "$LOG"
+    fi
+  fi
+  rm -rf "$dir"
+}
+
 markers_left() {
   local f left=()
   while IFS= read -r f; do
@@ -886,6 +934,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  keep_answers
   if [ -n "$CONFLICTS" ]; then
     LEFT="$(markers_left)"
     if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
