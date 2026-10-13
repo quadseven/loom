@@ -327,8 +327,10 @@ agy_agent() {
   "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
   agy_forget || { echo "could not clear agy's memory of earlier runs" >&2; return 3; }
   [ -f "$AGY_SETTINGS" ] || { echo "missing $AGY_SETTINGS" >&2; return 3; }
-  settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
+  # Build the sandbox first: once the settings are written, nothing may fail
+  # before agy runs and the restore below follows.
   profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
+  settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
     LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
@@ -336,7 +338,8 @@ agy_agent() {
 
 $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
   local rc=$?
-  # A failed restore must fail the run, even if agy itself succeeded.
+  # A failed restore must fail the run, even if agy itself succeeded. Only the
+  # copy of the file that agy_settings prints goes to /dev/null, not its status.
   printf '%s\n' "$settings" | agy_settings keep > /dev/null || { echo "could not restore agy's settings" >&2; return 3; }
   return "$rc"
 }

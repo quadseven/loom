@@ -668,7 +668,7 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
-    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, **env):
+    def agy_lane(self, runas_ok=True, model="gemini-3.8-flash-high", cache_link=None, agy_bin=None, **env):
         lane_home = Path(self._tmp.name) / "loomuser"
         workdir = lane_home / "lanes"
         (lane_home / "tmp").mkdir(parents=True)
@@ -703,7 +703,7 @@ cat > /dev/null
             LOOM_AGY_RUNAS=str(runas),
             LOOM_AGY_HOME=str(lane_home),
             LOOM_AGY_WORKDIR=str(workdir),
-            LOOM_AGY_BIN=str(agy),
+            LOOM_AGY_BIN=str(agy_bin or agy),
             LOOM_AGY_KEYCHAIN=str(lane_home / "loom.keychain-db"),
             LOOM_AGY_KEY_SSM="/k/kc",
             LOOM_AGY_MODEL=model,
@@ -791,6 +791,24 @@ cat > /dev/null
         self.assertIn("could not restore agy's settings", log)
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_leaves_its_settings_alone_when_the_sandbox_cannot_be_built(self):
+        # The sandbox is built before the settings are written, so a run that
+        # never starts leaves no rewritten file without its restore.
+        lane_home = Path(self._tmp.name) / "loomuser"
+        lane_home.mkdir()
+        quoted = lane_home / 'a"gy'
+        quoted.symlink_to(lane_home / "agy")
+        inbox, workdir, result, agy = self.agy_lane(agy_bin=quoted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        state = workdir.parent / ".gemini" / "antigravity-cli"
+        self.assertEqual(json.loads((state / "settings.json").read_text())["permissions"], {"allow": ["read_url(*)"]})
+        self.assertFalse((state / ".settings.json.new").exists())
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("refusing sandbox: unsafe path", log)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
     def test_agy_settings_never_write_through_a_link_left_in_their_place(self):
