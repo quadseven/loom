@@ -614,6 +614,17 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
 
+    def test_empty_api_credit_holds_the_lane_for_24_hours(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        before = int(time.time())
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="Credit balance is too low")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("out of credit", beat["reason"])
+        self.assertGreaterEqual(beat["retry_at"], before + 86400)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 86400)
+
     def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="early-limit")
