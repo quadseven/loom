@@ -1837,6 +1837,9 @@ class Station:
         if time.localtime(self.now).tm_hour < self.s.digest_hour:
             return
         path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        # Read-then-post is safe: run() holds station.lock (flock) for the
+        # whole pass, so no second pass can read the same day's comments
+        # before this one has posted.
         dated = self._dated_metrics(path)
         if today not in dated:
             self._post_metrics_comment(path, today, dated)
