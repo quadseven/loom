@@ -51,6 +51,25 @@ def ticket_name(repo: str, number: int, attempt: int = 1) -> str:
     return name
 
 
+# Each header's rule: (is the value usable, the message when it is not).
+_HEADER_RULES = {
+    "Difficulty": (lambda v: v in DIFFICULTIES,
+                   lambda v: "Difficulty: must be one of %s" % ", ".join(DIFFICULTIES)),
+    "Model": (lambda v: bool(MODEL_RE.fullmatch(v)),
+              lambda v: "Model: %r is not a model id" % v),
+    "Base": (lambda v: bool(BASE_RE.fullmatch(v)),
+             lambda v: "Base: %r is not a branch name" % v),
+    "Not before": (lambda v: bool(NOT_BEFORE_RE.fullmatch(v)),
+                   lambda v: "Not before: %r is not a UTC time like 2026-10-13T17:00:00Z" % v),
+}
+
+
+def _check_header(key: str, value: str) -> None:
+    ok, message = _HEADER_RULES[key]
+    if not ok(value):
+        raise ValueError(message(value))
+
+
 def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     """Split the leading Difficulty:, Model: and Base: lines from the rest.
 
@@ -68,14 +87,7 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
         key, value = m.group(1), m.group(2).strip()
         if key in headers:
             raise ValueError("%s: given twice" % key)
-        if key == "Difficulty" and value not in DIFFICULTIES:
-            raise ValueError("Difficulty: must be one of %s" % ", ".join(DIFFICULTIES))
-        if key == "Model" and not MODEL_RE.fullmatch(value):
-            raise ValueError("Model: %r is not a model id" % value)
-        if key == "Base" and not BASE_RE.fullmatch(value):
-            raise ValueError("Base: %r is not a branch name" % value)
-        if key == "Not before" and not NOT_BEFORE_RE.fullmatch(value):
-            raise ValueError("Not before: %r is not a UTC time like 2026-10-13T17:00:00Z" % value)
+        _check_header(key, value)
         headers[key] = value
         i += 1
     rest = lines[i:]
