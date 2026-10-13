@@ -989,6 +989,8 @@ class Station:
 
     def _page_body(self, repo: str, issues: List[Dict[str, Any]], today: str) -> str:
         """Every ask in one repo, grouped under the goal home its body names."""
+        # _goal_issues keeps only objects with numeric issue numbers; a read
+        # failure reaches _send_digest as GitHubError before any page is posted.
         goals = {int(g["number"]): g for g in self._goal_issues(repo)}
         groups: Dict[Optional[int], List[Dict[str, Any]]] = {}
         for issue in issues:
@@ -1064,6 +1066,7 @@ class Station:
             except GitHubError as err:
                 _say("could not post the digest page in %s: %s; next pass" % (repo, err))
                 return False
+            # A successful HTTP status can still carry an unusable reply.
             url = made.get("html_url") if isinstance(made, dict) else None
             if not url:
                 _say("no digest page link from %s; next pass" % repo)

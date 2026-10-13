@@ -54,6 +54,7 @@ class FakeGitHub:
         self.digest_issues = []
         self.pages = []
         self.page_error = False
+        self.page_reply = None
         self.goals = []
         self.goal_error = False
 
@@ -116,7 +117,8 @@ class FakeGitHub:
                 return reply(502, {"message": "down"})
             self.pages.append(data["body"])
             n = len(self.pages)
-            return reply(201, {"id": n, "html_url": "https://github.com/%s/issues/900#issuecomment-%d" % (REPO, n)})
+            made = {"id": n, "html_url": "https://github.com/%s/issues/900#issuecomment-%d" % (REPO, n)}
+            return reply(201, self.page_reply if self.page_reply is not None else made)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
@@ -1125,6 +1127,16 @@ class AsksTest(Base):
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(self.reachable(self.sent[1][1]["content"]), set(trusted) | {9})
 
+    def test_a_non_object_page_reply_holds_the_digest(self):
+        self.add_many()
+        self.fake.page_reply = []
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertIn("pending", self.ledger())
+        self.fake.page_reply = None
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+
     def test_a_failed_trust_check_of_an_old_ask_does_not_hold_an_urgent_one(self):
         from unittest import mock
         from bus.github import GitHubError
@@ -1151,14 +1163,18 @@ class AsksTest(Base):
 
     def test_a_failed_goal_read_holds_the_digest_until_the_next_pass(self):
         trusted = self.add_many()
+        ledger_path = os.path.join(self.home, "state", "station", "asks.json")
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"digest": "2030-05-04"}, fh)
         self.fake.goal_error = True
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             self.go()
         self.assertEqual(self.sent, [])
         # No plan is fixed on a failed read, so the next pass plans afresh.
-        ledger_path = os.path.join(self.home, "state", "station", "asks.json")
-        self.assertTrue(not os.path.exists(ledger_path) or "pending" not in self.ledger())
+        self.assertTrue(os.path.exists(ledger_path))
+        self.assertNotIn("pending", self.ledger())
         self.assertIn("could not read the goal homes for the digest", out.getvalue())
         self.fake.goal_error = False
         self.go(NOON + 60)
