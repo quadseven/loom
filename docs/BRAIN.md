@@ -45,8 +45,11 @@ that talks to GitHub about tickets.
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
-| `loom:failed` | The runner gave up; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
+| `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
+| `needs-brain` | The automatic fix round limit was reached; review this ticket in full. |
+| `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
+| `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
@@ -56,13 +59,15 @@ that talks to GitHub about tickets.
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
+| `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 
 A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
 and `running` and `failed` exist because the
 station and the runner need to say "taken" and "gave up" without the brain
-present.
+present. `loom:ready` is a PR readiness label, and `needs-brain` asks for a
+full review after automatic fix rounds; neither replaces the ticket state.
 
 ## Ticket issues
 
@@ -94,7 +99,10 @@ The station renders the local brief from the issue: `Repo` is the issue's
 repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 <owner/name>#<number>`, then the header lines and the body. The runner adds
 `Refs <owner/name>#<number>` to the pull request body, never a closing
-keyword.
+keyword. The station checks those references and the conventional branch
+number on every pass against all pull request states. A merged pull request
+repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
+`loom:closed-unmerged`. Neither outcome occupies a lane slot.
 
 ## Onboarding a repo
 
@@ -207,15 +215,14 @@ A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
 
-A lane pull request with failing checks or review findings goes back to its
-lane, not to the brain: `python3 -m bus.brain fix OWNER/NAME#PR --ticket
-OWNER/NAME#N --file FINDINGS.md` refuses unless the pull request is open, on
-a same-repo `loom/` branch and linked to the ticket (its `Refs` line or its
-branch number), and the ticket is `loom:pr`. It comments the findings on the
-ticket, starting with `<!-- loom:fix v1 -->` and naming the pull request and
-its branch (the failing checks with the last lines of their logs, each
-unresolved review thread with its id, path, line and text), then moves the
-ticket back to `loom:briefed` on the same lane.
+The station polls lane PRs once per pass. Once checks finish, failed checks
+and unresolved threads started by `grug-tribe[bot]` are sent back to the same
+lane as a `loom:fix` comment, using the same findings format as
+`python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner
+pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
+per ticket (default 3), after which the station adds `needs-brain`. A clean
+PR receives `loom:ready`; a later push removes that label until the new head
+has finished checks and review again.
 
 When the station claims a ticket whose latest comment from an allowed login
 is such a fix comment, newer than its last claim, the brief keeps the pull
@@ -223,8 +230,11 @@ request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
 section holding the comment. A fix comment edited after it was posted is
 refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
-comments on the pull request; it never opens a second one. A fix brief whose
-pull request is no longer open is parked as failed.
+comments on the pull request; it never opens a second one. The sandboxed agent
+can write `.loom/replies.json` with thread ids, reply text and a resolve
+boolean. The runner posts valid entries after a successful push and resolves
+those marked true; missing or invalid files produce no replies. A fix brief
+whose pull request is no longer open is parked as failed.
 
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
@@ -232,10 +242,38 @@ When the runner finishes, the station finds the brief in `done/` or
 - Done: label `loom:pr`, comment with the pull request link.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
-- Limited (a reason starting `limit:`, the lane's provider refusing work for
-  a while): not a failure. Label `loom:briefed` again (`loom:pr` for a fix
+- Limited (a reason starting `limit:` after its class, the spark lane's
+  guard refusing work for a while): not a failure, and not one of the
+  automatic retries below. Label `loom:briefed` again (`loom:pr` for a fix
   brief), comment that the lane is unavailable; the factory moves a ticket
   briefed on a lane whose heartbeat says `limit:` to the next rung at once.
+
+The runner starts each failure reason with its class: `[limit]` (a usage,
+rate or quota limit, or an HTTP 429 or 402 from the provider), `[transient]`
+(a network or server fault, a timeout, or the agent exiting before any
+edit) or `[work]` (anything else: failing tests, no commit, a guard's
+refusal). A reason without a class is work. On a limit the runner also
+writes its heartbeat unavailable with a `retry_at` time (the provider's
+reset when it names one, else 60 minutes) and takes no brief until then.
+
+- A failed fix brief (a `Fix-PR:` line) goes back to `loom:pr`, whatever its
+  class, so its open pull request is never duplicated.
+- A limit or transient failure is retried automatically, at most
+  `LOOM_RETRY_MAX` times (default 2) since the ticket last went to the brain
+  or opened a pull request. The station comments once, `Automatic retry <n>
+  of <max> (<class>): moved from lane <from> to lane <to>.` with the reason,
+  then moves the ticket to `loom:briefed` with the new `lane:` label. Its next
+  claim is a new attempt, so a fresh branch. The new lane is the first
+  available one whose runner accepts the ticket's model and repo, idle
+  before busy: another slot of the same provider (not after a limit, which
+  the slots share), then anthropic, its slots, codex, codex-2, opencode-go
+  and agy, then free lanes for an easy ticket on a public repo. Never
+  claude, and never a lane an earlier retry left.
+- Any other failure, or one with no retry or lane left, is reported as
+  failed above, saying why it was not retried.
+
+The station applies the retry labels with its own login, so that login must
+be in `LOOM_BRIEF_AUTHORS`, or the trust rules refuse the retried ticket.
 
 ## Polling budget
 
@@ -264,7 +302,15 @@ exact question or action and what the brain does in each case. The station
 forwards asks to the operator's Discord webhook (URL read from SSM on the
 lane machine, never on Muse's VM): `loom:urgent` asks within a minute, the
 rest as one daily digest. Asks in private repos stay private on GitHub; the
-digest carries only titles and links.
+digest carries only titles and links. When the digest does not fit in one
+message, its full list, grouped by goal, is a comment on the `loom:digest`
+issue in each ask's own repo, and the message links to it. To file an ask
+under its goal, name the goal home in its body (`Part of #N`).
+
+Open `loom:human` issues are not asks: the station never posts one on its
+own. They are listed once a day under "Waiting on you" at the end of the
+same digest (the 15 newest, grouped by repo, each with the first line of
+its `loom:human` comment), so hundreds of them still make one message.
 
 ## The tick
 
@@ -279,8 +325,10 @@ create it. The tick deletes it when done. Hard limit: 15 minutes.
 someone else).
 
 Order (#35): read lane status; gather events since the last journal entry
-(checks, reviews, comments, outcomes); review and ship merge-ready pull requests
-(read every diff, green checks and the review bot, answer every thread);
+(checks, reviews, comments, outcomes); review `needs-brain` tickets in full
+(every diff, green checks and the review bot, every thread answered); merge
+only `loom:ready` pull requests, after confirming the verdict matches the
+current head and checks are green;
 verify shipped work live and close only then; pick the next problems by
 impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
@@ -349,6 +397,7 @@ One comment per tick that changed something, on the goal's home issue:
 ```markdown
 <!-- loom:journal v1 -->
 Tick <UTC time>, <holder>
+- Measure: <the goal's metrics read this tick, or none>
 - Shipped: <links or none>
 - Briefed: <links with lanes or none>
 - Waiting: <what is in flight and on whom>
@@ -374,3 +423,22 @@ unchanged, and refuses unless that holder holds the tick lock.
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
+
+### Report deadlines
+
+Each goal owes its own report every 2 hours, counted from its newest valid
+report or, with none, from when the goal was opened. A valid report is a
+comment on that goal's home that starts with the report marker, from a
+`LOOM_BRIEF_AUTHORS` login when that is set. A marker inside another
+comment, a journal, or a report on another goal (a parent goal included)
+does not move the deadline: a parent's report never covers its child goals.
+
+`python3 -m bus.brain status` shows, per goal, when it last had a journal, a
+valid report, a measurement (a journal or report with a `Measure:` line that
+is not none) and a completed action (a `Shipped:` line that is not none),
+and its report state: ok, due (2 hours past), or overdue (one more tick,
+30 minutes, past that). Due and overdue goals are listed under "Reports
+owed before unlock"; the tick posts those reports before it unlocks. An
+overdue report is a missed deadline only: it is separate from a report the
+station could not forward and from a brain that stopped ticking, which the
+station reports on its own.

@@ -50,6 +50,10 @@ _Avoid_: heartbeat, dashboard
 The usage a lane's inference source still allows before its limit, window or credit runs out.
 _Avoid_: budget, allowance
 
+**Validation contract**:
+A repo's `.loom/validation.conf`: the interpreter, submodules, setup and check its CI uses, which the runner prepares before the agent and runs again on the agent's commit; only a passing check opens the pull request.
+_Avoid_: test config, CI file
+
 **Transcript**:
 The full record of one agent session on one brief: the brief, the agent's messages and every tool call with its result.
 _Avoid_: log, chat history

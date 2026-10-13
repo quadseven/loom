@@ -67,6 +67,63 @@ class BrainTests(unittest.TestCase):
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
 
+    def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"},
+                 {"number": 2, "title": "Stale", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"}]
+        bot = {"login": "brain-bot"}
+        g1 = [{"body": "<!-- loom:journal v1 -->\n- Measure: p95 2s\n- Shipped: #5", "createdAt": "2030-01-01T19:45:00Z", "author": bot},
+              {"body": "<!-- loom:report v1 -->\n- Measure: p95 2s", "createdAt": "2030-01-01T19:00:00Z", "author": bot}]
+        g2 = [{"body": "<!-- loom:journal v1 -->\n- Shipped: none", "createdAt": "2030-01-01T19:50:00Z", "author": bot},
+              {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T14:26:00Z", "author": bot}]
+        gh = GitHub("t", transport=Fake(
+            reply(200, goals), reply(200, []),
+            reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
+            reply(200, [])))
+        report = brain.status(gh, [REPO], REPO, env={}, now=now, authors=["brain-bot"])
+        self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
+                      "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
+        self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T14:26:00Z, "
+                      "measure none, action none - report overdue (due 2030-01-01T16:26:00Z)", report)
+        owed = report.split("### Reports owed before unlock")[1].split("###")[0]
+        self.assertIn("#2 report OVERDUE since 2030-01-01T16:26:00Z", owed)
+        self.assertNotIn("#1", owed)
+
+    def test_only_a_marked_report_on_the_goal_advances_its_deadline(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        issue = {"number": 3, "created_at": "2030-01-01T17:00:00Z"}
+        bot = {"login": "brain-bot"}
+        ignored = [
+            {"body": "<!-- loom:journal v1 -->\nquoting <!-- loom:report v1 -->", "createdAt": "2030-01-01T19:55:00Z", "author": bot},
+            {"body": "Summary\n<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:56:00Z", "author": bot},
+            {"body": "<!-- loom:report v1 -->\nfrom a stranger", "createdAt": "2030-01-01T19:57:00Z", "author": {"login": "stranger"}},
+        ]
+        led = brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, now, ["brain-bot"])
+        self.assertNotIn("report", led)
+        self.assertEqual((led["state"], led["due"]), ("overdue", "2030-01-01T19:00:00Z"))
+        earlier = brain.datetime(2030, 1, 1, 19, 15, tzinfo=brain.timezone.utc)
+        self.assertEqual(brain.goal_ledger(issue, {"comments": {"nodes": ignored}}, earlier, ["brain-bot"])["state"], "due")
+        marked = ignored + [{"body": "<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:58:00Z", "author": bot}]
+        led = brain.goal_ledger(issue, {"comments": {"nodes": marked}}, now, ["brain-bot"])
+        self.assertEqual((led["report"], led["state"], led["due"]),
+                         ("2030-01-01T19:58:00Z", "ok", "2030-01-01T21:58:00Z"))
+
+    def test_goal_without_any_stamp_is_unknown_not_young(self):
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        led = brain.goal_ledger({"number": 4}, {"comments": {"nodes": []}}, now)
+        self.assertEqual((led["state"], led["due"]), ("unknown", None))
+
+    def test_report_deadline_changes_state_at_due_and_grace(self):
+        last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
+        due = last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        grace = brain.timedelta(seconds=brain.REPORT_GRACE)
+        for now, state in ((due - brain.timedelta(seconds=1), "ok"),
+                           (due, "due"),
+                           (due + grace - brain.timedelta(seconds=1), "due"),
+                           (due + grace, "overdue")):
+            with self.subTest(now=now):
+                self.assertEqual(brain._report_deadline(last, now), (due, state))
+
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
@@ -837,6 +894,84 @@ def item(number, body=BODY, labels=(), **extra):
            "labels": [{"name": name} for name in labels]}
     out.update(extra)
     return out
+
+
+def rung_marker(n, login="example-brain"):
+    return {"body": "<!-- loom:rung %d -->\nmoved" % n, "created_at": "2030-01-01T00:00:00Z",
+            "user": {"login": login}}
+
+
+class PastLastRungTests(unittest.TestCase):
+    BOT = {"__typename": "Bot", "login": "grug-tribe"}
+
+    def report(self, comments9, comments10=(), threads=(), env=None):
+        past = dict(stuck_ticket("failed"), title="Past", created_at="2030-01-01T00:00:00Z")
+        rung2 = dict(stuck_ticket("failed"), number=10, title="Rung two")
+        node = dict(ready_node(threads=[]), mergeable="CONFLICTING",
+                    rulingThreads={"nodes": list(threads)})
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [past, rung2]),
+                  ("GET", "/issues/9/events"): reply(200, []),
+                  ("GET", "/issues/9/comments"): reply(200, list(comments9)),
+                  ("GET", "/issues/10/events"): reply(200, []),
+                  ("GET", "/issues/10/comments"): reply(200, list(comments10)),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                      {"number": 4, "title": "PR", "head": {"ref": "loom/9-work"}},
+                      {"number": 5, "title": "PR2", "head": {"ref": "loom/10-work"}}]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p4": node, "p5": node}}})}
+        routes.update(lanes_routes(()))
+        fake = Routed(routes)
+        env = {"LOOM_BRIEF_AUTHORS": "example-brain"} if env is None else env
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=env)
+        section = report.split(brain.PAST_RUNG_HEADING, 1)[1].split("\n#", 1)[0]
+        query = [c[2]["query"] for c in fake.calls if c[1].endswith("/graphql")][0]
+        return section, query
+
+    def test_status_lists_a_ticket_past_rung_3_with_its_answered_high_thread(self):
+        answered = {"isResolved": False, "comments": {"nodes": [
+            {"databaseId": 71, "author": self.BOT, "body": "high | correctness | the cache is never cleared\nmore"},
+            {"author": {"__typename": "User", "login": "example-brain"},
+             "body": "Lane codex answered this finding instead of changing the code:\n\n"
+                     "> The cache is cleared in reset().\n> See line 40."}]}}
+        person = {"isResolved": False, "comments": {"nodes": [
+            {"databaseId": 72, "author": {"__typename": "User", "login": "example-reviewer"}, "body": "why this?"}]}}
+        done = {"isResolved": True, "comments": {"nodes": [{"author": self.BOT, "body": "low | old"}]}}
+        section, query = self.report([rung_marker(1), rung_marker(2), rung_marker(3)],
+                                     [rung_marker(1), rung_marker(2)], [answered, person, done])
+        lines = [l for l in section.splitlines() if l.strip()]
+        self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable conflicting - 2 unresolved threads")
+        self.assertEqual(lines[1], "  - high, comment 71: high | correctness | the cache is never cleared - "
+                                   "lane answer: The cache is cleared in reset(). See line 40.")
+        self.assertEqual(lines[2], "  - comment 72 opened by a person, never resolved by a ruling: why this?")
+        self.assertNotIn("#10", section)
+        self.assertEqual(len(lines), 3)
+        # Only the past-rung ticket's pull request asks for the extra fields.
+        self.assertIn("p4: pullRequest(number:4) { %s%s }" % (brain.READY_FIELDS, brain.RULING_FIELDS), query)
+        self.assertIn("p5: pullRequest(number:5) { %s }" % brain.READY_FIELDS, query)
+
+    def test_restarted_or_untrusted_ladders_are_not_past_the_last_rung(self):
+        restarted = [rung_marker(1), rung_marker(2), rung_marker(3), rung_marker(0)]
+        stranger = [rung_marker(1, "example-stranger"), rung_marker(2, "example-stranger"),
+                    rung_marker(3, "example-stranger")]
+        for name, comments in (("restarted", restarted), ("stranger", stranger)):
+            with self.subTest(name):
+                section, _ = self.report(comments)
+                self.assertNotIn("#9", section)
+
+    def test_an_unanswered_finding_says_so(self):
+        thread = {"isResolved": False, "comments": {"nodes": [
+            {"databaseId": 73, "author": self.BOT, "body": "**critical** | security | token logged"}]}}
+        section, _ = self.report([rung_marker(1), rung_marker(2), rung_marker(3)], threads=[thread])
+        self.assertIn("  - critical, comment 73: **critical** | security | token logged - no lane answer", section)
+
+    def test_muse_names_the_section_status_prints(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "MUSE.md"), encoding="utf-8") as f:
+            muse = f.read()
+        heading = brain.PAST_RUNG_HEADING.lstrip("# ")
+        self.assertIn('"%s"' % heading, muse)
+        step = muse.split('"%s"' % heading, 1)[1].split("\n6. ", 1)[0]
+        self.assertIn("up to 3", step)
+        self.assertIn("never resolve a thread a person opened", " ".join(step.lower().split()))
 
 
 class Routes:

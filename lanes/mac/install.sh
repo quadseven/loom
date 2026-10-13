@@ -3,7 +3,8 @@
 #
 #   lanes/mac/install.sh [lane ...]
 #     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark,
-#     plus the extra slots anthropic-2 to anthropic-8, codex-2 and opencode-go-2
+#     plus the extra slots anthropic-2 to anthropic-8, codex-2, opencode-go-2
+#     and opencode-go-3 (which runs LOOM_OPENCODE_GO_3_MODEL)
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
@@ -29,6 +30,7 @@ LOOM_CODEX_MODEL="${LOOM_CODEX_MODEL:-$(sed -nE 's/^[[:space:]]*model[[:space:]]
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1:free}"
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
+LOOM_OPENCODE_GO_3_MODEL="${LOOM_OPENCODE_GO_3_MODEL:-opencode-go/deepseek-v4.1-flash}"
 LOOM_ANTHROPIC_MODEL="${LOOM_ANTHROPIC_MODEL:-claude-sonnet-5-5}"
 LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/space-bunny-free}"
 LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
@@ -36,7 +38,7 @@ LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwe
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
 LOOM_SPARK_URL="${LOOM_SPARK_URL:-}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
-export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_ANTHROPIC_MODEL \
+export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_MODEL
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -50,7 +52,7 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
-  codex-2 opencode-go-2)
+  codex-2 opencode-go-2 opencode-go-3)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
@@ -114,7 +116,8 @@ done
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
 # with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
-# LOOM_DIGEST_HOUR, LOOM_AWS_REGION, and LOOM_DISCORD_CHANNEL_ID,
+# LOOM_DIGEST_HOUR, LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
+# ticket, default 2), and LOOM_DISCORD_CHANNEL_ID,
 # LOOM_DISCORD_BOT_TOKEN_SSM and LOOM_DISCORD_DEFAULT_GOAL (talking to the
 # brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
 # LOOM_ANTHROPIC_BUDGET_SINCE, LOOM_ANTHROPIC_BUDGET_EXPIRES and
@@ -156,6 +159,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_METRICS_GOAL</key><string>$(xml "${LOOM_METRICS_GOAL:-}")</string>
     <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
+    <key>LOOM_RETRY_MAX</key><string>$(xml "${LOOM_RETRY_MAX:-}")</string>
     <key>LOOM_DISCORD_CHANNEL_ID</key><string>$(xml "${LOOM_DISCORD_CHANNEL_ID:-}")</string>
     <key>LOOM_DISCORD_BOT_TOKEN_SSM</key><string>$(xml "${LOOM_DISCORD_BOT_TOKEN_SSM:-}")</string>
     <key>LOOM_DISCORD_DEFAULT_GOAL</key><string>$(xml "${LOOM_DISCORD_DEFAULT_GOAL:-}")</string>
