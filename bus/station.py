@@ -2067,6 +2067,78 @@ class Station:
         ledger["_checked"] = self.now
         _write_json(path, ledger)
 
+    def post_overdue_standups(self) -> None:
+        """Post a data-only report when an open goal has gone overdue."""
+        now = brain.datetime.fromtimestamp(self.now, brain.timezone.utc)
+        authors = [a.lower() for a in self.s.authors]
+        state_path = os.path.join(self.state, "standups.json")
+        state = _read_json(state_path, {})
+        if not isinstance(state, dict):
+            raise StateError("state file %s does not hold an object" % state_path)
+        checked = state.get("_checked")
+        if isinstance(checked, (int, float)) and not isinstance(checked, bool) \
+                and 0 <= self.now - checked < REPORT_CHECK:
+            return
+        state["_checked"] = self.now
+        for repo, goal in self._goal_homes():
+            number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            sent = state.get(key)
+            if isinstance(sent, (int, float)) and not isinstance(sent, bool) \
+                    and 0 <= self.now - sent < brain.REPORT_EVERY:
+                continue
+            comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" %
+                                        (repo, number))
+            node = {"comments": {"nodes": [
+                {"body": c.get("body"), "createdAt": c.get("created_at"),
+                 "author": {"login": tickets._login(c.get("user"))}}
+                for c in comments if isinstance(c, dict)]}}
+            ledger = brain.goal_ledger(goal, node, now, authors)
+            if ledger["state"] != "overdue":
+                continue
+            children = self.gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" %
+                                        (repo, number))
+            children = [i for i in children if isinstance(i, dict)]
+            active = [i for i in children if i.get("state") == "open"
+                      and "loom:ticket" in [x.get("name") for x in i.get("labels", [])]]
+            failed = [i for i in active if "loom:failed" in
+                      [x.get("name") for x in i.get("labels", [])]]
+            aged_pr = [i for i in active if "loom:pr" in
+                      [x.get("name") for x in i.get("labels", [])]
+                      and (self._epoch(str(i.get("created_at") or "")) is not None)
+                      and self.now - self._epoch(str(i.get("created_at") or ""))
+                      > factory.STUCK_AGE]
+            stuck = failed + aged_pr
+            in_flight = [i for i in active if any(x in
+                         [y.get("name") for y in i.get("labels", [])]
+                         for x in ("loom:queued", "loom:briefed", "loom:running", "loom:pr"))]
+            asks = [i for i in active if any(x in
+                    [y.get("name") for y in i.get("labels", [])]
+                    for x in (NEEDS_OPERATOR, HUMAN))]
+            merged = [i for i in children if "loom:merged" in
+                      [x.get("name") for x in i.get("labels", [])]]
+            verified = [i for i in children if "loom:verified" in
+                        [x.get("name") for x in i.get("labels", [])]]
+            sent_back = [i for i in children if "loom:shipped" in
+                         [x.get("name") for x in i.get("labels", [])]]
+
+            def rows(items: List[Dict[str, Any]]) -> str:
+                return ", ".join("#%s %s" % (i.get("number"),
+                    " ".join(str(i.get("title") or "").split())) for i in items) or "none"
+
+            body = "\n".join([REPORT_MARKER, "Written by the station from ticket data.",
+                "", "### Going well", "Merged: %s. Verified: %s. Sent back: %s." %
+                (rows(merged), rows(verified), rows(sent_back)), "",
+                "### Not going well", "Failed: %s." % rows(failed), "",
+                "### Still stuck", "Past the stuck age in PR: %s." % rows(aged_pr), "",
+                "### Next", "In flight: %s." % rows(in_flight), "",
+                "### Needs you", "Open asks: %s." % rows(asks)])
+            brain._check_written_text(body)
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                         {"body": body})
+            state[key] = self.now
+        _write_json(state_path, state)
+
     # -- the brain -------------------------------------------------------
     def _brain(self) -> Optional[Tuple[Dict[str, Any], Optional[float]]]:
         """The last brain tick (lanes/mac/brain.sh) and when a tick last ended
@@ -2488,7 +2560,8 @@ class Station:
         except (GitHubError, OSError, ValueError) as err:
             _say("hand_back failed: %s" % err)
         self.claim_new()
-        for step in (self.publish_lanes, self.forward_asks, self.forward_reports,
+        for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+                     self.forward_reports,
                      self.watch_brain, self.relay_operator, self.run_factory,
                      self.prune_trees):
             try:

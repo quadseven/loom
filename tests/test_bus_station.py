@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import spend, station, tickets  # noqa: E402
+from bus import brain, spend, station, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -58,6 +58,7 @@ class FakeGitHub:
         self.page_error = False
         self.page_reply = None
         self.goals = []
+        self.sub_issues = {}
         self.goal_error = False
         self.private = True
         self.threads = {}
@@ -225,6 +226,8 @@ class FakeGitHub:
 
     def _issue_call(self, method, n, sub, data):
         if method == "GET":
+            if sub == "sub_issues":
+                return reply(200, self.sub_issues.get(n, []))
             if sub == "events" and n not in self.issues:
                 return reply(200, self.events[n])
             found = {None: self.issues, "events": self.events, "comments": self.comments}
@@ -2151,6 +2154,53 @@ class ReportsTest(Base):
         self.assertLessEqual(len(content), station.DISCORD_MAX)
         self.assertTrue(content.endswith("https://github.com/%s/issues/40#issuecomment-100" % REPO))
         self.assertTrue(content.splitlines()[-2] == "line")
+
+    def test_station_posts_an_overdue_data_only_standup_once(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        self.fake.sub_issues[40] = [
+            {"number": 41, "title": "Merged task", "state": "closed",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]},
+            {"number": 42, "title": "Open task", "state": "open",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
+        ]
+        self.clock = time.time()
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.clock)
+        st.post_overdue_standups()
+        st.post_overdue_standups()
+        made = [c for c in self.fake.comments[40] if str(c.get("body", "")).startswith(
+            station.REPORT_MARKER)]
+        self.assertEqual(len(made), 2)
+        body = made[-1]["body"]
+        for heading in ("### Going well", "### Not going well", "### Still stuck",
+                        "### Next", "### Needs you"):
+            self.assertIn(heading, body)
+        self.assertIn("#41 Merged task", body)
+        self.assertIn("#42 Open task", body)
+        brain._check_written_text(body)
+
+    def test_station_standup_says_nothing_in_flight_without_tickets(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        self.assertIn("In flight: none.", self.fake.comments[40][-1]["body"])
+
+    def test_station_does_not_post_for_a_fresh_report(self):
+        self.add_goal()
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nfresh report")
+        self.fake.comments[40][0]["created_at"] = fresh
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 1)
 
 
 
