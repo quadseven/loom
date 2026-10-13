@@ -107,13 +107,14 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
 TIERS: Dict[str, Tuple[str, ...]] = {
-    "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "openrouter", "workersai",
+    "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai",
              "zen", "zai", "agy"),
-    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3") + ANTHROPIC,
+    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC,
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
 # Lanes whose provider may train on prompts: public repos only.
-PUBLIC_ONLY = ("zen", "zai", "agy")
+# opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
+PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.

@@ -190,7 +190,7 @@ class LabelTests(unittest.TestCase):
             {"name": "needs-operator", "color": "000000", "description": "x"},  # foreign: untouched
             {"name": "bug", "color": "ffffff", "description": None},            # foreign
         ]
-        replies = [reply(200, existing)] + [reply(201, {})] * 40
+        replies = [reply(200, existing)] + [reply(201, {})] * (len(labels.LABELS) + 5)
         t = Scripted(*replies)
         gh = GitHub("tok", transport=t)
         changed = labels.ensure_labels(gh, REPO)
@@ -210,7 +210,7 @@ class LabelTests(unittest.TestCase):
 
     def test_foreign_label_with_other_prefix_never_patched(self):
         existing = [{"name": "needs-operator", "color": "111111", "description": "mine"}]
-        t = Scripted(reply(200, existing), *[reply(201, {})] * 40)
+        t = Scripted(reply(200, existing), *[reply(201, {})] * (len(labels.LABELS) + 5))
         labels.ensure_labels(GitHub("tok", transport=t), REPO)
         self.assertFalse([c for c in t.calls if c[0] == "PATCH"])
 

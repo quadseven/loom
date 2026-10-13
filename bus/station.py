@@ -409,6 +409,13 @@ def _read_json(path: str, default: Any, strict: bool = True) -> Any:
         return default
 
 
+def _after_first_line(text: str) -> str:
+    """The text after its first non-empty line, leading blank lines dropped."""
+    lines = text.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.lstrip("#").strip()), len(lines))
+    return "\n".join(lines[first + 1:]).strip("\n")
+
+
 def _write_json(path: str, data: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -2005,13 +2012,17 @@ class Station:
         # the line is never posted twice.
         msg_id = str(made.get("id") or "") if isinstance(made, dict) else ""
         where = self._report_thread(token, msg_id, name) if msg_id.isdigit() else ""
-        if not where:
+        if where:
+            # The line already shows the report's first line; the thread
+            # starts after it, so Discord's preview never repeats it.
+            body = _after_first_line(body)
+        else:
             # No thread: the full report goes in the channel, so it is never
             # lost behind a line that does not expand.
             _say("no thread for the report line; the full report goes in the channel")
             where = chan
         link = self._report_link(issue, comment)
-        for part in self._chunks(body + ("\n" + link if link else "")):
+        for part in self._chunks((body + "\n" + link if body else link) if link else body):
             ok, _ = self._bot(token, "POST", "/channels/%s/messages" % where, {
                 "content": part, "allowed_mentions": {"parse": []}})
             if not ok:
@@ -2057,6 +2068,7 @@ class Station:
         for ident, issue, comment in comments:
             if ident <= last_id:
                 continue
+            sent = False
             author = str((comment.get("user") or {}).get("login") or "").lower()
             if author in allowed:
                 if not secret_checked:
@@ -2069,8 +2081,15 @@ class Station:
                 if not send(issue, comment):
                     _write_json(path, ledger)
                     return False
+                sent = True
             ledger[key] = ident
             last_id = ident
+            if sent:
+                # The report is out: persist the position before the next
+                # comment, so a pass killed here (the installer restarted the
+                # station mid-pass, 2026-10-13) re-sends nothing already sent.
+                # The whole file is written atomically by _write_json.
+                _write_json(path, ledger)
         return True
 
     def _report_window(self, checked: Any) -> Optional[str]:
@@ -2146,51 +2165,65 @@ class Station:
             return
         children = self.gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" %
                                     (repo, number))
-        body = self._overdue_standup_body(children)
+        body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")))
         brain._check_written_text(body)
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                      {"body": body})
         state[key] = self.now
 
-    def _overdue_standup_body(self, children: List[Any]) -> str:
-        groups = self._standup_ticket_groups(children)
+    def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None) -> str:
+        groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
-
-        return "\n".join([REPORT_MARKER, "Written by the station from ticket data.",
-            "", "### Going well", "Merged: %s. Verified: %s. Sent back: %s." %
+        counts = [(len(groups[k]), word) for k, word in (
+            ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
+            ("failed", "failed"), ("aged_pr", "stuck"), ("in_flight", "in flight"),
+            ("asks", "waiting on you"))]
+        summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
+        first = ("%s since the last report." % summary) if summary else "Nothing moved since the last report."
+        return "\n".join([REPORT_MARKER, first,
+            "", "### Going well", "Merged: %s. Verified: %s. Shipped: %s." %
             (rows(groups["merged"]), rows(groups["verified"]),
              rows(groups["sent_back"])), "",
             "### Not going well", "Failed: %s." % rows(groups["failed"]), "",
             "### Still stuck", "Past the stuck age in PR: %s." %
             rows(groups["aged_pr"]), "",
             "### Next", "In flight: %s." % rows(groups["in_flight"]), "",
-            "### Needs you", "Open asks: %s." % rows(groups["asks"])])
+            "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
+            "Written by the station from ticket data, because no brain reported in time."])
 
-    def _standup_ticket_groups(self, children: List[Any]) -> Dict[str, List[Dict[str, Any]]]:
+    def _standup_ticket_groups(self, children: List[Any], since: Optional[float] = None
+                               ) -> Dict[str, List[Dict[str, Any]]]:
+        """Tickets by standup heading. Merged, verified and shipped count only
+        tickets updated since the last report, so a standup says what changed."""
         groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
             "merged", "verified", "sent_back", "failed", "aged_pr", "in_flight", "asks")}
         for issue in children:
-            if not isinstance(issue, dict):
-                continue
-            labels = {label.get("name") for label in issue.get("labels", [])}
-            for label, group in (("loom:merged", "merged"),
-                                 ("loom:verified", "verified"),
-                                 ("loom:shipped", "sent_back")):
-                if label in labels:
+            if isinstance(issue, dict):
+                for group in self._standup_groups_of(issue, since):
                     groups[group].append(issue)
-            if issue.get("state") != "open" or "loom:ticket" not in labels:
-                continue
-            if "loom:failed" in labels:
-                groups["failed"].append(issue)
-            if "loom:pr" in labels:
-                created = self._epoch(str(issue.get("created_at") or ""))
-                if created is not None and self.now - created > factory.STUCK_AGE:
-                    groups["aged_pr"].append(issue)
-            if labels.intersection(("loom:queued", "loom:briefed", "loom:running", "loom:pr")):
-                groups["in_flight"].append(issue)
-            if labels.intersection((NEEDS_OPERATOR, HUMAN)):
-                groups["asks"].append(issue)
         return groups
+
+    def _standup_groups_of(self, issue: Dict[str, Any], since: Optional[float]) -> List[str]:
+        """The standup headings one ticket belongs under."""
+        labels = {label.get("name") for label in issue.get("labels", [])}
+        updated = self._epoch(str(issue.get("updated_at") or ""))
+        recent = since is None or (updated is not None and updated >= since)
+        found = [group for label, group in (("loom:merged", "merged"),
+                                            ("loom:verified", "verified"),
+                                            ("loom:shipped", "sent_back"))
+                 if label in labels and recent]
+        if issue.get("state") != "open" or "loom:ticket" not in labels:
+            return found
+        created = self._epoch(str(issue.get("created_at") or ""))
+        aged = created is not None and self.now - created > factory.STUCK_AGE
+        for group, hit in (("failed", "loom:failed" in labels),
+                           ("aged_pr", "loom:pr" in labels and aged),
+                           ("in_flight", bool(labels & {"loom:queued", "loom:briefed",
+                                                        "loom:running", "loom:pr"})),
+                           ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):
+            if hit:
+                found.append(group)
+        return found
 
     @staticmethod
     def _standup_rows(items: List[Dict[str, Any]]) -> str:
@@ -2719,6 +2752,12 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         except OSError:
             _say("another pass is running")
             return 0
+        # Record this pass's pid in the lock file while we hold it, so the
+        # installer can see a pass is in flight (lanes/mac/lock.sh
+        # station_busy) and wait before booting the station out mid-pass.
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
         if gh is None:
             from .github import token_from_env
             gh = GitHub(token_from_env())
