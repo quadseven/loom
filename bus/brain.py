@@ -97,6 +97,33 @@ def _field_set(body: str, name: str) -> bool:
     return bool(match and match.group(1).strip().lower() not in ("", "none"))
 
 
+def _comment_kinds(body: str) -> List[str]:
+    """What a goal comment records: a journal or a report, and with either,
+    a measurement and a completed action when those fields are set."""
+    if body.startswith(JOURNAL_MARKER):
+        kinds = ["journal"]
+    elif body.startswith(REPORT_MARKER):
+        kinds = ["report"]
+    else:
+        return []
+    if _field_set(body, "Measure"):
+        kinds.append("measure")
+    if _field_set(body, "Shipped"):
+        kinds.append("action")
+    return kinds
+
+
+def _report_deadline(last: Optional[datetime], now: datetime) -> Tuple[datetime, str]:
+    """The next report deadline counted from `last`, and whether it is ok,
+    due, or overdue at `now`."""
+    due = (last or now) + timedelta(seconds=REPORT_EVERY)
+    if now >= due + timedelta(seconds=REPORT_GRACE):
+        return due, "overdue"
+    if now >= due:
+        return due, "due"
+    return due, "ok"
+
+
 def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
                 now: datetime, authors: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """When the goal last had a journal, a valid report, a measurement and a
@@ -111,28 +138,12 @@ def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
     for c in ((node or {}).get("comments") or {}).get("nodes") or []:
         login = str((c.get("author") or {}).get("login") or "").lower()
         at = str(c.get("createdAt") or "")
-        body = str(c.get("body") or "")
         if _stamp(at) is None or (allowed is not None and login not in allowed):
             continue
-        kinds = []
-        if body.startswith(JOURNAL_MARKER):
-            kinds.append("journal")
-        elif body.startswith(REPORT_MARKER):
-            kinds.append("report")
-        if kinds and _field_set(body, "Measure"):
-            kinds.append("measure")
-        if kinds and _field_set(body, "Shipped"):
-            kinds.append("action")
-        for kind in kinds:
+        for kind in _comment_kinds(str(c.get("body") or "")):
             seen[kind] = max(seen.get(kind, ""), at)
-    start = _stamp(seen.get("report", "")) or _stamp(str(issue.get("created_at") or "")) or now
-    due = start + timedelta(seconds=REPORT_EVERY)
-    if now >= due + timedelta(seconds=REPORT_GRACE):
-        state = "overdue"
-    elif now >= due:
-        state = "due"
-    else:
-        state = "ok"
+    last = _stamp(seen.get("report", "")) or _stamp(str(issue.get("created_at") or ""))
+    due, state = _report_deadline(last, now)
     return dict(seen, due=_iso(due), state=state)
 
 
