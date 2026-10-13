@@ -11,7 +11,7 @@ from unittest import mock
 from datetime import datetime, timezone
 
 from bus import metrics, station
-from bus.github import GitHubError
+from bus.github import GitHubError, Response
 
 REPO = "example-owner/example-repo"
 NOW = datetime(2030, 1, 2, 17, tzinfo=timezone.utc).timestamp()
@@ -119,7 +119,7 @@ class MetricsTest(unittest.TestCase):
                 self.assertFalse(self.numbers()[index].passed)
 
     def test_check_runs_reply_without_a_body_counts_as_no_review(self):
-        self.gh.rest = lambda method, path, body=None: type("Response", (), {"data": None})()
+        self.gh.rest = lambda method, path, body=None: Response(200, None)
         self.assertFalse(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
 
     def test_a_torn_slot_sample_line_is_skipped(self):
