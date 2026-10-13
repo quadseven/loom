@@ -1031,8 +1031,12 @@ cat > /dev/null
 
     def test_opencode_temp_paths_and_external_directory_denial_keep_the_sandbox_boundary(self):
         profile_file = self._tmp.name + "/sandbox.profile"
-        self.write_tool(self.bin / "sandbox-exec", "#!/bin/sh\nprintf '%s' \"$2\" > " +
-                        shlex.quote(profile_file) + "\nshift 2\nexec \"$@\"\n")
+        self.write_tool(
+            self.bin / "sandbox-exec",
+            "#!/bin/sh\n[ \"$1\" = -p ] || exit 91\nprintf '%s' \"$2\" > "
+            + shlex.quote(profile_file)
+            + "\nshift 2\nexec \"$@\"\n",
+        )
         inbox = self.loom / "briefs" / "opencode-go"
         inbox.mkdir(parents=True)
         (inbox / "T042-fix-the-thing.md").write_text(
