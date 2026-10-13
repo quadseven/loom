@@ -4,6 +4,7 @@ the remote, and fake agent and gh commands on PATH that record their calls."""
 import json
 import os
 import signal
+import shlex
 import shutil
 import socket
 import subprocess
@@ -413,6 +414,100 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
                                    "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def advance_main(self, name, text):
+        """A commit on the remote's default branch after the PR branch left it."""
+        work = Path(self._tmp.name) / "main-work"
+        git("clone", "-q", str(self.remote), str(work))
+        (work / name).write_text(text)
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "Main moves", cwd=work)
+        git("push", "-q", "origin", "main", cwd=work)
+
+    def remote_file(self, ref, name):
+        return subprocess.run(["git", "--git-dir", str(self.remote), "show", "%s:%s" % (ref, name)],
+                              capture_output=True, text=True).stdout
+
+    def parents(self, ref):
+        return subprocess.run(["git", "--git-dir", str(self.remote), "rev-list", "--parents", "-n", "1", ref],
+                              capture_output=True, text=True, check=True).stdout.split()[1:]
+
+    # The agent sees the brief as its last argument; these record what it saw.
+    AGENT_NOTHING = """#!/usr/bin/env bash
+case "$*" in *"conflicts in: first.txt"*) echo "agent saw conflicts" >> "$FAKE_LOG" ;; esac
+cat > /dev/null
+"""
+
+    def test_a_fix_brief_merges_a_moved_default_branch_even_with_no_agent_change(self):
+        name, before = self.fix_brief()
+        self.advance_main("main.txt", "main moved\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertEqual(self.remote_file(after, "main.txt"), "main moved\n")
+        self.assertEqual(self.remote_file(after, "first.txt"), "first try\n")
+        self.assertEqual(len(self.parents(after)), 2)
+        self.assertIn(before, self.parents(after))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_conflict_goes_to_the_agent_and_the_runner_completes_the_merge(self):
+        name, before = self.fix_brief()
+        self.advance_main("first.txt", "main's version\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "printf 'both kept\\n' > first.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent saw conflicts", self.calls())
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertEqual(self.remote_file(after, "first.txt"), "both kept\n")
+        self.assertEqual(len(self.parents(after)), 2)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_conflict_in_a_path_with_a_space_is_found_whole(self):
+        name, before = self.fix_brief()
+        work = Path(self._tmp.name) / "space-work"
+        git("clone", "-q", "-b", self.FIX_BRANCH, str(self.remote), str(work))
+        (work / "my notes.txt").write_text("branch side\n")
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "notes", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        self.advance_main("my notes.txt", "main side\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        self.run_lane()
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertIn("conflict markers left in my notes.txt",
+                      (self.loom / "logs" / "codex" / (name + ".log")).read_text())
+
+    def test_a_merge_base_past_the_fetch_depth_is_found_by_unshallowing(self):
+        name, before = self.fix_brief()
+        work = Path(self._tmp.name) / "deep-work"
+        git("clone", "-q", str(self.remote), str(work))
+        for i in range(210):
+            git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                "commit", "-q", "--allow-empty", "-m", "main %d" % i, cwd=work)
+        (work / "deep.txt").write_text("deep\n")
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "deep", cwd=work)
+        git("push", "-q", "origin", "main", cwd=work)
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.remote_head(self.FIX_BRANCH)
+        self.assertEqual(self.remote_file(after, "deep.txt"), "deep\n")
+        self.assertIn(before, self.parents(after))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_conflict_markers_left_by_the_agent_park_the_brief(self):
+        name, before = self.fix_brief()
+        self.advance_main("first.txt", "main's version\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertIn("conflict markers left in first.txt",
+                      (self.loom / "logs" / "codex" / (name + ".log")).read_text())
 
     def test_a_fix_brief_whose_pull_request_closed_is_parked_unrun(self):
         name, before = self.fix_brief()
@@ -835,6 +930,92 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertFalse(beat["available"])
         self.assertNotIn("unknown lane", beat["reason"])  # mapped to the anthropic lane
         self.assertFalse((self.loom / "state" / "usage" / "anthropic.json").exists())
+
+    # The anthropic lane's claude: records its argv in TMPDIR (its environment
+    # is emptied), edits the tree, writes a warning to stderr, and prints
+    # what it is given on stdout (the CLI's JSON result, or nothing).
+    def fake_claude(self, stdout, code=0):
+        self.write_tool(self.bin / "claude", """#!/usr/bin/env bash
+args="$*"; args="${args//$'\\n'/ }"
+printf 'claude %%s\\n' "$args" >> "$TMPDIR/agent.log"
+echo fixed > fix.txt
+echo "a warning on stderr" >&2
+printf '%%s' %s
+exit %d
+""" % (shlex.quote(stdout), code))
+
+    def anthropic_run(self, slot="anthropic", **env):
+        return self.api_lane(slot, **{"LOOM_ANTHROPIC_KEY_SSM": "/k/an",
+                                      "FAKE_SECRET__k_an": "fake-an-key",
+                                      "LOOM_ANTHROPIC_MODEL": "claude-test", **env})
+
+    def spend_lines(self):
+        path = self.loom / "state" / "usage" / "spend.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_an_anthropic_run_records_its_cost_from_the_json_result(self):
+        self.fake_claude(json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": "All done: the thing works.", "total_cost_usd": 0.4321,
+            "usage": {"input_tokens": 12, "output_tokens": 345,
+                      "cache_creation_input_tokens": 600, "cache_read_input_tokens": 7000},
+        }) + "\n")
+        inbox, result = self.anthropic_run("anthropic-3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("claude ")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("-p --output-format json --model claude-test", agent[0])
+        [line] = self.spend_lines()
+        self.assertEqual(line["cost_usd"], 0.4321)
+        self.assertEqual((line["slot"], line["ticket"], line["model"]),
+                         ("anthropic-3", "T042-fix-the-thing", "claude-test"))
+        self.assertEqual((line["input_tokens"], line["output_tokens"],
+                          line["cache_creation_input_tokens"], line["cache_read_input_tokens"]),
+                         (12, 345, 600, 7000))
+        self.assertGreater(line["at"], time.time() - 120)
+        # The lane log keeps the human-readable result, not the raw JSON.
+        log = (self.loom / "logs" / "anthropic-3" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("All done: the thing works.", log)
+        self.assertIn("a warning on stderr", log)
+        self.assertNotIn("total_cost_usd", log)
+        self.assertEqual(list((self.loom / "logs" / "anthropic-3").glob("*.result")), [])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_an_anthropic_run_without_a_result_records_unknown_cost_not_zero(self):
+        self.fake_claude("killed before the result\n", code=3)
+        inbox, result = self.anthropic_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [line] = self.spend_lines()
+        self.assertIsNone(line["cost_usd"])
+        self.assertEqual(line["ticket"], "T042-fix-the-thing")
+        log = (self.loom / "logs" / "anthropic" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("killed before the result", log)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_anthropic_credit_under_the_floor_makes_the_slot_unavailable(self):
+        self.fake_claude("")
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        (usage / "spend.jsonl").write_text(
+            json.dumps({"at": 1000, "slot": "anthropic", "cost_usd": 50.0}) + "\n"
+            + json.dumps({"at": int(time.time()) - 60, "slot": "anthropic-2", "cost_usd": 6.5}) + "\n")
+        since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400))
+        inbox, result = self.anthropic_run("anthropic-2", LOOM_ANTHROPIC_BUDGET_USD="10",
+                                           LOOM_ANTHROPIC_BUDGET_SINCE=since)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((usage / "anthropic-2.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("remaining $3.50 is under the floor of $5.00", beat["reason"])
+        self.assertFalse(any(c.startswith(("claude ", "aws ")) for c in self.calls()))
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        # Above the floor (a lower floor here) the slot is available again.
+        self.run_lane("anthropic-2", LOOM_ANTHROPIC_BUDGET_USD="10",
+                      LOOM_ANTHROPIC_BUDGET_SINCE=since, LOOM_ANTHROPIC_FLOOR_USD="2",
+                      LOOM_ANTHROPIC_KEY_SSM="/k/missing")
+        beat = json.loads((usage / "anthropic-2.json").read_text())
+        self.assertNotIn("floor", beat["reason"])
 
     def test_a_codex_slot_runs_its_brief_with_codex(self):
         slot = self.loom / "briefs" / "codex-2"
