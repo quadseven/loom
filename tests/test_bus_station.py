@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import calendar
+import contextlib
 import fcntl
+import io
 import json
 import os
 import re
@@ -50,6 +52,10 @@ class FakeGitHub:
         self.edits = []
         self.posts = []
         self.asks = []
+        self.digest_issues = []
+        self.pages = []
+        self.page_error = False
+        self.page_reply = None
         self.goals = []
         self.goal_error = False
         self.private = True
@@ -73,10 +79,10 @@ class FakeGitHub:
         return reply(200, self.asks, {"ETag": etag})
 
     def add_ask(self, number, title="Need a decision", author="alice-example",
-                labeller="alice-example", urgent=False):
+                labeller="alice-example", urgent=False, body="", created="2030-01-01T00:00:00Z"):
         labels = [{"name": "needs-operator"}] + ([{"name": "loom:urgent"}] if urgent else [])
         self.asks.append({"number": number, "title": title, "user": {"login": author},
-                          "labels": labels, "created_at": "2030-01-01T00:00:00Z",
+                          "labels": labels, "created_at": created, "body": body,
                           "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
         self.events[number] = [labeled("needs-operator", labeller)]
 
@@ -114,6 +120,8 @@ class FakeGitHub:
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
+        if rest == "issues/900/comments" and method == "POST":
+            return self._post_page(data)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
@@ -124,9 +132,21 @@ class FakeGitHub:
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
 
+    def _post_page(self, data):
+        if self.page_error:
+            return reply(502, {"message": "down"})
+        self.pages.append(data["body"])
+        n = len(self.pages)
+        made = {"id": n, "html_url": "https://github.com/%s/issues/900#issuecomment-%d" % (REPO, n)}
+        return reply(201, self.page_reply if self.page_reply is not None else made)
+
     def _issues_and_status(self, method, rest, query, headers, data):
         if method == "GET" and rest == "issues":
             return self._get_issues(query, headers)
+        if method == "POST" and rest == "issues" and data["labels"] == ["loom:digest"]:
+            self.created.append(data)
+            self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
+            return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
@@ -150,6 +170,8 @@ class FakeGitHub:
             return self._get_goals()
         if "loom:lanes" in query:
             return reply(200, self.lanes_issues)
+        if "loom:digest" in query:
+            return reply(200, self.digest_issues)
         return self._list_briefed(headers)
 
     def _get_goals(self):
@@ -1621,12 +1643,12 @@ class AsksTest(Base):
         super().setUp()
         self.settings.webhook_ssm = "/example/webhook"
         self.sent = []
-        self.fail = False
+        self.fail_post = False
         self.read = []
 
     def go(self, now=NOON):
         def post(url, payload):
-            if self.fail:
+            if self.fail_post:
                 raise OSError("down")
             self.sent.append((url, payload))
 
@@ -1709,14 +1731,175 @@ class AsksTest(Base):
 
     def test_a_failed_post_is_retried_next_pass(self):
         self.fake.add_ask(5, urgent=True)
-        self.fail = True
+        self.fail_post = True
         self.go()
         self.assertEqual(self.sent, [])
-        self.fail = False
+        self.fail_post = False
         self.go(NOON + 60)
         self.assertEqual(len(self.sent), 2)  # the urgent ask and the digest
         self.go(NOON + 120)
         self.assertEqual(len(self.sent), 2)
+
+    # The audit's size distribution: 56 open asks, 53 of them trusted, with
+    # titles long enough that only 14 fit in one message.
+    def add_many(self):
+        self.fake.add_goal(30)
+        self.fake.goals[0].update(title="Ship the factory")
+        for n in range(100, 156):
+            title = "Grant the %s permission the lane needs %s" % (
+                "x" * (20 + (n * 7) % 30), "y" * (n % 9))
+            self.fake.add_ask(n, title=title, body="Part of #30." if n % 2 else "",
+                              created="2030-01-%02dT00:00:00Z" % (1 + (n - 100) // 2),
+                              author="stranger" if n in (101, 120, 140) else "alice-example")
+        return [n for n in range(100, 156) if n not in (101, 120, 140)]
+
+    def reachable(self, content):
+        """Ask numbers the notification shows or links to."""
+        found = {int(n) for n in re.findall(r"/issues/(\d+)$", content, re.M)}
+        for i in map(int, re.findall(r"issues/900#issuecomment-(\d+)", content)):
+            found |= {int(n) for n in re.findall(r"^- #(\d+) ", self.fake.pages[i - 1], re.M)}
+        return found
+
+    def ledger(self):
+        with open(os.path.join(self.home, "state", "station", "asks.json")) as fh:
+            return json.load(fh)
+
+    def test_every_trusted_ask_is_reachable_from_one_notification(self):
+        trusted = self.add_many()
+        self.assertEqual(len(trusted), 53)
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        content = self.sent[0][1]["content"]
+        self.assertLessEqual(len(content), station.DISCORD_MAX)
+        self.assertIn("- and ", content)
+        self.assertEqual(self.reachable(content), set(trusted))
+        # The newest asks are the ones shown inline.
+        self.assertIn("/issues/155\n", content)
+        self.assertIn("/issues/154\n", content)
+        self.assertNotIn("/issues/100\n", content)
+        page = self.fake.pages[0]
+        self.assertTrue(page.startswith(station.DIGEST_MARKER))
+        self.assertIn("## Ship the factory (#30)", page)
+        self.assertIn("## Not filed under a goal", page)
+        self.assertLess(page.index("- #103 "), page.index("## Not filed"))
+        self.assertGreater(page.index("- #102 "), page.index("## Not filed"))
+        self.assertEqual(self.fake.created[0]["labels"], ["loom:digest"])
+
+    def test_the_ledger_records_what_was_covered(self):
+        trusted = self.add_many()
+        self.go()
+        ledger = self.ledger()
+        self.assertEqual(sorted(ledger["covered"]),
+                         sorted("%s#%d" % (REPO, n) for n in trusted))
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{12}", v) for v in ledger["covered"].values()))
+        self.assertEqual(ledger["pages"], {REPO: "https://github.com/%s/issues/900#issuecomment-1" % REPO})
+        self.assertNotIn("pending", ledger)
+
+    def test_new_and_changed_asks_lead_the_next_digest(self):
+        self.add_many()
+        self.go()
+        self.fake.add_ask(10, title="A fresh ask", created="2029-01-01T00:00:00Z")
+        self.fake.asks[0]["body"] = "Edited."  # ask 100, the oldest
+        self.go(NOON + 86400)
+        lines = self.sent[1][1]["content"].splitlines()
+        self.assertEqual(lines[0], "Asks waiting for you: 54, 2 new since the last digest")
+        self.assertEqual(sorted(line.rsplit("/", 1)[1] for line in lines[1:3]), ["10", "100"])
+        self.assertEqual(len(self.fake.pages), 2)
+
+    def test_a_retry_sends_the_same_digest(self):
+        self.add_many()
+        self.fail_post = True
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.fake.pages), 1)
+        self.assertIn("pending", self.ledger())
+        self.fake.add_ask(10, title="Arrived after the first try")
+        self.fail_post = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.fake.pages), 1)  # the page is not posted twice
+        content = self.sent[0][1]["content"]
+        self.assertNotIn("Arrived after", content)
+        self.assertNotIn("%s#10" % REPO, self.ledger()["covered"])
+        self.go(NOON + 120)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_page_post_holds_the_digest_not_urgent_asks(self):
+        trusted = self.add_many()
+        self.fake.add_ask(9, title="Breaking now", urgent=True)
+        self.fake.page_error = True
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.go()
+        self.assertEqual([p["content"] for _, p in self.sent],
+                         ["Urgent ask: Breaking now https://github.com/%s/issues/9" % REPO])
+        self.assertIn("daily digest pending: could not post its page", out.getvalue())
+        self.assertIn("pending", self.ledger())
+        self.fake.page_error = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.reachable(self.sent[1][1]["content"]), set(trusted) | {9})
+
+    def test_a_non_object_page_reply_holds_the_digest(self):
+        self.add_many()
+        self.fake.page_reply = []
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.assertIn("pending", self.ledger())
+        self.fake.page_reply = None
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_trust_check_of_an_old_ask_does_not_hold_an_urgent_one(self):
+        from unittest import mock
+        from bus.github import GitHubError
+        self.fake.add_ask(5, title="Old one")
+        self.fake.add_ask(6, title="Breaking now", urgent=True)
+        real = station.Station._ask_trusted
+
+        def flaky(st, repo, issue):
+            if issue["number"] == 5:
+                raise GitHubError("boom", 502)
+            return real(st, repo, issue)
+        with mock.patch.object(station.Station, "_ask_trusted", flaky):
+            self.go()
+        self.assertEqual([p["content"] for _, p in self.sent],
+                         ["Urgent ask: Breaking now https://github.com/%s/issues/6" % REPO])
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_a_small_digest_needs_no_page(self):
+        self.fake.add_ask(5, title="Slow one")
+        self.go()
+        self.assertEqual(self.fake.pages, [])
+        self.assertEqual(self.ledger()["pages"], {})
+
+    def test_a_failed_goal_read_holds_the_digest_until_the_next_pass(self):
+        trusted = self.add_many()
+        ledger_path = os.path.join(self.home, "state", "station", "asks.json")
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"digest": "2030-05-04"}, fh)
+        self.fake.goal_error = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.go()
+        self.assertEqual(self.sent, [])
+        # No plan is fixed on a failed read, so the next pass plans afresh.
+        self.assertTrue(os.path.exists(ledger_path))
+        self.assertNotIn("pending", self.ledger())
+        self.assertIn("could not read the goal homes for the digest", out.getvalue())
+        self.fake.goal_error = False
+        self.go(NOON + 60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+
+    def test_a_goal_with_an_odd_number_does_not_stop_the_digest(self):
+        trusted = self.add_many()
+        self.fake.goals.append({"number": "abc", "title": "Odd"})
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.reachable(self.sent[0][1]["content"]), set(trusted))
+        self.assertIn("Ship the factory (#30)", self.fake.pages[0])
 
 
 class ReportsTest(Base):

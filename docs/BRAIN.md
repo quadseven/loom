@@ -59,6 +59,7 @@ that talks to GitHub about tickets.
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
+| `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 
 A ticket carries exactly one state label. The #35 states are queued,
@@ -301,7 +302,10 @@ exact question or action and what the brain does in each case. The station
 forwards asks to the operator's Discord webhook (URL read from SSM on the
 lane machine, never on Muse's VM): `loom:urgent` asks within a minute, the
 rest as one daily digest. Asks in private repos stay private on GitHub; the
-digest carries only titles and links.
+digest carries only titles and links. When the digest does not fit in one
+message, its full list, grouped by goal, is a comment on the `loom:digest`
+issue in each ask's own repo, and the message links to it. To file an ask
+under its goal, name the goal home in its body (`Part of #N`).
 
 ## The tick
 
