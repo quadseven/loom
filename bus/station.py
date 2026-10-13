@@ -832,7 +832,8 @@ class Station:
         """The next eligible lane: another slot of the failed lane's provider
         (not after a limit, which the slots share), then RETRY_ORDER, then free
         lanes for an easy ticket. Only available lanes whose runner takes the
-        ticket's model and repo; an idle one before a busy one."""
+        ticket's model and repo; an idle one before a busy one. Candidate
+        eligibility is kept in _retry_eligible so this method selects by order."""
         try:
             headers = tickets.parse(issue.get("body"))[0]
         except ValueError:
