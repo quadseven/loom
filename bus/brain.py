@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
-from . import proof, text, tickets
+from . import handoff, lock, proof, text, tickets
 from .labels import ESCALATION, LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -55,14 +55,14 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                     goals: List[Dict[str, Any]]) -> Dict[str, Any]:
     pr_ids = [int(x["number"]) for x in prs]
     goal_ids = [int(x["number"]) for x in goals]
-    # A single query fetches every PR's combined check rollup and review threads,
-    # plus comments on the goal issues for journal timestamps.
+    # A single query fetches every PR's merge-ready data (READY_FIELDS), plus
+    # comments on the goal issues for journal timestamps.
     # GitHub GraphQL does not support a dynamic issue-number list as a top-level
     # node argument. Build aliases from the numbers while retaining one request.
     owner, name = repo.split("/", 1)
     fields = []
     for n in pr_ids:
-        fields.append("p%d: pullRequest(number:%d) { commits(last:1) { nodes { commit { statusCheckRollup { state } } } } reviewThreads(first:100) { nodes { isResolved } } }" % (n, n))
+        fields.append("p%d: pullRequest(number:%d) { %s }" % (n, n, READY_FIELDS))
     for n in goal_ids:
         fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n))
     if not fields:
@@ -73,6 +73,15 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     repo_data = result.get("repository") or {}
     return {"prs": {n: repo_data.get("p%d" % n) for n in pr_ids},
             "goals": {n: repo_data.get("g%d" % n) for n in goal_ids}}
+
+
+# What merge_ready reads for one pull request: the head commit's time and
+# check rollup, the reviews, and each review thread's state and first comment.
+READY_FIELDS = (
+    "commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
+    " reviews(last:100) { nodes { author { __typename login } state submittedAt } }"
+    " reviewThreads(first:100) { nodes { isResolved"
+    " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }")
 
 
 def _gql(value: str) -> str:
@@ -169,7 +178,8 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
     lines = ["### Goals"]
     owed = []
     for issue in goals:
-        led = goal_ledger(issue, data["goals"].get(int(issue["number"])), now, authors)
+        node = data["goals"].get(int(issue["number"])) or {}
+        led = goal_ledger(issue, node, now, authors)
         lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
                      " - report %s (due %s)" % (
                          issue["number"], issue.get("title", ""),
@@ -178,6 +188,11 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                          led["state"], led["due"]))
         if led["state"] != "ok":
             owed.append("- #%s report %s since %s" % (issue["number"], led["state"].upper(), led["due"]))
+        comments = (node.get("comments") or {}).get("nodes") or []
+        found = handoff.journals(
+            [{"body": c.get("body"), "at": c.get("createdAt"),
+              "login": (c.get("author") or {}).get("login")} for c in comments], authors)
+        lines += ["  " + x for x in handoff.stage_lines(handoff.marks(found))]
     # A missed report deadline is its own condition: not a forwarding failure
     # and not a stopped brain. Post these before unlocking.
     lines += ["", "### Reports owed before unlock"] + (owed or ["- none"])
@@ -199,17 +214,71 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
     return lines
 
 
-def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]]) -> str:
-    node = node or {}
+def by_bot(comment: Dict[str, Any], bot: str) -> bool:
+    """Written by the review bot's app; a person can take the same login
+    without "[bot]", so the author type must be Bot as well."""
+    author = comment.get("author") or {}
+    return (author.get("__typename") == "Bot"
+            and str(author.get("login") or "").lower() == bot.lower())
+
+
+def _head_commit(node: Dict[str, Any]) -> Dict[str, Any]:
     commits = (node.get("commits") or {}).get("nodes") or []
-    rollup = commits[-1].get("commit", {}).get("statusCheckRollup") if commits else None
-    threads = (node.get("reviewThreads") or {}).get("nodes") or []
+    return (commits[-1].get("commit") or {}) if commits else {}
+
+
+def _checks_blocker(head: Dict[str, Any]) -> Optional[str]:
+    checks = (head.get("statusCheckRollup") or {}).get("state") or "UNKNOWN"
+    return None if checks == "SUCCESS" else "checks %s" % checks.lower()
+
+
+def _review_blocker(node: Dict[str, Any], bot: str) -> Optional[str]:
+    # The newest submitted review decides; an older CHANGES_REQUESTED that a
+    # later review from the bot superseded no longer blocks.
+    reviews = [r for r in (node.get("reviews") or {}).get("nodes") or []
+               if by_bot(r, bot) and r.get("submittedAt")]
+    latest = max(reviews, key=lambda r: str(r["submittedAt"]), default=None)
+    if latest and latest.get("state") == "CHANGES_REQUESTED":
+        return "grug changes_requested"
+    return None
+
+
+def _threads_blocker(threads: List[Dict[str, Any]]) -> Optional[str]:
     unresolved = sum(1 for t in threads if not t.get("isResolved"))
-    return "- #%s %s - checks %s - %d unresolved threads" % (
-        pr["number"], pr.get("title", ""), (rollup or {}).get("state", "UNKNOWN"), unresolved)
+    return "%d unresolved threads" % unresolved if unresolved else None
 
 
-def _repo_section(gh: GitHub, repo: str, now: datetime,
+def _unfixed_blocker(threads: List[Dict[str, Any]], head: Dict[str, Any],
+                     bot: str) -> Optional[str]:
+    # A finding is fixed only when a commit came after it, so one created at
+    # or after the head commit (>=) still has no fix-up commit.
+    committed = str(head.get("committedDate") or "")
+    roots = [((t.get("root") or {}).get("nodes") or [{}])[0] or {} for t in threads]
+    unfixed = sum(1 for c in roots
+                  if by_bot(c, bot) and str(c.get("createdAt") or "") >= committed)
+    if unfixed:
+        return "%d grug findings with no fix-up commit after them" % unfixed
+    return None
+
+
+def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
+    """The canonical merge-ready signal (docs/BRAIN.md): "READY", or
+    "blocked: " and every blocker, from one pull request's READY_FIELDS.
+    It reads nothing else, so the same API data always gives the same verdict."""
+    node = node or {}
+    head = _head_commit(node)
+    threads = (node.get("reviewThreads") or {}).get("nodes") or []
+    blockers = [b for b in (_checks_blocker(head), _review_blocker(node, bot),
+                            _threads_blocker(threads),
+                            _unfixed_blocker(threads, head, bot)) if b]
+    return "blocked: " + ", ".join(blockers) if blockers else "READY"
+
+
+def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
+    return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
+
+
+def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None) -> List[str]:
     issues = _issues(gh, repo)
     goals = [i for i in issues if "loom:goal" in _labels(i)]
@@ -219,7 +288,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime,
     data = _graphql_status(gh, repo, prs, goals)
     lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(gh, repo, tickets, now)) + ["", "### Pull requests"]
-    lines += [_pr_line(pr, data["prs"].get(int(pr["number"]))) for pr in prs]
+    lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "needs-operator" in _labels(i)]
@@ -238,13 +307,17 @@ def _lane_status(gh: GitHub, lanes_repo: str) -> str:
 
 
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
-           now: Optional[datetime] = None, authors: Optional[Sequence[str]] = None) -> str:
+           env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
+           authors: Optional[Sequence[str]] = None) -> str:
+    from . import factory  # factory imports this module
+    env = os.environ if env is None else env
+    bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     if authors is None:
-        authors = os.environ.get("LOOM_BRIEF_AUTHORS", "").replace(",", " ").split()
+        authors = trusted_authors(env)
     out: List[str] = ["# Loom status"]
     for repo in repos:
-        out += _repo_section(gh, repo, now, authors)
+        out += _repo_section(gh, repo, now, bot, authors)
     out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
 
@@ -1014,6 +1087,117 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
 
 
+def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:
+    """The item as it is now, for handoff: a pull request's head commit, an
+    issue's state label and comment count; None once it is closed or gone."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number), ok=(404,))
+    data = issue.data or {}
+    if issue.status == 404 or data.get("state") != "open":
+        return None
+    if "pull_request" in data:
+        pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        return "pr-" + sha[:12] if pr.get("state") == "open" and sha else None
+    state = next((x for x in _labels(data) if x.startswith("loom:") and x[5:] in STATES), "open")
+    return "%s-c%d" % (state.replace("loom:", ""), int(data.get("comments") or 0))
+
+
+def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    names = _labels(issue)
+    rules = {
+        "review": ("pull_request" in issue, "a review item is a pull request"),
+        "merge": ("pull_request" in issue, "a merge item is a pull request"),
+        "failed": ("loom:failed" in names, "a failed item is a loom:failed ticket"),
+        "ask": ("needs-operator" in names, "an ask item is a needs-operator issue"),
+        "regression": ("pull_request" not in issue, "a regression item is an issue"),
+    }
+    if stage not in rules:
+        raise ValueError("unknown stage %s; stages are %s" % (stage, ", ".join(handoff.STAGES)))
+    ok, reason = rules[stage]
+    if not ok:
+        raise ValueError(reason)
+
+
+def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str) -> str:
+    """The journal line that yields stage work on an open item to any peer."""
+    handoff.defer_marker(stage, item, "x", holder)
+    _check_stage_item(gh, stage, *item)
+    rev = item_revision(gh, *item)
+    if rev is None:
+        raise ValueError("only an open item is deferred")
+    return handoff.defer_marker(stage, item, rev, holder)
+
+
+def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None:
+    current = lock._read_lock(gh, lock_repo)
+    if current is None or current[0] != holder or current[1] is None or current[1] <= now:
+        raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
+                         % (holder, lock_repo))
+
+
+def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
+                   ) -> List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]:
+    # Nothing is caught here: a GitHubError ends the command through main's
+    # narrow handler, so a fault never reads as a goal with no journals.
+    goals: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]] = []
+    for repo in repos:
+        for issue in _issues(gh, repo):
+            if "loom:goal" not in _labels(issue):
+                continue
+            comments = gh.paginate("/repos/%s/issues/%s/comments" % (repo, issue["number"]))
+            goals.append((repo, issue, handoff.journals(
+                [{"body": c.get("body"), "at": c.get("created_at"),
+                  "login": (c.get("user") or {}).get("login")} for c in comments], authors)))
+    return goals
+
+
+def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
+                       found: List[Dict[str, Any]]) -> List[str]:
+    found_marks = handoff.marks(found)
+    items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
+    current = {m.item: item_revision(gh, *m.item) for m in items}
+    alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
+    out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
+    out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
+    for m in items:
+        if m in alive:
+            out.append("- resume %s %s (deferred by %s at %s)" % (
+                m.stage, handoff.item_ref(m.item), m.holder, m.at))
+        else:
+            out.append("- dropped %s %s: %s since the defer" % (
+                m.stage, handoff.item_ref(m.item),
+                "finished or closed" if current[m.item] is None else "changed"))
+    return out
+
+
+def _freshness_line(peers: List[Dict[str, Any]]) -> str:
+    window = "%g hours" % (handoff.QUIET.total_seconds() / 3600)
+    if not peers:
+        return "No other brain journaled in the last %s: all GitHub stages are open to you." % window
+    newest = max(peers, key=lambda j: str(j.get("at") or ""))
+    return ("Another brain journaled in the last %s (%s at %s): outside your own scope, "
+            "do only the resume items below." % (
+                window, handoff.journal_holder(newest) or "unnamed", newest.get("at") or "unknown time"))
+
+
+def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
+           now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> str:
+    """What the lock holder may finish for other brains: the live resume items
+    on every goal, with each goal's stage owners, and whether broad GitHub
+    work is open to it under the freshness rule (handoff.QUIET). Refuses
+    unless `holder` holds the lock, so only the lock holder acts on it."""
+    now = now or datetime.now(timezone.utc)
+    _lock_holder(gh, lock_repo, holder, now)
+    goals = _goal_journals(gh, repos, trusted_authors(env))
+    out = ["# Resume for %s" % holder, "",
+           _freshness_line(handoff.peer_journals(
+               [j for _, _, found in goals for j in found], holder, now))]
+    for repo, issue, found in goals:
+        out += _goal_resume_lines(gh, repo, issue, found)
+    return "\n".join(out)
+
+
 STUCK_STATES = ("failed", "briefed", "pr")
 UNCLAIMED_HOURS = 2
 STUCK_HOURS = 6
@@ -1242,6 +1426,9 @@ def parser() -> argparse.ArgumentParser:
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
+    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True)
+    dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True)
+    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -1319,9 +1506,22 @@ def _cmd_escalate(gh: GitHub, args: argparse.Namespace) -> None:
     print(escalate(gh, repo, number, _read(args.file) if args.file else "", _repo(args.lanes_repo)))
 
 
+def _cmd_defer(gh: GitHub, args: argparse.Namespace) -> None:
+    print(defer(gh, args.stage, _ref(args.item, "item"), args.holder))
+
+
+def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
+    print(handoff.done_marker(args.stage, _ref(args.item, "item"), args.holder))
+
+
+def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
+    print(resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo)))
+
+
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
+            "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate}
 
 

@@ -305,32 +305,66 @@ agy_forget() {
     done' agy-forget "$s" "${AGY_STATE_KEEP[@]}" -- "${AGY_CACHE_KEEP[@]}"
 }
 
+# agy's CLI settings (settings.json in its state directory, which the sandbox
+# keeps read-only) hold its permission rules. Print mode cannot prompt, so a
+# tool no rule allows is denied and the run ends with no output. Before every
+# run the runner rewrites the file as the lane user from lanes/agy/settings.json:
+# shell commands and the file tools allowed, web fetching denied. Only
+# trustedWorkspaces, the operator's one-time sign-in choice, is carried over
+# from the old file; any other key is dropped. After the run it writes back
+# exactly what it wrote before, so nothing a run did to the file survives.
+# The text travels on stdin (the lane user cannot read this checkout), and a
+# link left in place of the scratch file is removed, never written through.
+# Usage: agy_settings merge|keep < text; prints what it wrote.
+AGY_SETTINGS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/agy/settings.json"
+agy_settings() {
+  # shellcheck disable=SC2016 # expanded by the lane user's shell
+  "${AGY_RUNAS[@]}" /bin/bash -c '
+    s="$1"; f="$s/settings.json"; t="$s/.settings.json.new"
+    mkdir -p "$s" && rm -f "$t" || exit 1
+    (set -C; cat > "$t") || exit 1
+    if [ "$2" = merge ] && [ -f "$f" ] && [ ! -L "$f" ] &&
+      tw="$(plutil -extract trustedWorkspaces json -o - "$f" 2> /dev/null)"; then
+      plutil -replace trustedWorkspaces -json "$tw" "$t" || exit 1
+    fi
+    mv -f "$t" "$f" && cat "$f"' agy-settings "$AGY_HOME/.gemini/antigravity-cli" "$1"
+}
+
 # agy stores its token so that /usr/bin/security may read it without a
 # prompt, and agy itself reads it that way, so the sandbox cannot forbid that
-# tool. Any shell command the agent ran could therefore copy the token out.
-# The lane stays edits-only (never --dangerously-skip-permissions): print mode
-# soft-denies shell commands, and a denied command ends the run with no
-# output, so the brief says so up front. Slash commands and skill expansion
-# in the prompt stay off; the agent can still load a skill it decides to use.
-AGY_TOOLS_NOTE="Tools on this lane: shell commands are not available here, and asking for one ends the run. Read files with your file viewing and search tools, and change them with your edit tools only."
+# tool, and a shell command could read the token. The settings deny commands
+# that start with security, a speed bump rather than a wall. The lane never
+# passes --dangerously-skip-permissions. Slash commands and skill expansion in
+# the prompt stay off; the agent can still load a skill it decides to use.
+AGY_TOOLS_NOTE="Tools on this lane: run the repo's tests and lint with your shell tool, as the brief asks, and edit files only inside this tree. Web fetching is not available here."
 
 # The agy lane: unlock the lane user's keychain (password on stdin to a shell
 # running as that user, never in this process's argv), then run agy as that
-# user in an emptied environment inside the sandbox, edits only. The runner,
+# user in an emptied environment inside the sandbox. The runner,
 # as this user, commits, pushes and opens the PR from the shared tree.
 agy_agent() {
-  local profile
+  local profile settings
   AGENT_HOME="$AGY_HOME/tmp"
   "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
   agy_forget || { echo "could not clear agy's memory of earlier runs" >&2; return 3; }
   agy_skills
+  [ -f "$AGY_SETTINGS" ] || { echo "missing $AGY_SETTINGS" >&2; return 3; }
+  # Build the sandbox first: a run that stops here never wrote the settings,
+  # and once they are written nothing may fail before agy runs and the
+  # restore below follows.
   profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
+  settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
     LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
     "$AGY_BIN" -p "$1
 
 $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
+  local rc=$?
+  # A failed restore must fail the run, even if agy itself succeeded. Only the
+  # copy of the file that agy_settings prints goes to /dev/null, not its status.
+  printf '%s\n' "$settings" | agy_settings keep > /dev/null || { echo "could not restore agy's settings" >&2; return 3; }
+  return "$rc"
 }
 
 # The spark lane: a vLLM coder on a machine of the operator's own, serving
@@ -358,6 +392,23 @@ spark_probe() {
   [ "$status" -eq 0 ] && return 0
   READY_REASON="the spark endpoint did not answer (curl exit $status)"
   return 2
+}
+
+# A provider that refused this run for a usage, rate or credit limit, read
+# from the run's own last lines of output. Sets LIMIT_WHY. On 2026-10-13 a
+# codex usage limit read as "agent exited 1" on 21 runs, each costing its
+# ticket a rung of the model ladder and keeping the lane advertised as up.
+# Only the last few non-empty lines count, where the CLIs print the error
+# they exit on: text the model wrote earlier in the run cannot pause a lane.
+# A run that fakes one pauses its own lane for LIMIT_HOLD at most and hands
+# its brief to another lane, which is all a match does.
+LIMIT_LINE_RE='^(error|api error)\b.*(usage limit|rate[ _-]?limit|credit balance|quota|too many requests|overloaded)|usage limit reached|[0-9]+-hour limit reached'
+provider_limit() {
+  local line
+  line="$(tail -c +"$(( ${LOG_START:-0} + 1 ))" "$LOG" 2>/dev/null | grep -v '^[[:space:]]*$' |
+    tail -n 5 | grep -iE "$LIMIT_LINE_RE" | tail -n 1)"
+  [ -n "$line" ] || return 1
+  LIMIT_WHY="lane $SLOT's provider reported a usage or rate limit"
 }
 
 # Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
@@ -595,6 +646,54 @@ conflict_list() {
 }
 
 # Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
+# A fix brief's agent may answer a finding instead of fixing it, one file a
+# thread in .loom-answers/ (bus/tickets.py says how). The answers never go in
+# the commit: they move to the inbox, where the station posts each on its
+# thread. The copy opens the folder and each file without following links,
+# through the folder's descriptor, and keeps only a regular file with one
+# link, at most 8 KB, named for a thread: a symlink, a hard link to a file
+# outside the tree, a FIFO or a folder swapped for a link is dropped unread,
+# so an answer cannot carry a file the agent could not read itself.
+keep_answers() {
+  local dir="$TREE/.loom-answers"
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0
+  if [ -n "$FIX_PR" ]; then
+    if ! python3 - "$dir" "$INBOX/answers/$TICKET" <<'PY' >> "$LOG" 2>&1
+import os, re, stat, sys
+src, dst = sys.argv[1], sys.argv[2]
+nofollow = os.O_RDONLY | os.O_NOFOLLOW
+try:
+    folder = os.open(src, nofollow | os.O_DIRECTORY)
+except OSError:
+    sys.exit(0)
+try:
+    for name in os.listdir(folder):
+        if not re.fullmatch(r"PRRT_[A-Za-z0-9_-]{1,100}[.]md", name):
+            continue
+        try:
+            fd = os.open(name, nofollow | os.O_NONBLOCK, dir_fd=folder)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(fd)
+            ok = stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size <= 8192
+            data = os.read(fd, 8193) if ok else b""
+        finally:
+            os.close(fd)
+        if ok and len(data) <= 8192:
+            os.makedirs(dst, exist_ok=True)
+            with open(os.path.join(dst, name), "wb") as out:
+                out.write(data)
+finally:
+    os.close(folder)
+PY
+    then
+      echo "[$(date -u +%FT%TZ)] $TICKET: the answers in .loom-answers could not be kept" >> "$LOG"
+    fi
+  fi
+  rm -rf "$dir"
+}
+
 markers_left() {
   local f left=()
   while IFS= read -r f; do
@@ -659,6 +758,8 @@ anthropic_credit_ok() {
 # The lane's CLI and, for API lanes, its key. Sets API_KEY.
 lane_ready() {
   local cli key_ssm
+  # A limit an earlier run hit holds for every lane, not only spark.
+  limit_held && return 1
   if [ "$LANE" = agy ]; then
     command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
     "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
@@ -871,6 +972,7 @@ for BRIEF in "$INBOX"/*.md; do
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
+  LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
     (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
@@ -878,6 +980,12 @@ for BRIEF in "$INBOX"/*.md; do
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  # A run the provider refused for a limit is not a failure: the lane steps
+  # out for LIMIT_HOLD and the brief goes back for another lane.
+  if [ "$STATUS" -ne 0 ] && provider_limit; then
+    mark_limit
+    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)"; continue
+  fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
@@ -886,6 +994,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  keep_answers
   if [ -n "$CONFLICTS" ]; then
     LEFT="$(markers_left)"
     if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
@@ -940,11 +1049,22 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ]; then
     park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
   fi
-  # Never forced: a branch that moved on the remote refuses the push.
+  # Never forced: a branch that moved on the remote refuses the push. A fix
+  # brief's branch moved by someone else during the run (another lane's
+  # round, a person's commit) is not this run's failure: it is parked as
+  # "branch moved", and the station hands the new head back to the factory.
   if [ "$COMMITTED" -eq 1 ]; then
-    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" >> "$LOG" 2>&1; then
+    if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
+      printf '%s\n' "$PUSH_OUT" >> "$LOG"
+      if [ -n "$FIX_PR" ] && printf '%s\n' "$PUSH_OUT" | grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)'; then
+        NOW_HEAD="$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote origin "refs/heads/$BRANCH" 2>> "$LOG" | cut -f1)"
+        if [ -n "$NOW_HEAD" ] && [ "$NOW_HEAD" != "$BASE" ]; then
+          park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
+        fi
+      fi
       park "$BRIEF" "push failed"; continue
     fi
+    [ -z "$PUSH_OUT" ] || printf '%s\n' "$PUSH_OUT" >> "$LOG"
   fi
   if [ -n "$FIX_PR" ]; then
     ITEMS="$(fix_items "$BRIEF")"

@@ -46,7 +46,13 @@ counts as stale; that pass makes no decision.
 ## The station
 
 `lanes/mac/install.sh` also installs `com.loom.station`, which runs
-`python3 -m bus station` from this checkout every 60 seconds. It turns trusted
+`lanes/mac/station.sh` from this checkout every 60 seconds. That script first
+deploys Loom itself: it fast-forwards this checkout (which the lanes and the
+brain run from too) to its default branch once that head's `unittest` check
+passed, never over local changes and never off the default branch
+(`LOOM_DEPLOY=0` turns it off), and then runs `python3 -m bus station`. A
+merged Loom pull request is running a minute after its CI passes on main.
+The station turns trusted
 `loom:briefed` ticket issues into briefs in the lane inboxes
 (`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
 `loom:running`, and later reports the run from `done/` or `failed/` back to the
@@ -88,7 +94,18 @@ A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
 tickets is passed over for the next untried one, and stays untried, so a
 ticket gives up only once it has run on every rung. A ticket that failed on
-a ladder model (its `Model:` line and lane) has tried that rung. A fix brief that ends with nothing committed (most often
+a ladder model (its `Model:` line and lane) has tried that rung. When every
+untried rung is busy, it waits on the least loaded one, and a ladder ticket
+queued behind more than 2 others on its lane moves to an untried rung with a
+free lane (not a failure).
+A fix brief may answer a finding instead of fixing it: the agent writes the
+reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
+the tree (never committed; links dropped unread), and the station posts each
+answer as the reply on its thread, redacted and text-checked. The station
+resolves the thread only when the round ran on a ladder model and the thread
+is the review bot's own medium or low finding; any other answered thread
+stays open, and the factory reads it as a finding that survived.
+A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
@@ -391,13 +408,25 @@ lookup leaves the brief for the next pass. The rule covers:
   `loom`) instead: the runner starts it with `sudo -n -u loom`, in that user's
   emptied environment, inside the sandbox (keychain server allowed, loopback
   and everything else denied as for the other API lanes).
-- Edits only. agy stores its token so that `/usr/bin/security` can read it
+- Runs commands inside its sandbox. Print mode cannot prompt, so a tool no
+  rule allows is denied and the run ends with no output. Before each run the
+  runner writes agy's settings (`~/.gemini/antigravity-cli/settings.json`)
+  as the lane user from `lanes/agy/settings.json`: `permissions.allow` lets
+  through shell commands and the file tools, and `permissions.deny` blocks
+  web fetching (`read_url`, `execute_url`). Of the old file, only
+  `trustedWorkspaces` (set at sign-in) is kept. After the run the runner
+  writes back exactly what it wrote before, and the sandbox keeps the file
+  read-only during the run, so a run cannot leave a wider rule behind. The
+  brief tells agy to run the repo's tests and lint and to edit only inside
+  its tree, as the other lanes do.
+- Commands run as the lane user, inside the same sandbox and emptied
+  environment as agy itself, so they can write only where the agent can (see
+  below). agy stores its token so that `/usr/bin/security` can read it
   without a prompt, and reads it that way itself, so the sandbox cannot block
-  that tool; a shell command from the agent could copy the token out. The
-  runner never passes `--dangerously-skip-permissions`, passes
-  `--disable-slash-commands`, and tells agy in the brief that shell commands
-  are unavailable (print mode soft-denies them, and a denied command ends the
-  run with no output).
+  that tool, and a command could read the token. The settings deny commands
+  starting with `security`, which slows that down but does not stop it. The
+  runner never passes `--dangerously-skip-permissions` and passes
+  `--disable-slash-commands`.
 - Public repos only: whether the plan trains on prompts is not established.
 - One-time setup, done by the operator:
   1. Create the standard user, hidden, and store its password in SSM.

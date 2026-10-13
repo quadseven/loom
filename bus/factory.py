@@ -180,14 +180,6 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     return checks_failing and bool(FIX_CHECK_RE.search(last))
 
 
-def _by_bot(comment: Dict[str, Any], bot: str) -> bool:
-    """Written by the review bot's app; a person can take the same login
-    without "[bot]", so the author type must be Bot as well."""
-    author = comment.get("author") or {}
-    return (author.get("__typename") == "Bot"
-            and str(author.get("login") or "").lower() == bot.lower())
-
-
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
     nodes = (thread.get(field) or {}).get("nodes") or [{}]
     return nodes[index] or {}
@@ -198,8 +190,8 @@ def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
     "Fixed in" reply. A thread a person opened, or any reply after the
     bot's, stays open for a person or the brain."""
     last = _end(thread, "comments", -1)
-    return (not thread.get("isResolved") and _by_bot(_end(thread, "root", 0), bot)
-            and _by_bot(last, bot)
+    return (not thread.get("isResolved") and brain.by_bot(_end(thread, "root", 0), bot)
+            and brain.by_bot(last, bot)
             and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
 
 
@@ -251,13 +243,16 @@ def current_rung(issue: Dict[str, Any]) -> int:
 
 def next_rung(tried: set, load: Dict[str, int]) -> int:
     """The lowest untried rung with a lane under RUNG_BUSY (docs/MUSE.md: a
-    higher rung rather than a wait behind a busy lane), else the lowest
-    untried rung, to wait there. 0 once every rung was tried."""
+    higher rung rather than a wait behind a busy lane), else the untried rung
+    whose least-loaded lane holds the least, to wait there. 0 once every rung
+    was tried. Waiting on the lowest rung instead queued 33 tickets on the
+    one claude lane on 2026-10-13 while six other ladder slots sat idle."""
     untried = [n for n in range(1, len(LADDER) + 1) if n not in tried]
-    for rung in untried:
-        if min(load.get(lane, 0) for lane in LADDER[rung - 1][0]) < RUNG_BUSY:
-            return rung
-    return untried[0] if untried else 0
+    if not untried:
+        return 0
+    least = {n: min(load.get(lane, 0) for lane in LADDER[n - 1][0]) for n in untried}
+    free = [n for n in untried if least[n] < RUNG_BUSY]
+    return free[0] if free else min(untried, key=lambda n: (least[n], n))
 
 
 def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
@@ -384,7 +379,8 @@ class Factory:
                  % (len(picked), repo, number))
 
     def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
-               why: str, head: str = "Repeatedly stuck", failed_here: bool = True) -> Optional[str]:
+               why: str, head: str = "Repeatedly stuck", failed_here: bool = True,
+               skip: int = 0) -> Optional[str]:
         """Put the ticket on its next rung: its Model: line and lane label, and
         a rung marker. The rung it ran on counts as tried when it failed
         there. Returns the lane, or None once every rung was tried."""
@@ -392,7 +388,7 @@ class Factory:
         tried = tried_rungs(comments)
         if failed_here:
             tried |= {current_rung(issue)} - {0}
-        rung = next_rung(tried, self.load)
+        rung = next_rung(tried | ({skip} - {0}), self.load)
         if not rung:
             return None
         lanes, model = LADDER[rung - 1]
@@ -562,18 +558,27 @@ class Factory:
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))
 
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
-        number = int(issue["number"])
-        hold = held_until(issue)
-        if self.now < hold:
+        if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
         if _lane(issue) in self.limited:
             self._step_aside(repo, issue)
             return
-        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+        if not self._spread(repo, issue):
+            self._unclaimed(repo, issue)
+
+    def _briefed_since(self, repo: str, issue: Dict[str, Any]) -> float:
+        """When the ticket was last labeled briefed, or its hold ended if
+        later; 0 when it never was."""
+        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
         since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
                      and e.get("event") == "labeled"
                      and (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
-        since = max(since, hold) if since else since
+        return max(since, held_until(issue)) if since else since
+
+    def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
+        """A ticket briefed BRIEFED_STALL with no lane claiming it climbs."""
+        number = int(issue["number"])
+        since = self._briefed_since(repo, issue)
         if not since or self.now - since < BRIEFED_STALL:
             return
         comments = self._comments(repo, number)
@@ -588,6 +593,29 @@ class Factory:
             return
         self.actions += 1
         _say("moved stalled %s#%d to %s" % (repo, number, lane))
+
+    def _spread(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """A ladder ticket waiting behind more than RUNG_BUSY others on its
+        lane moves to an untried rung with a free lane. Not a failure; the
+        rung it leaves stays on its record. True when it moved."""
+        here = current_rung(issue)
+        old = _lane(issue)
+        if not here or self.load.get(old, 0) <= RUNG_BUSY:
+            return False
+        comments = self._comments(repo, int(issue["number"]))
+        tried = tried_rungs(comments) | {here}
+        if not any(min(self.load.get(lane, 0) for lane in LADDER[n - 1][0]) < RUNG_BUSY
+                   for n in range(1, len(LADDER) + 1) if n not in tried):
+            return False
+        lane = self._climb(repo, issue, comments, "%d tickets wait on lane %s"
+                           % (self.load.get(old, 0), old), head="Not a failure",
+                           failed_here=False, skip=here)
+        if lane is None:
+            return False
+        self.load[old] = self.load.get(old, 0) - 1
+        self.actions += 1
+        _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
+        return True
 
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
         """Move a ticket off a lane at a limit to the next rung. Past the last
