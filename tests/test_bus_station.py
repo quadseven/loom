@@ -556,7 +556,7 @@ class RetryTest(Base):
     def failed(self, lane="codex", reason="[transient] agent exited 1", body=PLAIN,
                attempt=1, fix=None, number=12):
         self.fake.add(number, lane=lane, body=body, state="running")
-        for a in range(attempt):
+        for _ in range(attempt):
             self.fake.comments[number].append(
                 {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
         name = tickets.ticket_name(REPO, number, attempt)

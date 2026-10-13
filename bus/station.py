@@ -684,24 +684,33 @@ class Station:
         order = ([] if klass == "limit" else same) + RETRY_ORDER
         if headers.get("Difficulty") == "easy":
             order += FREE_LANES
-        public: Optional[bool] = None
+        public: Dict[str, bool] = {}
         busy = None
         for cand in dict.fromkeys(order):
-            if cand in skip or cand not in LANES or not self._heartbeat_ok(cand):
+            if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public):
                 continue
-            if klass == "limit" and provider(cand) == provider(failed):
-                continue
-            if model and not lane_takes_model(cand, model):
-                continue
-            if needs_public_repo(cand, model):
-                if public is None:
-                    public = self._public(repo)
-                if not public:
-                    continue
             if self._inbox_empty(cand):
                 return cand
             busy = busy or cand
         return busy
+
+    def _retry_eligible(self, repo: str, cand: str, failed: str, klass: str, model: str,
+                        public: Dict[str, bool]) -> bool:
+        """Whether lane cand can take a retry: a known, available lane, not
+        the failed lane's provider after a limit, whose runner takes the
+        model and, for a public-only lane, a public repo. public caches the
+        repo lookup across candidates."""
+        if cand not in LANES or not self._heartbeat_ok(cand):
+            return False
+        if klass == "limit" and provider(cand) == provider(failed):
+            return False
+        if model and not lane_takes_model(cand, model):
+            return False
+        if needs_public_repo(cand, model):
+            if repo not in public:
+                public[repo] = self._public(repo)
+            return public[repo]
+        return True
 
     def _public(self, repo: str) -> bool:
         try:
