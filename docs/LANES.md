@@ -272,7 +272,9 @@ One-time bot setup:
 every lane's agent session as a chat at `http://localhost:7340/`: the brief,
 the agent's messages, each tool call with its output, edits as diffs. It reads
 Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
-(openrouter, opencode-go) and codex rollouts. It binds localhost only and
+(openrouter, opencode-go; the 1.x `message`/`part` tables or the 2.0
+`session_message` table) and codex rollouts. A slot such as `opencode-go-3`
+lists under its own name and reads as its lane. It binds localhost only and
 answers only localhost Host headers; transcripts never leave the machine.
 API-lane agents run on the same machine, so their sandbox denies every
 loopback connection; they cannot query the viewer or any other local service.
@@ -306,6 +308,29 @@ loopback connection; they cannot query the viewer or any other local service.
   wipes the scratch home. Links are never followed.
 - No background processes: launchd starts a pass every minute and a lock
   keeps one pass per lane.
+
+### One slot on opencode 2.0
+
+opencode 2.0's installer overwrites the one binary every opencode lane runs,
+so try it on one slot. Install it somewhere of its own (outside the repo, not
+over the 1.x binary on PATH) and name it for that slot only:
+
+```sh
+LOOM_OPENCODE_GO_3_OPENCODE=/path/to/opencode2/bin/opencode lanes/mac/install.sh opencode-go-3
+```
+
+(the installer writes every `LOOM_*` setting into the slot's plist).
+
+`LOOM_<SLOT>_OPENCODE` (or `LOOM_<LANE>_OPENCODE` for every slot of a lane)
+names the opencode binary; without it a lane runs `opencode` from PATH. Before
+each run the runner asks the binary for `--version`; when it prints
+`opencode v2.` the run adds `--standalone --auto`, because 2.0's `run`
+otherwise talks to a shared background service, which the sandbox (no
+loopback) refuses and which would mix lanes' sessions. The sandbox lets the
+agent read the named binary's real directory, exactly as it does the default
+one; a binary that needs files outside that directory will not start there.
+The transcript is archived and shown on the viewer like a 1.x one. To go
+back, re-run the installer for that slot without the variable.
 
 ### Anthropic spend
 
