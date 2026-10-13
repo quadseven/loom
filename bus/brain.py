@@ -299,8 +299,8 @@ def regress(gh: GitHub, repo: str, goal: int, number: int, lane: str, evidence: 
     """Send a shipped ticket that regressed live back to a lane. Each goal has
     one slot past its cap for this, held while a loom:regression ticket is in
     flight; the ticket is re-briefed, never copied into a new issue. The count
-    and the write are not atomic: like brief, this relies on the brain's tick
-    lock (docs/BRAIN.md), so only one brain writes to a goal at a time."""
+    and the write are not atomic. Callers must hold the brain's tick lock
+    (docs/BRAIN.md), as for brief, through the completed write."""
     _check_regress_args(lane, evidence)
     children = _goal_children(gh, repo, goal)
     if not any(int(c.get("number", 0)) == number for c in children):

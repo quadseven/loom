@@ -250,6 +250,8 @@ the evidence on the ticket, starting with `<!-- loom:regression v1 -->`, the
 goal, and why it was admitted (within capacity, or through the regression
 slot with the in-flight count and the cap), then labels the ticket
 `loom:briefed`, the lane and `loom:regression`.
+An interactive brain must hold the tick lock while running `regress` or
+`brief`; their capacity checks and writes are not atomic on their own.
 
 Each goal has one regression slot past its cap. It is held while any of the
 goal's `loom:regression` tickets is in flight, so on a full goal a second

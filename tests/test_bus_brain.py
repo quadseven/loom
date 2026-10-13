@@ -293,6 +293,17 @@ class GoalFake:
         link = '<%s?per_page=10&page=%d>; rel="next"' % (url.split("?")[0], page + 1)
         return 200, {"Link": link} if more else {}, json.dumps(items).encode()
 
+    def issue_request(self, method, number, data):
+        if method == "GET":
+            return reply(200, self.issues[number])
+        if method == "PUT":
+            self.issues[number]["labels"] = [{"name": n} for n in data["labels"]]
+            return reply(200, [])
+        if method == "PATCH":
+            self.issues[number].update(data)
+            return reply(200, {})
+        return reply(201, {})
+
     def __call__(self, method, url, headers, body):
         data = json.loads(body) if body else None
         path = url.split("api.github.com")[1].split("?")[0]
@@ -310,15 +321,7 @@ class GoalFake:
             self.children.append(data["sub_issue_id"] - 1000)
             return reply(201, {})
         number = int(rest.split("/")[1])
-        if method == "GET":
-            return reply(200, self.issues[number])
-        if method == "PUT":
-            self.issues[number]["labels"] = [{"name": n} for n in data["labels"]]
-            return reply(200, [])
-        if method == "PATCH":
-            self.issues[number].update(data)
-            return reply(200, {})
-        return reply(201, {})
+        return self.issue_request(method, number, data)
 
     def writes(self):
         return [c for c in self.calls if c[0] != "GET"]
@@ -405,6 +408,20 @@ class RegressionTests(unittest.TestCase):
         fake = GoalFake(4)
         fake.issues[50].update(state="closed", state_reason="not_planned")
         with self.assertRaises(ValueError):
+            brain.regress(GitHub("t", transport=fake), REPO, 1, 50, "codex", EVIDENCE)
+        self.assertEqual(fake.writes(), [])
+
+    def test_regress_refuses_an_empty_issue_response(self):
+        fake = GoalFake(4)
+        issue_request = fake.issue_request
+
+        def missing_issue(method, number, data):
+            if method == "GET" and number == 50:
+                return reply(200)
+            return issue_request(method, number, data)
+
+        fake.issue_request = missing_issue
+        with self.assertRaisesRegex(ValueError, "only a shipped or verified ticket"):
             brain.regress(GitHub("t", transport=fake), REPO, 1, 50, "codex", EVIDENCE)
         self.assertEqual(fake.writes(), [])
 
