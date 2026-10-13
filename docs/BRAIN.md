@@ -300,6 +300,21 @@ Tick <UTC time>, <holder>
 - Cost: <GitHub requests>, <minutes>
 ```
 
+A journal may also carry handoff lines (docs/MUSE.md, Handing off stage
+work), each an HTML comment:
+
+```markdown
+<!-- loom:defer v1 stage=merge item=<owner/name>#<number> rev=<revision> holder=<name> -->
+<!-- loom:done v1 stage=merge item=<owner/name>#<number> holder=<name> -->
+```
+
+`python3 -m bus.brain defer` and `done` print them; the revision is the item
+when deferred (a pull request's head commit, an issue's state and comment
+count). Only journals from `LOOM_BRIEF_AUTHORS` logins count. For each stage
+and item the newest line wins; `python3 -m bus.brain resume OWNER/NAME...
+--holder NAME` lists the defers still standing whose item is open and
+unchanged, and refuses unless that holder holds the tick lock.
+
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
