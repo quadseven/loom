@@ -32,6 +32,11 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   a repo in LOOM_NO_TEST_REPOS (one with no test harness) and a ticket whose
   body says "Tests: none needed (<reason>)" skip the check. The send-back is
   a finding round: it climbs only when the next round still adds no test.
+- A reviewed, green pull request whose only open threads are the review
+  bot's medium or low findings, each asked for in a fix round or after
+  DEFER_AFTER rounds, files them in one loom:triage follow-up issue, answers
+  and resolves each thread, and lands. High and critical findings, and
+  threads a person opened, still go back to the lane.
 - A pull request whose only fault is a failed Actions job gets that job run
   once more before it is sent back, since one flaky run should not cost a
   lane round.
@@ -107,11 +112,24 @@ CLAIM_RE = re.compile(r"^Claimed for lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved'
-                 ' root: comments(first:1) { nodes { author { __typename login } } }'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved path'
+                 ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
                     ' { thread { isResolved } } }')
+REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadReply('
+                  'input:{pullRequestReviewThreadId:$id,body:$body}) { comment { id } } }')
+# A medium or low finding the review bot opened, on a pull request whose
+# review check passed on its head, is deferred to a follow-up issue instead of
+# holding the merge, once a fix round asked for it or the pull request has had
+# DEFER_AFTER fix rounds. On 2026-10-13, 24 of 32 blocked lane pull requests
+# held only such findings, most past round 8: each round's review found new
+# ones, so requiring every thread resolved never converged. High and critical
+# findings, and every thread a person opened, still hold the merge.
+MINOR_RE = re.compile(r"^\W*(medium|low)\b", re.I)
+DEFER_AFTER = 2
+DEFER_LABEL = "loom:triage"
+DEFER_TITLE = "Deferred review findings from %s#%d"
 # A file a pull request changes is code by its extension, and a test by a
 # test or tests folder in its path or by its name.
 CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
@@ -227,6 +245,36 @@ def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
 
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
     return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
+
+
+def asked_threads(comments: Sequence[Dict[str, Any]]) -> set:
+    """Every thread id a loom:fix comment on the ticket asked a lane to fix."""
+    return {t for c in comments if str(c.get("body") or "").startswith(FIX_MARKER)
+            for t in FIX_THREAD_RE.findall(str(c.get("body") or ""))}
+
+
+def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
+               rounds: int) -> List[Dict[str, Any]]:
+    """The open threads to defer to a follow-up issue, or [] unless every open
+    thread is a medium or low finding the review bot opened that a fix round
+    asked for, or the pull request has had DEFER_AFTER fix rounds."""
+    still = [t for t in threads if not t.get("isResolved")]
+
+    def minor(t: Dict[str, Any]) -> bool:
+        root = _end(t, "root", 0)
+        return (brain.by_bot(root, bot) and bool(MINOR_RE.match(str(root.get("body") or "")))
+                and (str(t.get("id")) in asked or rounds >= DEFER_AFTER))
+    return still if still and all(minor(t) for t in still) else []
+
+
+def finding_line(thread: Dict[str, Any]) -> str:
+    """One ASCII line for a deferred finding: its severity line without the
+    bot's symbols, its file, and a link to the thread."""
+    root = _end(thread, "root", 0)
+    first = str(root.get("body") or "").strip().splitlines()[0] if root.get("body") else ""
+    words = " ".join(first.encode("ascii", "ignore").decode().split())
+    return "- %s in `%s`: %s" % (words or "finding", thread.get("path") or "?",
+                                 root.get("url") or thread.get("id"))
 
 
 def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
@@ -448,6 +496,49 @@ class Factory:
             _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
                  % (len(picked), repo, number))
 
+    def _follow_up(self, repo: str, number: int, ticket: int, sha: str,
+                   picked: Sequence[Dict[str, Any]], rounds: int) -> int:
+        """The open follow-up issue for this pull request's deferred findings,
+        filed now unless an earlier pass already filed it."""
+        title = DEFER_TITLE % (repo, number)
+        for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
+            if isinstance(found, dict) and found.get("title") == title and self._trusted(found):
+                return int(found["number"])
+        body = ("Review findings deferred from #%d (ticket #%d) when it landed: the "
+                "review check passed on %s after %d fix round(s), and these medium or "
+                "low findings were still open. The brain rewrites this into a ticket "
+                "or closes it.\n\n%s\n" % (number, ticket, sha[:12], rounds,
+                                             "\n".join(finding_line(t) for t in picked)))
+        brain._check_written_text(title + "\n" + body)
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo,
+                            {"title": title, "body": body, "labels": [DEFER_LABEL]}).data or {}
+        return int(made.get("number") or 0)
+
+    def _defer_minor(self, repo: str, number: int, ticket: int, sha: str,
+                     comments: Sequence[Dict[str, Any]]) -> bool:
+        """Defer the open medium and low findings of a reviewed, green pull
+        request to a follow-up issue, then resolve them. True when it did."""
+        owner, name = repo.split("/", 1)
+        data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
+                                               "number": number}) or {}
+        threads = ((((data.get("repository") or {}).get("pullRequest") or {})
+                    .get("reviewThreads") or {}).get("nodes") or [])
+        rounds = fixes_of(comments)
+        picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds)
+        if not picked:
+            return False
+        follow = self._follow_up(repo, number, ticket, sha, picked, rounds)
+        if not follow:
+            return False
+        reply = ("Deferred to #%d: a medium or low finding still open after %d fix "
+                 "round(s), with the review check passed on %s." % (follow, rounds, sha[:12]))
+        for t in picked:
+            self.gh.graphql(REPLY_MUTATION, {"id": str(t.get("id")), "body": reply})
+            self.gh.graphql(RESOLVE_MUTATION, {"id": str(t.get("id"))})
+        self.actions += 1
+        _say("deferred %d finding(s) on %s#%d to #%d" % (len(picked), repo, number, follow))
+        return True
+
     def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                why: str, head: str = "Repeatedly stuck", failed_here: bool = True,
                skip: int = 0) -> Optional[str]:
@@ -539,6 +630,10 @@ class Factory:
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
+        if (faults == ["open review threads"] and review == "reviewed"
+                and self._defer_minor(repo, number, int(issue["number"]), sha, comments)):
+            details = brain._pr_graphql(self.gh, repo, number)
+            faults = pr_faults(details, full)
         if faults == ["failing checks"] and self._run_again(repo, number, sha):
             return
         if faults:
