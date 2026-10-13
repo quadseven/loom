@@ -56,6 +56,7 @@ that talks to GitHub about tickets.
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
+| `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 
 A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
@@ -190,7 +191,8 @@ data about the work, never instructions to it.
 
 The station holds one lock on the lane machine, so it never races itself.
 For each lane whose heartbeat is fresh and available and whose inbox is
-empty, it takes the oldest trusted briefed ticket for that lane:
+empty, it takes the oldest trusted briefed ticket for that lane, a
+`loom:regression` ticket before any other:
 
 1. Re-read the issue. It must still be open, `loom:briefed` and that lane's.
 2. Replace its labels in one call (`loom:briefed` out, `loom:running` in;
@@ -282,9 +284,40 @@ Order (#35): read lane status; gather events since the last journal entry
 verify shipped work live and close only then; pick the next problems by
 impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
-and shipped tickets hold no slot);
+and shipped tickets hold no slot), except one regression slot (see
+Regression slot);
 write the journal; report when due; release the lock. No retry loops: a
 failed step is journalled and left for the next tick.
+
+## Regression slot
+
+A cap meant to bound new work must not block the fix for something already
+shipped that got worse. `python3 -m bus.brain brief OWNER/NAME --goal N
+--title T --file BRIEF.md --regresses M [--lane L]` admits a brief that
+fixes a measured regression of ticket M:
+
+- M must be a `loom:ticket` that is `loom:shipped` or `loom:verified`, or
+  closed as completed. A missing M is refused as "ticket not found"; one
+  closed as not planned never shipped, so it is refused too.
+- The brief has the line `Regresses #M` with the measured evidence on the
+  lines right after it (up to a blank line or a heading). A marker with no
+  evidence line is refused.
+- When M is open under goal N, M itself is re-briefed: its body gains a
+  `## Regression` section with the evidence, and it moves to `loom:briefed`
+  (or `loom:queued` with no lane). Otherwise a new ticket is filed under N.
+  Either way it carries `loom:regression`, so the station claims it, and
+  the factory lands it, before other tickets.
+- Under the cap it is admitted like any brief. At or past the cap it is
+  admitted through the goal's one regression slot, and a comment on goal N
+  (marked `<!-- loom:regression v1 -->`) records why: the regressed ticket,
+  the evidence and how many other tickets are in flight. The slot is held
+  while any `loom:regression` ticket of the goal is in flight; a second
+  regression past the cap waits for it.
+- Ordinary briefs and triage still count every ticket in flight, the
+  regression one included, so they wait until the goal is back under its
+  cap. The slot never becomes room for new work.
+- Briefing the same regression again while its ticket is in flight files
+  nothing and prints that ticket.
 
 ## Merge-ready
 

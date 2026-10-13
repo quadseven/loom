@@ -42,11 +42,12 @@ not looked hard enough yet. Each tick the brain:
 - Finishes before it starts: each tick merges every lane pull request that
   `bus.brain status` marks `READY` (the merge-ready signal in
   docs/BRAIN.md) before it briefs anything new.
-- When a goal is at its cap, a brief that fixes a live regression on a
-  ticket already shipped may still be filed, past the cap, by setting
-  `LOOM_GOAL_CAP` to the cap plus 8 for that one brief command (until a
-  reserved regression slot exists, #102). Ordinary new work waits for the
-  cap.
+- When a goal is at its cap, a brief that fixes a measured regression of a
+  ticket already shipped still goes in, through the goal's one regression
+  slot: `brief --regresses M`, with `Regresses #M` and the evidence in the
+  brief (docs/BRAIN.md, Regression slot). Never raise `LOOM_GOAL_CAP` for
+  it. Link the next measured result in the goal's journal. Ordinary new
+  work waits for the cap.
 - Proves every change: a ticket is verified only when its proof shows on the
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.

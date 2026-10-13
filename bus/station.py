@@ -21,7 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import spend
@@ -83,6 +83,7 @@ LANES_TITLE = "Loom lane status"
 LANES_REPUBLISH = 3600
 NEEDS_OPERATOR = "needs-operator"
 URGENT = "loom:urgent"
+REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
@@ -146,7 +147,8 @@ class Settings:
                  anthropic: Optional[spend.Budget] = None,
                  factory_on: bool = False,
                  review_check: str = factory.DEFAULT_REVIEW_CHECK,
-                 review_bot: str = factory.DEFAULT_REVIEW_BOT) -> None:
+                 review_bot: str = factory.DEFAULT_REVIEW_BOT,
+                 no_test_repos: Sequence[str] = ()) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -165,6 +167,7 @@ class Settings:
         self.factory_on = factory_on
         self.review_check = review_check
         self.review_bot = review_bot
+        self.no_test_repos = list(no_test_repos)
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -199,7 +202,8 @@ class Settings:
                    review_check=(env.get("LOOM_REVIEW_CHECK", "").strip()
                                  or factory.DEFAULT_REVIEW_CHECK),
                    review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
-                               or factory.DEFAULT_REVIEW_BOT))
+                               or factory.DEFAULT_REVIEW_BOT),
+                   no_test_repos=words("LOOM_NO_TEST_REPOS"))
 
 
 def _origin_repo() -> str:
@@ -663,7 +667,9 @@ class Station:
                 if lane in by_lane:
                     by_lane[lane].append((repo, issue))
         for lane in free:
+            # A regression fix (bus.brain brief --regresses) goes first.
             cands = sorted(by_lane[lane], key=lambda c: (
+                REGRESSION not in _label_names(c[1]),
                 str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
             for repo, issue in cands:
                 try:
@@ -1745,7 +1751,8 @@ class Station:
         factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                         review_check=self.s.review_check,
                         review_bot=self.s.review_bot,
-                        limited=self.limited_lanes()).run()
+                        limited=self.limited_lanes(),
+                        no_test_repos=self.s.no_test_repos).run()
 
     def prune_trees(self) -> None:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
