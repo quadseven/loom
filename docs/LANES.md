@@ -294,17 +294,54 @@ One-time bot setup:
    `LOOM_DISCORD_MENTION=<the operator's user id>` and, optionally,
    `LOOM_DISCORD_DEFAULT_GOAL=owner/name#N`.
 
+## Transcript uploads
+
+Transcripts are read on the Loom dashboard, which stores them and serves them
+over your private network (it is not part of this repo). Each station pass
+uploads every run that finished since the last one: a brief in a slot's
+`done/` or `failed/`, and the last brain tick. The body is
+`{ticket, slot, model, outcome, started_at, finished_at, events}`, each event
+`{ts, role, kind, text}` with kind `text`, `tool_use`, `tool_result` or `log`
+and role `user`, `assistant`, `thinking`, `tool` or `runner`. The events are
+the CLI's own session record (read by `bus/sessions.py`, the one parser the
+viewer below uses too) followed by the run's last attempt in
+`logs/<slot>/<ticket>.log`; a lane that keeps no transcript sends its log
+alone. Every text has local paths replaced by `<path>` and GitHub, Anthropic,
+OpenAI, AWS and Cloudflare key shapes and bearer tokens replaced by
+`[redacted]`; each event is cut at 20,000 characters (a log keeps its tail)
+and the body at 8 MB, dropping the oldest tool results first.
+
+The station POSTs the body as JSON to `LOOM_TRANSCRIPT_URL` (https only) with
+`Authorization: Bearer <token>`, the token read from the SSM parameter named
+by `LOOM_TRANSCRIPT_TOKEN_SSM` (in `LOOM_AWS_REGION`) with the webhook's
+reader, which gives up after 30 seconds. Set both when running
+`lanes/mac/install.sh`; they live only in the station's local plist. With
+either empty nothing is sent. The ledger `state/station/transcripts.json`
+records each run once sent; a failed upload is tried on the next pass, and
+after 5 failures the run is given up with one line in `station.log`. Errors
+name only their type, never the URL or the token. The first pass after
+uploads are turned on records the runs already finished without sending
+them, and one pass sends at most 10 and stops at its first failure.
+
+A brain tick is finished when `state/brain.json` has `outcome` `ok` or
+`failed` and a numeric `started` (when `lanes/mac/brain.sh` started the
+agent; a skipped tick has none) and `at` (when it ended). It uploads as slot
+`brain` with its UTC start time as the ticket and `model` from the same
+file: the Claude Code sessions in the operator's `~/.claude/projects` for
+`$LOOM_HOME/brain` last written between `started` and `at`.
+
 ## Transcript viewer
 
-`lanes/viewer/serve.py` (installed with the lanes as `com.loom.viewer`) serves
+For reading on the lane machine itself, `lanes/viewer/serve.py` (installed
+with the lanes as `com.loom.viewer`) serves
 every lane's agent session as a chat at `http://localhost:7340/`: the brief,
 the agent's messages, each tool call with its output, edits as diffs. It reads
 Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
 (openrouter, opencode-go; the 1.x `message`/`part` tables or the 2.0
 `session_message` table) and codex rollouts. A slot such as `opencode-go-3`
 lists under its own name and reads as its lane. It binds localhost only and
-answers only localhost Host headers; transcripts never leave the machine.
-API-lane agents run on the same machine, so their sandbox denies every
+answers only localhost Host headers; the viewer itself sends nothing off
+the machine (the uploads above do). API-lane agents run on the same machine, so their sandbox denies every
 loopback connection; they cannot query the viewer or any other local service.
 
 ## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
@@ -329,7 +366,9 @@ loopback connection; they cannot query the viewer or any other local service.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
-- Logs stay on the lane machine. Nothing is pushed except the ticket branch,
+- Logs stay on the lane machine, apart from the scrubbed transcript the
+  station uploads to the dashboard when that is set up (see "Transcript
+  uploads"). Nothing is pushed except the ticket branch,
   or a side branch holding edits that failed the validation contract.
 - API-lane session transcripts (Claude Code `.jsonl`, opencode's `opencode.db`)
   are copied to `logs/<lane>/<ticket>/` after each run, before the next run

@@ -1,6 +1,6 @@
 """The transcript viewer: every lane's session, rendered like a terminal chat.
 
-Seam: transcripts.load_events(...) turns each CLI's own record into one event
+Seam: bus.sessions.load_events(...) turns each CLI's own record into one event
 list; render.page(...) turns events into HTML. Fixtures mirror the real formats
 seen on the lane machine (Claude Code .jsonl, opencode 1.18 SQLite, codex
 rollout .jsonl).
@@ -14,10 +14,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lanes" / "viewer"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import render  # noqa: E402
 import serve  # noqa: E402
-import transcripts  # noqa: E402
+from bus import sessions as transcripts  # noqa: E402
 
 
 def claude_lines():
@@ -90,7 +91,7 @@ class LoadEvents(Fixture):
         db.write_bytes(b"not sqlite at all")
         (self.loom / "logs/openrouter/T2.log").write_text("printed\n")
         events = transcripts.load_events("openrouter", "T2", self.loom, self.claude_projects, self.codex_sessions)
-        self.assertEqual(events, [{"kind": "log", "text": "printed\n"}])
+        self.assertEqual(events, [{"kind": "log", "text": "printed\n", "ts": None}])
 
     def test_opencode_lane_reads_the_archived_sqlite_store(self):
         db = self.loom / "logs/openrouter/T1/.local/share/opencode/opencode.db"
@@ -154,7 +155,7 @@ class LoadEvents(Fixture):
         log.parent.mkdir(parents=True)
         log.write_text("agent printed this\n")
         events = transcripts.load_events("openrouter", "T9", self.loom, self.claude_projects, self.codex_sessions)
-        self.assertEqual(events, [{"kind": "log", "text": "agent printed this\n"}])
+        self.assertEqual(events, [{"kind": "log", "text": "agent printed this\n", "ts": None}])
 
     def test_unsafe_lane_or_ticket_names_are_refused(self):
         for lane, ticket in (("codex", "../x"), ("bogus", "T1"), ("bogus-2", "T1"), ("codex-x", "T1"),
@@ -205,7 +206,7 @@ class Server(Fixture):
         log.write_text("printed\n")
         self.assertTrue(serve.ROUTE.match("/t/opencode-go-3/T4"))
         events = transcripts.load_events("opencode-go-3", "T4", self.loom, self.claude_projects, self.codex_sessions)
-        self.assertEqual(events, [{"kind": "log", "text": "printed\n"}])
+        self.assertEqual(events, [{"kind": "log", "text": "printed\n", "ts": None}])
 
     def test_only_localhost_host_headers_are_served(self):
         self.assertTrue(serve.allowed_host("localhost:8765", 8765))
