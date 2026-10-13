@@ -46,7 +46,13 @@ counts as stale; that pass makes no decision.
 ## The station
 
 `lanes/mac/install.sh` also installs `com.loom.station`, which runs
-`python3 -m bus station` from this checkout every 60 seconds. It turns trusted
+`lanes/mac/station.sh` from this checkout every 60 seconds. That script first
+deploys Loom itself: it fast-forwards this checkout (which the lanes and the
+brain run from too) to its default branch once that head's `unittest` check
+passed, never over local changes and never off the default branch
+(`LOOM_DEPLOY=0` turns it off), and then runs `python3 -m bus station`. A
+merged Loom pull request is running a minute after its CI passes on main.
+The station turns trusted
 `loom:briefed` ticket issues into briefs in the lane inboxes
 (`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
 `loom:running`, and later reports the run from `done/` or `failed/` back to the
