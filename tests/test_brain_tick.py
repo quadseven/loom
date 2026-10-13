@@ -109,6 +109,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual(last["model"], "claude-opus-5-5")
         self.tick(FAKE_LOCK="1")
         last, _ = self.beat()
+        # brain.sh always writes started, including null when the lock is held.
         self.assertIsNone(last["started"])
 
     def test_no_repos_means_no_lock_and_no_model_call(self):

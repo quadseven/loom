@@ -22,7 +22,7 @@ GITHUB = "gh" + "p_" + "A1b2C3" * 6
 ANTHROPIC = "sk-" + "ant-api03-" + "x" * 40
 OPENAI = "sk-" + "proj-" + "Y" * 40
 AWS_ID = "AK" + "IA" + "ABCDEFGHIJKLMNOP"
-AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY"
+AWS_SECRET = "example" * 7
 CLOUDFLARE = "Zz9" * 14
 
 

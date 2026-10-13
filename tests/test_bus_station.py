@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1365,6 +1366,21 @@ class TranscriptTest(Base):
         self.go()
         self.go()
         self.assertEqual(self.sent, [])
+
+    def test_a_brief_removed_after_listing_does_not_stop_other_uploads(self):
+        self.go()
+        self.finish("T1")
+        self.finish("T2")
+        runs = list(station.Station(GitHub("token", transport=self.fake), self.settings,
+                                    read_secret=self.read_secret, upload=self.upload,
+                                    user_home=self.user)._finished_briefs())
+        os.remove(self.inbox("anthropic-3", "done", "T1.md"))
+        worker = station.Station(GitHub("token", transport=self.fake), self.settings,
+                                 read_secret=self.read_secret, upload=self.upload,
+                                 user_home=self.user)
+        with mock.patch.object(worker, "_finished_briefs", return_value=iter(runs)):
+            worker.upload_transcripts()
+        self.assertEqual([body["ticket"] for _, _, body in self.sent], ["T2"])
 
     def test_a_failed_upload_is_retried_then_given_up_with_one_quiet_line(self):
         self.go()

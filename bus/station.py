@@ -1645,10 +1645,14 @@ class Station:
                 self.s.home, self.user_home, run["started"], run["at"],
                 "done" if run["outcome"] == "ok" else "failed", run.get("model"))
         slot, kind, brief, name = run
-        with open(brief, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
+        try:
+            with open(brief, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            finished_at = os.stat(brief).st_ctime
+        except FileNotFoundError:
+            return None  # The finished brief was swept after it was listed.
         return transcripts.run_body(self.s.home, slot, name, kind, text, self.user_home,
-                                    os.stat(brief).st_ctime)
+                                    finished_at)
 
     def _transcript_token(self) -> Optional[str]:
         try:
