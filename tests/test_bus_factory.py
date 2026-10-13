@@ -15,6 +15,8 @@ NOW = 2_000_000_000.0
 # A loom:fix comment that asked for thread PRRT_1 and a failing check.
 FIX_ASKED = FIX_MARKER + "\nPull request: x#50\n\n### Check: lint\n\n    E1\n\n### Thread PRRT_1 (comment 1) at a.py:1\n\n    rename"
 ME = {"login": "alice-example"}
+# Every rung of the ladder tried since the last restart.
+ALL_RUNGS = [{"body": factory.RUNG_MARKER % n, "user": ME} for n in (1, 2, 3)]
 STRANGER = {"login": "mallory-example"}
 
 
@@ -106,7 +108,17 @@ class FakeGitHub:
         return Response(200, {})
 
     def graphql(self, query, variables=None):
-        number = int(re.search(r"pullRequest\(number:(\d+)\)", query).group(1))
+        if "resolveReviewThread" in query:
+            self.writes.append(("RESOLVE", variables["id"], None))
+            for details in self.details.values():
+                for thread in details["reviewThreads"]["nodes"]:
+                    if thread["id"] == variables["id"]:
+                        thread["isResolved"] = True
+            return {"resolveReviewThread": {"thread": {"isResolved": True}}}
+        if variables and "number" in variables:
+            number = variables["number"]
+        else:
+            number = int(re.search(r"pullRequest\(number:(\d+)\)", query).group(1))
         return {"repository": {"pullRequest": self.details[number]}}
 
 
@@ -259,11 +271,29 @@ class PullRequests(Base):
 
     def test_past_the_last_rung_it_is_left_failed_for_the_brain(self):
         self.gh.ticket(5, "pr")
-        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME}, {"body": factory.RUNG_MARKER % 3, "user": ME}]
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.moved, [(5, "failed", None)])
+
+    def test_a_rung_skipped_while_busy_is_still_tried_later(self):
+        # Spilled straight to rung 3 while rungs 1 and 2 were busy: stuck
+        # again, it goes to rung 1, not past the end of the ladder.
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 3, "user": ME},
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual(self.moved, [])
+        self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
+        self.assertEqual(factory.tried_rungs(self.gh.comments[5]), {1, 3})
+
+    def test_a_ticket_that_failed_on_a_ladder_model_does_not_get_it_again(self):
+        self.gh.ticket(6, "failed", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.go()
+        self.assertEqual(self.model(6), "gpt-6-sol")
 
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")
@@ -333,6 +363,81 @@ class PullRequests(Base):
         self.assertEqual((self.merged, self.fixed), ([], []))
 
 
+BOT = {"__typename": "Bot", "login": "grug-tribe"}
+FIXED = "Fixed in 1234567: the flagged code changed and this review does not raise it again."
+NO_CHANGE = "Lane claude made no change for the fix to #50 and said why on the pull request"
+
+
+class ReviewBotThreads(Base):
+    def thread(self, *comments):
+        nodes = [{"author": a, "body": b} for a, b in comments]
+        self.gh.details[50]["reviewThreads"]["nodes"][0].update(
+            comments={"nodes": nodes}, root={"nodes": nodes[:1]})
+
+    def test_a_thread_the_bot_marked_fixed_is_resolved_and_the_pull_request_lands(self):
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.comments[5].append({"body": FIX_ASKED.replace("### Check: lint\n\n    E1\n\n", ""),
+                                    "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "medium finding"), (BOT, FIXED))
+        self.go()
+        self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
+
+    def test_a_person_with_the_bot_login_does_not_resolve_a_thread(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "finding"), ({"__typename": "User", "login": "grug-tribe"}, FIXED))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_thread_a_person_opened_stays_open_even_under_a_bot_fixed_reply(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((ME, "this breaks on an empty list"), (BOT, FIXED))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_reply_after_the_bot_marked_it_fixed_keeps_it_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+        self.thread((BOT, "finding"), (BOT, FIXED), (ME, "this still breaks when x is empty"))
+        self.go()
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual(self.merged, [])
+
+    def test_a_no_change_round_waits_for_the_review_it_asked_for(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(600)},
+                                {"body": NO_CHANGE, "user": ME, "created_at": iso(120)}]
+        self.gh.pull(50, 5, resolved=False, green=False)
+        self.gh.runs["sha50"][1]["completed_at"] = iso(900)
+        self.go()
+        self.assertEqual((self.fixed, self.merged), ([], []))
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+
+    def test_a_no_change_round_is_judged_once_the_review_answered(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(600)},
+                                {"body": NO_CHANGE, "user": ME, "created_at": iso(120)}]
+        self.gh.pull(50, 5, resolved=False, green=False)
+        self.gh.runs["sha50"][1]["completed_at"] = iso(30)
+        self.go()
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def test_a_no_change_round_with_no_review_is_judged_after_the_grace(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += [{"body": FIX_ASKED, "user": ME, "created_at": iso(7200)},
+                                {"body": NO_CHANGE, "user": ME,
+                                 "created_at": iso(factory.REVIEW_GRACE + 60)}]
+        self.gh.pull(50, 5, resolved=False, green=False)
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+
+
 class Trust(Base):
     def test_a_strangers_ticket_or_pull_request_is_never_touched(self):
         self.gh.ticket(5, "pr")
@@ -380,7 +485,7 @@ class Tickets(Base):
 
     def test_a_failed_ticket_past_the_last_rung_is_left_alone(self):
         self.gh.ticket(6, "failed")
-        self.gh.comments[6].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        self.gh.comments[6] += ALL_RUNGS
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
@@ -429,7 +534,7 @@ class Tickets(Base):
 
     def test_a_limited_ticket_past_the_last_rung_stays_for_its_lane(self):
         self.gh.ticket(7, "briefed", lane="spark")
-        self.gh.comments[7].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        self.gh.comments[7] += ALL_RUNGS
         self.go(limited=["spark"])
         self.assertEqual(self.lane(7), "spark")
         self.assertEqual(self.moved, [])
@@ -448,13 +553,21 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.with_model("Difficulty: hard\n\n## Why", "b"),
                          "Model: b\nDifficulty: hard\n\n## Why")
 
-    def test_a_busy_rung_spills_to_the_next(self):
-        self.assertEqual(factory.pick_rung(1, {}), 1)
-        self.assertEqual(factory.pick_rung(1, {"claude": 2}), 2)
-        self.assertEqual(factory.pick_rung(1, {"claude": 2, "codex": 2, "codex-2": 3}), 3)
-        self.assertEqual(factory.pick_rung(2, {"codex": 0}), 2)
-        self.assertEqual(factory.pick_rung(3, {}), 3)
-        self.assertEqual(factory.pick_rung(4, {}), 0)
+    def test_a_busy_rung_spills_to_the_next_untried(self):
+        busy = {"claude": 2, "codex": 2, "codex-2": 3}
+        self.assertEqual(factory.next_rung(set(), {}), 1)
+        self.assertEqual(factory.next_rung(set(), {"claude": 2}), 2)
+        self.assertEqual(factory.next_rung(set(), busy), 3)
+        self.assertEqual(factory.next_rung({1}, {"codex": 0}), 2)
+        self.assertEqual(factory.next_rung({3}, {}), 1)
+        self.assertEqual(factory.next_rung({1, 2, 3}, {}), 0)
+        # Every untried rung busy: wait on the lowest rather than skip it.
+        all_busy = dict(busy, **{lane: 2 for lane in factory.ANTHROPIC})
+        self.assertEqual(factory.next_rung({1}, all_busy), 2)
+
+    def test_tried_rungs_start_again_at_a_rung_zero_marker(self):
+        comments = ALL_RUNGS + [{"body": factory.RUNG_MARKER % 0}, {"body": factory.RUNG_MARKER % 2}]
+        self.assertEqual(factory.tried_rungs(comments), {2})
 
     def test_pick_lane_takes_the_least_loaded(self):
         self.assertEqual(factory.pick_lane(("codex", "codex-2"), {"codex": 2, "codex-2": 1}), "codex-2")

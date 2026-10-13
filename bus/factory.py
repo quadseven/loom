@@ -28,6 +28,14 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
 - A pull request whose only fault is a failed Actions job gets that job run
   once more before it is sent back, since one flaky run should not cost a
   lane round.
+- The review bot replies "Fixed in <sha>" on a thread whose flagged code
+  changed, but GitHub does not let its app resolve threads, so the thread
+  stays open. Such a thread, with nobody writing after the bot's reply, is
+  resolved here before the pull request is judged; otherwise it would count
+  as a finding that survived the round (77 of 218 open threads on
+  2026-10-13 were the bot's own "Fixed in" threads).
+- A round where the lane made no change and explained why waits for the
+  review it asked for, up to REVIEW_GRACE, before the round is judged.
 - A failed ticket climbs the ladder, and so does a ticket left briefed for
   BRIEFED_STALL with no lane claiming it.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
@@ -67,6 +75,9 @@ REVIEW_GRACE = 1800
 # At most this many merges, send-backs and climbs per pass.
 MAX_ACTIONS = 12
 DEFAULT_REVIEW_CHECK = "Grug - Elder"
+# The review bot's login as GraphQL reports it (an app, without "[bot]").
+DEFAULT_REVIEW_BOT = "grug-tribe"
+BOT_FIXED_PREFIX = "Fixed in "
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The operator's ladder, 2026-10-12: "sonnet 5.5, or codex sol or opus 5.5
@@ -86,6 +97,14 @@ RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
 FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
 CLAIM_RE = re.compile(r"^Claimed for lane ")
+# bus/station.py's note when a fix round ended without a commit.
+NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved'
+                 ' root: comments(first:1) { nodes { author { __typename login } } }'
+                 ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
+RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
+                    ' { thread { isResolved } } }')
 ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
@@ -161,6 +180,44 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     return checks_failing and bool(FIX_CHECK_RE.search(last))
 
 
+def _by_bot(comment: Dict[str, Any], bot: str) -> bool:
+    """Written by the review bot's app; a person can take the same login
+    without "[bot]", so the author type must be Bot as well."""
+    author = comment.get("author") or {}
+    return (author.get("__typename") == "Bot"
+            and str(author.get("login") or "").lower() == bot.lower())
+
+
+def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
+    nodes = (thread.get(field) or {}).get("nodes") or [{}]
+    return nodes[index] or {}
+
+
+def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
+    """An open thread the review bot opened whose newest comment is its own
+    "Fixed in" reply. A thread a person opened, or any reply after the
+    bot's, stays open for a person or the brain."""
+    last = _end(thread, "comments", -1)
+    return (not thread.get("isResolved") and _by_bot(_end(thread, "root", 0), bot)
+            and _by_bot(last, bot)
+            and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
+
+
+def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
+    return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
+
+
+def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
+    """When the last fix round ended with no commit, 0 when it did not."""
+    for c in reversed(comments):
+        body = str(c.get("body") or "")
+        if body.startswith(FIX_MARKER):
+            return 0.0
+        if NO_CHANGE_RE.match(body):
+            return _ts(c.get("created_at"))
+    return 0.0
+
+
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
     return sum(1 for c in comments if str(c.get("body") or "").startswith(FIX_MARKER))
 
@@ -170,16 +227,37 @@ def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
     return min(lanes, key=lambda lane: (load.get(lane, 0), lanes.index(lane)))
 
 
-def pick_rung(start: int, load: Dict[str, int]) -> int:
-    """The first rung from `start` (1-based) with a lane under RUNG_BUSY, else
-    the last rung. 0 past the last rung."""
-    if start > len(LADDER):
-        return 0
-    for rung in range(start, len(LADDER)):
-        lanes = LADDER[rung - 1][0]
-        if min(load.get(lane, 0) for lane in lanes) < RUNG_BUSY:
+def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
+    """The rungs the ticket has run on since its ladder last started (the
+    newest rung 0 marker). A rung skipped because its lanes were busy is not
+    tried: on 2026-10-13 a restart wave filled the claude and codex lanes,
+    tickets spilled straight to rung 3 and gave up after one more round."""
+    tried: set = set()
+    for c in comments:
+        for m in RUNG_RE.finditer(str(c.get("body") or "")):
+            rung = int(m.group(1))
+            tried = set() if rung == 0 else tried | {rung}
+    return tried
+
+
+def current_rung(issue: Dict[str, Any]) -> int:
+    """The rung whose model and lane the ticket runs on now, 0 when none: a
+    brief can start on a ladder model, and failing there tries that rung."""
+    m = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+    model = m.group(1) if m else ""
+    return next((n for n, (lanes, rung_model) in enumerate(LADDER, 1)
+                 if rung_model == model and _lane(issue) in lanes), 0)
+
+
+def next_rung(tried: set, load: Dict[str, int]) -> int:
+    """The lowest untried rung with a lane under RUNG_BUSY (docs/MUSE.md: a
+    higher rung rather than a wait behind a busy lane), else the lowest
+    untried rung, to wait there. 0 once every rung was tried."""
+    untried = [n for n in range(1, len(LADDER) + 1) if n not in tried]
+    for rung in untried:
+        if min(load.get(lane, 0) for lane in LADDER[rung - 1][0]) < RUNG_BUSY:
             return rung
-    return len(LADDER)
+    return untried[0] if untried else 0
 
 
 def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
@@ -223,6 +301,7 @@ class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
                  review_check: str = DEFAULT_REVIEW_CHECK,
+                 review_bot: str = DEFAULT_REVIEW_BOT,
                  merge: Callable[..., Any] = brain.merge,
                  fix: Callable[..., Any] = brain.fix,
                  move: Callable[..., Any] = brain.move,
@@ -232,6 +311,7 @@ class Factory:
         self.now = now
         self.trusted = {t.lower() for t in trusted}
         self.review_check = review_check
+        self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
         self.limited = set(limited)
         self.actions = 0
@@ -284,13 +364,35 @@ class Factory:
              % (repo, number, self.review_check))
         return "unreviewed"
 
+    def _reviewed_since(self, sha: str, since: float) -> bool:
+        """Has the review check finished on this commit at or after `since`?"""
+        return any(r.get("name") == self.review_check and _ts(r.get("completed_at")) >= since
+                   for r in self._runs.get(sha, []))
+
     # -- writes ----------------------------------------------------------
-    def _climb(self, repo: str, issue: Dict[str, Any], rung: int, why: str,
-               head: str = "Repeatedly stuck") -> Optional[str]:
-        """Put the ticket on `rung` (1-based): its Model: line and lane label,
-        and a rung marker. Returns the lane, or None past the last rung."""
+    def _resolve_bot_fixed(self, repo: str, number: int) -> None:
+        owner, name = repo.split("/", 1)
+        data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
+                                               "number": number}) or {}
+        threads = ((((data.get("repository") or {}).get("pullRequest") or {})
+                    .get("reviewThreads") or {}).get("nodes") or [])
+        picked = bot_fixed(threads, self.review_bot)
+        for thread_id in picked:
+            self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
+        if picked:
+            _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
+                 % (len(picked), repo, number))
+
+    def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+               why: str, head: str = "Repeatedly stuck", failed_here: bool = True) -> Optional[str]:
+        """Put the ticket on its next rung: its Model: line and lane label, and
+        a rung marker. The rung it ran on counts as tried when it failed
+        there. Returns the lane, or None once every rung was tried."""
         number = int(issue["number"])
-        rung = pick_rung(rung, self.load)
+        tried = tried_rungs(comments)
+        if failed_here:
+            tried |= {current_rung(issue)} - {0}
+        rung = next_rung(tried, self.load)
         if not rung:
             return None
         lanes, model = LADDER[rung - 1]
@@ -322,8 +424,7 @@ class Factory:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
         if stuck(comments, open_threads, checks_failing, age, self.now):
-            rung = rung_of(comments) + 1
-            if self._climb(repo, issue, rung, why) is None:
+            if self._climb(repo, issue, comments, why) is None:
                 self._give_up(repo, issue, why)
                 return
         self.fix(self.gh, repo, int(pr["number"]), (repo, number), FIX_NOTES)
@@ -362,12 +463,18 @@ class Factory:
         review = self._review_state(repo, number, sha, _ts(full.get("updated_at")))
         if review == "wait":
             return
+        comments = self._comments(repo, int(issue["number"]))
+        ended = no_change_at(comments)
+        if (ended and not self._reviewed_since(sha, ended)
+                and self.now - ended <= REVIEW_GRACE):
+            return  # the review the lane asked for has not answered yet
+        self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
         if faults == ["failing checks"] and self._run_again(repo, number, sha):
             return
         if faults:
-            self._send_back(repo, full, issue, self._comments(repo, int(issue["number"])),
+            self._send_back(repo, full, issue, comments,
                             ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
             self._land(repo, number, full, issue)
@@ -440,12 +547,9 @@ class Factory:
                prs: Dict[int, Dict[str, Any]]) -> None:
         number = int(issue["number"])
         comments = self._comments(repo, number)
-        rung = rung_of(comments) + 1
-        if rung > len(LADDER):
-            return  # left for the brain; _give_up said so once
-        lane = self._climb(repo, issue, rung, "it failed on lane %s" % _lane(issue))
+        lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue))
         if lane is None:
-            return
+            return  # left for the brain; _give_up said so once
         pr = prs.get(number)
         if pr is not None:
             # Back to loom:pr so the fix brief reuses its open pull request.
@@ -477,9 +581,8 @@ class Factory:
                for c in comments):
             return
         hours = (self.now - since) / 3600
-        rung = rung_of(comments) + 1
         why = "briefed %.0f hours on lane %s with no claim" % (hours, _lane(issue))
-        lane = self._climb(repo, issue, rung, why)
+        lane = self._climb(repo, issue, comments, why, failed_here=False)
         if lane is None:
             self._give_up(repo, issue, why)
             return
@@ -491,11 +594,9 @@ class Factory:
         rung it stays where it is, for the lane to take once it is back."""
         number = int(issue["number"])
         old = _lane(issue)
-        rung = rung_of(self._comments(repo, number)) + 1
-        if rung > len(LADDER):
-            return
-        lane = self._climb(repo, issue, rung, "lane %s is at a limit" % old,
-                           head="Not a failure")
+        lane = self._climb(repo, issue, self._comments(repo, number),
+                           "lane %s is at a limit" % old, head="Not a failure",
+                           failed_here=False)
         if lane is None:
             return
         self.actions += 1

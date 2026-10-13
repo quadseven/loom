@@ -49,6 +49,13 @@ LANE_SAID_MAX = 2500
 # An absolute path: a run of non-space characters starting with a slash (not
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
+# Credential shapes that must not reach a public comment: provider key
+# prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
+SECRET_RE = re.compile(
+    r"(?i)\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat|xox[a-z]|glpat|AKIA|ASIA)[-_A-Za-z0-9]{12,}"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+"
+    r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
 REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
@@ -748,14 +755,14 @@ class Station:
 
     def _lane_said(self, lane: str, name: str) -> str:
         """The agent's own words from the run log: every line that is not a
-        runner line, with local paths removed, capped."""
+        runner line, with local paths and credential shapes removed, capped."""
         log = os.path.join(self.s.home, "logs", lane, name + ".log")
         try:
             with open(log, encoding="utf-8", errors="replace") as fh:
                 lines = [line.rstrip() for line in fh]
         except OSError:
             return ""
-        said = [PATH_RE.sub("<path>", line) for line in lines
+        said = [SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", line)) for line in lines
                 if not re.match(r"^\[\d{4}-\d\d-\d\dT", line) and not line.startswith("rsync(")]
         text = "\n".join(said).strip()
         if len(text) > LANE_SAID_MAX:
