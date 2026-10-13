@@ -107,9 +107,9 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
 TIERS: Dict[str, Tuple[str, ...]] = {
-    "easy": ("spark", "opencode-go", "opencode-go-2", "openrouter", "workersai",
+    "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "openrouter", "workersai",
              "zen", "zai", "agy"),
-    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2") + ANTHROPIC,
+    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3") + ANTHROPIC,
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
 # Lanes whose provider may train on prompts: public repos only.
@@ -363,7 +363,8 @@ def is_code(path: str) -> bool:
 
 def is_test(path: str) -> bool:
     folders, _, name = path.lower().rpartition("/")
-    return (bool({"test", "tests"} & set(folders.split("/")))
+    return (bool({"test", "tests", "t", "spec", "__tests__"} & set(folders.split("/")))
+            or name.startswith("test")
             or bool(TEST_NAME_RE.search(name)))
 
 

@@ -3,6 +3,7 @@ the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import json
 import os
+import re
 import signal
 import shlex
 import shutil
@@ -100,12 +101,20 @@ fi
 """
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
-# only edits it the way a sandboxed codex must ($FAKE_AGENT=edit), makes no
-# file change at all ($FAKE_AGENT=noop), or exits non-zero ($FAKE_AGENT=fail).
+# only edits it ($FAKE_AGENT=edit), makes no file change ($FAKE_AGENT=noop),
+# exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
+# $FAKE_EXIT, editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
+# The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
+# rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
+if [ "${FAKE_AGENT:-commit}" = say ]; then
+  [ -z "${FAKE_EDIT:-}" ] || echo partial > fix.txt
+  printf '%s\\n' "$FAKE_OUT"
+  exit "${FAKE_EXIT:-1}"
+fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
   echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
@@ -124,9 +133,11 @@ if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkfifo .loom-answers/PRRT_4x.md
   echo "scratch" > .loom-answers/notes.txt
 fi
+[ -f vendor/sub/value.txt ] && echo "agent-saw submodule" >> "$FAKE_LOG"
+[ -z "${FAKE_AGENT_WEAKEN:-}" ] || { mkdir -p .loom; echo 'check: true' > .loom/validation.conf; }
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
-echo fixed > fix.txt
+printf '%s\\n' "${FAKE_AGENT_TEXT:-fixed}" > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
 git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
@@ -252,6 +263,26 @@ if echo '{"permissions":{"allow":["read_url(*)"]}}' > "$P" 2>/dev/null; then set
 printf 'agy %s | cwd=%s home=%s mem=%s cfg=%s rc=%s set=%s skill=%s skillw=%s\\n' "$args" "$PWD" "$HOME" "$mem" "$cfg" "$rc" "$set" "$skill" "$skillw" >> "$TMPDIR/agy.log"
 mkdir -p "$G/antigravity-cli/brain" && echo note > "$G/antigravity-cli/brain/this-run.md"
 echo fixed > fix.txt
+"""
+
+# A repo's validation contract, as its CI would run it: a pinned interpreter,
+# a required submodule, a setup step and a check. check.py needs the
+# submodule at its pinned revision, fails on a "broken" fix.txt, and, like a
+# formatter, strips trailing spaces from fix.txt.
+CONTRACT = """# The same steps CI runs.
+interpreter: python3.12
+submodules: yes
+setup: python3.12 -c 'open(".prepared", "w").write("ok")'
+check: test -f .prepared && python3.12 check.py
+"""
+CHECK_PY = """import pathlib, sys
+assert pathlib.Path("vendor/sub/value.txt").read_text() == "v1\\n", "submodule not at its pin"
+fix = pathlib.Path("fix.txt")
+if fix.exists():
+    text = fix.read_text()
+    fix.write_text(text.rstrip() + "\\n")
+    if "broken" in text:
+        sys.exit("fix.txt is broken")
 """
 
 
@@ -552,30 +583,30 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("failed: limit: lane codex's provider reported a usage or rate limit "
-                      "(agent exited 1)", log)
+        self.assertIn("failed: [limit] agent exited 1: provider limit reached", log)
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertTrue(beat["reason"].startswith("limit: "), beat)
-        # The next brief is handed on without running the agent.
+        self.assertIn("provider limit reached", beat["reason"])
+        self.assertAlmostEqual(beat["retry_at"] - time.time(), 3600, delta=30)
+        # The next brief waits until the provider limit lifts.
         agents = sum(c.startswith("codex ") for c in self.calls())
         self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
         self.run_lane()
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
-        self.assertTrue((self.inbox / "failed" / "T043-next.md").exists())
+        self.assertTrue((self.inbox / "T043-next.md").exists())
 
     def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="early-limit")
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("failed: agent exited 1", log)
+        self.assertIn("failed: [transient] agent exited 1", log)
         self.assertNotIn("failed: limit", log)
 
     def test_a_finding_that_mentions_a_rate_limit_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF + "\nThe client ignores the rate limit header.\n")
         self.run_lane(FAKE_AGENT="fail")
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("failed: agent exited 3", log)
+        self.assertIn("failed: [transient] agent exited 3", log)
         self.assertNotIn("failed: limit", log)
 
     def test_a_fix_briefs_answers_move_to_the_inbox_and_never_into_the_commit(self):
@@ -890,7 +921,7 @@ cat > /dev/null
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
         # The remote did not move: this run's own rewrite is a push failure.
-        self.assertIn("failed: push failed",
+        self.assertIn("failed: [transient] push failed",
                       (self.loom / "logs" / "codex" / (name + ".log")).read_text())
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
 
@@ -900,17 +931,18 @@ cat > /dev/null
         # agent works: the push is refused, and that is not this run's failure.
         work = Path(self._tmp.name) / "pr-work"
         self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
-            "echo fixed > fix.txt\n",
+            "printf '%s\\n' \"${FAKE_AGENT_TEXT:-fixed}\" > fix.txt\n",
             "(cd %s && echo other > other.txt && git add other.txt &&"
             " git -c user.name=t -c user.email=t@example.invalid commit -qm Other &&"
-            " git push -q origin %s)\necho fixed > fix.txt\n" % (work, self.FIX_BRANCH), 1))
+            " git push -q origin %s)\n"
+            "printf '%%s\\n' \"${FAKE_AGENT_TEXT:-fixed}\" > fix.txt\n" % (work, self.FIX_BRANCH), 1))
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         moved = self.remote_head(self.FIX_BRANCH)
         self.assertNotEqual(moved, before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
         log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
-        self.assertIn("failed: branch moved: %s is at %s on the remote, not %s"
+        self.assertIn("failed: [work] branch moved: %s is at %s on the remote, not %s"
                       % (self.FIX_BRANCH, moved[:12], before[:12]), log)
         self.assertNotIn("failed: push failed", log)
         self.assertFalse(any(c.startswith("gh pr comment") for c in self.calls()))
@@ -1414,6 +1446,23 @@ cat > /dev/null
         self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def slot_run(self, slot):
+        inbox, result = self.api_lane(
+            slot, LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/kimi-k2.7-code",
+            LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        return [c for c in self.calls() if c.startswith("opencode ")][-1]
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_slot_with_its_own_model_setting_runs_that_model(self):
+        self.assertIn("-m opencode-go/deepseek-v4.1-flash", self.slot_run("opencode-go-3"))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_slot_without_one_runs_its_lanes_model(self):
+        self.assertIn("-m opencode-go/kimi-k2.7-code", self.slot_run("opencode-go-2"))
+
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_zai_lane_hands_its_key_to_a_free_flash_model(self):
         inbox, result = self.api_lane(
@@ -1509,7 +1558,7 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertFalse((self.loom / "worktrees" / "T042-fix-the-thing").exists())
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
-        self.assertIn("failed: limit: the spark endpoint refused the connection", self.spark_log())
+        self.assertIn("failed: [limit] limit: the spark endpoint refused the connection", self.spark_log())
         beat = self.spark_beat()
         self.assertFalse(beat["available"])
         self.assertTrue(beat["reason"].startswith("limit: "), beat)
@@ -1530,7 +1579,7 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
-        self.assertIn("failed: limit: the spark endpoint answered 503 (agent exited 3)", self.spark_log())
+        self.assertIn("failed: [limit] limit: the spark endpoint answered 503 (agent exited 3)", self.spark_log())
         beat = self.spark_beat()
         self.assertFalse(beat["available"])
         self.assertTrue(beat["reason"].startswith("limit: "), beat)
@@ -1539,7 +1588,7 @@ cat > /dev/null
     def test_a_spark_run_that_fails_while_the_endpoint_answers_is_an_ordinary_failure(self):
         inbox, _ = self.api_lane("spark", extra="AGENT_FAIL=1\n", **self.SPARK)
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
-        self.assertIn("failed: agent exited 3", self.spark_log())
+        self.assertIn("failed: [transient] agent exited 3", self.spark_log())
         self.assertNotIn("limit:", self.spark_log())
         self.assertTrue(self.spark_beat()["available"])
         self.assertFalse((self.loom / "state" / "usage" / "spark.limit").exists())
@@ -1732,6 +1781,102 @@ exit %d
         self.run_lane()
         self.assertEqual(self.calls(), [])
 
+    def failure_line(self, ticket="T042-fix-the-thing", lane="codex"):
+        lines = [l for l in (self.loom / "logs" / lane / (ticket + ".log")).read_text().splitlines()
+                 if " failed: " in l]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0].split(" failed: ", 1)[1]
+
+    def beat(self, lane="codex"):
+        return json.loads((self.loom / "state" / "usage" / (lane + ".json")).read_text())
+
+    # (agent output, exit status, edited the tree, expected class)
+    SAMPLES = [
+        ("Claude AI usage limit reached|1999999999", 1, False, "limit"),
+        ('API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}', 1, True, "limit"),
+        ("Error: You exceeded your current quota, please check your plan", 1, True, "limit"),
+        ("ProviderError: HTTP 402 Payment Required", 1, False, "limit"),
+        ("Rate limit hit. Please try again in 20 minutes.", 0, False, "limit"),
+        ("TypeError: fetch failed (ECONNRESET)", 1, True, "transient"),
+        ('API Error: 529 {"type":"overloaded_error"}', 1, True, "transient"),
+        ("panic: something broke before any edit", 1, False, "transient"),
+        ("killed", 137, True, "transient"),
+        ("FAILED tests/test_x.py::test_y - AssertionError at line 429", 1, True, "work"),
+        ("I looked and there is nothing to change.", 0, False, "work"),
+    ]
+
+    def test_each_failure_is_classed_from_the_agents_exit_and_output(self):
+        for out, status, edited, want in self.SAMPLES:
+            with self.subTest(out=out):
+                for d in ("logs", "state", "briefs"):
+                    shutil.rmtree(self.loom / d, ignore_errors=True)
+                self.inbox.mkdir(parents=True)
+                self.drop_brief()
+                env = {"FAKE_AGENT": "say", "FAKE_OUT": out, "FAKE_EXIT": str(status)}
+                if edited:
+                    env["FAKE_EDIT"] = "1"
+                result = self.run_lane(**env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+                self.assertTrue(self.failure_line().startswith("[%s] " % want), self.failure_line())
+                self.assertEqual(self.beat()["available"], want != "limit")
+
+    def test_a_limit_holds_the_lane_unavailable_until_the_providers_reset(self):
+        reset = int(time.time()) + 7200
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="Claude AI usage limit reached|%d" % reset)
+        self.assertIn("provider limit reached", self.failure_line())
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertEqual(beat["retry_at"], reset)
+        # Later passes take no brief and read no key until the reset.
+        self.drop_brief("T043-next.md", BRIEF.replace("T042-fix-the-thing", "T043-next"))
+        self.log.write_text("")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.inbox / "T043-next.md").exists())
+        self.assertFalse(self.beat()["available"])
+        self.assertEqual(self.beat()["retry_at"], reset)
+
+    def test_a_limit_without_a_reset_waits_an_hour(self):
+        before = int(time.time())
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="Error: 429 Too Many Requests")
+        self.assertTrue(before + 3600 <= self.beat()["retry_at"] <= int(time.time()) + 3600)
+
+    def test_a_limit_with_a_retry_after_waits_that_long(self):
+        before = int(time.time())
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="status 429: retry after 120 seconds")
+        self.assertTrue(before + 120 <= self.beat()["retry_at"] <= int(time.time()) + 120)
+
+    def test_a_lane_takes_work_again_once_its_retry_time_passed(self):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        (usage / "codex.json").write_text(json.dumps(
+            {"lane": "codex", "at": 1, "available": False, "reason": "limit",
+             "retry_at": int(time.time()) - 5}))
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat()["available"])
+        self.assertNotIn("retry_at", self.beat())
+
+    def test_a_finished_run_that_mentions_rate_limits_still_opens_its_pr(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_EDIT="1", FAKE_EXIT="0",
+                               FAKE_OUT="Added a rate limit and a quota check; HTTP 429 now.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat()["available"])
+
+    def test_a_refusal_by_a_guard_is_a_work_failure(self):
+        self.drop_brief(text=BRIEF.replace("Repo: example/repo", "Repo: stranger/repo"))
+        self.run_lane()
+        self.assertTrue(self.failure_line().startswith("[work] owner stranger"))
+
     def test_brief_aimed_at_a_non_loom_branch_is_refused_before_running(self):
         self.drop_brief(text=BRIEF.replace("Branch: loom/T042-fix-the-thing", "Branch: hotfix"))
         result = self.run_lane()
@@ -1868,6 +2013,202 @@ exit %d
             ["bash", "-c", 'source "$1"; runner_busy "$2"', "test",
              str(INSTALL_LOCK), str(lock)], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
+
+
+    # The validation contract (.loom/validation.conf).
+
+    def contract_repo(self, contract=CONTRACT):
+        """Give the remote a submodule pinned behind its tip, the contract
+        and check.py. Returns the pinned submodule commit."""
+        root = Path(self._tmp.name)
+        commit = ("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm")
+        sub = root / "sub-seed"
+        git("init", "-q", "-b", "main", str(sub))
+        (sub / "value.txt").write_text("v1\n")
+        git("add", "value.txt", cwd=sub)
+        git(*commit, "v1", cwd=sub)
+        pinned = subprocess.run(["git", "rev-parse", "HEAD"], cwd=sub, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        (sub / "value.txt").write_text("v2\n")
+        git(*commit, "v2", "-a", cwd=sub)
+        git("clone", "-q", "--bare", str(sub), str(self.remote.parent / "sub.git"))
+        work = root / "contract-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("-c", "protocol.file.allow=always", "submodule", "add", "-q", "../sub.git", "vendor/sub", cwd=work)
+        git("checkout", "-q", pinned, cwd=work / "vendor" / "sub")
+        (work / ".loom").mkdir()
+        (work / ".loom" / "validation.conf").write_text(contract)
+        (work / "check.py").write_text(CHECK_PY)
+        git("add", "-A", cwd=work)
+        git(*commit, "contract", cwd=work)
+        git("push", "-q", "origin", "main", cwd=work)
+        return pinned
+
+    def run_contract_lane(self, interpreter=True, **env):
+        """A codex pass that may clone file:// submodules; with interpreter,
+        python3.12 is on PATH."""
+        path = self.lane_env()["PATH"]
+        if interpreter:
+            self.write_tool(Path(self._tmp.name) / "pybin" / "python3.12",
+                            f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+            path = f"{Path(self._tmp.name) / 'pybin'}:{path}"
+        return self.run_lane(PATH=path, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="protocol.file.allow",
+                             GIT_CONFIG_VALUE_0="always", **env)
+
+    def records(self):
+        path = self.loom / "logs" / "codex" / "T042-fix-the-thing.validation.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def remote_heads(self):
+        return subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                              capture_output=True, text=True, check=True).stdout
+
+    def lane_log(self):
+        return (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_an_unprepared_workspace_is_a_setup_failure_and_the_agent_never_runs(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(interpreter=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("setup failed: interpreter python3.12 is not on PATH", self.lane_log())
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_prepared_workspace_checks_the_agents_commit_before_the_pr(self):
+        pinned = self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        # The agent worked in the prepared tree and was told the check.
+        self.assertIn("agent-saw submodule", self.calls())
+        self.assertIn("## Validation environment", self.log.read_text())
+        records = self.records()
+        self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records],
+                         [("prepare", 0, True), ("setup", 0, True), ("baseline", 0, True), ("final", 0, True)])
+        self.assertIn(pinned, records[0]["detail"])
+        self.assertEqual(records[-1]["command"], "test -f .prepared && python3.12 check.py")
+        head = subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", "loom/T042-fix-the-thing"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(records[-1]["revision"], head)
+        self.assertIn(f"Validation: check exited 0 at {head[:12]}", self.body.read_text())
+        # What setup left behind is not committed.
+        files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", head],
+                               capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("fix.txt", files)
+        self.assertNotIn(".prepared", files)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_zero_exit_agent_with_a_failing_check_opens_no_pr_and_keeps_its_edits(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT="edit", FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("validation failed: the check exited 1", self.lane_log())
+        self.assertFalse(any(r["phase"] == "final" and r["ok"] for r in self.records()))
+        heads = self.remote_heads()
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-unvalidated-" in h]
+        self.assertEqual(len(side), 1, heads)
+        kept = subprocess.run(["git", "--git-dir", str(self.remote), "show", f"{side[0]}:fix.txt"],
+                              capture_output=True, text=True, check=True).stdout
+        self.assertEqual(kept, "broken\n")
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_check_that_has_to_reformat_the_agents_files_does_not_pass(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="fixed   ")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("the check changed tracked files", self.lane_log())
+        self.assertEqual(self.records()[-1]["exit"], 0)
+        self.assertFalse(self.records()[-1]["ok"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_the_agent_cannot_weaken_the_contract_it_is_checked_against(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT="edit", FAKE_AGENT_TEXT="broken", FAKE_AGENT_WEAKEN="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertEqual(self.records()[-1]["command"], "test -f .prepared && python3.12 check.py")
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_fix_run_checks_against_the_base_branchs_contract_not_the_pull_requests(self):
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        # An earlier run on the pull request's branch weakened the contract.
+        work = Path(self._tmp.name) / "pr-work"
+        (work / ".loom").mkdir(exist_ok=True)
+        (work / ".loom" / "validation.conf").write_text("check: true\n")
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "weaken", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        before = self.remote_head(self.FIX_BRANCH)
+        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records[-1]["command"], "test -f .prepared && python3.12 check.py")
+        self.assertFalse(records[-1]["ok"])
+
+    def test_a_contract_with_an_unknown_line_is_a_setup_failure(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertIn("setup failed: .loom/validation.conf has an unknown line 'python: 3.12'", self.lane_log())
+
+    def test_a_contract_command_with_a_control_or_non_ascii_byte_is_a_setup_failure(self):
+        self.contract_repo(contract=CONTRACT + "setup: true\x1b[2K; echo hidden\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertIn("setup: and check: must be printable ASCII", self.lane_log())
+
+    def test_contract_run_itself_refuses_an_unchecked_command(self):
+        # The guard sits at the bash -c call too, not only in load_contract.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run"))
+        tmp = Path(self._tmp.name)
+        marker = tmp / "ran"
+        fakes = tmp / "fakebin"
+        fakes.mkdir()
+        (fakes / "sandbox-exec").write_text('#!/bin/bash\nshift 2\nexec "$@"\n')
+        (fakes / "sandbox-exec").chmod(0o755)
+        (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+        (fakes / "timeout").chmod(0o755)
+        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(tmp / "log"), "TREE": str(tmp),
+               "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30"}
+        result = subprocess.run(["bash", "-c", script, "test", f"true\x1b[2K; touch {marker}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertFalse(marker.exists())
+        result = subprocess.run(["bash", "-c", script, "test", f"touch {marker}\n"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertFalse(marker.exists())
+        result = subprocess.run(["bash", "-c", script, "test", f"touch {marker}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
 
 
 if __name__ == "__main__":

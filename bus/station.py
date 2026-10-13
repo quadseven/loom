@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -57,7 +58,9 @@ RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id
                     ' { thread { isResolved } } }')
 # The runner's reason, and its heartbeat's, when a lane's provider refused
 # work for a while (the spark lane's thermal guard). Not a failure: the ticket
-# goes back to briefed, and the factory moves it to the next lane.
+# goes back to briefed, and the factory moves it to the next lane. It follows
+# the class prefix ("[limit] limit: ...") and, unlike a classed provider limit
+# that _retry handles, never counts against LOOM_RETRY_MAX.
 LIMIT = "limit:"
 # The runner's reason when a fix brief's push was refused because another
 # push moved the pull request's branch during the run. Not a failure: the
@@ -88,6 +91,15 @@ REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
 DIGEST_HEAD = "Asks waiting for you:"
+# When every ask does not fit in the daily notification, the full digest is a
+# comment on this issue in each ask's own repo (so a private repo's asks stay
+# in that repo), and the notification links to it.
+DIGEST_LABEL = "loom:digest"
+DIGEST_TITLE = "Loom asks digest"
+DIGEST_MARKER = "<!-- loom:digest v1 -->"
+# Room kept for the mention, which _send adds in front.
+MENTION_ROOM = 40
+ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # Reports come every 2 hours, so the goal homes are read at most this often,
@@ -115,6 +127,32 @@ JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 JOURNAL_CHECK = 600
 JOURNAL_LOOKBACK = 24 * 3600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
+# Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
+# each failure reason with its class; a reason without one is a work failure.
+CLASS_RE = re.compile(r"^\[(limit|transient|work)\] ")
+RETRY_CLASSES = ("limit", "transient")
+RETRY_MAX = 2
+RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
+                      r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
+# The brain's lane order for a retry, after the failed lane's own provider.
+# claude is never chosen: it spends the operator's own subscription.
+RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
+               "codex", "codex-2", "opencode-go", "agy"]
+# Free lanes take only easy tickets on public repos.
+FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
+# The model families each lane's runner accepts (lanes/run_lane.sh); codex
+# takes any model outside the claude family.
+CLAUDE_MODELS = ["claude*", "opus*", "sonnet*", "haiku*", "fable*"]
+LANE_MODELS = {
+    "claude": CLAUDE_MODELS,
+    "anthropic": ["claude*"],
+    "openrouter": ["openrouter/*:free"],
+    "opencode-go": ["opencode-go/*"],
+    "zen": ["opencode/*-free"],
+    "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
+    "workersai": ["cloudflare-workers-ai/@cf/*"],
+    "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
+}
 # Operator messages in the Discord channel become notes on a goal home, and
 # the brain's replies go back to the channel (docs/LANES.md, "Talking to the
 # brain"). The channel and the goal homes are read at most this often.
@@ -147,7 +185,8 @@ class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
                  mention: str = "", digest_hour: int = 9,
-                 region: str = "us-east-1", channel_id: str = "",
+                 region: str = "us-east-1", retry_max: int = RETRY_MAX,
+                 channel_id: str = "",
                  bot_token_ssm: str = "", default_goal: str = "",
                  anthropic: Optional[spend.Budget] = None,
                  factory_on: bool = False,
@@ -163,6 +202,7 @@ class Settings:
         self.mention = mention
         self.digest_hour = digest_hour
         self.region = region
+        self.retry_max = retry_max
         self.channel_id = channel_id
         self.bot_token_ssm = bot_token_ssm
         self.default_goal = default_goal
@@ -188,6 +228,11 @@ class Settings:
         if not 0 <= hour <= 23:
             hour = 9
         try:
+            retry_max = int(env.get("LOOM_RETRY_MAX", "").strip() or RETRY_MAX)
+        except ValueError:
+            retry_max = RETRY_MAX
+        retry_max = max(retry_max, 0)
+        try:
             budget = spend.Budget.from_env(env)
         except ValueError as err:
             _say("ignoring the anthropic budget: %s" % err)
@@ -199,6 +244,7 @@ class Settings:
                    mention=env.get("LOOM_DISCORD_MENTION", "").strip(),
                    digest_hour=hour,
                    region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
+                   retry_max=retry_max,
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
                    bot_token_ssm=env.get("LOOM_DISCORD_BOT_TOKEN_SSM", "").strip(),
                    default_goal=env.get("LOOM_DISCORD_DEFAULT_GOAL", "").strip(),
@@ -376,6 +422,53 @@ def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
     """The one lane the issue names, or None when it names none or several."""
     lanes = [n[len("lane:"):] for n in _label_names(issue) if n.startswith("lane:")]
     return lanes[0] if len(lanes) == 1 and lanes[0] in LANES else None
+
+
+def provider(lane: str) -> str:
+    """The provider lane of a slot (anthropic-2 -> anthropic), as the runner
+    maps it."""
+    return re.sub(r"-[0-9]+$", "", lane)
+
+
+def failure_class(reason: str) -> str:
+    m = CLASS_RE.match(reason)
+    return m.group(1) if m else "work"
+
+
+def lane_takes_model(lane: str, model: str) -> bool:
+    """Whether the lane's runner accepts the model (lanes/run_lane.sh)."""
+    lane = provider(lane)
+    if lane == "codex":
+        return not any(fnmatch.fnmatchcase(model, p) for p in CLAUDE_MODELS)
+    return any(fnmatch.fnmatchcase(model, p) for p in LANE_MODELS.get(lane, []))
+
+
+def needs_public_repo(lane: str, model: str) -> bool:
+    """Free lanes, and lanes whose provider trains on prompts, take public
+    repos only."""
+    lane = provider(lane)
+    return (lane in FREE_LANES or lane == "agy"
+            or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
+
+
+def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]]]:
+    """(automatic retries since the ticket last went to the brain or opened a
+    pull request, the lanes those retries left, and (from, to) of the latest
+    retry when no claim has followed it: a retry whose relabel did not
+    happen yet)."""
+    used, left, pending = 0, set(), None
+    for c in comments:
+        body = str(c.get("body") or "").strip() if isinstance(c, dict) else ""
+        m = RETRY_RE.match(body)
+        if m:
+            used += 1
+            left.add(m.group(1))
+            pending = (m.group(1), m.group(2))
+        elif body.startswith("Lane "):
+            used, left, pending = 0, set(), None
+        elif CLAIM_RE.fullmatch(body):
+            pending = None
+    return used, left, pending
 
 
 def scrub(reason: str) -> str:
@@ -756,6 +849,67 @@ class Station:
                 reported[key] = kind
                 _write_json(path, reported)
 
+    @staticmethod
+    def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
+        body = str(pr.get("body") or "")
+        ref = re.search(r"^Refs %s#([0-9]+)[ \t]*$" % re.escape(repo), body, re.M)
+        head = str((pr.get("head") or {}).get("ref") or "")
+        branch = re.match(r"loom/([0-9]+)(?:-|$)", head)
+        match = ref or branch
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _terminal_label(pr: dict) -> Optional[str]:
+        # The pulls list endpoint carries merged_at only; merged appears on
+        # the single-PR endpoint, so both are accepted.
+        if bool(pr.get("merged_at")) or pr.get("merged") is True:
+            return "loom:merged"
+        if pr.get("state") == "closed":
+            return "loom:closed-unmerged"
+        return None
+
+    def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict) -> None:
+        number = self._pr_ticket_number(repo, pr)
+        ticket = tickets_by_number.get(number) if number is not None else None
+        if ticket is None:
+            return
+        labels = _label_names(ticket)
+        if any(state in labels for state in ("loom:merged", "loom:shipped", "loom:verified")):
+            return
+        target = self._terminal_label(pr)
+        if target is None or target in labels:
+            return
+        state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
+                       "shipped", "verified", "closed-unmerged")
+        states = {"loom:" + state for state in state_names}
+        kept = [name for name in labels if name not in states]
+        kept.append(target)
+        self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
+                     {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+
+    def _reconcile_repo(self, repo: str) -> None:
+        issues = self.gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Apr" % repo)
+        tickets_by_number = {int(i["number"]): i for i in issues
+                             if "loom:ticket" in _label_names(i)}
+        for pr in self.gh.paginate("/repos/%s/pulls?state=all" % repo):
+            if isinstance(pr, dict):
+                self._reconcile_pr_ticket(repo, pr, tickets_by_number)
+
+    def reconcile_pull_requests(self) -> None:
+        """Repair ticket state from the PR's authoritative terminal state.
+
+        A GitHub failure on one repo is logged and the pass moves on; the
+        next pass retries, since the repair is idempotent."""
+        for repo in self.s.repos:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                continue
+            try:
+                # Both the issues and pulls fetches are covered by this repo guard.
+                self._reconcile_repo(repo)
+            except (GitHubError, OSError) as err:
+                _say("could not reconcile pull requests for %s: %s" % (repo, err))
+
     def hand_back(self) -> None:
         """Return completed lane PRs with failed checks or bot findings."""
         rounds = _fix_round_limit()
@@ -956,27 +1110,135 @@ class Station:
             self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
-        self._report_failed(repo, number, lane, name, text)
-        return True
+        return self._report_failure(repo, number, lane, text, name)
 
-    def _report_failed(self, repo: str, number: int, lane: str, name: str, text: str) -> None:
-        """A brief parked in failed/: a limit, a moved branch or a fix round
-        with nothing to commit is not a failure; anything else is."""
+    def _report_failure(self, repo: str, number: int, lane: str, text: str, name: str) -> bool:
+        """Report a failed brief, keeping fix rounds on their existing pull request."""
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
-        if reason.startswith(LIMIT):
-            self._limited(repo, number, fix_pr.isdigit(), lane, reason)
-            return
-        if fix_pr.isdigit() and reason.startswith(BRANCH_MOVED):
-            self._branch_moved(repo, number, int(fix_pr), lane, reason)
-            return
-        if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
+        klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        # Thermal-limit briefs carry "limit:" with or without a class and
+        # return to the factory. Provider limits have a class but no marker,
+        # so they take the bounded retry path below.
+        if bare.startswith(LIMIT):
+            self._limited(repo, number, fix_pr.isdigit(), lane, bare)
+            return True
+        if fix_pr.isdigit() and bare.startswith(BRANCH_MOVED):
+            self._branch_moved(repo, number, int(fix_pr), lane, bare)
+            return True
+        if fix_pr.isdigit() and bare.startswith(NO_COMMIT):
             self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
-            return
+            return True
+        if fix_pr:
+            # A fresh attempt would open a second pull request for the ticket.
+            self._relabel(repo, number, "loom:pr")
+            self._comment(repo, number, "Lane %s failed: %s. This was a fix round on pull "
+                          "request #%s; the ticket is back at loom:pr and the pull request "
+                          "is unchanged." % (lane, reason, fix_pr))
+            _say("reported %s#%d fix failed, back to loom:pr: %s" % (repo, number, reason))
+            return True
+        note = ""
+        if klass in RETRY_CLASSES:
+            note = self._retry(repo, number, lane, klass, reason)
+            if not note:
+                return True
+            note = ". Not retried: %s." % note
         self._relabel(repo, number, "loom:failed")
-        self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
+        self._comment(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
+        return True
+
+    def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
+        """Brief a running ticket to another lane after a limit or transient
+        failure. Its next claim is a new attempt, so a fresh branch. Returns ""
+        when it moved, else why not."""
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if RUNNING not in names:
+            return "the ticket is no longer running"
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        used, left, pending = retry_chain(comments)
+        if pending and pending[0] == lane:
+            # An earlier pass commented this retry but did not relabel.
+            target = pending[1]
+        else:
+            if used >= self.s.retry_max:
+                return "%d of %d automatic retries used" % (used, self.s.retry_max)
+            target = self._retry_lane(repo, issue, lane, klass, left | {lane})
+            if target is None:
+                return "no other eligible lane is available"
+            # The comment comes first: it is the count of retries, and it tells
+            # a pass that finds the relabel undone where the ticket was going.
+            self._comment(repo, number, "Automatic retry %d of %d (%s): moved from lane %s "
+                          "to lane %s. Lane %s failed: %s"
+                          % (used + 1, self.s.retry_max, klass, lane, target, lane, reason))
+        labels = [n for n in names if n != RUNNING and not n.startswith("lane:")]
+        labels += [BRIEFED, "lane:" + target]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        _say("retrying %s#%d on lane %s after a %s failure on lane %s"
+             % (repo, number, target, klass, lane))
+        return ""
+
+    def _retry_lane(self, repo: str, issue: Dict[str, Any], failed: str, klass: str,
+                    skip: set) -> Optional[str]:
+        """The next eligible lane: another slot of the failed lane's provider
+        (not after a limit, which the slots share), then RETRY_ORDER, then free
+        lanes for an easy ticket. Only available lanes whose runner takes the
+        ticket's model and repo; an idle one before a busy one. Candidate
+        eligibility is kept in _retry_eligible so this method selects by order."""
+        try:
+            headers = tickets.parse(issue.get("body"))[0]
+        except ValueError as err:
+            # Without Model and Difficulty no lane can be judged eligible, so
+            # guessing would send the brief to a lane that refuses it.
+            _say("not retrying %s#%s: its body does not parse: %s"
+                 % (repo, issue.get("number"), err))
+            return None
+        model = headers.get("Model", "")
+        order = self._retry_order(failed, klass, headers.get("Difficulty"))
+        public: Dict[str, bool] = {}
+        busy = None
+        for cand in dict.fromkeys(order):
+            if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public):
+                continue
+            if self._inbox_empty(cand):
+                return cand
+            busy = busy or cand
+        return busy
+
+    def _retry_order(self, failed: str, klass: str, difficulty: Optional[str]) -> List[str]:
+        same = [lane for lane in LANES if provider(lane) == provider(failed)]
+        order = ([] if klass == "limit" else same) + RETRY_ORDER
+        if difficulty == "easy":
+            order += FREE_LANES
+        return order
+
+    def _retry_eligible(self, repo: str, cand: str, failed: str, klass: str, model: str,
+                        public: Dict[str, bool]) -> bool:
+        """Whether lane cand can take a retry: a known, available lane, not
+        the failed lane's provider after a limit, whose runner takes the
+        model and, for a public-only lane, a public repo. public caches the
+        repo lookup across candidates."""
+        if cand not in LANES or not self._heartbeat_ok(cand):
+            return False
+        if klass == "limit" and provider(cand) == provider(failed):
+            return False
+        if model and not lane_takes_model(cand, model):
+            return False
+        if needs_public_repo(cand, model):
+            if repo not in public:
+                public[repo] = self._public(repo)
+            return public[repo]
+        return True
+
+    def _public(self, repo: str) -> bool:
+        try:
+            data = self.gh.rest("GET", "/repos/%s" % repo).data
+        except GitHubError as err:
+            _say("could not read whether %s is public: %s" % (repo, err))
+            return False
+        return isinstance(data, dict) and data.get("private") is False
 
     def _limited(self, repo: str, number: int, fix: bool, lane: str, reason: str) -> None:
         """A run the lane's provider refused (a limit, not a failure). The
@@ -1265,18 +1527,6 @@ class Station:
             return False
         return True
 
-    def _digest_text(self, lines: List[str]) -> str:
-        room = DISCORD_MAX - 60  # the mention and the "and N more" line
-        keep, size = [], len(DIGEST_HEAD)
-        for line in lines:
-            size += len(line) + 1
-            if size > room:
-                break
-            keep.append(line)
-        if len(keep) < len(lines):
-            keep.append("- and %d more" % (len(lines) - len(keep)))
-        return DIGEST_HEAD + "\n" + "\n".join(keep)
-
     def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """(key, repo, issue) for every open ask, oldest first; None when any
         repo could not be read (a partial list must not become a digest)."""
@@ -1341,9 +1591,8 @@ class Station:
         today = time.strftime("%Y-%m-%d", local)
         return today, local.tm_hour >= self.s.digest_hour and sent.get("digest") != today
 
-    def _deliver(self, url: str, todo: List[Tuple[str, Dict[str, Any]]],
-                 digest: List[Dict[str, Any]], ledger: Tuple[str, Dict[str, Any], List[str]],
-                 today: str) -> None:
+    def _send_urgent(self, url: str, todo: List[Tuple[str, Dict[str, Any]]],
+                     ledger: Tuple[str, Dict[str, Any], List[str]]) -> None:
         path, sent, urgent_sent = ledger
         for key, issue in todo:
             title = " ".join(str(issue.get("title") or "").split())
@@ -1351,8 +1600,155 @@ class Station:
                 urgent_sent.append(key)
                 sent["urgent"] = urgent_sent
                 _write_json(path, sent)
-        if digest and self._send(url, self._digest_text([self._line(i) for i in digest])):
+
+    @staticmethod
+    def _ask_rev(issue: Dict[str, Any]) -> str:
+        """The revision of an ask: its title and body as the operator reads them."""
+        return _sha12("%s\n%s" % (issue.get("title") or "", issue.get("body") or ""))
+
+    def _plan_digest(self, asks: List[Tuple[str, str, Dict[str, Any]]],
+                     covered_before: Any, today: str) -> Dict[str, Any]:
+        """Today's digest, fixed before anything is sent so a retry sends the
+        same one. Asks new or changed since the last sent digest go first,
+        newest first, so they are not buried behind old ones."""
+        prev = covered_before if isinstance(covered_before, dict) else {}
+        covered = {k: self._ask_rev(i) for k, _, i in asks}
+        new = [a for a in reversed(asks) if prev.get(a[0]) != covered[a[0]]]
+        seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
+        plan: Dict[str, Any] = {
+            "day": today, "covered": covered, "new": len(new),
+            "lines": [self._line(i) for _, _, i in new + seen], "pages": {}}
+        whole = "\n".join([self._digest_head(plan)] + plan["lines"])
+        if len(whole) <= DISCORD_MAX - MENTION_ROOM:
+            return plan
+        repos: List[str] = []
+        for _, repo, _ in asks:
+            if repo not in repos:
+                repos.append(repo)
+        plan["pages"] = {repo: {"body": self._page_body(
+            repo, [i for _, r, i in asks if r == repo], today), "url": ""}
+            for repo in repos}
+        plan["order"] = repos
+        return plan
+
+    def _page_body(self, repo: str, issues: List[Dict[str, Any]], today: str) -> str:
+        """Every ask in one repo, grouped under the goal home its body names."""
+        # _goal_issues keeps only objects with numeric issue numbers; a read
+        # failure reaches _send_digest as GitHubError before any page is posted.
+        goals = {int(g["number"]): g for g in self._goal_issues(repo)}
+        groups: Dict[Optional[int], List[Dict[str, Any]]] = {}
+        for issue in issues:
+            refs = [int(n) for n in ASK_GOAL_REF_RE.findall(str(issue.get("body") or ""))]
+            goal = next((n for n in refs if n in goals), None)
+            groups.setdefault(goal, []).append(issue)
+        out = [DIGEST_MARKER, "Asks waiting for the operator on %s: %d in this repo."
+               % (today, len(issues))]
+        for goal in sorted(groups, key=lambda g: (g is None, g or 0)):
+            if goal is None:
+                head = "Not filed under a goal"
+            else:
+                head = "%s (#%d)" % (" ".join(str(goals[goal].get("title") or "").split()), goal)
+            out += ["", "## " + head.replace("@", "@\u200b"), ""]
+            out += ["- #%d %s" % (int(i["number"]),
+                                  " ".join(str(i.get("title") or "").split()).replace("@", "@\u200b"))
+                    for i in groups[goal]]
+        return "\n".join(out)
+
+    @staticmethod
+    def _digest_head(plan: Dict[str, Any]) -> str:
+        return "%s %d, %d new since the last digest" % (DIGEST_HEAD, len(plan["lines"]), plan["new"])
+
+    def _digest_text(self, plan: Dict[str, Any]) -> str:
+        """The daily notification: as many asks as fit, then a link per repo
+        to the full digest when some do not."""
+        lines = plan["lines"]
+        head = self._digest_head(plan)
+        pages = plan.get("pages") or {}
+        tail = ["Every ask, by goal:"] + [
+            "- %s %s" % (repo, pages[repo].get("url") or "")
+            for repo in plan.get("order") or []] if pages else []
+        room = DISCORD_MAX - MENTION_ROOM - len(head) - sum(len(t) + 1 for t in tail)
+        keep: List[str] = []
+        size = len("- and 9999 more") + 1 if pages else 0
+        for line in lines:
+            size += len(line) + 1
+            if size > room:
+                break
+            keep.append(line)
+        if len(keep) < len(lines):
+            keep.append("- and %d more" % (len(lines) - len(keep)))
+        return "\n".join([head] + keep + tail)
+
+    def _digest_issue(self, repo: str) -> int:
+        found = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                 % (repo, DIGEST_LABEL))
+        numbers = sorted(int(i["number"]) for i in found
+                         if isinstance(i, dict) and "pull_request" not in i and "number" in i)
+        if numbers:
+            return numbers[0]
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": DIGEST_TITLE, "labels": [DIGEST_LABEL],
+            "body": "The station posts the full daily digest of asks here when "
+                    "they do not all fit in the operator's notification."}).data
+        if not isinstance(made, dict) or "number" not in made:
+            raise GitHubError("no issue was created in %s" % repo)
+        return int(made["number"])
+
+    def _post_pages(self, plan: Dict[str, Any], ledger: Tuple[str, Dict[str, Any], List[str]]
+                    ) -> bool:
+        """Post each repo's full digest once; the link is kept in the plan, so
+        a retry reuses a page already posted."""
+        path, sent, _ = ledger
+        for repo in plan.get("order") or []:
+            page = plan["pages"][repo]
+            if page.get("url"):
+                continue
+            try:
+                number = self._digest_issue(repo)
+                made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                                    {"body": page["body"]}).data
+            except GitHubError as err:
+                # Leave the fixed plan pending; forward_asks has already sent urgent asks.
+                _say("daily digest pending: could not post its page in %s: %s; next pass"
+                     % (repo, err))
+                return False
+            # A successful HTTP status can still carry an unusable reply.
+            url = made.get("html_url") if isinstance(made, dict) else None
+            if not url:
+                _say("no digest page link from %s; next pass" % repo)
+                return False
+            page["url"] = str(url)
+            _write_json(path, sent)
+        return True
+
+    def _send_digest(self, url: Optional[str], keyed: List[Tuple[str, str, Dict[str, Any]]],
+                     ledger: Tuple[str, Dict[str, Any], List[str]], today: str) -> None:
+        path, sent, _ = ledger
+        plan = sent.get("pending")
+        if not (isinstance(plan, dict) and plan.get("day") == today):
+            trust = self._check_asks(keyed, {k for k, _, _ in keyed})
+            if trust is None:
+                return
+            asks = [a for a in keyed if trust.get(a[0])]
+            if not asks:
+                return
+            try:
+                plan = self._plan_digest(asks, sent.get("covered"), today)
+            except GitHubError as err:
+                _say("could not read the goal homes for the digest: %s; next pass" % err)
+                return
+            sent["pending"] = plan
+            _write_json(path, sent)
+        if url is None:
+            url = self._webhook()
+        if url is None or not self._post_pages(plan, ledger):
+            return
+        if self._send(url, self._digest_text(plan)):
+            # What the operator was sent: each ask's revision and the links.
             sent["digest"] = today
+            sent["covered"] = plan["covered"]
+            sent["pages"] = {r: p["url"] for r, p in (plan.get("pages") or {}).items()}
+            del sent["pending"]
             _write_json(path, sent)
 
     def forward_asks(self) -> None:
@@ -1368,18 +1764,18 @@ class Station:
         self._prune_urgent(ledger, {k for k, _, _ in keyed})
         urgent_keys = {k for k, _, i in keyed
                        if URGENT in _label_names(i) and k not in ledger[2]}
-        if not urgent_keys and not digest_due:
-            return
-        trust = self._check_asks(keyed, {k for k, _, _ in keyed} if digest_due else urgent_keys)
-        if trust is None:
-            return
-        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
-        digest = [i for k, _, i in keyed if trust.get(k)] if digest_due else []
-        if not todo and not digest:
-            return
-        url = self._webhook()
-        if url is not None:
-            self._deliver(url, todo, digest, ledger, today)
+        url = None
+        # Urgent asks go out on their own: nothing the digest needs (a trust
+        # check of an old ask, a page post) can hold them.
+        trust = self._check_asks(keyed, urgent_keys) if urgent_keys else {}
+        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and (trust or {}).get(k)]
+        if todo:
+            url = self._webhook()
+            if url is None:
+                return
+            self._send_urgent(url, todo, ledger)
+        if digest_due:
+            self._send_digest(url, keyed, ledger, today)
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
@@ -1387,7 +1783,7 @@ class Station:
             "/repos/%s/issues?labels=loom:goal&state=open&per_page=100" % repo)
         return [i for i in (data if isinstance(data, list) else [])
                 if isinstance(i, dict) and "pull_request" not in i
-                and "number" in i]
+                and str(i.get("number")).isdigit()]
 
     @staticmethod
     def _report_id(comment: Dict[str, Any]) -> int:
@@ -1994,6 +2390,10 @@ class Station:
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
+        try:
+            self.reconcile_pull_requests()
+        except (GitHubError, OSError) as err:
+            _say("pull request reconciliation failed: %s" % err)
         try:
             self.hand_back()
         except (GitHubError, OSError, ValueError) as err:

@@ -259,7 +259,8 @@ factory moves its waiting tickets to a free lane in the same tier as above
 when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
-anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 is opencode-go. Each takes one
+anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 and opencode-go-3 are
+opencode-go (opencode-go-3 runs its own model, so leave Model: off its briefs). Each takes one
 ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.
