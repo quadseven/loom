@@ -922,10 +922,12 @@ class Station:
         """The first line of the newest loom:human comment from an allowed
         login (the brain's ask), or "" when there is none."""
         allowed = {a.lower() for a in self.s.authors}
-        # paginate adds per_page=100 and follows next links. These reads are
-        # limited to the 15 shown issues; _human_text holds the whole digest
-        # on a GitHubError so it cannot send a partial list.
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
+        # paginate follows the next links, so the newest comment is read however
+        # long the thread is. Only the HUMAN_SHOWN listed issues are read, once a
+        # day when the digest is due. A GitHubError is left to _human_text,
+        # which holds the whole digest rather than send a list missing an ask.
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                    % (repo, int(issue["number"])))
         for c in reversed(comments):
             body = str(c.get("body") or "") if isinstance(c, dict) else ""
             if body.startswith(HUMAN_MARKER) and tickets._login(c.get("user")) in allowed:
@@ -1044,6 +1046,22 @@ class Station:
             sent["digest"] = today
             _write_json(path, sent)
 
+    def _due_asks(self, keyed: List[Tuple[str, str, Dict[str, Any]]], urgent_sent: List[str],
+                  digest_due: bool) -> Optional[Tuple[List[Tuple[str, Dict[str, Any]]],
+                                                      List[Dict[str, Any]]]]:
+        """The trusted urgent asks not yet sent, and every trusted ask when the
+        digest is due; None when a trust check failed (nothing goes this pass)."""
+        urgent_keys = {k for k, _, i in keyed
+                       if URGENT in _label_names(i) and k not in urgent_sent}
+        if not urgent_keys and not digest_due:
+            return [], []
+        trust = self._check_asks(keyed, {k for k, _, _ in keyed} if digest_due else urgent_keys)
+        if trust is None:
+            return None
+        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
+        digest = [i for k, _, i in keyed if trust.get(k)] if digest_due else []
+        return todo, digest
+
     def _human_section(self, digest: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
         """The due digest's asks and its "Waiting on you" text. When the
         loom:human list cannot be read whole, the digest waits (no asks, no
@@ -1065,15 +1083,10 @@ class Station:
         if keyed is None:
             return
         self._prune_urgent(ledger, {k for k, _, _ in keyed})
-        urgent_keys = {k for k, _, i in keyed
-                       if URGENT in _label_names(i) and k not in ledger[2]}
-        if not urgent_keys and not digest_due:
+        due = self._due_asks(keyed, ledger[2], digest_due)
+        if due is None:
             return
-        trust = self._check_asks(keyed, {k for k, _, _ in keyed} if digest_due else urgent_keys)
-        if trust is None:
-            return
-        todo = [(k, i) for k, _, i in keyed if k in urgent_keys and trust.get(k)]
-        digest = [i for k, _, i in keyed if trust.get(k)] if digest_due else []
+        todo, digest = due
         digest, human = self._human_section(digest) if digest_due else ([], "")
         if not todo and not digest and not human:
             return
