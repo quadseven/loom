@@ -608,7 +608,15 @@ opencode_agent() {
   bin="$(opencode_bin)"
   case "$(timeout "$NET_TIMEOUT" "$bin" --version < /dev/null 2> /dev/null | head -n 1)" in
     "opencode v2."*)
-      standalone_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')" || return 3
+      # A random port avoids a bind-and-release race with other local services.
+      standalone_port="$(python3 -c 'import secrets; print(49152 + secrets.randbelow(16384))')" || {
+        echo "could not select an opencode standalone port" >&2
+        return 3
+      }
+      if ! [[ "$standalone_port" =~ ^[0-9]{1,5}$ ]] || [ "$standalone_port" -lt 1 ] || [ "$standalone_port" -gt 65535 ]; then
+        echo "invalid opencode standalone port" >&2
+        return 3
+      fi
       flags=(--standalone --auto --port "$standalone_port")
       ;;
   esac

@@ -427,6 +427,31 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(self.sandbox_network_rules(),
                          ['(deny network-outbound (remote ip "localhost:*"))'])
 
+    def test_opencode_2_rejects_missing_or_invalid_selected_port(self):
+        function = re.search(r"^opencode_agent\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        script = (function + '\nopencode_bin() { printf "%s" "$FAKE_BIN"; }\n'
+                  'opencode_config() { :; }\n'
+                  'api_agent() { echo launched; }\n'
+                  'NET_TIMEOUT=5\nMODEL=test/model\nopencode_agent - brief\n')
+        version_bin = Path(self._tmp.name) / "opencode2"
+        self.write_tool(version_bin, '#!/bin/sh\necho "opencode v2.0.28"\n')
+        picker_bin = self.bin / "python3"
+        for output, expected in [('', 'invalid opencode standalone port'),
+                                 ('garbled', 'invalid opencode standalone port'),
+                                 ('65536', 'invalid opencode standalone port'),
+                                 ('99999999999999999999', 'invalid opencode standalone port'),
+                                 (None, 'could not select an opencode standalone port')]:
+            body = 'exit 1' if output is None else f"printf '%s' {shlex.quote(output)}"
+            self.write_tool(picker_bin, f'#!/bin/sh\n{body}\n')
+            result = subprocess.run(['bash', '-c', script],
+                                    env={**os.environ, 'FAKE_BIN': str(version_bin),
+                                         'PATH': f'{self.bin}:{os.environ["PATH"]}'},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 3, (result.stdout, result.stderr))
+            self.assertIn(expected, result.stderr)
+            self.assertNotIn('launched', result.stdout)
+
     def test_brief_with_an_existing_pr_is_retired_without_running(self):
         self.drop_brief()
         result = self.run_lane(FAKE_GH_EXISTING="852")
