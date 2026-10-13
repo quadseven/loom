@@ -133,6 +133,9 @@ def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
     """When the goal last had a journal, a valid report, a measurement and a
     completed action, and where its report deadline stands.
 
+    Comment classification and deadline thresholds live in separate helpers;
+    this function only folds timestamps for one goal.
+
     Only a comment on this goal that starts with the report marker counts as
     its report: a marker inside another comment, a journal, or a report on
     another goal (a parent goal included) does not. With `authors`, only

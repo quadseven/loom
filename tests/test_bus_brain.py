@@ -101,6 +101,17 @@ class BrainTests(unittest.TestCase):
         self.assertEqual((led["report"], led["state"], led["due"]),
                          ("2030-01-01T19:58:00Z", "ok", "2030-01-01T21:58:00Z"))
 
+    def test_report_deadline_changes_state_at_due_and_grace(self):
+        last = brain.datetime(2030, 1, 1, 17, 0, tzinfo=brain.timezone.utc)
+        due = last + brain.timedelta(seconds=brain.REPORT_EVERY)
+        grace = brain.timedelta(seconds=brain.REPORT_GRACE)
+        for now, state in ((due - brain.timedelta(seconds=1), "ok"),
+                           (due, "due"),
+                           (due + grace - brain.timedelta(seconds=1), "due"),
+                           (due + grace, "overdue")):
+            with self.subTest(now=now):
+                self.assertEqual(brain._report_deadline(last, now), (due, state))
+
     def test_brief_refusals_create_nothing(self):
         cases = [
             ("## Why\nmissing", "codex", 0),
