@@ -22,7 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import metrics
@@ -149,6 +149,7 @@ class Settings:
                  factory_on: bool = False,
                  review_check: str = factory.DEFAULT_REVIEW_CHECK,
                  review_bot: str = factory.DEFAULT_REVIEW_BOT,
+                 no_test_repos: Sequence[str] = (),
                  metrics_goal: str = "") -> None:
         self.home = home
         self.repos = repos
@@ -168,6 +169,7 @@ class Settings:
         self.factory_on = factory_on
         self.review_check = review_check
         self.review_bot = review_bot
+        self.no_test_repos = list(no_test_repos)
         self.metrics_goal = metrics_goal
 
     @classmethod
@@ -204,6 +206,7 @@ class Settings:
                                  or factory.DEFAULT_REVIEW_CHECK),
                    review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
                                or factory.DEFAULT_REVIEW_BOT),
+                   no_test_repos=words("LOOM_NO_TEST_REPOS"),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip())
 
 
@@ -1769,7 +1772,8 @@ class Station:
         factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                         review_check=self.s.review_check,
                         review_bot=self.s.review_bot,
-                        limited=self.limited_lanes()).run()
+                        limited=self.limited_lanes(),
+                        no_test_repos=self.s.no_test_repos).run()
 
     def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
         dated = {}

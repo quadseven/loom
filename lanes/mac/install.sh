@@ -119,7 +119,8 @@ done
 # brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
 # LOOM_ANTHROPIC_BUDGET_SINCE, LOOM_ANTHROPIC_BUDGET_EXPIRES and
 # LOOM_ANTHROPIC_FLOOR_USD (the anthropic spend line; the lanes get them with
-# every other LOOM_* setting). Runs from this checkout, like the lanes, through
+# every other LOOM_* setting), and LOOM_NO_TEST_REPOS (repos the factory
+# lands code changes in without a test, docs/LANES.md). Runs from this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
 LABEL="com.loom.station"
@@ -162,6 +163,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_ANTHROPIC_BUDGET_SINCE</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_SINCE:-}")</string>
     <key>LOOM_ANTHROPIC_BUDGET_EXPIRES</key><string>$(xml "${LOOM_ANTHROPIC_BUDGET_EXPIRES:-}")</string>
     <key>LOOM_ANTHROPIC_FLOOR_USD</key><string>$(xml "${LOOM_ANTHROPIC_FLOOR_USD:-}")</string>
+    <key>LOOM_NO_TEST_REPOS</key><string>$(xml "${LOOM_NO_TEST_REPOS:-}")</string>
   </dict>
 </dict>
 </plist>
