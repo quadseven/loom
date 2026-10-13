@@ -280,10 +280,27 @@ be in `LOOM_BRIEF_AUTHORS`, or the trust rules refuse the retried ticket.
 The GitHub API limit (5,000 requests an hour) is shared by every client of
 the account, the brain included.
 
-- The station reads each watched repo once a minute with
-  `GET /repos/{repo}/issues?labels=loom:briefed&state=open` and the last
-  ETag; GitHub does not count a `304 Not Modified` against the limit.
+- Every GET the station sends carries the ETag of the last answer to the
+  same URL (kept under `$LOOM_HOME/state/station/etags`, removed after a day
+  unused); GitHub does not count a `304 Not Modified` against the limit, and
+  the station reuses the kept answer.
+- A repo with a ticket in flight (briefed, running or pr at its last scan,
+  or a brief for it in a lane inbox) is scanned every pass; any other repo
+  at most every 10 minutes, so a ticket briefed in an idle repo can wait
+  that long to be claimed.
+- Reconciliation reads a repo's pull requests only while it has a `loom:pr`
+  ticket, and then only the open ones and one page of the most recently
+  closed ones.
+- Below 15% of any rate limit (from the `X-RateLimit-*` headers of the last
+  response, kept across passes) a pass does claims and reports only; the
+  rest (reconciliation, hand-back, lane status, asks, standups, goal
+  reports, metrics, the brain watch, the Discord relay and the factory)
+  waits for the reset. The station says so once per rate limit window.
+- Each pass logs one line: `requests: N, M counted (by endpoint kind), K
+  answered 304 (not counted); budget R of L left, resets T`.
 - Writes happen only on claims, outcomes, status changes and asks.
+- `LOOM_STATION_INTERVAL` (seconds, default 60, at least 60) sets the pass
+  interval at install.
 - The brain's tick stays under 300 requests and logs its count in the
   journal.
 
