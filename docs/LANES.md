@@ -399,13 +399,25 @@ lookup leaves the brief for the next pass. The rule covers:
   `loom`) instead: the runner starts it with `sudo -n -u loom`, in that user's
   emptied environment, inside the sandbox (keychain server allowed, loopback
   and everything else denied as for the other API lanes).
-- Edits only. agy stores its token so that `/usr/bin/security` can read it
+- Runs commands inside its sandbox. Print mode cannot prompt, so a tool no
+  rule allows is denied and the run ends with no output. Before each run the
+  runner writes agy's settings (`~/.gemini/antigravity-cli/settings.json`)
+  as the lane user from `lanes/agy/settings.json`: `permissions.allow` lets
+  through shell commands and the file tools, and `permissions.deny` blocks
+  web fetching (`read_url`, `execute_url`). Of the old file, only
+  `trustedWorkspaces` (set at sign-in) is kept. After the run the runner
+  writes back exactly what it wrote before, and the sandbox keeps the file
+  read-only during the run, so a run cannot leave a wider rule behind. The
+  brief tells agy to run the repo's tests and lint and to edit only inside
+  its tree, as the other lanes do.
+- Commands run as the lane user, inside the same sandbox and emptied
+  environment as agy itself, so they can write only where the agent can (see
+  below). agy stores its token so that `/usr/bin/security` can read it
   without a prompt, and reads it that way itself, so the sandbox cannot block
-  that tool; a shell command from the agent could copy the token out. The
-  runner never passes `--dangerously-skip-permissions`, passes
-  `--disable-slash-commands`, and tells agy in the brief that shell commands
-  are unavailable (print mode soft-denies them, and a denied command ends the
-  run with no output).
+  that tool, and a command could read the token. The settings deny commands
+  starting with `security`, which slows that down but does not stop it. The
+  runner never passes `--dangerously-skip-permissions` and passes
+  `--disable-slash-commands`.
 - Public repos only: whether the plan trains on prompts is not established.
 - One-time setup, done by the operator:
   1. Create the standard user, hidden, and store its password in SSM.

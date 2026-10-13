@@ -305,32 +305,66 @@ agy_forget() {
     done' agy-forget "$s" "${AGY_STATE_KEEP[@]}" -- "${AGY_CACHE_KEEP[@]}"
 }
 
+# agy's CLI settings (settings.json in its state directory, which the sandbox
+# keeps read-only) hold its permission rules. Print mode cannot prompt, so a
+# tool no rule allows is denied and the run ends with no output. Before every
+# run the runner rewrites the file as the lane user from lanes/agy/settings.json:
+# shell commands and the file tools allowed, web fetching denied. Only
+# trustedWorkspaces, the operator's one-time sign-in choice, is carried over
+# from the old file; any other key is dropped. After the run it writes back
+# exactly what it wrote before, so nothing a run did to the file survives.
+# The text travels on stdin (the lane user cannot read this checkout), and a
+# link left in place of the scratch file is removed, never written through.
+# Usage: agy_settings merge|keep < text; prints what it wrote.
+AGY_SETTINGS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/agy/settings.json"
+agy_settings() {
+  # shellcheck disable=SC2016 # expanded by the lane user's shell
+  "${AGY_RUNAS[@]}" /bin/bash -c '
+    s="$1"; f="$s/settings.json"; t="$s/.settings.json.new"
+    mkdir -p "$s" && rm -f "$t" || exit 1
+    (set -C; cat > "$t") || exit 1
+    if [ "$2" = merge ] && [ -f "$f" ] && [ ! -L "$f" ] &&
+      tw="$(plutil -extract trustedWorkspaces json -o - "$f" 2> /dev/null)"; then
+      plutil -replace trustedWorkspaces -json "$tw" "$t" || exit 1
+    fi
+    mv -f "$t" "$f" && cat "$f"' agy-settings "$AGY_HOME/.gemini/antigravity-cli" "$1"
+}
+
 # agy stores its token so that /usr/bin/security may read it without a
 # prompt, and agy itself reads it that way, so the sandbox cannot forbid that
-# tool. Any shell command the agent ran could therefore copy the token out.
-# The lane stays edits-only (never --dangerously-skip-permissions): print mode
-# soft-denies shell commands, and a denied command ends the run with no
-# output, so the brief says so up front. Slash commands and skill expansion
-# in the prompt stay off; the agent can still load a skill it decides to use.
-AGY_TOOLS_NOTE="Tools on this lane: shell commands are not available here, and asking for one ends the run. Read files with your file viewing and search tools, and change them with your edit tools only."
+# tool, and a shell command could read the token. The settings deny commands
+# that start with security, a speed bump rather than a wall. The lane never
+# passes --dangerously-skip-permissions. Slash commands and skill expansion in
+# the prompt stay off; the agent can still load a skill it decides to use.
+AGY_TOOLS_NOTE="Tools on this lane: run the repo's tests and lint with your shell tool, as the brief asks, and edit files only inside this tree. Web fetching is not available here."
 
 # The agy lane: unlock the lane user's keychain (password on stdin to a shell
 # running as that user, never in this process's argv), then run agy as that
-# user in an emptied environment inside the sandbox, edits only. The runner,
+# user in an emptied environment inside the sandbox. The runner,
 # as this user, commits, pushes and opens the PR from the shared tree.
 agy_agent() {
-  local profile
+  local profile settings
   AGENT_HOME="$AGY_HOME/tmp"
   "${AGY_RUNAS[@]}" mkdir -p "$AGENT_HOME" || return 3
   agy_forget || { echo "could not clear agy's memory of earlier runs" >&2; return 3; }
   agy_skills
+  [ -f "$AGY_SETTINGS" ] || { echo "missing $AGY_SETTINGS" >&2; return 3; }
+  # Build the sandbox first: a run that stops here never wrote the settings,
+  # and once they are written nothing may fail before agy runs and the
+  # restore below follows.
   profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
+  settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
     LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
     "$AGY_BIN" -p "$1
 
 $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
+  local rc=$?
+  # A failed restore must fail the run, even if agy itself succeeded. Only the
+  # copy of the file that agy_settings prints goes to /dev/null, not its status.
+  printf '%s\n' "$settings" | agy_settings keep > /dev/null || { echo "could not restore agy's settings" >&2; return 3; }
+  return "$rc"
 }
 
 # The spark lane: a vLLM coder on a machine of the operator's own, serving
