@@ -2212,16 +2212,17 @@ class ReportsTest(Base):
             time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
         stuck_old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
             time.time() - station.factory.STUCK_AGE - 60))
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
         self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
         self.fake.comments[40][0]["created_at"] = old
         self.fake.sub_issues[40] = [
-            {"number": 41, "title": "Merged task", "state": "closed",
+            {"number": 41, "title": "Merged task", "state": "closed", "updated_at": recent,
              "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]},
             {"number": 42, "title": "Open task", "state": "open",
              "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
-            {"number": 43, "title": "Verified task", "state": "closed",
+            {"number": 43, "title": "Verified task", "state": "closed", "updated_at": recent,
              "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]},
-            {"number": 44, "title": "Sent back task", "state": "closed",
+            {"number": 44, "title": "Sent back task", "state": "closed", "updated_at": recent,
              "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]},
             {"number": 45, "title": "Failed task", "state": "open",
              "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]},
@@ -2247,7 +2248,26 @@ class ReportsTest(Base):
                               (45, "Failed task"), (46, "Stuck task"),
                               (47, "Decision task")):
             self.assertIn("#%d %s" % (number, title), body)
+        self.assertEqual(body.splitlines()[1], "1 merged, 1 verified, 1 shipped, 1 failed, "
+                         "1 stuck, 2 in flight, 1 waiting on you since the last report.")
         brain._check_written_text(body)
+
+    def test_station_standup_lists_only_what_changed_since_the_last_report(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        older = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 3600))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        self.fake.sub_issues[40] = [
+            {"number": 41, "title": "Merged long ago", "state": "closed", "updated_at": older,
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]}]
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        body = self.fake.comments[40][-1]["body"]
+        self.assertNotIn("Merged long ago", body)
+        self.assertEqual(body.splitlines()[1], "Nothing moved since the last report.")
 
     def test_station_standup_says_nothing_in_flight_without_tickets(self):
         self.add_goal()
@@ -2711,7 +2731,7 @@ class BotReportsTest(Base):
         self.assertTrue(self.discord.threads[0][1]["name"].startswith("Events 20"))
         link = "https://github.com/%s/issues/40#issuecomment-100" % REPO
         self.assertEqual(self.discord.in_thread[0]["content"],
-                         "## Shipped the search page\nDetail one\nDetail two\n" + link)
+                         "Detail one\nDetail two\n" + link)
         for body in self.discord.sent + self.discord.in_thread:
             self.assertEqual(body["flags"], station.SUPPRESS_EMBEDS)
             self.assertEqual(body["allowed_mentions"], {"parse": []})
@@ -2722,7 +2742,8 @@ class BotReportsTest(Base):
         parts = [m["content"] for m in self.discord.in_thread]
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(len(p) <= station.DISCORD_MAX for p in parts))
-        self.assertEqual("\n".join(parts).count("line"), 700)
+        # The first line is the channel line, so the thread holds the rest.
+        self.assertEqual("\n".join(parts).count("line"), 699)
         self.assertTrue(parts[-1].endswith("#issuecomment-100"))
 
     def test_a_failed_line_is_retried_and_a_failed_thread_is_not(self):
@@ -2743,7 +2764,8 @@ class BotReportsTest(Base):
         self.assertEqual([m["content"].split("\n")[0] for m in self.discord.sent],
                          ["**Events** report", "**Loom ships tickets quicker** second report",
                           "second report"])
-        self.assertEqual(self.discord.in_thread[-1]["content"].split("\n")[0], "report")
+        # A one-line report is all in its channel line; its thread holds the link.
+        self.assertTrue(self.discord.in_thread[-1]["content"].endswith("#issuecomment-100"))
 
     def test_markdown_in_the_short_name_is_dropped(self):
         self.fake.issues[41]["body"] = "Short name: **Big** _win_ `x` ~~y~~ ||z||\n"

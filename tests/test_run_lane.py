@@ -188,7 +188,7 @@ echo '{"transcript": "the whole conversation"}' > "$HOME/.local/share/opencode/s
 # opencode 1.18 keeps sessions in SQLite.
 echo "sqlite session store" > "$HOME/.local/share/opencode/opencode.db"
 echo "sqlite wal" > "$HOME/.local/share/opencode/opencode.db-wal"
-mkdir -p "$HOME/.local/share/opencode/log"
+(cd "$HOME" && mkdir -p .local/share/opencode/log)
 echo "request failed: HTTP 400" > "$HOME/.local/share/opencode/log/opencode.log"
 ln -s "$real_home/.ssh/id_planted" "$HOME/.local/share/opencode/storage/session/leak.json" 2>/dev/null
 # A link for a whole directory: .claude -> a directory outside the home.
