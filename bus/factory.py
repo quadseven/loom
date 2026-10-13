@@ -227,16 +227,37 @@ def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
     return min(lanes, key=lambda lane: (load.get(lane, 0), lanes.index(lane)))
 
 
-def pick_rung(start: int, load: Dict[str, int]) -> int:
-    """The first rung from `start` (1-based) with a lane under RUNG_BUSY, else
-    the last rung. 0 past the last rung."""
-    if start > len(LADDER):
-        return 0
-    for rung in range(start, len(LADDER)):
-        lanes = LADDER[rung - 1][0]
-        if min(load.get(lane, 0) for lane in lanes) < RUNG_BUSY:
+def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
+    """The rungs the ticket has run on since its ladder last started (the
+    newest rung 0 marker). A rung skipped because its lanes were busy is not
+    tried: on 2026-10-13 a restart wave filled the claude and codex lanes,
+    tickets spilled straight to rung 3 and gave up after one more round."""
+    tried: set = set()
+    for c in comments:
+        for m in RUNG_RE.finditer(str(c.get("body") or "")):
+            rung = int(m.group(1))
+            tried = set() if rung == 0 else tried | {rung}
+    return tried
+
+
+def current_rung(issue: Dict[str, Any]) -> int:
+    """The rung whose model and lane the ticket runs on now, 0 when none: a
+    brief can start on a ladder model, and failing there tries that rung."""
+    m = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+    model = m.group(1) if m else ""
+    return next((n for n, (lanes, rung_model) in enumerate(LADDER, 1)
+                 if rung_model == model and _lane(issue) in lanes), 0)
+
+
+def next_rung(tried: set, load: Dict[str, int]) -> int:
+    """The lowest untried rung with a lane under RUNG_BUSY (docs/MUSE.md: a
+    higher rung rather than a wait behind a busy lane), else the lowest
+    untried rung, to wait there. 0 once every rung was tried."""
+    untried = [n for n in range(1, len(LADDER) + 1) if n not in tried]
+    for rung in untried:
+        if min(load.get(lane, 0) for lane in LADDER[rung - 1][0]) < RUNG_BUSY:
             return rung
-    return len(LADDER)
+    return untried[0] if untried else 0
 
 
 def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
@@ -362,12 +383,16 @@ class Factory:
             _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
                  % (len(picked), repo, number))
 
-    def _climb(self, repo: str, issue: Dict[str, Any], rung: int, why: str,
-               head: str = "Repeatedly stuck") -> Optional[str]:
-        """Put the ticket on `rung` (1-based): its Model: line and lane label,
-        and a rung marker. Returns the lane, or None past the last rung."""
+    def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+               why: str, head: str = "Repeatedly stuck", failed_here: bool = True) -> Optional[str]:
+        """Put the ticket on its next rung: its Model: line and lane label, and
+        a rung marker. The rung it ran on counts as tried when it failed
+        there. Returns the lane, or None once every rung was tried."""
         number = int(issue["number"])
-        rung = pick_rung(rung, self.load)
+        tried = tried_rungs(comments)
+        if failed_here:
+            tried |= {current_rung(issue)} - {0}
+        rung = next_rung(tried, self.load)
         if not rung:
             return None
         lanes, model = LADDER[rung - 1]
@@ -399,8 +424,7 @@ class Factory:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
         if stuck(comments, open_threads, checks_failing, age, self.now):
-            rung = rung_of(comments) + 1
-            if self._climb(repo, issue, rung, why) is None:
+            if self._climb(repo, issue, comments, why) is None:
                 self._give_up(repo, issue, why)
                 return
         self.fix(self.gh, repo, int(pr["number"]), (repo, number), FIX_NOTES)
@@ -523,12 +547,9 @@ class Factory:
                prs: Dict[int, Dict[str, Any]]) -> None:
         number = int(issue["number"])
         comments = self._comments(repo, number)
-        rung = rung_of(comments) + 1
-        if rung > len(LADDER):
-            return  # left for the brain; _give_up said so once
-        lane = self._climb(repo, issue, rung, "it failed on lane %s" % _lane(issue))
+        lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue))
         if lane is None:
-            return
+            return  # left for the brain; _give_up said so once
         pr = prs.get(number)
         if pr is not None:
             # Back to loom:pr so the fix brief reuses its open pull request.
@@ -560,9 +581,8 @@ class Factory:
                for c in comments):
             return
         hours = (self.now - since) / 3600
-        rung = rung_of(comments) + 1
         why = "briefed %.0f hours on lane %s with no claim" % (hours, _lane(issue))
-        lane = self._climb(repo, issue, rung, why)
+        lane = self._climb(repo, issue, comments, why, failed_here=False)
         if lane is None:
             self._give_up(repo, issue, why)
             return
@@ -574,11 +594,9 @@ class Factory:
         rung it stays where it is, for the lane to take once it is back."""
         number = int(issue["number"])
         old = _lane(issue)
-        rung = rung_of(self._comments(repo, number)) + 1
-        if rung > len(LADDER):
-            return
-        lane = self._climb(repo, issue, rung, "lane %s is at a limit" % old,
-                           head="Not a failure")
+        lane = self._climb(repo, issue, self._comments(repo, number),
+                           "lane %s is at a limit" % old, head="Not a failure",
+                           failed_here=False)
         if lane is None:
             return
         self.actions += 1
