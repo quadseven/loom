@@ -839,6 +839,84 @@ def item(number, body=BODY, labels=(), **extra):
     return out
 
 
+def rung_marker(n, login="example-brain"):
+    return {"body": "<!-- loom:rung %d -->\nmoved" % n, "created_at": "2030-01-01T00:00:00Z",
+            "user": {"login": login}}
+
+
+class PastLastRungTests(unittest.TestCase):
+    BOT = {"__typename": "Bot", "login": "grug-tribe"}
+
+    def report(self, comments9, comments10=(), threads=(), env=None):
+        past = dict(stuck_ticket("failed"), title="Past", created_at="2030-01-01T00:00:00Z")
+        rung2 = dict(stuck_ticket("failed"), number=10, title="Rung two")
+        node = dict(ready_node(threads=[]), mergeable="CONFLICTING",
+                    rulingThreads={"nodes": list(threads)})
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [past, rung2]),
+                  ("GET", "/issues/9/events"): reply(200, []),
+                  ("GET", "/issues/9/comments"): reply(200, list(comments9)),
+                  ("GET", "/issues/10/events"): reply(200, []),
+                  ("GET", "/issues/10/comments"): reply(200, list(comments10)),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                      {"number": 4, "title": "PR", "head": {"ref": "loom/9-work"}},
+                      {"number": 5, "title": "PR2", "head": {"ref": "loom/10-work"}}]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p4": node, "p5": node}}})}
+        routes.update(lanes_routes(()))
+        fake = Routed(routes)
+        env = {"LOOM_BRIEF_AUTHORS": "example-brain"} if env is None else env
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=env)
+        section = report.split(brain.PAST_RUNG_HEADING, 1)[1].split("\n#", 1)[0]
+        query = [c[2]["query"] for c in fake.calls if c[1].endswith("/graphql")][0]
+        return section, query
+
+    def test_status_lists_a_ticket_past_rung_3_with_its_answered_high_thread(self):
+        answered = {"isResolved": False, "comments": {"nodes": [
+            {"databaseId": 71, "author": self.BOT, "body": "high | correctness | the cache is never cleared\nmore"},
+            {"author": {"__typename": "User", "login": "example-brain"},
+             "body": "Lane codex answered this finding instead of changing the code:\n\n"
+                     "> The cache is cleared in reset().\n> See line 40."}]}}
+        person = {"isResolved": False, "comments": {"nodes": [
+            {"databaseId": 72, "author": {"__typename": "User", "login": "example-reviewer"}, "body": "why this?"}]}}
+        done = {"isResolved": True, "comments": {"nodes": [{"author": self.BOT, "body": "low | old"}]}}
+        section, query = self.report([rung_marker(1), rung_marker(2), rung_marker(3)],
+                                     [rung_marker(1), rung_marker(2)], [answered, person, done])
+        lines = [l for l in section.splitlines() if l.strip()]
+        self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable conflicting - 2 unresolved threads")
+        self.assertEqual(lines[1], "  - high, comment 71: high | correctness | the cache is never cleared - "
+                                   "lane answer: The cache is cleared in reset(). See line 40.")
+        self.assertEqual(lines[2], "  - comment 72 opened by a person, never resolved by a ruling: why this?")
+        self.assertNotIn("#10", section)
+        self.assertEqual(len(lines), 3)
+        # Only the past-rung ticket's pull request asks for the extra fields.
+        self.assertIn("p4: pullRequest(number:4) { %s%s }" % (brain.READY_FIELDS, brain.RULING_FIELDS), query)
+        self.assertIn("p5: pullRequest(number:5) { %s }" % brain.READY_FIELDS, query)
+
+    def test_restarted_or_untrusted_ladders_are_not_past_the_last_rung(self):
+        restarted = [rung_marker(1), rung_marker(2), rung_marker(3), rung_marker(0)]
+        stranger = [rung_marker(1, "example-stranger"), rung_marker(2, "example-stranger"),
+                    rung_marker(3, "example-stranger")]
+        for name, comments in (("restarted", restarted), ("stranger", stranger)):
+            with self.subTest(name):
+                section, _ = self.report(comments)
+                self.assertNotIn("#9", section)
+
+    def test_an_unanswered_finding_says_so(self):
+        thread = {"isResolved": False, "comments": {"nodes": [
+            {"databaseId": 73, "author": self.BOT, "body": "**critical** | security | token logged"}]}}
+        section, _ = self.report([rung_marker(1), rung_marker(2), rung_marker(3)], threads=[thread])
+        self.assertIn("  - critical, comment 73: **critical** | security | token logged - no lane answer", section)
+
+    def test_muse_names_the_section_status_prints(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "MUSE.md"), encoding="utf-8") as f:
+            muse = f.read()
+        heading = brain.PAST_RUNG_HEADING.lstrip("# ")
+        self.assertIn('"%s"' % heading, muse)
+        step = muse.split('"%s"' % heading, 1)[1].split("\n6. ", 1)[0]
+        self.assertIn("up to 3", step)
+        self.assertIn("never resolve a thread a person opened", " ".join(step.lower().split()))
+
+
 class Routes:
     """Replies by method and path; records every call. The issue list is
     served in pages of `page` items with Link headers."""

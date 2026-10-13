@@ -46,17 +46,19 @@ def _labels(issue: Dict[str, Any]) -> List[str]:
 
 
 def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
-                    goals: List[Dict[str, Any]]) -> Dict[str, Any]:
+                    goals: List[Dict[str, Any]], ruling: Sequence[int] = ()) -> Dict[str, Any]:
     pr_ids = [int(x["number"]) for x in prs]
     goal_ids = [int(x["number"]) for x in goals]
     # A single query fetches every PR's merge-ready data (READY_FIELDS), plus
-    # comments on the goal issues for journal timestamps.
+    # comments on the goal issues for journal timestamps, plus RULING_FIELDS
+    # for the pull requests of tickets past the last rung.
     # GitHub GraphQL does not support a dynamic issue-number list as a top-level
     # node argument. Build aliases from the numbers while retaining one request.
     owner, name = repo.split("/", 1)
     fields = []
     for n in pr_ids:
-        fields.append("p%d: pullRequest(number:%d) { %s }" % (n, n, READY_FIELDS))
+        fields.append("p%d: pullRequest(number:%d) { %s%s }" % (
+            n, n, READY_FIELDS, RULING_FIELDS if n in ruling else ""))
     for n in goal_ids:
         fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n))
     if not fields:
@@ -76,6 +78,16 @@ READY_FIELDS = (
     " reviews(last:100) { nodes { author { __typename login } state submittedAt } }"
     " reviewThreads(first:100) { nodes { isResolved"
     " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }")
+
+
+# What the "Past the last rung" section reads on top: the merge state and each
+# thread's comments, for its author, severity and the newest lane answer.
+RULING_FIELDS = (
+    " mergeable rulingThreads: reviewThreads(first:100) { nodes { isResolved"
+    " comments(first:50) { nodes { databaseId author { __typename login } body } } } }")
+PAST_RUNG_HEADING = "### Past the last rung"
+# bus/station.py's reply when a lane answered a finding instead of fixing it.
+_LANE_ANSWER = re.compile(r"^Lane \S+ answered this finding instead of changing the code:")
 
 
 def _gql(value: str) -> str:
@@ -183,16 +195,92 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> st
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
 
-def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str) -> List[str]:
+def _one_line(value: Any, limit: int = 200) -> str:
+    line = " ".join(str(value or "").split())
+    return line if len(line) <= limit else line[:limit - 3] + "..."
+
+
+def _lane_answer(comments: List[Dict[str, Any]]) -> Optional[str]:
+    """The newest lane answer in a thread, its quoted text on one line."""
+    for c in reversed(comments):
+        body = str(c.get("body") or "")
+        if _LANE_ANSWER.match(body):
+            said = [x[1:].strip() if x.startswith(">") else x
+                    for x in body.split("\n")[1:]]
+            return _one_line(" ".join(said), 300)
+    return None
+
+
+def _thread_line(thread: Dict[str, Any], bot: str) -> str:
+    comments = (thread.get("comments") or {}).get("nodes") or []
+    root = (comments[0] if comments else None) or {}
+    first = str(root.get("body") or "").split("\n", 1)[0]
+    where = "comment %s" % root.get("databaseId", "unknown")
+    if not by_bot(root, bot):
+        return "  - %s opened by a person, never resolved by a ruling: %s" % (where, _one_line(first))
+    severity = _one_line(first.split("|", 1)[0].strip("*_ \t").lower(), 20) or "unknown"
+    answer = _lane_answer(comments[1:])
+    return "  - %s, %s: %s - %s" % (severity, where, _one_line(first),
+                                    "lane answer: %s" % answer if answer else "no lane answer")
+
+
+def past_last_rung(tickets: List[Dict[str, Any]], histories: Dict[int, "History"]
+                   ) -> List[Dict[str, Any]]:
+    """The loom:failed tickets that ran on every rung since their ladder last
+    started, oldest first: the factory leaves them for the brain."""
+    from . import factory  # factory imports this module
+    every = set(range(1, len(factory.LADDER) + 1))
+    found = [i for i in tickets if "loom:failed" in _labels(i)
+             and every <= histories.get(int(i["number"]), History(0, 0, [], [], None)).rungs]
+    return sorted(found, key=lambda i: str(i.get("created_at") or ""))
+
+
+def _past_rung_lines(past: List[Dict[str, Any]], pr_of: Dict[int, Dict[str, Any]],
+                     data: Dict[str, Any], bot: str) -> List[str]:
+    lines = [PAST_RUNG_HEADING]
+    for issue in past:
+        head = "- #%s %s" % (issue["number"], issue.get("title", ""))
+        pr = pr_of.get(int(issue["number"]))
+        if pr is None:
+            lines.append(head + " - no open pull request")
+            continue
+        node = data["prs"].get(int(pr["number"])) or {}
+        threads = [t for t in (node.get("rulingThreads") or {}).get("nodes") or []
+                   if not t.get("isResolved")]
+        lines.append("%s - PR #%s - mergeable %s - %d unresolved threads" % (
+            head, pr["number"], str(node.get("mergeable") or "unknown").lower(), len(threads)))
+        lines += [_thread_line(t, bot) for t in threads]
+    return lines
+
+
+def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    found: Dict[int, Dict[str, Any]] = {}
+    for pr in prs:
+        try:
+            ticket = _ticket_association(repo, pr)
+        except ValueError:
+            continue
+        if ticket is not None:
+            found.setdefault(ticket[1], pr)
+    return found
+
+
+def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
+                  authors: Sequence[str] = ()) -> List[str]:
     issues = _issues(gh, repo)
     goals = [i for i in issues if "loom:goal" in _labels(i)]
     tickets = [i for i in issues if "loom:ticket" in _labels(i)]
     prs = [i for i in gh.paginate("/repos/%s/pulls?state=open" % repo)
            if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
-    data = _graphql_status(gh, repo, prs, goals)
+    histories, skipped = _histories(gh, repo, tickets, now, authors)
+    past = past_last_rung(tickets, histories)
+    pr_of = _ticket_prs(repo, prs)
+    ruling = [int(pr_of[int(i["number"])]["number"]) for i in past if int(i["number"]) in pr_of]
+    data = _graphql_status(gh, repo, prs, goals, ruling)
     lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data) + [""]
-    lines += _ticket_lines(tickets, now, _stuck_marks(gh, repo, tickets, now)) + ["", "### Pull requests"]
+    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
+    lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "needs-operator" in _labels(i)]
@@ -218,7 +306,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     now = datetime.now(timezone.utc)
     out: List[str] = ["# Loom status"]
     for repo in repos:
-        out += _repo_section(gh, repo, now, bot)
+        out += _repo_section(gh, repo, now, bot, trusted_authors(env))
     out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
 
@@ -1102,7 +1190,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 STUCK_STATES = ("failed", "briefed", "pr")
 UNCLAIMED_HOURS = 2
 STUCK_HOURS = 6
-# Ticket histories one status call reads per repo; see _stuck_marks.
+# Ticket histories one status call reads per repo; see _histories.
 STATUS_HISTORY_MAX = 20
 ESCALATE_MARKER = "<!-- loom:escalate v1 -->"
 _RUNG_LINE = re.compile(r"^Rung: ([0-9]+) (\S+) (\S+)[ \t]*$", re.M)
@@ -1126,12 +1214,15 @@ class History:
     """What a ticket's own issue history says about its attempts."""
 
     def __init__(self, failed: int, fixes: int, tried: List[str],
-                 reasons: List[str], rung: Optional[int]) -> None:
+                 reasons: List[str], rung: Optional[int], rungs: Optional[set] = None) -> None:
         self.failed = failed
         self.fixes = fixes
         self.tried = tried
         self.reasons = reasons
         self.rung = rung  # the lowest untried rung, or None past the third
+        # The factory's rungs it ran on since its ladder last started, from
+        # trusted rung markers (bus/factory.py tried_rungs).
+        self.rungs = rungs or set()
 
     @property
     def attempts(self) -> int:
@@ -1219,10 +1310,18 @@ def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes
     return reasons
 
 
-def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime) -> History:
+def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
+             authors: Sequence[str] = ()) -> History:
+    from . import factory  # factory imports this module
     number = int(issue["number"])
     events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
-    bodies = _bodies(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)))
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    bodies = _bodies(comments)
+    # Only a trusted login's rung marker counts, as in the factory: anyone
+    # can comment on a public repo.
+    trusted = {a.lower() for a in authors}
+    rungs = factory.tried_rungs([c for c in comments if isinstance(c, dict) and str(
+        (c.get("user") or {}).get("login") or "").lower() in trusted])
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
@@ -1231,23 +1330,29 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime) -> His
     tried = _tried_models(_first_model(issue, bodies), bodies)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, claims, now)
     untried = [i for i, (_, model) in enumerate(ESCALATION) if model not in tried]
-    return History(failed, fixes, tried, reasons, untried[0] if untried else None)
+    return History(failed, fixes, tried, reasons, untried[0] if untried else None, rungs)
 
 
-def _stuck_marks(gh: GitHub, repo: str, found: List[Dict[str, Any]],
-                 now: datetime) -> Dict[int, str]:
-    """Marks for repeatedly stuck tickets. Each history is two paginated reads,
-    so status reads at most STATUS_HISTORY_MAX per repo, the least recently
-    updated first (the likeliest to be stuck), and says which it skipped."""
+def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime,
+               authors: Sequence[str] = ()) -> Tuple[Dict[int, History], List[int]]:
+    """The histories of stuck-state tickets, and the numbers it skipped. Each
+    history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
+    per repo, the least recently updated first (the likeliest to be stuck)."""
     candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)),
                         key=lambda i: str(i.get("updated_at") or ""))
+    return ({int(i["number"]): _history(gh, repo, i, now, authors)
+             for i in candidates[:STATUS_HISTORY_MAX]},
+            [int(i["number"]) for i in candidates[STATUS_HISTORY_MAX:]])
+
+
+def _stuck_marks(histories: Dict[int, History], skipped: List[int]) -> Dict[int, str]:
+    """Marks for repeatedly stuck tickets, and for those status skipped."""
     marks: Dict[int, str] = {}
-    for issue in candidates[STATUS_HISTORY_MAX:]:
-        marks[int(issue["number"])] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
-    for issue in candidates[:STATUS_HISTORY_MAX]:
-        history = _history(gh, repo, issue, now)
+    for number in skipped:
+        marks[number] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
+    for number, history in histories.items():
         if history.reasons:
-            marks[int(issue["number"])] = " - REPEATEDLY STUCK (%s; attempts %d; tried %s; %s)" % (
+            marks[number] = " - REPEATEDLY STUCK (%s; attempts %d; tried %s; %s)" % (
                 ", ".join(history.reasons), history.attempts,
                 ", ".join(history.tried) or "none", history.next_text())
     return marks
