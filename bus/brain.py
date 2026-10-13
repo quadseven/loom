@@ -268,11 +268,15 @@ def _check_regressable(issue: Dict[str, Any]) -> None:
     names = _labels(issue)
     if "loom:ticket" not in names or not ("loom:shipped" in names or "loom:verified" in names):
         raise ValueError("only a shipped or verified ticket can regress")
-    if issue.get("state") != "open" and issue.get("state_reason") == "not_planned":
+    # Reopening resets state_reason, so not_planned only ever marks a ticket
+    # still closed as not planned: no state check is needed beside it.
+    if issue.get("state_reason") == "not_planned":
         raise ValueError("a ticket closed as not planned cannot regress")
 
 
 def _check_regression_slot(others: List[Dict[str, Any]], cap: int) -> None:
+    # others leaves out only the regressing ticket, which is shipped or
+    # verified and so not in flight: its length is the goal's in-flight count.
     count = len(others)
     held = any(REGRESSION in _labels(c) for c in others)
     if count >= cap and (held or count > cap):
@@ -294,7 +298,9 @@ def _rebrief_regression(gh: GitHub, repo: str, number: int, issue: Dict[str, Any
 def regress(gh: GitHub, repo: str, goal: int, number: int, lane: str, evidence: str) -> str:
     """Send a shipped ticket that regressed live back to a lane. Each goal has
     one slot past its cap for this, held while a loom:regression ticket is in
-    flight; the ticket is re-briefed, never copied into a new issue."""
+    flight; the ticket is re-briefed, never copied into a new issue. The count
+    and the write are not atomic: like brief, this relies on the brain's tick
+    lock (docs/BRAIN.md), so only one brain writes to a goal at a time."""
     _check_regress_args(lane, evidence)
     children = _goal_children(gh, repo, goal)
     if not any(int(c.get("number", 0)) == number for c in children):

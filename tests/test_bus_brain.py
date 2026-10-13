@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import unittest
 import unittest.mock
@@ -289,7 +290,13 @@ class GoalFake:
         self.calls.append((method, path, data))
         rest = path[len("/repos/%s/" % REPO):]
         if method == "GET" and rest == "issues/1/sub_issues":
-            return reply(200, [self.issues[n] for n in self.children])
+            # GitHub pages the list and links the next page, so a goal past one
+            # page is read the way gh.paginate reads the real endpoint.
+            page = int((re.search(r"[?&]page=(\d+)", url) or [0, "1"])[1])
+            items = [self.issues[n] for n in self.children][(page - 1) * 10:page * 10]
+            more = len(self.children) > page * 10
+            link = '<%s?per_page=10&page=%d>; rel="next"' % (url.split("?")[0], page + 1)
+            return 200, {"Link": link} if more else {}, json.dumps(items).encode()
         if method == "POST" and rest == "issues":
             number = max(self.issues) + 1
             self.issues[number] = {"number": number, "id": 1000 + number, "state": "open",
