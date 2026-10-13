@@ -37,6 +37,7 @@ class FakeGitHub:
         self.attempts = {}
         self.update_status = 202
         self.files = {}
+        self.filed = []
         self.private = True
 
     def ticket(self, number, state, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
@@ -73,6 +74,8 @@ class FakeGitHub:
             return list(self.issues.values())
         if path.endswith("/pulls?state=open"):
             return list(self.pulls.values())
+        if path.endswith("/issues?labels=loom:triage&state=open"):
+            return list(self.filed)
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
             return list(self.comments[int(m.group(1))])
@@ -83,29 +86,39 @@ class FakeGitHub:
 
     def rest(self, method, path, body=None, etag=None, ok=()):
         if method == "GET":
-            m = re.search(r"/pulls/(\d+)$", path)
-            if m:
-                return Response(200, self.pulls[int(m.group(1))])
-            m = re.search(r"/pulls/(\d+)/files\?per_page=100&page=(\d+)$", path)
-            if m:
-                page = int(m.group(2))
-                names = self.files[int(m.group(1))][(page - 1) * 100:page * 100]
-                return Response(200, [{"filename": n} for n in names])
-            m = re.search(r"/commits/(\w+)/check-runs", path)
-            if m:
-                return Response(200, {"check_runs": self.runs[m.group(1)]})
-            m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
-            if m:
-                return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
-            if path == "/repos/%s" % REPO:
-                return Response(200, {"private": self.private})
-            m = re.search(r"/actions/runs/(\d+)$", path)
-            if m:
-                return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})
-            raise AssertionError("unexpected GET %s" % path)
+            return self._get(path)
+        return self._write(method, path, body)
+
+    def _get(self, path):
+        m = re.search(r"/pulls/(\d+)$", path)
+        if m:
+            return Response(200, self.pulls[int(m.group(1))])
+        m = re.search(r"/pulls/(\d+)/files\?per_page=100&page=(\d+)$", path)
+        if m:
+            page = int(m.group(2))
+            names = self.files[int(m.group(1))][(page - 1) * 100:page * 100]
+            return Response(200, [{"filename": n} for n in names])
+        m = re.search(r"/commits/(\w+)/check-runs", path)
+        if m:
+            return Response(200, {"check_runs": self.runs[m.group(1)]})
+        m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
+        if m:
+            return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
+        if path == "/repos/%s" % REPO:
+            return Response(200, {"private": self.private})
+        m = re.search(r"/actions/runs/(\d+)$", path)
+        if m:
+            return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})
+        raise AssertionError("unexpected GET %s" % path)
+
+    def _write(self, method, path, body):
         self.writes.append((method, path, body))
         if path.endswith("/update-branch"):
             return Response(self.update_status, {})
+        if method == "POST" and path.endswith("/issues"):
+            made = dict(body, number=900 + len(self.filed), user=ME)
+            self.filed.append(made)
+            return Response(201, made)
         m = re.search(r"/issues/(\d+)(/labels|/comments)?$", path)
         if m:
             number = int(m.group(1))
@@ -118,6 +131,9 @@ class FakeGitHub:
         return Response(200, {})
 
     def graphql(self, query, variables=None):
+        if "addPullRequestReviewThreadReply" in query:
+            self.writes.append(("REPLY", variables["id"], variables["body"]))
+            return {"addPullRequestReviewThreadReply": {"comment": {"id": "c"}}}
         if "resolveReviewThread" in query:
             self.writes.append(("RESOLVE", variables["id"], None))
             for details in self.details.values():
@@ -513,6 +529,90 @@ class ReviewBotThreads(Base):
         self.gh.pull(50, 5, resolved=False, green=False)
         self.go()
         self.assertEqual(len(self.fixed), 1)
+
+
+MEDIUM = "\U0001f7e0 medium | _robustness_ | `missing-error-handling` | quick win\n\nGrug see a gap."
+HIGH = "\U0001f525 high | _correctness_ | `null-deref` | quick win\n\nGrug see a crash."
+ASKED_ONCE = FIX_MARKER + "\nPull request: x#50\n\n### Thread PRRT_1 (comment 1) at a.py:1\n\n    gap"
+ASKED_OTHER = FIX_MARKER + "\nPull request: x#50\n\n### Thread PRRT_9 (comment 9) at a.py:9\n\n    other"
+
+
+class DeferredFindings(Base):
+    def setUp(self):
+        super().setUp()
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, resolved=False)
+
+    def finding(self, body, author=BOT, asked=(ASKED_ONCE,)):
+        root = {"author": author, "body": body, "url": "https://example.invalid/pr/50#r1"}
+        self.gh.details[50]["reviewThreads"]["nodes"][0].update(
+            path="bus/a.py", comments={"nodes": [root]}, root={"nodes": [root]})
+        self.gh.comments[5] += [{"body": b, "user": ME} for b in asked]
+
+    def test_a_medium_finding_a_round_asked_for_goes_to_a_follow_up_and_the_pull_request_lands(self):
+        self.finding(MEDIUM)
+        self.go()
+        self.assertEqual(len(self.gh.filed), 1)
+        filed = self.gh.filed[0]
+        self.assertEqual((filed["title"], filed["labels"]),
+                         ("Deferred review findings from %s#50" % REPO, ["loom:triage"]))
+        self.assertIn("- medium | _robustness_ | `missing-error-handling` | quick win in `bus/a.py`:"
+                      " https://example.invalid/pr/50#r1", filed["body"])
+        self.assertTrue(all(ord(ch) < 128 for ch in filed["body"]))
+        replies = [w for w in self.gh.writes if w[0] == "REPLY"]
+        self.assertEqual(len(replies), 1)
+        self.assertTrue(replies[0][2].startswith("Deferred to #900: "))
+        self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertEqual((self.merged, self.fixed), ([(50, (REPO, 5))], []))
+
+    def test_a_new_medium_finding_on_the_first_round_goes_back_to_the_lane(self):
+        self.finding(MEDIUM, asked=(ASKED_OTHER,))
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged, len(self.fixed)), ([], [], 1))
+
+    def test_after_two_fix_rounds_a_new_medium_finding_is_deferred(self):
+        self.finding(MEDIUM, asked=(ASKED_OTHER, ASKED_OTHER))
+        self.go()
+        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+
+    def test_prose_that_starts_with_low_is_not_a_low_finding(self):
+        self.finding("Low risk, but this list can be empty.", asked=(ASKED_ONCE, ASKED_ONCE))
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged), ([], []))
+
+    def test_a_finding_line_survives_an_empty_or_blank_root(self):
+        for root in ({}, {"body": "   "}):
+            with self.subTest(root=root):
+                line = factory.finding_line({"id": "PRRT_2", "path": "a.py", "root": {"nodes": [root]}})
+                self.assertEqual(line, "- finding in `a.py`: PRRT_2")
+
+    def test_a_high_finding_is_never_deferred(self):
+        self.finding(HIGH, asked=(ASKED_ONCE, ASKED_ONCE, ASKED_ONCE))
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged), ([], []))
+        self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+
+    def test_a_thread_a_person_opened_is_never_deferred(self):
+        self.finding(MEDIUM, author={"__typename": "User", "login": "grug-tribe"},
+                     asked=(ASKED_ONCE, ASKED_ONCE))
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged), ([], []))
+
+    def test_without_the_review_check_on_the_head_nothing_is_deferred(self):
+        self.gh.runs["sha50"] = [{"name": "unittest", "status": "completed"}]
+        self.gh.pulls[50]["updated_at"] = iso(factory.REVIEW_GRACE + 60)
+        self.finding(MEDIUM)
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged), ([], []))
+
+    def test_an_open_follow_up_from_an_earlier_pass_is_reused(self):
+        self.gh.filed.append({"number": 777, "title": "Deferred review findings from %s#50" % REPO,
+                              "user": ME})
+        self.finding(MEDIUM)
+        self.go()
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertTrue([w for w in self.gh.writes if w[0] == "REPLY"][0][2].startswith("Deferred to #777: "))
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
 
 
 class Trust(Base):
