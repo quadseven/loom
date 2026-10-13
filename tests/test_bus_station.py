@@ -113,12 +113,7 @@ class FakeGitHub:
             return self._graphql(data)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
-            if self.page_error:
-                return reply(502, {"message": "down"})
-            self.pages.append(data["body"])
-            n = len(self.pages)
-            made = {"id": n, "html_url": "https://github.com/%s/issues/900#issuecomment-%d" % (REPO, n)}
-            return reply(201, self.page_reply if self.page_reply is not None else made)
+            return self._post_page(data)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
@@ -128,6 +123,14 @@ class FakeGitHub:
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _post_page(self, data):
+        if self.page_error:
+            return reply(502, {"message": "down"})
+        self.pages.append(data["body"])
+        n = len(self.pages)
+        made = {"id": n, "html_url": "https://github.com/%s/issues/900#issuecomment-%d" % (REPO, n)}
+        return reply(201, self.page_reply if self.page_reply is not None else made)
 
     def _list_issues(self, query, headers):
         if "needs-operator" in query:
