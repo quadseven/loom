@@ -30,6 +30,9 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   lane round.
 - A failed ticket climbs the ladder, and so does a ticket left briefed for
   BRIEFED_STALL with no lane claiming it.
+- A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
+  spark lane's does while its box is hot) moves to the next lane at once: the
+  next rung of the ladder. A limit is not a failure, so nothing waits for it.
 - Past the last rung the ticket is left failed for the brain, with a note.
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
@@ -222,13 +225,15 @@ class Factory:
                  review_check: str = DEFAULT_REVIEW_CHECK,
                  merge: Callable[..., Any] = brain.merge,
                  fix: Callable[..., Any] = brain.fix,
-                 move: Callable[..., Any] = brain.move) -> None:
+                 move: Callable[..., Any] = brain.move,
+                 limited: Sequence[str] = ()) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
         self.trusted = {t.lower() for t in trusted}
         self.review_check = review_check
         self.merge, self.fix, self.move = merge, fix, move
+        self.limited = set(limited)
         self.actions = 0
         self.load: Dict[str, int] = {}
         self.landed: set = set()
@@ -280,7 +285,8 @@ class Factory:
         return "unreviewed"
 
     # -- writes ----------------------------------------------------------
-    def _climb(self, repo: str, issue: Dict[str, Any], rung: int, why: str) -> Optional[str]:
+    def _climb(self, repo: str, issue: Dict[str, Any], rung: int, why: str,
+               head: str = "Repeatedly stuck") -> Optional[str]:
         """Put the ticket on `rung` (1-based): its Model: line and lane label,
         and a rung marker. Returns the lane, or None past the last rung."""
         number = int(issue["number"])
@@ -295,9 +301,9 @@ class Factory:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "%s\nRepeatedly stuck (%s): the factory moved this ticket up the "
+            "body": "%s\n%s (%s): the factory moved this ticket up the "
                     "model ladder to rung %d, %s on lane %s." % (
-                        RUNG_MARKER % rung, why, rung, model, lane)})
+                        RUNG_MARKER % rung, head, why, rung, model, lane)})
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
@@ -456,6 +462,9 @@ class Factory:
         hold = held_until(issue)
         if self.now < hold:
             return  # held by its Not before: line; nobody is late yet
+        if _lane(issue) in self.limited:
+            self._step_aside(repo, issue)
+            return
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
         since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
                      and e.get("event") == "labeled"
@@ -476,6 +485,21 @@ class Factory:
             return
         self.actions += 1
         _say("moved stalled %s#%d to %s" % (repo, number, lane))
+
+    def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Move a ticket off a lane at a limit to the next rung. Past the last
+        rung it stays where it is, for the lane to take once it is back."""
+        number = int(issue["number"])
+        old = _lane(issue)
+        rung = rung_of(self._comments(repo, number)) + 1
+        if rung > len(LADDER):
+            return
+        lane = self._climb(repo, issue, rung, "lane %s is at a limit" % old,
+                           head="Not a failure")
+        if lane is None:
+            return
+        self.actions += 1
+        _say("moved %s#%d off lane %s, at a limit, to %s" % (repo, number, old, lane))
 
     # -- the pass --------------------------------------------------------
     def run(self) -> None:
