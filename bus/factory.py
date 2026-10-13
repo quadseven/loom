@@ -566,20 +566,27 @@ class Factory:
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))
 
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
-        number = int(issue["number"])
-        hold = held_until(issue)
-        if self.now < hold:
+        if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
         if _lane(issue) in self.limited:
             self._step_aside(repo, issue)
             return
-        if self._spread(repo, issue):
-            return
-        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+        if not self._spread(repo, issue):
+            self._unclaimed(repo, issue)
+
+    def _briefed_since(self, repo: str, issue: Dict[str, Any]) -> float:
+        """When the ticket was last labeled briefed, or its hold ended if
+        later; 0 when it never was."""
+        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
         since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
                      and e.get("event") == "labeled"
                      and (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
-        since = max(since, hold) if since else since
+        return max(since, held_until(issue)) if since else since
+
+    def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
+        """A ticket briefed BRIEFED_STALL with no lane claiming it climbs."""
+        number = int(issue["number"])
+        since = self._briefed_since(repo, issue)
         if not since or self.now - since < BRIEFED_STALL:
             return
         comments = self._comments(repo, number)
