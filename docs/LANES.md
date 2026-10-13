@@ -65,6 +65,10 @@ least hourly, and never publishes the heartbeat's reason. With anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
+Hold: a ticket whose header has `Not before: 2026-10-13T17:00:00Z` (UTC) is
+not claimed before that time, and the factory does not count it as stalled
+until then; the line is left out of the brief the lane reads.
+
 Factory: at most every 5 minutes the station runs `bus/factory.py` over
 `LOOM_REPOS`, with no model. A lane pull request (a `loom/` branch whose
 ticket is `loom:pr`) whose checks have all finished, whose review check

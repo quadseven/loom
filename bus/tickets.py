@@ -6,7 +6,9 @@ issues", "Trust") is the contract.
 """
 from __future__ import annotations
 
+import calendar
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # The runner's own patterns (lanes/run_lane.sh).
@@ -15,7 +17,10 @@ BASE_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 DIFFICULTIES = ("easy", "medium", "hard")
 
-HEADER_RE = re.compile(r"(Difficulty|Model|Base):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Model|Base|Not before):[ \t]*(.*)")
+# "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
+# earlier than that UTC time, and the brain does not brief it before then.
+NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
 FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR):")
@@ -69,6 +74,8 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
             raise ValueError("Model: %r is not a model id" % value)
         if key == "Base" and not BASE_RE.fullmatch(value):
             raise ValueError("Base: %r is not a branch name" % value)
+        if key == "Not before" and not NOT_BEFORE_RE.fullmatch(value):
+            raise ValueError("Not before: %r is not a UTC time like 2026-10-13T17:00:00Z" % value)
         headers[key] = value
         i += 1
     rest = lines[i:]
@@ -128,7 +135,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     ]
     if fix:
         out.append("Fix-PR: %d" % fix.pr)
-    out += ["%s: %s" % (k, v) for k, v in headers.items()]
+    out += ["%s: %s" % (k, v) for k, v in headers.items() if k != "Not before"]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
     if body:
@@ -195,3 +202,11 @@ def trusted(issue: Dict[str, Any], events: List[Dict[str, Any]],
     if not owner or owner not in {o.lower() for o in owners}:
         return False, "repo owner %s is not in LOOM_REPO_OWNERS" % (owner or "unknown")
     return True, "ok"
+
+
+def not_before(headers: Dict[str, str]) -> Optional[float]:
+    """The ticket's Not before: time as epoch seconds, or None."""
+    value = headers.get("Not before")
+    if not value:
+        return None
+    return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))

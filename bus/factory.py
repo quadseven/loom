@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain
+from . import brain, tickets
 from .github import GitHub, GitHubError
 from .tickets import FIX_MARKER
 
@@ -399,10 +399,17 @@ class Factory:
 
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         number = int(issue["number"])
+        try:
+            hold = tickets.not_before(tickets.parse(issue.get("body"))[0]) or 0.0
+        except ValueError:
+            hold = 0.0
+        if self.now < hold:
+            return  # held by its Not before: line; nobody is late yet
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
         since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
                      and e.get("event") == "labeled"
                      and (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
+        since = max(since, hold) if since else since
         if not since or self.now - since < BRIEFED_STALL:
             return
         comments = self._comments(repo, number)

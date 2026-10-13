@@ -338,6 +338,13 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
 
+    def test_a_held_briefed_ticket_never_counts_as_stalled(self):
+        self.gh.ticket(7, "briefed", body="Not before: 2099-01-01T00:00:00Z\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(factory.BRIEFED_STALL + 600)}]
+        self.go()
+        self.assertEqual(self.model(7), None)
+
     def test_a_claimed_or_fresh_briefed_ticket_stays(self):
         self.gh.ticket(7, "briefed")
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
