@@ -6,7 +6,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
@@ -21,8 +21,18 @@ STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "
 # so they never count against a goal's cap.
 IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 DEFAULT_GOAL_CAP = 16
+# A ticket admitted for a measured regression of a shipped one. Past the cap,
+# a goal admits one such ticket at a time (its regression slot).
+REGRESSION = "loom:regression"
+REGRESSION_MARKER = "<!-- loom:regression v1 -->"
 SECTIONS = ("## Why", "## What", "## Acceptance criteria", "## Size", "## Out of scope")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
+REPORT_MARKER = "<!-- loom:report v1 -->"
+# Every goal owes its own report every REPORT_EVERY seconds, counted from its
+# newest valid report or, with none, from when the goal was opened. A report
+# that is one tick (REPORT_GRACE) past due is overdue.
+REPORT_EVERY = 2 * 3600
+REPORT_GRACE = 30 * 60
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
@@ -99,20 +109,114 @@ def _age(issue: Dict[str, Any], now: datetime) -> int:
     return max(0, int((now - created).total_seconds() // 3600))
 
 
-def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> List[str]:
+def _stamp(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _field_set(body: str, name: str) -> bool:
+    """The comment has a `- Name: value` line whose value is not none."""
+    match = re.search(r"^-?[ \t]*%s:[ \t]*(.*)$" % name, body, re.I | re.M)
+    return bool(match and match.group(1).strip().lower() not in ("", "none"))
+
+
+def _comment_kinds(body: str) -> List[str]:
+    """What a goal comment records: a journal or a report, and with either,
+    a measurement and a completed action when those fields are set."""
+    if body.startswith(JOURNAL_MARKER):
+        kinds = ["journal"]
+    elif body.startswith(REPORT_MARKER):
+        kinds = ["report"]
+    else:
+        return []
+    if _field_set(body, "Measure"):
+        kinds.append("measure")
+    if _field_set(body, "Shipped"):
+        kinds.append("action")
+    return kinds
+
+
+def _report_deadline(last: datetime, now: datetime) -> Tuple[datetime, str]:
+    """The next report deadline counted from `last`, and whether it is ok,
+    due, or overdue at `now`."""
+    due = last + timedelta(seconds=REPORT_EVERY)
+    if now >= due + timedelta(seconds=REPORT_GRACE):
+        return due, "overdue"
+    if now >= due:
+        return due, "due"
+    return due, "ok"
+
+
+def _goal_comments(node: Optional[Dict[str, Any]],
+                   authors: Optional[Sequence[str]]) -> List[Tuple[str, str]]:
+    """(createdAt, body) for each timestamped comment on a goal, keeping only
+    those by `authors` when given."""
+    allowed = {a.lower() for a in authors} if authors else None
+    found = []
+    for c in ((node or {}).get("comments") or {}).get("nodes") or []:
+        login = str((c.get("author") or {}).get("login") or "").lower()
+        at = str(c.get("createdAt") or "")
+        if _stamp(at) is None or (allowed is not None and login not in allowed):
+            continue
+        found.append((at, str(c.get("body") or "")))
+    return found
+
+
+def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
+                now: datetime, authors: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """When the goal last had a journal, a valid report, a measurement and a
+    completed action, and where its report deadline stands.
+
+    Comment filtering, classification and deadline thresholds live in
+    separate helpers; this function only folds timestamps for one goal.
+
+    Only a comment on this goal that starts with the report marker counts as
+    its report: a marker inside another comment, a journal, or a report on
+    another goal (a parent goal included) does not. With `authors`, only
+    their comments count, as only theirs reach the operator's phone."""
+    seen: Dict[str, str] = {}
+    for at, body in _goal_comments(node, authors):
+        for kind in _comment_kinds(body):
+            seen[kind] = max(seen.get(kind, ""), at)
+    last = _stamp(seen.get("report", "")) or _stamp(str(issue.get("created_at") or ""))
+    if last is None:
+        # No report and no creation stamp: the deadline cannot be counted, and
+        # counting it from now would make an ancient goal look young.
+        return dict(seen, due=None, state="unknown")
+    due, state = _report_deadline(last, now)
+    return dict(seen, due=_iso(due), state=state)
+
+
+def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
+                authors: Optional[Sequence[str]] = None) -> List[str]:
     lines = ["### Goals"]
-    authors = trusted_authors()
+    owed = []
     for issue in goals:
         node = data["goals"].get(int(issue["number"])) or {}
+        led = goal_ledger(issue, node, now, authors)
+        lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
+                     " - report %s (due %s)" % (
+                         issue["number"], issue.get("title", ""),
+                         led.get("journal", "none"), led.get("report", "none"),
+                         led.get("measure", "none"), led.get("action", "none"),
+                         led["state"], led["due"] or "unknown"))
+        if led["state"] != "ok":
+            owed.append("- #%s report %s since %s" % (
+                issue["number"], led["state"].upper(), led["due"] or "an unknown time"))
         comments = (node.get("comments") or {}).get("nodes") or []
-        latest = [c.get("createdAt", "") for c in comments
-                  if JOURNAL_MARKER in c.get("body", "")]
-        lines.append("- #%s %s - latest journal %s" % (
-            issue["number"], issue.get("title", ""), max(latest) if latest else "none"))
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
               "login": (c.get("author") or {}).get("login")} for c in comments], authors)
         lines += ["  " + x for x in handoff.stage_lines(handoff.marks(found))]
+    # A missed report deadline is its own condition: not a forwarding failure
+    # and not a stopped brain. Post these before unlocking.
+    lines += ["", "### Reports owed before unlock"] + (owed or ["- none"])
     return lines
 
 
@@ -266,18 +370,18 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
 
 
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
-                  authors: Sequence[str] = ()) -> List[str]:
+                  authors: Optional[Sequence[str]] = None) -> List[str]:
     issues = _issues(gh, repo)
     goals = [i for i in issues if "loom:goal" in _labels(i)]
     tickets = [i for i in issues if "loom:ticket" in _labels(i)]
     prs = [i for i in gh.paginate("/repos/%s/pulls?state=open" % repo)
            if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
-    histories, skipped = _histories(gh, repo, tickets, now, authors)
+    histories, skipped = _histories(gh, repo, tickets, now, authors or ())
     past = past_last_rung(tickets, histories)
     pr_of = _ticket_prs(repo, prs)
     ruling = [int(pr_of[int(i["number"])]["number"]) for i in past if int(i["number"]) in pr_of]
     data = _graphql_status(gh, repo, prs, goals, ruling)
-    lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data) + [""]
+    lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
@@ -299,14 +403,17 @@ def _lane_status(gh: GitHub, lanes_repo: str) -> str:
 
 
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
-           env: Optional[Dict[str, str]] = None) -> str:
+           env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
+           authors: Optional[Sequence[str]] = None) -> str:
     from . import factory  # factory imports this module
     env = os.environ if env is None else env
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    if authors is None:
+        authors = trusted_authors(env)
     out: List[str] = ["# Loom status"]
     for repo in repos:
-        out += _repo_section(gh, repo, now, bot, trusted_authors(env))
+        out += _repo_section(gh, repo, now, bot, authors)
     out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
 
@@ -338,8 +445,8 @@ def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
 
 
-def _goal_in_flight(gh: GitHub, repo: str, goal: int) -> int:
-    """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
+def _goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """The sub-issues of an open loom:goal issue; ValueError for anything else."""
     try:
         goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
     except GitHubError as exc:
@@ -348,16 +455,154 @@ def _goal_in_flight(gh: GitHub, repo: str, goal: int) -> int:
         raise
     if goal_issue.get("state") != "open" or "loom:goal" not in _labels(goal_issue):
         raise ValueError("goal must be an open loom:goal issue")
-    children = gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
-    return sum(1 for i in children if i.get("state") == "open" and "loom:ticket" in _labels(i)
-               and any(state in _labels(i) for state in IN_FLIGHT))
+    return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
+
+
+def _in_flight(issue: Dict[str, Any]) -> bool:
+    names = _labels(issue)
+    return (issue.get("state") == "open" and "loom:ticket" in names
+            and any(state in names for state in IN_FLIGHT))
+
+
+def _goal_in_flight(gh: GitHub, repo: str, goal: int) -> int:
+    """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
+    return sum(1 for i in _goal_children(gh, repo, goal) if _in_flight(i))
 
 
 def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
     count = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
     if count >= cap:
-        raise ValueError("goal already has %d tickets in flight (cap %d)" % (count, cap))
+        raise ValueError("goal already has %d tickets in flight (cap %d); only a measured "
+                         "regression of a shipped ticket passes it (--regresses)" % (count, cap))
+
+
+def _lines(text: str) -> List[str]:
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def _regression_evidence(body: str, regressed: int) -> List[str]:
+    """The evidence lines right after the brief's "Regresses #M" line, up to a
+    blank line or a heading; ValueError when either is missing."""
+    marker = "Regresses #%d" % regressed
+    lines = _lines(body)
+    at = next((i for i, line in enumerate(lines) if line.strip() == marker), None)
+    if at is None:
+        raise ValueError("a regression brief has the line %s" % marker)
+    evidence: List[str] = []
+    for line in lines[at + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            break
+        evidence.append(line.rstrip())
+    if not evidence:
+        raise ValueError("a regression brief has the measured evidence on the lines "
+                         "after %s" % marker)
+    return evidence
+
+
+def _regression_attempt(children: List[Dict[str, Any]],
+                        regressed: int) -> Optional[Dict[str, Any]]:
+    """The goal's ticket in flight for this regression already, if any: the
+    regressed ticket re-briefed, or a ticket whose body says Regresses #M."""
+    marker = "Regresses #%d" % regressed
+    for child in children:
+        if REGRESSION not in _labels(child) or not _in_flight(child):
+            continue
+        if (int(child.get("number") or 0) == regressed
+                or marker in [line.strip() for line in _lines(str(child.get("body") or ""))]):
+            return child
+    return None
+
+
+def _regressed_ticket(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
+    """The ticket that regressed: shipped or verified, or closed as completed."""
+    found = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number), ok=(404,))
+    issue = found.data or {}
+    if found.status == 404 or "pull_request" in issue:
+        raise ValueError("#%d: ticket not found" % number)
+    names = _labels(issue)
+    if "loom:ticket" not in names:
+        raise ValueError("#%d is not a loom:ticket" % number)
+    if issue.get("state") != "open":
+        if issue.get("state_reason") == "not_planned":
+            raise ValueError("#%d was closed as not planned, so it never shipped" % number)
+        return issue
+    if not any(x in names for x in ("loom:shipped", "loom:verified")):
+        raise ValueError("only a shipped or verified ticket can regress; #%d is not" % number)
+    return issue
+
+
+def _regression_slot(children: List[Dict[str, Any]], cap: int) -> Optional[str]:
+    """None while the goal is under its cap; past it, why a regression may still
+    be admitted: through the goal's one regression slot, refused while another
+    regression ticket holds it. Count-then-label is not atomic (GitHub has no
+    compare-and-set on labels); one brain acts at a time under bus lock, so at
+    worst a race adds one ticket to a soft cap."""
+    flying = [c for c in children if _in_flight(c)]
+    if len(flying) < cap:
+        return None
+    held = [c for c in flying if REGRESSION in _labels(c)]
+    if held:
+        raise ValueError("the goal's regression slot is held by #%s, with %d other tickets "
+                         "in flight (cap %d)" % (held[0].get("number"), len(flying) - 1, cap))
+    return ("past the cap through the regression slot, with %d other tickets in flight "
+            "(cap %d)" % (len(flying), cap))
+
+
+def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
+                 lane: Optional[str], extra: Sequence[str] = ()) -> Dict[str, Any]:
+    names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
+    if lane:
+        names.append("lane:" + lane)
+    issue = gh.rest("POST", "/repos/%s/issues" % repo, {
+        "title": title, "body": body, "labels": names + list(extra)}).data
+    gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
+            {"sub_issue_id": issue["id"]})
+    return issue
+
+
+def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
+                       evidence: List[str], lane: Optional[str],
+                       model: Optional[str]) -> Dict[str, Any]:
+    """Send the regressed ticket itself back to a lane: its body gains a
+    Regression section with the evidence, then its labels move."""
+    number = int(issue["number"])
+    body = str(issue.get("body") or "")
+    new = "%s\n\n## Regression\n\n%s\n\nRegresses #%d\n%s\n" % (
+        body.rstrip("\n"), title, number, "\n".join(evidence))
+    if model is not None:
+        new = _with_model(new, model)
+    _check_written_text(new)
+    tickets.parse(new)
+    kept = _moved_labels(_labels(issue), "briefed" if lane else "queued", lane)
+    gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+            {"labels": kept + [REGRESSION] if REGRESSION not in kept else kept})
+    return issue
+
+
+def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
+                      lane: Optional[str], model: Optional[str], full_body: str,
+                      regressed: int) -> str:
+    """Admit a brief for a measured regression of a shipped ticket; see brief."""
+    evidence = _regression_evidence(body, regressed)
+    children = _goal_children(gh, repo, goal)
+    held = _regression_attempt(children, regressed)
+    if held is not None:
+        return str(held.get("html_url", ""))
+    issue = _regressed_ticket(gh, repo, regressed)
+    why = _regression_slot(children, goal_cap())
+    ours = any(int(c.get("number") or 0) == regressed for c in children)
+    if issue.get("state") == "open" and ours:
+        made = _rebrief_regressed(gh, repo, issue, title, evidence, lane, model)
+    else:
+        made = _file_ticket(gh, repo, goal, title, full_body, lane, [REGRESSION])
+    if why is not None:
+        note = ("%s\n#%s was admitted %s: it fixes a measured regression of shipped #%d. "
+                "Ordinary briefs wait until the goal is back under its cap.\n\nEvidence:\n%s"
+                % (REGRESSION_MARKER, made.get("number"), why, regressed, "\n".join(evidence)))
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, goal), {"body": note})
+    return str(made.get("html_url", ""))
 
 
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
@@ -371,28 +616,37 @@ def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
 def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
           model: Optional[str] = None, base: Optional[str] = None,
-          not_before: Optional[str] = None, refs: Optional[int] = None) -> str:
+          not_before: Optional[str] = None, refs: Optional[int] = None,
+          regresses: Optional[int] = None) -> str:
     """File a ticket under the goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Refs #M", and the original gets a comment
     naming the ticket and loom:rewritten in place of loom:triage. The original
-    is never closed, retitled or edited."""
+    is never closed, retitled or edited.
+
+    With regresses, the brief fixes a measured regression of shipped ticket M:
+    its body has the line "Regresses #M" and the evidence on the lines after
+    it. It is labelled loom:regression, which the station claims first. The
+    ticket M itself is re-briefed when it is open under this goal; otherwise
+    a new ticket is filed. Past the cap it is admitted through the goal's one
+    regression slot, with a comment on the goal saying why; ordinary briefs
+    still count it and wait. A second brief for a regression already in
+    flight files nothing and returns that ticket."""
     _check_brief_args(title, body, lane, model, base)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
+    if refs is not None and regresses is not None:
+        raise ValueError("a brief is a rewrite or a regression, not both")
     if refs is not None:
         body = body.rstrip("\n") + "\n\nRefs #%d\n" % refs
     _check_written_text(title + "\n" + body)
+    full_body = _ticket_body(body, difficulty, model, base, not_before)
+    if regresses is not None:
+        return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
+                                 regresses)
     if refs is not None:
         _check_rewritable(gh, repo, refs)
     _check_goal_capacity(gh, repo, goal)
-    names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
-    if lane:
-        names.append("lane:" + lane)
-    issue = gh.rest("POST", "/repos/%s/issues" % repo, {
-        "title": title, "body": _ticket_body(body, difficulty, model, base, not_before),
-        "labels": names}).data
-    gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
-            {"sub_issue_id": issue["id"]})
+    issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
                 {"body": "%s\nRewritten as ticket #%d, which refs this issue. This issue "
@@ -1325,16 +1579,23 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
     bodies = _bodies(comments)
-    rungs = _trusted_rungs(comments, authors)
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
     fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
-    claims = [at for body, at in bodies if at is not None and _CLAIM.fullmatch(body.strip())]
     tried = _tried_models(_first_model(issue, bodies), bodies)
-    reasons = _stuck_reasons(issue, labelled, failed, fixes, claims, now)
+    reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now)
+    return History(failed, fixes, tried, reasons, _lowest_untried(tried),
+                   _trusted_rungs(comments, authors))
+
+
+def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
+    return [at for body, at in bodies if at is not None and _CLAIM.fullmatch(body.strip())]
+
+
+def _lowest_untried(tried: List[str]) -> Optional[int]:
     untried = [i for i, (_, model) in enumerate(ESCALATION) if model not in tried]
-    return History(failed, fixes, tried, reasons, untried[0] if untried else None, rungs)
+    return untried[0] if untried else None
 
 
 def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime,
@@ -1429,7 +1690,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--refs", type=int)
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
@@ -1466,7 +1727,8 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
-                args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs))
+                args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
+                args.regresses))
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:

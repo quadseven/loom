@@ -395,6 +395,15 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [(60, (REPO, 6))])
 
+    def test_a_regression_tickets_pull_request_lands_first(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.ticket(6, "pr")
+        self.gh.issues[6]["labels"].append({"name": "loom:regression"})
+        self.gh.pull(60, 6, created=3600)
+        self.go()
+        self.assertEqual(self.merged, [(60, (REPO, 6))])
+
     def test_a_failed_actions_job_is_run_once_more_before_a_send_back(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)

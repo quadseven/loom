@@ -122,7 +122,7 @@ Past the last rung the ticket is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
-pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+pass, `loom:urgent` and `loom:regression` tickets first, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
 back. A ready pull request that changes a code file (by extension: `.py`,
 `.js`, `.ts`, `.tsx`, `.jsx`, `.css`, `.cpp`, `.h`, `.hpp`, `.go`, `.rs`,
