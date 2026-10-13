@@ -386,6 +386,23 @@ class ClaimTest(Base):
         with open(self.inbox("codex", "example-owner.example-repo-12-r2.md")) as fh:
             self.assertIn("Branch: loom/12-fix-the-thing-r2\n", fh.read())
 
+    def test_a_ticket_whose_newest_brief_is_still_in_a_lane_inbox_is_not_claimed_again(self):
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane claude (body sha256 0123456789ab)"})
+        # The first claim's run has not ended: its brief waits or runs on claude.
+        self.write(self.inbox("claude", "example-owner.example-repo-12.md"), "running\n")
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.fake.paths("PUT"), [])
+        self.assertEqual(len(self.fake.comments[12]), 1)
+        self.assertIn("loom:briefed", self.fake.names(12))
+        # Once that run has ended, the next pass claims it.
+        os.makedirs(self.inbox("claude", "failed"))
+        os.replace(self.inbox("claude", "example-owner.example-repo-12.md"),
+                   self.inbox("claude", "failed", "example-owner.example-repo-12.md"))
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12-r2.md"])
+
     def test_a_second_pass_after_a_304_makes_one_call(self):
         self.fake.add(12, author="stranger")
         self.run_pass()
@@ -602,6 +619,19 @@ class FixTest(Base):
         self.assertNotIn("start, lane", said)
         self.assertEqual(again, station.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
+
+    def test_a_fix_whose_branch_moved_goes_back_to_its_pull_request_not_a_failure(self):
+        self.failed_fix([
+            "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: branch moved: "
+            "loom/12-fix-the-thing is at 0123456789ab on the remote, not ba9876543210 as when "
+            "the run started"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
+        body = self.fake.comments[12][-1]["body"]
+        self.assertIn("Lane codex did not push its fix to #99: the branch moved during the run "
+                      "(branch moved: loom/12-fix-the-thing is at 0123456789ab", body)
+        self.assertIn("not a failure", body)
+        self.assertNotIn("failed", body)
+        self.assertEqual(self.fake.comments[99], [])
 
     def test_a_lane_explanation_is_redacted_of_credentials_before_it_is_posted(self):
         self.failed_fix([
