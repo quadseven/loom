@@ -122,34 +122,55 @@ def by_bot(comment: Dict[str, Any], bot: str) -> bool:
             and str(author.get("login") or "").lower() == bot.lower())
 
 
-def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
-    """The canonical merge-ready signal (docs/BRAIN.md): "READY", or
-    "blocked: " and every blocker, from one pull request's READY_FIELDS.
-    It reads nothing else, so the same API data always gives the same verdict."""
-    node = node or {}
+def _head_commit(node: Dict[str, Any]) -> Dict[str, Any]:
     commits = (node.get("commits") or {}).get("nodes") or []
-    head = (commits[-1].get("commit") or {}) if commits else {}
-    blockers = []
+    return (commits[-1].get("commit") or {}) if commits else {}
+
+
+def _checks_blocker(head: Dict[str, Any]) -> Optional[str]:
     checks = (head.get("statusCheckRollup") or {}).get("state") or "UNKNOWN"
-    if checks != "SUCCESS":
-        blockers.append("checks %s" % checks.lower())
+    return None if checks == "SUCCESS" else "checks %s" % checks.lower()
+
+
+def _review_blocker(node: Dict[str, Any], bot: str) -> Optional[str]:
     # The newest submitted review decides; an older CHANGES_REQUESTED that a
     # later review from the bot superseded no longer blocks.
     reviews = [r for r in (node.get("reviews") or {}).get("nodes") or []
                if by_bot(r, bot) and r.get("submittedAt")]
     latest = max(reviews, key=lambda r: str(r["submittedAt"]), default=None)
     if latest and latest.get("state") == "CHANGES_REQUESTED":
-        blockers.append("grug changes_requested")
-    threads = (node.get("reviewThreads") or {}).get("nodes") or []
+        return "grug changes_requested"
+    return None
+
+
+def _threads_blocker(threads: List[Dict[str, Any]]) -> Optional[str]:
     unresolved = sum(1 for t in threads if not t.get("isResolved"))
-    if unresolved:
-        blockers.append("%d unresolved threads" % unresolved)
+    return "%d unresolved threads" % unresolved if unresolved else None
+
+
+def _unfixed_blocker(threads: List[Dict[str, Any]], head: Dict[str, Any],
+                     bot: str) -> Optional[str]:
+    # A finding is fixed only when a commit came after it, so one created at
+    # or after the head commit (>=) still has no fix-up commit.
     committed = str(head.get("committedDate") or "")
     roots = [((t.get("root") or {}).get("nodes") or [{}])[0] or {} for t in threads]
     unfixed = sum(1 for c in roots
                   if by_bot(c, bot) and str(c.get("createdAt") or "") >= committed)
     if unfixed:
-        blockers.append("%d grug findings with no fix-up commit after them" % unfixed)
+        return "%d grug findings with no fix-up commit after them" % unfixed
+    return None
+
+
+def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
+    """The canonical merge-ready signal (docs/BRAIN.md): "READY", or
+    "blocked: " and every blocker, from one pull request's READY_FIELDS.
+    It reads nothing else, so the same API data always gives the same verdict."""
+    node = node or {}
+    head = _head_commit(node)
+    threads = (node.get("reviewThreads") or {}).get("nodes") or []
+    blockers = [b for b in (_checks_blocker(head), _review_blocker(node, bot),
+                            _threads_blocker(threads),
+                            _unfixed_blocker(threads, head, bot)) if b]
     return "blocked: " + ", ".join(blockers) if blockers else "READY"
 
 
