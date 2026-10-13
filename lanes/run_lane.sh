@@ -392,7 +392,8 @@ api_agent() {
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
     # shellcheck disable=SC2030 # deliberately local to the agent's subshell
-    export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
+    export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" \
+      TMP="$AGENT_HOME/tmp" TEMP="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     [ "$key_var" = - ] || export "$key_var=$key"
     # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
     while IFS= read -r kv; do [ -z "$kv" ] || export "${kv?}"; done <<< "$extra"
@@ -586,7 +587,7 @@ opencode_config() {
   local provider="" id="${MODEL#spark/}"
   [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": 32768, \"output\": 4096}}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
-}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"$provider}"
+}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": {\"external_directory\": \"deny\"}$provider}"
 }
 
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from

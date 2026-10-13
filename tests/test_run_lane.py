@@ -164,6 +164,7 @@ small="$(printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | sed -nE 's/.*"small_model"
 port="$(printf '%s' "$args" | sed -nE 's/.*PROBE_PORT=([0-9]+).*/\\1/p')"
 if [ -n "$port" ] && /usr/bin/nc -z -w 1 127.0.0.1 "$port" > /dev/null 2>&1; then lo=reachable; else lo=denied; fi
 printf 'account=%s\\n' "${CLOUDFLARE_ACCOUNT_ID:-none}" >> "$TMPDIR/agent.log"
+printf 'tempvars=%s|%s|%s|%s\\n' "$HOME" "$TMPDIR" "$TMP" "$TEMP" >> "$TMPDIR/agent.log"
 procs="$(ps -axo args= 2>/dev/null)"
 case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
 printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s lo=%s small=%s\\n' "$args" \\
@@ -1051,8 +1052,53 @@ cat > /dev/null
         self.assertFalse((self.home / "hooked").exists())
         # opencode's helper (title) agent must not fall back to a paid model.
         self.assertIn("small=openrouter/vendor/model:free", agent[0])
+        self.assertIn(f"tempvars={self.loom}/run/openrouter-home|{self.loom}/run/openrouter-home/tmp|{self.loom}/run/openrouter-home/tmp|{self.loom}/run/openrouter-home/tmp", self.calls())
+        config = next(line.removeprefix("config=") for line in self.calls()
+                      if line.startswith("config="))
+        self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_opencode_temp_paths_and_external_directory_denial_keep_the_sandbox_boundary(self):
+        profile_file = str(Path(self._tmp.name) / "sandbox.profile")
+        self.write_tool(
+            self.bin / "sandbox-exec",
+            "#!/bin/sh\n[ \"$1\" = -p ] || exit 91\nprintf '%s' \"$2\" > "
+            + shlex.quote(profile_file)
+            + "\nshift 2\nexec \"$@\"\n",
+        )
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(
+            BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        result = self.run_lane(
+            "opencode-go",
+            LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+            FAKE_SECRET__k_oc="fake-oc-key",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/model-free",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        home = self.loom / "run" / "opencode-go-home"
+        calls = self.calls()
+        temp_dir = home / "tmp"
+        self.assertIn(f"tempvars={home}|{temp_dir}|{temp_dir}|{temp_dir}", calls)
+        config = next(line.removeprefix("config=") for line in calls if line.startswith("config="))
+        self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
+        profile = Path(profile_file).read_text()
+        writes = [line for line in profile.splitlines() if "file-write*" in line]
+        scratch = home.resolve()
+        self.assertEqual(len(writes), 3)
+        self.assertEqual(writes[0], f'(deny file-read* file-write* (subpath "{self.home.resolve()}"))')
+        allowed = re.fullmatch(
+            r'\(allow file-read\* file-write\* \(subpath "(.+)"\) \(subpath "(.+)"\)\)',
+            writes[1],
+        )
+        self.assertIsNotNone(allowed)
+        tree, profile_scratch = allowed.groups()
+        self.assertTrue(tree.endswith("/worktrees/T042-fix-the-thing"), tree)
+        self.assertEqual(profile_scratch, str(scratch))
+        self.assertEqual(writes[2], f'(deny file-write* (subpath "{tree}/.git"))')
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
