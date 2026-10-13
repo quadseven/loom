@@ -210,14 +210,6 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     return checks_failing and bool(FIX_CHECK_RE.search(last))
 
 
-def _by_bot(comment: Dict[str, Any], bot: str) -> bool:
-    """Written by the review bot's app; a person can take the same login
-    without "[bot]", so the author type must be Bot as well."""
-    author = comment.get("author") or {}
-    return (author.get("__typename") == "Bot"
-            and str(author.get("login") or "").lower() == bot.lower())
-
-
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
     nodes = (thread.get(field) or {}).get("nodes") or [{}]
     return nodes[index] or {}
@@ -228,8 +220,8 @@ def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
     "Fixed in" reply. A thread a person opened, or any reply after the
     bot's, stays open for a person or the brain."""
     last = _end(thread, "comments", -1)
-    return (not thread.get("isResolved") and _by_bot(_end(thread, "root", 0), bot)
-            and _by_bot(last, bot)
+    return (not thread.get("isResolved") and brain.by_bot(_end(thread, "root", 0), bot)
+            and brain.by_bot(last, bot)
             and str(last.get("body") or "").startswith(BOT_FIXED_PREFIX))
 
 
