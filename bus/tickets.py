@@ -151,7 +151,7 @@ def parse_findings(body: str) -> List[Finding]:
     pending_disposition = None
     pending_disposition_value = None
     
-    for i, line in enumerate(lines):
+    for line in lines:
         stripped = line.strip()
         
         # Look for a thread header: "### Thread <id> (comment <id>) at <path>:<line>"
@@ -214,14 +214,6 @@ def parse_findings(body: str) -> List[Finding]:
         findings.append(finding)
     
     return findings
-
-
-def find_uncovered_dispositions(findings: List[Finding]) -> List[Finding]:
-    """Return findings that don't have a disposition other than 'does_not_apply'.
-    
-    These are findings that still need to be dispositioned.
-    """
-    return [f for f in findings if f.disposition == "does_not_apply"]
 
 
 FIX_MARKER = "<!-- loom:fix v1 -->"
@@ -290,7 +282,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if fix:
         out.append("Fix-PR: %d" % fix.pr)
         for f in fix.findings_list:
-            out.append("Finding-%s: %s" % (f.id, f.text[:200]))
+            out.append("Finding-%s: %s" % (f.id, " ".join(f.text.split())[:200]))
     out += ["%s: %s" % (k, v) for k, v in headers.items()]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"

@@ -48,15 +48,15 @@ Implemented a system to track dispositions for every pre-roll finding before a s
 
 ### Acceptance Criteria
 
-1. ✅ **Test refuses a ship handoff containing an undispositioned review finding and accepts one linked to an existing ticket**
+1. [x] **Test refuses a ship handoff containing an undispositioned review finding and accepts one linked to an existing ticket**
    - Implemented in station.py `_claim()` function
    - Tests written in test_bus_tickets.py
 
-2. ✅ **Restarting or transferring the brain preserves finding IDs and does not create duplicate tickets for the same review**
+2. [x] **Restarting or transferring the brain preserves finding IDs and does not create duplicate tickets for the same review**
    - Stable ID assignment based on finding order
    - IDs persist across multiple fix() calls
 
-3. ✅ **Live proof: the next pre-roll review has a durable disposition for every finding before the pin merge, and the next tick can enumerate its remaining work without rereading prose comments**
+3. [x] **Live proof: the next pre-roll review has a durable disposition for every finding before the pin merge, and the next tick can enumerate its remaining work without rereading prose comments**
    - Dispositions are stored in the fix comment
    - Next tick can read findings and their dispositions directly
 

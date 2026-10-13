@@ -338,12 +338,8 @@ class Station:
             self._refuse(repo, issue, str(err))
             return False
         
-        if fix is None:
-            self._refuse(repo, issue, "no loom:fix comment found")
-            return False
-        
-        # Check if all findings have dispositions
-        if not fix.has_all_dispositions():
+        # A fix brief goes out only once every finding has a disposition.
+        if fix is not None and not fix.has_all_dispositions():
             undispositioned = [f.id for f in fix.findings_list if not f.disposition]
             self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
             return False
