@@ -253,10 +253,11 @@ on hard work):
 
 - Easy: `spark` (the local vLLM coder, model `spark/...`, any repo, private
   ones included) when lane status shows it available, else a free lane:
-  opencode-go, openrouter, workersai, or zen, zai and agy on public repos
-  only. Never anthropic or claude for an easy ticket.
-- Medium: codex or opencode-go first; an anthropic slot only when every codex
-  and opencode-go slot already holds work.
+  opencode-go, openrouter, workersai, or zen, zai, agy and opencode-go-4
+  on public repos only (opencode-go-4 is Muse Spark, which trains on prompts).
+  Never anthropic or claude for an easy ticket.
+- Medium: codex or opencode-go first (opencode-go-4 on public repos only); an
+  anthropic slot only when every codex and opencode-go slot already holds work.
 - Hard: anthropic, claude or codex, never a free lane or spark. Keep the
   anthropic slots busy with hard work while the credit lasts.
 
@@ -266,8 +267,9 @@ factory moves its waiting tickets to a free lane in the same tier as above
 when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
-anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 and opencode-go-3 are
-opencode-go (opencode-go-3 runs its own model, so leave Model: off its briefs). Each takes one
+anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 to opencode-go-4 are
+opencode-go (opencode-go-3 and opencode-go-4 run their own models, so leave Model: off
+their briefs; opencode-go-4 is Muse Spark, which trains on prompts: public repos only). Each takes one
 ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.

@@ -4,7 +4,8 @@
 #   lanes/mac/install.sh [lane ...]
 #     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark,
 #     plus the extra slots anthropic-2 to anthropic-8, codex-2, opencode-go-2
-#     and opencode-go-3 (which runs LOOM_OPENCODE_GO_3_MODEL)
+#     opencode-go-3 (which runs LOOM_OPENCODE_GO_3_MODEL) and opencode-go-4
+#     (LOOM_OPENCODE_GO_4_MODEL, Muse Spark Contributor: public repos only)
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
@@ -31,6 +32,7 @@ LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1:free}"
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
 LOOM_OPENCODE_GO_3_MODEL="${LOOM_OPENCODE_GO_3_MODEL:-opencode-go/deepseek-v4.1-flash}"
+LOOM_OPENCODE_GO_4_MODEL="${LOOM_OPENCODE_GO_4_MODEL:-opencode-go/muse-spark-1.3-contributor}"
 LOOM_ANTHROPIC_MODEL="${LOOM_ANTHROPIC_MODEL:-claude-sonnet-5-5}"
 LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/space-bunny-free}"
 LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
@@ -38,7 +40,7 @@ LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwe
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
 LOOM_SPARK_URL="${LOOM_SPARK_URL:-}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
-export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_ANTHROPIC_MODEL \
+export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_MODEL
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -52,7 +54,7 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
-  codex-2 opencode-go-2 opencode-go-3)
+  codex-2 opencode-go-2 opencode-go-3 opencode-go-4)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
