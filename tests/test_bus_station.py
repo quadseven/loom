@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -52,6 +53,10 @@ class FakeGitHub:
         self.humans = []
         self.goals = []
         self.goal_error = False
+        self.threads = {}
+        self.reply_fails = set()
+        self.replies = []
+        self.resolved = []
 
     def add_goal(self, number, journals=()):
         """journals: (login, age in seconds) pairs, posted as journal comments."""
@@ -158,6 +163,17 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _graphql(self, data):
+        query, variables = data["query"], data.get("variables") or {}
+        if "addPullRequestReviewThreadReply" in query:
+            if variables["id"] in self.reply_fails:
+                return reply(502, {"message": "bad gateway"})
+            self.replies.append((variables["id"], variables["body"]))
+            return reply(200, {"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "c"}}}})
+        if "resolveReviewThread" in query:
+            self.resolved.append(variables["id"])
+            return reply(200, {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}})
+        if "PullRequestReviewThread" in query:
+            return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
         editor = self.editors[data["variables"]["number"]]
         return reply(200, {"data": {"repository": {"issue": {
             "editor": {"login": editor} if editor and editor != "<ghost>" else None,
@@ -617,6 +633,166 @@ class FixTest(Base):
             fix_body=None)
         self.assertIn("loom:failed", self.fake.names(12))
         self.assertEqual(self.fake.comments[99], [])
+
+
+class PruneTest(Base):
+    def tree(self, name, age):
+        path = os.path.join(self.home, "worktrees", name)
+        os.makedirs(os.path.join(path, ".git"))
+        self.write(os.path.join(path, "a.py"), "x\n")
+        old = time.time() - age
+        os.utime(path, (old, old))
+        return path
+
+    def test_a_finished_lane_tree_is_removed_and_a_live_or_fresh_one_kept(self):
+        done = self.tree("example.repo-1", station.TREE_KEEP + 60)
+        running = self.tree("example.repo-2", station.TREE_KEEP + 60)
+        fresh = self.tree("example.repo-3", 60)
+        self.write(self.inbox("codex", "example.repo-2.md"), "brief\n")
+        self.run_pass()
+        self.assertFalse(os.path.exists(done))
+        self.assertTrue(os.path.exists(running))
+        self.assertTrue(os.path.exists(fresh))
+
+    def test_an_unreadable_inbox_stops_the_prune(self):
+        done = self.tree("example.repo-1", station.TREE_KEEP + 60)
+        unreadable = self.inbox("claude")
+        real = os.listdir
+
+        def listdir(path="."):
+            # Raised directly, not by chmod, which a root runner ignores.
+            if path == unreadable:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path)
+
+        with mock.patch.object(station.os, "listdir", listdir):
+            self.run_pass()
+        self.assertTrue(os.path.exists(done))
+
+    def test_a_link_in_the_worktrees_folder_is_removed_without_following_it(self):
+        outside = os.path.join(self._tmp.name, "keep-me")
+        os.makedirs(outside)
+        self.write(os.path.join(outside, "f"), "x\n")
+        root = os.path.join(self.home, "worktrees")
+        os.makedirs(root)
+        link = os.path.join(root, "example.repo-9")
+        os.symlink(outside, link)
+        old = time.time() - station.TREE_KEEP - 60
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.run_pass()
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(os.path.exists(os.path.join(outside, "f")))
+BOT = {"__typename": "Bot", "login": "grug-tribe"}
+THREAD_FIX = FIX_BODY + "\n### Thread PRRT_abcd1 (comment 5) at a.py:3\n\n    medium finding\n"
+
+
+class AnswerTest(Base):
+    """A fix brief's answers to findings (lanes/run_lane.sh keep_answers)."""
+
+    def thread(self, tid="PRRT_abcd1", pr=99, severity="medium", author=BOT):
+        self.fake.threads[tid] = {
+            "isResolved": False,
+            "pullRequest": {"number": pr, "repository": {"nameWithOwner": REPO}},
+            "comments": {"nodes": [{"author": author,
+                                    "body": "%s | _correctness_ | `null-deref`\n\nx" % severity}]}}
+
+    def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX):
+        body = BODY.replace("Model: model-x", "Model: " + model)
+        self.fake.add(12, state="running", body=body)
+        self.fake.comments[99] = []
+        name = tickets.ticket_name(REPO, 12, 2)
+        brief = tickets.render_brief(REPO, self.fake.issues[12], "codex", 2,
+                                     tickets.parse_fix(REPO, fix_body))
+        self.write(self.inbox("codex", kind, name + ".md"), brief)
+        for tid, text in answers.items():
+            self.write(self.inbox("codex", "answers", name, tid + ".md"), text)
+        if kind == "failed":
+            self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                       "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing\n")
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        return name
+
+    def test_the_brief_tells_the_agent_how_to_answer(self):
+        brief = tickets.render_brief(REPO, {"number": 12, "title": "t", "body": BODY}, "codex", 2,
+                                     tickets.parse_fix(REPO, THREAD_FIX))
+        self.assertIn(".loom-answers/<thread id>.md", brief)
+
+    def test_a_strong_models_answer_to_a_medium_bot_finding_is_posted_and_resolved(self):
+        self.thread()
+        name = self.finish({"PRRT_abcd1": "The guard on a.py:2 returns before x is read."})
+        self.assertEqual(len(self.fake.replies), 1)
+        tid, body = self.fake.replies[0]
+        self.assertEqual(tid, "PRRT_abcd1")
+        self.assertIn("Lane codex answered this finding instead of changing the code", body)
+        self.assertIn("> The guard on a.py:2 returns before x is read.", body)
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+
+    def test_an_answer_on_a_no_change_round_is_posted_too(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Already guarded at a.py:2."}, kind="failed")
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_a_model_off_the_ladder_answers_but_does_not_resolve(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Not valid."}, model="model-x")
+        self.assertEqual(len(self.fake.replies), 1)
+        self.assertEqual(self.fake.resolved, [])
+
+    def test_a_high_finding_is_answered_but_stays_open(self):
+        self.thread(severity="high")
+        self.finish({"PRRT_abcd1": "Not valid."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def test_a_persons_thread_is_answered_but_stays_open(self):
+        self.thread(author={"__typename": "User", "login": "grug-tribe"})
+        self.finish({"PRRT_abcd1": "Not valid."})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+
+    def test_a_thread_the_brief_did_not_ask_about_or_on_another_pull_request_is_ignored(self):
+        self.thread("PRRT_other9")
+        self.thread(pr=98)
+        self.finish({"PRRT_other9": "Not valid.", "PRRT_abcd1": "Not valid."})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_an_answer_is_redacted_of_credentials_and_local_paths(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "token ghp_" + "a1B2c3D4e5F6g7H8i9J0 in /Users/example/x.py"})
+        body = self.fake.replies[0][1]
+        self.assertNotIn("ghp_", body)
+        self.assertNotIn("/Users/", body)
+        self.assertIn("<redacted>", body)
+
+    def test_one_failed_reply_neither_stops_the_others_nor_repeats_on_the_next_pass(self):
+        self.thread("PRRT_abcd1")
+        self.thread("PRRT_abcd2")
+        self.fake.reply_fails.add("PRRT_abcd1")
+        fix = THREAD_FIX + "\n### Thread PRRT_abcd2 (comment 6) at a.py:4\n\n    medium finding\n"
+        name = self.finish({"PRRT_abcd1": "Not valid.", "PRRT_abcd2": "Not valid either."},
+                           fix_body=fix)
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd2"])
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.run_pass()
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd2"])
+
+    def test_an_answer_file_that_is_a_link_is_not_read(self):
+        self.thread()
+        outside = os.path.join(self._tmp.name, "outside.md")
+        self.write(outside, "secret words\n")
+        name = tickets.ticket_name(REPO, 12, 2)
+        folder = self.inbox("codex", "answers", name)
+        os.makedirs(folder)
+        os.symlink(outside, os.path.join(folder, "PRRT_abcd1.md"))
+        self.finish({})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_an_answer_that_fails_the_text_checks_is_not_posted(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Fixes #12 already."})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
 
 
 class RefusalTest(Base):
