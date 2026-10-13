@@ -234,10 +234,15 @@ class PullRequests(Base):
         for path in ("README.md", "a.yml", "a.json", "Makefile"):
             self.assertFalse(factory.is_code(path), path)
         for path in ("tests/x.py", "src/test/Foo.cpp", "test_x.py", "x_test.go",
-                     "a.test.ts", "a.spec.js"):
+                     "a.test.ts", "a.spec.js", "t/TestBlackfathomDeeps.cpp",
+                     "spec/a_spec.rb", "src/__tests__/a.js", "testing.py"):
             self.assertTrue(factory.is_test(path), path)
-        for path in ("src/latest.py", "src/latest_x.py", "contest/a.py", "testing.py"):
+        for path in ("src/latest.py", "src/latest_x.py", "contest/a.py",
+                     "src/contest.py", "src/latest.cpp"):
             self.assertFalse(factory.is_test(path), path)
+
+    def test_lacks_test_recognizes_t_test_and_test_prefix(self):
+        self.assertFalse(factory.lacks_test(["src/a.cpp", "t/TestA.cpp"]))
 
     def test_it_waits_while_a_check_runs(self):
         self.gh.ticket(5, "pr")
