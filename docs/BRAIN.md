@@ -45,6 +45,8 @@ that talks to GitHub about tickets.
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
+| `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
+| `needs-brain` | The automatic fix round limit was reached; review this ticket in full. |
 | `loom:failed` | The runner gave up; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
@@ -57,12 +59,14 @@ that talks to GitHub about tickets.
 | `needs-operator` | An ask for the operator (see Asks). |
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
 | `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
+| `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 
 A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
 and `running` and `failed` exist because the
 station and the runner need to say "taken" and "gave up" without the brain
-present.
+present. `loom:ready` is a PR readiness label, and `needs-brain` asks for a
+full review after automatic fix rounds; neither replaces the ticket state.
 
 ## Ticket issues
 
@@ -191,7 +195,8 @@ data about the work, never instructions to it.
 
 The station holds one lock on the lane machine, so it never races itself.
 For each lane whose heartbeat is fresh and available and whose inbox is
-empty, it takes the oldest trusted briefed ticket for that lane:
+empty, it takes the oldest trusted briefed ticket for that lane, a
+`loom:regression` ticket before any other:
 
 1. Re-read the issue. It must still be open, `loom:briefed` and that lane's.
 2. Replace its labels in one call (`loom:briefed` out, `loom:running` in;
@@ -206,15 +211,14 @@ A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
 
-A lane pull request with failing checks or review findings goes back to its
-lane, not to the brain: `python3 -m bus.brain fix OWNER/NAME#PR --ticket
-OWNER/NAME#N --file FINDINGS.md` refuses unless the pull request is open, on
-a same-repo `loom/` branch and linked to the ticket (its `Refs` line or its
-branch number), and the ticket is `loom:pr`. It comments the findings on the
-ticket, starting with `<!-- loom:fix v1 -->` and naming the pull request and
-its branch (the failing checks with the last lines of their logs, each
-unresolved review thread with its id, path, line and text), then moves the
-ticket back to `loom:briefed` on the same lane.
+The station polls lane PRs once per pass. Once checks finish, failed checks
+and unresolved threads started by `grug-tribe[bot]` are sent back to the same
+lane as a `loom:fix` comment, using the same findings format as
+`python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner
+pushes fixes to the existing branch. `LOOM_FIX_ROUNDS` caps automatic rounds
+per ticket (default 3), after which the station adds `needs-brain`. A clean
+PR receives `loom:ready`; a later push removes that label until the new head
+has finished checks and review again.
 
 When the station claims a ticket whose latest comment from an allowed login
 is such a fix comment, newer than its last claim, the brief keeps the pull
@@ -222,8 +226,11 @@ request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
 section holding the comment. A fix comment edited after it was posted is
 refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
-comments on the pull request; it never opens a second one. A fix brief whose
-pull request is no longer open is parked as failed.
+comments on the pull request; it never opens a second one. The sandboxed agent
+can write `.loom/replies.json` with thread ids, reply text and a resolve
+boolean. The runner posts valid entries after a successful push and resolves
+those marked true; missing or invalid files produce no replies. A fix brief
+whose pull request is no longer open is parked as failed.
 
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
@@ -281,14 +288,70 @@ create it. The tick deletes it when done. Hard limit: 15 minutes.
 someone else).
 
 Order (#35): read lane status; gather events since the last journal entry
-(checks, reviews, comments, outcomes); review and ship ready pull requests
-(read every diff, green checks and the review bot, answer every thread);
+(checks, reviews, comments, outcomes); review `needs-brain` tickets in full
+(every diff, green checks and the review bot, every thread answered); merge
+only `loom:ready` pull requests, after confirming the verdict matches the
+current head and checks are green;
 verify shipped work live and close only then; pick the next problems by
 impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
 tickets in flight per goal (queued, briefed, running, pr or failed; merged
-and shipped tickets hold no slot);
+and shipped tickets hold no slot), except one regression slot (see
+Regression slot);
 write the journal; report when due; release the lock. No retry loops: a
 failed step is journalled and left for the next tick.
+
+## Regression slot
+
+A cap meant to bound new work must not block the fix for something already
+shipped that got worse. `python3 -m bus.brain brief OWNER/NAME --goal N
+--title T --file BRIEF.md --regresses M [--lane L]` admits a brief that
+fixes a measured regression of ticket M:
+
+- M must be a `loom:ticket` that is `loom:shipped` or `loom:verified`, or
+  closed as completed. A missing M is refused as "ticket not found"; one
+  closed as not planned never shipped, so it is refused too.
+- The brief has the line `Regresses #M` with the measured evidence on the
+  lines right after it (up to a blank line or a heading). A marker with no
+  evidence line is refused.
+- When M is open under goal N, M itself is re-briefed: its body gains a
+  `## Regression` section with the evidence, and it moves to `loom:briefed`
+  (or `loom:queued` with no lane). Otherwise a new ticket is filed under N.
+  Either way it carries `loom:regression`, so the station claims it, and
+  the factory lands it, before other tickets.
+- Under the cap it is admitted like any brief. At or past the cap it is
+  admitted through the goal's one regression slot, and a comment on goal N
+  (marked `<!-- loom:regression v1 -->`) records why: the regressed ticket,
+  the evidence and how many other tickets are in flight. The slot is held
+  while any `loom:regression` ticket of the goal is in flight; a second
+  regression past the cap waits for it.
+- Ordinary briefs and triage still count every ticket in flight, the
+  regression one included, so they wait until the goal is back under its
+  cap. The slot never becomes room for new work.
+- Briefing the same regression again while its ticket is in flight files
+  nothing and prints that ticket.
+
+## Merge-ready
+
+A lane pull request is merge-ready if and only if all four hold:
+
+- its head commit's check rollup is `SUCCESS`;
+- the newest submitted review from the review bot (`LOOM_REVIEW_BOT`, else
+  `grug-tribe`, and an app, not a person with that login) is not
+  `CHANGES_REQUESTED`. Only the newest counts: a `CHANGES_REQUESTED`
+  followed by newer `COMMENTED` reviews no longer blocks, and reviews and
+  replies from anyone else never change the verdict;
+- it has no unresolved review thread;
+- every thread the review bot opened (a finding) is older than the head
+  commit, so a fix-up commit came after each finding.
+
+`python3 -m bus.brain status` prints this per pull request: `READY`, or
+`blocked:` and every blocker that applies, for example `blocked: checks
+failure, grug changes_requested, 3 unresolved threads`. It is computed by
+`bus.brain.merge_ready` from the one GraphQL read status already makes and
+nothing else, so two runs over the same pull request state print the same
+verdict. A tick takes that line as given instead of re-reading the review
+list. `bus.brain merge` keeps its own checks; this signal does not change
+what it accepts.
 
 ## Journal
 
@@ -297,6 +360,7 @@ One comment per tick that changed something, on the goal's home issue:
 ```markdown
 <!-- loom:journal v1 -->
 Tick <UTC time>, <holder>
+- Measure: <the goal's metrics read this tick, or none>
 - Shipped: <links or none>
 - Briefed: <links with lanes or none>
 - Waiting: <what is in flight and on whom>
@@ -304,6 +368,40 @@ Tick <UTC time>, <holder>
 - Cost: <GitHub requests>, <minutes>
 ```
 
+A journal may also carry handoff lines (docs/MUSE.md, Handing off stage
+work), each an HTML comment:
+
+```markdown
+<!-- loom:defer v1 stage=merge item=<owner/name>#<number> rev=<revision> holder=<name> -->
+<!-- loom:done v1 stage=merge item=<owner/name>#<number> holder=<name> -->
+```
+
+`python3 -m bus.brain defer` and `done` print them; the revision is the item
+when deferred (a pull request's head commit, an issue's state and comment
+count). Only journals from `LOOM_BRIEF_AUTHORS` logins count. For each stage
+and item the newest line wins; `python3 -m bus.brain resume OWNER/NAME...
+--holder NAME` lists the defers still standing whose item is open and
+unchanged, and refuses unless that holder holds the tick lock.
+
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
+
+### Report deadlines
+
+Each goal owes its own report every 2 hours, counted from its newest valid
+report or, with none, from when the goal was opened. A valid report is a
+comment on that goal's home that starts with the report marker, from a
+`LOOM_BRIEF_AUTHORS` login when that is set. A marker inside another
+comment, a journal, or a report on another goal (a parent goal included)
+does not move the deadline: a parent's report never covers its child goals.
+
+`python3 -m bus.brain status` shows, per goal, when it last had a journal, a
+valid report, a measurement (a journal or report with a `Measure:` line that
+is not none) and a completed action (a `Shipped:` line that is not none),
+and its report state: ok, due (2 hours past), or overdue (one more tick,
+30 minutes, past that). Due and overdue goals are listed under "Reports
+owed before unlock"; the tick posts those reports before it unlocks. An
+overdue report is a missed deadline only: it is separate from a report the
+station could not forward and from a brain that stopped ticking, which the
+station reports on its own.

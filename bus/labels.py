@@ -38,6 +38,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:briefed": {"color": "1d76db", "description": "Assigned to a lane, waiting for the station"},
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},
     "loom:pr": {"color": "0075ca", "description": "The runner opened a pull request"},
+    "loom:ready": {"color": "0e8a16", "description": "Checks passed and review-bot threads are resolved"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
     "loom:shipped": {"color": "2ea44f", "description": "Deployed by the project's ship owner"},
@@ -48,8 +49,9 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "loom:digest": {"color": "ededed", "description": "The issue holding the daily asks digest"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
-    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must rewrite or ask"},
+    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
+    "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",
