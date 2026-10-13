@@ -23,6 +23,7 @@ from bus.github import GitHub  # noqa: E402
 REPO = "example-owner/example-repo"
 AUTHORS = ["alice-example", "bob-example"]
 OWNERS = ["example-owner"]
+CLOSED_PULLS = "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100"
 BODY = "Difficulty: hard\nModel: model-x\n\n## Why\nBecause.\n\n## What\nDo it.\n"
 
 
@@ -173,7 +174,7 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
-        if "labels=loom%3Apr" in query:
+        if "labels=loom%3Apr" in query or "labels=loom:pr&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:pr" in self.names(i["number"])])
         if "needs-operator" in query:
@@ -341,6 +342,114 @@ class ReconcilePullRequestTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:closed-unmerged", self.fake.names(12))
         self.assertNotIn("loom:merged", self.fake.names(12))
+
+
+class BudgetTest(Base):
+    """The station's GitHub budget (T218): conditional list reads, a floor
+    under which a pass only claims and reports, and idle repos scanned every
+    IDLE_SCAN seconds."""
+
+    PR_LIST = "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % REPO
+
+    def passes(self, transport=None, now=None, gh=None):
+        gh = gh or GitHub("token", transport=transport or self.fake)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(station.run(self.settings, gh, now=now or time.time()), 0)
+        return gh, err.getvalue()
+
+    def gets(self, fragment):
+        return [p for p in self.fake.paths("GET") if fragment in p]
+
+    def test_a_repeated_list_read_sends_the_etag_and_a_304_is_unchanged(self):
+        self.fake.add(12, state="pr")
+        sent = []
+
+        def transport(method, url, headers, body):
+            # The fake gives the loom:pr list an ETag that moves with the data.
+            if method == "GET" and url.endswith(self.PR_LIST):
+                sent.append(headers.get("If-None-Match"))
+                etag = '"pr%d"' % self.fake.version
+                if headers.get("If-None-Match") == etag:
+                    self.fake.calls.append((method, self.PR_LIST))
+                    return reply(304, None, {"ETag": etag})
+                status, _, raw = self.fake(method, url, headers, body)
+                return status, {"ETag": etag}, raw
+            return self.fake(method, url, headers, body)
+
+        self.passes(transport)
+        self.assertEqual(sent[0], None)
+        # The ticket's pull request merged; the loom:pr list did not change.
+        self.fake.pulls = [{"number": 99, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#12" % REPO, "head": {"ref": "loom/12-x"}}]
+        gh, err = self.passes(transport)
+        self.assertEqual(sent[2], '"pr%d"' % (self.fake.version - 1))
+        self.assertGreaterEqual(gh.not_modified, 1)
+        # The 304's kept list still named the ticket, so it was reconciled.
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertRegex(err, r"requests: \d+, \d+ counted \(.*issues list \d+.*\), "
+                              r"\d+ answered 304 \(not counted\)")
+
+    def low(self, remaining=500):
+        reset = int(time.time()) + 1800
+        headers = {"X-RateLimit-Remaining": str(remaining), "X-RateLimit-Limit": "5000",
+                   "X-RateLimit-Reset": str(reset), "X-RateLimit-Resource": "core"}
+
+        def transport(method, url, headers_in, body):
+            status, _, raw = self.fake(method, url, headers_in, body)
+            return status, headers, raw
+        return transport, reset
+
+    def test_below_the_floor_a_pass_claims_and_defers_the_rest_saying_so_once(self):
+        self.settings.status_repo = REPO
+        self.fake.add(12)
+        transport, reset = self.low()
+        gh = GitHub("token", transport=transport)
+        # The last pass's responses said the budget is low.
+        gh.rate["core"] = (500, 5000, reset)
+        _, err = self.passes(gh=gh)
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertEqual(self.gets("loom:pr"), [])
+        self.assertEqual(self.gets("loom:lanes"), [])
+        self.assertEqual(err.count("budget low"), 1)
+        self.assertIn("500 of 5000 left", err)
+        # The next pass knows from the station's state, and does not say it again.
+        _, err = self.passes(transport)
+        self.assertEqual(self.gets("loom:pr"), [])
+        self.assertEqual(self.gets("loom:lanes"), [])
+        self.assertNotIn("budget low", err)
+
+    def test_above_the_floor_nothing_is_deferred(self):
+        self.settings.status_repo = REPO
+        transport, _ = self.low(remaining=4000)
+        _, err = self.passes(transport)
+        self.assertEqual(len(self.gets("loom:pr")), 2)
+        self.assertEqual(len(self.gets("loom:lanes")), 1)
+        self.assertNotIn("budget low", err)
+        self.assertIn("budget 4000 of 5000 left", err)
+
+    def test_an_idle_repo_is_scanned_once_per_ten_minutes(self):
+        start = time.time()
+        self.passes(now=start)
+        self.assertEqual(len(self.gets("loom:briefed")), 1)
+        # A ticket briefed a minute later waits for the next scan of the repo.
+        self.fake.add(12)
+        self.passes(now=start + 60)
+        self.assertEqual(len(self.gets("loom:briefed")), 1)
+        self.assertEqual(len(self.gets("loom:pr")), 2)
+        self.assertEqual(self.listing(), [])
+        self.heartbeat("codex", age=-station.IDLE_SCAN)
+        self.passes(now=start + station.IDLE_SCAN)
+        self.assertEqual(len(self.gets("loom:briefed")), 2)
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
+    def test_a_repo_with_a_ticket_in_flight_is_scanned_every_pass(self):
+        start = time.time()
+        self.fake.add(12, state="pr")
+        for n in range(3):
+            self.passes(now=start + 60 * n)
+        self.assertEqual(len(self.gets("loom:briefed")), 3)
+        self.assertEqual(len(self.gets("loom:pr")), 6)
 
 
 class ReviewFake:
@@ -683,8 +792,12 @@ class ClaimTest(Base):
         self.run_pass()
         first = len(self.fake.calls)
         gh = self.run_pass()
-        self.assertEqual(len(self.fake.calls), first + 5)
-        self.assertEqual(gh.requests, 5)  # Includes the reconciliation and PR review polls.
+        # The loom:pr list for reconciliation and for PR reviews (this fake
+        # sends no ETag for it), then the briefed list's 304; with no loom:pr
+        # ticket no pull request list is read.
+        self.assertEqual(len(self.fake.calls), first + 3)
+        self.assertEqual(gh.requests, 3)
+        self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
     def test_a_304_reuses_the_stored_list(self):
@@ -888,7 +1001,8 @@ class FixTest(Base):
                          ["Lane codex pushed fixes to a pull request: https://example.com/pull/99"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
-                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
+                                 "/repos/%s/pulls?state=open&per_page=100" % REPO,
+                                 CLOSED_PULLS % REPO])
 
     def failed_fix(self, log_lines, fix_body=FIX_BODY):
         self.fake.add(12, state="running")
@@ -1385,9 +1499,10 @@ class OutcomeTest(Base):
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertIn("https://example.com/pull/99", self.fake.comments[12][0]["body"])
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
-        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
-                                 "/repos/%s/pulls?state=all&per_page=100" % REPO,
-                                 "/repos/%s/pulls?state=all&per_page=100" % REPO])
+        # Reconciliation reads the open pull requests (shared with PR
+        # reviews) and one page of recently closed ones, never all of them.
+        self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO]
+                         + ["/repos/%s/pulls?state=open&per_page=100" % REPO, CLOSED_PULLS % REPO] * 2)
 
     def test_done_without_a_pull_request_is_retried_not_reported(self):
         self.finished("done")

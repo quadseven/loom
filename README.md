@@ -31,7 +31,8 @@ flowchart LR
 3. **Ticket.** An issue with Why, What, exactly three acceptance checks
    (one names a test that fails without the fix, one is the live proof),
    Size and Out of scope.
-4. **Station.** Runs once a minute on the lane machine. It hands each
+4. **Station.** Runs once a minute on the lane machine (`LOOM_STATION_INTERVAL`
+   seconds). It hands each
    ticket to a free lane and reports the outcome back on the ticket.
 5. **Lane.** One agent CLI on one subscription or API key, in its own clone
    and branch. It never merges; the runner pushes and opens the pull

@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +89,30 @@ class InstallScriptTest(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         self.assertNotIn("installing anyway", result.stdout)
         self.assertIn("installed com.loom.station", result.stdout)
+
+    def station_interval(self):
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        return plist.split("<key>StartInterval</key><integer>", 1)[1].split("<", 1)[0]
+
+    def test_the_station_interval_defaults_to_a_minute(self):
+        env = {k: v for k, v in os.environ.items() if k != "LOOM_STATION_INTERVAL"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.station_interval(), "60")
+
+    def test_the_station_interval_comes_from_the_environment(self):
+        result = self.run_install(LOOM_STATION_INTERVAL="180")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.station_interval(), "180")
+
+    def test_a_bad_station_interval_installs_nothing(self):
+        for bad in ("soon", "30"):
+            with self.subTest(bad=bad):
+                result = self.run_install(LOOM_STATION_INTERVAL=bad)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("LOOM_STATION_INTERVAL", result.stderr)
+                self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
 
 
 if __name__ == "__main__":

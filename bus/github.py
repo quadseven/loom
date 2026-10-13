@@ -1,13 +1,19 @@
 """A small GitHub REST and GraphQL client: standard library only.
 
-It counts every request (304s included), supports ETags, and takes an
-injectable transport so tests never touch the network.
+It counts every request (304s included) by endpoint kind, supports ETags,
+remembers the rate limit headers of the last response, and takes an
+injectable transport so tests never touch the network. With a cache folder
+set, every GET sends the ETag of the last answer to the same URL and a 304
+returns that answer: GitHub does not count a 304 against the hourly budget.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -36,6 +42,34 @@ class Response:
         self.data = data
         self.etag = etag
         self.headers = headers if headers is not None else {}
+
+
+def request_kind(method: str, url: str) -> str:
+    """The endpoint kind a request is counted under in the station's log."""
+    path = url.split("://", 1)[-1].split("/", 1)[-1].split("?", 1)[0]
+    path = "/" + path.rstrip("/")
+    if path == "/graphql":
+        return "graphql"
+    if method != "GET":
+        return "writes"
+    if "/check-runs" in path or re.search(r"/commits/[^/]+/status$", path):
+        return "check runs"
+    if path.endswith("/comments"):
+        return "comments"
+    if path.endswith("/events"):
+        return "events"
+    if re.search(r"^/repos/[^/]+/[^/]+/issues$", path):
+        return "issues list"
+    if re.search(r"^/repos/[^/]+/[^/]+/pulls$", path):
+        return "pulls list"
+    return "other"
+
+
+def _int(value: Any) -> Optional[int]:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -69,11 +103,20 @@ def urllib_transport(method: str, url: str, headers: Dict[str, str],
 
 class GitHub:
     def __init__(self, token: str, api: str = DEFAULT_API,
-                 transport: Optional[Transport] = None) -> None:
+                 transport: Optional[Transport] = None,
+                 cache_dir: Optional[str] = None) -> None:
         self._token = token
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
+        # Where GET answers are kept for conditional requests; None sends none.
+        self.cache_dir = cache_dir
         self.requests = 0
+        self.not_modified = 0
+        # Requests by request_kind, 304s left out: what the budget counted.
+        self.kinds: Dict[str, int] = {}
+        # resource (core, graphql, ...) -> (remaining, limit, reset epoch),
+        # from the newest response that carried the headers.
+        self.rate: Dict[str, Tuple[int, int, int]] = {}
 
     def _url(self, path: str) -> str:
         # Absolute URLs (pagination's next links) must stay on the API host:
@@ -100,22 +143,116 @@ class GitHub:
         if body is not None:
             payload = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        # A caller's own ETag means the caller keeps the answer; otherwise
+        # the cache does, when there is one.
+        cached = self._cached(url) if method == "GET" and not etag else None
         if etag:
             headers["If-None-Match"] = etag
+        elif cached is not None:
+            headers["If-None-Match"] = cached["etag"]
         self.requests += 1
         status, raw_headers, raw = self.transport(method, url,
                                                   headers, payload)
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
+        # Read before any error is raised: a 403 at the limit carries them.
+        self._note_rate(resp_headers)
+        if status == 304:
+            self.not_modified += 1
+        else:
+            kind = request_kind(method, url)
+            self.kinds[kind] = self.kinds.get(kind, 0) + 1
         text = (raw or b"").decode("utf-8", "replace")
         if not (200 <= status < 300 or status == 304 or status in ok):
             raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
+        if status == 304 and cached is not None:
+            self._touch(url)
+            resp_headers.setdefault("link", cached.get("link") or "")
+            return Response(304, cached.get("data"), cached["etag"], resp_headers)
         data = None
         if text.strip():
             try:
                 data = json.loads(text)
             except ValueError:
                 data = None
+        if method == "GET" and status == 200 and not etag and resp_headers.get("etag"):
+            self._keep(url, {"etag": resp_headers["etag"], "data": data,
+                             "link": resp_headers.get("link", "")})
         return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    # -- the rate limit ------------------------------------------------
+    def _note_rate(self, headers: Dict[str, str]) -> None:
+        remaining = _int(headers.get("x-ratelimit-remaining"))
+        limit = _int(headers.get("x-ratelimit-limit"))
+        reset = _int(headers.get("x-ratelimit-reset"))
+        if remaining is None or limit is None or reset is None or limit <= 0:
+            return
+        resource = str(headers.get("x-ratelimit-resource") or "core").strip() or "core"
+        self.rate[resource] = (remaining, limit, reset)
+
+    # -- the conditional request cache ---------------------------------
+    def _cache_path(self, url: str) -> str:
+        assert self.cache_dir
+        key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:40]
+        return os.path.join(self.cache_dir, key + ".json")
+
+    def _cached(self, url: str) -> Optional[Dict[str, Any]]:
+        """The kept answer for this URL, or None. A lost or unreadable entry
+        only costs one full read."""
+        if not self.cache_dir:
+            return None
+        try:
+            with open(self._cache_path(url), encoding="utf-8") as fh:
+                entry = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(entry, dict) or not isinstance(entry.get("etag"), str) \
+                or not entry["etag"] or entry.get("url") != url:
+            return None
+        return entry
+
+    def _keep(self, url: str, entry: Dict[str, Any]) -> None:
+        if not self.cache_dir:
+            return
+        path = self._cache_path(url)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(dict(entry, url=url), fh)
+            os.replace(tmp, path)
+        except (OSError, TypeError, ValueError):
+            # A cache that cannot be written costs a full read next time.
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _touch(self, url: str) -> None:
+        try:
+            os.utime(self._cache_path(url))
+        except OSError:
+            pass
+
+    def prune_cache(self, keep: float, now: Optional[float] = None) -> int:
+        """Remove kept answers no request has used for `keep` seconds (a
+        finished pull request's check runs, say); returns how many."""
+        if not self.cache_dir:
+            return 0
+        now = time.time() if now is None else now
+        try:
+            names = os.listdir(self.cache_dir)
+        except OSError:
+            return 0
+        removed = 0
+        for name in names:
+            path = os.path.join(self.cache_dir, name)
+            try:
+                if now - os.stat(path).st_mtime > keep:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                continue
+        return removed
 
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
