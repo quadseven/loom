@@ -15,6 +15,21 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2"]
 LANES = LANES + SLOTS
 
+# The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
+# rung, lowest first. Lanes stand in for each other on the same provider:
+# codex-2 for codex, and any anthropic slot for the last rung's claude lane.
+ESCALATION = [("claude", "claude-sonnet-5-5"), ("codex", "gpt-6-sol"),
+              ("claude", "claude-opus-5-5")]
+ANTHROPIC_LANES = [x for x in LANES if x.startswith("anthropic")]
+
+
+def rung_lanes(rung: int) -> List[str]:
+    """The lanes that can run a rung (0-based), best first."""
+    lane = ESCALATION[rung][0]
+    if lane == "codex":
+        return ["codex", "codex-2"]
+    return [lane] + (ANTHROPIC_LANES if rung == len(ESCALATION) - 1 else [])
+
 # name -> (6-hex color, short ASCII description)
 LABELS: Dict[str, Dict[str, str]] = {
     "loom:goal": {"color": "5319e7", "description": "The goal's home issue"},
@@ -32,6 +47,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
+    "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must rewrite or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
 }
 for _lane in LANES:
