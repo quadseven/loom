@@ -111,6 +111,8 @@ if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkdir -p .loom-answers
   echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
   ln -s "$FAKE_SECRET_FILE" .loom-answers/PRRT_2.md
+  ln "$FAKE_SECRET_FILE" .loom-answers/PRRT_3x.md
+  mkfifo .loom-answers/PRRT_4x.md
   echo "scratch" > .loom-answers/notes.txt
 fi
 echo fixed > fix.txt
@@ -481,7 +483,8 @@ class LaneRunnerTest(unittest.TestCase):
                                FAKE_SECRET_FILE=str(secret))
         self.assertEqual(result.returncode, 0, result.stderr)
         answers = self.inbox / "answers" / name
-        # Only the regular file named for a thread; the symlink is dropped unread.
+        # Only the regular file named for a thread; the symlink, the hard link
+        # to a file outside the tree and the FIFO are dropped unread.
         self.assertEqual(sorted(os.listdir(answers)), ["PRRT_1.md"])
         self.assertEqual((answers / "PRRT_1.md").read_text(), "Not valid: a.py:2 already guards it.\n")
         files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",

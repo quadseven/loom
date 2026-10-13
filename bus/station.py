@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -38,7 +39,7 @@ FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
-ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{4,80})\.md$")
+ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
 STRONG_MODELS = frozenset(model for _, model in factory.LADDER)
 THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
@@ -754,8 +755,16 @@ class Station:
 
     def _answer(self, repo: str, pr: int, lane: str, thread_id: str, path: str,
                 strong: bool) -> None:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            said = SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", fh.read(ANSWER_MAX))).strip()
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
+                return
+            raw = fh.read(ANSWER_MAX).decode("utf-8", errors="replace")
+        said = SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", raw)).strip()
         node = (self.gh.graphql(THREAD_QUERY, {"id": thread_id}) or {}).get("node") or {}
         where = node.get("pullRequest") or {}
         if (not said or node.get("isResolved")

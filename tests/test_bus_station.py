@@ -701,6 +701,17 @@ class AnswerTest(Base):
         self.assertNotIn("/Users/", body)
         self.assertIn("<redacted>", body)
 
+    def test_an_answer_file_that_is_a_link_is_not_read(self):
+        self.thread()
+        outside = os.path.join(self._tmp.name, "outside.md")
+        self.write(outside, "secret words\n")
+        name = tickets.ticket_name(REPO, 12, 2)
+        folder = self.inbox("codex", "answers", name)
+        os.makedirs(folder)
+        os.symlink(outside, os.path.join(folder, "PRRT_abcd1.md"))
+        self.finish({})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
     def test_an_answer_that_fails_the_text_checks_is_not_posted(self):
         self.thread()
         self.finish({"PRRT_abcd1": "Fixes #12 already."})
