@@ -1312,7 +1312,8 @@ class TranscriptTest(Base):
 
     def upload(self, url, token, body):
         if self.fail_upload:
-            raise OSError("refused by %s with %s" % (url, token))
+            # The real transport raises URLError, whose text holds the URL.
+            raise urllib.error.URLError("refused by %s with %s" % (url, token))
         self.sent.append((url, token, body))
 
     def read_secret(self, name, region):
@@ -1371,8 +1372,9 @@ class TranscriptTest(Base):
                 self.go()
         lines = [l for l in err.getvalue().splitlines() if "transcript" in l]
         self.assertEqual(lines, ["station: gave up uploading the transcript of "
-                                 "anthropic-3/T2 after 5 failures (OSError)"])
+                                 "anthropic-3/T2 after 5 failures (URLError)"])
         self.assertNotIn("SECRET", err.getvalue())
+        self.assertNotIn("dashboard.example.com", err.getvalue())
         self.fail_upload = False
         self.go()
         self.assertEqual(len(self.sent), 1)
@@ -1415,6 +1417,13 @@ class TranscriptTest(Base):
         self.go()
         self.write(os.path.join(self.home, "state", "brain.json"), json.dumps(
             {"at": 1893492060, "outcome": "skipped", "exit": 0, "started": None}))
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_a_skip_that_kept_a_stale_start_time_uploads_nothing(self):
+        self.go()
+        self.write(os.path.join(self.home, "state", "brain.json"), json.dumps(
+            {"at": 1893492060, "outcome": "skipped", "exit": 0, "started": 1893492000}))
         self.go()
         self.assertEqual(self.sent, [])
 
