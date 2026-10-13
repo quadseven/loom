@@ -33,9 +33,15 @@ rest to Muse (docs/MUSE.md).
 
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. The station adds a `brain` row to the lane status, and when no tick
-has ended well for 2 hours it sends one urgent Discord message, then one more
-when the brain is back.
+included. The station adds a `brain` row to the lane status. The brain also
+runs on Muse, so the station reads GitHub too: while no local tick has ended
+well for 2 hours it looks (at most every 10 minutes) for the newest
+`<!-- loom:journal v1 -->` comment from a `LOOM_BRIEF_AUTHORS` login on the
+open `loom:goal` issues in `LOOM_REPOS`. The brain is alive when either the
+local tick or a journal is at most 2 hours old. Only when both are older does
+the station send one urgent Discord message, naming the newest journal's time
+and goal, then one more when the brain is back. A GitHub read error never
+counts as stale; that pass makes no decision.
 
 ## The station
 
@@ -54,8 +60,48 @@ Lane status: every pass the station reads each lane's heartbeat (`yes` when
 available and at most 600 seconds old, else `no`) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes and at least hourly, and never publishes the
-heartbeat's reason.
+only when a yes or no changes, when an anthropic run is recorded, and at
+least hourly, and never publishes the heartbeat's reason. With anthropic
+spend recorded or a budget set, it ends with the spend line ("Anthropic
+spend" below).
+
+Hold: a ticket whose header has `Not before: 2026-10-13T17:00:00Z` (UTC) is
+not claimed before that time, and the factory does not count it as stalled
+until then; the line is left out of the brief the lane reads.
+
+Factory: at most every 5 minutes the station runs `bus/factory.py` over
+`LOOM_REPOS`, with no model. A lane pull request (a `loom/` branch whose
+ticket is `loom:pr`) whose checks have all finished, whose review check
+(`LOOM_REVIEW_CHECK`, default `Grug - Elder`) has run on its head commit,
+and that is mergeable, green and free of open threads is squash-merged
+through `bus.brain merge`. One with a failing check, an open thread or a
+conflict goes back to a lane as a fix brief. It stays on its lane while the
+rounds make progress, and climbs the model ladder only when stuck: a review
+thread survived a fix round, checks it was asked to fix still fail, or the
+pull request is over 6 hours old and has not climbed in 6 hours (a review that finds new things, or a
+conflict alone, never climbs). Failed tickets and briefed tickets no lane
+claimed for 2 hours climb too. After a push the factory waits for the review
+to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
+starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
+`claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
+A rung whose lanes each already hold 2 briefed or running tickets is passed
+over for the next. A fix brief that ends with nothing committed (most often
+every thread was already fixed and the review thread is stale) is not a
+failure: the station posts the lane's explanation on the pull request, asks
+the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
+`/grug improve`), and returns the ticket to `loom:pr`. Before a fix brief's
+agent runs, the runner merges the default branch into the pull request's
+branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
+the agent changes nothing, and a conflict is handed to the agent with the
+file list, its markers in the tree; the runner completes the merge, or parks
+the brief with "conflict markers left in FILES".
+Past the last rung the ticket is left `loom:failed` for the brain. Landing
+keeps the default branch green: a ready pull request that is behind its base
+is brought up to date first (GitHub's update-branch) and lands only after its
+checks and review pass again on the new head; each repo lands at most one a
+pass, `loom:urgent` tickets first, then the oldest. A pull request whose only
+fault is a failed Actions job gets that job run once more before it is sent
+back. At most 12 actions per pass. `LOOM_FACTORY=0` turns it off.
 
 Asks: the station reads open `needs-operator` issues in each `LOOM_REPOS` repo
 (ETag polls) and forwards those whose author and latest `needs-operator`
@@ -66,6 +112,76 @@ empty nothing is forwarded). A `loom:urgent` ask is posted at once, once; all
 open asks go in one digest per day after `LOOM_DIGEST_HOUR` (local hour,
 default 9). Posts mention nobody except the numeric user id in
 `LOOM_DISCORD_MENTION`; a failed post is retried on the next pass.
+
+Reports: the station also reads comments on open `loom:goal` issues in each
+`LOOM_REPOS` repo. On first run it records the newest report comment per repo
+without sending old reports; later `<!-- loom:report v1 -->` comments from
+`LOOM_BRIEF_AUTHORS` are sent to the same webhook, without a mention. A
+successful send advances the per-repo ledger, while a failed send is retried
+on the next pass. When the Discord bot below is set up
+(`LOOM_DISCORD_CHANNEL_ID` and `LOOM_DISCORD_BOT_TOKEN_SSM`), reports go
+through the bot instead, and the webhook setting is not needed for them:
+each report is one short line, the goal's short name in bold and the
+report's first line, with a thread on it holding the full report and the
+comment link, so tapping the line expands it. The short name is a
+`Short name: ...` line in the goal home body when there is one, else the goal
+home title. A failed line is retried on the next pass; once the line is out,
+a failed thread is only logged, so the line is never posted twice. Every
+station post, through the webhook or the bot, suppresses link previews.
+
+### Talking to the brain from Discord
+
+The webhook only posts. To let the operator answer a report, ask a question
+or give an instruction from the channel, the station also reads the channel
+with a Discord bot, at most every 30 seconds:
+
+- Each new message whose author id is `LOOM_DISCORD_MENTION` (the operator)
+  becomes one comment on a goal home, starting with
+  `<!-- loom:operator v1 discord=<message id> -->` and then the message text,
+  followed by an `Attachments:` list with the link of each attached image or
+  file, so the brain can open a screenshot (a message with only an
+  attachment is noted too). Discord's attachment links expire after about a
+  day.
+  Messages from anyone else, bots included, are ignored. The goal is the one
+  the message names: `owner/name#N` or `#N` of an open `loom:goal` issue in
+  `LOOM_REPOS`, else a word of four or more letters found in one goal title
+  only, else `LOOM_DISCORD_DEFAULT_GOAL` (`owner/name#N`). The station reacts
+  with a checkmark and replies "Noted for the brain" with the note's link,
+  naming the goal only when the message named one; a message that names no goal
+  when no default is set gets a "Not noted" reply instead. The last message
+  id is kept in `$LOOM_HOME/state/station/operator.json`, so each message is
+  noted once; the first read only looks back 10 minutes.
+- A comment on an open goal home starting with
+  `<!-- loom:reply v1 discord=<message id> -->` from a `LOOM_BRIEF_AUTHORS`
+  login (the brain's answer, docs/MUSE.md) is posted to the channel once, as
+  a reply to that message, with the comment link.
+
+The note is posted with the station's GitHub token, and the brain trusts
+only notes from `LOOM_BRIEF_AUTHORS` logins, so that token's login must be
+on the list. The note is a GitHub comment: in a public repo, what the
+operator types is public. The bot token is read from SSM (region `LOOM_AWS_REGION`) and never
+printed; a failed Discord call is logged by method and status only, and
+retried on the next pass. With `LOOM_DISCORD_CHANNEL_ID`,
+`LOOM_DISCORD_BOT_TOKEN_SSM` or `LOOM_DISCORD_MENTION` empty, none of this
+runs.
+
+One-time bot setup:
+
+1. In the Discord developer portal, create an application and add a bot to
+   it. In the bot's settings, enable the Message Content intent (without it
+   the bot reads empty messages).
+2. Invite the bot to the server (OAuth2 URL generator, scope `bot`) and give
+   it, on the operator's channel, View Channel, Read Message History, Send
+   Messages, Add Reactions, Create Public Threads and Send Messages in
+   Threads.
+3. Store the bot token as a SecureString parameter in SSM, in
+   `LOOM_AWS_REGION`, under a name of your choice such as
+   `/YOUR/PATH/discord-bot-token`.
+4. Turn on Developer Mode in Discord, copy the channel id, and run
+   `lanes/mac/install.sh` with `LOOM_DISCORD_CHANNEL_ID=<channel id>`,
+   `LOOM_DISCORD_BOT_TOKEN_SSM=/YOUR/PATH/discord-bot-token`,
+   `LOOM_DISCORD_MENTION=<the operator's user id>` and, optionally,
+   `LOOM_DISCORD_DEFAULT_GOAL=owner/name#N`.
 
 ## Transcript viewer
 
@@ -105,6 +221,32 @@ loopback connection; they cannot query the viewer or any other local service.
   wipes the scratch home. Links are never followed.
 - No background processes: launchd starts a pass every minute and a lock
   keeps one pass per lane.
+
+### Anthropic spend
+
+The anthropic slots spend API credits, so the runner tracks what each run
+costs without an Admin API key: it runs `claude -p --output-format json`,
+writes the result's text to the lane log, and appends one line per run to
+`$LOOM_HOME/state/usage/spend.jsonl` (time, slot, ticket, model,
+`cost_usd` from the result's `total_cost_usd`, and token counts). A run that
+left no result is recorded with `cost_usd` null, never zero. Settings, set at
+install (the lanes and the station both get them):
+
+| setting | meaning |
+|---|---|
+| `LOOM_ANTHROPIC_BUDGET_USD` | credit available, in dollars; unset shows only the spend |
+| `LOOM_ANTHROPIC_BUDGET_SINCE` | when that credit was counted (`YYYY-MM-DD` is 00:00 UTC, or `YYYY-MM-DDTHH:MMZ`); runs before it do not count against it |
+| `LOOM_ANTHROPIC_BUDGET_EXPIRES` | when the credit expires, same format |
+| `LOOM_ANTHROPIC_FLOOR_USD` | stop the anthropic slots when the remaining credit is under this (default 5) |
+
+The lane status comment gains one line: spent today (UTC), spent since
+`LOOM_ANTHROPIC_BUDGET_SINCE`, remaining against `LOOM_ANTHROPIC_BUDGET_USD`,
+the burn over the last 24 hours, and the balance projected at
+`LOOM_ANTHROPIC_BUDGET_EXPIRES` at that burn. Runs of unknown cost are counted
+and named, not guessed. A new run republishes the comment on the next station
+pass. Under the floor (or with a budget setting that does not parse) each
+anthropic slot reports itself unavailable with that reason, and the station
+sends the anthropic slots nothing more.
 
 ## Public repos only: providers that train on prompts
 
