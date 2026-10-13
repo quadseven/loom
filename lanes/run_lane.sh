@@ -380,6 +380,51 @@ is_api_lane() {
   return 1
 }
 
+# A fix brief's branch, brought up to date with the repository's default
+# branch before the agent runs, so a lane can resolve a conflict: the agent's
+# sandbox cannot write .git, so it can never fetch or merge itself (#145).
+# A clean merge stays as a commit. A conflict is left in the tree with its
+# markers, CONFLICTS names the files, and the runner completes the merge after
+# the agent. UPDATE_REASON is set when the branch could not be updated.
+update_fix_branch() {
+  local default
+  UPDATE_REASON=""; CONFLICTS=""
+  default="${BASE_BRANCH:-$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote --symref origin HEAD 2>> "$LOG" |
+    sed -n 's#^ref: refs/heads/\(.*\)[[:space:]]HEAD$#\1#p')}"
+  if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
+    UPDATE_REASON="could not read the default branch"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
+    UPDATE_REASON="could not fetch $default"; return 1
+  fi
+  if ! safe_git merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+  fi
+  safe_git merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
+  if safe_git merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
+    return 0
+  fi
+  CONFLICTS="$(safe_git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ *$//')"
+  if [ -z "$CONFLICTS" ]; then
+    safe_git merge --abort >> "$LOG" 2>&1 || true
+    UPDATE_REASON="merging $default into $BRANCH failed"; return 1
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET: merging $default conflicts in $CONFLICTS; the agent resolves it" >> "$LOG"
+  return 0
+}
+
+# Files of CONFLICTS that still hold a conflict marker line.
+markers_left() {
+  local f left=""
+  for f in $CONFLICTS; do
+    [ -f "$TREE/$f" ] && grep -qE '^(<<<<<<<|=======|>>>>>>>)( |$)' "$TREE/$f" && left="$left $f"
+  done
+  echo "${left# }"
+}
+
 run_agent() {
   local brief_text
   brief_text="$(cat "$1")"
@@ -616,13 +661,27 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "clone or branch failed"; continue
   fi
   BASE="$(git -C "$TREE" rev-parse HEAD)"
+  RUN_BRIEF="$BRIEF"
+  CONFLICTS=""
+  if [ -n "$FIX_PR" ]; then
+    # BASE is taken first, so a clean merge alone counts as a change and an
+    # out-of-date pull request is pushed up to date.
+    if ! update_fix_branch; then park "$BRIEF" "$UPDATE_REASON"; continue; fi
+    if [ -n "$CONFLICTS" ]; then
+      RUN_BRIEF="$WORKDIR/$TICKET.run.md"
+      { cat "$BRIEF"
+        printf '\n## Merge conflicts\n\nThe runner merged the default branch into this branch and it conflicts in: %s\n' "$CONFLICTS"
+        printf 'Resolve every conflict in those files first: keep both sides'"'"' intent, remove every conflict marker, and keep the tests green. Do not run git; the runner completes the merge.\n'
+      } > "$RUN_BRIEF"
+    fi
+  fi
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   ( set -m
-    (cd "$TREE" && run_agent "$BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
@@ -631,9 +690,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS"; continue; fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
+  if [ -n "$CONFLICTS" ]; then
+    LEFT="$(markers_left)"
+    if [ -n "$LEFT" ]; then park "$BRIEF" "conflict markers left in $LEFT"; continue; fi
+  fi
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
-  if [ -n "$(safe_git status --porcelain)" ]; then
-    if ! { safe_git checkout -q "$BRANCH" && safe_git add -A &&
+  # During a merge the branch is already checked out, and the commit
+  # completes the merge.
+  if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
+    if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
            safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes"; continue
     fi
