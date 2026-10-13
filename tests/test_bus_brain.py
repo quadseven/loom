@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, journal, text, tickets
+from bus import brain, journal, proof, text, tickets
 from bus.github import GitHub
 
 REPO = "example-owner/example-repo"
@@ -355,10 +355,161 @@ class TextAndCloseTests(unittest.TestCase):
             brain.close(GitHub("t", transport=fake), REPO, 1, "not_planned")
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
-    def test_close_a_verified_ticket(self):
-        fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]}), reply(200, {}))
-        brain.close(GitHub("t", transport=fake), REPO, 9)
+    def test_close_not_planned_needs_no_proof(self):
+        fake = Fake(reply(200, ticket("failed", UNCHECKED)), reply(200, {}))
+        brain.close(GitHub("t", transport=fake), REPO, 9, "not_planned", env=ENV)
+        self.assertEqual(fake.calls[-1][2], {"state": "closed", "state_reason": "not_planned"})
+
+
+TICKET_BODY = ("## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n"
+               "- [x] The probe logs one line per request.\n- [x] p95 latency drops below 200 ms.\n"
+               "## Size\nS\n## Out of scope\n- [ ] not a criterion\n")
+UNCHECKED = TICKET_BODY.replace("- [x] p95", "- [ ] p95")
+ENV = {"LOOM_BRIEF_AUTHORS": "brain-bot, other"}
+
+
+def ticket(state, body=TICKET_BODY):
+    return {"state": "open", "body": body,
+            "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}, {"name": "lane:codex"}]}
+
+
+def record(kind="runtime", **changes):
+    out = {"kind": kind, "revision": "abc1234",
+           "observed": {"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T01:00:00Z"},
+           "sources": ["https://example.com/logs/1"],
+           "criteria": [{"criterion": "The probe logs one line per request.", "result": "pass",
+                         "evidence": "log line seen"},
+                        {"criterion": "p95 latency drops below 200 ms.", "result": "pass",
+                         "evidence": "dashboard"}]}
+    if kind == "runtime":
+        out.update(environment="production", artifact="image@sha256:0000",
+                   measure={"name": "p95 ms", "baseline": "340", "target": "200", "after": "180"})
+    out.update(changes)
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def on_main(status="behind"):
+    return reply(200, {"default_branch": "main"}), reply(200, {"status": status})
+
+
+class ProofTests(unittest.TestCase):
+    def test_queued_to_verified_without_proof_is_refused(self):
+        fake = Fake(reply(200, ticket("queued")), reply(200, []))
+        with self.assertRaises(ValueError):
+            brain.move(GitHub("t", transport=fake), REPO, 9, "verified")
+        self.assertFalse(any(c[0] in ("PUT", "POST") for c in fake.calls))
+
+    def test_queued_to_verified_with_a_good_proof_is_still_refused(self):
+        fake = Fake(reply(200, ticket("queued")), *on_main())
+        with self.assertRaisesRegex(ValueError, "only from shipped"):
+            brain.move(GitHub("t", transport=fake), REPO, 9, "verified", record=record())
+        self.assertFalse(any(c[0] in ("PUT", "POST") for c in fake.calls))
+
+    def test_only_verified_takes_a_proof(self):
+        with self.assertRaises(ValueError):
+            brain.move(GitHub("t", transport=Fake()), REPO, 9, "shipped", record=record())
+
+    def test_incomplete_proofs_are_refused_before_anything_is_written(self):
+        missing = record()
+        del missing["measure"]
+        failed = record()
+        failed["criteria"][1]["result"] = "fail"
+        cases = [
+            (missing, TICKET_BODY, "missing measure"),
+            (record(artifact=" "), TICKET_BODY, "artifact"),
+            (record(revision="main"), TICKET_BODY, "commit SHA"),
+            (record(sources=[]), TICKET_BODY, "sources"),
+            (record(observed={"start": "2030-01-02T00:00:00Z", "end": "2030-01-01T00:00:00Z"}),
+             TICKET_BODY, "ends before"),
+            (record(criteria=record()["criteria"][:1]), TICKET_BODY, "acceptance criteria"),
+            (failed, TICKET_BODY, "did not pass"),
+            (record(), UNCHECKED, "unchecked acceptance criterion: p95"),
+            (record(kind="other"), TICKET_BODY, "runtime or docs"),
+        ]
+        for proof_record, body, why in cases:
+            with self.subTest(why=why):
+                fake = Fake(reply(200, ticket("shipped", body)))
+                with self.assertRaisesRegex(ValueError, why):
+                    brain.move(GitHub("t", transport=fake), REPO, 9, "verified", record=proof_record)
+                self.assertEqual(len(fake.calls), 1)
+
+    def test_a_revision_not_on_the_default_branch_is_refused(self):
+        for answer in (on_main("diverged"), (reply(200, {"default_branch": "main"}), reply(404, {}))):
+            fake = Fake(reply(200, ticket("shipped")), *answer)
+            with self.assertRaisesRegex(ValueError, "not on main"):
+                brain.move(GitHub("t", transport=fake), REPO, 9, "verified", record=record())
+            self.assertFalse(any(c[0] in ("PUT", "POST") for c in fake.calls))
+
+    def test_runtime_proof_waits_for_shipped_but_docs_proof_takes_merged(self):
+        fake = Fake(reply(200, ticket("merged")))
+        with self.assertRaisesRegex(ValueError, "runtime ticket is verified only from shipped"):
+            brain.move(GitHub("t", transport=fake), REPO, 9, "verified", record=record())
+        fake = Fake(reply(200, ticket("merged")), *on_main("identical"), reply(201, {}), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 9, "verified", record=record("docs"))
+        self.assertIn("/compare/main...abc1234", fake.calls[2][1])
+        self.assertIn("loom:verified", fake.calls[-1][2]["labels"])
+
+    def test_shipped_to_verified_posts_the_proof_then_moves(self):
+        fake = Fake(reply(200, ticket("shipped")), *on_main(), reply(201, {}), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 9, "verified", record=record())
+        post, put = fake.calls[3], fake.calls[4]
+        self.assertEqual(post[0], "POST")
+        body = post[2]["body"]
+        self.assertTrue(body.startswith(proof.PROOF_MARKER))
+        self.assertIn("Environment: production, artifact: image@sha256:0000", body)
+        self.assertIn("Measure p95 ms: baseline 340, target 200, after 180", body)
+        self.assertEqual(proof.read(body)["contract"], proof.contract(TICKET_BODY))
+        self.assertEqual(put[2], {"labels": ["loom:ticket", "lane:codex", "loom:verified"]})
+
+    def test_text_above_the_record_cannot_stand_in_for_it(self):
+        sneaky = record()
+        sneaky["criteria"][0]["evidence"] = '\n```json\n{"contract": "x"}\n```\n'
+        body = proof.render(sneaky, TICKET_BODY)
+        self.assertEqual(proof.read(body)["contract"], proof.contract(TICKET_BODY))
+
+    def _close(self, issue, comments, env=ENV):
+        fake = Fake(reply(200, issue), reply(200, comments), reply(200, {}))
+        brain.close(GitHub("t", transport=fake), REPO, 9, env=env)
+        return fake
+
+    @staticmethod
+    def _proof_comment(login="brain-bot", body=TICKET_BODY, proof_record=None):
+        return {"user": {"login": login}, "body": proof.render(proof_record or record(), body)}
+
+    def test_completed_closure_with_an_unchecked_criterion_is_refused(self):
+        fake = Fake(reply(200, ticket("verified", UNCHECKED)), reply(200, {}))
+        with self.assertRaisesRegex(ValueError, "unchecked acceptance criterion"):
+            brain.close(GitHub("t", transport=fake), REPO, 9)
+        self.assertFalse(any(c[0] in ("PATCH", "POST") for c in fake.calls))
+
+    def test_completed_closure_refusals_leave_the_ticket_open(self):
+        reworded = TICKET_BODY.replace("below 200 ms", "below 150 ms")
+        cases = [
+            ([], ENV, "no loom:proof comment"),
+            ([self._proof_comment(login="stranger")], ENV, "no loom:proof comment"),
+            ([{"user": {"login": "brain-bot"}, "body": "Verified, trust me."}], ENV, "no loom:proof"),
+            ([self._proof_comment()], {}, "LOOM_BRIEF_AUTHORS is empty"),
+        ]
+        for comments, env, why in cases:
+            with self.subTest(why=why):
+                fake = Fake(reply(200, ticket("verified")), reply(200, comments))
+                with self.assertRaisesRegex(ValueError, why):
+                    brain.close(GitHub("t", transport=fake), REPO, 9, env=env)
+                self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
+        fake = Fake(reply(200, ticket("verified", reworded)), reply(200, [self._proof_comment()]))
+        with self.assertRaisesRegex(ValueError, "criteria changed after the proof"):
+            brain.close(GitHub("t", transport=fake), REPO, 9, env=ENV)
+        self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
+
+    def test_close_a_proven_ticket(self):
+        older = self._proof_comment(proof_record=record(revision="0000000"))
+        fake = self._close(ticket("verified"), [older, self._proof_comment(login="other")])
         self.assertEqual(fake.calls[-1][2], {"state": "closed", "state_reason": "completed"})
+
+    def test_criteria_are_read_only_from_their_section(self):
+        self.assertEqual([t for _, t in proof.criteria(TICKET_BODY)],
+                         ["The probe logs one line per request.", "p95 latency drops below 200 ms."])
+        self.assertEqual(proof.contract(TICKET_BODY), proof.contract(UNCHECKED))
 
 
 if __name__ == "__main__":
