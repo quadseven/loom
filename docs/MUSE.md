@@ -261,6 +261,11 @@ on hard work):
 - Hard: anthropic, claude or codex, never a free lane or spark. Keep the
   anthropic slots busy with hard work while the credit lasts.
 
+An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
+brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
+its hold expires. When the API credit is gone, route hard work to codex and
+the claude lane.
+
 Spark takes one ticket at a time and steps aside while its box is hot: the
 factory moves its waiting tickets to a free lane in the same tier as above
 (the table `TIERS` in bus/factory.py), never up the ladder, so brief it only

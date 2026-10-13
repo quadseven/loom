@@ -651,6 +651,12 @@ class Tickets(Base):
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
         self.assertEqual(self.model(6), "claude-sonnet-5-5")
 
+    def test_a_failed_medium_ticket_skips_unavailable_anthropic_lanes(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.go(available=["codex", "codex-2", "opencode-go"])
+        self.assertIn(self.lane(6), ("codex", "codex-2", "opencode-go"))
+        self.assertNotIn("anthropic", self.lane(6))
+
     def test_failed_tickets_spread_past_a_busy_sonnet_lane(self):
         for n in (1, 2, 3, 4):
             self.gh.ticket(n, "failed", lane="zai")

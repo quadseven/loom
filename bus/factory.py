@@ -337,13 +337,14 @@ def current_rung(issue: Dict[str, Any]) -> int:
                  if rung_model == model and _lane(issue) in lanes), 0)
 
 
-def next_rung(tried: set, load: Dict[str, int]) -> int:
+def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None) -> int:
     """The lowest untried rung with a lane under RUNG_BUSY (docs/MUSE.md: a
     higher rung rather than a wait behind a busy lane), else the untried rung
     whose least-loaded lane holds the least, to wait there. 0 once every rung
     was tried. Waiting on the lowest rung instead queued 33 tickets on the
     one claude lane on 2026-10-13 while six other ladder slots sat idle."""
-    untried = [n for n in range(1, len(LADDER) + 1) if n not in tried]
+    untried = [n for n in range(1, len(LADDER) + 1)
+               if n not in tried and (eligible is None or n in eligible)]
     if not untried:
         return 0
     least = {n: min(load.get(lane, 0) for lane in LADDER[n - 1][0]) for n in untried}
@@ -604,10 +605,18 @@ class Factory:
         tried = tried_rungs(comments)
         if failed_here:
             tried |= {current_rung(issue)} - {0}
-        rung = next_rung(tried | ({skip} - {0}), self.load)
+        available_lanes = {lane for lanes, _ in LADDER for lane in lanes
+                           if lane not in self.limited
+                           and (self.available is None or lane in self.available)}
+        eligible = {n for n, (lanes, _) in enumerate(LADDER, 1)
+                    if any(lane in available_lanes for lane in lanes)}
+        rung = next_rung(tried | ({skip} - {0}), self.load, eligible)
         if not rung:
             return None
         lanes, model = LADDER[rung - 1]
+        lanes = tuple(lane for lane in lanes if lane in available_lanes)
+        if not lanes:
+            return None
         lane = pick_lane(lanes, self.load)
         body = with_model(str(issue.get("body") or ""), model)
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
