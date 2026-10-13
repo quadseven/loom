@@ -758,22 +758,27 @@ class Station:
             self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
+        self._report_failed(repo, number, lane, name, text)
+        return True
+
+    def _report_failed(self, repo: str, number: int, lane: str, name: str, text: str) -> None:
+        """A brief parked in failed/: a limit, a moved branch or a fix round
+        with nothing to commit is not a failure; anything else is."""
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         if reason.startswith(LIMIT):
             self._limited(repo, number, fix_pr.isdigit(), lane, reason)
-            return True
+            return
         if fix_pr.isdigit() and reason.startswith(BRANCH_MOVED):
             self._branch_moved(repo, number, int(fix_pr), lane, reason)
-            return True
+            return
         if fix_pr.isdigit() and reason.startswith(NO_COMMIT):
             self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
-            return True
+            return
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s" % (lane, reason))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
-        return True
 
     def _limited(self, repo: str, number: int, fix: bool, lane: str, reason: str) -> None:
         """A run the lane's provider refused (a limit, not a failure). The
