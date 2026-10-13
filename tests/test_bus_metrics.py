@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 
 from bus import metrics, station
@@ -117,6 +121,22 @@ class MetricsTest(unittest.TestCase):
     def test_check_runs_reply_without_a_body_counts_as_no_review(self):
         self.gh.rest = lambda method, path, body=None: type("Response", (), {"data": None})()
         self.assertFalse(metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").passes(REPO, "abc"))
+
+    def test_a_torn_slot_sample_line_is_skipped(self):
+        path = os.path.join(self.home, "state", "station", "slot-samples.jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"at": NOW - 1000, "idle": False}) + "\n")
+            fh.write('{"at": %d, "id' % (NOW - 500))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            samples = metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").slot_samples()
+        self.assertEqual((0, 1), samples)
+        self.assertIn("unreadable slot sample", err.getvalue())
+
+    def test_a_hung_git_ls_files_raises_os_error(self):
+        timeout = subprocess.TimeoutExpired(["git"], 60)
+        with mock.patch.object(metrics.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(OSError):
+                metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").generic_files()
 
     def _idle_slot(self):
         path = os.path.join(self.home, "state", "station", "slot-samples.jsonl")

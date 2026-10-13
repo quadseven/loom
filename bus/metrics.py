@@ -5,6 +5,7 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterator, List, Sequence
@@ -156,18 +157,26 @@ class Collector:
         samples = []
         with open(path, encoding="utf-8") as fh:
             for line in fh:
+                # The station appends one line per pass; a pass killed mid-write
+                # leaves a torn line, which must not stop every later day's line.
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    raise OSError("unreadable slot sample") from None
+                    print("metrics: skipping an unreadable slot sample", file=sys.stderr)
+                    continue
+                if not isinstance(record, dict):
+                    continue
                 if self.since <= stamp(record.get("at")) <= self.now:
                     samples.append(record)
         return sum(bool(s.get("idle")) for s in samples), len(samples)
 
     def generic_files(self) -> List[str]:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        result = subprocess.run(["git", "ls-files", "-z"], cwd=root,
-                                capture_output=True, check=False)
+        try:
+            result = subprocess.run(["git", "ls-files", "-z"], cwd=root,
+                                    capture_output=True, check=False, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise OSError("git ls-files timed out for the generic metric") from None
         if result.returncode:
             raise OSError("could not list tracked files for the generic metric")
         found = []
