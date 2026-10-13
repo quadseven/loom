@@ -48,6 +48,9 @@ LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origi
 BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
 [[ "$BRAIN_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BRAIN_INTERVAL" -ge 60 ] ||
   { echo "LOOM_BRAIN_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
+STATION_INTERVAL="${LOOM_STATION_INTERVAL:-60}"
+[[ "$STATION_INTERVAL" =~ ^[0-9]+$ ]] && [ "$STATION_INTERVAL" -ge 60 ] ||
+  { echo "LOOM_STATION_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -113,8 +116,9 @@ EOF
   echo "installed $LABEL -> $X_REPO/lanes/run_lane.sh $L"
 done
 
-# The station: one pass a minute that turns briefed ticket issues into local
-# briefs and reports outcomes (docs/BRAIN.md). It reads LOOM_REPOS,
+# The station: one pass every LOOM_STATION_INTERVAL seconds (default 60) that
+# turns briefed ticket issues into local briefs and reports outcomes
+# (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
 # with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
@@ -142,7 +146,7 @@ cat > "$PLIST" <<EOF
     <string>$X_REPO/lanes/mac/station.sh</string>
   </array>
   <key>WorkingDirectory</key><string>$X_REPO</string>
-  <key>StartInterval</key><integer>60</integer>
+  <key>StartInterval</key><integer>$STATION_INTERVAL</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$X_LOOM/logs/station.log</string>
   <key>StandardErrorPath</key><string>$X_LOOM/logs/station.log</string>

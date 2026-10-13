@@ -188,6 +188,14 @@ DiscordCall = Callable[[str, str, str, Optional[Dict[str, Any]]], Any]
 
 
 MAX_FIX_BODY = 60000
+# Below this share of any GitHub rate limit a pass does claims and reports
+# only: the hourly budget is shared with the brains, and a station that spends
+# it all stops claiming until the reset.
+BUDGET_FLOOR = 0.15
+# A repo with no briefed, running or pr ticket is scanned this often at most.
+IDLE_SCAN = 600
+# Conditional-request answers unused this long are removed.
+CACHE_KEEP = 24 * 3600
 
 
 class Settings:
@@ -530,6 +538,17 @@ class Station:
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
         self._spend: Optional[spend.Summary] = None
+        # This pass's repo scans: the repos due, what was read of each, and
+        # which held a ticket in flight.
+        self._due: Optional[List[str]] = None
+        self._scans: Dict[str, Any] = {}
+        self._seen: Dict[str, set] = {}
+        self._busy: set = set()
+        self._pulls: Dict[str, List[Dict[str, Any]]] = {}
+        # The GitHub budget as the last pass left it, and the reset it was
+        # last reported low for.
+        self._budget: Optional[Dict[str, Any]] = None
+        self._told_low = False
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -569,27 +588,92 @@ class Station:
         return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners)
 
     def _poll(self, repo: str) -> List[Dict[str, Any]]:
-        path = os.path.join(self.state, repo.replace("/", ".") + ".json")
-        saved = _read_json(path, {}, strict=False)
-        if not isinstance(saved, dict):
-            saved = {}
-        stored = saved.get("issues") if isinstance(saved.get("issues"), list) else None
+        # A conditional read (bus/github.py keeps the last answer): an
+        # unchanged list is a 304, which the budget does not count.
         resp = self.gh.rest(
-            "GET", "/repos/%s/issues?labels=loom:briefed&state=open&per_page=100" % repo,
-            etag=saved.get("etag") if stored is not None else None)
-        if resp.status == 304 and stored is not None:
-            items = stored
-        else:
-            items = resp.data if isinstance(resp.data, list) else []
-            _write_json(path, {"etag": resp.etag, "issues": items})
-            if len(items) >= 100:
-                _say("%s has 100 or more briefed tickets; only the first page is read" % repo)
+            "GET", "/repos/%s/issues?labels=loom:briefed&state=open&per_page=100" % repo)
+        items = resp.data if isinstance(resp.data, list) else []
+        if resp.status != 304 and len(items) >= 100:
+            _say("%s has 100 or more briefed tickets; only the first page is read" % repo)
         out = []
         for item in items:
             if isinstance(item, dict) and "pull_request" not in item:
                 item.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
                 out.append(item)
+        self._observe(repo, "briefed", bool(out))
         return out
+
+    # -- which repos a pass scans -----------------------------------------
+    def _inbox_repos(self) -> set:
+        """Repos named by a brief waiting or running in a lane inbox."""
+        found = set()
+        for lane in LANES:
+            try:
+                entries = os.listdir(self.inbox(lane))
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.endswith((".md", ".claiming")):
+                    continue
+                try:
+                    with open(os.path.join(self.inbox(lane), entry), encoding="utf-8") as fh:
+                        m = ISSUE_LINE_RE.search(fh.read())
+                except (OSError, ValueError):
+                    continue
+                if m:
+                    found.add(m.group(1))
+        return found
+
+    def _scan_due(self, rec: Any) -> bool:
+        if not isinstance(rec, dict) or rec.get("busy") is not False:
+            return True
+        at = rec.get("at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            return True
+        # A time in the future (a clock that stepped back) scans now.
+        return not 0 <= self.now - at < IDLE_SCAN
+
+    def scan_repos(self) -> List[str]:
+        """The watched repos this pass scans: every repo with a ticket in
+        flight (briefed, running or pr at its last scan, or a brief for it in
+        a lane inbox), and an idle repo once IDLE_SCAN seconds have passed
+        since its last scan."""
+        if self._due is None:
+            saved = _read_json(os.path.join(self.state, "scans.json"), {}, strict=False)
+            self._scans = saved if isinstance(saved, dict) else {}
+            local = self._inbox_repos()
+            self._due = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)
+                         and (r in local or self._scan_due(self._scans.get(r)))]
+        return self._due
+
+    def _observe(self, repo: str, kind: str, busy: bool) -> None:
+        self._seen.setdefault(repo, set()).add(kind)
+        if busy:
+            self._busy.add(repo)
+
+    def record_scans(self) -> None:
+        """Remember when each scanned repo was read and whether it held a
+        ticket in flight. A due repo whose briefed list was not read this
+        pass (no lane was free) is read now: an unchanged list is a 304."""
+        due = self.scan_repos()
+        for repo in due:
+            if "briefed" not in self._seen.get(repo, set()):
+                try:
+                    self._poll(repo)
+                except GitHubError as err:
+                    _say("could not list %s: %s" % (repo, err))
+        local = self._inbox_repos()
+        record = {r: v for r, v in self._scans.items() if r in self.s.repos}
+        for repo in due:
+            seen = self._seen.get(repo, set())
+            prev = record.get(repo)
+            was_busy = not isinstance(prev, dict) or prev.get("busy") is not False
+            # A list not read this pass (a failed read, or a step the budget
+            # deferred) keeps what the last scan saw.
+            unread = not {"briefed", "pr"} <= seen
+            busy = repo in self._busy or repo in local or (unread and was_busy)
+            record[repo] = {"at": self.now, "busy": busy}
+        _write_json(os.path.join(self.state, "scans.json"), record)
 
     # -- once-only memory ----------------------------------------------
     def _skip_known(self, repo: str, issue: Dict[str, Any]) -> bool:
@@ -832,7 +916,7 @@ class Station:
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 _say("ignoring %r in LOOM_REPOS: not OWNER/NAME" % repo)
-                continue
+        for repo in self.scan_repos():
             try:
                 found = self._poll(repo)
             except GitHubError as err:
@@ -950,21 +1034,31 @@ class Station:
         ticket["labels"] = [{"name": name} for name in kept]
 
     def _reconcile_repo(self, repo: str) -> None:
-        issues = self.gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Apr" % repo)
-        tickets_by_number = {int(i["number"]): i for i in issues
+        tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
-        for pr in self.gh.paginate("/repos/%s/pulls?state=all" % repo):
-            if isinstance(pr, dict):
-                self._reconcile_pr_ticket(repo, pr, tickets_by_number)
+        if not tickets_by_number:
+            return
+        # Only a closed pull request changes a ticket, and only a ticket with
+        # no open one: those PRs are the most recently updated closed ones,
+        # so one page of them is read, never the repo's whole PR history.
+        open_prs = [p for p in self._open_pulls(repo)
+                    if isinstance(p, dict) and p.get("state", "open") == "open"]
+        waiting = {n: t for n, t in tickets_by_number.items()
+                   if not any(_linked_pr(t, repo, p) for p in open_prs)}
+        if not waiting:
+            return
+        closed = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
+                              "&direction=desc&per_page=100" % repo).data
+        for pr in closed if isinstance(closed, list) else []:
+            if isinstance(pr, dict) and pr.get("state") == "closed":
+                self._reconcile_pr_ticket(repo, pr, waiting)
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
 
         A GitHub failure on one repo is logged and the pass moves on; the
         next pass retries, since the repair is idempotent."""
-        for repo in self.s.repos:
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-                continue
+        for repo in self.scan_repos():
             try:
                 # Both the issues and pulls fetches are covered by this repo guard.
                 self._reconcile_repo(repo)
@@ -974,17 +1068,28 @@ class Station:
     def hand_back(self) -> None:
         """Return completed lane PRs with failed checks or bot findings."""
         rounds = _fix_round_limit()
-        for repo in self.s.repos:
+        for repo in self.scan_repos():
             issues = self._pr_tickets(repo)
             if not issues:
                 continue
-            prs = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data or []
+            prs = self._open_pulls(repo)
             for issue in issues:
                 self._hand_back_ticket(repo, issue, prs, rounds)
 
     def _pr_tickets(self, repo: str) -> List[Dict[str, Any]]:
         issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % repo).data or []
-        return [i for i in issues if isinstance(i, dict) and "pull_request" not in i]
+        found = [i for i in issues if isinstance(i, dict) and "pull_request" not in i]
+        self._observe(repo, "pr", bool(found))
+        return found
+
+    def _open_pulls(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open pull requests, read once a pass (reconciliation
+        and hand-back change tickets, never pull requests). The same URL as
+        the factory's read, so one kept answer serves both."""
+        if repo not in self._pulls:
+            data = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data
+            self._pulls[repo] = data if isinstance(data, list) else []
+        return self._pulls[repo]
 
     def _hand_back_ticket(self, repo: str, issue: Dict[str, Any], prs: List[Dict[str, Any]],
                           rounds: int) -> None:
@@ -1543,19 +1648,10 @@ class Station:
 
     # -- asks -------------------------------------------------------------
     def _poll_asks(self, repo: str) -> List[Dict[str, Any]]:
-        path = os.path.join(self.state, "asks-" + repo.replace("/", ".") + ".json")
-        saved = _read_json(path, {}, strict=False)
-        if not isinstance(saved, dict):
-            saved = {}
-        stored = saved.get("issues") if isinstance(saved.get("issues"), list) else None
-        resp = self.gh.rest(
-            "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, NEEDS_OPERATOR),
-            etag=saved.get("etag") if stored is not None else None)
-        if resp.status == 304 and stored is not None:
-            items = stored
-        else:
-            items = resp.data if isinstance(resp.data, list) else []
-            _write_json(path, {"etag": resp.etag, "issues": items})
+        # A conditional read, like _poll.
+        items = self.gh.rest(
+            "GET", "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, NEEDS_OPERATOR)).data
+        items = items if isinstance(items, list) else []
         return [i for i in items if isinstance(i, dict) and "pull_request" not in i
                 and i.get("html_url") and "number" in i]
 
@@ -2716,26 +2812,102 @@ class Station:
         if removed:
             _say("removed %d finished lane tree(s)" % removed)
 
+    # -- the GitHub budget --------------------------------------------------
+    def _budget_state(self) -> Dict[str, Any]:
+        if self._budget is None:
+            saved = _read_json(os.path.join(self.state, "budget.json"), {}, strict=False)
+            self._budget = saved if isinstance(saved, dict) else {}
+        return self._budget
+
+    def _rates(self) -> Dict[str, Tuple[int, int, int]]:
+        """resource -> (remaining, limit, reset) for every rate limit window
+        still open: the last pass's, updated by this pass's responses."""
+        rates: Dict[str, Tuple[int, int, int]] = {}
+        saved = self._budget_state().get("rates")
+        for resource, value in (saved.items() if isinstance(saved, dict) else ()):
+            if (isinstance(value, list) and len(value) == 3
+                    and all(isinstance(v, int) and not isinstance(v, bool) for v in value)):
+                rates[str(resource)] = (value[0], value[1], value[2])
+        rates.update(self.gh.rate)
+        return {r: v for r, v in rates.items() if v[1] > 0 and v[2] > self.now}
+
+    def budget_low(self) -> Optional[Tuple[str, int, int, int]]:
+        """(resource, remaining, limit, reset) of the lowest rate limit when
+        it is under BUDGET_FLOOR of its limit, else None."""
+        low = [(v[0] / v[1], r) + v for r, v in self._rates().items()
+               if v[0] < BUDGET_FLOOR * v[1]]
+        return min(low)[1:] if low else None
+
+    def _deferred(self) -> bool:
+        """True when the budget is low: the step waits for the reset. Said
+        once per rate limit window."""
+        low = self.budget_low()
+        if low is None:
+            return False
+        resource, remaining, limit, reset = low
+        state = self._budget_state()
+        if not self._told_low and state.get("told") != [resource, reset]:
+            _say("GitHub %s budget low (%d of %d left, resets %s): claims and "
+                 "reports only until then" % (resource, remaining, limit, self._utc(reset)))
+        state["told"] = [resource, reset]
+        self._told_low = True
+        return True
+
+    def end_pass(self) -> None:
+        """Log this pass's requests, keep the rate limits for the next pass,
+        and remove conditional-request answers nothing uses any more."""
+        gh = self.gh
+        kinds = ", ".join("%s %d" % (k, n) for k, n in
+                          sorted(gh.kinds.items(), key=lambda kv: (-kv[1], kv[0])))
+        line = "requests: %d, %d counted (%s), %d answered 304 (not counted)" % (
+            gh.requests, gh.requests - gh.not_modified, kinds or "none", gh.not_modified)
+        rates = self._rates()
+        if "core" in rates:
+            remaining, limit, reset = rates["core"]
+            line += "; budget %d of %d left, resets %s" % (remaining, limit, self._utc(reset))
+        _say(line)
+        state = self._budget_state()
+        state["rates"] = {r: list(v) for r, v in rates.items()}
+        if self.budget_low() is None:
+            state.pop("told", None)
+        try:
+            _write_json(os.path.join(self.state, "budget.json"), state)
+            gh.prune_cache(CACHE_KEEP, self.now)
+        except OSError as err:
+            _say("could not keep the GitHub budget: %s" % err)
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
-        try:
-            self.reconcile_pull_requests()
-        except (GitHubError, OSError) as err:
-            _say("pull request reconciliation failed: %s" % err)
-        try:
-            self.hand_back()
-        except (GitHubError, OSError, ValueError) as err:
-            _say("hand_back failed: %s" % err)
+        if not self._deferred():
+            try:
+                self.reconcile_pull_requests()
+            except (GitHubError, OSError) as err:
+                _say("pull request reconciliation failed: %s" % err)
+        if not self._deferred():
+            try:
+                self.hand_back()
+            except (GitHubError, OSError, ValueError) as err:
+                _say("hand_back failed: %s" % err)
         self.claim_new()
+        try:
+            self.record_scans()
+        except OSError as err:
+            _say("could not record the repo scans: %s" % err)
+        # Below the budget floor these wait for the reset; trees are local.
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.post_metrics,
-                     self.watch_brain, self.relay_operator, self.run_factory,
-                     self.prune_trees):
+                     self.watch_brain, self.relay_operator, self.run_factory):
+            if self._deferred():
+                break
             try:
                 step()
             except (GitHubError, OSError) as err:
                 _say("%s failed: %s" % (step.__name__, err))
+        try:
+            self.prune_trees()
+        except OSError as err:
+            _say("prune_trees failed: %s" % err)
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
@@ -2761,13 +2933,17 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         if gh is None:
             from .github import token_from_env
             gh = GitHub(token_from_env())
+        if gh.cache_dir is None:
+            # Every GET is conditional: a list re-read each pass costs a 304.
+            gh.cache_dir = os.path.join(state, "station", "etags")
+        st = Station(gh, settings, **hooks)
         try:
-            Station(gh, settings, **hooks).run_pass()
+            st.run_pass()
         except StateError as err:
             _say("stopping: %s" % err)
             return 1
         finally:
-            _say("requests: %d" % gh.requests)
+            st.end_pass()
         return 0
     finally:
         os.close(fd)
