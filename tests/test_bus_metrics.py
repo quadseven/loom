@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timezone
 
 from bus import metrics, station
+from bus.github import GitHubError
 
 REPO = "example-owner/example-repo"
 NOW = datetime(2030, 1, 2, 17, tzinfo=timezone.utc).timestamp()
@@ -158,6 +159,33 @@ class MetricsTest(unittest.TestCase):
         self.assertIn("9/9 pass; streak 2 day(s)", self.gh.posts[0])
         self.assertIn("projected 7-day date 2030-01-07", self.gh.posts[0])
         self.assertIn("9/9 pass; streak 2/7", sent[0])
+
+    def test_collection_failure_alerts_once_and_retries_daily_comment(self):
+        settings = station.Settings(self.home, [REPO], ["trusted-bot"], [], digest_hour=0,
+                                    metrics_goal=REPO + "#1", webhook_ssm="fake",
+                                    review_check="Review")
+        sent = []
+        st = station.Station(self.gh, settings, now=NOW,
+                             read_secret=lambda name, region: "https://example.com/webhook",
+                             post=lambda url, body: sent.append(body["content"]))
+        paginate = self.gh.paginate
+        failing = True
+
+        def interrupted(path):
+            if failing and path.endswith("/pulls?state=all&per_page=100"):
+                raise GitHubError("temporary API failure")
+            return paginate(path)
+
+        self.gh.paginate = interrupted
+        st.post_metrics()
+        st.post_metrics()
+        self.assertEqual(self.gh.posts, [])
+        self.assertEqual(sent, ["Loom metrics 2030-01-02: collection failed; retrying."])
+        failing = False
+        st.post_metrics()
+        self.assertEqual(len(self.gh.posts), 1)
+        self.assertEqual(len(sent), 2)
+        self.assertIn("9/9 pass", sent[1])
 
     def test_regression_note_and_fix_without_test_fail_quality(self):
         self.gh.pr["body"] = "Fixes a bug"

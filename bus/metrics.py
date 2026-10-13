@@ -5,7 +5,7 @@ import os
 import re
 import statistics
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Sequence
 
@@ -48,6 +48,24 @@ class Number:
     def line(self) -> str:
         return "%s %s: %s (target %s)" % (
             "PASS" if self.passed else "FAIL", self.name, self.value, self.target)
+
+
+@dataclass
+class Totals:
+    pull_old: int = 0
+    past_rung: int = 0
+    merged_tickets: int = 0
+    verified: int = 0
+    asks: int = 0
+    regressions: int = 0
+    unchecked: int = 0
+    fix_no_test: int = 0
+    faults: int = 0
+    goals: int = 0
+    merge_times: List[float] = field(default_factory=list)
+    merged_by_repo: Dict[str, int] = field(default_factory=dict)
+    report_ages: Dict[str, float] = field(default_factory=dict)
+    goal_repos: set[str] = field(default_factory=set)
 
 
 class Collector:
@@ -109,16 +127,19 @@ class Collector:
                             continue
                         counts[lane] += 1
                         if kind == "failed":
-                            with open(entry.path, encoding="utf-8") as fh:
-                                body = fh.read()
-                            issue = re.search(r"^Issue: (\S+#\d+)$", body, re.M)
-                            model = re.search(r"^Model: ([^\n]+)$", body, re.M)
-                            if not issue:
-                                unlinked += 1
-                            if issue and model:
-                                by_model = failures.setdefault(issue.group(1), {})
-                                by_model[model.group(1)] = by_model.get(model.group(1), 0) + 1
+                            unlinked += self._failed_run(entry.path, failures)
         return counts, failures, unlinked
+
+    @staticmethod
+    def _failed_run(path: str, failures: Dict[str, Dict[str, int]]) -> int:
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        issue = re.search(r"^Issue: (\S+#\d+)$", body, re.M)
+        model = re.search(r"^Model: ([^\n]+)$", body, re.M)
+        if issue and model:
+            by_model = failures.setdefault(issue.group(1), {})
+            by_model[model.group(1)] = by_model.get(model.group(1), 0) + 1
+        return int(not issue)
 
     def slot_samples(self) -> tuple[int, int]:
         path = os.path.join(self.home, "state", "station", "slot-samples.jsonl")
@@ -158,121 +179,128 @@ class Collector:
                 found.append(rel)
         return found
 
+    def _goal_reports(self, repo: str, issues: List[Dict[str, Any]], total: Totals) -> None:
+        goals = [issue for issue in issues if "loom:goal" in names(issue)]
+        total.goals += len(goals)
+        if goals:
+            total.goal_repos.add(repo)
+        for goal in goals:
+            newest = max((stamp(c.get("created_at"))
+                          for c in self.issue_comments(repo, int(goal["number"]))
+                          if self.trusted_comment(c)
+                          and str(c.get("body") or "").startswith(REPORT)), default=0.0)
+            total.report_ages["%s#%d" % (repo, goal["number"])] = (
+                self.now - newest if newest else float("inf"))
+
+    def _urgent_regression(self, repo: str, issue: Dict[str, Any], created: float) -> bool:
+        notes = [(created, str(issue.get("body") or ""))]
+        notes += [(stamp(c.get("created_at")), str(c.get("body") or ""))
+                  for c in self.issue_comments(repo, int(issue["number"]))]
+        return any(REGRESSION.search(body) and self.now - at > 7200
+                   for at, body in notes if at)
+
+    def _ticket(self, repo: str, issue: Dict[str, Any], labels: set[str],
+                total: Totals) -> None:
+        number = int(issue["number"])
+        comments = [c for c in self.issue_comments(repo, number) if self.trusted_comment(c)]
+        last_reset = max((stamp(c.get("created_at")) for c in comments
+                          if "<!-- loom:rung 0 -->" in str(c.get("body") or "")), default=0)
+        given_up = max((stamp(c.get("created_at")) for c in comments
+                        if "tried every rung" in str(c.get("body") or "").lower()), default=0)
+        if (given_up > last_reset and self.now - given_up > WINDOW
+                and issue.get("state") == "open" and "loom:failed" in labels):
+            total.past_rung += 1
+            if not any(match.group(1) != repo or int(match.group(2)) != number
+                       for c in comments if stamp(c.get("created_at")) >= given_up
+                       for match in REPAIR_REF.finditer(str(c.get("body") or ""))):
+                total.faults += 1
+        merged = self.label_time(repo, issue, "loom:merged")
+        if merged >= self.since:
+            total.merged_tickets += 1
+            total.verified += "loom:verified" in labels
+            briefed = min((stamp(e.get("created_at"))
+                           for e in self.issue_events(repo, number)
+                           if e.get("event") == "labeled"
+                           and (e.get("label") or {}).get("name") == "loom:briefed"),
+                          default=0.0)
+            if briefed and briefed <= merged:
+                total.merge_times.append((merged - briefed) / 3600)
+
+    def _issue(self, repo: str, issue: Dict[str, Any], total: Totals) -> None:
+        if "pull_request" in issue:
+            return
+        labels = names(issue)
+        created = stamp(issue.get("created_at"))
+        if created >= self.since and ("needs-operator" in labels or
+                self.label_time(repo, issue, "needs-operator")):
+            total.asks += 1
+        if ("loom:urgent" in labels and issue.get("state") == "open"
+                and self._urgent_regression(repo, issue, created)):
+            total.regressions += 1
+        if "loom:ticket" in labels:
+            self._ticket(repo, issue, labels, total)
+
+    def _pull(self, repo: str, pr: Dict[str, Any], total: Totals) -> None:
+        if not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
+            return
+        if pr.get("state") == "open" and self.now - stamp(pr.get("created_at")) > 21600:
+            total.pull_old += 1
+        if stamp(pr.get("merged_at")) < self.since:
+            return
+        total.merged_by_repo[repo] += 1
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha or not self.passes(repo, sha):
+            total.unchecked += 1
+        if FIX.search(str(pr.get("body") or "")):
+            files = self.list("/repos/%s/pulls/%d/files" % (repo, int(pr["number"])))
+            if not any(TEST_FILE.search(str(f.get("filename") or ""))
+                       and f.get("status") != "removed" for f in files):
+                total.fix_no_test += 1
+
     def collect(self) -> List[Number]:
-        pull_old = 0
-        merge_times: List[float] = []
-        past_rung = 0
-        merged_by_repo: Dict[str, int] = {}
-        merged_tickets = verified = 0
-        asks = regressions = unchecked = fix_no_test = faults = 0
-        report_ages: Dict[str, float] = {}
-        goal_repos: set[str] = set()
-        goals = 0
+        total = Totals()
         for repo in self.repos:
             issues = self.list("/repos/%s/issues?state=all&per_page=100" % repo)
             pulls = self.list("/repos/%s/pulls?state=all&per_page=100" % repo)
-            goal_issues = [i for i in issues if "loom:goal" in names(i)]
-            goals += len(goal_issues)
-            if goal_issues:
-                goal_repos.add(repo)
-            for goal in goal_issues:
-                newest = 0.0
-                for comment in self.issue_comments(repo, int(goal["number"])):
-                    if self.trusted_comment(comment) and str(comment.get("body") or "").startswith(REPORT):
-                        newest = max(newest, stamp(comment.get("created_at")))
-                report_ages["%s#%d" % (repo, goal["number"])] = (
-                    self.now - newest if newest else float("inf"))
+            self._goal_reports(repo, issues, total)
             for issue in issues:
-                if "pull_request" in issue:
-                    continue
-                labels = names(issue)
-                created = stamp(issue.get("created_at"))
-                if created >= self.since and ("needs-operator" in labels or
-                        self.label_time(repo, issue, "needs-operator")):
-                    asks += 1
-                if "loom:urgent" in labels and issue.get("state") == "open":
-                    notes = [(created, str(issue.get("body") or ""))]
-                    notes += [(stamp(c.get("created_at")), str(c.get("body") or ""))
-                              for c in self.issue_comments(repo, int(issue["number"]))]
-                    if any(REGRESSION.search(text) and self.now - at > 7200
-                           for at, text in notes if at):
-                        regressions += 1
-                if "loom:ticket" not in labels:
-                    continue
-                number = int(issue["number"])
-                comments = [c for c in self.issue_comments(repo, number)
-                            if self.trusted_comment(c)]
-                last_reset = max((stamp(c.get("created_at")) for c in comments
-                                  if "<!-- loom:rung 0 -->" in str(c.get("body") or "")), default=0)
-                given_up = max((stamp(c.get("created_at")) for c in comments
-                                if "tried every rung" in str(c.get("body") or "").lower()), default=0)
-                if (given_up > last_reset and self.now - given_up > WINDOW
-                        and issue.get("state") == "open" and "loom:failed" in labels):
-                    past_rung += 1
-                    if not any(match.group(1) != repo or int(match.group(2)) != number
-                               for c in comments if stamp(c.get("created_at")) >= given_up
-                               for match in REPAIR_REF.finditer(str(c.get("body") or ""))):
-                        faults += 1
-                merged = self.label_time(repo, issue, "loom:merged")
-                if merged >= self.since:
-                    merged_tickets += 1
-                    verified += "loom:verified" in labels
-                    briefed = min((stamp(e.get("created_at"))
-                                   for e in self.issue_events(repo, number)
-                                   if e.get("event") == "labeled"
-                                   and (e.get("label") or {}).get("name") == "loom:briefed"),
-                                  default=0.0)
-                    if briefed and briefed <= merged:
-                        merge_times.append((merged - briefed) / 3600)
-            merged_by_repo[repo] = 0
+                self._issue(repo, issue, total)
+            total.merged_by_repo[repo] = 0
             for pr in pulls:
-                if not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
-                    continue
-                if pr.get("state") == "open" and self.now - stamp(pr.get("created_at")) > 21600:
-                    pull_old += 1
-                merged = stamp(pr.get("merged_at"))
-                if merged < self.since:
-                    continue
-                merged_by_repo[repo] += 1
-                sha = str((pr.get("head") or {}).get("sha") or "")
-                if not sha or not self.passes(repo, sha):
-                    unchecked += 1
-                if FIX.search(str(pr.get("body") or "")):
-                    files = self.list("/repos/%s/pulls/%d/files" % (repo, int(pr["number"])))
-                    if not any(TEST_FILE.search(str(f.get("filename") or ""))
-                               and f.get("status") != "removed" for f in files):
-                        fix_no_test += 1
+                self._pull(repo, pr, total)
         runs, failures, parked_without_ticket = self.local_runs()
-        faults += parked_without_ticket
+        total.faults += parked_without_ticket
         total_runs = sum(runs.values())
         anthropic = sum(v for lane, v in runs.items() if lane.startswith("anthropic"))
         repeat = sum(any(n >= 2 for n in models.values()) for models in failures.values())
         idle, samples = self.slot_samples()
         generic = self.generic_files()
-        median = statistics.median(merge_times) if merge_times else float("inf")
-        flow_ok = pull_old == 0 and median < 3 and past_rung == 0
-        throughput_ok = bool(goals) and all(merged_by_repo[r] for r in goal_repos) \
-            and merged_tickets > 0 and verified * 2 >= merged_tickets
+        median = statistics.median(total.merge_times) if total.merge_times else float("inf")
+        flow_ok = total.pull_old == 0 and median < 3 and total.past_rung == 0
+        throughput_ok = bool(total.goals) and all(total.merged_by_repo[r] for r in total.goal_repos) \
+            and total.merged_tickets > 0 and total.verified * 2 >= total.merged_tickets
         spread_ok = total_runs > 0 and anthropic * 2 <= total_runs and samples > 0 and idle == 0
-        max_age = max(report_ages.values(), default=float("inf"))
+        max_age = max(total.report_ages.values(), default=float("inf"))
         return [
             Number("Flow", "%d PRs >6h; median %.1fh (%d tickets); %d past last rung >24h" %
-                   (pull_old, median, len(merge_times), past_rung), "0; <3h; 0", flow_ok),
+                   (total.pull_old, median, len(total.merge_times), total.past_rung), "0; <3h; 0", flow_ok),
             Number("Throughput", "%s; verified %d/%d" %
-                   (", ".join("%s %d" % pair for pair in merged_by_repo.items()), verified, merged_tickets),
+                   (", ".join("%s %d" % pair for pair in total.merged_by_repo.items()),
+                    total.verified, total.merged_tickets),
                    "each goal repo >=1 merge; >=50% verified", throughput_ok),
             Number("Spread", "%s; Anthropic %d/%d; idle %d/%d passes" %
                    (", ".join("%s %d" % pair for pair in runs.items()), anthropic, total_runs, idle, samples),
                    "Anthropic <=50%; idle 0", spread_ok),
             Number("Escalation", "%d tickets failed twice on one model" % repeat, "0", repeat == 0),
             Number("Quality", "%d unfixed regressions >2h; %d unreviewed merges; %d fix PRs without tests" %
-                   (regressions, unchecked, fix_no_test), "0; 0; 0",
-                   regressions == unchecked == fix_no_test == 0),
-            Number("Autonomy", "%d asks opened" % asks, "<=1/day", asks <= 1),
+                   (total.regressions, total.unchecked, total.fix_no_test), "0; 0; 0",
+                   total.regressions == total.unchecked == total.fix_no_test == 0),
+            Number("Autonomy", "%d asks opened" % total.asks, "<=1/day", total.asks <= 1),
             Number("Visibility", "%s" % ", ".join("%s %.1fh" % (r, age / 3600)
-                                                 for r, age in report_ages.items()),
-                   "each goal report <=2h", bool(goals) and max_age <= 7200),
-            Number("Self-repair", "%d un-ticketed factory faults" % faults, "0", faults == 0),
+                                                 for r, age in total.report_ages.items()),
+                   "each goal report <=2h", bool(total.goals) and max_age <= 7200),
+            Number("Self-repair", "%d un-ticketed factory faults" % total.faults,
+                   "0", total.faults == 0),
             Number("Generic", "%d files: %s" % (len(generic), ", ".join(generic)),
                    "0 files", not generic),
         ]

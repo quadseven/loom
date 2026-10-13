@@ -551,6 +551,20 @@ class Station:
         if not free:
             self._record_slot_sample(False)
             return
+        by_lane = self._claim_candidates(free)
+        for lane in free:
+            cands = sorted(by_lane[lane], key=lambda c: (
+                str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
+            for repo, issue in cands:
+                try:
+                    if self._try_ticket(repo, lane, issue):
+                        break
+                except (GitHubError, OSError) as err:
+                    _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
+        self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
+                                     for lane in free))
+
+    def _claim_candidates(self, free: List[str]) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
         by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {l: [] for l in free}
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
@@ -565,17 +579,7 @@ class Station:
                 lane = _lane_of(issue)
                 if lane in by_lane:
                     by_lane[lane].append((repo, issue))
-        for lane in free:
-            cands = sorted(by_lane[lane], key=lambda c: (
-                str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
-            for repo, issue in cands:
-                try:
-                    if self._try_ticket(repo, lane, issue):
-                        break
-                except (GitHubError, OSError) as err:
-                    _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
-        self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
-                                     for lane in free))
+        return by_lane
 
     def _record_slot_sample(self, idle: bool) -> None:
         if not self.s.metrics_goal:
@@ -1568,20 +1572,10 @@ class Station:
         factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                         review_check=self.s.review_check).run()
 
-    def post_metrics(self) -> None:
-        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)",
-                           self.s.metrics_goal)
-        if not ref or ref.group(1) not in self.s.repos:
-            return
-        today = time.strftime("%Y-%m-%d", time.localtime(self.now))
-        if time.localtime(self.now).tm_hour < self.s.digest_hour:
-            return
-        repo, number = ref.group(1), int(ref.group(2))
-        path = "/repos/%s/issues/%d/comments" % (repo, number)
-        comments = self.gh.paginate(path)
+    def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
         dated = {}
         allowed = {author.lower() for author in self.s.authors}
-        for comment in comments:
+        for comment in self.gh.paginate(path):
             body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
             author = str((comment.get("user") or {}).get("login") or "").lower()
             if author not in allowed:
@@ -1589,24 +1583,33 @@ class Station:
             match = re.match(r"<!-- loom:metrics v1 -->\n(\d{4}-\d{2}-\d{2}): (\d)/9 pass; streak (\d+)", body)
             if match:
                 dated[match.group(1)] = (int(match.group(2)), int(match.group(3)))
-        if today not in dated:
+        return dated
+
+    def _post_metrics_comment(self, path: str, today: str,
+                              dated: Dict[str, Tuple[int, int]]) -> None:
+        try:
             numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
                                         self.now, self.s.review_check,
                                         self.s.authors).collect()
-            passed = sum(value.passed for value in numbers)
-            yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
-            streak = dated.get(yesterday, (0, 0))[1] + 1 if passed == 9 else 0
-            body = metrics.render(numbers, today, streak)
-            self.gh.rest("POST", path, {"body": body})
-            dated[today] = (passed, streak)
+        except (GitHubError, OSError) as err:
+            _say("metrics collection failed: %s" % err)
+            self._metrics_notice(today, "failure",
+                                 "Loom metrics %s: collection failed; retrying." % today)
+            return
+        passed = sum(value.passed for value in numbers)
+        yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+        streak = dated.get(yesterday, (0, 0))[1] + 1 if passed == 9 else 0
+        body = metrics.render(numbers, today, streak)
+        self.gh.rest("POST", path, {"body": body})
+        dated[today] = (passed, streak)
+
+    def _metrics_notice(self, today: str, key: str, line: str) -> None:
         ledger_path = os.path.join(self.state, "metrics.json")
         ledger = _read_json(ledger_path, {})
         if not isinstance(ledger, dict):
             raise StateError("metrics ledger is not an object")
-        if ledger.get("discord") == today:
+        if ledger.get(key) == today:
             return
-        passed, streak = dated[today]
-        line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
         if self._bot_reports():
             token = self._bot_token()
             if token is None:
@@ -1621,8 +1624,25 @@ class Station:
         else:
             return
         if ok:
-            ledger["discord"] = today
+            ledger[key] = today
             _write_json(ledger_path, ledger)
+
+    def post_metrics(self) -> None:
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)",
+                           self.s.metrics_goal)
+        if not ref or ref.group(1) not in self.s.repos:
+            return
+        today = time.strftime("%Y-%m-%d", time.localtime(self.now))
+        if time.localtime(self.now).tm_hour < self.s.digest_hour:
+            return
+        path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        dated = self._dated_metrics(path)
+        if today not in dated:
+            self._post_metrics_comment(path, today, dated)
+        if today in dated:
+            passed, streak = dated[today]
+            line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
+            self._metrics_notice(today, "discord", line)
 
     def run_pass(self) -> None:
         self.finish_claims()
