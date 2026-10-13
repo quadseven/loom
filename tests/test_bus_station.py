@@ -640,6 +640,14 @@ class PruneTest(Base):
         self.assertTrue(os.path.exists(running))
         self.assertTrue(os.path.exists(fresh))
 
+    def test_an_unreadable_inbox_stops_the_prune(self):
+        done = self.tree("example.repo-1", station.TREE_KEEP + 60)
+        os.makedirs(self.inbox("claude"))
+        os.chmod(self.inbox("claude"), 0)
+        self.addCleanup(os.chmod, self.inbox("claude"), 0o755)
+        self.run_pass()
+        self.assertTrue(os.path.exists(done))
+
     def test_a_link_in_the_worktrees_folder_is_removed_without_following_it(self):
         outside = os.path.join(self._tmp.name, "keep-me")
         os.makedirs(outside)

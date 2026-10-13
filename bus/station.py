@@ -1720,20 +1720,31 @@ class Station:
         root = os.path.join(self.s.home, "worktrees")
         try:
             names = os.listdir(root)
-        except OSError:
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            _say("cannot list %s to remove finished lane trees: %s" % (root, err))
             return
         live = set()
         for lane in LANES:
             try:
                 live |= {e[:-3] for e in os.listdir(self.inbox(lane)) if e.endswith(".md")}
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError as err:
+                # An inbox that cannot be read may hold a running brief:
+                # remove nothing rather than a tree still in use.
+                _say("cannot list lane %s's inbox, so no lane tree is removed: %s" % (lane, err))
+                return
         removed = 0
         for name in names:
             path = os.path.join(root, name)
             try:
                 st = os.lstat(path)
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot stat lane tree %s: %s" % (name, err))
                 continue
             if name in live or self.now - st.st_mtime < TREE_KEEP:
                 continue
