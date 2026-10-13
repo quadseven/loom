@@ -1441,10 +1441,25 @@ class BotReportsTest(Base):
         self.go()
         self.assertEqual(len(self.discord.sent), 1)
         self.assertEqual(len(self.discord.threads), 1)
-        # Once the line is out, a failed thread does not post it again.
+        # Once the line is out, a failed thread does not post it again, and
+        # the full report goes in the channel instead.
         self.comment(41, 101, "second report")
         self.discord.fail_thread = True
         self.go()
         self.go()
-        self.assertEqual(len(self.discord.sent), 2)
+        self.assertEqual([m["content"].split("\n")[0] for m in self.discord.sent],
+                         ["**Events** report", "**Loom ships tickets quicker** second report",
+                          "second report"])
         self.assertEqual(self.discord.in_thread[-1]["content"].split("\n")[0], "report")
+
+    def test_markdown_in_the_short_name_is_dropped(self):
+        self.fake.issues[41]["body"] = "Short name: **Big** _win_ `x` ~~y~~ ||z||\n"
+        self.comment(41, 101, "status")
+        self.go()
+        self.assertEqual(self.discord.sent[0]["content"], "**Big win x y z** status")
+
+    def test_a_report_on_an_issue_without_the_goal_label_is_not_forwarded(self):
+        self.fake.add(42, title="Not a goal", body="Short name: Nope\n", state="briefed")
+        self.comment(42, 102, "should stay on GitHub")
+        self.go()
+        self.assertEqual(self.discord.sent, [])

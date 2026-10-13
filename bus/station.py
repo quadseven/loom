@@ -927,6 +927,9 @@ class Station:
         """A "Short name:" line in the goal home body, else its title."""
         m = SHORT_NAME_RE.search(str(issue.get("body") or ""))
         name = " ".join((m.group(1) if m else str(issue.get("title") or "")).split())
+        # Anyone who can edit the goal home writes this text: keep its
+        # markdown out of the bold it is shown in.
+        name = re.sub(r"[*_`~|\\]", "", name).strip()
         return name[:SHORT_NAME_MAX] or "#%s" % issue.get("number")
 
     @staticmethod
@@ -980,24 +983,30 @@ class Station:
         # The line is out: from here a failure is logged and not retried, so
         # the line is never posted twice.
         msg_id = str(made.get("id") or "") if isinstance(made, dict) else ""
-        if not msg_id.isdigit():
-            _say("the report line came back without an id; no thread")
-            return True
-        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(self.now))
-        ok, thread = self._bot(token, "POST", "/channels/%s/messages/%s/threads"
-                               % (chan, msg_id), {
-                                   "name": ("%s %s" % (name, when))[:THREAD_NAME_MAX],
-                                   "auto_archive_duration": THREAD_ARCHIVE_MINUTES})
-        thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
-        if not ok or not thread_id.isdigit():
-            return True
+        where = self._report_thread(token, msg_id, name) if msg_id.isdigit() else ""
+        if not where:
+            # No thread: the full report goes in the channel, so it is never
+            # lost behind a line that does not expand.
+            _say("no thread for the report line; the full report goes in the channel")
+            where = chan
         link = self._report_link(issue, comment)
         for part in self._chunks(body + ("\n" + link if link else "")):
-            ok, _ = self._bot(token, "POST", "/channels/%s/messages" % thread_id, {
+            ok, _ = self._bot(token, "POST", "/channels/%s/messages" % where, {
                 "content": part, "allowed_mentions": {"parse": []}})
             if not ok:
                 break
         return True
+
+    def _report_thread(self, token: str, msg_id: str, name: str) -> str:
+        """The id of a new thread on the report line, or "" when Discord
+        would not make one."""
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(self.now))
+        ok, thread = self._bot(token, "POST", "/channels/%s/messages/%s/threads"
+                               % (self.s.channel_id, msg_id), {
+                                   "name": ("%s %s" % (name, when))[:THREAD_NAME_MAX],
+                                   "auto_archive_duration": THREAD_ARCHIVE_MINUTES})
+        thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
+        return thread_id if ok and thread_id.isdigit() else ""
 
     def _report_comments(self, repo: str, issues: List[Dict[str, Any]], since: str
                          ) -> List[Tuple[int, Dict[str, Any], Dict[str, Any]]]:
@@ -1043,6 +1052,17 @@ class Station:
             last_id = ident
         return True
 
+    def _report_window(self, checked: Any) -> Optional[str]:
+        """The time to read reports from, or None when the last read is too
+        recent to read again."""
+        if not isinstance(checked, (int, float)) or isinstance(checked, bool):
+            start = self.now - REPORT_FIRST_LOOKBACK
+        elif 0 <= self.now - checked < REPORT_CHECK:
+            return None
+        else:
+            start = checked - REPORT_OVERLAP
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+
     def forward_reports(self) -> None:
         if not (self.s.webhook_ssm or self._bot_reports()):
             return
@@ -1050,14 +1070,9 @@ class Station:
         ledger = _read_json(path, {})
         if not isinstance(ledger, dict):
             raise StateError("state file %s does not hold an object" % path)
-        checked = ledger.get("_checked")
-        if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
-                and 0 <= self.now - checked < REPORT_CHECK):
+        since = self._report_window(ledger.get("_checked"))
+        if since is None:
             return
-        start = (checked - REPORT_OVERLAP
-                 if isinstance(checked, (int, float)) and not isinstance(checked, bool)
-                 else self.now - REPORT_FIRST_LOOKBACK)
-        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
         allowed = {a.lower() for a in self.s.authors}
         # Forget repos that left LOOM_REPOS, so the ledger stays their size.
         keep = {r.replace("/", ".") for r in self.s.repos} | {"_checked"}
@@ -1312,16 +1327,23 @@ class Station:
                            and int(m["id"]) > int(after)),
                           key=lambda m: int(m["id"]))
         for msg in messages:
-            author = msg.get("author") if isinstance(msg.get("author"), dict) else {}
-            text = str(msg.get("content") or "").strip()
-            files = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
-            urls = [str(f.get("url")) for f in files if isinstance(f, dict)
-                    and str(f.get("url") or "").startswith("https://")]
-            if (str(author.get("id") or "") == self.s.mention and not author.get("bot")
-                    and (text or urls)):
-                self._relay_one(token, str(msg["id"]), text, urls)
+            said = self._operator_said(msg)
+            if said is not None:
+                self._relay_one(token, str(msg["id"]), *said)
             ledger["after"] = str(msg["id"])
             _write_json(path, ledger)
+
+    def _operator_said(self, msg: Dict[str, Any]) -> Optional[Tuple[str, List[str]]]:
+        """(text, attachment links) of a message the operator wrote, or None
+        for anyone else's message and for an empty one."""
+        author = msg.get("author") if isinstance(msg.get("author"), dict) else {}
+        if str(author.get("id") or "") != self.s.mention or author.get("bot"):
+            return None
+        text = str(msg.get("content") or "").strip()
+        files = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
+        urls = [str(f.get("url")) for f in files if isinstance(f, dict)
+                and str(f.get("url") or "").startswith("https://")]
+        return (text, urls) if text or urls else None
 
     def _relay_one(self, token: str, msg_id: str, text: str, urls: List[str]) -> None:
         """Note one operator message, with a link to each attachment, on its
