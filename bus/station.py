@@ -339,6 +339,19 @@ def post_webhook(url: str, payload: Dict[str, Any]) -> None:
         raise OSError("the webhook answered %d" % status)
 
 
+# Answers about the body itself: sending the same body again cannot succeed.
+# A 401 or 403 is about the token, so those retry like a network error.
+REFUSED_BODY = (400, 413, 422)
+
+
+class UploadRefused(OSError):
+    """The dashboard read the body and refused it (REFUSED_BODY)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__("the transcript upload answered %d" % status)
+        self.status = status
+
+
 def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
     """POST one transcript to the dashboard. Errors never carry the URL or
     the token."""
@@ -356,6 +369,8 @@ def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
         err.close()
     except (urllib.error.URLError, OSError):
         raise OSError("the transcript upload failed to connect") from None
+    if status in REFUSED_BODY:
+        raise UploadRefused(status)
     if not 200 <= status < 300:
         raise OSError("the transcript upload answered %d" % status)
 
@@ -2431,9 +2446,26 @@ class Station:
                 if token is None:
                     return
             try:
-                self.upload(self.s.transcript_url, token, build())
+                body = build()
+            except ValueError as err:
+                # A run with no ticket (a brief from before tickets) can never
+                # be filed; skip it for good and keep going.
+                _say("skipped the transcript of %s: %s" % (key, err))
+                self._record(ledger, key, tick, "no ticket")
+                _write_json(path, ledger)
+                continue
+            try:
+                self.upload(self.s.transcript_url, token, body)
                 result: Any = "sent"
                 sent += 1
+            except UploadRefused as err:
+                # The dashboard is up and refused this body: give it up now and
+                # send the next, so one bad run never blocks the rest.
+                _say("the dashboard refused the transcript of %s (%d); given up"
+                     % (key, err.status))
+                self._record(ledger, key, tick, "refused")
+                _write_json(path, ledger)
+                continue
             # Deliberately broad, as in _send: an error text can carry the URL
             # or the token; only the type is logged, once, when giving up.
             except Exception as err:  # noqa: BLE001

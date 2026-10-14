@@ -3056,6 +3056,8 @@ class TranscriptUploadTest(Base):
         return UPLOAD_TOKEN
 
     def upload(self, url, token, body):
+        if body["ticket"] in getattr(self, "refuse", ()):
+            raise station.UploadRefused(400)
         if self.fail:
             self.fail -= 1
             raise OSError("connect to %s with %s failed" % (url, token))
@@ -3100,6 +3102,28 @@ class TranscriptUploadTest(Base):
         self.assertEqual([e["kind"] for e in body["events"]], ["log"])
         self.assertIn("agent said hi from <path>", body["events"][0]["text"])
         self.assertEqual(self.ledger()["anthropic-2/T1"], "sent")
+
+    def test_a_refused_run_is_given_up_at_once_and_the_next_still_sends(self):
+        self.go()
+        self.finish("A")
+        self.finish("B")
+        self.refuse = {self.ref("A")}
+        out = self.go()
+        self.assertEqual([b["ticket"] for _, _, b in self.sent], [self.ref("B")])
+        self.assertEqual(self.ledger()["anthropic-2/A"], "refused")
+        self.assertIn("refused the transcript of anthropic-2/A (400)", out)
+
+    def test_a_wrong_token_is_retried_not_given_up(self):
+        self.assertNotIn(401, station.REFUSED_BODY)
+        self.assertNotIn(403, station.REFUSED_BODY)
+
+    def test_a_run_with_no_ticket_is_skipped_and_the_next_still_sends(self):
+        self.go()
+        self.write(self.inbox("anthropic-2", "done", "T001-old-style.md"), "# Brief: T001\n")
+        self.finish("B")
+        self.go()
+        self.assertEqual([b["ticket"] for _, _, b in self.sent], [self.ref("B")])
+        self.assertEqual(self.ledger()["anthropic-2/T001-old-style"], "no ticket")
 
     def test_runs_finished_before_uploads_were_turned_on_are_not_sent(self):
         self.finish("OLD", kind="failed")
