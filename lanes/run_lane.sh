@@ -1552,9 +1552,15 @@ for BRIEF in "$INBOX"/*.md; do
   INTENT_CLASS=""
   INTENT_TEXT=""
   prepare_intent "$BRIEF" >> "$LOG" 2>&1
-  if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
-       --label "class:$INTENT_CLASS" --body "$(pr_body "$BRIEF" "$TICKET")" >> "$LOG" 2>&1; then
+  # The class label goes on after the PR exists: a repo without the label
+  # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
+  if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
+       --body "$(pr_body "$BRIEF" "$TICKET")" 2>> "$LOG")"; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed"; continue
+  fi
+  echo "$PR_URL" >> "$LOG"
+  if [ -n "$INTENT_CLASS" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "class:$INTENT_CLASS" >> "$LOG" 2>&1; then
+    echo "[$(date -u +%FT%TZ)] could not add label class:$INTENT_CLASS to $PR_URL; the PR stands" >> "$LOG"
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET done" >> "$LOG"
   mv "$BRIEF" "$INBOX/done/"
