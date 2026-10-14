@@ -885,8 +885,9 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        # Reconciliation, PR review polling, and the goal scan still run.
-        self.assertEqual(self.run_pass().requests, 4)
+        # Reconciliation, PR review polling, the goal scan and the invariant
+        # check's read of open pull requests (their plan checks) still run.
+        self.assertEqual(self.run_pass().requests, 5)
 
 
 class TicketsTest(unittest.TestCase):

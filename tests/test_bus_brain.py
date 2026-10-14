@@ -92,6 +92,15 @@ class BrainTests(unittest.TestCase):
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
 
+    def test_status_lists_open_invariant_issues_for_the_report(self):
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 7, "title": "Lane spark: 12 runs in 24 hours and none done",
+                         "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}]}]),
+            reply(200, []), reply(200, [])))
+        lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
+        at = lines.index(brain.INVARIANTS_HEADING)
+        self.assertEqual(lines[at + 1], "- #7 Lane spark: 12 runs in 24 hours and none done")
+
     def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
         goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"},
