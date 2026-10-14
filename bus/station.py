@@ -2357,9 +2357,10 @@ class Station:
         for lane, kind, path, name in self._finished_briefs():
             def body(lane=lane, kind=kind, path=path, name=name) -> Dict[str, Any]:
                 with open(path, encoding="utf-8") as fh:
-                    model = self._field(fh.read(), "Model")
-                return transcripts.run_body(home, lane, name, kind, model,
-                                            self.claude_projects, self.codex_sessions)
+                    text = fh.read()
+                return transcripts.run_body(home, lane, name, kind, self._field(text, "Model"),
+                                            self.claude_projects, self.codex_sessions,
+                                            issue=self._field(text, "Issue"))
             runs.append(("%s/%s" % (lane, name), None, body))
         tick = self._brain()
         last = tick[0] if tick else {}
