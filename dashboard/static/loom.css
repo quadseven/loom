@@ -164,6 +164,10 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .lane-card { display: grid; gap: 7px; }
 .lane-card p { margin: 0; overflow-wrap: anywhere; }
 .share-track, .quota { position: relative; height: 8px; border-radius: 6px; background: var(--raised); overflow: visible; }
+.usage-card { margin: 10px 0; }
+.usage-card p { margin: 8px 0 0; color: var(--body); overflow-wrap: anywhere; }
+.usage-track { height: 10px; margin-top: 12px; border-radius: 8px; background: var(--raised); overflow: hidden; }
+.usage-track span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .share-track span, .quota span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .share-track i { position: absolute; left: 50%; top: -4px; height: 16px; border-left: 2px solid var(--bad); }
 .empty-state { color: var(--muted); border: 1px dashed var(--line-strong); border-radius: 10px; padding: 14px; }

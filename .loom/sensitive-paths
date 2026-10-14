@@ -7,3 +7,7 @@ bus/factory.py
 bus/proof.py
 lanes/mac/install.sh
 .github/
+# Dashboard screens merge only after the brain has looked at them in a
+# browser at phone and desktop widths (2026-10-14: a screen merged unseen
+# with empty and junk sections).
+dashboard/

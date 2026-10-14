@@ -21,6 +21,7 @@ from . import views
 from .github import TicketStore
 from .shell import page
 from . import transcripts as transcript_store
+from . import usage as usage_store
 from . import ticket as ticket_view
 
 
@@ -237,13 +238,35 @@ def _handle_transcript_post(handler, state):
         return handler.send_json(503, {"error": "transcript storage unavailable"})
 
 
+def _handle_usage_post(handler, state):
+    token = os.environ.get("LOOM_UPLOAD_TOKEN", "")
+    supplied = handler.headers.get("Authorization", "")
+    if not token or not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+        if length < 1 or length > 2_000_000:
+            raise ValueError("invalid request size")
+        body = json.loads(handler.rfile.read(length))
+        store = getattr(state, "usage", None)
+        if store is None:
+            store = usage_store.Store()
+            state.usage = store
+        return handler.send_json(201, store.upload(body))
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+
+
 def _handler_for(state):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             return _dispatch_get(self, state)
 
         def do_POST(self):
-            if self.path.split("?", 1)[0] != "/api/transcripts":
+            path = self.path.split("?", 1)[0]
+            if path == "/api/usage":
+                return _handle_usage_post(self, state)
+            if path != "/api/transcripts":
                 return self.send_text(404, "not found")
             return _handle_transcript_post(self, state)
 
@@ -299,6 +322,8 @@ def _dispatch_get(handler, state):
         return _dispatch_static(handler, path)
     if path in ("/improving", "/lanes"):
         return _send_dashboard_view(handler, state, path)
+    if path == "/usage":
+        return _dispatch_usage(handler, state)
     if path in ("/", "/tickets"):
         return _dispatch_ticket_list(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
@@ -398,6 +423,18 @@ def _dispatch_basic(handler, state, path):
     if path == "/api/tickets":
         return handler.send_json(200, state.response())
     return handler.send_text(404, "not found")
+
+
+def _dispatch_usage(handler, state):
+    from datetime import datetime, timezone
+    rows = [row for items in getattr(getattr(state, "usage", None), "providers", {}).values() for row in items]
+    now = datetime.now(timezone.utc)
+    rows.sort(key=lambda row: (row.get("used_pct") is None,
+                               -(float(row["used_pct"]) if row.get("used_pct") is not None else 0)))
+    body = ['<p class="empty-state">Usage limits have not been uploaded yet.</p>'] if not rows else []
+    for row in rows:
+        body.append(views.render_usage_row(row, now))
+    return handler.send_page(page("Usage", "usage", "".join(body), status="Live"))
 
 
 def _send_dashboard_view(handler, state, path):
