@@ -2271,6 +2271,56 @@ class Station:
         _write_json(path, ledger)
 
     # -- backlog triage --------------------------------------------------
+    def _backlog_scan_due(self, state: Dict[str, Any]) -> bool:
+        scanned = state.get("_scanned")
+        return (not isinstance(scanned, (int, float)) or isinstance(scanned, bool)
+                or not 0 <= self.now - scanned < TRIAGE_INTERVAL)
+
+    def _backlog_goals(self, state: Dict[str, Any]
+                       ) -> Optional[Dict[str, Tuple[str, int, Any]]]:
+        """Backlog goal homes and their last triage time. The list is fetched
+        once an hour; stale cache entries are dropped from *state*. Returns
+        None when the list cannot be read, after logging the failure."""
+        if not self._backlog_scan_due(state):
+            goals: Dict[str, Tuple[str, int, Any]] = {}
+            for key, last in state.items():
+                if key == "_scanned":
+                    continue
+                repo, num = key.rsplit("#", 1)
+                goals[key] = (repo, int(num), last)
+            return goals
+        try:
+            homes = self._goal_homes()
+        except (GitHubError, OSError) as err:
+            _say("could not list goal homes for triage: %s" % err)
+            return None
+        goals = {}
+        keep = {"_scanned"}
+        for repo, goal in homes:
+            title = str(goal.get("title") or "")
+            if not title.startswith("Backlog:"):
+                continue
+            number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            keep.add(key)
+            goals[key] = (repo, number, state.get(key))
+        for stale in [k for k in state if k not in keep]:
+            del state[stale]
+        state["_scanned"] = self.now
+        return goals
+
+    def _triage_recent(self, last: Any) -> bool:
+        return (isinstance(last, (int, float)) and not isinstance(last, bool)
+                and 0 <= self.now - last < TRIAGE_INTERVAL)
+
+    def _run_triage(self, key: str, repo: str, number: int) -> None:
+        lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
+        queued = sum(1 for line in lines if " queued under #" in line)
+        triage_count = sum(1 for line in lines if " loom:triage" in line)
+        held = sum(1 for line in lines if " held:" in line)
+        _say("triage %s: %d queued, %d triage, %d held" % (
+            key, queued, triage_count, held))
+
     def triage_backlogs(self) -> None:
         """Run brain.triage once an hour on every backlog goal home.
 
@@ -2282,46 +2332,17 @@ class Station:
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
-        scanned = state.get("_scanned")
-        scan_due = (not isinstance(scanned, (int, float)) or isinstance(scanned, bool)
-                    or not 0 <= self.now - scanned < TRIAGE_INTERVAL)
-        goals: Dict[str, Tuple[str, int, Any]] = {}
-        if scan_due:
-            try:
-                homes = self._goal_homes()
-            except (GitHubError, OSError) as err:
-                _say("could not list goal homes for triage: %s" % err)
-                return
-            for repo, goal in homes:
-                title = str(goal.get("title") or "")
-                if not title.startswith("Backlog:"):
-                    continue
-                number = int(goal["number"])
-                key = "%s#%d" % (repo, number)
-                goals[key] = (repo, number, state.get(key))
-            state = {k: v for k, v in state.items()
-                     if k == "_scanned" or k in goals}
-            state["_scanned"] = self.now
-        else:
-            for key, last in state.items():
-                if key == "_scanned":
-                    continue
-                repo, num = key.rsplit("#", 1)
-                goals[key] = (repo, int(num), last)
+        goals = self._backlog_goals(state)
+        if goals is None:
+            return
         for key, (repo, number, last) in goals.items():
-            if (isinstance(last, (int, float)) and not isinstance(last, bool)
-                    and 0 <= self.now - last < TRIAGE_INTERVAL):
+            if self._triage_recent(last):
                 continue
             try:
-                lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
+                self._run_triage(key, repo, number)
             except (GitHubError, OSError, ValueError) as err:
                 _say("triage %s failed: %s" % (key, err))
                 continue
-            queued = sum(1 for line in lines if " queued under #" in line)
-            triage_count = sum(1 for line in lines if " loom:triage" in line)
-            held = sum(1 for line in lines if " held:" in line)
-            _say("triage %s: %d queued, %d triage, %d held" % (
-                key, queued, triage_count, held))
             state[key] = self.now
         _write_json(path, state)
 

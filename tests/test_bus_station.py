@@ -243,6 +243,22 @@ class FakeGitHub:
                   and any(lab["name"] == "loom:briefed" for lab in i["labels"])]
         return reply(200, listed, {"ETag": etag})
 
+    def _update_labels(self, method, n, data):
+        # POST adds labels; PUT replaces them. Both update events.
+        old = set(self.names(n))
+        if method == "POST":
+            new = list(self.names(n))
+            for label in data["labels"]:
+                if label not in old:
+                    new.append(label)
+        else:
+            new = list(data["labels"])
+        self.events.setdefault(n, [])
+        self.events[n] += [labeled(x, "alice-example") for x in new if x not in old]
+        self.issues[n]["labels"] = [{"name": x} for x in new]
+        self.version += 1
+        return reply(201 if method == "POST" else 200, [])
+
     def _issue_call(self, method, n, sub, data):
         if method == "GET":
             if sub == "sub_issues":
@@ -259,20 +275,7 @@ class FakeGitHub:
             self.sub_issues.setdefault(n, []).append(self.issues.get(data["sub_issue_id"] - 1000, {}))
             return reply(201, {})
         if method in ("POST", "PUT") and sub == "labels":
-            # POST adds labels; PUT replaces them. Both update events.
-            old = set(self.names(n))
-            if method == "POST":
-                new = list(self.names(n))
-                for label in data["labels"]:
-                    if label not in old:
-                        new.append(label)
-            else:
-                new = list(data["labels"])
-            self.events.setdefault(n, [])
-            self.events[n] += [labeled(x, "alice-example") for x in new if x not in old]
-            self.issues[n]["labels"] = [{"name": x} for x in new]
-            self.version += 1
-            return reply(201 if method == "POST" else 200, [])
+            return self._update_labels(method, n, data)
         raise AssertionError("unexpected issue call %s %s/%s" % (method, n, sub))
 
 
