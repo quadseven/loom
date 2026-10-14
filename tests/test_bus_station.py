@@ -835,6 +835,15 @@ class HandBackTest(unittest.TestCase):
         self.assertEqual(len(self.gh.comments), 1)
         self.assertIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_pending_brain_fix_is_queued_before_automatic_hand_back(self):
+        self.gh.comments.append({"user": {"login": AUTHORS[0]},
+                                 "body": tickets.FIX_MARKER + "\n" +
+                                         brain.BRAIN_FIX_MARKER + "\nManual review finding"})
+        self.run_hand_back(checks=[("lint", "automatic check finding")])
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertNotIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
+
     def test_fix_round_cap_adds_needs_brain(self):
         self.gh.comments.extend({"user": {"login": "alice-example"},
                                  "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
