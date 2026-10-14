@@ -1,0 +1,172 @@
+"""Data builders and HTML fragments for the improving and lane views."""
+from __future__ import annotations
+
+import html
+import re
+from urllib.parse import quote
+
+METRICS_MARKER = "<!-- loom:metrics v1 -->"
+JOURNAL_MARKER = "<!-- loom:journal v1 -->"
+LANES_MARKER = "<!-- loom:lanes v1 -->"
+FOOTER = re.compile(r"Loom ticket ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#?(\d+), lane ([A-Za-z0-9_.-]+), model (.+?)\.(?:\s|$)")
+NUMBER = re.compile(r"^\d+\. (PASS|FAIL) (.+?): (.*?) \(target (.*?)\)$", re.M)
+REF = re.compile(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+
+
+def _ticket_href(repo: str, number: int) -> str:
+    return "/t/%s/%d" % (quote(repo, safe="/"), int(number))
+
+
+def parse_metrics(comments):
+    found = []
+    for comment in comments:
+        body = str(comment.get("body") or "")
+        if body.startswith(METRICS_MARKER):
+            date = re.search(r"\n(\d{4}-\d\d-\d\d):", body)
+            nums = {name: {"value": value, "passed": passed == "PASS"}
+                    for passed, name, value, _ in NUMBER.findall(body)}
+            found.append((date.group(1) if date else "", nums))
+    return sorted(found, key=lambda row: row[0], reverse=True)
+
+
+def build_improvements(journals, tickets, metrics_comments):
+    """Join journal friction lines to referenced tickets and metric movement."""
+    metrics = parse_metrics(metrics_comments)
+    latest = metrics[0][1] if metrics else {}
+    previous = metrics[1][1] if len(metrics) > 1 else {}
+    records = []
+    for journal in journals:
+        body = str(journal.get("body") or "")
+        if not body.startswith(JOURNAL_MARKER):
+            continue
+        for line in body.splitlines():
+            if not re.match(r"- (?:Waiting|Asks|Measure):", line, re.I):
+                continue
+            friction = line.split(":", 1)[1].strip()
+            refs = REF.findall(friction)
+            if not refs:
+                refs = REF.findall(str(journal.get("body") or ""))
+            ticket = None
+            for repo, number in refs:
+                ticket = next((row for row in tickets if row.get("repo") == repo
+                               and str(row.get("number")) == number), None)
+                if ticket:
+                    break
+            if not ticket and journal.get("repo") and journal.get("issue_number"):
+                ticket = next((row for row in tickets
+                               if (journal["repo"], str(journal["issue_number"]))
+                               in row.get("refs", [])), None)
+                if ticket:
+                    repo, number = ticket["repo"], str(ticket["number"])
+            if not ticket:
+                repo, number, ticket = "", "", None
+            state = (ticket or {}).get("state") or "not ticketed"
+            moved = None
+            if ticket and state in ("shipped", "merged", "verified"):
+                moved = next((name for name, value in latest.items()
+                              if name in previous and value["value"] != previous[name]["value"]), None)
+            stage = 0 if not ticket else 1
+            if ticket and state in ("shipped", "merged", "verified"):
+                stage = 2
+            if moved:
+                stage = 4
+            records.append({"friction": friction, "journal": journal, "ticket": ticket,
+                            "state": state, "moved": moved, "stage": stage})
+    return {"records": records, "latest": latest, "previous": previous,
+            "metrics_available": bool(metrics)}
+
+
+def build_scoreboard(pull_requests):
+    """Count lane PRs by footer model and difficulty tier."""
+    tiers = {}
+    for pr in pull_requests:
+        body = str(pr.get("body") or "")
+        match = FOOTER.search(body)
+        if not match:
+            continue
+        repo, number, lane, model = match.groups()
+        tier = str(pr.get("tier") or pr.get("difficulty") or "unknown").lower()
+        if tier not in ("easy", "medium", "hard", "frontier"):
+            tier = "unknown"
+        counts = tiers.setdefault(tier, {}).setdefault(model.strip(),
+            {"merged": 0, "open": 0, "closed": 0, "lane": lane})
+        state = str(pr.get("state") or "open").lower()
+        key = "merged" if state == "closed" and pr.get("merged_at") else state
+        if key in ("merged", "open", "closed"):
+            counts[key] += 1
+    return tiers
+
+
+def render_improving(data):
+    esc = html.escape
+    parts = ['<section class="card"><h2>Noticed to moved</h2><div class="improvement-list">']
+    for row in data["records"]:
+        ticket = row["ticket"]
+        source = row["journal"]
+        ref = source.get("html_url") or ""
+        journal = '<a href="%s">journal</a>' % esc(ref, True) if ref else "journal"
+        ticket_html = ('<a href="%s">#%s %s</a>' % (_ticket_href(ticket["repo"], ticket["number"]),
+                       esc(str(ticket["number"])), esc(str(ticket.get("title") or "ticket")))
+                       if ticket else "ticket not found")
+        moved = '<strong class="good">moved: %s</strong>' % esc(row["moved"]) if row["moved"] else ""
+        segments = "".join('<span class="%s"></span>' % (
+            "done" if index < row["stage"] else "current" if index == row["stage"] else "")
+            for index in range(4))
+        parts.append('<article class="improvement"><div class="progress four">%s</div><p>"%s"</p><p>%s / %s / %s %s</p></article>' % (
+            segments, esc(row["friction"]), journal, ticket_html,
+            esc(str(row["state"])), moved))
+    parts.append("</div></section><section><h2>Factory numbers</h2>")
+    if not data["metrics_available"]:
+        parts.append('<p class="empty-state">Daily metrics are missing: no metrics comment was found.</p>')
+    else:
+        for name, current in data["latest"].items():
+            old = data["previous"].get(name)
+            direction = ("better" if current["passed"] and not old["passed"] else
+                         "worse" if old["passed"] and not current["passed"] else
+                         "better" if current["passed"] else "worse") if old is not None else "previous value missing"
+            parts.append('<article class="card metric"><strong>%s</strong><span>%s</span><span>was %s / %s</span></article>' % (
+                esc(name), esc(current["value"]), esc(old["value"] if old is not None else "missing"), esc(direction)))
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def parse_lane_rows(body):
+    rows = []
+    for line in str(body or "").splitlines():
+        match = re.match(r"\|\s*([^|]+)\|\s*(yes|no)\s*\|\s*([^|]+)\|", line, re.I)
+        if match and match.group(1).strip().lower() != "lane":
+            rows.append({"lane": match.group(1).strip(), "available": match.group(2).lower() == "yes",
+                         "heartbeat": match.group(3).strip()})
+    return rows
+
+
+def render_lanes(data):
+    esc = html.escape
+    parts = ['<section><h2>Anthropic share</h2>']
+    share = data.get("anthropic_share")
+    if share is None:
+        parts.append('<p class="empty-state">Share is missing: no lane run totals were available.</p>')
+    else:
+        parts.append('<div class="share-track"><span style="width:%d%%"></span><i></i></div><p>%d%% of lane runs / cap 50%%</p>' % (min(100, share), share))
+    parts.append('</section><section><h2>Lanes</h2><div class="lane-grid">')
+    if not data.get("lanes"):
+        parts.append('<p class="empty-state">Lane status is missing: no loom:lanes comment was found.</p>')
+    for lane in data.get("lanes", []):
+        availability = "busy" if lane["ticket"] else ("free" if lane["available"] else "held")
+        reason = lane.get("reason") or ("heartbeat available" if lane["available"] else lane.get("heartbeat") or "unavailable reason missing")
+        ticket = lane.get("ticket")
+        ticket_html = ('<a href="%s">%s</a>' % (_ticket_href(ticket["repo"], ticket["number"]), esc(str(ticket["title"] or "ticket"))) if ticket else "")
+        quota = lane.get("quota")
+        quota_html = '<div class="quota"><span style="width:%d%%"></span></div>' % max(0, min(100, quota)) if quota is not None else '<small>quota missing</small>'
+        parts.append('<article class="card lane-card"><strong>%s</strong><span>%s / %s</span><p>%s %s</p>%s</article>' % (
+            esc(lane["lane"]), esc(availability), esc(lane.get("model") or "model missing"),
+            ticket_html, esc(reason), quota_html))
+    parts.append('</div></section><section><h2>Models by tier</h2>')
+    if not data.get("scoreboard"):
+        parts.append('<p class="empty-state">Scoreboard is missing: no lane pull requests matched the runner footer.</p>')
+    for tier, models in data.get("scoreboard", {}).items():
+        parts.append('<h3>%s</h3>' % esc(tier.title()))
+        for model, counts in models.items():
+            parts.append('<article class="card metric"><strong>%s</strong><span>%s</span><span>%d merged / %d open / %d closed</span></article>' % (
+                esc(model), esc(counts["lane"]), counts["merged"], counts["open"], counts["closed"]))
+    return "".join(parts)
