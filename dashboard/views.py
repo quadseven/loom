@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
@@ -179,4 +180,43 @@ def render_lanes(data):
         for model, counts in models.items():
             parts.append('<article class="card metric"><strong>%s</strong><span>%s</span><span>%d merged / %d open / %d closed</span></article>' % (
                 esc(model), esc(counts["lane"]), counts["merged"], counts["open"], counts["closed"]))
+    return "".join(parts)
+
+
+def render_usage_row(row, now=None):
+    """Render one provider window with text equivalents for every visual cue."""
+    esc = html.escape
+    now = now or datetime.now(timezone.utc)
+    used = row.get("used_pct")
+    provider = esc(str(row.get("provider", "")))
+    window_label = "5 hours" if row.get("window") == "5-hour" else str(row.get("window", ""))
+    window = esc(window_label)
+    lanes = ", ".join(row.get("lanes") or []) or "no lanes listed"
+    note = esc(str(row.get("note") or ""))
+    as_of = datetime.fromisoformat(str(row["as_of"]).replace("Z", "+00:00")).astimezone(timezone.utc)
+    age_seconds = max(0, int((now - as_of).total_seconds()))
+    age = "less than a minute ago" if age_seconds < 60 else "%d minutes ago" % (age_seconds // 60)
+    stale = age_seconds > 7200
+    parts = ['<article class="card usage-card"><div class="label">%s | %s</div><h2>%s</h2><p>Lanes: %s</p>' %
+             (provider, window, window, esc(lanes))]
+    if used is None:
+        parts.append('<p><strong>Not exposed yet.</strong> %s</p>' % note)
+    else:
+        pct = max(0, min(100, float(used)))
+        remaining = max(0, 100 - pct)
+        parts.append('<div class="usage-track" role="img" aria-label="%.1f%% used, %.1f%% left"><span style="width:%.1f%%"></span></div><p>%.1f%% used / %.1f%% left</p>' % (pct, remaining, pct, pct, remaining))
+    reset = row.get("resets_at")
+    if reset:
+        try:
+            reset_at = datetime.fromisoformat(reset.replace("Z", "+00:00")).astimezone(timezone.utc)
+            seconds = int((reset_at - now).total_seconds())
+            relative = "in %dh" % (seconds // 3600) if seconds >= 3600 else "in %dm" % max(0, seconds // 60)
+            absolute = reset_at.strftime("%Y-%m-%d %H:%M UTC")
+            parts.append('<p>Resets at %s (%s)</p>' % (esc(absolute), esc(relative)))
+        except ValueError:
+            parts.append('<p>Reset time unavailable.</p>')
+    else:
+        parts.append('<p>Reset time unavailable.</p>')
+    parts.append('<p>Source: %s</p><p>Reading: %s%s</p></article>' %
+                 (esc(str(row.get("source", ""))), age, ' <strong>Stale</strong>' if stale else ""))
     return "".join(parts)

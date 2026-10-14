@@ -335,6 +335,16 @@ class DashboardViewTest(unittest.TestCase):
         self.assertIn("Other ticket", body)
         self.assertNotIn("Elsewhere ticket", body)
 
+    def test_ticket_filters_without_params(self):
+        from dashboard.server import _tickets
+        from urllib.parse import urlsplit
+        body = _tickets(self.State(), urlsplit("/tickets"))
+        self.assertIn("Sample ticket", body)
+        self.assertIn("Other ticket", body)
+        self.assertIn('href="/tickets?state=pr"', body)
+        self.assertIn('href="/tickets?state=briefed"', body)
+        self.assertNotIn("Clear filters", body)
+
     def test_missing_backlog_reason(self):
         from dashboard.server import _floor
         import os
