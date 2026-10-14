@@ -1554,6 +1554,7 @@ class TriageTests(unittest.TestCase):
                  item(9, body="see Part of #1 inline", labels=ticket),    # not its own line
                  dict(item(11, body="Part of #1\n", labels=ticket), pull_request={}),
                  item(12, body="Part of #1\n"),     # anyone's issue: no loom:ticket label
+                 None, "not an issue",              # malformed search items are skipped
                  item(150, state="closed", body="Part of #1\n", labels=ticket)]  # a sub-issue
         routes = Routes([], goal_children=full, search=found)
         children = brain.goal_children(GitHub("t", transport=routes), REPO, 1)
