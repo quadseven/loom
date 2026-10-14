@@ -75,6 +75,11 @@ class WatchBase(unittest.TestCase):
 
 
 class SignatureTest(unittest.TestCase):
+    def test_a_credential_never_reaches_a_signature(self):
+        sig = watch.signature("auth failed: Authorization: Bearer abcdef0123456789xyz api_key=hunter2hunter2")
+        self.assertNotIn("abcdef0123456789xyz", sig)
+        self.assertNotIn("hunter2", sig)
+
     def test_two_403s_on_different_repos_match(self):
         self.assertEqual(watch.signature(LINE_403), watch.signature(LINE_403_B))
         self.assertIn("403", watch.signature(LINE_403))

@@ -131,6 +131,11 @@ live regression).
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).
    Spend at most a third of the tick on them; defer what is left again.
+   `resume` then lists up to 5 verify-due tickets (open `loom:shipped`, no
+   proof yet), oldest ship first, as `resume verify` items after the stage
+   work and before any new brief. Verify them as step 4 says; write a proof
+   only from evidence you saw in this tick, and otherwise leave a one-line
+   note on the ticket naming what evidence is missing.
 3. The station hands failed checks and unresolved review-bot threads back to
    the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the

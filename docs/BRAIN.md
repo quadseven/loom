@@ -50,7 +50,7 @@ that talks to GitHub about tickets.
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
-| `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
+| `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
 | `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Refs #<number>`. The issue stays open. |
@@ -70,6 +70,19 @@ and `running` and `failed` exist because the
 station and the runner need to say "taken" and "gave up" without the brain
 present. `loom:ready` is a PR readiness label, and `needs-brain` asks for a
 full review after automatic fix rounds; neither replaces the ticket state.
+
+### Shipping Loom itself
+
+The station deploys this repo (lanes/mac/station.sh) and records each
+successful deploy: the revision and when. Each pass after one, it moves every
+open `loom:merged` ticket of `LOOM_SELF_REPO` (default the lanes repo,
+`LOOM_STATUS_REPO`) whose pull request's merge commit the deployed revision
+carries to `loom:shipped`, with a note naming the revision and the deploy
+time, and one log line per move. The pull request is the merged one whose
+`Refs` line or `loom/<number>` branch names the ticket. At most 20 move a
+pass, oldest merge first. A deploy that did not happen records nothing, so it
+ships nothing. Tickets of every other repo are never moved here; their goal
+home's ship rules decide.
 
 ## Ticket issues
 
@@ -605,6 +618,15 @@ count). Only journals from `LOOM_BRIEF_AUTHORS` logins count. For each stage
 and item the newest line wins; `python3 -m bus.brain resume OWNER/NAME...
 --holder NAME` lists the defers still standing whose item is open and
 unchanged, and refuses unless that holder holds the tick lock.
+
+`resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
+tickets across the repos, oldest ship first, each with how long ago it
+shipped and its Live criterion (the acceptance line that starts with
+"Live"). `python3 -m bus.brain status` prints the same list in full under
+"### Verify due" for each repo. The hourly lane-machine brain (scope live)
+spends up to a third of its tick on these items: it writes a proof only from
+evidence it saw in the tick, and otherwise leaves a one-line note on the
+ticket naming what evidence is missing.
 
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
