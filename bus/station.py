@@ -37,7 +37,7 @@ from . import transcripts
 from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, _OPENER
+from .github import GitHub, GitHubError, _OPENER, _next_link
 from .journal import REPLY_RE
 from .labels import LANES
 
@@ -141,6 +141,15 @@ BRAIN_OUTCOMES = ("ok", "skipped", "failed")
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 JOURNAL_CHECK = 600
 JOURNAL_LOOKBACK = 24 * 3600
+# Shipping Loom's own tickets at deploy: lanes/mac/station.sh records the
+# revision it deployed and when in DEPLOYED_FILE, and each pass moves at most
+# SHIP_PER_PASS merged tickets that revision carries to loom:shipped, oldest
+# merge first. Their pull requests are looked for in at most SHIP_PAGES pages
+# of the repo's most recently updated closed pull requests.
+DEPLOYED_FILE = "deployed.json"
+SHIP_PER_PASS = 20
+SHIP_PAGES = 5
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
@@ -231,7 +240,8 @@ class Settings:
                  transcript_token_ssm: str = "",
                  watched: Optional[List[Tuple[str, str]]] = None,
                  rewrite_cmd: str = "",
-                 rewrite_private_cmd: str = "") -> None:
+                 rewrite_private_cmd: str = "",
+                 self_repo: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -259,6 +269,9 @@ class Settings:
         self.watched = watch.components(home) if watched is None else watched
         self.rewrite_cmd = rewrite_cmd
         self.rewrite_private_cmd = rewrite_private_cmd
+        # The repo this checkout deploys from (LOOM_SELF_REPO, default the
+        # lanes repo): its merged tickets ship when the station deploys them.
+        self.self_repo = self_repo or status_repo
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -311,7 +324,8 @@ class Settings:
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
-                   rewrite_private_cmd=env.get("LOOM_REWRITE_PRIVATE_CMD", "").strip())
+                   rewrite_private_cmd=env.get("LOOM_REWRITE_PRIVATE_CMD", "").strip(),
+                   self_repo=env.get("LOOM_SELF_REPO", "").strip())
 
 
 def _origin_repo() -> str:
@@ -324,6 +338,18 @@ def _origin_repo() -> str:
         return ""
     m = REMOTE_RE.search(out.stdout.strip()) if out.returncode == 0 else None
     return m.group(1) if m else ""
+
+
+def _is_ancestor(commit: str, revision: str) -> bool:
+    """The commit is the revision or one of its ancestors in this checkout,
+    the one lanes/mac/station.sh deploys. An unknown commit is not."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", root, "merge-base", "--is-ancestor", commit, revision],
+                             capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
 
 
 def read_ssm(name: str, region: str) -> str:
@@ -603,12 +629,14 @@ class Station:
                  read_secret: Optional[SecretReader] = None,
                  post: Optional[Poster] = None,
                  discord: Optional[DiscordCall] = None,
-                 upload: Optional[Uploader] = None) -> None:
+                 upload: Optional[Uploader] = None,
+                 ancestor: Optional[Callable[[str, str], bool]] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
+        self.ancestor = ancestor or _is_ancestor
         # Where Claude Code and codex keep their sessions (the claude lane's
         # and the brain's transcripts, and codex rollouts).
         self.claude_projects = Path.home() / ".claude" / "projects"
@@ -1146,6 +1174,74 @@ class Station:
                 self._reconcile_repo(repo)
             except (GitHubError, OSError) as err:
                 _say("could not reconcile pull requests for %s: %s" % (repo, err))
+
+    # -- shipping at deploy ----------------------------------------------
+    def _deployed(self) -> Optional[Tuple[str, float]]:
+        """The revision lanes/mac/station.sh last deployed and when, or None
+        when it has recorded no successful deploy (LOOM_DEPLOY=0, or none yet)."""
+        rec = _read_json(os.path.join(self.state, DEPLOYED_FILE), None, strict=False)
+        if not isinstance(rec, dict):
+            return None
+        revision, at = rec.get("revision"), rec.get("at")
+        if not isinstance(revision, str) or not COMMIT_RE.fullmatch(revision) \
+                or isinstance(at, bool) or not isinstance(at, (int, float)):
+            return None
+        return revision, float(at)
+
+    def _merged_pulls(self, repo: str, wanted: set) -> Dict[int, Dict[str, Any]]:
+        """Each wanted ticket's latest merged pull request, found by its Refs
+        line or loom branch in the most recently updated closed pull requests
+        (the URL reconciliation reads), stopping once every one is found."""
+        found: Dict[int, Dict[str, Any]] = {}
+        url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
+                              "&direction=desc&per_page=100" % repo)
+        for _ in range(SHIP_PAGES):
+            resp = self.gh.rest("GET", url)
+            for pr in resp.data if isinstance(resp.data, list) else []:
+                if not isinstance(pr, dict) or not pr.get("merged_at") \
+                        or not COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
+                    continue
+                number = self._pr_ticket_number(repo, pr)
+                if number in wanted and (number not in found or str(pr["merged_at"])
+                                         > str(found[number]["merged_at"])):
+                    found[number] = pr
+            url = _next_link(resp.headers.get("link", ""))
+            if not url or wanted <= set(found):
+                break
+        return found
+
+    def ship_deployed(self) -> None:
+        """Move each open merged ticket of the repo this checkout deploys
+        (LOOM_SELF_REPO) whose pull request's merge commit the deployed
+        revision carries to loom:shipped, with a note naming the revision and
+        the deploy time. Other repos keep their own ship rules (docs/BRAIN.md)."""
+        repo = self.s.self_repo
+        deployed = self._deployed()
+        if deployed is None or not tickets.REPO_RE.fullmatch(repo or ""):
+            return
+        revision, at = deployed
+        listed = self.gh.rest("GET", "/repos/%s/issues?labels=loom:merged&state=open"
+                              "&per_page=100" % repo).data
+        merged = {int(i["number"]) for i in (listed if isinstance(listed, list) else [])
+                  if isinstance(i, dict) and "pull_request" not in i
+                  and "loom:ticket" in _label_names(i)}
+        if not merged:
+            return
+        carried = sorted((str(pr["merged_at"]), number, pr)
+                         for number, pr in self._merged_pulls(repo, merged).items()
+                         if self.ancestor(str(pr["merge_commit_sha"]), revision))
+        for _, number, pr in carried[:SHIP_PER_PASS]:
+            note = ("Shipped: the station deployed revision %s at %s, which carries "
+                    "pull request #%d (merge commit %s)." % (
+                        revision[:12], self._utc(at), int(pr["number"]),
+                        str(pr["merge_commit_sha"])[:12]))
+            try:
+                brain.move(self.gh, repo, number, "shipped", note=note)
+            except (GitHubError, ValueError) as err:
+                _say("could not ship %s#%d: %s" % (repo, number, err))
+                continue
+            _say("shipped %s#%d: deployed %s carries #%d" % (
+                repo, number, revision[:12], int(pr["number"])))
 
     def hand_back(self) -> None:
         """Return completed lane PRs with failed checks or bot findings."""
@@ -3294,7 +3390,7 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.ship_deployed, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,

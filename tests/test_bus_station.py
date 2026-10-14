@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -193,6 +194,9 @@ class FakeGitHub:
         if "labels=loom%3Apr" in query or "labels=loom:pr&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:pr" in self.names(i["number"])])
+        if "labels=loom%3Amerged" in query or "labels=loom:merged&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:merged" in self.names(i["number"])])
         if "needs-operator" in query:
             return self._list_asks(headers)
         if "loom:human" in query:
@@ -398,6 +402,138 @@ class ReconcilePullRequestTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:closed-unmerged", self.fake.names(12))
         self.assertNotIn("loom:merged", self.fake.names(12))
+
+
+DEPLOYED = "d" * 40
+DEPLOYED_AT = calendar.timegm((2030, 1, 3, 12, 0, 0))
+
+
+class ShipDeployedTest(Base):
+    """Loom's own merged tickets move to loom:shipped once the station has
+    deployed a revision that carries their pull request's merge commit."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.self_repo = REPO
+        self.carried = set()
+
+    def record_deploy(self, revision=DEPLOYED, at=DEPLOYED_AT):
+        self.write(os.path.join(self.home, "state", "station", "deployed.json"),
+                   json.dumps({"revision": revision, "at": at}))
+
+    def merged(self, number, pr, merged_at="2030-01-02T00:00:00Z", carried=True):
+        """A merged ticket and its merged pull request, whose merge commit the
+        deployed revision carries when carried is true."""
+        self.fake.add(number, state="merged")
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "body": "Refs %s#%d" % (REPO, number),
+                                "head": {"ref": "loom/%d-fix" % number}})
+        if carried:
+            self.carried.add(sha)
+
+    def ancestor(self, commit, revision):
+        return revision == DEPLOYED and commit in self.carried
+
+    def ship(self, transport=None):
+        gh = GitHub("token", transport=transport or self.fake)
+        station.Station(gh, self.settings, ancestor=self.ancestor).ship_deployed()
+
+    def test_a_ticket_the_deployed_revision_carries_ships_with_the_revision_in_its_note(self):
+        self.merged(12, 99)
+        self.record_deploy()
+        with mock.patch("bus.station._say") as say:
+            self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        note = self.fake.comments[12][-1]["body"]
+        self.assertIn(DEPLOYED[:12], note)
+        self.assertIn("2030-01-03 12:00:00Z", note)
+        self.assertIn("#99", note)
+        say.assert_called_once_with("shipped %s#12: deployed %s carries #99" % (REPO, DEPLOYED[:12]))
+
+    def test_a_ticket_whose_commit_is_not_yet_deployed_stays_merged(self):
+        self.merged(12, 99, carried=False)
+        self.merged(13, 100)
+        self.record_deploy()
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+        self.assertIn("loom:shipped", self.fake.names(13))
+
+    def test_without_a_successful_deploy_nothing_moves(self):
+        self.merged(12, 99)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.calls, [])
+        # A record that is not a deploy (a torn write) moves nothing either.
+        self.record_deploy(revision="not-a-commit")
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_ticket_in_another_repo_is_never_moved(self):
+        other = "second-owner/second-repo"
+        ticket = {"number": 13, "state": "open",
+                  "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]}
+        pr = {"number": 100, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+              "merge_commit_sha": "%040x" % 100, "body": "Refs %s#13" % other,
+              "head": {"ref": "loom/13-fix"}}
+        self.carried.add(pr["merge_commit_sha"])
+        touched = []
+
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if path.startswith("/repos/%s/" % other):
+                touched.append((method, path))
+                return reply(200, [pr] if "/pulls" in path else [ticket])
+            return self.fake(method, url, headers, body)
+
+        self.settings.repos = [REPO, other]
+        self.record_deploy()
+        self.ship(transport)
+        self.assertEqual(touched, [])
+        # With no repo of its own to ship, the station moves nothing at all.
+        self.settings.self_repo = ""
+        self.merged(12, 99)
+        self.ship(transport)
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(touched, [])
+
+    def test_at_most_twenty_move_a_pass_oldest_merge_first(self):
+        for n in range(22):
+            self.merged(100 + n, 500 + n, merged_at="2030-01-02T00:%02d:00Z" % (59 - n))
+        self.record_deploy()
+        self.ship()
+        left = [n for n in range(100, 122) if "loom:merged" in self.fake.names(n)]
+        self.assertEqual(left, [100, 101])
+        self.ship()
+        self.assertTrue(all("loom:shipped" in self.fake.names(n) for n in range(100, 122)))
+
+    def test_a_pass_ships_after_the_deploy(self):
+        self.merged(12, 99)
+        self.record_deploy()
+        gh = GitHub("token", transport=self.fake)
+        self.assertEqual(station.run(self.settings, gh, ancestor=self.ancestor), 0)
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_self_repo_defaults_to_the_lanes_repo(self):
+        env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
+               "LOOM_STATUS_REPO": "example-owner/lanes"}
+        self.assertEqual(station.Settings.from_env(env).self_repo, "example-owner/lanes")
+        env["LOOM_SELF_REPO"] = REPO
+        self.assertEqual(station.Settings.from_env(env).self_repo, REPO)
+
+    def test_the_default_ancestry_check_reads_this_checkout(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                              capture_output=True, text=True)
+        if head.returncode != 0:
+            self.skipTest("not a git checkout")
+        sha = head.stdout.strip()
+        self.assertTrue(station._is_ancestor(sha, sha))
+        self.assertFalse(station._is_ancestor("0" * 40, sha))
 
 
 class BudgetTest(Base):

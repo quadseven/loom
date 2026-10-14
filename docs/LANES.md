@@ -101,7 +101,10 @@ deploys Loom itself: it fast-forwards this checkout (which the lanes and the
 brain run from too) to its default branch once that head's `unittest` check
 passed, never over local changes and never off the default branch
 (`LOOM_DEPLOY=0` turns it off), and then runs `python3 -m bus station`. A
-merged Loom pull request is running a minute after its CI passes on main.
+merged Loom pull request is running a minute after its CI passes on main,
+and the pass after the deploy moves its ticket to `loom:shipped`
+(`LOOM_SELF_REPO`, default `LOOM_STATUS_REPO`; docs/BRAIN.md, Shipping Loom
+itself).
 The station turns trusted
 `loom:briefed` ticket issues into briefs in the lane inboxes
 (`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
