@@ -56,9 +56,10 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   A limit is not a failure, so it never climbs; with no free lane the ticket
   waits where it is for its lane to come back.
 - Past the last rung the ticket is left failed for the brain, with a note.
-- A revert ticket (bus/revert.py, REVERT_LABEL) lands first, on green: its
-  medium and low findings are deferred at once instead of after a fix round,
-  and it needs no test of its own (the failing check it fixes is its test).
+- A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
+  pull request is green, even while the default branch is red. Its medium
+  and low findings are deferred at once instead of after a fix round, and
+  it needs no test of its own (the failing check it fixes is its test).
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
 survives restarts and any brain can read where a ticket stands.
