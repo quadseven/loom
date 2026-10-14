@@ -246,7 +246,7 @@ def marker_cadence(f: Facts) -> List[Breach]:
                                "Limit: one a day"),
                               day[-1].at))
         elif kind == "report":
-            close = [(a, b) for a, b in zip(found, found[1:]) if b.at - a.at < REPORT_GAP]
+            close = [(a, b) for a, b in zip(found, found[1:], strict=False) if b.at - a.at < REPORT_GAP]
             if not close:
                 continue
             a, b = close[-1]

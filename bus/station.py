@@ -2789,6 +2789,28 @@ class Station:
         where = repo if self._publics[repo] else "a private repo"
         return invariants.Ref(key, "%s %d of %s" % (noun, number, where))
 
+    def _invariant_held(self, held: Any) -> Dict[str, float]:
+        """Since when each lane now at a limit has been held: kept from the
+        last pass, now for a lane newly at a limit."""
+        held = {k: v for k, v in held.items() if self._num(v)} if isinstance(held, dict) else {}
+        return {lane: held.get(lane, self.now) for lane in self.limited_lanes()}
+
+    def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
+        """Goal homes with their sub-issue counts, and their journals and
+        marker posts; a source that cannot be read stays None."""
+        try:
+            homes = self._goal_homes()
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the goal homes: %s" % err)
+            return
+        facts.goals = [(self._invariant_ref(repo, int(g["number"])),
+                        int((g.get("sub_issues_summary") or {}).get("total") or 0))
+                       for repo, g in homes]
+        try:
+            facts.journals, facts.posts = self._invariant_comments(homes)
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the goal home comments: %s" % err)
+
     def _invariant_facts(self, state: Dict[str, Any]) -> invariants.Facts:
         """What the invariants read, each source on its own: one that cannot
         be read stays None and its invariants find nothing this pass."""
@@ -2800,23 +2822,8 @@ class Station:
                 setattr(facts, name, read())
             except (GitHubError, OSError) as err:
                 _say("invariants: could not read %s: %s" % (name, err))
-        held = state.get("held")
-        held = {k: v for k, v in held.items() if self._num(v)} if isinstance(held, dict) else {}
-        limited = self.limited_lanes()
-        facts.held = state["held"] = {lane: held.get(lane, self.now) for lane in limited}
-        try:
-            homes = self._goal_homes()
-        except (GitHubError, OSError) as err:
-            _say("invariants: could not read the goal homes: %s" % err)
-            homes = None
-        if homes is not None:
-            facts.goals = [(self._invariant_ref(repo, int(g["number"])),
-                            int((g.get("sub_issues_summary") or {}).get("total") or 0))
-                           for repo, g in homes]
-            try:
-                facts.journals, facts.posts = self._invariant_comments(homes)
-            except (GitHubError, OSError) as err:
-                _say("invariants: could not read the goal home comments: %s" % err)
+        facts.held = state["held"] = self._invariant_held(state.get("held"))
+        self._invariant_goal_facts(facts)
         seen = state.get("brain_seen")
         newest = max([j.at for j in facts.journals or []] + ([seen] if self._num(seen) else []),
                      default=None)
@@ -2908,26 +2915,34 @@ class Station:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
             for pr in self._open_pulls(repo):
-                head = pr.get("head") or {}
-                if (pr.get("draft") or not str(head.get("ref") or "").startswith("loom/")
-                        or not head.get("sha")
-                        or tickets._login(pr.get("user")).lower() not in authors):
-                    continue
-                data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?check_name=%s&per_page=100"
-                                    % (repo, head["sha"], quote(self.s.plan_check, safe=""))).data
-                runs = [r for r in (data or {}).get("check_runs") or []
-                        if isinstance(r, dict) and r.get("name") == self.s.plan_check
-                        and r.get("status") == "completed"
-                        and self._epoch(str(r.get("completed_at") or "")) is not None]
-                if not runs:
-                    continue
-                run = max(runs, key=lambda r: str(r.get("completed_at")))
-                out.append(invariants.Check(
-                    self._invariant_ref(repo, int(pr["number"]), "pull request"),
-                    self.s.plan_check, str(run.get("conclusion") or ""),
-                    self._epoch(str(run["completed_at"])) or 0.0,
-                    str((run.get("output") or {}).get("title") or "")))
+                if self._trusted_lane_pull(pr, authors):
+                    check = self._plan_check_of(repo, pr)
+                    if check is not None:
+                        out.append(check)
         return out
+
+    @staticmethod
+    def _trusted_lane_pull(pr: Dict[str, Any], authors: set) -> bool:
+        head = pr.get("head") or {}
+        return bool(not pr.get("draft") and str(head.get("ref") or "").startswith("loom/")
+                    and head.get("sha") and tickets._login(pr.get("user")).lower() in authors)
+
+    def _plan_check_of(self, repo: str, pr: Dict[str, Any]) -> Optional[invariants.Check]:
+        """The newest completed plan check run on the pull request's head, or None."""
+        data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?check_name=%s&per_page=100"
+                            % (repo, pr["head"]["sha"], quote(self.s.plan_check, safe=""))).data
+        runs = [r for r in (data or {}).get("check_runs") or []
+                if isinstance(r, dict) and r.get("name") == self.s.plan_check
+                and r.get("status") == "completed"
+                and self._epoch(str(r.get("completed_at") or "")) is not None]
+        if not runs:
+            return None
+        run = max(runs, key=lambda r: str(r.get("completed_at")))
+        return invariants.Check(
+            self._invariant_ref(repo, int(pr["number"]), "pull request"),
+            self.s.plan_check, str(run.get("conclusion") or ""),
+            self._epoch(str(run["completed_at"])) or 0.0,
+            str((run.get("output") or {}).get("title") or ""))
 
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
