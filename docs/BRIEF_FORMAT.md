@@ -25,7 +25,8 @@ parked.
 writes `.loom/answer.md`; the runner validates and posts it as one ticket
 comment, then labels the ticket `loom:answered` for the brain to review. It
 does not push a branch or open a pull request. Without this header, a run
-still needs to produce a commit.
+still needs to produce a commit. Any value other than `answer` parks the brief,
+and an answer brief without an `Issue:` number is parked too.
 
 The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that
@@ -38,7 +39,7 @@ Repo: <owner/name>
 Branch: loom/T0001-<slug>
 Base: <target branch, optional>
 Model: <model id, optional>
-Deliverable: answer (optional)
+Deliverable: answer (optional; any other value parks the brief)
 
 # T0001: <short title>
 
