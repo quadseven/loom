@@ -646,8 +646,9 @@ class BudgetTest(Base):
         self.assertEqual(len(self.gets("loom:pr")), 6)
 
 
-READY_BODY = ("## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n"
-              "- [ ] done\n## Size\nS\n## Out of scope\n- none")
+READY_BODY = ("## Why\nThe page query is slow for every visitor.\n## What\nwhat\n"
+              "## Acceptance criteria\n- [ ] done\n- [ ] tested\n- [ ] live\n"
+              "## Size\nS\n## Out of scope\n- none")
 
 
 class TriageTest(Base):
