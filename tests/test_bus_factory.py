@@ -439,6 +439,15 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [(60, (REPO, 6))])
 
+    def test_a_revert_tickets_pull_request_lands_first_with_no_test_of_its_own(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.ticket(6, "pr")
+        self.gh.issues[6]["labels"].append({"name": "loom:revert"})
+        self.gh.pull(60, 6, created=3600, files=("bus/a.py",))
+        self.go()
+        self.assertEqual((self.merged, self.fixed), ([(60, (REPO, 6))], []))
+
     def test_a_failed_actions_job_is_run_once_more_before_a_send_back(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
@@ -690,6 +699,19 @@ class DeferredFindings(Base):
 
     def test_a_new_medium_finding_on_the_first_round_goes_back_to_the_lane(self):
         self.finding(MEDIUM, asked=(ASKED_OTHER,))
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged, len(self.fixed)), ([], [], 1))
+
+    def test_a_revert_defers_a_medium_finding_without_a_fix_round(self):
+        self.gh.issues[5]["labels"].append({"name": "loom:revert"})
+        self.finding(MEDIUM, asked=())
+        self.go()
+        self.assertEqual((len(self.gh.filed), self.merged, self.fixed),
+                         (1, [(50, (REPO, 5))], []))
+
+    def test_a_revert_still_goes_back_for_a_high_finding(self):
+        self.gh.issues[5]["labels"].append({"name": "loom:revert"})
+        self.finding(HIGH, asked=())
         self.go()
         self.assertEqual((self.gh.filed, self.merged, len(self.fixed)), ([], [], 1))
 
