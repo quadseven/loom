@@ -130,6 +130,21 @@ class ExplainerPage(unittest.TestCase):
                 height = declarations.get("min-height", declarations.get("height"))
                 self.assertIsNotNone(height, f"{tag} has no declared tap target height")
                 self.assertGreaterEqual(float(height.removesuffix("px")), 44, f"{tag} tap target too small")
+                # Width too: a short header link ("Docs") rendered 30px wide.
+                width = declarations.get("min-width", declarations.get("width"))
+                self.assertIsNotNone(width, f"{tag} has no declared tap target width")
+                self.assertGreaterEqual(float(width.removesuffix("px")), 44, f"{tag} tap target too narrow")
+
+    def test_the_hero_numbers_are_facts_of_how_loom_works(self):
+        # The page carries no live data, so its numbers are fixed facts of the
+        # design, never examples that could read as claims ("1 goal at a time"
+        # was false: Loom runs many goals at once).
+        text = re.sub(r"<[^>]+>", " ", self.source)
+        self.assertNotIn("goal at a time", text)
+        self.assertNotIn("illustrative", text.lower())
+        for fact in ("steps from goal to verified", "checks on every ticket",
+                     "reviewed pull request per ticket"):
+            self.assertIn(fact, text)
 
 
 if __name__ == "__main__":
