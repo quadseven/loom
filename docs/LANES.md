@@ -237,8 +237,18 @@ spread target. Use the keys in `.env.example` as setup placeholders.
 The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
 its previous metrics comments can be trusted for the streak.
 
-Reports: the station also reads comments on open `loom:goal` issues in each
-`LOOM_REPOS` repo. On first run it records the newest report comment per repo
+Reports: by default the station sends a digest, not each report:
+`LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
+At each time it sends one message: every goal home whose latest report since
+the last digest says something moved, as its short name, the report's first
+line and a link; a count of the goal homes where nothing moved; and the
+factory's daily numbers, which then no longer go out on their own. Each time
+is sent once, and a failed send is tried again on the next pass. Switching
+the digest on sends nothing until the next digest time. Setting
+`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below.
+
+Each report on its own: the station also reads comments on open `loom:goal`
+issues in each `LOOM_REPOS` repo. On first run it records the newest report comment per repo
 without sending old reports; later `<!-- loom:report v1 -->` comments from
 `LOOM_BRIEF_AUTHORS` are sent to the same webhook, without a mention. A
 successful send advances the per-repo ledger, while a failed send is retried
@@ -374,6 +384,45 @@ most 5, and below the GitHub budget floor only reads, filing on a later
 pass. Once an hour `station.log` gets a `watch: scanned ...` line with the
 logs, lines and matches seen, which is how a quiet day shows it ran; the
 watcher's own lines never count as hits.
+
+## Invariants
+
+Each station pass runs `bus/invariants.py`, at most every 5 minutes, on what
+the station already reads: the journals and marker comments trusted logins
+posted on every goal home in the last day, the lane runs that ended in the
+last day (`briefs/<lane>/done` and `failed`, timed by their logs), the lanes
+held by a limit, queued tickets, sub-issue counts, the review bot's plan
+check on open lane pull requests (`LOOM_PLAN_CHECK`, default
+`Grug - Chief`) and remote heartbeats. Each invariant is one function
+returning breaches with evidence:
+
+- One brain's two newest ticks each journaled a failed or degraded step
+  (`- Step <name>: failed ...`, docs/BRAIN.md Journal), or no brain journaled
+  for 90 minutes once one has been seen.
+- A `loom:metrics` line posted more than once for one day, or two
+  `loom:report` comments within 90 minutes, on one goal home.
+- A lane with 5 or more runs in 24 hours and none done.
+- A lane held by a limit for over 2 hours while tickets of its tier are queued.
+- A goal home at 90 or more sub-issues.
+- An open lane pull request whose plan check failed more than 30 minutes ago.
+- A remote lane whose newest heartbeat is older than its `beat_max`.
+
+Each breach files one issue labelled `loom:triage` and `loom:invariant` on
+the invariant goal home (`LOOM_INVARIANT_GOAL`; empty means
+`LOOM_METRICS_GOAL` when it is in the self repo, else the self repo's one
+goal home that is not a backlog), as a sub-issue and with a `Part of #N`
+line, carrying the evidence. A hidden marker holds a hash of the invariant
+and its subject: an open issue for the same breach files nothing, and a
+closed one is reopened with a comment only for evidence newer than its
+close. Issues and pull requests in a private repo are named in words, and
+failure reasons have repos, paths and credentials replaced. One pass files
+or reopens at most 5, and below the GitHub budget floor files nothing.
+`python3 -m bus.brain status` lists the open ones under "Invariants broken"
+for the brain's report, and the station's own standup on that goal home
+names them under "Not going well". `state/station/invariants.json` keeps
+the issue numbers, when each lane was first seen held, and the newest
+journal seen. Adding an invariant is one function in `INVARIANTS` plus a
+test.
 
 ## Transcript viewer
 

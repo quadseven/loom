@@ -101,6 +101,32 @@ button { color: inherit; font: inherit; }
 .mobile-topbar, .mobile-tabs { display: none; }
 .ticket-row, .card { border: 1px solid var(--line); border-radius: 10px; background: var(--row); padding: 12px 14px; }
 .ticket-row:hover, .card:hover { border-color: var(--line-strong); background: var(--raised); }
+.section { margin: 0 0 28px; }
+.section h2, .card h2 { margin: 0 0 12px; font-size: 16px; font-weight: 500; }
+.standup { margin: 0 0 28px; color: var(--body); font-size: clamp(20px, 2.4vw, 28px); font-weight: 500; letter-spacing: -.015em; }
+.conveyor { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 7px; }
+.step-card { display: grid; min-height: 104px; align-content: start; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.step-card strong { font: 600 22px var(--font-mono); font-variant-numeric: tabular-nums; }
+.step-card span { font: 11px var(--font-mono); }
+.step-card small { color: var(--muted); font: 10px/1.35 var(--font-mono); }
+.step-card.bottleneck { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.bottleneck-note { color: var(--accent); font: 12px var(--font-mono); }
+.floor-columns { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, .8fr); gap: 24px; align-items: start; }
+.floor-aside { display: grid; gap: 10px; }
+.ticket-grid, .goal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 8px; }
+.ticket-row { display: grid; gap: 7px; }
+.ticket-top, .ticket-bottom { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ticket-title { color: var(--body-on-row); font-size: 14px; line-height: 1.4; }
+.ticket-bottom .progress { flex: 1; }
+.empty-state { padding: 22px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--muted); text-align: center; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }
+.chips .chip { font-size: 11px; }
+.goal-card h2 { margin: 6px 0 12px; font-size: 17px; }
+.goal-card > a:last-child { color: var(--accent); }
+.metric { font: 600 30px/1.1 var(--font-mono); font-variant-numeric: tabular-nums; }
+.sparkline { display: flex; height: 44px; align-items: end; gap: 5px; margin: 14px 0; }
+.sparkline i { width: 12px; min-height: 3px; border-radius: 2px 2px 0 0; background: var(--accent); }
+.stale-note { padding: 8px 12px; border: 1px solid var(--accent); border-radius: 8px; color: var(--accent); }
 .ticket-title { color: var(--body-on-row); font-size: 14px; line-height: 1.4; }
 .machine-fact, .label, .chip { font-family: var(--font-mono); }
 .machine-fact { color: var(--muted-on-bg); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -125,6 +151,17 @@ button { color: inherit; font: inherit; }
 .sheet-handle { width: 40px; height: 4px; margin: 0 auto 12px; border-radius: 4px; background: var(--line-strong); }
 .sheet-heading { display: flex; align-items: center; justify-content: space-between; }
 .sheet-heading h2 { font-size: 18px; }
+.backlog-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; }
+.backlog-filters label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.backlog-filters select, .backlog-filters button { min-height: 44px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
+.backlog-epic { margin-bottom: 12px; }
+.backlog-epic h2, .card h2 { font-size: 18px; }
+.backlog-epic ul { padding-left: 20px; }
+.backlog-epic li { padding: 4px 0; }
+.start-here { border-color: var(--accent); margin-bottom: 16px; }
+.start-here h2 { margin-bottom: 4px; }
+blockquote { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--accent); white-space: pre-wrap; }
+footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .more-sheet .nav-row { min-height: 52px; }
 @media (max-width: 959px) {
   .desktop-nav { display: none; }
@@ -137,4 +174,55 @@ button { color: inherit; font: inherit; }
   .tab-link { display: flex; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: 11px var(--font-mono); }
   .tab-link[aria-current="page"] { background: var(--raised); color: var(--text); }
 }
+@media (max-width: 720px) { .floor-columns { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+
+.improvement-list, .lane-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 8px; }
+.improvement { border: 1px solid var(--line); border-radius: 10px; background: var(--row); padding: 12px; overflow-wrap: anywhere; }
+.improvement p { margin: 8px 0 0; color: var(--body); }
+.progress.four { grid-template-columns: repeat(4, 1fr); }
+.good { color: var(--good); }
+.metric { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin: 8px 0; }
+.lane-card { display: grid; gap: 7px; }
+.lane-card p { margin: 0; overflow-wrap: anywhere; }
+.share-track, .quota { position: relative; height: 8px; border-radius: 6px; background: var(--raised); overflow: visible; }
+.usage-card { margin: 10px 0; }
+.usage-card p { margin: 8px 0 0; color: var(--body); overflow-wrap: anywhere; }
+.usage-track { height: 10px; margin-top: 12px; border-radius: 8px; background: var(--raised); overflow: hidden; }
+.usage-track span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.share-track span, .quota span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.share-track i { position: absolute; left: 50%; top: -4px; height: 16px; border-left: 2px solid var(--bad); }
+.empty-state { color: var(--muted); border: 1px dashed var(--line-strong); border-radius: 10px; padding: 14px; }
+.ticket-header { margin-bottom: 18px; }
+.ticket-header h2 { margin: 8px 0; font-size: clamp(19px, 3vw, 26px); }
+.state-words { margin-top: 6px; color: var(--muted); font: 10px var(--font-mono); }
+.ticket-columns { display: grid; grid-template-columns: 260px minmax(0, 1fr) 300px; gap: 20px; align-items: start; }
+.ticket-pane { min-width: 0; }
+.ticket-pane h3 { font-size: 16px; }
+.ticket-segments { display: none; }
+.acceptance { list-style: none; margin: 0; padding: 0; }
+.acceptance li { padding: 7px 0; color: var(--muted); }
+.acceptance .checked { color: var(--good); }
+.ticket-timeline { border-left: 1px solid var(--line); padding-left: 18px; color: var(--accent); }
+.ticket-timeline span { display: block; color: var(--muted); }
+.attempts { display: flex; flex-wrap: wrap; gap: 6px; }
+.attempt-chip { display: inline-flex; min-height: 40px; align-items: center; padding: 0 10px; border: 1px solid var(--line); border-radius: 999px; font: 11px var(--font-mono); }
+.transcript-event, .transcript-brief, .tool-block { margin: 8px 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--row); }
+.transcript-event b, .transcript-brief b, .tool-block b { display: block; margin-bottom: 4px; color: var(--dim); font: 10px var(--font-mono); text-transform: uppercase; }
+.transcript-event p { margin: 0; white-space: pre-wrap; }
+.transcript-event pre, .transcript-brief pre, .tool-block pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 var(--font-mono); }
+.transcript-brief summary { cursor: pointer; }
+.transcript-brief summary span { color: var(--accent); }
+.thought { color: var(--muted); }
+.thought em { font-size: 13px; }
+.tool-result.bad { color: var(--bad); }
+.tool-result.good { color: var(--good); }
+.runner { font: 11px var(--font-mono); }
+.ticket-pane [hidden] { display: none; }
+@media (max-width: 959px) {
+  .ticket-segments { position: sticky; top: 52px; z-index: 4; display: flex; justify-content: space-around; margin: -8px -16px 12px; padding: 4px; border-bottom: 1px solid var(--line); background: var(--bg); }
+  .ticket-segments a { min-height: 44px; padding: 12px; color: var(--muted); }
+  .ticket-segments a[aria-current="true"] { color: var(--accent); }
+  .ticket-columns { display: block; }
+  .ticket-columns > [hidden] { display: none; }
+}

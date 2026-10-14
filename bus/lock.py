@@ -87,8 +87,17 @@ def acquire(gh: GitHub, repo: str, holder: str, minutes: int = 15,
 def release(gh: GitHub, repo: str, holder: str) -> bool:
     _check_holder(holder)
     current = _read_lock(gh, repo)
-    if current is None or current[0] != holder:
+    if current is None or current[0] != holder or current[1] is None or current[1] <= datetime.now(timezone.utc):
         return False
-    gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
-            ok=(404,))
+    # Keep the lock ref as the durable last-tick record. Expire it now so the
+    # next holder can replace it immediately through acquire's stale-lock path.
+    ref_path = "/repos/%s/git/ref/heads/%s" % (repo, LOCK_BRANCH)
+    ref = gh.rest("GET", ref_path)
+    sha = ref.data["object"]["sha"]
+    previous = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, sha)).data
+    message = re.sub(r"expires=\S+", "expires=" + datetime.now(timezone.utc).strftime(TIME_FORMAT),
+                     previous.get("message", ""))
+    commit = gh.rest("POST", "/repos/%s/git/commits" % repo, {
+        "message": message, "tree": previous["tree"]["sha"], "parents": [sha]})
+    gh.rest("PATCH", ref_path, {"sha": commit.data["sha"], "force": True})
     return True

@@ -17,7 +17,9 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
          "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
-         "opencode-go-4"]
+         "opencode-go-4",
+         # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
+         "spark-2"]
 LANES = LANES + SLOTS
 # Remote lanes pull ticket work from GitHub and have no local station inbox.
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
@@ -50,6 +52,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:briefed": {"color": "1d76db", "description": "Assigned to a lane, waiting for the station"},
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},
     "loom:pr": {"color": "0075ca", "description": "The runner opened a pull request"},
+    "loom:answered": {"color": "5319e7", "description": "The runner posted an answer for brain review"},
     "loom:ready": {"color": "0e8a16", "description": "Checks passed and review-bot threads are resolved"},
     "loom:failed": {"color": "d93f0b", "description": "The runner gave up; see the ticket"},
     "loom:merged": {"color": "8fd19e", "description": "Merged, not deployed yet"},
@@ -61,6 +64,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "loom:digest": {"color": "ededed", "description": "The issue holding the daily asks digest"},
+    "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},

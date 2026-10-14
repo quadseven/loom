@@ -24,9 +24,12 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
+from . import handoff
+from . import invariants
 from . import metrics
 from . import rewrite
 from . import revert
@@ -114,6 +117,11 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
 REPORT_CHECK = 300
+# The operator's two reading times (2026-10-14: "Twice a day. Morning and
+# evening. 10am and 9pm"): one digest of every goal's reports each, instead of
+# each report as it is posted. LOOM_REPORT_DIGEST_TIMES="" turns it off.
+DIGEST_TIMES = "10:00,21:00"
+DIGEST_FIRST_LOOKBACK = 12 * 3600
 REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
 # A backlog goal home is triaged at most this often.
@@ -226,6 +234,17 @@ IDLE_SCAN = 600
 CACHE_KEEP = 24 * 3600
 
 
+def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:
+    """Local HH:MM times from a comma or space separated list, sorted; any
+    entry that is not a valid time is left out."""
+    times = set()
+    for item in str(raw or "").replace(",", " ").split():
+        m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", item)
+        if m:
+            times.add((int(m.group(1)), int(m.group(2))))
+    return tuple(sorted(times))
+
+
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
@@ -244,8 +263,14 @@ class Settings:
                  watched: Optional[List[Tuple[str, str]]] = None,
                  rewrite_cmd: str = "",
                  rewrite_private_cmd: str = "",
-                 self_repo: str = "") -> None:
+                 self_repo: str = "",
+                 invariant_goal: str = "",
+                 plan_check: str = invariants.DEFAULT_PLAN_CHECK,
+                 report_digest: Sequence[Tuple[int, int]] = ()) -> None:
         self.home = home
+        # Local times (hour, minute) to send one digest of every goal's
+        # reports; empty forwards each report as it is posted.
+        self.report_digest = tuple(report_digest)
         self.repos = repos
         self.authors = authors
         self.owners = owners
@@ -275,6 +300,13 @@ class Settings:
         # The repo this checkout deploys from (LOOM_SELF_REPO, default the
         # lanes repo): its merged tickets ship when the station deploys them.
         self.self_repo = self_repo or status_repo
+        # owner/name#N: the goal home invariant breaches are filed on
+        # (LOOM_INVARIANT_GOAL); empty means LOOM_METRICS_GOAL when it is in
+        # the self repo, else the self repo's one goal home that is not a
+        # backlog.
+        self.invariant_goal = invariant_goal
+        # The review bot's check that reads a pull request's plan (its body).
+        self.plan_check = plan_check
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -283,6 +315,7 @@ class Settings:
 
         def words(name: str) -> List[str]:
             return env.get(name, "").replace(",", " ").split()
+        report_digest = parse_digest_times(env.get("LOOM_REPORT_DIGEST_TIMES", DIGEST_TIMES))
         try:
             hour = int(env.get("LOOM_DIGEST_HOUR", "").strip() or 9)
         except ValueError:
@@ -310,6 +343,7 @@ class Settings:
                    webhook_ssm=env.get("LOOM_DISCORD_WEBHOOK_SSM", "").strip(),
                    mention=env.get("LOOM_DISCORD_MENTION", "").strip(),
                    digest_hour=hour,
+                   report_digest=report_digest,
                    region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
                    retry_max=retry_max,
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
@@ -328,7 +362,10 @@ class Settings:
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
                    rewrite_private_cmd=env.get("LOOM_REWRITE_PRIVATE_CMD", "").strip(),
-                   self_repo=env.get("LOOM_SELF_REPO", "").strip())
+                   self_repo=env.get("LOOM_SELF_REPO", "").strip(),
+                   invariant_goal=env.get("LOOM_INVARIANT_GOAL", "").strip(),
+                   plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
+                               or invariants.DEFAULT_PLAN_CHECK))
 
 
 def _origin_repo() -> str:
@@ -671,6 +708,10 @@ class Station:
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
         self._remote_beats: Dict[str, Optional[float]] = {}
+        # Whether each repo is public, and the repo invariant breaches are
+        # filed in: what a public issue may name (_invariant_ref).
+        self._publics: Dict[str, bool] = {}
+        self._invariant_repo = ""
         # The GitHub budget as the last pass left it, and the reset it was
         # last reported low for.
         self._budget: Optional[Dict[str, Any]] = None
@@ -1394,6 +1435,9 @@ class Station:
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
         ready = self._ready_marker(comments)
+        if brain._pending_brain_fix(comments, self.s.authors):
+            self._move_fix_to_lane(repo, number, lane, names)
+            return
         if self._fix_pending(names, comments, sha):
             return
         self._clear_stale_ready(repo, number, names, ready, sha)
@@ -1550,6 +1594,9 @@ class Station:
         if not self._repo_ok(repo):
             return True
         if kind == "done":
+            if self._field(text, "Deliverable") == "answer":
+                _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
+                return True
             branch = self._field(text, "Branch")
             prs = self.gh.rest("GET", "/repos/%s/pulls?head=%s:%s&state=all"
                                % (repo, repo.split("/")[0], branch)).data
@@ -2515,8 +2562,135 @@ class Station:
             start = checked - REPORT_OVERLAP
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
 
+    def _due_digest(self) -> Optional[Tuple[str, str]]:
+        """(slot id, label) of the latest digest time today that has passed,
+        or None before the first one."""
+        local = time.localtime(self.now)
+        passed = [(h, m) for h, m in self.s.report_digest
+                  if (local.tm_hour, local.tm_min) >= (h, m)]
+        if not passed:
+            return None
+        h, m = passed[-1]
+        label = "morning" if h < 12 else ("afternoon" if h < 18 else "evening")
+        return "%s %02d:%02d" % (time.strftime("%Y-%m-%d", local), h, m), label
+
+    def _digest_lines(self, since: str, after_id: int = 0) -> Tuple[List[str], int, int]:
+        """One line per goal home whose latest report since `since` (and with
+        a comment id above after_id, so no report is told twice) says
+        something moved, the count of goal homes with nothing to say, and the
+        highest report id read."""
+        moving, quiet, top = [], 0, after_id
+        allowed = {a.lower() for a in self.s.authors}
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = self._goal_issues(repo)
+            latest: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+            for ident, issue, comment in self._report_comments(repo, issues, since):
+                author = str((comment.get("user") or {}).get("login") or "").lower()
+                if author in allowed and ident > after_id:
+                    latest[int(issue["number"])] = (issue, comment)
+                    top = max(top, ident)
+            quiet += len(issues) - len(latest)
+            for issue, comment in latest.values():
+                body = self._report_body(comment)
+                first = next((x.lstrip("#").strip() for x in body.splitlines()
+                              if x.lstrip("#").strip()), "")
+                if not first or first.lower().startswith("nothing moved"):
+                    quiet += 1
+                    continue
+                moving.append("- **%s** %s <%s>" % (
+                    self._short_name(issue), first[:SHORT_LINE_MAX],
+                    self._report_link(issue, comment)))
+        return moving, quiet, top
+
+    def _digest_factory_line(self) -> str:
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)",
+                           self.s.metrics_goal)
+        if not ref:
+            return ""
+        path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        dated = self._dated_metrics(path)
+        if not dated:
+            return ""
+        day = max(dated)
+        passed, streak = dated[day]
+        return "Factory %s: %d/9 numbers pass; streak %d of 7." % (day, passed, streak)
+
+    def _digest_send(self, text: str) -> bool:
+        """Every chunk of the digest to the channel, as the bot or through
+        the webhook; False when any chunk failed or the secret is unreadable."""
+        if self._bot_reports():
+            token = self._bot_token()
+            if token is None:
+                return False
+            for part in self._chunks(text):
+                ok, _ = self._bot(token, "POST", "/channels/%s/messages" % self.s.channel_id,
+                                  {"content": part, "allowed_mentions": {"parse": []},
+                                   "flags": SUPPRESS_EMBEDS})
+                if not ok:
+                    return False
+            return True
+        url = self._webhook()
+        if url is None:
+            return False
+        return all(self._send(url, part, mention=False) for part in self._chunks(text))
+
+    def send_report_digest(self) -> None:
+        """At each digest time, one message: the goals that moved since the
+        last digest with their report's first line and link, a count of the
+        quiet ones, and the factory's daily numbers. Sent once per time; a
+        failed send is tried again on the next pass."""
+        due = self._due_digest()
+        path = os.path.join(self.state, "reports.json")
+        ledger = _read_json(path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        if "_digest_slot" not in ledger:
+            # First pass with a digest: start from now, and count a digest
+            # time already past today as sent, so switching on mid-day sends
+            # nothing until the next digest time.
+            ledger["_digest_slot"] = due[0] if due else ""
+            ledger["_digest_since"] = self.now
+            _write_json(path, ledger)
+            return
+        if due is None:
+            return
+        slot, label = due
+        if ledger.get("_digest_slot") == slot:
+            return
+        last = ledger.get("_digest_since")
+        start = last if isinstance(last, (int, float)) and not isinstance(last, bool) \
+            else self.now - DIGEST_FIRST_LOOKBACK
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+        seen = ledger.get("_digest_last_id")
+        after = seen if isinstance(seen, int) and not isinstance(seen, bool) else 0
+        moving, quiet, top = self._digest_lines(since, after)
+        lines = ["**Loom %s digest** (%s)" % (label, slot[11:])]
+        if moving:
+            lines.append("Moving, %d goal%s:" % (len(moving), "" if len(moving) == 1 else "s"))
+            lines += moving
+        else:
+            lines.append("No goal moved since the last digest.")
+        if quiet:
+            lines.append("Quiet: %d goal%s, nothing moved." % (quiet, "" if quiet == 1 else "s"))
+        factory_line = self._digest_factory_line()
+        if factory_line:
+            lines.append(factory_line)
+        if not self._digest_send("\n".join(lines)):
+            _say("report digest %s not sent; next pass tries again" % slot)
+            return
+        ledger["_digest_slot"] = slot
+        ledger["_digest_since"] = self.now
+        ledger["_digest_last_id"] = top
+        _write_json(path, ledger)
+        _say("sent the %s report digest: %d moving, %d quiet" % (label, len(moving), quiet))
+
     def forward_reports(self) -> None:
         if not (self.s.webhook_ssm or self._bot_reports()):
+            return
+        if self.s.report_digest:
+            self.send_report_digest()
             return
         path = os.path.join(self.state, "reports.json")
         ledger = _read_json(path, {})
@@ -2713,6 +2887,219 @@ class Station:
         watch.Watcher(self.gh, repo, self.s.watched, os.path.join(self.state, "watch.json"),
                       self.now, _say, write=not self._deferred()).run()
 
+    # -- invariants -------------------------------------------------------
+    def check_invariants(self) -> None:
+        """Check the factory's own invariants on what the station reads
+        (bus/invariants.py), at most every invariants.CHECK_EVERY seconds,
+        and file one loom:invariant issue per breach on the invariant goal
+        home. Below the budget floor nothing is filed."""
+        path = os.path.join(self.state, "invariants.json")
+        state = invariants.load(path, _say)
+        checked = state.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < invariants.CHECK_EVERY:
+            return
+        state["checked"] = self.now
+        goal = self._invariant_goal()
+        self._invariant_repo = goal[0] if goal else ""
+        facts = self._invariant_facts(state)
+        breaches = invariants.check(facts, _say)
+        if breaches and goal is None:
+            _say("invariants: %d broken, but no goal home to file them on; set "
+                 "LOOM_INVARIANT_GOAL" % len(breaches))
+        if goal is not None:
+            issues = state.get("issues")
+            if not isinstance(issues, dict):
+                issues = state["issues"] = {}
+            invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
+                             write=not self._deferred()).run(breaches)
+        invariants.save(path, state)
+
+    def _invariant_goal(self) -> Optional[Tuple[str, int]]:
+        """(repo, number) of the goal home breaches are filed on: the
+        LOOM_INVARIANT_GOAL setting, else LOOM_METRICS_GOAL when it is in the
+        self repo, else the self repo's one open goal home that is not a
+        backlog; None when none of these names one."""
+        spec = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)")
+        ref = spec.fullmatch(self.s.invariant_goal)
+        if ref:
+            return ref.group(1), int(ref.group(2))
+        ref = spec.fullmatch(self.s.metrics_goal)
+        if ref and ref.group(1) == self.s.self_repo:
+            return ref.group(1), int(ref.group(2))
+        repo = self.s.self_repo
+        if not repo or not tickets.REPO_RE.fullmatch(repo):
+            return None
+        homes = [i for i in self._goal_issues(repo)
+                 if not str(i.get("title") or "").startswith("Backlog:")]
+        return (repo, int(homes[0]["number"])) if len(homes) == 1 else None
+
+    def _invariant_ref(self, repo: str, number: int, noun: str = "issue") -> invariants.Ref:
+        """A Ref whose label a public issue may carry: #N in the repo issues
+        are filed in, the repo named for another public one, and a private
+        repo named in words only."""
+        key = "%s#%d" % (repo, number)
+        if repo == self._invariant_repo:
+            return invariants.Ref(key, ("%s #%d" % (noun, number)) if noun != "issue" else "#%d" % number)
+        if repo not in self._publics:
+            self._publics[repo] = self._public(repo)
+        where = repo if self._publics[repo] else "a private repo"
+        return invariants.Ref(key, "%s %d of %s" % (noun, number, where))
+
+    def _invariant_held(self, held: Any) -> Dict[str, float]:
+        """Since when each lane now at a limit has been held: kept from the
+        last pass, now for a lane newly at a limit."""
+        held = {k: v for k, v in held.items() if self._num(v)} if isinstance(held, dict) else {}
+        return {lane: held.get(lane, self.now) for lane in self.limited_lanes()}
+
+    def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
+        """Goal homes with their sub-issue counts, and their journals and
+        marker posts; a source that cannot be read stays None."""
+        try:
+            homes = self._goal_homes()
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the goal homes: %s" % err)
+            return
+        facts.goals = [(self._invariant_ref(repo, int(g["number"])),
+                        int((g.get("sub_issues_summary") or {}).get("total") or 0))
+                       for repo, g in homes]
+        try:
+            facts.journals, facts.posts = self._invariant_comments(homes)
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the goal home comments: %s" % err)
+
+    def _invariant_facts(self, state: Dict[str, Any]) -> invariants.Facts:
+        """What the invariants read, each source on its own: one that cannot
+        be read stays None and its invariants find nothing this pass."""
+        facts = invariants.Facts(now=self.now)
+        for name, read in (("runs", self._invariant_runs),
+                           ("beats", lambda: {lane: self._remote_heartbeat(lane)
+                                              for lane in REMOTE_LANES})):
+            try:
+                setattr(facts, name, read())
+            except (GitHubError, OSError) as err:
+                _say("invariants: could not read %s: %s" % (name, err))
+        facts.held = state["held"] = self._invariant_held(state.get("held"))
+        self._invariant_goal_facts(facts)
+        seen = state.get("brain_seen")
+        newest = max([j.at for j in facts.journals or []] + ([seen] if self._num(seen) else []),
+                     default=None)
+        if newest is not None:
+            facts.brain_seen = state["brain_seen"] = newest
+        if any(self.now - since > invariants.HELD_MAX for since in facts.held.values()):
+            try:
+                facts.queued = self._invariant_queued()
+            except (GitHubError, OSError) as err:
+                _say("invariants: could not read the queued tickets: %s" % err)
+        try:
+            facts.checks = self._invariant_checks()
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the plan checks: %s" % err)
+        return facts
+
+    def _invariant_runs(self) -> List[invariants.Run]:
+        """Each lane run that ended in the last day, timed by its log (the
+        brief keeps the time it was written when it moves)."""
+        runs = []
+        for lane, kind, path, name in self._finished_briefs():
+            log = os.path.join(self.s.home, "logs", lane, name + ".log")
+            try:
+                at = os.path.getmtime(log)
+            except OSError:
+                at = os.path.getmtime(path)
+            if not 0 <= self.now - at <= invariants.DAY:
+                continue
+            reason = self._failure_reason(lane, name) if kind == "failed" else ""
+            runs.append(invariants.Run(lane, kind == "done", at, reason))
+        return runs
+
+    def _invariant_comments(self, homes: List[Tuple[str, Dict[str, Any]]]
+                            ) -> Tuple[List[invariants.Journal], List[invariants.Posted]]:
+        """The journals and marker comments trusted logins posted on each goal
+        home in the last day. The since time is whole hours, so the same URL
+        (and its kept answer) serves an hour of passes."""
+        since = int((self.now - invariants.DAY) // 3600 * 3600)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+        authors = {a.lower() for a in self.s.authors}
+        journals, posts = [], []
+        for repo, goal in homes:
+            ref = self._invariant_ref(repo, int(goal["number"]))
+            for c in self.gh.paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
+                                      % (repo, int(goal["number"]), stamp)):
+                if not isinstance(c, dict) or tickets._login(c.get("user")).lower() not in authors:
+                    continue
+                at = self._epoch(str(c.get("created_at") or ""))
+                body = str(c.get("body") or "").lstrip()
+                if at is None or not 0 <= self.now - at <= invariants.DAY:
+                    continue
+                if body.startswith(JOURNAL_MARKER):
+                    tick = re.search(r"^Tick (\S+),", body, re.M)
+                    journals.append(invariants.Journal(
+                        at, ref, handoff.journal_holder({"body": body}),
+                        tick.group(1) if tick else "", invariants.failed_steps(body)))
+                elif body.startswith(metrics.MARKER):
+                    day = re.match(re.escape(metrics.MARKER) + r"\n(\d{4}-\d{2}-\d{2}):", body)
+                    posts.append(invariants.Posted(ref, "metrics", at, day.group(1) if day
+                                                   else time.strftime("%Y-%m-%d", time.gmtime(at))))
+                elif body.startswith(REPORT_MARKER):
+                    posts.append(invariants.Posted(ref, "report", at, ""))
+        return journals, posts
+
+    def _invariant_queued(self) -> List[Tuple[invariants.Ref, Tuple[str, ...]]]:
+        """Each trusted queued ticket and the lanes of its difficulty tier."""
+        authors = {a.lower() for a in self.s.authors}
+        out = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            for issue in self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo):
+                if (not isinstance(issue, dict) or "pull_request" in issue
+                        or "loom:queued" not in _label_names(issue)
+                        or tickets._login(issue.get("user")).lower() not in authors):
+                    continue
+                ref = self._invariant_ref(repo, int(issue["number"]))
+                if repo not in self._publics:
+                    self._publics[repo] = self._public(repo)
+                out.append((ref, factory.tier_lanes(issue, not self._publics[repo])))
+        return out
+
+    def _invariant_checks(self) -> List[invariants.Check]:
+        """The newest completed plan check on each open, trusted lane pull
+        request's head commit."""
+        authors = {a.lower() for a in self.s.authors}
+        out = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            for pr in self._open_pulls(repo):
+                if self._trusted_lane_pull(pr, authors):
+                    check = self._plan_check_of(repo, pr)
+                    if check is not None:
+                        out.append(check)
+        return out
+
+    @staticmethod
+    def _trusted_lane_pull(pr: Dict[str, Any], authors: set) -> bool:
+        head = pr.get("head") or {}
+        return bool(not pr.get("draft") and str(head.get("ref") or "").startswith("loom/")
+                    and head.get("sha") and tickets._login(pr.get("user")).lower() in authors)
+
+    def _plan_check_of(self, repo: str, pr: Dict[str, Any]) -> Optional[invariants.Check]:
+        """The newest completed plan check run on the pull request's head, or None."""
+        data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?check_name=%s&per_page=100"
+                            % (repo, pr["head"]["sha"], quote(self.s.plan_check, safe=""))).data
+        runs = [r for r in (data or {}).get("check_runs") or []
+                if isinstance(r, dict) and r.get("name") == self.s.plan_check
+                and r.get("status") == "completed"
+                and self._epoch(str(r.get("completed_at") or "")) is not None]
+        if not runs:
+            return None
+        run = max(runs, key=lambda r: str(r.get("completed_at")))
+        return invariants.Check(
+            self._invariant_ref(repo, int(pr["number"]), "pull request"),
+            self.s.plan_check, str(run.get("conclusion") or ""),
+            self._epoch(str(run["completed_at"])) or 0.0,
+            str((run.get("output") or {}).get("title") or ""))
+
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
         """(ledger key, brain tick start or None, body builder) for every
@@ -2866,13 +3253,24 @@ class Station:
         if ledger["state"] != "overdue":
             return
         children = brain.goal_children(self.gh, repo, number)
-        body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")))
+        breaches = (self._open_breaches(repo, number)
+                    if (repo, number) == self._invariant_goal() else None)
+        body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
+                                          breaches)
         brain._check_written_text(body)
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                      {"body": body})
         state[key] = self.now
 
-    def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None) -> str:
+    def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
+        """The open loom:invariant issues filed on the goal home."""
+        return [i for i in self.gh.paginate("/repos/%s/issues?labels=%s&state=open"
+                                            % (repo, invariants.LABEL))
+                if isinstance(i, dict) and "pull_request" not in i
+                and brain._names_goal(i.get("body"), goal)]
+
+    def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
+                              breaches: Optional[List[Dict[str, Any]]] = None) -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
         counts = [(len(groups[k]), word) for k, word in (
@@ -2885,7 +3283,9 @@ class Station:
             "", "### Going well", "Merged: %s. Verified: %s. Shipped: %s." %
             (rows(groups["merged"]), rows(groups["verified"]),
              rows(groups["sent_back"])), "",
-            "### Not going well", "Failed: %s." % rows(groups["failed"]), "",
+            "### Not going well", "Failed: %s." % rows(groups["failed"])]
+            + (["Invariants broken: %s." % rows(breaches)] if breaches is not None else [])
+            + ["",
             "### Still stuck", "Past the stuck age in PR: %s." %
             rows(groups["aged_pr"]), "",
             "### Next", "In flight: %s." % rows(groups["in_flight"]),
@@ -3390,7 +3790,8 @@ class Station:
         dated = self._dated_metrics(path)
         if today not in dated:
             self._post_metrics_comment(path, today, dated)
-        if today in dated:
+        if today in dated and not self.s.report_digest:
+            # With a report digest the day's numbers ride in it instead.
             passed, streak = dated[today]
             line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
             self._metrics_notice(today, "discord", line)
@@ -3531,7 +3932,7 @@ class Station:
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
-                     self.watch_default_branches, self.run_factory):
+                     self.watch_default_branches, self.run_factory, self.check_invariants):
             if self._deferred():
                 break
             try:
@@ -3547,9 +3948,26 @@ class Station:
         except OSError as err:
             _say("prune_trees failed: %s" % err)
         try:
-            usage.write(self.s.home, usage.collect(self.s.home, now=self.now))
+            records = usage.collect(self.s.home, now=self.now)
+            usage.write(self.s.home, records)
+            self.upload_usage_limits(records)
         except OSError as err:
             _say("could not write usage limits: %s" % err)
+
+    def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
+        """Send the current limits snapshot using the transcript upload token."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        url = self.s.transcript_url.removesuffix("/api/transcripts") + "/api/usage"
+        token = self._transcript_token()
+        if token is None:
+            return
+        try:
+            self.upload(url, token, records)
+        except UploadRefused as err:
+            _say("the dashboard refused the usage snapshot (%d)" % err.status)
+        except Exception as err:  # noqa: BLE001
+            _say("usage snapshot upload failed (%s)" % type(err).__name__)
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:

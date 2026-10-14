@@ -32,6 +32,9 @@ class Fake:
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 
+    def assert_all_used(self):
+        assert not self.replies, "unused replies: %s" % self.replies
+
 
 def goal():
     return {"number": 1, "id": 101, "state": "open", "title": "Goal", "labels": [{"name": "loom:goal"}]}
@@ -45,6 +48,56 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
 
 
 class BrainTests(unittest.TestCase):
+    def test_tick_step_records_and_reads_step_and_refuses_a_non_holder(self):
+        now = brain.datetime(2030, 1, 1, 12, 0, tzinfo=brain.timezone.utc)
+        original = {"object": {"sha": "old"}}
+        commit = {"message": "holder=muse expires=2030-01-01T13:00:00Z",
+                  "tree": {"sha": "tree"}}
+        fake = Fake(reply(200, original), reply(200, commit),
+                    reply(200, original), reply(200, commit),
+                    reply(200, {"sha": "new"}), reply(200, {}),
+                    reply(200, original), reply(200, commit),
+                    reply(200, original), reply(200, commit))
+        gh = GitHub("t", transport=fake)
+        saved = brain.tick_step(gh, REPO, "merge", "reviewing changes", "muse", now)
+        self.assertEqual((saved["step"], saved["step_index"]), ("merge", 3))
+        self.assertEqual(saved["notes"], [{"ts": "2030-01-01T12:00:00Z", "step": "merge", "text": "reviewing changes"}])
+        self.assertIn('"step_index":3', fake.calls[4][2]["message"])
+        with self.assertRaisesRegex(ValueError, "does not hold the lock"):
+            brain.tick_step(gh, REPO, "verify", holder="intruder", now=now)
+
+    def test_tick_step_show_reads_the_recorded_json_payload(self):
+        saved = {"started_at": "2030-01-01T12:00:00Z", "step": "merge",
+                 "step_index": 3, "notes": [{"ts": "2030-01-01T12:01:00Z",
+                 "step": "merge", "text": "checking"}]}
+        message = "holder=muse expires=2030-01-01T13:00:00Z\nloom:tick=" + json.dumps(saved)
+        gh = GitHub("t", transport=Fake(reply(200, {"object": {"sha": "c"}}),
+                                         reply(200, {"message": message})))
+        record = brain.tick_step(gh, REPO)
+        self.assertEqual(record["holder"], "muse")
+        self.assertEqual(record["step_index"], 3)
+        self.assertEqual(record["notes"][0]["text"], "checking")
+
+    def test_tick_step_show_returns_null_record_when_commit_is_missing(self):
+        gh = GitHub("t", transport=Fake(reply(200, {"object": {"sha": "gone"}}),
+                                         reply(404, {"message": "Not Found"})))
+        record = brain.tick_step(gh, REPO)
+        self.assertIsNone(record["holder"])
+        self.assertIsNone(record["step"])
+        self.assertEqual(record["notes"], [])
+
+    def test_step_github_failure_is_logged_and_command_succeeds(self):
+        class Broken:
+            requests = 0
+            def rest(self, *args, **kwargs):
+                self.requests += 1
+                raise GitHubError("offline")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            brain._cmd_step(Broken(), brain.argparse.Namespace(
+                lock_repo=REPO, name="merge", note=None, holder="muse", show=False))
+        self.assertIn("brain step write failed", err.getvalue())
+
     def test_goal_trunk_reads_the_trunk_line_from_a_goal_body(self):
         self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
@@ -88,6 +141,15 @@ class BrainTests(unittest.TestCase):
         lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
+
+    def test_status_lists_open_invariant_issues_for_the_report(self):
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 7, "title": "Lane spark: 12 runs in 24 hours and none done",
+                         "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}]}]),
+            reply(200, []), reply(200, [])))
+        lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
+        at = lines.index(brain.INVARIANTS_HEADING)
+        self.assertEqual(lines[at + 1], "- #7 Lane spark: 12 runs in 24 hours and none done")
 
     def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
@@ -418,6 +480,16 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
 
+    def test_a_remote_lane_is_refused_for_any_state_but_queued(self):
+        # A limit hand-off or a fix round (briefed) must never land on a
+        # remote lane, which claims only new queued tickets.
+        for state in ("briefed", "running", "pr"):
+            with self.subTest(state=state):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "only works with --to queued"):
+                    brain.move(GitHub("t", transport=fake), REPO, 8, state, "muse")
+                self.assertEqual(fake.calls, [])
+
     def test_move_keeps_labels_and_swaps_lane(self):
         fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}, {"name": "lane:agy"}, {"name": "custom"}]}), reply(200, []))
         gh = GitHub("t", transport=fake)
@@ -453,6 +525,63 @@ class BrainTests(unittest.TestCase):
         fake = Fake(reply(200, {"state": "open", "labels": []}))
         with self.assertRaises(ValueError):
             brain.move(GitHub("t", transport=fake), REPO, 8, "queued", "codex")
+
+    def test_move_remote_lane_with_private_repo_raises_error(self):
+        repo = "org/private-repo"
+        fake = Fake(
+            reply(200, {"state": "open", "labels": []}),
+            reply(200, {"private": True})
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, repo, 8, "queued", "muse")
+        self.assertIn("this repo is private", str(ctx.exception))
+        self.assertIn("public", str(ctx.exception))
+        fake.assert_all_used()
+        self.assertFalse(any(call[0] in ("PUT", "POST", "PATCH", "DELETE") for call in fake.calls))
+
+    def test_move_remote_lane_with_non_queued_state_raises_error(self):
+        fake = Fake()
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "briefed", "muse")
+        self.assertIn("remote lane muse only works with --to queued", str(ctx.exception))
+        fake.assert_all_used()
+
+    def test_move_local_lane_with_queued_state_raises_error(self):
+        fake = Fake()
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "queued", "codex")
+        self.assertIn("local lane codex: use --to briefed instead", str(ctx.exception))
+        fake.assert_all_used()
+
+    def test_move_remote_lane_on_public_repo_succeeds(self):
+        fake = Fake(
+            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"private": False}),
+            reply(200, []),
+            reply(200, {}),
+            reply(201, {})
+        )
+        gh = GitHub("t", transport=fake)
+        brain.move(gh, REPO, 8, "queued", "muse", note="moving to muse")
+        self.assertEqual(len(fake.calls), 5)
+        self.assertEqual(fake.calls[3][2], {"labels": ["loom:ticket", "loom:queued", "lane:muse"]})
+        self.assertEqual(fake.calls[4][2], {"body": "moving to muse"})
+        fake.assert_all_used()
+
+    def test_move_remote_lane_with_pull_request_refuses(self):
+        fake = Fake(
+            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"private": False}),
+            reply(200, [{"number": 12, "state": "open"}])
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "queued", "muse")
+        self.assertIn("already has a pull request", str(ctx.exception))
+        fake.assert_all_used()
 
     def _merge_replies(self, changes=None):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
@@ -780,6 +909,31 @@ class FixTests(unittest.TestCase):
         self.refused(fix_pr(), fix_ticket("merged"))
         self.refused(fix_pr(), dict(fix_ticket(), state="closed"))
 
+    def test_fix_accepts_a_running_ticket_and_marks_it_as_a_brain_fix(self):
+        runs = {"check_runs": []}
+        threads = {"reviewThreads": {"nodes": []}}
+        fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("running")),
+                    reply(200, runs), reply(200, {"statuses": []}),
+                    reply(200, {"data": {"repository": {"pullRequest": threads}}}),
+                    reply(201, {}))
+        brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "fix this")
+        posted = next(c for c in fake.calls if c[0] == "POST" and "/comments" in c[1])
+        self.assertIn(brain.BRAIN_FIX_MARKER, posted[2]["body"])
+        self.assertFalse(any(c[0] == "PUT" for c in fake.calls))
+
+    def test_pending_brain_fix_is_replaced_by_the_newest_until_a_claim(self):
+        comments = [
+            {"user": {"login": "alice-example"},
+             "body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> first"},
+            {"user": {"login": "alice-example"},
+             "body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> second"},
+        ]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+        self.assertFalse(brain._pending_brain_fix(comments + [
+            {"user": {"login": "station"},
+             "body": "Claimed for lane codex (body sha256 0123456789ab)"}],
+            ["alice-example"]))
+
     def test_fix_refuses_notes_the_brain_must_never_post(self):
         with self.assertRaises(ValueError):
             brain.fix(GitHub("t", transport=Fake()), REPO, 8, (REPO, 9), "This does not fix #9")
@@ -828,7 +982,7 @@ class FixTests(unittest.TestCase):
         self.assertNotIn("unittest", body)
         self.assertEqual(put[0], "PUT")
         self.assertEqual(put[2], {"labels": ["loom:ticket", "lane:codex", "custom", "loom:briefed"]})
-        # What the station will read back from it.
+         # What the station will read back from it.
         fix = tickets.parse_fix(REPO, body)
         self.assertEqual((fix.pr, fix.branch), (8, "loom/9-work"))
         self.assertIn("\n    ## Why\n", fix.findings)
@@ -842,6 +996,15 @@ class TextAndCloseTests(unittest.TestCase):
 
     def test_slash_commands_without_the_at_sign_pass(self):
         text.check("/%s improve" % text.REVIEW_BOT_SHORT_NAME)
+
+    def test_an_operator_note_with_phone_punctuation_passes(self):
+        # A phone keyboard types curly quotes; the shared checks must not
+        # refuse them. Only the lane answer path requires ASCII.
+        text.check("Don\u2019t stop the \u201cbig\u201d run")
+
+    def test_an_absolute_local_path_is_refused(self):
+        with self.assertRaises(ValueError):
+            text.check("see /Users/someone/notes.txt")
 
     def test_close_completed_needs_verified(self):
         fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}))
@@ -1070,7 +1233,7 @@ class ModelFlagTests(unittest.TestCase):
         self.assertEqual(order, ["PATCH", "PUT"])
 
     def test_fix_refuses_an_unknown_lane_or_bad_model(self):
-        for kw in (dict(lane="bogus"), dict(model="bad model")):
+        for kw in (dict(lane="bogus"), dict(lane="muse"), dict(model="bad model")):
             fake = Fake()
             with self.assertRaises(ValueError):
                 brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "n", **kw)
@@ -1938,6 +2101,16 @@ class RegressionSlotTests(unittest.TestCase):
         args = brain.parser().parse_args(["brief", REPO, "--goal", "1", "--title", "T",
                                           "--file", "b.md", "--regresses", "5"])
         self.assertEqual(args.regresses, 5)
+
+
+class AnsweredStatusTests(unittest.TestCase):
+    def test_answered_tickets_have_a_brain_status_section(self):
+        issue = {"number": 17, "title": "Diagnosis", "created_at": "2026-10-14T00:00:00Z",
+                 "labels": [{"name": label} for label in
+                            ("loom:ticket", "loom:answered", "lane:codex")]}
+        lines = brain._ticket_lines([issue], datetime(2026, 10, 14, tzinfo=timezone.utc))
+        index = lines.index("#### answered")
+        self.assertEqual(lines[index + 1], "- #17 Diagnosis - lane:codex - 0h")
 
 
 if __name__ == "__main__":
