@@ -103,7 +103,7 @@
       if (stopped || document.hidden || running) return;
       running = true;
       try {
-        const response = await fetch(url, { headers: { Accept: 'application/json' } });
+        const response = await fetch(typeof url === 'function' ? url() : url, { headers: { Accept: 'application/json' } });
         if (!response.ok) throw new Error(`Poll failed: ${response.status}`);
         onData(await response.json());
       } catch (error) {
@@ -131,4 +131,40 @@
       document.removeEventListener('visibilitychange', schedule);
     };
   };
+
+  const thoughtToggle = document.querySelector('[data-thought-toggle]');
+  thoughtToggle?.addEventListener('change', () => {
+    document.querySelectorAll('[data-thought]').forEach((row) => { row.hidden = !thoughtToggle.checked; });
+  });
+  document.querySelectorAll('[data-ticket-tab]').forEach((tab) => {
+    tab.addEventListener('click', (event) => {
+      if (window.matchMedia('(max-width: 959px)').matches) {
+        event.preventDefault();
+        document.querySelectorAll('[data-pane]').forEach((pane) => {
+          pane.hidden = pane.dataset.pane !== tab.dataset.ticketTab;
+        });
+        document.querySelectorAll('[data-ticket-tab]').forEach((item) => item.setAttribute('aria-current', String(item === tab)));
+        updateQuery('tab', tab.dataset.ticketTab);
+      }
+    });
+  });
+  const initialTab = new URL(window.location.href).searchParams.get('tab') || 'transcript';
+  if (window.matchMedia('(max-width: 959px)').matches) {
+    document.querySelectorAll('[data-pane]').forEach((pane) => { pane.hidden = pane.dataset.pane !== initialTab; });
+  }
+  const liveRun = document.querySelector('.run-events[data-running="true"][data-run]');
+  if (liveRun && liveRun.dataset.run) {
+    let after = '';
+    const eventsUrl = () => `/api/tickets/${window.location.pathname.split('/').slice(2).join('/')}/runs/${encodeURIComponent(liveRun.dataset.run)}${after ? `?after=${encodeURIComponent(after)}` : ''}`;
+    window.loomPoll(eventsUrl, 5000, (payload) => {
+      (payload.events || []).forEach((event) => {
+        const row = document.createElement('div');
+        row.className = `transcript-event ${event.role === 'thinking' ? 'thought' : ''}`;
+        if (event.role === 'thinking') row.dataset.thought = '';
+        const label = document.createElement('b'); label.textContent = event.role === 'runner' ? 'runner' : event.role === 'user' ? 'brief' : 'said';
+        const content = document.createElement('p'); content.textContent = event.text || '';
+        row.append(label, content); liveRun.append(row); after = event.ts || after;
+      });
+    });
+  }
 })();
