@@ -2542,6 +2542,20 @@ class ReportDigestTest(Base):
             self.at(10, minute)
         self.assertEqual(self.sent, [])
 
+    def test_the_digest_carries_the_latest_daily_factory_numbers(self):
+        self.goal(40, "Goal forty")
+        self.settings.metrics_goal = "%s#40" % REPO
+        self.fake.comments[40].append({"id": 90, "body": "<!-- loom:metrics v1 -->\n2026-10-13: 3/9 pass; streak 0 day(s)",
+                                       "user": {"login": AUTHORS[0]}})
+        self.fake.comments[40].append({"id": 91, "body": "<!-- loom:metrics v1 -->\n2026-10-14: 4/9 pass; streak 0 day(s)",
+                                       "user": {"login": AUTHORS[0]}})
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=self.base + 10 * 3600, read_secret=lambda n, r: URL,
+                             post=lambda url, payload: None)
+        self.assertEqual(st._digest_factory_line(), "Factory 2026-10-14: 4/9 numbers pass; streak 0 of 7.")
+        self.settings.metrics_goal = ""
+        self.assertEqual(st._digest_factory_line(), "")
+
     def test_digest_times_parse_and_turn_off(self):
         self.assertEqual(station.parse_digest_times("10:00, 21:00"), ((10, 0), (21, 0)))
         self.assertEqual(station.parse_digest_times("25:00 9:5 x"), ())
