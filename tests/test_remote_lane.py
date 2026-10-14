@@ -151,6 +151,19 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertFalse([c for c in gh.calls if c[0] == "POST" and c[1].endswith("/pulls")])
 
 
+class TakesTest(unittest.TestCase):
+    def test_a_queued_ticket_with_no_or_empty_body_is_skipped_not_a_crash(self):
+        # tickets.parse returns (headers, rest) for any body, so [0] is a
+        # dict ({} here) and the ticket is skipped for having no Difficulty.
+        for body in (None, "", "no headers here"):
+            with self.subTest(body=body):
+                item = {"number": 5, "body": body,
+                        "labels": [{"name": "loom:queued"}, {"name": "lane:muse"}]}
+                self.assertFalse(lane._takes(item, "muse"))
+        item["body"] = "Difficulty: easy\n\n## What\nx"
+        self.assertTrue(lane._takes(item, "muse"))
+
+
 class RemoteBeatTests(unittest.TestCase):
     def test_a_remote_lane_counts_as_up_for_its_own_window(self):
         # Muse ticks about every 30 minutes; a 40-minute-old beat is up for
