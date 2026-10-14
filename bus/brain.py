@@ -696,6 +696,28 @@ def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
 
+_REPO_REF = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#\d+")
+
+
+def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
+    """A public repo's ticket names another repo's issue in words: its PR body
+    repeats the ticket, and the leak scan fails an owner/name#N there that no
+    fix round can change. The repo is read only when such a reference is
+    present. A failed read is not caught: its GitHubError ends the command
+    through main's handler before anything is filed. A read that does not say
+    whether the repo is private refuses too, so the check never passes on an
+    answer it could not read."""
+    if all(m.group(1).lower() == repo.lower() for m in _REPO_REF.finditer(text)):
+        return
+    private = (gh.rest("GET", "/repos/%s" % repo).data or {}).get("private")
+    if not isinstance(private, bool):
+        raise ValueError("could not tell whether %s is public, so another repo's issue "
+                         "cannot be named as owner/name#N; name it in words" % repo)
+    if not private:
+        raise ValueError("this repo is public: name another repo's issue in words "
+                         "(for example \"issue 12 of another repo\"), not as owner/name#N")
+
+
 def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
           model: Optional[str] = None, base: Optional[str] = None,
@@ -725,6 +747,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if refs is not None:
         body = body.rstrip("\n") + "\n\nRefs #%d\n" % refs
     _check_written_text(title + "\n" + body)
+    _check_no_foreign_refs(gh, repo, title + "\n" + body)
     if refs is not None:
         _check_rewritable(gh, repo, refs)
     goal_issue: Optional[Dict[str, Any]] = None
@@ -1385,9 +1408,10 @@ def _quoted(text: str) -> List[str]:
             for l in lines] or ["    (empty)"]
 
 
-def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
-    """The last lines of a GitHub Actions job's log, or None. GitHub answers
-    with a redirect to a signed URL, fetched without the token."""
+def _job_log(gh: GitHub, repo: str, job_id: int) -> Optional[List[str]]:
+    """A GitHub Actions job's log lines without timestamps or colours, or
+    None. GitHub answers with a redirect to a signed URL, fetched without the
+    token."""
     resp = gh.rest("GET", "/repos/%s/actions/jobs/%d/logs" % (repo, job_id), ok=(302,))
     where = resp.headers.get("location", "")
     if resp.status != 302 or not where.startswith("https://"):
@@ -1396,9 +1420,14 @@ def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
     status, _, raw = gh.transport("GET", where, {"User-Agent": "loom-bus"}, None)
     if status != 200:
         return None
-    lines = [_LOG_STAMP.sub("", _ANSI.sub("", l))
-             for l in (raw or b"").decode("utf-8", "replace").splitlines()]
-    return "\n".join(lines[-LOG_LINES:])
+    return [_LOG_STAMP.sub("", _ANSI.sub("", l))
+            for l in (raw or b"").decode("utf-8", "replace").splitlines()]
+
+
+def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
+    """The last lines of a GitHub Actions job's log, or None."""
+    lines = _job_log(gh, repo, job_id)
+    return None if lines is None else "\n".join(lines[-LOG_LINES:])
 
 
 def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
