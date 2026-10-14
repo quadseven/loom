@@ -979,6 +979,36 @@ class TrustTest(unittest.TestCase):
 
 
 class ClaimTest(Base):
+    def test_a_mismatched_model_moves_to_a_compatible_lane_before_claim(self):
+        self.heartbeat("opencode-go-3")
+        self.heartbeat("claude")
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        self.run_pass()
+        self.assertEqual(self.listing("opencode-go-3"), [])
+        self.assertEqual(self.listing("claude"), ["example-owner.example-repo-12.md"])
+        self.assertIn("lane:claude", self.fake.names(12))
+        self.assertIn("Claimed for lane claude", self.fake.comments[12][-1]["body"])
+
+    def test_a_mismatched_model_waits_queued_without_a_free_compatible_lane(self):
+        self.heartbeat("opencode-go-3")
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        self.run_pass()
+        self.assertEqual(self.listing("opencode-go-3"), [])
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("claude-sonnet-5-5", self.fake.comments[12][-1]["body"])
+        self.assertEqual(self.fake.issues[12]["body"], body)
+
+    def test_a_mismatched_model_is_queued_even_when_no_lane_is_free(self):
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        self.write(self.inbox("codex", "other.md"), "busy\n")
+        self.run_pass()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12][-1]["body"],
+                         "Model claude-sonnet-5-5 waits for a free compatible lane.")
+
     def test_a_trusted_ticket_becomes_a_brief_and_is_claimed(self):
         self.fake.add(12)
         self.run_pass()
@@ -1803,7 +1833,9 @@ class OutcomeTest(Base):
         self.assertNotIn("agent exited 1", body)
 
     def limited(self, lane="spark", fix_body=None):
-        self.fake.add(12, state="running", lane=lane)
+        self.fake.add(12, state="running", lane=lane,
+                      body=BODY.replace("Model: model-x", "Model: spark/test")
+                      if lane == "spark" else BODY)
         self.fake.comments[99] = []
         fix = tickets.parse_fix(REPO, fix_body) if fix_body else None
         name = tickets.ticket_name(REPO, 12, 1)
@@ -2046,7 +2078,8 @@ class SpendTest(Base):
         self.assertFalse(st._heartbeat_ok("anthropic"))
         self.assertFalse(st._heartbeat_ok("anthropic-4"))
         self.assertTrue(st._heartbeat_ok("codex"))
-        self.fake.add(12, lane="anthropic-4")
+        self.fake.add(12, lane="anthropic-4",
+                      body=BODY.replace("Model: model-x", "Model: claude-sonnet-5-5"))
         st.run_pass()
         self.assertEqual(self.listing("anthropic-4"), [])
         self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
