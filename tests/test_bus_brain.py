@@ -32,6 +32,9 @@ class Fake:
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 
+    def assert_all_used(self):
+        assert not self.replies, "unused replies: %s" % self.replies
+
 
 def goal():
     return {"number": 1, "id": 101, "state": "open", "title": "Goal", "labels": [{"name": "loom:goal"}]}
@@ -436,6 +439,44 @@ class BrainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             brain.move(GitHub("t", transport=fake), REPO, 8, "queued", "codex")
 
+    def test_move_remote_lane_with_private_repo_raises_error(self):
+        repo = "org/private-repo"
+        fake = Fake(
+            reply(200, {"state": "open", "labels": []}),
+            reply(200, {"private": True})
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, repo, 8, "queued", "muse")
+        self.assertIn("this repo is public", str(ctx.exception))
+        fake.assert_all_used()
+
+    def test_move_remote_lane_with_non_queued_state_raises_error(self):
+        fake = Fake(reply(200, {"state": "open", "labels": []}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "briefed", "muse")
+        self.assertIn("remote lane muse only works with --to queued", str(ctx.exception))
+        fake.assert_all_used()
+
+    def test_move_local_lane_with_queued_state_raises_error(self):
+        fake = Fake(reply(200, {"state": "open", "labels": []}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "queued", "codex")
+        self.assertIn("local lane codex: use --to briefed instead", str(ctx.exception))
+        fake.assert_all_used()
+
+    def test_move_remote_lane_on_public_repo_succeeds(self):
+        fake = Fake(
+            reply(200, {"private": False}),
+            reply(200, {"state": "open", "labels": []})
+        )
+        gh = GitHub("t", transport=fake)
+        brain.move(gh, REPO, 8, "queued", "muse")
+        self.assertEqual(len(fake.calls), 2)
+        fake.assert_all_used()
+
     def _merge_replies(self, changes=None):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
         details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}}
@@ -810,10 +851,48 @@ class FixTests(unittest.TestCase):
         self.assertNotIn("unittest", body)
         self.assertEqual(put[0], "PUT")
         self.assertEqual(put[2], {"labels": ["loom:ticket", "lane:codex", "custom", "loom:briefed"]})
-        # What the station will read back from it.
+         # What the station will read back from it.
         fix = tickets.parse_fix(REPO, body)
         self.assertEqual((fix.pr, fix.branch), (8, "loom/9-work"))
         self.assertIn("\n    ## Why\n", fix.findings)
+
+    def test_move_remote_lane_remote_valid(self):
+        gh = GitHub("t", transport=Fake([
+            {"method": "GET", "path": "/repos/quadseven/loom", "reply": {"private": False}},
+            {"method": "GET", "path": "/repos/quadseven/loom/issues/1", "reply": {
+                "id": 1, "number": 1, "title": "Test", "state": "open",
+                "labels": [{"name": "loom:ticket"}, {"name": "lane:codex"}]
+            }},
+            {"method": "PATCH", "path": "/repos/quadseven/loom/issues/1", "reply": {
+                "id": 1, "number": 1, "title": "Test", "state": "open",
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}, {"name": "lane:muse"}]
+            }},
+        ]))
+        move(gh, REPO, 1, "queued", "muse", None, None)
+        calls = gh.transport._calls
+        _patch = [c for c in calls if c["method"] == "PATCH"]
+        self.assertEqual(len(_patch), 1)
+        self.assertIn({"name": "loom:queued"}, _patch[0]["data"]["labels"])
+        self.assertIn({"name": "lane:muse"}, _patch[0]["data"]["labels"])
+
+    def test_move_remote_lane_private_repo_refuses(self):
+        gh = GitHub("t", transport=Fake([
+            {"method": "GET", "path": "/repos/quadseven/loom", "reply": {"private": True}},
+        ]))
+        with self.assertRaises(ValueError) as ctx:
+            move(gh, REPO, 1, "queued", "muse", None, None)
+        self.assertIn("this repo is public", str(ctx.exception))
+
+    def test_move_local_lane_to_queued_refuses(self):
+        gh = GitHub("t", transport=Fake([
+            {"method": "GET", "path": "/repos/quadseven/loom/issues/1", "reply": {
+                "id": 1, "number": 1, "title": "Test", "state": "open",
+                "labels": [{"name": "loom:ticket"}, {"name": "lane:codex"}]
+            }},
+        ]))
+        with self.assertRaises(ValueError) as ctx:
+            move(gh, REPO, 1, "queued", "codex", None, None)
+        self.assertIn("local lane codex: use --to briefed instead", str(ctx.exception))
 
 
 class TextAndCloseTests(unittest.TestCase):

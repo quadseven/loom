@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
 from . import change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
-from .labels import ESCALATION, LANES, rung_lanes
+from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
@@ -1160,10 +1160,13 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
                      model: Optional[str] = None) -> None:
     if state not in STATES:
         raise ValueError("invalid state")
-    if lane is not None and (state != "briefed" or lane not in LANES):
-        raise ValueError("lane is valid only for briefed and must be known")
+    if lane is not None:
+        if lane in REMOTE_LANES and state != "queued":
+            raise ValueError("remote lane %s only works with --to queued" % lane)
+        if lane not in LANES and lane not in REMOTE_LANES:
+            raise ValueError("lane is valid only for briefed and must be known")
     if model is not None and state != "briefed":
-        raise ValueError("model is valid only for briefed")
+        raise ValueError("model is valid only for briefing")
     _check_model(model)
     if note is not None:
         _check_written_text(note)
@@ -1248,6 +1251,17 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     _check_move_args(state, lane, note, model)
     if (state == "verified") != (record is not None):
         raise ValueError("verified needs a proof record, and no other state takes one")
+    
+    if lane in REMOTE_LANES:
+        if state != "queued":
+            raise ValueError("remote lane %s only works with --to queued" % lane)
+        repo_info = gh.rest("GET", "/repos/%s" % repo).data
+        if repo_info.get("private") is True:
+            raise ValueError("this repo is public: name another repo's issue in words instead of a link")
+    
+    if state == "queued" and lane not in REMOTE_LANES:
+        raise ValueError("local lane %s: use --to briefed instead" % lane)
+    
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
