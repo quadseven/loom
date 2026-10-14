@@ -22,7 +22,11 @@ jobs:
       - name: coreutils timeout
         run: command -v timeout || brew install coreutils
       - name: unittest (no test may skip)
+        # bash with pipefail: without it the step's status is tee's, and a
+        # failing suite passed CI (the default macOS shell is bash -e only).
+        shell: bash
         run: |
+          set -o pipefail
           python -B -m unittest discover -s tests -v 2>&1 | tee unittest.out
           if grep -qE "\.\.\. skipped |skipped=[0-9]" unittest.out; then
             echo "::error::a test skipped; the sandbox tests must run in CI"
