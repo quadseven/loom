@@ -433,6 +433,15 @@ class BrainTests(unittest.TestCase):
             brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "opencode-go-3")
         self.assertEqual(len(fake.calls), 1)
 
+    def test_move_does_not_echo_an_invalid_model_from_the_issue(self):
+        issue = {"state": "open", "body": "Model: claude-sonnet-5-5\x1b[31m\n\nWork.",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:briefed"},
+                            {"name": "lane:claude"}]}
+        fake = Fake(reply(200, issue))
+        with self.assertRaisesRegex(ValueError, "^model is not a model id$"):
+            brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "opencode-go-3")
+        self.assertEqual(len(fake.calls), 1)
+
     def test_move_refusals(self):
         for labels in ([{"name": "loom:ticket"}, {"name": "loom:queued"}],):
             fake = Fake(reply(200, {"state": "open", "labels": labels}))
