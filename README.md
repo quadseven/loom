@@ -115,4 +115,11 @@ space-separated list of `OWNER/NAME` repositories. Set
 `LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
 the dashboard also checks the standard GitHub CLI authentication. Set
 `LOOM_DASHBOARD_BUDGET_FLOOR` to change the remaining-request threshold below
-which the last ticket snapshot is served as stale. The default is 500.
+which the last ticket snapshot is served as stale. The default is 500. Set
+`LOOM_IMPROVEMENT_HOMES` to the space-separated `OWNER/NAME` repositories
+whose goal journals and child tickets feed `/improving`; set
+`LOOM_METRICS_GOAL=OWNER/NAME#N` for the daily factory numbers. Improvement
+homes may also be specific goal issues as `OWNER/NAME#N`. Set
+`LOOM_STATUS_REPO=OWNER/NAME` to read the station's lane status comment for
+`/lanes`. `.env.example` lists the dashboard variables with placeholder
+values.
