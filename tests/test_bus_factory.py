@@ -97,7 +97,10 @@ class FakeGitHub:
     def _get(self, path):
         m = re.search(r"/issues/(\d+)$", path)
         if m:
-            return Response(200, self.issues[int(m.group(1))])
+            number = int(m.group(1))
+            if number not in self.issues:
+                return Response(404, {"message": "Not Found"})
+            return Response(200, self.issues[number])
         m = re.search(r"/pulls/(\d+)$", path)
         if m:
             return Response(200, self.pulls[int(m.group(1))])
@@ -1019,6 +1022,46 @@ class Tickets(Base):
                               "created_at": iso(factory.BRIEFED_STALL + 600)}]
         self.go()
         self.assertEqual(self.model(7), None)
+
+    def waiting(self, number=7, age=None, dependency="pr"):
+        """A briefed ticket that waits on ticket 5, briefed `age` seconds ago."""
+        self.gh.ticket(5, dependency)
+        self.gh.ticket(number, "briefed", body="After: #5\nDifficulty: easy\n\n## Why\nx\n")
+        self.gh.events[number] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                                   "created_at": iso(factory.BRIEFED_STALL + 600
+                                                     if age is None else age)}]
+        return number
+
+    def test_a_ticket_waiting_on_another_never_counts_as_stalled(self):
+        self.waiting()
+        self.go()
+        self.assertEqual((self.model(7), self.lane(7)), (None, "codex"))
+        self.assertEqual(self.moved, [])
+        self.assertEqual(self.gh.comments[7], [])
+
+    def test_a_hold_of_more_than_two_days_is_reported_to_the_brain_once(self):
+        self.waiting(age=factory.HOLD_STUCK + 600)
+        self.go()
+        said = [c["body"] for c in self.gh.comments[7]]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("Held 48 hours by After: waiting for #5", said[0])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issues[7]["labels"]])
+        self.go()
+        self.assertEqual(len(self.gh.comments[7]), 1)
+
+    def test_a_hold_the_brain_already_heard_about_is_left_alone(self):
+        self.waiting(age=factory.HOLD_STUCK + 600)
+        self.gh.issues[7]["labels"].append({"name": "needs-brain"})
+        self.go()
+        self.assertEqual(self.gh.comments[7], [])
+
+    def test_a_merged_dependency_is_no_hold_and_the_ticket_stalls_as_usual(self):
+        self.waiting(dependency="merged")
+        self.go()
+        # Stalled with no hold: it moves to another easy lane, never up the ladder.
+        self.assertNotEqual(self.lane(7), "codex")
+        self.assertIsNone(self.model(7))
+        self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
 
     def test_a_claimed_or_fresh_briefed_ticket_stays(self):
         self.gh.ticket(7, "briefed")
