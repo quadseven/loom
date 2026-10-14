@@ -210,9 +210,10 @@ def render_lanes(data):
         line = "%s - %s" % (ticket_html, esc(heartbeat)) if ticket_html else esc(heartbeat)
         quota = lane.get("quota")
         quota_html = '<div class="quota"><span style="width:%d%%"></span></div>' % max(0, min(100, int(quota))) if quota is not None else '<small>quota missing</small>'
-        parts.append('<article class="card lane-card"><strong>%s</strong><span>%s / %s</span><p>%s</p>%s</article>' % (
+        reason = ('<p>%s</p>' % esc(lane["reason"])) if lane.get("reason") else ""
+        parts.append('<article class="card lane-card"><strong>%s</strong><span>%s / %s</span><p>%s</p>%s%s</article>' % (
             esc(lane["lane"]), esc(availability), esc(lane.get("model") or "model missing"),
-            line, quota_html))
+            line, reason, quota_html))
     parts.append('</div></section><section><h2>Models by tier</h2>')
     if not data.get("scoreboard"):
         parts.append('<p class="empty-state">Scoreboard is missing: no lane pull requests matched the runner footer.</p>')
