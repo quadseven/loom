@@ -110,6 +110,14 @@ XS | S | M | L
 - ...
 ```
 
+`brief` refuses a body whose pull request would fail the review bot's plan
+checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
+non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
+Out of scope), and files a Size written as a word (Small, Medium, Large) as
+its letter. Triage counts the same checks as missing sections. The runner
+writes the Size as the letter whatever the brief says, and logs any plan
+check its body still fails before it opens the pull request.
+
 The station renders the local brief from the issue: `Repo` is the issue's
 repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 <owner/name>#<number>`, then the header lines and the body. The runner adds
@@ -173,8 +181,15 @@ runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
 for a later run. Any other issue gets `loom:triage` and one comment naming
 what is missing. Triage writes labels, sub-issue links and that comment
-only: it never closes, retitles or edits an issue, because an automated
-pass over old issues over-calls work as done.
+only: it never closes or retitles an issue, and edits nothing but the one
+line below, because an automated pass over old issues over-calls work as
+done.
+
+GitHub holds at most 100 sub-issues under one issue and refuses the next one
+(422). A ticket a goal refuses that way, from `brief` or triage, gets a
+`Part of #N` line at the end of its body instead, and a goal's tickets are
+its sub-issues plus, once it holds 100, the issues whose body has that line
+(one search). The backlog board reads parentage the same way.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
@@ -603,6 +618,11 @@ Tick <UTC time>, <holder>
 - Asks: <links or none>
 - Cost: <GitHub requests>, <minutes>
 ```
+
+A step that failed or ran degraded adds a line `- Step <name>: failed <why>`
+or `- Step <name>: degraded <why>` (the step names are in docs/MUSE.md); a
+brain whose two newest ticks both carry one is an invariant breach
+(docs/LANES.md, Invariants).
 
 A journal may also carry handoff lines (docs/MUSE.md, Handing off stage
 work), each an HTML comment:

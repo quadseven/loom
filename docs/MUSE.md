@@ -73,6 +73,32 @@ tickets and pull requests like any other work.
   is already open; add the new evidence there instead.
 - Review the other brains' Loom pull requests like any lane PR.
 
+## Remote pull lane
+
+The `muse` lane runs on a remote VM and pulls its ticket from GitHub. It does
+not use the station's local brief inbox. A scheduled lane task runs these
+steps on each tick:
+
+1. Pull the Loom checkout, publish availability with
+   `python3 -m bus.lane heartbeat --lane muse`, then run
+   `python3 -m bus.lane claim --lane muse`.
+   The command returns the oldest eligible public ticket and its rendered
+   brief. If there is no work, end the tick.
+2. Clone that repository, check out the brief's `loom/<n>-<slug>` branch,
+   then read the brief and make its change.
+3. Run the repository's `.loom/validation.conf` check, commit and push the
+   branch. Keep a heartbeat current while working with
+   `python3 -m bus.lane heartbeat OWNER/NAME#N --lane muse`.
+4. Open the pull request with `python3 -m bus.lane pr OWNER/NAME#N
+   --base BASE`. The command writes the standard Intent section, class label
+   and ticket reference, then moves the ticket to `loom:pr`.
+5. Journal one line on the ticket describing the result.
+
+Claims expire after two hours without a heartbeat. A claim without a pull
+request expires after three hours and returns to `loom:queued` with a
+`[transient]` reason. The brain tick remains a separate process and follows
+the regular brain instructions above.
+
 ## Handing off stage work
 
 Every brain may stop short: out of budget, out of time, or out of scope.
@@ -232,6 +258,11 @@ live regression).
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
+   A step of this tick that failed or ran degraded gets its own line,
+   `- Step <name>: failed <why>` or `- Step <name>: degraded <why>`, with
+   the step's name from the list above (lock, status, merge, verify, failed,
+   asks, brief, triage, journal, unlock): the station files a ticket when one
+   brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
    Every 2 hours per goal (when status lists the goal as due or overdue),
    also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
@@ -240,7 +271,9 @@ live regression).
    - First line: one sentence on how the goal is doing since the last report
      (better, the same, or worse, and the one number that shows it).
    - Going well: one to three things that moved, in plain words.
-   - Not going well: one to three things that got worse or failed.
+   - Not going well: one to three things that got worse or failed, and
+     on the goal home the station files invariant breaches on, every issue
+     `status` lists under "Invariants broken".
    - Still stuck since last report: anything the previous report already
      named as stuck or blocked and still is, with how long; say "nothing"
      when the list is empty. Read the previous report to fill this in.
@@ -272,13 +305,17 @@ Choose only lanes that lane status shows as available, by the ticket's
 Anthropic credits, easy work on the free lanes and Spark, the credit spent
 on hard work):
 
-- Easy: `spark` (the local vLLM coder, model `spark/...`, any repo, private
-  ones included) when lane status shows it available, else a free lane:
-  opencode-go, openrouter, workersai, or zen, zai, agy and opencode-go-4
-  on public repos only (opencode-go-4 is Muse Spark, which trains on prompts).
+- Easy: on a public repo muse first, then agy (the operator's priority;
+  muse runs remotely); then `spark` and `spark-2` (the local coders, one per
+  Spark box, `LOOM_SPARK_URL` and `LOOM_SPARK_2_URL`, model `spark/...`, any
+  repo, private ones included) when lane status shows them available, else a
+  free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
+  opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
+  which trains on prompts).
   Never anthropic or claude for an easy ticket.
-- Medium: codex or opencode-go first (opencode-go-4 on public repos only); an
-  anthropic slot only when every codex and opencode-go slot already holds work.
+- Medium: on a public repo muse first, then agy; then codex or opencode-go
+  (opencode-go-4 on public repos only); an anthropic slot only when every
+  codex and opencode-go slot already holds work.
 - Hard: anthropic, claude or codex, never a free lane or spark. Keep the
   anthropic slots busy with hard work while the credit lasts.
 
