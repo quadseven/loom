@@ -132,7 +132,8 @@ done
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
 # with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
-# LOOM_DIGEST_HOUR, LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
+# LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
+# default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
 # ticket, default 2), and LOOM_DISCORD_CHANNEL_ID,
 # LOOM_DISCORD_BOT_TOKEN_SSM and LOOM_DISCORD_DEFAULT_GOAL (talking to the
 # brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
@@ -187,6 +188,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
+    <key>LOOM_REPORT_DIGEST_TIMES</key><string>$(xml "${LOOM_REPORT_DIGEST_TIMES-10:00,21:00}")</string>
     <key>LOOM_METRICS_GOAL</key><string>$(xml "${LOOM_METRICS_GOAL:-}")</string>
     <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
     <key>LOOM_RETRY_MAX</key><string>$(xml "${LOOM_RETRY_MAX:-}")</string>
