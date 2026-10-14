@@ -146,22 +146,25 @@ class TicketStore:
         if isinstance(remaining, int):
             self._last_remaining = remaining
 
+    def _read_repos(self, data: Dict[str, Any], errors: Dict[str, str]) -> bool:
+        """Read each repo into data/errors; return True if the budget floor stopped the pass."""
+        for repo in self.repos:
+            if self._below_floor():
+                return True
+            try:
+                data[repo] = self._read_repo(repo)
+                errors.pop(repo, None)
+            except (GitHubError, OSError, ValueError) as exc:
+                errors[repo] = self._error_reason(exc)
+            self._note_budget()
+        return False
+
     def refresh(self) -> None:
         with self._refresh_lock:
             current = self._snapshot
             data = dict(current["tickets"])
             errors = dict(current["errors"])
-            stale = self._below_floor()
-            for repo in ([] if stale else self.repos):
-                if self._below_floor():
-                    stale = True
-                    break
-                try:
-                    data[repo] = self._read_repo(repo)
-                    errors.pop(repo, None)
-                except (GitHubError, OSError, ValueError) as exc:
-                    errors[repo] = self._error_reason(exc)
-                self._note_budget()
+            stale = self._read_repos(data, errors) if not self._below_floor() else True
             snapshot = {"tickets": data, "errors": errors, "stale": stale, "ready": True}
             with self._snapshot_lock:
                 self._snapshot = snapshot

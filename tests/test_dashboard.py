@@ -102,6 +102,7 @@ class DashboardTest(unittest.TestCase):
         self.assertIsNone(row["rung"])
         self.assertEqual(payload["auth"], "none")
         self.assertIn("example-owner/failing", payload["errors"])
+        self.assertTrue(payload["errors"]["example-owner/failing"].endswith(": stub read failure"))
         self.assertIn("403", payload["errors"]["example-owner/failing"])
 
     def test_requests_serve_background_snapshot_without_refreshing(self):
