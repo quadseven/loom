@@ -580,12 +580,89 @@ def _goal_issue(gh: GitHub, repo: str, goal: int) -> Dict[str, Any]:
     return issue
 
 
+# GitHub refuses a 101st sub-issue (422), so a ticket also names its goal
+# with a "Part of #N" line, the parentage rule the backlog board uses too.
+SEARCH_PAGES = 10
+SUB_ISSUE_LIMIT = 100
+
+
+def part_of_line(goal: int) -> str:
+    return "Part of #%d" % goal
+
+
+def _names_goal(body: Any, goal: int) -> bool:
+    return bool(re.search(r"^Part of #%d(?!\d)" % goal, str(body or ""), re.M))
+
+
+def _with_part_of(body: str, goal: int) -> str:
+    """The body with a Part of line for the goal, added once at the end."""
+    if _names_goal(body, goal):
+        return body
+    return body.rstrip("\n") + "\n\n" + part_of_line(goal) + "\n"
+
+
+def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo whose body has a Part of #goal line
+    (search, then the label and the exact line checked here: the search
+    also matches loose words)."""
+    q = quote('repo:%s is:issue label:loom:ticket in:body "%s"' % (repo, part_of_line(goal)))
+    url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
+    found: List[Dict[str, Any]] = []
+    for _ in range(SEARCH_PAGES):
+        if not url:
+            break
+        resp = gh.rest("GET", url)
+        data = resp.data if isinstance(resp.data, dict) else {}
+        # Anyone can open an issue that says Part of #N in a public repo, but
+        # only someone with write access can label it: a Part of issue counts
+        # only as a loom:ticket, as a sub-issue link counts only when made by
+        # someone who may write.
+        found.extend(item for item in data.get("items") or []
+                     if isinstance(item, dict) and "pull_request" not in item
+                     and "loom:ticket" in _labels(item)
+                     and _names_goal(item.get("body"), goal))
+        url = _next_link(resp.headers.get("link", ""))
+    return found
+
+
 def _goal_children(gh: GitHub, repo: str, goal: int,
                    issue: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """The sub-issues of an open loom:goal issue; ValueError for anything else."""
+    """The tickets of an open loom:goal issue: its sub-issues, plus issues
+    whose body says Part of #goal (past GitHub's 100 sub-issue limit);
+    ValueError for anything that is not an open goal."""
     if issue is None:
         issue = _goal_issue(gh, repo, goal)
-    return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
+    return goal_children(gh, repo, goal)
+
+
+def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """Sub-issues of the goal, then, once the goal holds GitHub's limit of
+    sub-issues (the only way a ticket gets a Part of line instead), the Part
+    of #goal issues not already listed. Below the limit it costs no search."""
+    children = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal)))
+    if len(children) < SUB_ISSUE_LIMIT:
+        return children
+    seen = {int(c.get("number") or 0) for c in children if isinstance(c, dict)}
+    for item in _part_of_issues(gh, repo, goal):
+        number = int(item.get("number") or 0)
+        if number and number not in seen:
+            children.append(item)
+            seen.add(number)
+    return children
+
+
+def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
+    """Add the issue as a sub-issue of the goal. False when GitHub refuses it
+    (422, for example a goal already at its 100 sub-issue limit): the Part of
+    line is then the only link, which goal_children reads."""
+    try:
+        gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
+                {"sub_issue_id": issue["id"]})
+    except GitHubError as exc:
+        if exc.status != 422:
+            raise
+        return False
+    return True
 
 
 def _in_flight(issue: Dict[str, Any]) -> bool:
@@ -688,8 +765,11 @@ def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
         names.append("lane:" + lane)
     issue = gh.rest("POST", "/repos/%s/issues" % repo, {
         "title": title, "body": body, "labels": names + list(extra)}).data
-    gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
-            {"sub_issue_id": issue["id"]})
+    if not _link_to_goal(gh, repo, goal, issue):
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
+                {"body": _with_part_of(body, goal)})
+        print("#%s is linked to goal #%d by a Part of line: GitHub refused it as a "
+              "sub-issue" % (issue.get("number"), goal), file=sys.stderr)
     return issue
 
 
@@ -911,7 +991,9 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
     the goal, while the goal has room; the rest get loom:triage and one
     comment naming what is missing. Only labels, sub-issue links and that
-    comment are written: an issue is never closed, retitled or edited.
+    comment are written, plus a Part of line at the end of a ready issue's
+    body when GitHub refuses the sub-issue link: an issue is never closed or
+    retitled, and nothing else in it is edited.
     Returns one line per issue looked at.
     """
     if limit < 1:
@@ -933,15 +1015,11 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
                 continue
-            try:
-                gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
-                        {"sub_issue_id": issue["id"]})
-            except GitHubError as exc:
-                if exc.status != 422:
-                    raise
-                lines.append("#%d skipped: GitHub refused it as a sub-issue of #%d"
-                             % (number, goal))
-                continue
+            if not _link_to_goal(gh, repo, goal, issue):
+                # The goal is at GitHub's sub-issue limit (or refused it for
+                # another reason): the Part of line links it instead.
+                gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                        {"body": _with_part_of(str(issue.get("body") or ""), goal)})
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:ticket", "loom:queued"]})
             in_flight += 1
