@@ -277,6 +277,17 @@ on hard work):
 - Hard: anthropic, claude or codex, never a free lane or spark. Keep the
   anthropic slots busy with hard work while the credit lasts.
 
+When no lane of a ticket's tier is up (every one at a limit or down), the
+factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
+its lane) fall back to the next harder tier's free lanes, then the easier
+tier's (the table `FALLBACK` next to `TIERS` in bus/factory.py), keeping
+private repos off the public-only lanes. Medium falls back to hard, then
+easy: claude when it is free, else spark or a free lane. Easy and hard have
+no fallback, for the rules above. A fallback move says so in its note
+("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
+so its next move takes its own tier again once a lane of it is up. A tier
+with a lane up but busy is waited for, not fallen back from.
+
 An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
 brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
 its hold expires. When the API credit is gone, route hard work to codex and

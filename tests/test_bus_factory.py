@@ -884,6 +884,19 @@ class Queued(Base):
         self.assertEqual(self.lane(7), "codex-2")
 
 
+    def test_a_queued_medium_ticket_whose_tier_is_at_a_limit_falls_back(self):
+        self.queued(7)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(limited=factory.TIERS["medium"])
+        self.assertEqual(self.lane(7), "claude")
+        self.assertIn("(tier medium, fallback: no medium lane is up)", self.gh.comments[7][-1]["body"])
+        say.assert_called_once_with("gave queued %s#7 lane claude "
+                                    "(tier medium, fallback: no medium lane is up)" % REPO)
+        self.queued(8)
+        self.assign(limited=factory.TIERS["medium"])
+        self.assertEqual(self.lane(8), "spark")
+
+
 class Tickets(Base):
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
         self.gh.ticket(6, "failed", lane="zai")
@@ -1004,6 +1017,52 @@ class Tickets(Base):
         self.go(limited=["codex"])
         self.assertEqual(self.lane(7), "anthropic")
 
+    def limited_medium(self, busy=()):
+        """A medium ticket briefed on codex with every medium lane at a limit,
+        and a ticket waiting on each lane in `busy`."""
+        self.gh.ticket(7, "briefed", lane="codex")
+        for n, lane in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        with mock.patch("bus.factory._say") as say:
+            self.go(limited=factory.TIERS["medium"])
+        return say
+
+    def test_a_medium_ticket_whose_tier_is_at_a_limit_falls_back_to_claude(self):
+        say = self.limited_medium()
+        self.assertEqual((self.lane(7), self.model(7)), ("claude", None))
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("fallback: no medium lane is up", note)
+        self.assertNotIn("loom:rung", note)
+        say.assert_any_call("moved %s#7 off lane codex, at a limit, to claude "
+                            "(fallback: no medium lane is up)" % REPO)
+
+    def test_with_claude_busy_a_medium_ticket_falls_back_to_a_free_easy_lane(self):
+        self.limited_medium(busy=("claude",))
+        self.assertEqual(self.lane(7), "spark")
+        self.assertIn("fallback: no medium lane is up", self.gh.comments[7][-1]["body"])
+
+    def test_a_private_ticket_never_falls_back_to_a_public_only_lane(self):
+        busy = ("claude", "spark", "openrouter", "workersai")
+        self.limited_medium(busy=busy)
+        self.assertEqual(self.lane(7), "codex")  # waits; zen, zai and agy are public only
+        self.setUp()
+        self.gh.private = False
+        self.limited_medium(busy=busy)
+        self.assertEqual(self.lane(7), "zen")
+
+    def test_a_medium_lane_that_is_up_but_busy_is_waited_for(self):
+        self.gh.ticket(7, "briefed", lane="codex")
+        self.gh.ticket(20, "briefed", lane="codex-2")
+        self.go(limited=[x for x in factory.TIERS["medium"] if x != "codex-2"] + ["codex"])
+        self.assertEqual(self.lane(7), "codex")
+
+    def test_a_fallback_ticket_returns_to_its_tier_on_its_next_move(self):
+        self.limited_medium()
+        self.assertEqual(self.lane(7), "claude")
+        self.go(limited=["claude"])
+        self.assertEqual(self.lane(7), "codex")
+        self.assertIn("in its difficulty tier", self.gh.comments[7][-1]["body"])
+
     def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
         body = "Model: claude-opus-5-5\nDifficulty: easy\n\n## Why\nx\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
@@ -1079,6 +1138,16 @@ class Helpers(unittest.TestCase):
                     self.assertIn(lane, public)
                 self.assertFalse([x for x in lanes if x.startswith(("anthropic", "claude"))])
         self.assertFalse(set(factory.PUBLIC_ONLY) - set(factory.TIERS["easy"]))
+
+    def test_the_fallback_order_matches_muse_md(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "MUSE.md")) as fh:
+            doc = " ".join(fh.read().split())
+        for difficulty, fallback in factory.FALLBACK.items():
+            self.assertTrue(set(fallback) <= set(factory.TIERS) - {difficulty})
+            self.assertIn("%s falls back to %s" % (difficulty.capitalize(), ", then ".join(fallback)), doc)
+        for difficulty in set(factory.TIERS) - set(factory.FALLBACK):
+            self.assertRegex(doc, re.compile(r"\b%s\b[\w ]* have no fallback" % difficulty, re.I))
 
     def test_without_model_drops_only_the_header(self):
         self.assertEqual(factory.without_model("Model: m\nDifficulty: easy\n\nModel: x"),
