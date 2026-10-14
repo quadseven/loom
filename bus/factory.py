@@ -40,6 +40,14 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
 - A pull request whose only fault is a failed Actions job gets that job run
   once more before it is sent back, since one flaky run should not cost a
   lane round.
+- A pull request whose only failing checks are leak scans that failed in
+  their "title and body" section, with a clean diff section, is fixed in its
+  text: no lane can fix text the runner re-renders from the ticket each
+  round (a ticket spent 14 rounds on one example reference on 2026-10-13).
+  Each flagged body line is rewritten, a cross-repo issue reference as
+  "issue N of another repo" in words, or dropped when it cannot be; editing
+  the body reruns the scan. Once per head commit, with a comment on the
+  ticket saying which lines changed.
 - The review bot replies "Fixed in <sha>" on a thread whose flagged code
   changed, but GitHub does not let its app resolve threads, so the thread
   stays open. Such a thread, with nobody writing after the bot's reply, is
@@ -157,6 +165,17 @@ TESTS_NONE_RE = re.compile(r"^Tests: none needed \(\S[^)\n]*\)", re.M)
 # next round can tell the finding survived.
 NO_TEST_HEADING = "### Test: the change has no test"
 ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
+# The leak scan (infra-public's _reusable.leak-scan.yml) logs its diff and its
+# title-and-body text as two sections; each hit is "  <file>:<line>  [<rule>] ...".
+LEAK_CHECK_RE = re.compile(r"leak|private identifiers", re.I)
+LEAK_DIFF_MARK = "--- PR diff ---"
+LEAK_TEXT_MARK = "--- title and body ---"
+LEAK_HIT_RE = re.compile(r"^\s*\S+:(\d+)\s+\[([\w-]+)\]\s")
+LEAK_REF_RULE = "private-issue-ref"
+# The scanner's cross-repo reference shape: [owner/]name#N.
+SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
+                         r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
+BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
 
@@ -378,6 +397,65 @@ def lacks_test(paths: Sequence[str]) -> bool:
 def open_thread_ids(details: Dict[str, Any]) -> List[str]:
     threads = (details.get("reviewThreads") or {}).get("nodes") or []
     return [str(t.get("id")) for t in threads if not t.get("isResolved")]
+
+
+def body_leak_hits(log: Sequence[str]) -> Optional[Dict[int, str]]:
+    """{line of the scanned text: rule} when a leak-scan job log failed in its
+    title-and-body section with a clean diff section; else None. The scanned
+    text is the title on line 1 and the body from line 2."""
+    marks = [l.strip() for l in log]
+    if LEAK_TEXT_MARK not in marks or LEAK_DIFF_MARK not in marks:
+        return None
+    cut = len(marks) - 1 - marks[::-1].index(LEAK_TEXT_MARK)
+    start = max((i for i in range(cut) if marks[i] == LEAK_DIFF_MARK), default=-1)
+    diff, text = marks[start + 1:cut], log[cut + 1:]
+    if (start < 0 or not any(l.startswith("leak guard: clean") for l in diff)
+            or any(l.startswith(("BLOCKED", "FATAL")) for l in diff)):
+        return None
+    if not any(l.strip().startswith("BLOCKED") for l in text):
+        return None
+    hits = {int(m.group(1)): m.group(2) for m in map(LEAK_HIT_RE.match, text) if m}
+    return hits or None
+
+
+def refs_in_words(line: str, repo: str) -> str:
+    """The line with each [owner/]name#N in words: "issue N of this repo" for
+    the repo's own, "issue N of another repo" for any other."""
+    owner, name = repo.lower().split("/", 1)
+
+    def words(m: "re.Match[str]") -> str:
+        own = m.group(2).lower() == name and (m.group(1) or owner).lower() == owner
+        return "issue %s of %s" % (m.group(3), "this repo" if own else "another repo")
+    return SCAN_REF_RE.sub(words, line)
+
+
+def repair_leak_text(title: str, body: str, hits: Dict[int, str],
+                     repo: str) -> Optional[Tuple[str, str, List[str]]]:
+    """(title, body, what changed) with each flagged line rewritten in words,
+    or dropped when it cannot be; None when a flag does not fit the text (a
+    title that is not a reference, a line that is not there)."""
+    lines = body.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    if len(title.splitlines()) != 1:
+        return None
+    changed: List[str] = []
+    dropped = set()
+    for at, rule in sorted(hits.items()):
+        refs = rule == LEAK_REF_RULE
+        if at == 1:
+            if not refs or not SCAN_REF_RE.search(title):
+                return None
+            title = refs_in_words(title, repo)
+            changed.append("title: put a cross-repo issue reference in words")
+        elif not 2 <= at <= len(lines) + 1:
+            return None
+        elif refs and SCAN_REF_RE.search(lines[at - 2]):
+            lines[at - 2] = refs_in_words(lines[at - 2], repo)
+            changed.append("body line %d: put a cross-repo issue reference in words" % (at - 1))
+        else:
+            dropped.add(at - 2)
+            changed.append("body line %d: dropped (flagged as %s)" % (at - 1, rule))
+    kept = [l for i, l in enumerate(lines) if i not in dropped]
+    return title, "\n".join(kept), changed
 
 
 def held_until(issue: Dict[str, Any]) -> float:
@@ -704,9 +782,9 @@ class Factory:
                 and self._defer_minor(repo, number, int(issue["number"]), sha, comments)):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full)
-        if faults == ["failing checks"] and self._run_again(repo, number, sha):
-            return
-        if faults == ["failing checks"] and self._repair_body_leak(repo, number, full, issue, comments, sha):
+        if faults == ["failing checks"] and (
+                self._repair_body_leak(repo, number, full, issue, comments, sha)
+                or self._run_again(repo, number, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
@@ -717,29 +795,42 @@ class Factory:
     def _repair_body_leak(self, repo: str, number: int, full: Dict[str, Any],
                           issue: Dict[str, Any], comments: List[Dict[str, Any]],
                           sha: str) -> bool:
-        """Rewrite a body-only leak-scan failure once for this head."""
-        marker = "<!-- loom:body-leak-repaired %s -->" % sha
+        """Rewrite the flagged lines of the pull request's text when every
+        failing check is a leak scan that failed on that text alone; once per
+        head commit. False leaves the pull request to the usual paths."""
+        marker = BODY_LEAK_MARKER % sha
         if any(marker in str(c.get("body") or "") for c in comments):
             return False
-        failed = [r for r in self._runs.get(sha, [])
-                  if r.get("conclusion") in ("failure", "timed_out")]
-        report = "\n".join(str((r.get("output") or {}).get("text") or "") for r in failed)
-        if not report or not re.search(r"title and body", report, re.I):
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if not failed or not all(LEAK_CHECK_RE.search(str(r.get("name") or ""))
+                                 and (r.get("app") or {}).get("slug") == "github-actions"
+                                 for r in failed):
             return False
-        if re.search(r"diff(?:erence)?(?: section)?[^\n]*(?:fail|hit|detect)|diff section", report, re.I):
+        hits: Dict[int, str] = {}
+        for run in failed:
+            try:
+                log = brain._job_log(self.gh, repo, int(run["id"]))
+            except (GitHubError, KeyError, TypeError, ValueError):
+                return False
+            found = body_leak_hits(log or [])
+            if found is None:
+                return False
+            hits.update(found)
+        fixed = repair_leak_text(str(full.get("title") or ""), str(full.get("body") or ""),
+                                 hits, repo)
+        if fixed is None:
             return False
-        body = str(full.get("body") or "")
-        repo_ref = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
-        found = repo_ref.findall(body)
-        if not found:
-            return False
-        rewritten = repo_ref.sub(lambda m: ("issue %s of this repository" % m.group(2)
-            if m.group(1).lower() == repo.lower() else "issue %s of another repository" % m.group(2)), body)
-        self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"body": rewritten})
+        title, body, changed = fixed
+        self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
+                     {"title": title, "body": body})
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
-                     {"body": marker + "\nThe factory rewrote repository issue references in the pull request body after a body-only leak-scan failure."})
+                     {"body": "%s\nThe leak scan on #%d failed on its title and body only, "
+                              "which the runner writes from this ticket, so the factory "
+                              "edited the text instead of sending it back:\n%s"
+                              % (marker, number, "\n".join("- " + c for c in changed))})
         self.actions += 1
-        _say("repaired body-only leak scan on %s#%d at %s" % (repo, number, sha[:12]))
+        _say("rewrote %d flagged line(s) of %s#%d's text after a body-only leak scan"
+             % (len(changed), repo, number))
         return True
 
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
