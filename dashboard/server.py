@@ -7,6 +7,7 @@ import os
 import re
 import ssl
 import statistics
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import urlopen
@@ -16,6 +17,7 @@ from .shell import page
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
+from . import views
 
 
 def _all_tickets(state):
@@ -201,6 +203,12 @@ def _handler_for(state):
                 return self.send_page(_goals(state))
             if path == "/tickets":
                 return self.send_page(_tickets(state, parsed))
+            if path in ("/static/loom.css", "/static/loom.js"):
+                asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
+                content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
+                return self.send_bytes(200, asset.read_bytes(), content_type)
+            if path in ("/improving", "/lanes"):
+                return _send_dashboard_view(self, state, path)
             detail = _ticket_detail(state, path)
             if detail is not None:
                 return self.send_page(*detail)
@@ -211,9 +219,11 @@ def _handler_for(state):
             self.send_bytes(code, body, "application/json; charset=utf-8")
 
         def send_page(self, body, code=200):
+            document = body if body.lstrip().lower().startswith("<!doctype html>") else (
+                "<!doctype html><meta charset=utf-8><title>Loom</title>" + body)
             if state.stale:
-                body = body.replace('<main class="page-content">', '<main class="page-content"><p class="stale-note">Showing stale ticket data.</p>')
-            self.send_bytes(code, body.encode("utf-8"), "text/html; charset=utf-8")
+                document = document.replace('<main class="page-content">', '<main class="page-content"><p class="stale-note">Showing stale ticket data.</p>')
+            self.send_bytes(code, document.encode("utf-8"), "text/html; charset=utf-8")
 
         def send_text(self, code, value):
             self.send_bytes(code, value.encode("utf-8"), "text/plain; charset=utf-8")
@@ -231,6 +241,49 @@ def _handler_for(state):
     return Handler
 
 
+def _dispatch_get(handler, state):
+    parsed = urlsplit(handler.path)
+    path = parsed.path
+    if path == "/livez":
+        return handler.send_text(200, "live")
+    if path == "/readyz":
+        return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
+    if path == "/api/tickets":
+        return handler.send_json(200, state.response())
+    if path in ("/static/loom.css", "/static/loom.js"):
+        asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
+        content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
+        return handler.send_bytes(200, asset.read_bytes(), content_type)
+    if path in ("/improving", "/lanes"):
+        return _send_dashboard_view(handler, state, path)
+    if path in ("/", "/tickets"):
+        tickets = state.response()["tickets"]
+        data = tickets if path == "/" else _ticket_page(state, parsed)
+        return handler.send_page(handler.ticket_list(data))
+    detail = _ticket_detail(state, path)
+    if detail is not None:
+        return handler.send_page(detail[0], detail[1])
+    return handler.send_text(404, "not found")
+
+
+def _send_dashboard_view(handler, state, path):
+    payload = state.response()
+    tickets = [row for rows in payload["tickets"].values() if rows for row in rows]
+    status = "stale" if payload["stale"] else "live"
+    if path == "/improving":
+        source = payload.get("improving", {})
+        data = views.build_improvements(source.get("journals", []), tickets,
+                                        source.get("metrics_comments", []))
+        body = views.render_improving(data)
+        title, active = "Improving", "improving"
+    else:
+        body = views.render_lanes(_lane_view_data(payload, tickets))
+        title, active = "Lanes and models", "lanes"
+    if payload.get("dashboard_errors"):
+        body += '<p class="empty-state">Some dashboard sources could not be read: %s</p>' % html.escape("; ".join(payload["dashboard_errors"]))
+    return handler.send_page(page(title, active, body, status=status))
+
+
 def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     state = store or TicketStore()
 
@@ -242,3 +295,40 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     server = DashboardHTTPServer((host, port), _handler_for(state))
     state.start_background()
     return server
+
+
+def _lane_view_data(payload, tickets):
+    comments = payload.get("lanes", [])
+    latest = max(comments, key=lambda c: str(c.get("created_at") or ""), default=None)
+    lane_rows = views.parse_lane_rows(latest.get("body") if latest else "")
+    lanes = []
+    for item in lane_rows:
+        active = next((ticket for ticket in tickets if ticket.get("lane") == item["lane"]
+                       and ticket.get("state") in ("running", "pr")), None)
+        item.update({"ticket": active, "model": active.get("model") if active else None,
+                     "quota": None,
+                     "reason": None if item["available"] else "held reason missing from lane status comment"})
+        lanes.append(item)
+    prs = payload.get("pull_requests", [])
+    tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
+    prepared = []
+    footer = views.FOOTER
+    anthropic = total = 0
+    for pr in prs:
+        match = footer.search(str(pr.get("body") or ""))
+        if not match:
+            continue
+        repo, number, lane, model = match.groups()
+        ticket = tickets_by_ref.get((repo, number))
+        prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
+        total += 1
+        anthropic += lane.startswith("anthropic")
+    metric_rows = views.parse_metrics(payload.get("improving", {}).get("metrics_comments", []))
+    share = None
+    if metric_rows:
+        spread = metric_rows[0][1].get("Spread", {}).get("value", "")
+        match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
+        if match and int(match.group(2)):
+            share = round(100 * int(match.group(1)) / int(match.group(2)))
+    return {"lanes": lanes, "scoreboard": views.build_scoreboard(prepared),
+            "anthropic_share": share}
