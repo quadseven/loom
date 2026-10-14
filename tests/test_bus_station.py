@@ -152,12 +152,18 @@ class FakeGitHub:
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
             return self._post_page(data)
-        if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
-                or (rest == "issues/1/comments" and self.lanes_issues):
+        if self._is_issue_route(rest):
             return self._issues_and_status(method, rest, parts.query, headers, data)
         m = re.match(r"issues/(\d+)/labels/(.+)$", rest)
         if m and method == "DELETE":
             return self._delete_label(int(m.group(1)), unquote(m.group(2)))
+        return self._other_route(method, rest, path, data)
+
+    def _is_issue_route(self, rest):
+        return (rest == "issues" or re.match(r"issues/comments/\d+$", rest)
+                or (rest == "issues/1/comments" and self.lanes_issues))
+
+    def _other_route(self, method, rest, path, data):
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)

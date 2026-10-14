@@ -100,16 +100,21 @@ class Repo:
             return self.reply(200, self.issues[n])
         if method == "GET" and sub == "comments":
             return self.reply(200, self.comments[n])
-        if method == "GET" and sub == "sub_issues" and n == GOAL:
-            return self.reply(200, self.subs)
-        if method == "POST" and sub == "sub_issues" and n == GOAL:
-            self.subs.append(next(i for i in self.issues.values()
-                                  if i["id"] == payload["sub_issue_id"]))
-            return self.reply(201, {})
+        if sub == "sub_issues" and n == GOAL:
+            return self.sub_issue_call(method, payload)
         if method == "POST" and sub == "comments":
             self.comments[n].append({"body": payload["body"]})
             return self.reply(201, {})
         return self.label_call(method, path, n, sub, payload)
+
+    def sub_issue_call(self, method, payload):
+        if method == "GET":
+            return self.reply(200, self.subs)
+        if method == "POST":
+            self.subs.append(next(i for i in self.issues.values()
+                                  if i["id"] == payload["sub_issue_id"]))
+            return self.reply(201, {})
+        raise AssertionError("unexpected sub_issues call %s" % method)
 
     def label_call(self, method, path, n, sub, payload):
         if method == "POST" and sub == "labels":
