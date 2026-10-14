@@ -137,7 +137,12 @@ live regression).
    Merge only PRs labeled `loom:ready`: confirm checks are green, no review-bot
    threads are unresolved, and the verdict applies to the current head SHA. Then run
    `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
-   which moves the ticket to `loom:merged`. Merged is not deployed: the
+   which moves the ticket to `loom:merged`. A fix you wrote during a ship
+   that carries no ticket (a `loom/`-less branch a trusted login opened) is
+   not listed among the lane pull requests: adopt it with
+   `python3 -m bus.brain merge OWNER/NAME#PR --adopt`, under the rules in
+   docs/BRAIN.md (Pull requests without a ticket), rather than leave it for
+   the operator. Merged is not deployed: the
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
@@ -188,15 +193,15 @@ live regression).
    and `brief --not-before` writes the line),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
-8. Triage the backlog. For each backlog goal (the goal home of a repo whose
-   old issues Loom works on; `python3 -m bus.brain onboard OWNER/NAME`
-   opens one), run
-   `python3 -m bus.brain triage OWNER/NAME --goal N` (at most 25 issues a
-   run, oldest first). It skips pull requests, epics, asks and anything with
-   a `loom:` label; a ready issue (every brief section, checkboxes under
-   Acceptance criteria) becomes a `loom:queued` ticket under the goal, the
-   rest get `loom:triage` and a comment naming what is missing. Then take up
-   to 5 `loom:triage` issues and, for each, either write the ticket with
+8. Triage the backlog. The station runs `python3 -m bus.brain triage
+   OWNER/NAME --goal N` once an hour on every backlog goal home (the goal
+   home onboard opens for a repo has a title starting `Backlog:`), with the
+   default limit of 25 issues a run, oldest first. It skips pull requests,
+   epics, asks and anything with a `loom:` label; a ready issue (every brief
+   section, checkboxes under Acceptance criteria) becomes a `loom:queued`
+   ticket under the goal, the rest get `loom:triage` and one comment naming
+   what is missing. The brain only rewrites `loom:triage` issues: take up to
+   5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket refs it, the original gets
    `loom:rewritten` and stays open) or, when only a person can do it, run
