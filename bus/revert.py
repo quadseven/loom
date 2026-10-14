@@ -134,6 +134,11 @@ def red_checks(runs: Sequence[Dict[str, Any]], skip: str = "") -> List[Dict[str,
             if r.get("status") == "completed" and r.get("conclusion") in RED]
 
 
+def _failing(names: Sequence[str]) -> str:
+    checks = ", ".join("`%s`" % n for n in names) or "a check"
+    return ("check %s fails" if len(names) == 1 else "checks %s fail") % checks
+
+
 def bisect(states: Sequence[Tuple[str, str]]) -> Tuple[str, Optional[str]]:
     """Over (sha, state) pairs, newest first: ("green", None) when the
     newest tested commit is green or none was tested, ("running", sha) while
@@ -232,15 +237,34 @@ class Reverts:
         login = str((item.get("user") or {}).get("login") or "").lower()
         return bool(login) and login in self.trusted
 
+    def _lane_merge(self, p: Any) -> bool:
+        return (isinstance(p, dict) and bool(p.get("merged_at")) and bool(p.get("merge_commit_sha"))
+                and self._trusted(p)
+                and str((p.get("head") or {}).get("ref") or "").startswith("loom/"))
+
     def _merged(self, repo: str) -> List[Dict[str, Any]]:
         """Trusted lane pull requests merged, from the newest page of closed
-        ones."""
+        ones: enough to tell whether one merged in the last RECENT seconds.
+        The culprit itself may be older than that page; _merge_of looks it
+        up by commit."""
         data = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated&direction=desc"
                                    "&per_page=100" % repo).data
-        return [p for p in (data if isinstance(data, list) else [])
-                if isinstance(p, dict) and p.get("merged_at") and p.get("merge_commit_sha")
-                and self._trusted(p)
-                and str((p.get("head") or {}).get("ref") or "").startswith("loom/")]
+        return [p for p in (data if isinstance(data, list) else []) if self._lane_merge(p)]
+
+    def _merge_of(self, repo: str, branch: str, sha: str,
+                  merged: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The lane pull request whose merge into `branch` is `sha`: from the
+        page already read, else from the commit's own pull requests (one
+        read, only for the red commit)."""
+        def into(p: Dict[str, Any]) -> bool:
+            return (str(p.get("merge_commit_sha")) == sha
+                    and str((p.get("base") or {}).get("ref") or "") == branch)
+        found = next((p for p in merged if into(p)), None)
+        if found is not None:
+            return found
+        data = self.gh.rest("GET", "/repos/%s/commits/%s/pulls" % (repo, sha)).data
+        return next((p for p in (data if isinstance(data, list) else [])
+                     if self._lane_merge(p) and into(p)), None)
 
     def _commits(self, repo: str, branch: str) -> List[Dict[str, Any]]:
         data = self.gh.rest("GET", "/repos/%s/commits?sha=%s&per_page=%d"
@@ -280,18 +304,38 @@ class Reverts:
             self._said.pop(repo, None)
             return
         reverts = self._reverts(repo)
+        self._redo_all(repo, reverts)
+        branch = str((self.gh.rest("GET", "/repos/%s" % repo).data or {}).get("default_branch") or "")
+        if not branch:
+            return
+        states = self._states(repo, branch)
+        verdict, sha = bisect(states)
+        if verdict in ("green", "running"):
+            self._said.pop(repo, None)
+        elif verdict == "wait":
+            self._decide(repo, "%s is red; waiting on the checks of %s, which may "
+                               "have turned it" % (branch, (sha or "")[:12]))
+        elif verdict == "unknown":
+            # No commit was green, so every commit read was judged.
+            self._decide(repo, "%s is red and none of its last %d commits is green; "
+                               "nothing to bisect" % (branch, len(states)))
+        else:
+            assert sha is not None
+            self._red(repo, branch, sha, self._merge_of(repo, branch, sha, merged), reverts)
+
+    def _redo_all(self, repo: str, reverts: List[Dict[str, Any]]) -> None:
         for issue in reverts:
             try:
                 self._redo(repo, issue)
             except (GitHubError, ValueError, KeyError, TypeError) as err:
                 _say("%s: re-briefing the ticket revert #%s reverted failed: %s"
                      % (repo, issue.get("number"), err))
-        branch = str((self.gh.rest("GET", "/repos/%s" % repo).data or {}).get("default_branch") or "")
-        if not branch:
-            return
-        commits = self._commits(repo, branch)
+
+    def _states(self, repo: str, branch: str) -> List[Tuple[str, str]]:
+        """(sha, state) of the branch's newest commits, from the head back
+        to the last green one."""
         states: List[Tuple[str, str]] = []
-        for c in commits:
+        for c in self._commits(repo, branch):
             age = self.now - _ts(((c.get("commit") or {}).get("committer") or {}).get("date"))
             state = commit_state(self._check_runs(repo, c["sha"]), age, self.review_check)
             states.append((c["sha"], state))
@@ -300,20 +344,7 @@ class Reverts:
             if state == "green" or (state == "pending"
                                     and all(s == "none" for _, s in states[:-1])):
                 break
-        verdict, sha = bisect(states)
-        if verdict in ("green", "running"):
-            self._said.pop(repo, None)
-        elif verdict == "wait":
-            self._decide(repo, "%s is red; waiting on the checks of %s, which may "
-                               "have turned it" % (branch, (sha or "")[:12]))
-        elif verdict == "unknown":
-            self._decide(repo, "%s is red and none of its last %d commits is green; "
-                               "nothing to bisect" % (branch, len(commits)))
-        else:
-            assert sha is not None
-            by_sha = {str(p["merge_commit_sha"]): p for p in merged
-                      if str((p.get("base") or {}).get("ref") or "") == branch}
-            self._red(repo, branch, sha, by_sha.get(sha), reverts)
+        return states
 
     def _red(self, repo: str, branch: str, sha: str, pr: Optional[Dict[str, Any]],
              reverts: List[Dict[str, Any]]) -> None:
@@ -373,20 +404,9 @@ class Reverts:
             self._decide(repo, "%s is red from %s; no lane is up to take its revert"
                          % (branch, short))
             return
-        checks = ", ".join("`%s`" % n for n in names) or "a check"
         number = ticket[1] if ticket else 0
         title = " ".join(str(pr.get("title") or "").split()) or "#%d" % int(pr["number"])
-        body = BODY % {
-            "difficulty": difficulty, "branch": branch, "short": short, "sha": sha, "pr": int(pr["number"]),
-            "for_ticket": " for ticket #%d" % number if number else "",
-            "minutes": (self.now - red_since) // 60,
-            "checks": ("check %s fails" if len(names) == 1 else "checks %s fail") % checks,
-            "redo": (" Ticket #%d goes back to its lane to redo the change once this "
-                     "lands." % number) if number else "",
-            "criteria": "\n".join("- [ ] The check `%s` passes on this pull request." % n
-                                  for n in names) or "- [ ] Every check passes on this pull request.",
-            "reverted": "Reverted ticket: #%d\n" % number if number else "",
-        }
+        body = self._body(branch, sha, pr, names, red_since, difficulty, number)
         full_title = "Revert %s: %s" % (short, title)
         brain._check_written_text(full_title + "\n" + body)
         made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
@@ -402,14 +422,28 @@ class Reverts:
                     "pull request #%d: %s. Revert ticket #%d reverts it. This ticket "
                     "goes back to `loom:briefed` on its lane once the revert lands, to "
                     "redo the change on the new default branch."
-                    % (branch, short, int(pr["number"]),
-                       ("check %s fails" if len(names) == 1 else "checks %s fail") % checks,
-                       revert))
+                    % (branch, short, int(pr["number"]), _failing(names), revert))
             brain._check_written_text(note)
             self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
         self._decide(repo, "%s is red from %s (#%d, %s); briefed revert #%d on lane %s"
                      % (branch, short, int(pr["number"]), ", ".join(names) or "checks",
                         revert, lane))
+
+    def _body(self, branch: str, sha: str, pr: Dict[str, Any], names: List[str],
+              red_since: float, difficulty: str, number: int) -> str:
+        """The revert ticket's body; `number` is the reverted ticket, or 0."""
+        return BODY % {
+            "difficulty": difficulty, "branch": branch, "short": sha[:12], "sha": sha,
+            "pr": int(pr["number"]),
+            "for_ticket": " for ticket #%d" % number if number else "",
+            "minutes": (self.now - red_since) // 60,
+            "checks": _failing(names),
+            "redo": (" Ticket #%d goes back to its lane to redo the change once this "
+                     "lands." % number) if number else "",
+            "criteria": "\n".join("- [ ] The check `%s` passes on this pull request." % n
+                                  for n in names) or "- [ ] Every check passes on this pull request.",
+            "reverted": "Reverted ticket: #%d\n" % number if number else "",
+        }
 
     def _redo(self, repo: str, revert: Dict[str, Any]) -> None:
         """Once a revert lands, its reverted ticket goes back to loom:briefed

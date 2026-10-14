@@ -88,7 +88,11 @@ class FakeGitHub:
             return self._write(method, path, body)
         self.reads.append(path)
         if path.startswith("/repos/%s/pulls?state=closed" % REPO):
-            return Response(200, list(self.pulls))
+            # One page, the most recently closed first.
+            return Response(200, list(reversed(self.pulls))[:100])
+        m = re.search(r"/commits/([0-9a-f]{40})/pulls$", path)
+        if m:
+            return Response(200, [p for p in self.pulls if p.get("merge_commit_sha") == m.group(1)])
         if path == "/repos/%s" % REPO:
             return Response(200, {"default_branch": "main", "private": True})
         if path == "/repos/%s/commits?sha=main&per_page=%d" % (REPO, revert.COMMITS):
@@ -186,6 +190,16 @@ class Bisect(Base):
         self.assertEqual(self.gh.filed, [])
         self.assertIn("%s, which no lane merged" % sha("by-hand")[:12], first)
         self.assertEqual(second, "")
+
+    def test_a_lane_merge_past_the_first_page_of_closed_pulls_is_still_found(self):
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100)
+        for n in range(100):
+            self.gh.pulls.append({"number": 100 + n, "user": STRANGER, "merged_at": None,
+                                  "head": {"ref": "stale-%d" % n}, "base": {"ref": "main"}})
+        self.gh.merge("m2", 51, 5, run("red", ago=3000), ago=3100)
+        self.assertNotIn("which no lane merged", self.go())
+        self.assertIn(sha("m1"), self.gh.filed[0]["body"])
 
     def test_a_lane_pull_request_by_a_stranger_is_not_a_lane_merge(self):
         self.green_base()
