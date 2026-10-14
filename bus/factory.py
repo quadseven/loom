@@ -35,12 +35,11 @@ Neither needs a model:
   body says "Tests: none needed (<reason>)" skip the check. The send-back is
   a finding round: it climbs only when the next round still adds no test.
 - A reviewed, green pull request whose only open threads are the review
-  bot's medium or low findings, each asked for in a fix round or after
-  DEFER_AFTER rounds, files them in one loom:triage follow-up issue, answers
-  and resolves each thread, and lands. High and critical findings, and
-  threads a person opened, still go back to the lane. A docs or tests change
-  defers such findings at once, with no fix round (its findings are style,
-  not behavior).
+  bot's medium or low findings files them in one loom:triage follow-up
+  issue, answers and resolves each thread, and lands, with no fix round
+  (2026-10-14: 64% of 361 fix rounds were review threads, most of them
+  medium). High and critical findings, and threads a person opened, still
+  go back to the lane.
 - The merge rule follows the pull request's class:<name> label
   (bus/change_class.py; docs/MUSE.md, Merge by change class). docs and tests
   defer a minor finding at once; logic is the rule above; a sensitive change
@@ -64,8 +63,10 @@ Neither needs a model:
   2026-10-13 were the bot's own "Fixed in" threads).
 - A round where the lane made no change and explained why waits for the
   review it asked for, up to REVIEW_GRACE, before the round is judged.
-- A failed ticket climbs the ladder, and so does a ticket left briefed for
-  BRIEFED_STALL with no lane claiming it.
+- A failed ticket climbs the ladder. A ticket left briefed for BRIEFED_STALL
+  with no lane claiming it does not: it never ran, so it moves to the
+  least-loaded other lane of its tier (a ladder ticket, of its rung), writing
+  no rung marker.
 - Each pass gives the oldest queued tickets free lanes in their difficulty
   tier, leaving held tickets and tickets without a readable tier queued.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
@@ -110,6 +111,9 @@ from .tickets import FIX_MARKER
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
+# A ticket held by its After: line this long, with none of the tickets it
+# waits for merged, is reported to the brain once like a stuck ticket.
+HOLD_STUCK = 48 * 3600
 # A head commit with no review check this long after its push is logged once
 # per pass as waiting on a review that may never come; it is never merged.
 REVIEW_GRACE = 1800
@@ -166,6 +170,8 @@ RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
 FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
 CLAIM_RE = re.compile(r"^Claimed for lane ")
+# The factory's own note when it moves a stalled ticket to another lane.
+STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
@@ -191,10 +197,6 @@ DEFER_AFTER = 2
 # so sensitive is checked first; a pull request with no class keeps today's
 # rule.
 CLASSES = change_class.CLASSES
-# A class whose medium and low findings are deferred at once, without waiting
-# for a fix round: a docs or tests change lands on green checks and a review
-# pass alone, since its findings are style, not behavior.
-FAST_CLASSES = ("docs", "tests")
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Deferred review findings from %s#%d"
 # A file a pull request changes is code by its extension, and a test by a
@@ -388,14 +390,25 @@ def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
 
 def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     """The rungs the ticket has run on since its ladder last started (the
-    newest rung 0 marker). A rung skipped because its lanes were busy is not
-    tried: on 2026-10-13 a restart wave filled the claude and codex lanes,
-    tickets spilled straight to rung 3 and gave up after one more round."""
+    newest rung 0 marker). A rung counts once a claim follows its marker: a
+    rung skipped because its lanes were busy, or one the ticket sat briefed
+    on with no lane claiming it, is not tried (on 2026-10-13 a restart wave
+    filled the claude and codex lanes, tickets spilled straight to rung 3 and
+    gave up after one more round; on 2026-10-14 a ticket that never ran
+    climbed past the last rung)."""
     tried: set = set()
+    pending: set = set()
     for c in comments:
-        for m in RUNG_RE.finditer(str(c.get("body") or "")):
+        body = str(c.get("body") or "")
+        if CLAIM_RE.match(body):
+            tried |= pending
+            pending = set()
+        for m in RUNG_RE.finditer(body):
             rung = int(m.group(1))
-            tried = set() if rung == 0 else tried | {rung}
+            if rung == 0:
+                tried, pending = set(), set()
+            else:
+                pending = pending | {rung}
     return tried
 
 
@@ -592,11 +605,26 @@ class Factory:
         self.landed: set = set()
         self.updated: set = set()
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
+        # The tickets named by After: lines, read once a pass.
+        self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
         login = str((item.get("user") or {}).get("login") or "").lower()
         return bool(login) and login in self.trusted
+
+    def _dependency(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
+        """The ticket an After: line names, read once a pass; None when it
+        cannot be read, which keeps the hold."""
+        key = "%s#%d" % (repo, number)
+        if key not in self._depends:
+            try:
+                data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                self._depends[key] = data if isinstance(data, dict) else None
+            except GitHubError as err:
+                _say("could not read %s: %s" % (key, err))
+                self._depends[key] = None
+        return self._depends[key]
 
     def _tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         data = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
@@ -889,10 +917,14 @@ class Factory:
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
-        immediate = class_of(full) in FAST_CLASSES
+        # Medium and low findings never send a pull request back on their own
+        # (2026-10-14: 64% of 361 fix rounds were review threads, most of them
+        # medium; "high-complexity" alone was 220 of ~1000 findings). They go
+        # to the follow-up issue at once, for every class; high and critical
+        # findings and failing checks still send it back.
         if (faults == ["open review threads"] and review == "reviewed"
                 and self._defer_minor(repo, number, int(issue["number"]), sha, comments,
-                                      immediate or REVERT_LABEL in _labels(issue))):
+                                      True)):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and (
@@ -1041,37 +1073,113 @@ class Factory:
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
+        waiting = self.held_by(repo, issue)
+        if waiting:
+            # Waiting for another ticket is not this one's fault: it is not
+            # stalled, so it climbs nothing, and only a long hold is reported.
+            self._tell_held(repo, issue, waiting)
+            return
         if _lane(issue) in self.limited:
             self._step_aside(repo, issue)
             return
         if not self._spread(repo, issue):
             self._unclaimed(repo, issue)
 
-    def _briefed_since(self, repo: str, issue: Dict[str, Any]) -> float:
-        """When the ticket was last labeled briefed, or its hold ended if
-        later; 0 when it never was."""
+    def held_by(self, repo: str, issue: Dict[str, Any]) -> List[tickets.After]:
+        """The After: tickets of this one that are not merged yet."""
+        try:
+            headers, _ = tickets.parse(issue.get("body"))
+        except ValueError:
+            return []  # an unusable brief is the station's to refuse
+        return tickets.after_holds(repo, headers, self._dependency)[0]
+
+    def _tell_held(self, repo: str, issue: Dict[str, Any],
+                   waiting: Sequence[tickets.After]) -> None:
+        """Report a ticket held by After: for more than HOLD_STUCK to the
+        brain, once (needs-brain says it was reported)."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        number = int(issue["number"])
+        since = self._briefed_since(repo, issue, self._comments(repo, number))
+        if not since or self.now - since < HOLD_STUCK:
+            return
+        waiting_for = ", ".join(a.short for a in waiting)
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+            "Held %.0f hours by After: waiting for %s. The station never claims a "
+            "ticket whose After: tickets are not merged, so this one is not late and "
+            "not stuck: the brain checks that %s is still coming, re-briefs this "
+            "ticket without it, or closes it." % (
+                (self.now - since) / 3600, waiting_for,
+                waiting_for if len(waiting) == 1 else "they are")})
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d has waited %.0f hours for %s; reported to the brain"
+             % (repo, number, (self.now - since) / 3600, waiting_for))
+
+    def _briefed_since(self, repo: str, issue: Dict[str, Any],
+                       comments: List[Dict[str, Any]]) -> float:
+        """When the ticket's wait on its lane began: the newest of its last
+        loom:briefed label, any lane: label, and the factory's own stall-move
+        note, or its hold's end if later; 0 when it never was briefed. A
+        moved ticket thus waits a full BRIEFED_STALL on its new lane."""
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
-        since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
-                     and e.get("event") == "labeled"
-                     and (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
-        return max(since, held_until(issue)) if since else since
+        named = [e for e in events if isinstance(e, dict) and e.get("event") == "labeled"]
+        since = max((_ts(e.get("created_at")) for e in named
+                     if (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
+        if not since:
+            return since
+        moved = [_ts(e.get("created_at")) for e in named
+                 if str((e.get("label") or {}).get("name") or "").startswith("lane:")]
+        moved += [_ts(c.get("created_at")) for c in comments
+                  if STALL_MOVE_RE.match(str(c.get("body") or ""))]
+        return max([since, held_until(issue)] + moved)
+
+    def _stall_lanes(self, repo: str, issue: Dict[str, Any], rung: int) -> List[str]:
+        """The other available lanes a stalled ticket may move to: those of
+        its rung, or of its difficulty tier. Never up the ladder."""
+        old = _lane(issue)
+        pool = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
+        return [x for x in pool if x != old and self._up(x)]
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
-        """A ticket briefed BRIEFED_STALL with no lane claiming it climbs."""
+        """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
+        least-loaded other lane of its tier (or of its rung), with no rung
+        marker: it never ran, so it has not failed on any model. With no such
+        lane it stays briefed, and the stall is said once per pass."""
         number = int(issue["number"])
-        since = self._briefed_since(repo, issue)
+        comments = self._comments(repo, number)
+        since = self._briefed_since(repo, issue, comments)
         if not since or self.now - since < BRIEFED_STALL:
             return
-        comments = self._comments(repo, number)
         if any(CLAIM_RE.match(str(c.get("body") or "")) and _ts(c.get("created_at")) >= since
                for c in comments):
             return
-        hours = (self.now - since) / 3600
-        why = "briefed %.0f hours on lane %s with no claim" % (hours, _lane(issue))
-        lane = self._climb(repo, issue, comments, why, failed_here=False)
-        if lane is None:
-            self._give_up(repo, issue, why)
+        old = _lane(issue)
+        rung = current_rung(issue)
+        lanes = self._stall_lanes(repo, issue, rung)
+        if not lanes:
+            _say("%s#%d stalled on lane %s: no other lane of its %s is available"
+                 % (repo, number, old, "rung" if rung else "tier"))
             return
+        self._move_stalled(repo, issue, pick_lane(lanes, self.load),
+                           (self.now - since) / 3600, rung)
+
+    def _move_stalled(self, repo: str, issue: Dict[str, Any], lane: str,
+                      hours: float, rung: int) -> None:
+        """Relabel a stalled ticket onto `lane` and say why; no rung marker."""
+        number, old = int(issue["number"]), _lane(issue)
+        kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+            "body": "Not a failure (briefed %.0f hours on lane %s with no claim): the "
+                    "factory moved this ticket to lane %s, %s." % (
+                        hours, old, lane,
+                        "on the same rung" if rung else "in its difficulty tier")})
+        self.load[old] = self.load.get(old, 0) - 1
+        self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
         _say("moved stalled %s#%d to %s" % (repo, number, lane))
 

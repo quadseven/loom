@@ -112,6 +112,8 @@ class Routes:
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com", 1)[-1].split("?")[0]
         self.calls.append((method, path))
+        if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
+            return 200, {}, b"[]"
         if (method, path) not in self.routes:
             raise AssertionError("unexpected call %s %s" % (method, path))
         status, data = self.routes[(method, path)]

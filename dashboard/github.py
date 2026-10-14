@@ -7,11 +7,13 @@ import ipaddress
 import re
 import tempfile
 import threading
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlsplit
 
 from bus import labels, tickets
 from bus.github import DEFAULT_API, GitHub, GitHubError
+from bus.metrics import waits_for_repos
 
 
 def repos_from_env() -> List[str]:
@@ -87,12 +89,16 @@ class TicketStore:
                           "lanes": [], "pull_requests": [], "dashboard_errors": []}
         self.operator_items = []
         self.human_counts = {}
+        self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
         self.auth = "token" if token else "none"
         self._snapshot_lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
         self._refresh_thread: Optional[threading.Thread] = None
         self._last_remaining: Optional[int] = None
+        self.waits = {}
+        self.waits_error = "waits have not been looked up yet"
+        self._waits_refreshed_at = 0.0
 
     @property
     def data(self):
@@ -152,11 +158,13 @@ class TicketStore:
 
     def _read_operator_items(self):
         items, human_counts = [], {}
+        ask_error = "LOOM_REPOS is not set" if not self.repos else ""
         for repo in self.repos:
             try:
                 asks = self.gh.paginate("/repos/%s/issues?labels=needs-operator&state=open" % quote(repo, safe="/"))
                 humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
-            except (GitHubError, OSError, ValueError):
+            except (GitHubError, OSError, ValueError) as exc:
+                ask_error = self._error_reason(exc)
                 continue
             human_counts[repo] = len([row for row in humans if isinstance(row, dict) and "pull_request" not in row])
             for issue in asks:
@@ -166,7 +174,7 @@ class TicketStore:
                               "html_url": issue.get("html_url"), "ask": issue.get("body") or issue.get("title", ""),
                               "waiting_since": issue.get("updated_at", "9999"), "waiting_since_source": "updated",
                               "unblocks": 0, "queue": "needs_operator"})
-        return items, human_counts
+        return items, human_counts, ask_error
 
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
         """Read optional view sources; errors stay visible without failing tickets."""
@@ -176,21 +184,22 @@ class TicketStore:
                          "dashboard_errors": ["optional view sources were not refreshed because the GitHub request budget is below its floor"]})
             return
 
-        journals, metric_comments, prs, lanes = [], [], [], []
+        journals, reports, metric_comments, prs, lanes = [], [], [], [], []
         errors = []
         homes, status_home = _dashboard_homes()
         for repo, issue_number in homes:
-            self._read_dashboard_home(repo, issue_number, journals, metric_comments, lanes, errors)
+            self._read_dashboard_home(repo, issue_number, journals, reports, metric_comments, lanes, errors)
         if status_home and tickets.REPO_RE.fullmatch(status_home):
             self._read_lane_status(status_home, lanes, errors)
         for repo in self.repos:
             self._read_pull_requests(repo, prs, errors)
         data["improving"] = {"journals": journals, "metrics_comments": metric_comments}
+        data["floor_context"] = _floor_context(reports, journals, self.operator_items, errors)
         data["lanes"] = lanes
         data["pull_requests"] = prs
         data["dashboard_errors"] = errors
 
-    def _read_dashboard_home(self, repo, issue_number, journals, metric_comments, lanes, errors):
+    def _read_dashboard_home(self, repo, issue_number, journals, reports, metric_comments, lanes, errors):
         try:
             if issue_number:
                 issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), issue_number)).data
@@ -209,6 +218,8 @@ class TicketStore:
                                     "issue_title": issue.get("title")})
                     if body.startswith("<!-- loom:journal v1 -->"):
                         journals.append(comment)
+                    if body.startswith("<!-- loom:report v1 -->"):
+                        reports.append(comment)
                     if body.startswith("<!-- loom:metrics v1 -->"):
                         metric_comments.append(comment)
                     if body.startswith("<!-- loom:lanes v1 -->") or body.startswith("<!-- loom:remote-heartbeat v1"):
@@ -263,24 +274,90 @@ class TicketStore:
             errors = dict(current["errors"])
             stale = self._read_repos(data, errors) if not self._below_floor() else True
             if self._below_floor():
-                operator_items, human_counts = self.operator_items, self.human_counts
+                operator_items, human_counts, ask_error = self.operator_items, self.human_counts, self.operator_error
             else:
-                operator_items, human_counts = self._read_operator_items()
+                operator_items, human_counts, ask_error = self._read_operator_items()
             snapshot = {"tickets": data, "errors": errors, "stale": stale, "ready": True}
             self.operator_items, self.human_counts = operator_items, human_counts
+            self.operator_error = ask_error
             self._read_dashboard(snapshot)
+            now = time.time()
+            if now - self._waits_refreshed_at >= 3600 and not self._below_floor():
+                try:
+                    rows, bottleneck = waits_for_repos(self.gh, self.repos, now)
+                    self.waits = {row["state"]: [row["median_h"]] * row["n"]
+                                  for row in rows if row.get("median_h") is not None and row.get("n")}
+                    snapshot["wait_rows"] = rows
+                    snapshot["wait_bottleneck"] = bottleneck
+                    self.waits_error = ""
+                except (GitHubError, OSError, ValueError) as exc:
+                    self.waits_error = self._error_reason(exc)
+                    snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+                    snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+                self._waits_refreshed_at = now
+            else:
+                snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+                snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+            floor_context = snapshot.get("floor_context", {})
+            floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
+                                  "needs_you_reason": ask_error,
+                                  "waits_error": self.waits_error})
+            snapshot["floor_context"] = floor_context
             with self._snapshot_lock:
                 self._snapshot = snapshot
 
     def response(self) -> Dict[str, Any]:
         with self._snapshot_lock:
             snapshot = self._snapshot
+        store = getattr(self, "usage", None)
+        usage_rows = [row for items in getattr(store, "providers", {}).values() for row in items] if store else []
         return {"tickets": snapshot["tickets"], "errors": snapshot["errors"],
                 "stale": snapshot["stale"], "auth": self.auth,
                 "improving": snapshot.get("improving", {}),
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
-                "dashboard_errors": snapshot.get("dashboard_errors", [])}
+                "wait_rows": snapshot.get("wait_rows", []),
+                "wait_bottleneck": snapshot.get("wait_bottleneck"),
+                "floor_context": snapshot.get("floor_context", {}),
+                "operator_items": list(self.operator_items),
+                "dashboard_errors": snapshot.get("dashboard_errors", []),
+                "usage": usage_rows}
+
+
+def _floor_context(reports, journals, asks, errors):
+    latest_report = max(reports, key=lambda row: str(row.get("created_at") or ""), default=None)
+    latest_journal = max(journals, key=lambda row: str(row.get("created_at") or ""), default=None)
+    def sections(comment):
+        result = {}
+        if not comment:
+            return result
+        body = str(comment.get("body") or "")
+        for line in body.splitlines()[1:]:
+            match = re.match(r"^\s*(?:[-*]\s*)?(Going well|Not going well|Still stuck(?: since last report)?|Next)\s*:\s*(.*)$", line, re.I)
+            if match:
+                key = {"going well": "well", "not going well": "not well",
+                       "still stuck": "stuck", "still stuck since last report": "stuck",
+                       "next": "next"}[match.group(1).lower()]
+                result[key] = match.group(2).strip()
+        return result
+    report_body = str((latest_report or {}).get("body") or "")
+    headline = next((line.strip() for line in report_body.splitlines()[1:] if line.strip()), None)
+    journal_body = str((latest_journal or {}).get("body") or "")
+    step = re.search(r"^\s*-\s*(?:Next(?: step)?|Next move)\s*:\s*(.+)$", journal_body, re.I | re.M)
+    journal_step = step.group(1).strip() if step else None
+    if not journal_step:
+        journal_step = next((line.strip()[2:].strip() for line in journal_body.splitlines()[1:]
+                             if line.strip().startswith("- ") and re.search(r"\b(next|will)\b", line, re.I)), None)
+    header = next((line for line in str((latest_journal or {}).get("body") or "").splitlines()[1:2]
+                   if line.startswith("Tick ")), "")
+    holder_match = re.search(r"^Tick\s+[^,]+,\s*(.+)$", header)
+    return {"report_headline": headline, "report_time": (latest_report or {}).get("created_at"),
+            "since_report": sections(latest_report), "journal_step": journal_step,
+            "journal_holder": holder_match.group(1).strip() if holder_match else None,
+            "journal_time": (latest_journal or {}).get("created_at"),
+            "needs_you": len(asks),
+            "report_reason": "no goal report found" if not reports else "",
+            "journal_reason": "no goal journal found" if not journals else ""}
 
 
 def _dashboard_homes():

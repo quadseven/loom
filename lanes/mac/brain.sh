@@ -91,7 +91,10 @@ fi
 PROMPT="You are the Loom brain for one tick. Follow $WORK/loom/docs/MUSE.md, \
 with these differences: the checkout is already up to date, and the tick lock \
 is already held for you as holder $HOLDER by the wrapper, so skip the lock and unlock steps \
-(never lock or unlock). LOOM_REPOS is set in your environment. Work from \
+(never lock or unlock). Record each other tick step with python3 -m bus.brain \
+step NAME --holder $HOLDER --lock-repo $LOCK_REPO in place of the step \
+command MUSE.md gives; the wrapper records lock and unlock. LOOM_REPOS is \
+set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
 goal. This replaces the 15-minute limit in MUSE.md: stop within \
 $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
@@ -107,7 +110,10 @@ $((MINUTES / 3)) minutes on them. Resume also lists up to 5 verify-due \
 tickets (shipped, no proof yet): spend up to a third of the tick on them, \
 oldest first. Write a proof only from evidence you saw in this tick; for a \
 ticket you cannot verify, leave a one-line note on it naming what evidence is \
-missing. Review, merge, brief and answer asks beyond \
+missing. Resume's sensitive pull requests are yours even when another brain \
+journaled in the last 2 hours: read the ticket and diff, answer or resolve \
+each review thread, then run bus.brain merge with its ticket when ready. Do \
+not wait for that brain's next tick. Review, merge, brief and answer asks beyond \
 those items only when resume says all GitHub stages are open to you (no other \
 brain journaled in the last 2 hours). Defer and done markers go in your \
 journal as MUSE.md says."

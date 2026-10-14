@@ -214,14 +214,22 @@ def _opencode_records(home: str, slots: List[str], _env: Dict[str, str], now: fl
 
 
 def _spark_records(home: str, slots: List[str], _env: Dict[str, str], now: float) -> List[Dict[str, Any]]:
-    path = Path(home) / "state" / "usage" / "spark.limit"
-    try:
-        until = float(path.read_text().split()[0])
-        return [_record("spark", slots, "thermal hold", None, None, "seconds",
-                        _utc_epoch(until, now), "state/usage/spark.limit", now)]
-    except (OSError, ValueError, IndexError):
-        return [_record("spark", slots, "thermal hold", None, None, None, None,
-                        "state/usage/spark.limit", now, "no active hold")]
+    usage_dir = Path(home) / "state" / "usage"
+    records = []
+    for slot in slots:
+        source = "state/usage/%s.limit" % slot
+        try:
+            fields = (usage_dir / (slot + ".limit")).read_text().split()
+            until = float(fields[0])
+            if until <= now:
+                raise ValueError("hold has expired")
+            reason = " ".join(fields[1:]) or None
+            records.append(_record("spark", [slot], "thermal hold", None, None, "seconds",
+                                   _utc_epoch(until, now, relative=False), source, now, reason))
+        except (OSError, ValueError, IndexError):
+            records.append(_record("spark", [slot], "thermal hold", None, None, None, None,
+                                   source, now, "no active hold"))
+    return records
 
 
 def write(home: str, records: List[Dict[str, Any]]) -> str:

@@ -15,7 +15,10 @@ from dashboard.github import TicketStore
 from dashboard import views
 from dashboard.server import make_server
 
+from tests import sandbox_caps
 
+
+@unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
 class DashboardTest(unittest.TestCase):
     def setUp(self):
         self.api_calls = []
@@ -287,7 +290,11 @@ class DashboardViewTest(unittest.TestCase):
         ]}
 
         def response(self):
-            return {"tickets": self.data}
+            return {"tickets": self.data, "wait_rows": [
+                {"state": "queued", "median_h": 1.5, "worst_h": 4, "n": 3},
+                {"state": "pr", "median_h": 5.5, "worst_h": 9, "n": 4},
+                {"state": "verified", "median_h": 20, "worst_h": 30, "n": 8}],
+                "pull_requests": [{"updated_at": "2026-10-14", "body": "Loom ticket example-owner/sample#32, lane codex, model model-y."}]}
 
     def test_floor_bottleneck_and_links(self):
         from dashboard.server import _floor
@@ -308,6 +315,38 @@ class DashboardViewTest(unittest.TestCase):
         self.assertIn("bottleneck", body)
         self.assertIn('href="/t/example-owner/sample/31"', body)
         self.assertIn('href="/t/example-owner/sample/32"', body)
+        self.assertIn("median 1.5h", body)
+        self.assertIn("worst 9.0h", body)
+        self.assertIn("state-pr bottleneck", body)
+        self.assertNotIn("state-verified bottleneck", body)
+        self.assertIn("model-y", body)
+
+    def test_goal_home_report_journal_and_needs_you_render(self):
+        from dashboard.github import _floor_context
+        from dashboard.server import _floor
+        state = self.State()
+        state.context = _floor_context(
+            [{"body": "<!-- loom:report v1 -->\nProgress improved: 4 tickets verified.\n"
+                      "Going well: Four tickets shipped\nNot going well: One check failed\n"
+                      "Still stuck since last report: One item for two days\nNext: Review the next ticket",
+              "created_at": "2026-10-14T12:00:00Z"}],
+            [{"body": "<!-- loom:journal v1 -->\nTick 2026-10-14T12:10:00Z, brain\n"
+                      "- Next: Review the next ticket", "created_at": "2026-10-14T12:10:00Z"}],
+            [{}, {}], [])
+        body = _floor(state)
+        for item in ("Progress improved: 4 tickets verified.", "Going well", "Four tickets shipped",
+                     "Not going well", "One check failed", "Still stuck", "One item for two days",
+                     "Next", "Review the next ticket", "brain", "2026-10-14T12:10:00Z", "<strong>2</strong>"):
+            self.assertIn(item, body)
+
+    def test_missing_goal_sources_keep_not_looked_reason(self):
+        from dashboard.server import _floor
+        state = self.State()
+        state.context = {"report_reason": "goal home unavailable", "journal_reason": "goal home unavailable",
+                         "needs_you_reason": "needs-operator source unavailable"}
+        body = _floor(state)
+        self.assertIn("not looked: goal home unavailable", body)
+        self.assertIn("not looked: needs-operator source unavailable", body)
 
     def test_ticket_filters_and_empty_state(self):
         from dashboard.server import _tickets
@@ -422,10 +461,7 @@ class LanesAndImprovingTest(unittest.TestCase):
             "---\n"
             "Loom ticket quadseven.loom-282-r2, lane codex, model gpt-6-luna.\n"
         )
-        match = views.FOOTER.search(pr_body)
-        self.assertIsNotNone(match)
-        self.assertEqual(match.groups(), ("quadseven/loom", "282", "codex", "gpt-6-luna"))
-        self.assertEqual(views.parse_footer(pr_body), ("quadseven/loom", "282", "codex", "gpt-6-luna"))
+        self.assertEqual(views.footer(pr_body), ("quadseven/loom", "282", "codex", "gpt-6-luna"))
 
         prs = [
             {"body": pr_body, "state": "closed", "merged_at": "2026-10-14T12:00:00Z", "difficulty": "medium"},
@@ -438,7 +474,7 @@ class LanesAndImprovingTest(unittest.TestCase):
         self.assertEqual(board["medium"]["gpt-6-luna"]["merged"], 1)
         self.assertEqual(board["medium"]["gpt-6-luna"]["open"], 1)
 
-        ticket = {"repo": "quadseven.loom", "number": 282, "difficulty": "medium", "state": "closed"}
+        ticket = {"repo": "quadseven/loom", "number": 282, "difficulty": "medium", "state": "closed"}
         payload = {
             "pull_requests": [{"body": pr_body, "state": "closed", "merged_at": "2026-10-14T12:00:00Z"}],
             "lanes": [],
@@ -562,12 +598,12 @@ class LanesAndImprovingTest(unittest.TestCase):
 
         self.assertIn('class="factory-grid"', html_out)
         self.assertEqual(html_out.count("factory-card"), 9)
+        self.assertEqual(html_out.count("metric-prev"), 9)
         for num_name in ("Metric One", "Metric Two", "Metric Three", "Metric Four",
                          "Metric Five", "Metric Six", "Metric Seven", "Metric Eight", "Metric Nine"):
             self.assertIn(num_name, html_out)
-        self.assertIn("was 40", html_out)
-        self.assertIn("was 8", html_out)
-        self.assertIn("was 80%", html_out)
+        for previous in ("40", "8", "80%", "15", "95", "4", "0"):
+            self.assertIn("was %s /" % previous, html_out)
         self.assertIn("better", html_out)
 
 
@@ -588,6 +624,138 @@ class FactoryNumberDirectionTest(unittest.TestCase):
 
     def test_no_friction_lines_says_so(self):
         self.assertIn("No friction lines in the journals yet.", self.render(True, True))
+class LaneCardsTest(unittest.TestCase):
+    def test_status_comment_renders_heartbeat_time_and_never_heartbeat_available(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "Updated 2026-10-14 20:17:00Z\n\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 2026-10-14 20:17:00Z |\n"
+            "| claude | yes | 20:17Z |\n"
+            "| agy | no | 2026-10-14 19:45:00Z |\n"
+        )
+        payload = {"lanes": [{"body": comment, "created_at": "2026-10-14T20:17:00Z"}],
+                   "pull_requests": [], "tickets": {}}
+        data = _lane_view_data(payload, [])
+        body = render_lanes(data)
+        self.assertNotIn("heartbeat available", body)
+        self.assertIn("heartbeat 20:17Z", body)
+        self.assertIn("heartbeat 19:45Z", body)
+        for lane in ("codex", "claude", "agy"):
+            self.assertIn(lane, body)
+
+    def test_running_ticket_has_separator_before_heartbeat_line(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 20:17Z |\n"
+        )
+        tickets = [{"repo": "example-owner/sample", "number": 362, "title": "Lane cards",
+                    "state": "running", "lane": "codex"}]
+        payload = {"lanes": [{"body": comment}], "pull_requests": [], "tickets": {}}
+        data = _lane_view_data(payload, tickets)
+        body = render_lanes(data)
+        self.assertIn("Lane cards</a> - heartbeat 20:17Z", body)
+
+    def test_pull_request_footer_shows_model_and_missing_says_model_missing(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 20:17Z |\n"
+            "| claude | yes | 20:17Z |\n"
+        )
+        prs = [{
+            "body": "Fixes #1\n\nLoom ticket example-owner/sample#31, lane codex, model gpt-6-sol.\n",
+            "created_at": "2026-10-14T12:00:00Z",
+        }]
+        payload = {"lanes": [{"body": comment}], "pull_requests": prs, "tickets": {}}
+        data = _lane_view_data(payload, [])
+        body = render_lanes(data)
+        self.assertIn("gpt-6-sol", body)
+        self.assertIn("model missing", body)
+
+    def test_the_runners_ticket_name_footer_names_the_lanes_model(self):
+        from dashboard.views import footer, render_lanes
+        from dashboard.server import _lane_view_data
+        self.assertEqual(footer("Loom ticket example-owner.my-repo-31-r2, lane codex-2, model gpt-6-sol."),
+                         ("example-owner/my-repo", "31", "codex-2", "gpt-6-sol"))
+        quoted = "The footer reads `Loom ticket example-owner.my-repo-31, lane codex, model gpt-6-luna.` (doc)"
+        self.assertIsNone(footer(quoted))
+        comment = ("<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n"
+                   "|---|---|---|\n| codex-2 | yes | 20:17Z |\n")
+        prs = [{"body": "Loom ticket example-owner.my-repo-31-r2, lane codex-2, model gpt-6-sol.\n",
+                "created_at": "2026-10-14T12:00:00Z"}]
+        body = render_lanes(_lane_view_data({"lanes": [{"body": comment}], "pull_requests": prs,
+                                             "tickets": {}}, []))
+        self.assertIn("gpt-6-sol", body)
+
+    def test_usage_record_shows_quota_bar_and_missing_says_quota_missing(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 20:17Z |\n"
+            "| claude | yes | 20:17Z |\n"
+        )
+        usage = [
+            {"provider": "codex", "lanes": ["codex"], "window": "weekly", "used_pct": 65,
+             "as_of": "2026-10-14T12:00:00Z", "source": "test"}
+        ]
+        payload = {"lanes": [{"body": comment}], "pull_requests": [], "tickets": {}, "usage": usage}
+        data = _lane_view_data(payload, [])
+        body = render_lanes(data)
+        self.assertIn('<div class="quota"><span style="width:65%"></span></div>', body)
+        self.assertIn("quota missing", body)
+
+    def test_lanes_http_route_integration(self):
+        from dashboard.server import _dispatch_get
+        from dashboard.usage import Store
+        class State:
+            stale = False
+            usage = Store()
+            def response(self):
+                comment = (
+                    "<!-- loom:lanes v1 -->\n"
+                    "| lane | available | heartbeat (UTC) |\n"
+                    "|---|---|---|\n"
+                    "| codex | yes | 20:17Z |\n"
+                    "| claude | yes | 20:17Z |\n"
+                )
+                prs = [{
+                    "body": "Loom ticket example-owner/sample#31, lane codex, model gpt-6-sol.\n",
+                    "created_at": "2026-10-14T12:00:00Z",
+                }]
+                return {"tickets": {}, "lanes": [{"body": comment}], "pull_requests": prs,
+                        "stale": False, "dashboard_errors": []}
+        state = State()
+        state.usage.upload([
+            {"provider": "codex", "lanes": ["codex"], "window": "5-hour", "used_pct": 42,
+             "as_of": "2026-10-14T12:00:00Z", "source": "test"}
+        ])
+        class Handler:
+            path = "/lanes"
+            def send_page(self, body, code=200):
+                self.result = (code, body)
+        handler = Handler()
+        _dispatch_get(handler, state)
+        body = handler.result[1]
+        self.assertNotIn("heartbeat available", body)
+        self.assertIn("heartbeat 20:17Z", body)
+        self.assertIn("gpt-6-sol", body)
+        self.assertIn('<div class="quota"><span style="width:42%"></span></div>', body)
+        self.assertIn("quota missing", body)
+        self.assertIn("model missing", body)
 
 
 if __name__ == "__main__":

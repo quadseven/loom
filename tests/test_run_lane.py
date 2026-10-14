@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
+from tests import sandbox_caps  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
@@ -120,6 +121,11 @@ if [ "${FAKE_AGENT:-commit}" = say ]; then
   exit "${FAKE_EXIT:-1}"
 fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
+  mkdir -p .loom
+  printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
   echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
   exit 1
@@ -141,6 +147,24 @@ fi
 [ -z "${FAKE_AGENT_WEAKEN:-}" ] || { mkdir -p .loom; echo 'check: true' > .loom/validation.conf; }
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = probes ]; then
+  printf '# test\\n' > .test_write
+  mkdir -p bin
+  printf 'test bin in workspace\\n' > bin/test
+  printf 'fixed\\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = binref ]; then
+  mkdir -p bin
+  printf '#!/bin/sh\\n' > bin/tool
+  printf '#!/bin/sh\\n./bin/tool\\n' > run.sh
+  printf 'fixed\\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
 printf '%s\\n' "${FAKE_AGENT_TEXT:-fixed}" > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
@@ -438,6 +462,44 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertFalse((self.inbox / "T042-fix-the-thing.md").exists())
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def pushed_files(self, branch="loom/T042-fix-the-thing"):
+        clone = Path(self._tmp.name) / "pushed-clone"
+        git("clone", "-q", str(self.remote), str(clone))
+        out = subprocess.run(["git", "diff", "--name-only", "main",
+                              "origin/%s" % branch],
+                             cwd=clone, capture_output=True, text=True,
+                             check=True)
+        return sorted(out.stdout.splitlines())
+
+    def run_log(self, name="T042-fix-the-thing.log"):
+        return (self.loom / "logs" / "codex" / name).read_text()
+
+    def test_probe_files_are_dropped_before_the_pr_opens(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="probes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The pushed branch carries only the real change.
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        # The run log names each file the runner dropped.
+        log = self.run_log()
+        self.assertIn("dropped sandbox probe file: .test_write", log)
+        self.assertIn("dropped sandbox probe file: bin/test", log)
+        # The PR Intent section names each file the runner dropped.
+        body = self.body.read_text()
+        self.assertIn("Dropped sandbox probe files: .test_write, bin/test",
+                      body)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_bin_file_the_diff_references_is_kept(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="binref")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["bin/tool", "fix.txt", "run.sh"])
+        self.assertNotIn("dropped sandbox probe file", self.run_log())
+        self.assertNotIn("Dropped sandbox probe files", self.body.read_text())
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
     def test_agent_commit_is_pushed_and_opened_as_a_chief_ready_pr(self):
         self.drop_brief()
         result = self.run_lane()
@@ -454,6 +516,52 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("\nSize: S\n", body)
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_answer_deliverable_posts_comment_and_does_not_push_or_open_pr(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+        result = self.run_lane(FAKE_AGENT="answer-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("gh issue comment 42") for c in calls), calls)
+        self.assertTrue(any("configured retry limit" in c for c in calls if c.startswith("gh issue comment")))
+        self.assertTrue(any(c.startswith("gh issue edit 42") and "loom:answered" in c for c in calls))
+        self.assertFalse(any(c.startswith("gh pr create") or c.startswith("gh pr comment") for c in calls))
+        self.assertFalse(any(c.startswith("git push") for c in calls))
+        pushed = subprocess.run(["git", "ls-remote", "--heads", str(self.remote),
+                                 "loom/T042-fix-the-thing"], capture_output=True,
+                                text=True, check=True).stdout
+        self.assertEqual(pushed, "")
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_answer_deliverable_refuses_local_paths_and_closing_keywords(self):
+        for answer, reason in (("See /Users/person/private/file", "absolute path"),
+                               ("This fixes #42", "closing keyword")):
+            with self.subTest(reason=reason):
+                self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+                result = self.run_lane(FAKE_AGENT="answer-file", FAKE_ANSWER_TEXT=answer)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+                self.assertIn(reason, log)
+                self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
+                failed = list((self.inbox / "failed").glob("*.md"))
+                self.assertTrue(failed)
+                failed[0].rename(self.inbox / failed[0].name)
+
+    def test_answer_deliverable_without_file_fails_as_no_answer_written(self):
+        brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer")
+        self.drop_brief(text=brief)
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("no answer written", log)
+
+    def test_no_deliverable_header_and_no_commit_still_fails(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("agent made no commit", log)
+        self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
 
     def test_a_body_the_runner_wrote_is_current_to_the_pr_repair_helper(self):
         # The body comes from run_lane.sh::pr_body, not from pr_repair's own
@@ -538,6 +646,15 @@ class LaneRunnerTest(unittest.TestCase):
         agent = [c for c in self.calls() if c.startswith("codex ")]
         self.assertIn("--model gpt-test-default", agent[0])
         self.assertIn("lane codex, model gpt-test-default", self.body.read_text())
+
+    def test_the_agent_is_told_to_work_test_first_and_run_the_suite(self):
+        self.drop_brief()
+        self.run_lane()
+        prompt = self.log.read_text()
+        self.assertIn("## How to work", prompt)
+        self.assertIn("Work test-first", prompt)
+        self.assertIn("run the repo's full test suite", prompt)
+        self.assertIn("cyclomatic complexity under 15", prompt)
 
     def test_pr_body_ends_with_refs_for_a_station_brief(self):
         self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo#42\n"))
@@ -1174,7 +1291,7 @@ cat > /dev/null
         result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
         return inbox, result
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_api_lane_agent_sees_only_its_key_and_a_scratch_home(self):
         inbox, result = self.api_lane(
             "openrouter",
@@ -1252,7 +1369,7 @@ cat > /dev/null
         self.assertEqual(writes[2], f'(deny file-write* (subpath "{tree}/.git"))')
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_links_left_in_the_scratch_home_cannot_redirect_runner_writes(self):
         # A previous agent could leave its config path as a link into the
         # real HOME; the runner, which is not sandboxed, must not follow it.
@@ -1270,7 +1387,7 @@ cat > /dev/null
         self.assertEqual(victim.read_text(), "original\n")
         self.assertTrue(any("small=openrouter/vendor/model:free" in c for c in self.calls()))
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_api_lane_transcripts_are_archived_without_following_links(self):
         # The scratch home is wiped before the next run; the transcript must
         # survive it, and a link the agent left must not pull in a secret.
@@ -1300,7 +1417,7 @@ cat > /dev/null
                 self.assertNotIn("private key", p.read_text())
                 self.assertNotIn("another lane's file", p.read_text())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_workersai_lane_gets_its_token_and_account_id(self):
         inbox, result = self.api_lane(
             "workersai",
@@ -1359,7 +1476,7 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         return inbox, [c for c in self.calls() if c.startswith("skills ")]
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_api_lane_sees_the_skill_snapshot_read_only_in_each_tools_folder(self):
         checkout = self.operator_skills()
         inbox, seen = self.anthropic_skill_run()
@@ -1382,7 +1499,7 @@ cat > /dev/null
         for p in (snapshot, *snapshot.rglob("*")):
             self.assertFalse(p.stat().st_mode & 0o222, p)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_the_skill_snapshot_refreshes_at_most_hourly_and_a_failed_refresh_keeps_it(self):
         checkout = self.operator_skills()
         self.anthropic_skill_run()
@@ -1465,7 +1582,7 @@ cat > /dev/null
         self.assertEqual((victim / "loom.keychain-db").read_text(), "keychain")
         self.assertFalse((workdir.parent / ".gemini" / "antigravity-cli" / "cache").is_symlink())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_agy_lane_unlocks_its_keychain_then_runs_as_the_lane_user(self):
         inbox, workdir, result, agy = self.agy_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1500,7 +1617,7 @@ cat > /dev/null
         self.assertIn("lane agy, model gemini-3.8-flash-high", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_agy_lane_rewrites_its_settings_to_allow_commands_and_deny_web_fetching(self):
         inbox, workdir, result, agy = self.agy_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1565,6 +1682,7 @@ cat > /dev/null
         self.assertEqual(victim.read_text(), "keep")
         self.assertIn("command(*)", json.loads((state / "settings.json").read_text())["permissions"]["allow"])
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_agy_lane_user_gets_the_skills_where_agy_reads_them_read_only(self):
         self.operator_skills()
         # A copy an earlier run left, read-only, is replaced, not merged.
@@ -1634,7 +1752,7 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_zen_lane_runs_a_free_model_sandboxed_without_a_key(self):
         # OpenCode Zen serves its free models with no stored credential.
         inbox, result = self.api_lane("zen", LOOM_ZEN_MODEL="opencode/space-bunny-free")
@@ -1685,7 +1803,7 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_opencode_go_other_models_still_take_a_private_repo(self):
         inbox, result = self.api_lane(
             "opencode-go", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
@@ -1703,11 +1821,11 @@ cat > /dev/null
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         return [c for c in self.calls() if c.startswith("opencode ")][-1]
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_slot_with_its_own_model_setting_runs_that_model(self):
         self.assertIn("-m opencode-go/deepseek-v4.1-flash", self.slot_run("opencode-go-3"))
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_slot_without_one_runs_its_lanes_model(self):
         self.assertIn("-m opencode-go/kimi-k2.7-code", self.slot_run("opencode-go-2"))
 
@@ -1717,7 +1835,7 @@ cat > /dev/null
         self.write_tool(path, FAKE_OPENCODE_2)
         return str(path)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_slot_on_opencode_2_uses_one_sandboxed_server(self):
         profile_file = Path(self._tmp.name) / "opencode2.profile"
         self.write_tool(self.bin / "sandbox-exec", "#!/bin/sh\nprintf '%s' \"$2\" > "
@@ -1740,7 +1858,7 @@ cat > /dev/null
         self.assertIn("secret=denied", run)
         self.assertIn("lo=denied", run)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_opencode_2_stops_its_server_after_agent_failure(self):
         inbox, result = self.api_lane(
             "opencode-go-3", extra="AGENT_FAIL=1\n",
@@ -1770,13 +1888,13 @@ cat > /dev/null
         self.assertNotIn("Transport: Was there a typo in the url or port?", log)
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_sibling_slot_keeps_the_default_opencode(self):
         run = self.slot_run("opencode-go-2", LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
         self.assertIn("run -m opencode-go/kimi-k2.7-code", run)
         self.assertNotIn("--standalone", run)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_zai_lane_hands_its_key_to_a_free_flash_model(self):
         inbox, result = self.api_lane(
             "zai", LOOM_ZAI_KEY_SSM="/k/zai", FAKE_SECRET__k_zai="fake-zai-key",
@@ -1828,7 +1946,7 @@ cat > /dev/null
     def spark_log(self):
         return (self.loom / "logs" / "spark" / "T042-fix-the-thing.log").read_text()
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
         # The local coder trains on nothing: no privacy lookup, private is fine.
         inbox, result = self.api_lane("spark", FAKE_GH_PRIVATE="true", **self.SPARK)
@@ -1854,7 +1972,7 @@ cat > /dev/null
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.spark_beat()["available"])
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_the_spark_2_slot_runs_against_its_own_box(self):
         # The second Spark box (2026-10-14: one sat idle with the coder warm).
         inbox = self.loom / "briefs" / "spark-2"
@@ -1872,7 +1990,7 @@ cat > /dev/null
         self.assertEqual(config["provider"]["spark"]["options"],
                          {"baseURL": "http://other-spark.example.invalid:8000/v1"})
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_uses_the_window_its_endpoint_serves(self):
         # The first sparkles run thrashed in a fixed 32K window against a
         # server serving 262144; the window is a lane setting now.
@@ -1883,7 +2001,7 @@ cat > /dev/null
         self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
                          {"context": 131072, "output": 16384})
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
         _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
                                   **self.SPARK)
@@ -1892,7 +2010,7 @@ cat > /dev/null
         self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
                          {"context": 32768, "output": 4096})
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_takes_the_brief_model_line(self):
         brief = BRIEF.replace("Lane: codex", "Lane: spark\nModel: spark/other-coder")
         inbox = self.loom / "briefs" / "spark"
@@ -1925,7 +2043,7 @@ cat > /dev/null
         self.assertTrue((inbox / "failed" / "T043-next.md").exists())
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
         inbox, result = self.api_lane("spark", extra="AGENT_FAIL=1\n", FAKE_CURL="200 503", **self.SPARK)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1936,7 +2054,7 @@ cat > /dev/null
         self.assertFalse(beat["available"])
         self.assertTrue(beat["reason"].startswith("limit: "), beat)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_that_fails_while_the_endpoint_answers_is_an_ordinary_failure(self):
         inbox, _ = self.api_lane("spark", extra="AGENT_FAIL=1\n", **self.SPARK)
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
@@ -2014,7 +2132,7 @@ cat > /dev/null
                 continue  # the agent's own record of the key it was handed
             self.assertNotIn("fake-go-key-s3cr3t", where)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_go_usage_limit_before_the_run_holds_the_lane_12_hours_and_hands_the_brief_on(self):
         requests, env = self.provider(self.GO_LIMIT)
         before = int(time.time())
@@ -2060,7 +2178,7 @@ cat > /dev/null
             self.assertEqual(result.stdout.strip(), "rc=1", model)
             self.assertEqual(sent.exists(), reaches, model)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_provider_that_answers_lets_the_run_go_ahead(self):
         requests, env = self.provider((200, '{"choices": [{"message": {"content": "p"}}]}'))
         inbox, result = self.api_lane("opencode-go", **env)
@@ -2071,14 +2189,14 @@ cat > /dev/null
         self.assertTrue(self.beat("opencode-go")["available"])
         self.assert_key_kept_out(result)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_429_that_is_not_a_go_usage_limit_lets_the_run_go_ahead(self):
         _, env = self.provider((429, '{"type": "RateLimitError"}'))
         inbox, _ = self.api_lane("opencode-go", **env)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.beat("opencode-go")["available"])
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_timed_out_run_then_a_go_usage_limit_parks_as_a_limit(self):
         requests, env = self.provider((200, "{}"), self.GO_LIMIT)
         before = int(time.time())
@@ -2096,7 +2214,7 @@ cat > /dev/null
         self.assertTrue(before + 43200 <= beat["retry_at"] <= int(time.time()) + 43200)
         self.assert_key_kept_out(result)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_timed_out_run_while_the_provider_answers_stays_transient(self):
         requests, env = self.provider((200, "{}"))
         inbox, _ = self.api_lane("opencode-go", extra="AGENT_TIMEOUT=1\n", **env)
@@ -2148,7 +2266,7 @@ exit %d
         path = self.loom / "state" / "usage" / "spend.jsonl"
         return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_an_anthropic_run_records_its_cost_from_the_json_result(self):
         self.fake_claude(json.dumps({
             "type": "result", "subtype": "success", "is_error": False,
@@ -2177,7 +2295,7 @@ exit %d
         self.assertEqual(list((self.loom / "logs" / "anthropic-3").glob("*.result")), [])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_an_anthropic_run_without_a_result_records_unknown_cost_not_zero(self):
         self.fake_claude("killed before the result\n", code=3)
         inbox, result = self.anthropic_run()
@@ -2422,6 +2540,7 @@ exit %d
             bystander.kill()
             bystander.wait()
 
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
     def test_an_agent_orphaned_by_a_killed_runner_is_stopped_by_the_next_pass(self):
         # What a reinstall did: launchd's bootout kills the runner's process
         # group mid-brief, and the agent (under timeout, in a group of its own)
@@ -2567,7 +2686,7 @@ exit %d
         self.assertIn("setup failed: interpreter loom-test-python is not on PATH", self.lane_log())
         self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_prepared_workspace_checks_the_agents_commit_before_the_pr(self):
         pinned = self.contract_repo()
         self.drop_brief()
@@ -2592,7 +2711,7 @@ exit %d
         self.assertIn("fix.txt", files)
         self.assertNotIn(".prepared", files)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_zero_exit_agent_with_a_failing_check_opens_no_pr_and_keeps_its_edits(self):
         self.contract_repo()
         self.drop_brief()
@@ -2610,7 +2729,7 @@ exit %d
                               capture_output=True, text=True, check=True).stdout
         self.assertEqual(kept, "broken\n")
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_check_that_has_to_reformat_the_agents_files_does_not_pass(self):
         self.contract_repo()
         self.drop_brief()
@@ -2622,7 +2741,7 @@ exit %d
         self.assertEqual(self.records()[-1]["exit"], 0)
         self.assertFalse(self.records()[-1]["ok"])
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_the_agent_cannot_weaken_the_contract_it_is_checked_against(self):
         self.contract_repo()
         self.drop_brief()
@@ -2631,7 +2750,7 @@ exit %d
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertEqual(self.records()[-1]["command"], "test -f .prepared && loom-test-python check.py")
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_fix_run_checks_against_the_base_branchs_contract_not_the_pull_requests(self):
         self.contract_repo()
         name, _ = self.fix_brief()

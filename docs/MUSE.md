@@ -158,6 +158,12 @@ live regression).
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).
    Spend at most a third of the tick on them; defer what is left again.
+   Sensitive pull requests listed by resume are also yours to handle, even
+   when another brain journaled in the last 2 hours. They are open,
+   needs-brain, older than 2 hours, green and passed the review check. Read
+   the ticket and diff, answer or resolve each review thread, then run
+   `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N` when ready.
+   Do not wait for the other brain's next tick.
    `resume` then lists up to 5 verify-due tickets (open `loom:shipped`, no
    proof yet), oldest ship first, as `resume verify` items after the stage
    work and before any new brief. Verify them as step 4 says; write a proof
@@ -226,7 +232,9 @@ live regression).
 7. First run `python3 -m bus.brain step brief --holder muse`. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,
-   and `brief --not-before` writes the line),
+   and `brief --not-before` writes the line), and any ticket that builds on
+   work not merged yet (`brief --after '#5, owner/name#7'` writes the line,
+   and the station holds the ticket until each of them is merged),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
    A brief without `--lane` stays queued until the station gives it a free
@@ -397,12 +405,13 @@ a cheap change lands fast and a dangerous one never lands on the factory's
 say-so alone:
 
 - `docs` and `tests`: the factory lands them on green checks and a review
-  pass on the head commit alone. A medium or low finding the review bot
-  opened is deferred to the follow-up issue at once, without waiting for a
-  fix round: it is style, not behavior.
-- `logic`: the rule above the class is unchanged: the factory lands a green,
-  reviewed pull request once its minor findings were asked for in a fix round
-  or it has had two rounds.
+  pass on the head commit alone.
+- `logic`: the factory lands a green, reviewed pull request whose only open
+  findings are medium or low.
+- For both rules a medium or low finding the review bot opened is deferred to
+  the follow-up issue at once, with no fix round (2026-10-14: 64% of 361 fix
+  rounds were review threads, most of them medium). A high or critical
+  finding still sends the pull request back.
 - `sensitive`: the factory never merges it. It marks the pull request
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
   requests", and leaves it for the brain. A brain merges it with

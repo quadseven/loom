@@ -3,13 +3,17 @@
 The patterns here mirror the checks in lanes/run_lane.sh, so a brief that
 passes them is one the unchanged runner accepts. docs/BRAIN.md ("Ticket
 issues", "Trust") is the contract.
+
+Two header lines say when a ticket may run: `Not before:` names a UTC time,
+and `After:` names the tickets it builds on. Neither reaches the brief the
+lane reads; both are settled before the station claims a ticket.
 """
 from __future__ import annotations
 
 import calendar
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
@@ -17,13 +21,18 @@ BASE_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 DIFFICULTIES = ("easy", "medium", "hard")
 
-HEADER_RE = re.compile(r"(Difficulty|Model|Base|Not before):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+# "After: #5, owner/name#7": the ticket builds on those tickets, and is not
+# claimed until each of them is merged.
+_AFTER_ITEM = r"(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+"
+AFTER_RE = re.compile(r"%s(?:[ \t]*,[ \t]*%s)*" % (_AFTER_ITEM, _AFTER_ITEM))
+_AFTER_REF_RE = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#([0-9]+)")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
-FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR):")
+FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable):")
 SLUG_MAX = 40
 
 
@@ -61,6 +70,11 @@ _HEADER_RULES = {
              lambda v: "Base: %r is not a branch name" % v),
     "Not before": (lambda v: bool(NOT_BEFORE_RE.fullmatch(v)),
                    lambda v: "Not before: %r is not a UTC time like 2026-10-13T17:00:00Z" % v),
+    "After": (lambda v: bool(AFTER_RE.fullmatch(v)),
+              lambda v: "After: %r is not a list of tickets like '#5' or "
+                        "'owner/name#7, #8'" % v),
+    "Deliverable": (lambda v: v == "answer",
+                    lambda v: "Deliverable: must be answer"),
 }
 
 
@@ -327,7 +341,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             # The Finding-<id> prefix also prevents a field() match in the runner.
             summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
             out.append("Finding-%s: %s" % (f.id, summary))
-    out += ["%s: %s" % (k, v) for k, v in headers.items() if k != "Not before"]
+    out += ["%s: %s" % (k, v) for k, v in headers.items()
+            if k not in ("Not before", "After")]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
     if body:
@@ -407,3 +422,81 @@ def not_before(headers: Dict[str, str]) -> Optional[float]:
     if not value:
         return None
     return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+# The state labels a ticket carries, in the order they are looked for.
+TICKET_STATES = ("queued", "briefed", "running", "pr", "ready", "failed",
+                 "merged", "closed-unmerged", "shipped", "verified")
+# A ticket at or past merged: its pull request landed.
+MERGED_STATES = ("merged", "shipped", "verified")
+
+
+class After(NamedTuple):
+    """One ticket named in an After: line, and what it says about the ticket
+    waiting for it."""
+
+    repo: str      # OWNER/NAME, the waiting ticket's own repo for a bare "#5"
+    number: int
+    short: str     # "#5" or "owner/name#7", as the line wrote it
+    why: str       # dependency_state: why it still holds, or "not-planned"
+
+
+def ticket_state(issue: Dict[str, Any]) -> str:
+    """The ticket's own state label ("queued", "pr", "merged", ...), or ""."""
+    names = {str(x.get("name") if isinstance(x, dict) else x)
+             for x in issue.get("labels") or []}
+    return next((s for s in TICKET_STATES if "loom:" + s in names), "")
+
+
+def dependency_state(issue: Optional[Dict[str, Any]]) -> str:
+    """Whether the ticket named in an After: line is merged yet.
+
+    "merged" once its state label is merged, shipped or verified, "closed"
+    for a closed ticket closed as completed, "not-planned" for one closed as
+    not planned (which releases the hold), its own state label ("queued",
+    "pr", ...) while it is still open, "none" when it carries no state
+    label, and "unreadable" when it could not be read at all. A label is
+    enough: the station reconciles pull requests to their terminal state
+    before it claims anything.
+    """
+    if not isinstance(issue, dict):
+        return "unreadable"
+    if issue.get("state") == "closed":
+        return "not-planned" if issue.get("state_reason") == "not_planned" else "closed"
+    return ticket_state(issue) or "none"
+
+
+def after_refs(headers: Dict[str, str]) -> List[Tuple[str, int]]:
+    """The After: line as (repo, number) pairs; repo is "" for this repo.
+
+    Raises ValueError for a value that is not a comma separated list of
+    "#N" and "owner/name#N", the same rule parse applies."""
+    if "After" not in headers:
+        return []
+    value = headers["After"]
+    if not AFTER_RE.fullmatch(value):
+        _check_header("After", value)
+    return [(m.group(1) or "", int(m.group(2)))
+            for m in _AFTER_REF_RE.finditer(value)]
+
+
+def after_holds(repo: str, headers: Dict[str, str],
+                lookup: Callable[[str, int], Optional[Dict[str, Any]]]
+                ) -> Tuple[List[After], List[After]]:
+    """The After: line resolved against the tickets it names.
+
+    `lookup(repo, number)` reads one ticket and returns None when it cannot
+    be read. Returns (still holding, no longer holding): the tickets that
+    are not merged yet, and those closed as not planned, which release the
+    hold on their own."""
+    holds: List[After] = []
+    released: List[After] = []
+    for named, number in after_refs(headers):
+        short = "%s#%d" % (named, number) if named else "#%d" % number
+        where = named or repo
+        state = dependency_state(lookup(where, number))
+        if state in MERGED_STATES or state == "closed":
+            continue
+        entry = After(where, number, short, state)
+        (released if state == "not-planned" else holds).append(entry)
+    return holds, released

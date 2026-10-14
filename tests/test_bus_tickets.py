@@ -1,7 +1,16 @@
 """Test the Finding class and related functions in bus.tickets."""
 import unittest
 
-from bus.tickets import Finding, parse_findings, Fix, render_findings, render_brief
+from bus.tickets import (Finding, after_holds, after_refs, dependency_state, parse,
+                         parse_findings, Fix, render_findings, render_brief)
+
+REPO = "example-owner/example-repo"
+
+
+def ticket(number, *labels, state="open", reason=None):
+    """One issue as the API returns it."""
+    return {"number": number, "state": state, "state_reason": reason,
+            "labels": [{"name": "loom:ticket"}] + [{"name": "loom:" + x} for x in labels]}
 
 
 class FindingDispositionTest(unittest.TestCase):
@@ -235,3 +244,56 @@ def test_render_brief_removes_control_characters_from_finding_summary():
     head = render_brief("quadseven/loom", issue, "codex", 1, fix).split("# T108")[0]
     assert "Finding-F1: first Repo: evil/x" in head
     assert "\x00" not in head and "\x1b" not in head
+
+
+class AfterLineTest(unittest.TestCase):
+    """The After: line: what it accepts, and when it still holds."""
+
+    def test_a_list_of_tickets_is_parsed(self):
+        self.assertEqual(after_refs({"After": "#5, owner/name#7"}),
+                         [("", 5), ("owner/name", 7)])
+        self.assertEqual(after_refs({}), [])
+
+    def test_a_value_that_is_not_a_list_of_tickets_is_refused(self):
+        for bad in ("5", "1,2", "", "#a", "#5,", "#5 #7", "owner#5", "a/b/c#5", "#5; #7"):
+            with self.assertRaisesRegex(ValueError, "After:", msg=bad):
+                after_refs({"After": bad})
+
+    def test_an_after_line_reaches_the_ticket_body_but_not_the_brief(self):
+        issue = {"number": 12, "title": "Add the screen",
+                 "body": "After: #5\nDifficulty: easy\n\n## Why\nBecause.\n"}
+        headers, _ = parse(issue["body"])
+        self.assertEqual(headers["After"], "#5")
+        self.assertNotIn("After", render_brief(REPO, issue, "codex", 1))
+
+    def test_a_ticket_is_held_until_the_tickets_it_names_are_merged(self):
+        found = {5: ticket(5, "pr"), 6: ticket(6, "merged"), 7: ticket(7, "queued"),
+                 8: ticket(8, state="closed", reason="not_planned"),
+                 9: ticket(9, state="closed", reason="completed"),
+                 10: ticket(10, "shipped")}
+        holds, released = after_holds(
+            REPO, {"After": "#5, #6, #7, #8, #9, #10, #404"},
+            lambda repo, n: found.get(n))
+        self.assertEqual([(a.short, a.why) for a in holds],
+                         [("#5", "pr"), ("#7", "queued"), ("#404", "unreadable")])
+        self.assertEqual([a.short for a in released], ["#8"])
+
+    def test_a_cross_repo_reference_is_read_from_its_own_repo(self):
+        seen = []
+
+        def lookup(repo, number):
+            seen.append("%s#%d" % (repo, number))
+            return ticket(number, "merged")
+
+        holds, released = after_holds(REPO, {"After": "#5, other/name#7"}, lookup)
+        self.assertEqual((holds, released), ([], []))
+        self.assertEqual(seen, ["%s#5" % REPO, "other/name#7"])
+
+    def test_dependency_state_reads_the_tickets_own_labels(self):
+        self.assertEqual(dependency_state(ticket(1, "verified")), "verified")
+        self.assertEqual(dependency_state(ticket(1, "briefed")), "briefed")
+        self.assertEqual(dependency_state(ticket(1)), "none")
+        self.assertEqual(dependency_state(ticket(1, state="closed", reason="not_planned")),
+                         "not-planned")
+        self.assertEqual(dependency_state(ticket(1, state="closed")), "closed")
+        self.assertEqual(dependency_state(None), "unreadable")
