@@ -15,7 +15,8 @@ from bus import brain, journal, proof, text, tickets
 from bus.github import GitHub, GitHubError
 
 REPO = "example-owner/example-repo"
-BODY = "## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n- [ ] done\n## Size\nS\n## Out of scope\n- none"
+BODY = ("## Why\nwhy: the page query is slow for every visitor.\n## What\nwhat\n"
+        "## Acceptance criteria\n- [ ] done\n- [ ] tested\n- [ ] live\n## Size\nS\n## Out of scope\n- none")
 
 
 def reply(status=200, body=None):
@@ -1477,7 +1478,7 @@ class TriageTests(unittest.TestCase):
         self.assert_never_edited(routes)
 
     def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
-        no_boxes = BODY.replace("- [ ] done", "done")
+        no_boxes = BODY.replace("- [ ] ", "")
         routes = Routes([item(6, body="It is slow.\n## Why\nusers wait"), item(7, body=no_boxes),
                          item(8, body=None)])
         self.run_triage(routes)
@@ -1897,7 +1898,7 @@ class RegressionSlotTests(unittest.TestCase):
             (5, evidenced(5), "closed as not planned"),
             (6, evidenced(6), "only a shipped or verified ticket can regress"),
             (7, evidenced(7), "#7 is not a loom:ticket"),
-            (8, BODY.replace("## Why\nwhy", "## Why\nRegresses #8\n"), "measured evidence"),
+            (8, BODY.replace("## Why\nwhy: the", "## Why\nRegresses #8\n\nThe"), "measured evidence"),
             (8, BODY, "has the line Regresses #8"),
         ]
         for number, body, why in cases:
