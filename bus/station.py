@@ -40,6 +40,7 @@ from . import brain
 from .github import GitHub, GitHubError, _OPENER, _next_link
 from .journal import REPLY_RE
 from .labels import LANES
+from .labels import REMOTE_LANES
 
 HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
@@ -575,11 +576,18 @@ def lane_takes_model(lane: str, model: str) -> bool:
     return any(fnmatch.fnmatchcase(model, p) for p in LANE_MODELS.get(lane, []))
 
 
+def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
+    """Whether a remote lane's last heartbeat still counts as up: within its
+    configured beat_max (labels.REMOTE_LANES), else HEARTBEAT_MAX_AGE."""
+    window = REMOTE_LANES.get(lane, {}).get("beat_max", HEARTBEAT_MAX_AGE)
+    return at is not None and -60 <= now - at <= window
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only."""
     lane = provider(lane)
-    return (lane in FREE_LANES or lane == "agy"
+    return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
             or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
 
 
@@ -653,6 +661,7 @@ class Station:
         self._seen: Dict[str, set] = {}
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
+        self._remote_beats: Dict[str, Optional[float]] = {}
         # The GitHub budget as the last pass left it, and the reset it was
         # last reported low for.
         self._budget: Optional[Dict[str, Any]] = None
@@ -958,6 +967,10 @@ class Station:
         return self._spend
 
     def _heartbeat_ok(self, lane: str) -> bool:
+        if lane in REMOTE_LANES:
+            if lane not in self._remote_beats:
+                self._remote_beats[lane] = self._remote_heartbeat(lane)
+            return remote_beat_fresh(lane, self._remote_beats[lane], self.now)
         # Credit under the floor stops the anthropic slots even before their
         # runner next reports it.
         if lane.split("-")[0] == "anthropic" and self._anthropic_spend().under_floor():
@@ -970,6 +983,46 @@ class Station:
         if isinstance(at, bool) or not isinstance(at, (int, float)):
             return False
         return -60 <= self.now - at <= HEARTBEAT_MAX_AGE
+
+    def _remote_heartbeat(self, lane: str) -> Optional[float]:
+        """Latest heartbeat posted by a remote worker on the lane status issue."""
+        saved = _read_json(os.path.join(self.state, "remote-status.json"), {}, strict=False)
+        cached = saved.get(lane) if isinstance(saved, dict) else None
+        if (isinstance(cached, dict) and isinstance(cached.get("checked_at"), (int, float))
+                and 0 <= self.now - cached["checked_at"] <= HEARTBEAT_MAX_AGE):
+            value = cached.get("heartbeat")
+            return value if isinstance(value, (int, float)) else None
+        heartbeat = self._read_remote_heartbeat(lane)
+        counts = self._read_remote_claim_count(lane) if heartbeat is not None else 0
+        if not isinstance(saved, dict):
+            saved = {}
+        saved[lane] = {"checked_at": self.now, "heartbeat": heartbeat, "claims": counts}
+        _write_json(os.path.join(self.state, "remote-status.json"), saved)
+        return heartbeat
+
+    def _read_remote_heartbeat(self, lane: str) -> Optional[float]:
+        repo = self.s.status_repo
+        if not repo:
+            return None
+        found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&per_page=100"
+                             % (repo, LANES_LABEL)).data
+        issues = [x for x in found if isinstance(x, dict) and "pull_request" not in x] \
+            if isinstance(found, list) else []
+        if not issues:
+            return None
+        latest = None
+        pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
+        for comment in self.gh.paginate("/repos/%s/issues/%d/comments" %
+                                        (repo, int(issues[0]["number"]))):
+            match = pattern.fullmatch(str(comment.get("body") or "").strip()) \
+                if isinstance(comment, dict) else None
+            if match and match.group(1) == lane:
+                try:
+                    at = float(match.group(2))
+                except ValueError:
+                    continue
+                latest = at if latest is None else max(latest, at)
+        return latest
 
     def limited_lanes(self) -> List[str]:
         """Lanes whose fresh heartbeat says unavailable at a limit."""
@@ -995,7 +1048,7 @@ class Station:
         return not any(n.endswith((".md", ".claiming")) for n in names)
 
     def claim_new(self) -> None:
-        free = [lane for lane in LANES
+        free = [lane for lane in LANES if lane not in REMOTE_LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         if not free:
             self._record_slot_sample(False)
@@ -1740,6 +1793,8 @@ class Station:
             beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                               None, strict=False)
             at = beat.get("at") if isinstance(beat, dict) else None
+            if lane in REMOTE_LANES:
+                at = self._remote_heartbeat(lane)
             when = (self._utc(at) if not isinstance(at, bool) and isinstance(at, (int, float))
                     else "-")
             rows.append((lane, "yes" if self._heartbeat_ok(lane) else "no", when))
@@ -1784,11 +1839,37 @@ class Station:
 
     def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
         summary = self._spend_shown()
-        return "\n".join(
+        body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now), "",
              "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
+            + ["", "Remote claims: muse %d/%d" % (
+                self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
             + (["", summary.line()] if summary is not None else []))
+        return body
+
+    def _remote_claim_count(self, lane: str) -> int:
+        saved = _read_json(os.path.join(self.state, "remote-status.json"), {}, strict=False)
+        cached = saved.get(lane) if isinstance(saved, dict) else None
+        if (isinstance(cached, dict) and isinstance(cached.get("checked_at"), (int, float))
+                and 0 <= self.now - cached["checked_at"] <= HEARTBEAT_MAX_AGE):
+            claims = cached.get("claims")
+            return int(claims) if isinstance(claims, int) else 0
+        if self._remote_heartbeat(lane) is None:
+            return 0
+        saved = _read_json(os.path.join(self.state, "remote-status.json"), {}, strict=False)
+        cached = saved.get(lane) if isinstance(saved, dict) else None
+        return int(cached.get("claims", 0)) if isinstance(cached, dict) else 0
+
+    def _read_remote_claim_count(self, lane: str) -> int:
+        count = 0
+        for repo in self.s.repos:
+            found = self.gh.rest("GET", "/repos/%s/issues?state=open&labels=loom:running,lane:%s"
+                                 % (repo, lane)).data
+            if isinstance(found, list):
+                count += sum(1 for item in found if isinstance(item, dict)
+                             and "pull_request" not in item)
+        return count
 
     def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
         for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)):
