@@ -259,3 +259,9 @@ class EventShape(Fixture):
         events = transcripts.convert([{"kind": "log", "ts": None, "text": "runner line"}])
         self.assertEqual(events[0]["ts"], "")
         self.assertTrue(all(isinstance(e[k], str) for e in events for k in ("ts", "role", "kind", "text")))
+
+    def test_a_brief_with_no_model_says_not_recorded(self):
+        self.write(self.home / "briefs/codex/done/example.loom-8.md", "# Brief\n")
+        body = transcripts.run_body(self.home, "codex", "example.loom-8", "done", "",
+                                    self.projects, self.codex)
+        self.assertEqual(body["model"], "not recorded")
