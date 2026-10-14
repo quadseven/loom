@@ -1790,22 +1790,8 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
                          % (holder, lock_repo))
 
 
-def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
-              note: Optional[str] = None, holder: Optional[str] = None,
-              now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Read the tick record, or append one step to the current lock commit."""
-    now = now or datetime.now(timezone.utc)
-    ref_path = "/repos/%s/git/ref/heads/%s" % (lock_repo, lock.LOCK_BRANCH)
-    ref = gh.rest("GET", ref_path, ok=(404,))
-    if ref.status == 404:
-        return {"holder": None, "started_at": None, "step": None,
-                "step_index": None, "steps": list(TICK_STEPS), "notes": []}
-    sha = ref.data["object"]["sha"]
-    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha), ok=(404,))
-    if commit.status == 404:
-        return {"holder": None, "started_at": None, "step": None,
-                "step_index": None, "steps": list(TICK_STEPS), "notes": []}
-    message = str(commit.data.get("message") or "")
+def _step_record(message: str) -> Dict[str, Any]:
+    """Read the recorded step fields from one lock commit message."""
     current_holder = re.search(r"holder=(\S+)", message)
     record = {"holder": current_holder.group(1) if current_holder else None,
               "started_at": None,
@@ -1818,6 +1804,24 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
             record.update({k: saved[k] for k in ("started_at", "step", "step_index", "notes")})
         except (ValueError, TypeError, KeyError):
             pass
+    return record
+
+
+def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
+              note: Optional[str] = None, holder: Optional[str] = None,
+              now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Read the tick record, or append one step to the current lock commit."""
+    now = now or datetime.now(timezone.utc)
+    ref_path = "/repos/%s/git/ref/heads/%s" % (lock_repo, lock.LOCK_BRANCH)
+    ref = gh.rest("GET", ref_path, ok=(404,))
+    if ref.status == 404:
+        return _step_record("")
+    sha = ref.data["object"]["sha"]
+    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha), ok=(404,))
+    if commit.status == 404:
+        return _step_record("")
+    message = str(commit.data.get("message") or "")
+    record = _step_record(message)
     if step is None:
         return record
     if step not in TICK_STEPS:

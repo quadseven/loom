@@ -383,6 +383,13 @@ class LockTests(unittest.TestCase):
         self.assertIn("heads/loom-lock/brain", g.refs)
         self.assertFalse(lock.release(gh, REPO, "tick-1"))
 
+    def test_release_with_unreadable_expiry_returns_false(self):
+        g = FakeGit()
+        g.seed_lock("tick-1", "invalid")
+        gh = GitHub("tok", transport=g)
+        self.assertFalse(lock.release(gh, REPO, "tick-1"))
+        self.assertIn("heads/loom-lock/brain", g.refs)
+
     def test_holder_validation(self):
         gh = GitHub("tok", transport=FakeGit())
         for bad in ("", "a b", "a=b", "a\nb", "x/y"):

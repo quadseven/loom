@@ -75,6 +75,14 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(record["step_index"], 3)
         self.assertEqual(record["notes"][0]["text"], "checking")
 
+    def test_tick_step_show_returns_null_record_when_commit_is_missing(self):
+        gh = GitHub("t", transport=Fake(reply(200, {"object": {"sha": "gone"}}),
+                                         reply(404, {"message": "Not Found"})))
+        record = brain.tick_step(gh, REPO)
+        self.assertIsNone(record["holder"])
+        self.assertIsNone(record["step"])
+        self.assertEqual(record["notes"], [])
+
     def test_step_github_failure_is_logged_and_command_succeeds(self):
         class Broken:
             requests = 0
