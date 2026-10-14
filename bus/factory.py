@@ -64,8 +64,10 @@ Neither needs a model:
   2026-10-13 were the bot's own "Fixed in" threads).
 - A round where the lane made no change and explained why waits for the
   review it asked for, up to REVIEW_GRACE, before the round is judged.
-- A failed ticket climbs the ladder, and so does a ticket left briefed for
-  BRIEFED_STALL with no lane claiming it.
+- A failed ticket climbs the ladder. A ticket left briefed for BRIEFED_STALL
+  with no lane claiming it does not: it never ran, so it moves to the
+  least-loaded other lane of its tier (a ladder ticket, of its rung), writing
+  no rung marker.
 - Each pass gives the oldest queued tickets free lanes in their difficulty
   tier, leaving held tickets and tickets without a readable tier queued.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
@@ -383,14 +385,25 @@ def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
 
 def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     """The rungs the ticket has run on since its ladder last started (the
-    newest rung 0 marker). A rung skipped because its lanes were busy is not
-    tried: on 2026-10-13 a restart wave filled the claude and codex lanes,
-    tickets spilled straight to rung 3 and gave up after one more round."""
+    newest rung 0 marker). A rung counts once a claim follows its marker: a
+    rung skipped because its lanes were busy, or one the ticket sat briefed
+    on with no lane claiming it, is not tried (on 2026-10-13 a restart wave
+    filled the claude and codex lanes, tickets spilled straight to rung 3 and
+    gave up after one more round; on 2026-10-14 a ticket that never ran
+    climbed past the last rung)."""
     tried: set = set()
+    pending: set = set()
     for c in comments:
-        for m in RUNG_RE.finditer(str(c.get("body") or "")):
+        body = str(c.get("body") or "")
+        if CLAIM_RE.match(body):
+            tried |= pending
+            pending = set()
+        for m in RUNG_RE.finditer(body):
             rung = int(m.group(1))
-            tried = set() if rung == 0 else tried | {rung}
+            if rung == 0:
+                tried, pending = set(), set()
+            else:
+                pending = pending | {rung}
     return tried
 
 
@@ -1040,7 +1053,10 @@ class Factory:
         return max(since, held_until(issue)) if since else since
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
-        """A ticket briefed BRIEFED_STALL with no lane claiming it climbs."""
+        """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
+        least-loaded other lane of its tier (or of its rung), with no rung
+        marker: it never ran, so it has not failed on any model. With no such
+        lane it stays briefed, and the stall is said once per pass."""
         number = int(issue["number"])
         since = self._briefed_since(repo, issue)
         if not since or self.now - since < BRIEFED_STALL:
@@ -1049,12 +1065,29 @@ class Factory:
         if any(CLAIM_RE.match(str(c.get("body") or "")) and _ts(c.get("created_at")) >= since
                for c in comments):
             return
-        hours = (self.now - since) / 3600
-        why = "briefed %.0f hours on lane %s with no claim" % (hours, _lane(issue))
-        lane = self._climb(repo, issue, comments, why, failed_here=False)
-        if lane is None:
-            self._give_up(repo, issue, why)
+        old = _lane(issue)
+        rung = current_rung(issue)
+        if rung:
+            lanes = [x for x in LADDER[rung - 1][0] if x != old and self._up(x)]
+        else:
+            lanes = [x for x in tier_lanes(issue, self._is_private(repo))
+                     if x != old and self._up(x)]
+        if not lanes:
+            _say("%s#%d stalled on lane %s: no other lane of its %s is available"
+                 % (repo, number, old, "rung" if rung else "tier"))
             return
+        lane = pick_lane(lanes, self.load)
+        hours = (self.now - since) / 3600
+        kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+            "body": "Not a failure (briefed %.0f hours on lane %s with no claim): the "
+                    "factory moved this ticket to lane %s, %s." % (
+                        hours, old, lane,
+                        "on the same rung" if rung else "in its difficulty tier")})
+        self.load[old] = self.load.get(old, 0) - 1
+        self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
         _say("moved stalled %s#%d to %s" % (repo, number, lane))
 

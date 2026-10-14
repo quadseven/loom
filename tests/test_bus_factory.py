@@ -17,7 +17,8 @@ NOW = 2_000_000_000.0
 FIX_ASKED = FIX_MARKER + "\nPull request: x#50\n\n### Check: lint\n\n    E1\n\n### Thread PRRT_1 (comment 1) at a.py:1\n\n    rename"
 ME = {"login": "alice-example"}
 # Every rung of the ladder tried since the last restart.
-ALL_RUNGS = [{"body": factory.RUNG_MARKER % n, "user": ME} for n in (1, 2, 3)]
+CLAIM = {"body": "Claimed for lane claude (body sha256 0123456789ab)", "user": ME}
+ALL_RUNGS = [c for n in (1, 2, 3) for c in ({"body": factory.RUNG_MARKER % n, "user": ME}, CLAIM)]
 STRANGER = {"login": "mallory-example"}
 
 
@@ -348,8 +349,8 @@ class PullRequests(Base):
 
     def test_age_climbs_once_per_window_not_every_round(self):
         self.gh.ticket(5, "pr")
-        self.gh.comments[5].append({"body": factory.RUNG_MARKER % 1, "user": ME,
-                                    "created_at": iso(3600)})
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME,
+                                 "created_at": iso(3600)}, CLAIM]
         self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 2)
         self.go()
         self.assertEqual(self.model(5), None, "climbed an hour after the last climb")
@@ -375,6 +376,7 @@ class PullRequests(Base):
             self.gh.issues[5]["labels"] = [{"name": x} for x in
                                            ("loom:ticket", "loom:pr", "lane:" + (self.lane(5) or "codex"))]
             self.go()
+            self.gh.comments[5].append(CLAIM)
             seen.append((self.lane(5), self.model(5)))
         self.assertEqual(seen, [("claude", "claude-sonnet-5-5"), ("codex", "gpt-6-sol"),
                                 ("claude", "claude-opus-5-5")])
@@ -391,13 +393,13 @@ class PullRequests(Base):
         # Spilled straight to rung 3 while rungs 1 and 2 were busy: stuck
         # again, it goes to rung 1, not past the end of the ladder.
         self.gh.ticket(5, "pr", lane="claude")
-        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 3, "user": ME},
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 3, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual(self.moved, [])
         self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
-        self.assertEqual(factory.tried_rungs(self.gh.comments[5]), {1, 3})
+        self.assertEqual(factory.tried_rungs(self.gh.comments[5]), {3})  # rung 1 is not claimed yet
 
     def test_a_ticket_that_failed_on_a_ladder_model_does_not_get_it_again(self):
         self.gh.ticket(6, "failed", lane="claude",
@@ -930,12 +932,35 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
-    def test_a_briefed_ticket_nobody_claims_moves_up(self):
-        self.gh.ticket(7, "briefed", lane="codex")
-        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
-                              "created_at": iso(factory.BRIEFED_STALL + 600)}]
+    def stalled(self, number, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
+        self.gh.ticket(number, "briefed", lane=lane, body=body)
+        self.gh.events[number] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                                   "created_at": iso(factory.BRIEFED_STALL + 600)}]
+
+    def test_a_briefed_ticket_nobody_claims_moves_within_its_tier(self):
+        self.stalled(7)
         self.go()
-        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+        self.assertEqual((self.lane(7), self.model(7)), ("codex-2", None))
+        self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
+
+    def test_a_stalled_rung_two_ticket_moves_to_the_other_rung_two_lane(self):
+        self.stalled(7, body="Model: gpt-6-sol\nDifficulty: medium\n\n## Why\nx\n")
+        self.go()
+        self.assertEqual((self.lane(7), self.model(7)), ("codex-2", "gpt-6-sol"))
+        self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
+
+    def test_three_stalls_in_a_row_never_give_up(self):
+        self.stalled(7)
+        for _ in range(3):
+            self.go()
+            self.assertEqual(self.moved, [])
+            self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
+        self.assertEqual(self.gh.issues[7]["body"].count("Model:"), 0)
+
+    def test_a_stall_with_no_available_lane_stays_briefed(self):
+        self.stalled(7)
+        self.go(available=["codex"])
+        self.assertEqual((self.lane(7), self.moved, self.gh.comments[7]), ("codex", [], []))
 
     def test_a_held_briefed_ticket_never_counts_as_stalled(self):
         self.gh.ticket(7, "briefed", body="Not before: 2099-01-01T00:00:00Z\nDifficulty: easy\n\n## Why\nx\n")
@@ -1155,8 +1180,12 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.without_model("Difficulty: easy\n\nx"), "Difficulty: easy\n\nx")
 
     def test_tried_rungs_start_again_at_a_rung_zero_marker(self):
-        comments = ALL_RUNGS + [{"body": factory.RUNG_MARKER % 0}, {"body": factory.RUNG_MARKER % 2}]
+        comments = ALL_RUNGS + [{"body": factory.RUNG_MARKER % 0}, {"body": factory.RUNG_MARKER % 2}, CLAIM]
         self.assertEqual(factory.tried_rungs(comments), {2})
+
+    def test_a_rung_with_no_claim_is_not_tried(self):
+        comments = [{"body": factory.RUNG_MARKER % 1}, CLAIM, {"body": factory.RUNG_MARKER % 2}]
+        self.assertEqual(factory.tried_rungs(comments), {1})
 
     def test_pick_lane_takes_the_least_loaded(self):
         self.assertEqual(factory.pick_lane(("codex", "codex-2"), {"codex": 2, "codex-2": 1}), "codex-2")
