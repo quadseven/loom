@@ -218,6 +218,25 @@ class DashboardSourceHygiene(unittest.TestCase):
 
 
 class InsightViews(unittest.TestCase):
+    def test_insight_routes_render_views(self):
+        from dashboard.server import _dispatch_get
+
+        class Handler:
+            def send_page(self, body):
+                return body
+
+            def send_text(self, code, body):
+                return code, body
+
+        for path, heading, renderer in (("/brain", "Brain", "brain_page"),
+                                        ("/hot-spots", "Hot spots", "hotspots_page")):
+            with self.subTest(path=path), patch("dashboard.server.insights." + renderer, return_value="<p>Fixture view</p>"):
+                handler = Handler()
+                handler.path = path
+                rendered = _dispatch_get(handler, object())
+                self.assertIn(heading, rendered)
+                self.assertIn("Fixture view", rendered)
+
     def test_brain_renders_fixture_step_and_preserves_handoff_markers(self):
         from dashboard.insights import brain_page
         from pathlib import Path
