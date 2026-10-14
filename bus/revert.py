@@ -357,6 +357,20 @@ class Reverts:
                                "reverted, left for a person or the brain" % (branch, short))
             return
         failing = red_checks(self._check_runs(repo, sha), self.review_check)
+        # Only a check that also ran on the merged pull request's head can
+        # blame the merge. A scheduled check attaches to whichever commit is
+        # the branch head when it runs, so one failing for days lands on the
+        # newest merge (2026-10-14: a nightly invariant check blamed a deploy
+        # and briefed its revert).
+        tested = {str(r.get("name")) for r in latest_runs(
+            self._check_runs(repo, str((pr.get("head") or {}).get("sha") or "")),
+            self.review_check)}
+        failing = [r for r in failing if str(r.get("name")) in tested]
+        if not failing:
+            self._decide(repo, "%s is red from %s, but only from checks that never ran "
+                               "on #%d (scheduled or branch-only); nothing reverted"
+                         % (branch, short, int(pr["number"])))
+            return
         names = sorted({str(r.get("name")) for r in failing})
         open_ = [i for i in reverts if in_flight(i)]
         named = revert_shas(reverts).get(sha)
