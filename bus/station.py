@@ -2540,7 +2540,8 @@ class Station:
             "### Not going well", "Failed: %s." % rows(groups["failed"]), "",
             "### Still stuck", "Past the stuck age in PR: %s." %
             rows(groups["aged_pr"]), "",
-            "### Next", "In flight: %s." % rows(groups["in_flight"]), "",
+            "### Next", "In flight: %s." % rows(groups["in_flight"]),
+            "Needs difficulty: %s." % rows(groups["needs_difficulty"]), "",
             "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
             "Written by the station from ticket data, because no brain reported in time."])
 
@@ -2549,7 +2550,8 @@ class Station:
         """Tickets by standup heading. Merged, verified and shipped count only
         tickets updated since the last report, so a standup says what changed."""
         groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
-            "merged", "verified", "sent_back", "failed", "aged_pr", "in_flight", "asks")}
+            "merged", "verified", "sent_back", "failed", "aged_pr", "in_flight",
+            "needs_difficulty", "asks")}
         for issue in children:
             if isinstance(issue, dict):
                 for group in self._standup_groups_of(issue, since):
@@ -2573,6 +2575,8 @@ class Station:
                            ("aged_pr", "loom:pr" in labels and aged),
                            ("in_flight", bool(labels & {"loom:queued", "loom:briefed",
                                                         "loom:running", "loom:pr"})),
+                           ("needs_difficulty", "loom:queued" in labels and
+                            not factory.tier_lanes(issue, False)),
                            ("asks", bool(labels & {NEEDS_OPERATOR, HUMAN}))):
             if hit:
                 found.append(group)
@@ -2942,6 +2946,11 @@ class Station:
             return
         self._factory().run()
 
+    def assign_queued(self) -> None:
+        """Give ready queued tickets a free lane after this pass's claims."""
+        if self.s.factory_on:
+            self._factory().assign_queued()
+
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
@@ -3160,6 +3169,11 @@ class Station:
             except (GitHubError, OSError, ValueError) as err:
                 _say("hand_back failed: %s" % err)
         self.claim_new()
+        if not self._deferred():
+            try:
+                self.assign_queued()
+            except (GitHubError, OSError) as err:
+                _say("assign_queued failed: %s" % err)
         try:
             self.record_scans()
         except OSError as err:

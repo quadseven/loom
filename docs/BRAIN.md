@@ -41,7 +41,7 @@ that talks to GitHub about tickets.
 |---|---|
 | `loom:goal` | The goal's home issue. |
 | `loom:ticket` | Every ticket issue. |
-| `loom:queued` | Written by the brain, no lane chosen yet. |
+| `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, oldest first; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
@@ -162,6 +162,11 @@ for a later run. Any other issue gets `loom:triage` and one comment naming
 what is missing. Triage writes labels, sub-issue links and that comment
 only: it never closes, retitles or edits an issue, because an automated
 pass over old issues over-calls work as done.
+
+The station assigns queued tickets to free lanes on each pass. A brain that
+wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
+a readable Difficulty line appear in the goal's next station standup as
+needing a difficulty.
 
 ## Proof
 

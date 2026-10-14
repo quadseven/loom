@@ -117,6 +117,11 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
 
+After claims on every pass, the station gives the oldest `loom:queued`
+tickets free lanes in their Difficulty tier and moves them to `loom:briefed`.
+It skips future `Not before:` times and tickets without a readable Difficulty.
+The latter appear in their goal's next station standup.
+
 Lane status: every pass the station reads each lane's heartbeat (`yes` when
 available and at most 600 seconds old, else `no`) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
