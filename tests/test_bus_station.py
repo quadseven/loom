@@ -67,10 +67,14 @@ class FakeGitHub:
         self.reply_fails = set()
         self.replies = []
         self.resolved = []
+        self.open_issues = []
 
-    def add_goal(self, number, journals=()):
+    def add_goal(self, number, journals=(), title="Goal"):
         """journals: (login, age in seconds) pairs, posted as journal comments."""
-        self.goals.append({"number": number, "labels": [{"name": "loom:goal"}]})
+        goal = {"number": number, "title": title, "state": "open",
+                "labels": [{"name": "loom:goal"}]}
+        self.goals.append(goal)
+        self.issues[number] = dict(goal)
         self.comments[number] = [
             {"body": "<!-- loom:journal v1 -->\nTick", "user": {"login": login},
              "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))}
@@ -99,6 +103,17 @@ class FakeGitHub:
                             "html_url": "https://github.com/%s/issues/%d" % (REPO, number)})
         self.comments[number] = [{"body": "<!-- loom:human v1 -->\n%s" % ask,
                                   "user": {"login": author}}] if ask else []
+
+    def add_open_issue(self, number, title="Open issue", body="It is slow.",
+                       author="alice-example", created="2030-01-01T00:00:00Z"):
+        """An open issue with no Loom labels, eligible for triage."""
+        issue = {"number": number, "id": 1000 + number, "title": title, "body": body,
+                 "state": "open", "user": {"login": author}, "created_at": created,
+                 "labels": []}
+        self.open_issues.append(issue)
+        self.issues[number] = dict(issue)
+        self.comments[number] = []
+        self.events[number] = []
 
     def add(self, number, title="Fix the thing", lane="codex", body=BODY,
             author="alice-example", created="2030-01-01T00:00:00Z",
@@ -188,6 +203,8 @@ class FakeGitHub:
             return reply(200, self.lanes_issues)
         if "loom:digest" in query:
             return reply(200, self.digest_issues)
+        if "sort=created&direction=asc" in query:
+            return reply(200, self.open_issues)
         return self._list_briefed(headers)
 
     def _get_goals(self):
@@ -226,6 +243,22 @@ class FakeGitHub:
                   and any(lab["name"] == "loom:briefed" for lab in i["labels"])]
         return reply(200, listed, {"ETag": etag})
 
+    def _update_labels(self, method, n, data):
+        # POST adds labels; PUT replaces them. Both update events.
+        old = set(self.names(n))
+        if method == "POST":
+            new = list(self.names(n))
+            for label in data["labels"]:
+                if label not in old:
+                    new.append(label)
+        else:
+            new = list(data["labels"])
+        self.events.setdefault(n, [])
+        self.events[n] += [labeled(x, "alice-example") for x in new if x not in old]
+        self.issues[n]["labels"] = [{"name": x} for x in new]
+        self.version += 1
+        return reply(201 if method == "POST" else 200, [])
+
     def _issue_call(self, method, n, sub, data):
         if method == "GET":
             if sub == "sub_issues":
@@ -238,13 +271,11 @@ class FakeGitHub:
         if method == "POST" and sub == "comments":
             self.comments[n].append({"body": data["body"]})
             return reply(201, {})
-        if method == "PUT" and sub == "labels":
-            # The station's own login, which is on the brief authors list.
-            old = set(self.names(n))
-            self.events[n] += [labeled(x, "alice-example") for x in data["labels"] if x not in old]
-            self.issues[n]["labels"] = [{"name": x} for x in data["labels"]]
-            self.version += 1
-            return reply(200, [])
+        if method == "POST" and sub == "sub_issues":
+            self.sub_issues.setdefault(n, []).append(self.issues.get(data["sub_issue_id"] - 1000, {}))
+            return reply(201, {})
+        if method in ("POST", "PUT") and sub == "labels":
+            return self._update_labels(method, n, data)
         raise AssertionError("unexpected issue call %s %s/%s" % (method, n, sub))
 
 
@@ -475,6 +506,79 @@ class BudgetTest(Base):
             self.passes(now=start + 60 * n)
         self.assertEqual(len(self.gets("loom:briefed")), 3)
         self.assertEqual(len(self.gets("loom:pr")), 6)
+
+
+READY_BODY = ("## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n"
+              "- [ ] done\n## Size\nS\n## Out of scope\n- none")
+
+
+class TriageTest(Base):
+    """The station triages backlog goal homes once an hour."""
+
+    def setUp(self):
+        super().setUp()
+        self.start = time.time()
+
+    def run_at(self, offset=0):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(station.run(
+                self.settings, GitHub("token", transport=self.fake),
+                now=self.start + offset), 0)
+        return err.getvalue()
+
+    def triage_reads(self):
+        return [p for p in self.fake.paths("GET")
+                if "sort=created&direction=asc" in p]
+
+    def test_a_backlog_goal_is_triaged_once_an_hour(self):
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.add_open_issue(100, body=READY_BODY)
+        self.fake.add_open_issue(101, body="It is slow.")
+        err = self.run_at()
+        self.assertEqual(len(self.triage_reads()), 1)
+        self.assertIn("loom:queued", self.fake.names(100))
+        self.assertIn("loom:triage", self.fake.names(101))
+        self.assertIn("triage %s#30: 1 queued, 1 triage, 0 held" % REPO, err)
+        # A second pass in the same hour does not triage again.
+        self.run_at(60)
+        self.assertEqual(len(self.triage_reads()), 1)
+
+    def test_a_backlog_goal_is_triaged_again_after_an_hour(self):
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.add_open_issue(100, body=READY_BODY)
+        self.run_at()
+        self.assertEqual(len(self.triage_reads()), 1)
+        self.run_at(station.TRIAGE_INTERVAL + 1)
+        self.assertEqual(len(self.triage_reads()), 2)
+
+    def test_a_backlog_goal_is_not_triaged_again_across_a_restart(self):
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.add_open_issue(100, body=READY_BODY)
+        path = os.path.join(self.home, "state", "station", "triage.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump({"%s#30" % REPO: self.start - 100}, fh)
+        self.run_at()
+        self.assertEqual(len(self.triage_reads()), 0)
+
+    def test_a_non_backlog_goal_is_never_triaged(self):
+        self.fake.add_goal(31, title="Ship the thing")
+        self.fake.add_open_issue(102, body="It is slow.")
+        self.run_at()
+        self.assertEqual(len(self.triage_reads()), 0)
+        self.assertEqual(self.fake.names(102), [])
+
+    def test_below_the_budget_floor_triage_is_deferred(self):
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.add_open_issue(103, body=READY_BODY)
+        path = os.path.join(self.home, "state", "station", "budget.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        reset = int(self.start) + 1800
+        with open(path, "w") as fh:
+            json.dump({"rates": {"core": [500, 5000, reset]}}, fh)
+        self.run_at()
+        self.assertEqual(len(self.triage_reads()), 0)
 
 
 class ReviewFake:
@@ -2966,9 +3070,14 @@ class TranscriptUploadTest(Base):
             st.upload_transcripts()
         return err.getvalue()
 
+    def ref(self, name):
+        """The ticket each finished brief names in its Issue: line, one per name."""
+        self.issues = getattr(self, "issues", {})
+        return "%s#%d" % (REPO, self.issues.setdefault(name, 100 + len(self.issues)))
+
     def finish(self, name="T1", kind="done", lane="anthropic-2"):
         self.write(self.inbox(lane, kind, name + ".md"),
-                   "# Brief: %s\n\nModel: model-x\nIssue: %s#12\n" % (name, REPO))
+                   "# Brief: %s\n\nModel: model-x\nIssue: %s\n" % (name, self.ref(name)))
         self.write(os.path.join(self.home, "logs", lane, name + ".log"),
                    "[2026-10-13T09:00:00Z] %s start, lane %s\nagent said hi from /Users/someone\n"
                    % (name, lane))
@@ -2986,7 +3095,7 @@ class TranscriptUploadTest(Base):
         url, token, body = self.sent[0]
         self.assertEqual((url, token), (UPLOAD_URL, UPLOAD_TOKEN))
         self.assertEqual({k: body[k] for k in ("ticket", "slot", "model", "outcome", "started_at")},
-                         {"ticket": "T1", "slot": "anthropic-2", "model": "model-x",
+                         {"ticket": self.ref("T1"), "slot": "anthropic-2", "model": "model-x",
                           "outcome": "done", "started_at": "2026-10-13T09:00:00Z"})
         self.assertEqual([e["kind"] for e in body["events"]], ["log"])
         self.assertIn("agent said hi from <path>", body["events"][0]["text"])
@@ -2997,7 +3106,7 @@ class TranscriptUploadTest(Base):
         self.go()
         self.finish("NEW")
         self.go()
-        self.assertEqual([b["ticket"] for _, _, b in self.sent], ["NEW"])
+        self.assertEqual([b["ticket"] for _, _, b in self.sent], [self.ref("NEW")])
         self.assertEqual(self.ledger()["anthropic-2/OLD"], "old")
 
     def test_a_failed_upload_is_retried_on_the_next_pass(self):
@@ -3032,7 +3141,7 @@ class TranscriptUploadTest(Base):
         self.go()
         self.assertEqual(self.sent, [])
         self.go()
-        self.assertEqual(sorted(b["ticket"] for _, _, b in self.sent), ["A", "B"])
+        self.assertEqual(sorted(b["ticket"] for _, _, b in self.sent), sorted([self.ref("A"), self.ref("B")]))
 
     def test_nothing_is_sent_without_both_settings(self):
         for url, ssm in (("", "/example/transcript-token"), (UPLOAD_URL, "")):
@@ -3082,8 +3191,8 @@ class TranscriptUploadTest(Base):
         self.brain_tick(3000, outcome="failed")
         self.go()
         self.assertEqual([(b["slot"], b["ticket"], b["model"], b["outcome"]) for _, _, b in self.sent],
-                         [("brain", "1970-01-01T00:33:20Z", "model-b", "ok"),
-                          ("brain", "1970-01-01T00:50:00Z", "model-b", "failed")])
+                         [("brain", "brain/1970-01-01T00:33:20Z", "model-b", "ok"),
+                          ("brain", "brain/1970-01-01T00:50:00Z", "model-b", "failed")])
         self.assertEqual([e["text"] for e in self.sent[0][2]["events"]], ["tick 2000"])
 
     def test_a_skipped_brain_tick_uploads_nothing(self):

@@ -48,6 +48,11 @@ TOKENS = [
 # A home directory as Claude Code names a project after it (-Users-name-...).
 MANGLED_HOME_RE = re.compile(r"(?<![A-Za-z0-9_.-])-(?:Users|home)-[A-Za-z0-9._-]+")
 # The runner's line that starts an attempt (lanes/run_lane.sh).
+# The dashboard files a run under its ticket, owner/name#N. A brief names it
+# in its Issue: line; its file name (owner.name-N, with -rN on a retry) is the
+# fallback. A brain tick is filed as brain/<UTC start>.
+ISSUE_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$")
+BRIEF_NAME_RE = re.compile(r"^([A-Za-z0-9-]+)\.([A-Za-z0-9_.-]+?)-([0-9]+)(?:-r[0-9]+)?$")
 START_RE = re.compile(r"^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\] \S+ start, lane ", re.M)
 ROLES = {"user": "user", "assistant": "assistant", "thinking": "thinking"}
 
@@ -128,9 +133,22 @@ def _utc(at: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
 
 
+def ticket_ref(name: str, issue: str = "") -> str:
+    """owner/name#N for a brief: its Issue: line when that is well formed,
+    else parsed from the brief's file name. ValueError when neither is."""
+    issue = (issue or "").strip()
+    if ISSUE_RE.match(issue):
+        return issue
+    m = BRIEF_NAME_RE.match(name)
+    if not m:
+        raise ValueError("brief %s names no ticket" % name)
+    return "%s/%s#%s" % m.groups()
+
+
 def run_body(home: Path, slot: str, ticket: str, outcome: str, model: str,
-             claude_projects: Path, codex_sessions: Path) -> Dict[str, Any]:
-    """A lane run (briefs/<slot>/done|failed/<ticket>.md) as an upload body.
+             claude_projects: Path, codex_sessions: Path, issue: str = "") -> Dict[str, Any]:
+    """A lane run (briefs/<slot>/done|failed/<ticket>.md) as an upload body,
+    filed under the ticket the brief's Issue: line names (ticket_ref).
     Raises ValueError for an unsafe slot or ticket name."""
     events = sessions.session_events(slot, ticket, home, claude_projects, codex_sessions)
     log = home / "logs" / slot / ("%s.log" % ticket)
@@ -143,7 +161,13 @@ def run_body(home: Path, slot: str, ticket: str, outcome: str, model: str,
             e = dict(e, text=e["text"][starts[-1].start():])
         events.append(e)
         finished = _utc(log.stat().st_mtime)
-    return limit({"ticket": ticket, "slot": slot, "model": model, "outcome": outcome,
+    if finished is None:
+        brief = home / "briefs" / slot / outcome / ("%s.md" % ticket)
+        finished = _utc(brief.stat().st_mtime if brief.exists() else time.time())
+    # A log with no start line (an older runner, or one cut short) still
+    # gives the run a start: the dashboard refuses a body without one.
+    started = started or finished
+    return limit({"ticket": ticket_ref(ticket, issue), "slot": slot, "model": model, "outcome": outcome,
                   "started_at": started, "finished_at": finished, "events": convert(events)})
 
 
@@ -155,6 +179,6 @@ def brain_body(home: Path, started: float, finished: float, outcome: str, model:
     work = home / "brain"
     events = sessions.claude_dir(sessions.project_dir(claude_projects, work), cwd=str(work),
                                  since=started, until=finished + 1)
-    return limit({"ticket": _utc(started), "slot": "brain", "model": model, "outcome": outcome,
+    return limit({"ticket": "brain/" + _utc(started), "slot": "brain", "model": model, "outcome": outcome,
                   "started_at": _utc(started), "finished_at": _utc(finished),
                   "events": convert(events)})
