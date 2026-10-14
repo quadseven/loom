@@ -3,8 +3,10 @@
 The brain reads diffs, plans, briefs and verifies. It must not be the only
 thing that moves finished work: on 2026-10-13 it left 29 lane pull requests
 unmerged for 4 to 12 hours, because its tick budget ran out before it reached
-their review threads, and their tickets filled every goal's cap. This pass
-runs from the station at most every FACTORY_CHECK seconds and needs no model:
+their review threads, and their tickets filled every goal's cap. The factory
+runs from the station at most every FACTORY_CHECK seconds for pull requests
+and stuck tickets. Queue assignment runs on every station pass after claims.
+Neither needs a model:
 
 - A lane pull request whose checks have all finished, whose review check
   (LOOM_REVIEW_CHECK) has run on its head commit, and that is mergeable,
@@ -64,6 +66,8 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   review it asked for, up to REVIEW_GRACE, before the round is judged.
 - A failed ticket climbs the ladder, and so does a ticket left briefed for
   BRIEFED_STALL with no lane claiming it.
+- Each pass gives the oldest queued tickets free lanes in their difficulty
+  tier, leaving held tickets and tickets without a readable tier queued.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
   spark lane's does while its box is hot) moves at once to a free lane in its
   difficulty tier (TIERS), or a ladder ticket to a free lane of its own rung.
@@ -1073,6 +1077,35 @@ class Factory:
         for issue in (i for found in tickets.values() for i in found.values()):
             if _state(issue) in ("briefed", "running"):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
+
+    def assign_queued(self) -> None:
+        """Give queued tickets free tier lanes, oldest first across repos."""
+        found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
+        self.count_load(found_by_repo)
+        queued = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
+                  if _state(issue) == "queued"]
+        for repo, issue in sorted(queued, key=lambda item: (
+                str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
+            if self.now < held_until(issue):
+                continue
+            lanes = [lane for lane in tier_lanes(issue, self._is_private(repo))
+                     if self._free(lane)]
+            if not lanes:
+                continue
+            lane = pick_lane(lanes, self.load)
+            difficulty = tickets.parse(issue.get("body"))[0]["Difficulty"]
+            self._guarded(self._assign_queued_one, repo, issue, lane, difficulty)
+
+    def _assign_queued_one(self, repo: str, issue: Dict[str, Any], lane: str,
+                           difficulty: str) -> None:
+        number = int(issue["number"])
+        self.move(self.gh, repo, number, "briefed", lane=lane,
+                  note="The station gave this queued ticket lane %s (tier %s)." %
+                       (lane, difficulty))
+        issue["labels"] = [{"name": x} for x in brain._moved_labels(
+            _labels(issue), "briefed", lane)]
+        self.load[lane] = self.load.get(lane, 0) + 1
+        _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, difficulty))
 
     def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
         """The first free lane of the difficulty tier the repo may use, else
