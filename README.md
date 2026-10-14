@@ -122,4 +122,5 @@ whose goal journals and child tickets feed `/improving`; set
 homes may also be specific goal issues as `OWNER/NAME#N`. Set
 `LOOM_STATUS_REPO=OWNER/NAME` to read the station's lane status comment for
 `/lanes`. `.env.example` lists the dashboard variables with placeholder
-values.
+values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
+and station so completed runs can upload to `POST /api/transcripts`.

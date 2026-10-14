@@ -53,6 +53,9 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         # Attempts and rung are computed from transcripts by the Ticket page.
         "attempts": None, "rung": None,
         "updated_at": issue.get("updated_at"),
+        "body": body,
+        "labels": names,
+        "html_url": issue.get("html_url"),
     }
 
 

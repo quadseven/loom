@@ -7,6 +7,7 @@ import json
 import os
 import re
 import socket
+import hmac
 import ipaddress
 import socket
 from pathlib import Path
@@ -19,6 +20,8 @@ from . import views
 from . import views
 from .github import TicketStore
 from .shell import page
+from . import transcripts as transcript_store
+from . import ticket as ticket_view
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -216,6 +219,30 @@ def _handler_for(state):
         def do_GET(self):
             return _dispatch_get(self, state)
 
+        def do_POST(self):
+            if self.path.split("?", 1)[0] != "/api/transcripts":
+                return self.send_text(404, "not found")
+            token = os.environ.get("LOOM_UPLOAD_TOKEN", "")
+            supplied = self.headers.get("Authorization", "")
+            if not token or not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
+                return self.send_json(401, {"error": "unauthorized"})
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 2_000_000:
+                    raise ValueError("invalid request size")
+                body = json.loads(self.rfile.read(length))
+                store = getattr(state, "transcripts", None)
+                if store is None:
+                    store = transcript_store.Store()
+                    state.transcripts = store
+                return self.send_json(201, store.upload(body))
+            except (ValueError, json.JSONDecodeError) as exc:
+                return self.send_json(400, {"error": str(exc)})
+            except RuntimeError as exc:
+                return self.send_json(503, {"error": str(exc)})
+            except transcript_store.storage_errors():
+                return self.send_json(503, {"error": "transcript storage unavailable"})
+
         def ticket_list(self, repos):
             rows = repos.get("filtered") if "filtered" in repos else [row for items in repos.values() if items for row in items]
             output = ["<h1>Loom tickets</h1>"]
@@ -260,6 +287,37 @@ def _handler_for(state):
 def _dispatch_get(handler, state):
     parsed = urlsplit(handler.path)
     path = parsed.path
+    api_match = re.fullmatch(r"/api/tickets/([^/]+)/([^/]+)/([0-9]+)(?:/runs(?:/([0-9]+))?)?", path)
+    if api_match:
+        owner, name, number, run_number = api_match.groups()
+        repo = unquote(owner) + "/" + unquote(name)
+        record = next((row for row in (state.data.get(repo) or []) if int(row.get("number", -1)) == int(number)), None)
+        if record is None:
+            return handler.send_json(404, {"error": "ticket missing from current snapshot"})
+        store = getattr(state, "transcripts", None)
+        if store is None:
+            try:
+                store = transcript_store.Store()
+                state.transcripts = store
+            except RuntimeError:
+                store = None
+        runs = store.attempts(repo + "#" + number) if store else []
+        if run_number is not None:
+            if not 1 <= int(run_number) <= len(runs):
+                return handler.send_json(404, {"error": "attempt missing"})
+            run = runs[int(run_number) - 1]
+            full = store.get(run["id"])
+            after = parse_qs(parsed.query).get("after", [""])[0]
+            events = [event for event in (full or {}).get("events", []) if not after or event.get("ts", "") > after]
+            return handler.send_json(200, {"run": run, "events": events})
+        if path.endswith("/runs"):
+            reason = None if store else "transcript store unavailable: configure dashboard database or explicit memory mode"
+            return handler.send_json(200, {"runs": runs, "missing_reason": reason})
+        payload = state.response()
+        prs = [pr for pr in payload.get("pull_requests", []) if re.search(r"(?:/issues/|/pull/)" + re.escape(number) + r"(?:\b|$)", str(pr.get("body") or ""))]
+        return handler.send_json(200, {"ticket": record, "checks": ticket_view.checks(record.get("body")),
+                                       "pull_request": prs, "timeline": [],
+                                       "timeline_missing": "ticket comments and label events are not in the current snapshot"})
     if path == "/livez":
         return handler.send_text(200, "live")
     if path == "/readyz":
@@ -287,7 +345,26 @@ def _dispatch_get(handler, state):
         return handler.send_page(handler.ticket_list(data))
     detail = _ticket_detail(state, path)
     if detail is not None:
-        return handler.send_page(detail[0], detail[1])
+        if detail[1] != 200:
+            return handler.send_page(detail[0], detail[1])
+        match = re.fullmatch(r"/t/([^/]+)/([^/]+)/([0-9]+)", path)
+        repo = unquote(match.group(1)) + "/" + unquote(match.group(2))
+        number = int(match.group(3))
+        record = next(row for row in (state.data.get(repo) or []) if int(row.get("number", -1)) == number)
+        store = getattr(state, "transcripts", None)
+        if store is None:
+            try:
+                store = transcript_store.Store()
+                state.transcripts = store
+            except RuntimeError:
+                store = None
+        runs = store.attempts(repo + "#" + str(number)) if store else []
+        params = parse_qs(parsed.query)
+        selected = params.get("run", [""])[0]
+        run = next((item for item in runs if str(item["id"]) == selected or str(item["attempt"]) == selected), runs[-1] if runs else None)
+        full = store.get(run["id"]) if store and run else None
+        body = ticket_view.render(record, runs, run.get("id") if run else None, (full or {}).get("events", []), [])
+        return handler.send_page(page("Ticket %s#%d" % (repo, number), "tickets", body, status="Live"))
     return handler.send_text(404, "not found")
 
 
