@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import metrics
+from . import rewrite
 from . import spend
 from . import text as _text
 from . import tickets
@@ -119,6 +120,13 @@ REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
 # A backlog goal home is triaged at most this often.
 TRIAGE_INTERVAL = 3600
+# Rewrites of loom:triage issues by the configured agent command
+# (bus/rewrite.py): at most REWRITE_PER_HOUR per backlog goal home in any hour,
+# at most REWRITE_PER_PASS a pass (an agent run holds the station's lock), and
+# an issue is not tried again for REWRITE_RETRY seconds after any outcome.
+REWRITE_PER_HOUR = 5
+REWRITE_PER_PASS = 2
+REWRITE_RETRY = 24 * 3600
 # Through the bot, a report is one short line (the goal's short name and the
 # report's first line) with a thread on it holding the full report.
 SHORT_NAME_RE = re.compile(r"^[ \t]*Short name:[ \t]*(\S.*?)[ \t]*$", re.M | re.I)
@@ -224,7 +232,9 @@ class Settings:
                  no_test_repos: Sequence[str] = (),
                  metrics_goal: str = "",
                  transcript_url: str = "",
-                 transcript_token_ssm: str = "") -> None:
+                 transcript_token_ssm: str = "",
+                 rewrite_cmd: str = "",
+                 rewrite_private_cmd: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -248,6 +258,11 @@ class Settings:
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
         self.transcript_token_ssm = transcript_token_ssm
+        # The agent command lines that rewrite loom:triage issues: one for
+        # public repos and one for private repos, which never fall back to
+        # the public one (its provider may train on prompts).
+        self.rewrite_cmd = rewrite_cmd
+        self.rewrite_private_cmd = rewrite_private_cmd
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -292,7 +307,9 @@ class Settings:
                    no_test_repos=words("LOOM_NO_TEST_REPOS"),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
-                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip())
+                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
+                   rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
+                   rewrite_private_cmd=env.get("LOOM_REWRITE_PRIVATE_CMD", "").strip())
 
 
 def _origin_repo() -> str:
@@ -584,18 +601,23 @@ class Station:
                  read_secret: Optional[SecretReader] = None,
                  post: Optional[Poster] = None,
                  discord: Optional[DiscordCall] = None,
-                 upload: Optional[Uploader] = None) -> None:
+                 upload: Optional[Uploader] = None,
+                 rewrite_run: Optional[rewrite.Runner] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
+        self.rewrite_run = rewrite_run or rewrite.run_agent
         # Where Claude Code and codex keep their sessions (the claude lane's
         # and the brain's transcripts, and codex rollouts).
         self.claude_projects = Path.home() / ".claude" / "projects"
         self.codex_sessions = Path.home() / ".codex" / "sessions"
         self.discord = discord or discord_call
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
+        # Backlog goal homes as triage_backlogs found them this pass:
+        # "owner/name#N" -> (repo, number).
+        self._backlogs: Dict[str, Tuple[str, int]] = {}
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
         self._spend: Optional[spend.Summary] = None
@@ -2350,6 +2372,7 @@ class Station:
         goals = self._backlog_goals(state)
         if goals is None:
             return
+        self._backlogs = {key: (repo, number) for key, (repo, number, _) in goals.items()}
         for key, (repo, number, last) in goals.items():
             if self._triage_recent(last):
                 continue
@@ -2360,6 +2383,110 @@ class Station:
                 continue
             state[key] = self.now
         _write_json(path, state)
+
+    # -- rewriting triaged issues ------------------------------------------
+    def _within(self, at: Any, seconds: int) -> bool:
+        return (isinstance(at, (int, float)) and not isinstance(at, bool)
+                and 0 <= self.now - at < seconds)
+
+    def _rewrite_state(self, path: str) -> Dict[str, Any]:
+        """rewrite.json with entries past their window dropped: "goals" maps
+        each backlog goal home to its rewrite times in the last hour, "issues"
+        each issue tried in the last day to {"at", "outcome"}, and "told" each
+        goal home to the last reason it was passed over and when."""
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        state: Dict[str, Any] = {"goals": {}, "issues": {}, "told": {}}
+        for key, times in (saved.get("goals") or {}).items():
+            kept = [t for t in (times if isinstance(times, list) else ())
+                    if self._within(t, 3600)]
+            if kept:
+                state["goals"][key] = kept
+        for key, entry in (saved.get("issues") or {}).items():
+            if isinstance(entry, dict) and self._within(entry.get("at"), REWRITE_RETRY):
+                state["issues"][key] = entry
+        for key, entry in (saved.get("told") or {}).items():
+            if isinstance(entry, list) and len(entry) == 2 and self._within(entry[1], 3600):
+                state["told"][key] = entry
+        return state
+
+    def _pass_over(self, state: Dict[str, Any], key: str, why: str) -> None:
+        """Say why a goal home gets no rewrite, once an hour per reason."""
+        told = state["told"].get(key)
+        if told is None or told[0] != why:
+            _say("rewrite %s: %s" % (key, why))
+            state["told"][key] = [why, self.now]
+
+    def _rewrite_command(self, repo: str, public: Dict[str, bool]) -> str:
+        """LOOM_REWRITE_CMD for a public repo, LOOM_REWRITE_PRIVATE_CMD for a
+        private one or one whose visibility cannot be read. A private repo
+        never falls back to the public command."""
+        if repo not in public:
+            public[repo] = self._public(repo)
+        return self.s.rewrite_cmd if public[repo] else self.s.rewrite_private_cmd
+
+    def _next_triaged(self, repo: str, tried: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The oldest open loom:triage issue not tried in the last day."""
+        for issue in rewrite.oldest_triaged(self.gh, repo):
+            if "%s#%d" % (repo, int(issue["number"])) not in tried:
+                return issue
+        return None
+
+    def _rewrite_one(self, state: Dict[str, Any], key: str, repo: str, number: int,
+                     public: Dict[str, bool]) -> bool:
+        """Rewrite the goal home's oldest untried loom:triage issue. True when
+        the agent ran (whatever it answered); the outcome is recorded."""
+        command = self._rewrite_command(repo, public)
+        if not command:
+            self._pass_over(state, key, "the repo is private and LOOM_REWRITE_PRIVATE_CMD "
+                            "is empty, so it is skipped" if not public[repo]
+                            else "LOOM_REWRITE_CMD is empty, so this public repo is skipped")
+            return False
+        issue = self._next_triaged(repo, state["issues"])
+        if issue is None:
+            return False
+        if not rewrite.goal_has_room(self.gh, repo, number):
+            self._pass_over(state, key, "the goal is at its cap of tickets in flight")
+            return False
+        outcome = rewrite.rewrite(self.gh, repo, number, issue, command, self.rewrite_run)
+        state["goals"].setdefault(key, []).append(self.now)
+        state["issues"]["%s#%d" % (repo, int(issue["number"]))] = {
+            "at": self.now, "outcome": outcome.action}
+        # A brief's detail is the ticket's URL; anything else may quote the agent.
+        detail = outcome.detail if outcome.action == "brief" else \
+            _text.scrub_paths(SECRET_RE.sub("<redacted>", outcome.detail))
+        _say("rewrite %s#%d: %s: %s" % (repo, int(issue["number"]), outcome.action,
+                                       detail[:REASON_MAX]))
+        return True
+
+    def rewrite_backlogs(self) -> None:
+        """Rewrite loom:triage issues on the backlog goal homes triage found
+        this pass, oldest issue first, with the agent command (bus/rewrite.py).
+
+        At most REWRITE_PER_HOUR per goal home in any hour and REWRITE_PER_PASS
+        a pass, goal homes that waited longest first, and none below the
+        budget floor. Each outcome is kept in rewrite.json, so an issue is not
+        tried again for a day, whether it was briefed, handed to a person,
+        skipped or failed."""
+        if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd) or not self._backlogs:
+            return
+        path = os.path.join(self.state, "rewrite.json")
+        state = self._rewrite_state(path)
+        public: Dict[str, bool] = {}
+        order = sorted(self._backlogs, key=lambda k: max(state["goals"].get(k) or [0]))
+        ran = 0
+        for key in order:
+            if ran >= REWRITE_PER_PASS or self._deferred():
+                break
+            if len(state["goals"].get(key) or []) >= REWRITE_PER_HOUR:
+                continue
+            repo, number = self._backlogs[key]
+            try:
+                ran += self._rewrite_one(state, key, repo, number, public)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("rewrite %s failed: %s" % (key, err))
+            finally:
+                _write_json(path, state)
 
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
@@ -3150,7 +3277,8 @@ class Station:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.triage_backlogs, self.post_metrics,
+                     self.forward_reports, self.triage_backlogs, self.rewrite_backlogs,
+                     self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
                      self.run_factory):
             if self._deferred():

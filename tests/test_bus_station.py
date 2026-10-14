@@ -7,13 +7,14 @@ import io
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -154,6 +155,11 @@ class FakeGitHub:
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
+        m = re.match(r"issues/(\d+)/labels/(.+)$", rest)
+        if m and method == "DELETE":
+            n, name = int(m.group(1)), unquote(m.group(2))
+            self.issues[n]["labels"] = [x for x in self.issues[n]["labels"] if x["name"] != name]
+            return reply(200, [])
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
@@ -176,6 +182,15 @@ class FakeGitHub:
             self.created.append(data)
             self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
             return reply(201, {"number": 900})
+        if method == "POST" and rest == "issues" and "loom:ticket" in data["labels"]:
+            number = 600 + len(self.created)
+            self.created.append(data)
+            self.issues[number] = {"number": number, "id": 1000 + number, "state": "open",
+                                   "title": data["title"], "body": data["body"],
+                                   "labels": [{"name": x} for x in data["labels"]]}
+            self.comments[number] = []
+            return reply(201, dict(self.issues[number], html_url="https://github.com/%s/issues/%d"
+                                   % (REPO, number)))
         if method == "POST" and rest == "issues":
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
@@ -203,6 +218,9 @@ class FakeGitHub:
             return reply(200, self.lanes_issues)
         if "loom:digest" in query:
             return reply(200, self.digest_issues)
+        if "labels=loom:triage" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:triage" in self.names(i["number"])])
         if "sort=created&direction=asc" in query:
             return reply(200, self.open_issues)
         return self._list_briefed(headers)
@@ -568,6 +586,27 @@ class TriageTest(Base):
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
         self.assertEqual(self.fake.names(102), [])
+
+    def test_a_triaged_issue_is_rewritten_into_a_ticket_in_the_same_pass(self):
+        self.fake.private = False
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.add_open_issue(101, body="It is slow.")
+        answer = os.path.join(self._tmp.name, "answer.json")
+        with open(answer, "w") as fh:
+            json.dump({"action": "brief", "title": "Make it fast", "difficulty": "medium",
+                       "body": READY_BODY}, fh)
+        self.settings.rewrite_cmd = " ".join(shlex.quote(x) for x in (
+            sys.executable, "-c", "import sys; sys.stdin.read(); print(open(sys.argv[1]).read())",
+            answer))
+        err = self.run_at()
+        self.assertIn("rewrite %s#101: brief:" % REPO, err)
+        self.assertEqual(self.fake.names(101), ["loom:rewritten"])
+        ticket = self.fake.created[-1]
+        self.assertEqual(sorted(ticket["labels"]), ["loom:queued", "loom:ticket"])
+        self.assertTrue(ticket["body"].endswith("Refs #101\n"))
+        # The original is never closed, retitled or edited.
+        self.assertFalse([p for m, p in self.fake.calls if m in ("PATCH", "PUT")
+                          and "/issues/101" in p])
 
     def test_below_the_budget_floor_triage_is_deferred(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)

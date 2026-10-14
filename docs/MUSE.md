@@ -200,8 +200,12 @@ live regression).
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
    ticket under the goal, the rest get `loom:triage` and one comment naming
-   what is missing. The brain only rewrites `loom:triage` issues: take up to
-   5 per tick and, for each, either write the ticket with
+   what is missing. With `LOOM_REWRITE_CMD` (and, for private repos,
+   `LOOM_REWRITE_PRIVATE_CMD`) set, the station also rewrites up to 5
+   `loom:triage` issues per backlog goal home an hour with that agent
+   command (docs/BRAIN.md, Rewriting triaged issues), and the brain need not
+   spend its tick on them. The brain only rewrites `loom:triage` issues: take
+   up to 5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket refs it, the original gets
    `loom:rewritten` and stays open) or, when only a person can do it, run

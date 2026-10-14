@@ -224,6 +224,17 @@ spread target. Use the keys in `.env.example` as setup placeholders.
 The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
 its previous metrics comments can be trusted for the streak.
 
+Rewrites: with `LOOM_REWRITE_CMD` set, the station turns `loom:triage` issues
+on backlog goal homes into `loom:queued` tickets that refs their originals, or
+`loom:human` asks. It does this with that command and no brain tick. The
+command reads a prompt on stdin and prints one JSON answer, for example an
+`opencode run` on an OpenCode Go model or a `codex exec`. Private repos use
+`LOOM_REWRITE_PRIVATE_CMD` only, never the public one, and are skipped while
+it is empty. It runs at most 5 an hour per goal home and 2 a pass, each for
+at most 5 minutes. Code checks every answer before anything is written.
+docs/BRAIN.md (Rewriting triaged issues) has the rules. Which model each
+command uses is the station's own setting, never this repo's.
+
 Reports: the station also reads comments on open `loom:goal` issues in each
 `LOOM_REPOS` repo. On first run it records the newest report comment per repo
 without sending old reports; later `<!-- loom:report v1 -->` comments from

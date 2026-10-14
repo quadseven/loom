@@ -52,8 +52,8 @@ that talks to GitHub about tickets.
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
-| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
-| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Refs #<number>`. The issue stays open. |
+| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The station's rewrite command (Rewriting triaged issues) or the brain rewrites it (`brief --refs`) or marks it `loom:human`. |
+| `loom:rewritten` | A ticket was written from this issue (by the brain or the station's rewrite command); the ticket says `Refs #<number>`. The issue stays open. |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed (money, hardware, an account, a credential, a decision reserved for the operator). |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -160,6 +160,50 @@ for a later run. Any other issue gets `loom:triage` and one comment naming
 what is missing. Triage writes labels, sub-issue links and that comment
 only: it never closes, retitles or edits an issue, because an automated
 pass over old issues over-calls work as done.
+
+## Rewriting triaged issues
+
+The station rewrites `loom:triage` issues on backlog goal homes itself, with
+an agent command and no brain tick (`bus/rewrite.py`). For one issue it
+builds a prompt from the issue (title, body, labels and its last 10
+comments) and the ticket template above. It runs the command with the prompt on
+stdin, in an empty directory and without the GitHub token, for at most 5
+minutes. Then it reads back one JSON object, the last one in the output
+that has an `action`:
+
+- `{"action": "brief", "title", "difficulty", "body"}`: filed with
+  `brief(..., refs=M)` and no lane, so the ticket is `loom:queued` and the
+  original gets `loom:rewritten`;
+- `{"action": "human", "ask"}`: handed to a person with `human`, only for
+  money, hardware, an account, a credential or a decision reserved for the
+  operator;
+- `{"action": "skip", "reason"}`: nothing is written.
+
+Before anything is written, code checks the answer. The title is one line
+of at most 100 characters. The difficulty is easy, medium or hard. The body
+has every brief section with checkboxes under Acceptance criteria
+(`missing_sections` finds nothing) and no header lines of its own. With its
+Difficulty and Refs lines added, the body passes `tickets.parse`. The title,
+body and ask pass the written-text check. An answer that fails a check, a
+command that fails or runs too long, and output with no answer all write
+nothing, and the station logs why. Like triage, a rewrite never closes,
+retitles or edits the original issue.
+
+`LOOM_REWRITE_CMD` is the command for public repos and
+`LOOM_REWRITE_PRIVATE_CMD` the one for private repos (and for a repo whose
+visibility cannot be read). Each is a command line that reads the prompt on
+stdin and prints the answer, for example an `opencode run` on an OpenCode Go
+model or a `codex exec`. A private repo never falls back to the public
+command, whose provider may train on prompts: with the private command empty,
+private repos are skipped. With both empty, nothing is rewritten.
+
+Pacing: the station rewrites at most 5 issues per backlog goal home in any
+hour and at most 2 per pass, because an agent run holds the station's lock.
+Each goal home takes its oldest `loom:triage` issue first, and the goal home
+that waited longest goes first. Nothing is rewritten below the GitHub budget
+floor or while the goal is at `LOOM_GOAL_CAP`. Each outcome is recorded in
+`state/station/rewrite.json`, so an issue is not tried again for a day,
+whatever the outcome was.
 
 ## Proof
 
