@@ -10,10 +10,14 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "station.sh"
 
-# Fake gh: prints $FAKE_CHECK as the check verdict the script's --jq asks for.
+# Fake gh: prints $FAKE_CHECK as the check verdict the script's --jq asks
+# for, and $FAKE_REVERTS as the bodies of the in-flight revert tickets.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
-printf '%s\\n' "${FAKE_CHECK:-success}"
+case "$*" in
+  *loom:revert*) printf '%s\\n' "${FAKE_REVERTS:-}" ;;
+  *) printf '%s\\n' "${FAKE_CHECK:-success}" ;;
+esac
 """
 # Fake python3: records that the station pass ran, from which directory.
 FAKE_PY = """#!/usr/bin/env bash
@@ -88,6 +92,24 @@ class StationScriptTest(unittest.TestCase):
             self.assertEqual(self.head(), before)
             self.assertNotIn("deployed", result.stdout)
         self.assertTrue(self.calls()[-1].startswith("python3 -m bus station"))
+
+    def test_a_head_that_brings_in_a_commit_a_revert_names_waits(self):
+        before = self.head()
+        bad = self.push_change()
+        self.push_change("three\n")
+        reverts = "## What\n- Start from the default branch and run `git revert --no-edit %s`." % bad
+        result = self.run_script(FAKE_REVERTS=reverts)
+        self.assertEqual(self.head(), before)
+        self.assertIn("not deploying: %s is named by a revert ticket" % bad[:12], result.stdout)
+        self.assertTrue(self.calls()[-1].startswith("python3 -m bus station"))
+
+    def test_a_named_commit_already_deployed_does_not_hold_the_next_one(self):
+        bad = self.push_change()
+        self.run_script()
+        self.assertEqual(self.head(), bad)
+        target = self.push_change("three\n")
+        result = self.run_script(FAKE_REVERTS="git revert --no-edit %s" % bad)
+        self.assertEqual(self.head(), target, result.stdout)
 
     def test_local_changes_are_never_overwritten(self):
         before = self.head()

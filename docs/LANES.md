@@ -117,6 +117,11 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
 
+After claims on every pass, the station gives the oldest `loom:queued`
+tickets free lanes in their Difficulty tier and moves them to `loom:briefed`.
+It skips future `Not before:` times and tickets without a readable Difficulty.
+The latter appear in their goal's next station standup.
+
 Lane status: every pass the station reads each lane's heartbeat (`yes` when
 available and at most 600 seconds old, else `no`) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
@@ -329,6 +334,38 @@ agent; a skipped tick has none) and `at` (when it ended). It uploads as slot
 `brain` with its UTC start time as the ticket and `model` from the same
 file: the Claude Code sessions in the operator's `~/.claude/projects` for
 `$LOOM_HOME/brain` last written between `started` and `at`.
+
+## Log watch
+
+Each station pass reads the lines each component added to its log since the
+last pass: by default `logs/station.log` (as `station`), `logs/brain.log`
+(`brain`) and each lane's `logs/<lane>-service.log` (named after the lane).
+`LOOM_WATCH` replaces that list with lines of `name=path`, a relative path
+being under `$LOOM_HOME`. A line counts when it says `error`, `failed`,
+`Traceback` or `refused`, or carries an HTTP 4xx or 5xx; a Python traceback
+counts once, as its exception line. Each line is reduced to a signature:
+times, numbers, hex ids and SHAs, long mixed ids, repos and issue numbers,
+paths, addresses and mentions become placeholders, so a 403 on two repos is
+one signature (the status code is kept).
+
+A signature seen 3 or more times within 30 minutes, and not seen in the 24
+hours before, files one `loom:triage` issue in `LOOM_STATUS_REPO` titled
+`<component>: <signature>`, with the count and the first and last example
+lines. The examples have paths, credential shapes, mail addresses, mentions,
+private hosts, IP addresses and repo names replaced, and each must pass the
+written-text check (`bus/text.py`) or is withheld. An open `loom:triage` issue
+with the same title is counted instead of filed again. While the signature
+keeps repeating its open issue gets a count comment at most once an hour; a
+closed one is left alone. No model is involved: diagnosis is the brain's.
+
+`state/station/watch.json` keeps each log's inode and offset and each
+signature seen in the last 24 hours. The first scan starts at the end of each
+log; a log that is later created, rotated (a new inode) or truncated is read
+from its start. One pass reads at most 1 MB of each log, files or counts at
+most 5, and below the GitHub budget floor only reads, filing on a later
+pass. Once an hour `station.log` gets a `watch: scanned ...` line with the
+logs, lines and matches seen, which is how a quiet day shows it ran; the
+watcher's own lines never count as hits.
 
 ## Transcript viewer
 
@@ -632,7 +669,8 @@ Adding one takes:
   `sandbox-exec` and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
   or key is missing reports itself unavailable and takes no work.
 - A branch in `run_agent` that runs the lane's CLI with the brief and the
-  model. An API lane calls `api_agent <key var or -> <CLI...>`, which runs it
+  model. An API lane calls `api_agent <key var or -> <CLI...>`
+  (`lanes/agent_sandbox.sh`, shared with the triage rewriter), which runs it
   under the sandbox in a fresh scratch home with only its own key exported,
   and must be listed in `is_api_lane` (its transcripts are then archived).
 - A case in the `LANE:MODEL` model check, so a brief naming a model outside

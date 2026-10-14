@@ -41,7 +41,7 @@ that talks to GitHub about tickets.
 |---|---|
 | `loom:goal` | The goal's home issue. |
 | `loom:ticket` | Every ticket issue. |
-| `loom:queued` | Written by the brain, no lane chosen yet. |
+| `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, oldest first; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
@@ -61,6 +61,8 @@ that talks to GitHub about tickets.
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
 | `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
+| `loom:revert` | A ticket the station filed to revert the merge that turned a default branch red (see Red default branch). Claimed and landed before every other ticket. |
+| `class:logic` | A change to behavior; every revert ticket carries it. |
 
 A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
@@ -160,6 +162,55 @@ for a later run. Any other issue gets `loom:triage` and one comment naming
 what is missing. Triage writes labels, sub-issue links and that comment
 only: it never closes, retitles or edits an issue, because an automated
 pass over old issues over-calls work as done.
+
+The station assigns queued tickets to free lanes on each pass. A brain that
+wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
+a readable Difficulty line appear in the goal's next station standup as
+needing a difficulty.
+
+### Agent rewrites
+
+The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).
+Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
+repos) to command lines that read a prompt on stdin and print one JSON object.
+`lanes/rewrite_agent.sh <key-ssm> <provider/model>` is one: it reads the
+provider key from the SSM parameter `<key-ssm>` and runs `opencode run` on the
+model in the opencode lanes' sandbox (`lanes/agent_sandbox.sh`), with an empty
+scratch home and working directory and every opencode tool denied, and prints
+only the agent's final text. The station runs from the checkout, so for
+example:
+
+```sh
+LOOM_REWRITE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash"
+LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/kimi-k2.7-code"
+```
+
+`<key-ssm>` is the parameter the opencode-go lanes read
+(`LOOM_OPENCODE_GO_KEY_SSM`). The private command's model must come from a
+provider that does not train on prompts: never a public-only one (docs/LANES.md,
+"Public repos only"), such as a Muse Spark Contributor model. The prompt
+holds the issue (title, body, labels, last 10 comments) and the ticket format
+above. The answer is one of:
+
+```json
+{"action": "brief", "title": "...", "difficulty": "easy|medium|hard", "body": "..."}
+{"action": "human", "ask": "..."}
+{"action": "skip", "reason": "..."}
+```
+
+Code checks the answer before anything is written: the body has every brief
+section, checkboxes under Acceptance criteria, no header lines, and passes the
+written-text check; difficulty is one of the three. A brief is filed queued
+(no lane) with `brief --refs M`; a human ask goes through `human`; a skip or
+an invalid answer writes nothing and is logged. The original issue is never
+closed, retitled or edited.
+
+A repo that is not public (or whose visibility cannot be read) only ever uses
+the private command, because the public one may run a provider that trains on
+prompts; with the private command empty the repo is skipped. The station runs
+at most 5 rewrites per backlog goal home per hour (and 5 per pass), oldest
+first, under the budget floor rule. `state/station/rewrite.json` records each
+attempt; an issue that did not become a ticket is not tried again for a day.
 
 ## Proof
 
@@ -319,6 +370,11 @@ the account, the brain included.
   rest (reconciliation, hand-back, lane status, asks, standups, goal
   reports, metrics, the brain watch, the Discord relay and the factory)
   waits for the reset. The station says so once per rate limit window.
+- The revert pass (see Red default branch) reads, per repo, the same page of
+  recently closed pull requests reconciliation reads; only in a repo with a
+  lane pull request merged in the last 6 hours does it read further: the
+  repo, its default branch's 30 newest commits, and one check-run page per
+  commit from the head back to the last green one.
 - Each pass logs one line: `requests: N, M counted (by endpoint kind), K
   answered 304 (not counted); budget R of L left, resets T`.
 - Writes happen only on claims, outcomes, status changes and asks.
@@ -407,6 +463,49 @@ fixes a measured regression of ticket M:
 - Briefing the same regression again while its ticket is in flight files
   nothing and prints that ticket.
 
+## Red default branch
+
+Lanes merge as soon as their own pull request is green and reviewed: there
+is no merge queue and no global lock. Two changes that are each green can
+still break the default branch together, so the station watches the
+branch after the merge instead (bus/revert.py, every pass, off with
+`LOOM_FACTORY=0`):
+
+- For each repo with a lane pull request merged in the last 6 hours, it
+  reads the check runs of the default branch's newest commits through the
+  API, from the head back to the last green commit. No checkout. The
+  review check is left out, since it reviews and does not test. A commit
+  with no check runs is waited on for 30 minutes, then skipped as
+  untested.
+- When the newest tested commit is red, the first red commit after the
+  last green one is the culprit. A commit before it that is still running
+  is waited on, since it may be the culprit.
+- The culprit is reverted only when all of these hold: it is the merge of
+  a trusted lane pull request whose head was green; it has been red for
+  30 minutes, so a newer commit had time to turn the branch green; no other
+  `loom:revert` ticket is in flight in the repo; and no revert ticket names
+  it yet. A red commit no lane merged is reported once and left for a
+  person or the brain.
+- The revert is a ticket titled `Revert <sha>: <title>`, labelled
+  `loom:revert` and `class:logic`, with no `Model:` line (rung 0). It goes
+  to the first free lane of the easy tier the repo may use, or of the next
+  tier up when no easy lane is up. Its What is `git revert --no-edit <sha>`.
+  Its acceptance criteria are the failing checks passing. Its body says
+  `Tests: none needed (...)` and `Reverted ticket: #N`.
+- The station claims it first. The factory lands it first, on green and
+  reviewed, deferring its medium and low findings at once instead of after
+  a fix round. A high or critical finding still sends it back.
+- The reverted ticket gets a comment naming the red check and the revert
+  ticket. Once the revert reaches `loom:merged`, the ticket goes back to
+  `loom:briefed` on its own lane, to redo the change on the new default
+  branch. Its comment is marked `<!-- loom:redo R -->`, so the move
+  happens once.
+- Each decision is one `revert:` line in the station log, said again only
+  when it changes.
+- The station's auto-deploy of Loom itself (lanes/mac/station.sh) does not
+  deploy a head that would bring in a commit an in-flight revert ticket
+  names. It waits for the revert, or for the ticket to land.
+
 ## Merge-ready
 
 A lane pull request is merge-ready if and only if all four hold:
@@ -429,6 +528,23 @@ nothing else, so two runs over the same pull request state print the same
 verdict. A tick takes that line as given instead of re-reading the review
 list. `bus.brain merge` keeps its own checks; this signal does not change
 what it accepts.
+
+## Merge by change class
+
+Every lane pull request carries one change class (`class:<name>`, set by the
+runner from its changed files; docs/LANES.md). The factory reads it when it
+decides merge-ready, so consequence decides the rule:
+
+- `docs` and `tests`: merged on green checks and a review pass on the head
+  commit alone. A medium or low finding the review bot opened is deferred to
+  the follow-up issue at once, with no fix round.
+- `logic`: the rule above is unchanged.
+- `sensitive`: never merged by the factory. The factory marks the pull
+  request `needs-brain`, and `bus.brain status` lists it under "Sensitive
+  pull requests". Only a brain merges it, with `bus.brain merge`, which for
+  this class also requires that the review check passed and that no high or
+  critical finding is open on the head commit.
+- A pull request with no class label keeps the `logic` rule.
 
 ## Pull requests without a ticket
 

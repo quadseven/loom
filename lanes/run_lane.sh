@@ -144,14 +144,28 @@ lane_setting() {
 # is the epoch time a provider limit lifts; until then every pass stays
 # unavailable without reading the key or taking a brief.
 BEAT="$LOOM_HOME/state/usage/$SLOT.json"
-heartbeat() {
-  local reason retry=""
+write_beat() {
+  local slot="$1" reason retry=""
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
-  reason="$(printf '%s' "$2" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
-  [[ "${3:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $3"
+  reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
+  [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
   mkdir -p "$LOOM_HOME/state/usage"
   printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s}\n' \
-    "$SLOT" "$(date +%s)" "$1" "$reason" "$retry" > "$BEAT.tmp" && mv "$BEAT.tmp" "$BEAT"
+    "$slot" "$(date +%s)" "$2" "$reason" "$retry" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
+    mv "$LOOM_HOME/state/usage/$slot.json.tmp" "$LOOM_HOME/state/usage/$slot.json"
+}
+heartbeat() { write_beat "$SLOT" "$@"; }
+
+# An empty API credit holds every slot that shares it, not only the one that
+# hit it: each gets the same unavailable heartbeat until $1. The shared set
+# is bus/factory.py's, so the factory and this runner agree on it.
+hold_shared_credit() {
+  local until="$1" slots slot
+  slots="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.factory credit-slots 2>/dev/null)" || return 0
+  case $'\n'"$slots"$'\n' in *$'\n'"$SLOT"$'\n'*) ;; *) return 0 ;; esac
+  for slot in $slots; do
+    write_beat "$slot" false "limit: out of credit; unavailable until $(utc "$until")" "$until"
+  done
 }
 
 utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
@@ -365,110 +379,11 @@ park() {
   mv "$1" "$INBOX/failed/"
 }
 
-# Seatbelt profile for API-lane agents: no reads or writes anywhere under the
-# real HOME except the worktree, the scratch home and the directory holding
-# the CLI's binary, plus read-only access to the skill snapshot. Inside the
-# worktree, .git stays readable (git diff and git log need it; a fresh clone
-# holds no credentials) but not writable: a planted
-# hook or config would run when the runner commits. Also no keychain, no Unix
-# sockets except DNS (an SSH agent's socket would hand over its keys), and no
-# AppleEvents, LaunchServices, osascript, open, launchctl, sudo or su (each can
-# run a command outside the sandbox or as another user), and no connections to this machine's own
-# loopback services (the transcript viewer serves other lanes' sessions). Paths are canonical, because the sandbox
-# matches resolved paths; proper ancestors get metadata-only literals so
-# getcwd and realpath still work without making HOME listable.
-sandbox_profile() {
-  # The agy lane reaches the keychain server: it runs as the lane user, whose
-  # only keychain is its own. Every other lane is denied it, and so is a
-  # validation run ($3 = check), whichever lane it serves.
-  local keychain_deny='(global-name "com.apple.SecurityServer") ' agy_lane=""
-  [ "$LANE" = agy ] && [ "${3:-}" != check ] && { keychain_deny=""; agy_lane=1; }
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule=""
-  if [ -n "${4:-}" ]; then
-    [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] || return 1
-    loopback_rule="(allow network-outbound (remote ip \"localhost:$4\"))"
-  fi
-  home="$(cd "$HOME" && pwd -P)"
-  tree="$(cd "$1" && pwd -P)"
-  [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
-  cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
-  cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
-  cli_root="$(dirname "$cli_real")"
-  # Paths go into the profile's string grammar: refuse any that could close it.
-  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$skills"; do
-    # shellcheck disable=SC1003 # matching a literal backslash
-    case "$p" in *'"'*|*'\'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
-  done
-  # Never let the CLI's directory cover HOME itself.
-  case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
-  allow_rw="(subpath \"$tree\") (subpath \"$(cd "$AGENT_HOME" && pwd -P)\")"
-  allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")"
-  # The skill snapshot: readable, never writable, wherever LOOM_HOME lives.
-  [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
-(deny file-write* (subpath \"$skills\"))
-"
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"}; do
-    p="$(dirname "$p")"
-    while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
-      meta="$meta (literal \"$p\")"
-      [ "$p" = "$home" ] && break
-      p="$(dirname "$p")"
-    done
-  done
-  [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n%s\n' \
-    "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny" "$loopback_rule"
-}
-
-# API lanes run the agent with an emptied environment (its provider key, a
-# scratch HOME and TMPDIR, PATH) inside the sandbox above. A key_var of "-"
-# means the provider needs no key (OpenCode Zen's free models). The key is
-# exported, never put in argv, so `ps` cannot show it. The agent can edit its
-# tree but cannot read credentials, push, open, or merge; the runner does that.
-api_agent() {
-  local key_var="$1" cli="$2" profile
-  mkdir -p "$AGENT_HOME/tmp"
-  profile="$(sandbox_profile "$PWD" "$cli" "" "${OPENCODE_SERVER_PORT:-}")" || return 3
-  (
-    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV" server_port="${OPENCODE_SERVER_PORT:-}"
-    for v in $(compgen -e); do unset "$v"; done
-    [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
-    # shellcheck disable=SC2030 # deliberately local to the agent's subshell
-    export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" \
-      TMP="$AGENT_HOME/tmp" TEMP="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
-    [ "$key_var" = - ] || export "$key_var=$key"
-    # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
-    while IFS= read -r kv; do [ -z "$kv" ] || export "${kv?}"; done <<< "$extra"
-    if [ -n "$server_port" ]; then
-      OPENCODE_PASSWORD="$(openssl rand -hex 32)" || exit 3
-      export OPENCODE_PASSWORD
-      sandbox-exec -p "$profile" "$cli" serve --hostname 127.0.0.1 \
-        --port "$server_port" > /dev/null 2>&1 < /dev/null &
-      server_pid=$!
-      trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
-      trap 'exit 143' TERM
-      trap 'exit 130' INT
-      trap 'exit 129' HUP
-      ready=""
-      deadline=$((SECONDS + 15))
-      while [ "$SECONDS" -lt "$deadline" ]; do
-        kill -0 "$server_pid" 2>/dev/null || { echo "opencode server stopped before it was ready" >&2; exit 3; }
-        if sandbox-exec -p "$profile" /usr/bin/nc -z -w 1 127.0.0.1 "$server_port" \
-          > /dev/null 2>&1; then ready=1; break; fi
-        sleep 0.1
-      done
-      [ -n "$ready" ] || { echo "opencode server was not ready within 15 seconds" >&2; exit 3; }
-      timeout -k 5 "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
-    else
-      exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
-    fi
-  ) 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
-  # The agent writes into a pipe, not the log file: the log lives under HOME,
-  # where the sandbox denies even fstat, and CLIs fstat their output at start.
-  # pipefail carries the agent's exit status through `cat`. The reader has its
-  # own deadline: a process the agent detached into another process group
-  # survives `timeout` and would hold the pipe, and the lane lock, open.
-}
+# The agent sandbox (sandbox_profile, api_agent), the opencode run
+# (opencode_config, opencode_run) and ssm_value, shared with
+# lanes/rewrite_agent.sh.
+# shellcheck source=lanes/agent_sandbox.sh
+. "$LOOM_ROOT/lanes/agent_sandbox.sh"
 
 # The agy lane's agent runs as the lane user, so that user's home is its real
 # home, not a scratch one. It may write only its tree, its TMPDIR, agy's state
@@ -617,7 +532,8 @@ mark_limit() {
 # ahead than LIMIT_HOLD (a clock that was wrong) is ignored.
 limit_held() {
   local ends why now
-  read -r ends why < "$LIMIT_FILE" 2>/dev/null || return 1
+  [ -f "$LIMIT_FILE" ] || return 1
+  read -r ends why < "$LIMIT_FILE" || return 1
   now="$(date +%s)"
   [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
   LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
@@ -636,23 +552,6 @@ spark_ready() {
   esac
 }
 
-# opencode runs helper agents (session titles) on its own default small model,
-# which can be a paid one; pin every opencode model to the lane's model so the
-# free lane stays free and the subscription lane stays in its catalogue. The
-# config travels in the environment: the runner writes nothing into space the
-# agent can write, so no link an agent leaves there can redirect it.
-opencode_config() {
-  # MODEL already passed the allowlist; refuse JSON-breaking characters here too.
-  # shellcheck disable=SC1003 # matching a literal backslash
-  case "$MODEL" in *'"'*|*'\'*) echo "refusing model with a quote or backslash" >&2; return 1 ;; esac
-  # The spark lane's provider is the local endpoint, declared here: an
-  # OpenAI-compatible provider named spark at LOOM_SPARK_URL (checked in
-  # spark_ready), serving the one model after "spark/". No key.
-  local provider="" id="${MODEL#spark/}"
-  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": 32768, \"output\": 4096}}}}}"
-  AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
-}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": {\"external_directory\": \"deny\"}$provider}"
-}
 
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
 # PATH. One slot can try a new major version (its installer would overwrite
@@ -663,20 +562,9 @@ opencode_bin() {
   printf '%s' "${b:-opencode}"
 }
 
-# opencode 2.x needs its own server on one allowed loopback port. --auto lets
-# it act without prompting, as 1.x run does.
 # Usage: opencode_agent <key_var> <brief text>
 opencode_agent() {
-  local bin port
-  bin="$(opencode_bin)"
-  opencode_config || return 1
-  case "$(timeout "$NET_TIMEOUT" "$bin" --version < /dev/null 2> /dev/null | head -n 1)" in
-    "opencode v2."*)
-      port="$(python3 -c 'import secrets; print(49152 + secrets.randbelow(16384))')" || return 3
-      OPENCODE_SERVER_PORT="$port" api_agent "$1" "$bin" run --server "http://127.0.0.1:$port" --auto -m "$MODEL" "$2"
-      return $? ;;
-  esac
-  api_agent "$1" "$bin" run -m "$MODEL" "$2"
+  opencode_run "$1" "$(opencode_bin)" "$2"
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
@@ -1191,8 +1079,7 @@ lane_ready() {
   case "$LANE" in zen) return 0 ;; spark) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
-  API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
-    --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+  API_KEY="$(ssm_value "$key_ssm")"
   [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
   lane_extra_ready
 }
@@ -1202,8 +1089,7 @@ agy_key() {
   local key_ssm
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
-  API_KEY="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
-    --name "$key_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+  API_KEY="$(ssm_value "$key_ssm")"
   [ -n "$API_KEY" ] || { READY_REASON="no keychain password readable at $(lane_var KEY_SSM)"; return 1; }
 }
 
@@ -1229,8 +1115,7 @@ lane_extra_ready() {
     local account_ssm
     account_ssm="$(lane_setting ACCOUNT_SSM)"
     [ -n "$account_ssm" ] || { READY_REASON="$(lane_var ACCOUNT_SSM) is not set"; return 1; }
-    LANE_ACCOUNT="$(timeout "$NET_TIMEOUT" aws ssm get-parameter ${LOOM_AWS_REGION:+--region "$LOOM_AWS_REGION"} \
-      --name "$account_ssm" --with-decryption --query Parameter.Value --output text 2>/dev/null)"
+    LANE_ACCOUNT="$(ssm_value "$account_ssm")"
     [[ "$LANE_ACCOUNT" =~ ^[A-Za-z0-9]+$ ]] || { READY_REASON="no account id readable at $(lane_var ACCOUNT_SSM)"; return 1; }
   fi
 }
@@ -1426,10 +1311,11 @@ for BRIEF in "$INBOX"/*.md; do
     # this lane the retry. The rest of the inbox waits for the reset.
     if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
+      hold_shared_credit "$RETRY_AT"
     else
       LIMIT_REASON="provider limit reached"
     fi
-    heartbeat false "$LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
     break
   fi

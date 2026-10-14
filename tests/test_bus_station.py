@@ -891,6 +891,15 @@ class ClaimTest(Base):
         self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
         self.assertIn("loom:briefed", self.fake.names(7))
 
+    def test_a_revert_ticket_is_claimed_before_a_regression_and_older_ones(self):
+        self.fake.add(7, created="2030-01-01T00:00:00Z")
+        self.fake.add(8, created="2030-01-02T00:00:00Z")
+        self.fake.issues[8]["labels"].append({"name": "loom:regression"})
+        self.fake.add(9, created="2030-01-03T00:00:00Z")
+        self.fake.issues[9]["labels"].append({"name": "loom:revert"})
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+
     def test_a_retry_after_failure_gets_a_fresh_branch(self):
         self.fake.add(12)
         self.fake.comments[12].append({"body": "Claimed for lane codex (body sha256 0123456789ab)"})
@@ -2522,6 +2531,25 @@ class ReportsTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings,
                         now=time.time()).post_overdue_standups()
         self.assertIn("In flight: none.", self.fake.comments[40][-1]["body"])
+
+    def test_station_standup_lists_queued_tickets_needing_difficulty_once(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        self.fake.sub_issues[40] = [
+            {"number": 41, "title": "Needs a tier", "state": "open", "body": "## Why\nx",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]},
+            {"number": 42, "title": "Has a tier", "state": "open",
+             "body": "Difficulty: medium\n\n## Why\nx",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]},
+        ]
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        body = self.fake.comments[40][-1]["body"]
+        self.assertIn("Needs difficulty: #41 Needs a tier.", body)
+        self.assertEqual(body.count("Needs difficulty:"), 1)
 
     def test_station_does_not_post_for_a_fresh_report(self):
         self.add_goal()

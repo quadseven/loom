@@ -3,8 +3,10 @@
 The brain reads diffs, plans, briefs and verifies. It must not be the only
 thing that moves finished work: on 2026-10-13 it left 29 lane pull requests
 unmerged for 4 to 12 hours, because its tick budget ran out before it reached
-their review threads, and their tickets filled every goal's cap. This pass
-runs from the station at most every FACTORY_CHECK seconds and needs no model:
+their review threads, and their tickets filled every goal's cap. The factory
+runs from the station at most every FACTORY_CHECK seconds for pull requests
+and stuck tickets. Queue assignment runs on every station pass after claims.
+Neither needs a model:
 
 - A lane pull request whose checks have all finished, whose review check
   (LOOM_REVIEW_CHECK) has run on its head commit, and that is mergeable,
@@ -36,10 +38,24 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   bot's medium or low findings, each asked for in a fix round or after
   DEFER_AFTER rounds, files them in one loom:triage follow-up issue, answers
   and resolves each thread, and lands. High and critical findings, and
-  threads a person opened, still go back to the lane.
+  threads a person opened, still go back to the lane. A docs or tests change
+  defers such findings at once, with no fix round (its findings are style,
+  not behavior).
+- The merge rule follows the pull request's class:<name> label
+  (bus/change_class.py; docs/MUSE.md, Merge by change class). docs and tests
+  defer a minor finding at once; logic is the rule above; a sensitive change
+  is never merged here: it is marked needs-brain and left for the brain.
 - A pull request whose only fault is a failed Actions job gets that job run
   once more before it is sent back, since one flaky run should not cost a
   lane round.
+- A pull request whose only failing checks are leak scans that failed in
+  their "title and body" section, with a clean diff section, is fixed in its
+  text: no lane can fix text the runner re-renders from the ticket each
+  round (a ticket spent 14 rounds on one example reference on 2026-10-13).
+  Each flagged body line is rewritten, a cross-repo issue reference as
+  "issue N of another repo" in words, or dropped when it cannot be; editing
+  the body reruns the scan. Once per head commit, with a comment on the
+  ticket saying which lines changed.
 - The review bot replies "Fixed in <sha>" on a thread whose flagged code
   changed, but GitHub does not let its app resolve threads, so the thread
   stays open. Such a thread, with nobody writing after the bot's reply, is
@@ -50,12 +66,18 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   review it asked for, up to REVIEW_GRACE, before the round is judged.
 - A failed ticket climbs the ladder, and so does a ticket left briefed for
   BRIEFED_STALL with no lane claiming it.
+- Each pass gives the oldest queued tickets free lanes in their difficulty
+  tier, leaving held tickets and tickets without a readable tier queued.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
   spark lane's does while its box is hot) moves at once to a free lane in its
   difficulty tier (TIERS), or a ladder ticket to a free lane of its own rung.
   A limit is not a failure, so it never climbs; with no free lane the ticket
   waits where it is for its lane to come back.
 - Past the last rung the ticket is left failed for the brain, with a note.
+- A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
+  pull request is green, even while the default branch is red. Its medium
+  and low findings are deferred at once instead of after a fix round, and
+  it needs no test of its own (the failing check it fixes is its test).
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
 survives restarts and any brain can read where a ticket stands.
@@ -76,7 +98,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, tickets
+from . import brain, change_class, tickets
 from .github import GitHub, GitHubError
 from .tickets import FIX_MARKER
 
@@ -94,6 +116,9 @@ DEFAULT_REVIEW_BOT = "grug-tribe"
 BOT_FIXED_PREFIX = "Fixed in "
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
+# The slots that draw on one API credit: an empty credit holds all of them.
+# run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
+SHARED_CREDIT = ANTHROPIC
 # The operator's ladder, 2026-10-12: "sonnet 5.5, or codex sol or opus 5.5
 # worst case". Each rung lists the lanes that serve it, best first.
 LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
@@ -145,6 +170,15 @@ REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadR
 # The bot opens each finding with its severity line, "<symbol> medium | ...".
 MINOR_RE = re.compile(r"^\W*(medium|low) \|")
 DEFER_AFTER = 2
+# The change class a lane pull request carries (bus/change_class.py): the
+# merge rule follows it (docs/MUSE.md, Merge by change class). Highest wins,
+# so sensitive is checked first; a pull request with no class keeps today's
+# rule.
+CLASSES = change_class.CLASSES
+# A class whose medium and low findings are deferred at once, without waiting
+# for a fix round: a docs or tests change lands on green checks and a review
+# pass alone, since its findings are style, not behavior.
+FAST_CLASSES = ("docs", "tests")
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Deferred review findings from %s#%d"
 # A file a pull request changes is code by its extension, and a test by a
@@ -157,8 +191,22 @@ TESTS_NONE_RE = re.compile(r"^Tests: none needed \(\S[^)\n]*\)", re.M)
 # next round can tell the finding survived.
 NO_TEST_HEADING = "### Test: the change has no test"
 ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
+# The leak scan (infra-public's _reusable.leak-scan.yml) logs its diff and its
+# title-and-body text as two sections; each hit is "  <file>:<line>  [<rule>] ...".
+LEAK_CHECK_RE = re.compile(r"leak|private identifiers", re.I)
+LEAK_DIFF_MARK = "--- PR diff ---"
+LEAK_TEXT_MARK = "--- title and body ---"
+LEAK_HIT_RE = re.compile(r"^\s*\S+:(\d+)\s+\[([\w-]+)\]\s")
+LEAK_REF_RULE = "private-issue-ref"
+# The scanner's cross-repo reference shape: [owner/]name#N.
+SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
+                         r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
+BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
+# bus/revert.py's revert tickets, landed first and on green.
+REVERT_LABEL = "loom:revert"
+FIRST = ("loom:urgent", "loom:regression", REVERT_LABEL)
 
 FIX_NOTES = """The factory sent this pull request back: it has failing checks, open \
 review threads or a conflict with the default branch, listed below.
@@ -203,6 +251,11 @@ def _labels(issue: Dict[str, Any]) -> List[str]:
 def _state(issue: Dict[str, Any]) -> str:
     states = ["loom:" + s for s in brain.STATES]
     return next((x[5:] for x in _labels(issue) if x in states), "")
+
+
+def class_of(item: Dict[str, Any]) -> str:
+    """The change class a lane pull request carries, or empty when absent."""
+    return change_class.class_of(item)
 
 
 def _lane(issue: Dict[str, Any]) -> str:
@@ -271,16 +324,18 @@ def asked_threads(comments: Sequence[Dict[str, Any]]) -> set:
 
 
 def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
-               rounds: int) -> List[Dict[str, Any]]:
+               rounds: int, immediate: bool = False) -> List[Dict[str, Any]]:
     """The open threads to defer to a follow-up issue, or [] unless every open
     thread is a medium or low finding the review bot opened that a fix round
-    asked for, or the pull request has had DEFER_AFTER fix rounds."""
+    asked for, or the pull request has had DEFER_AFTER fix rounds. With
+    `immediate` (a docs or tests change) any such finding defers at once,
+    with no fix round."""
     still = [t for t in threads if not t.get("isResolved")]
 
     def minor(t: Dict[str, Any]) -> bool:
         root = _end(t, "root", 0)
         return (brain.by_bot(root, bot) and bool(MINOR_RE.match(str(root.get("body") or "")))
-                and (str(t.get("id")) in asked or rounds >= DEFER_AFTER))
+                and (immediate or str(t.get("id")) in asked or rounds >= DEFER_AFTER))
     return still if still and all(minor(t) for t in still) else []
 
 
@@ -380,6 +435,65 @@ def open_thread_ids(details: Dict[str, Any]) -> List[str]:
     return [str(t.get("id")) for t in threads if not t.get("isResolved")]
 
 
+def body_leak_hits(log: Sequence[str]) -> Optional[Dict[int, str]]:
+    """{line of the scanned text: rule} when a leak-scan job log failed in its
+    title-and-body section with a clean diff section; else None. The scanned
+    text is the title on line 1 and the body from line 2."""
+    marks = [l.strip() for l in log]
+    if LEAK_TEXT_MARK not in marks or LEAK_DIFF_MARK not in marks:
+        return None
+    cut = len(marks) - 1 - marks[::-1].index(LEAK_TEXT_MARK)
+    start = max((i for i in range(cut) if marks[i] == LEAK_DIFF_MARK), default=-1)
+    diff, text = marks[start + 1:cut], log[cut + 1:]
+    if (start < 0 or not any(l.startswith("leak guard: clean") for l in diff)
+            or any(l.startswith(("BLOCKED", "FATAL")) for l in diff)):
+        return None
+    if not any(l.strip().startswith("BLOCKED") for l in text):
+        return None
+    hits = {int(m.group(1)): m.group(2) for m in map(LEAK_HIT_RE.match, text) if m}
+    return hits or None
+
+
+def refs_in_words(line: str, repo: str) -> str:
+    """The line with each [owner/]name#N in words: "issue N of this repo" for
+    the repo's own, "issue N of another repo" for any other."""
+    owner, name = repo.lower().split("/", 1)
+
+    def words(m: "re.Match[str]") -> str:
+        own = m.group(2).lower() == name and (m.group(1) or owner).lower() == owner
+        return "issue %s of %s" % (m.group(3), "this repo" if own else "another repo")
+    return SCAN_REF_RE.sub(words, line)
+
+
+def repair_leak_text(title: str, body: str, hits: Dict[int, str],
+                     repo: str) -> Optional[Tuple[str, str, List[str]]]:
+    """(title, body, what changed) with each flagged line rewritten in words,
+    or dropped when it cannot be; None when a flag does not fit the text (a
+    title that is not a reference, a line that is not there)."""
+    lines = body.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    if len(title.splitlines()) != 1:
+        return None
+    changed: List[str] = []
+    dropped = set()
+    for at, rule in sorted(hits.items()):
+        refs = rule == LEAK_REF_RULE
+        if at == 1:
+            if not refs or not SCAN_REF_RE.search(title):
+                return None
+            title = refs_in_words(title, repo)
+            changed.append("title: put a cross-repo issue reference in words")
+        elif not 2 <= at <= len(lines) + 1:
+            return None
+        elif refs and SCAN_REF_RE.search(lines[at - 2]):
+            lines[at - 2] = refs_in_words(lines[at - 2], repo)
+            changed.append("body line %d: put a cross-repo issue reference in words" % (at - 1))
+        else:
+            dropped.add(at - 2)
+            changed.append("body line %d: dropped (flagged as %s)" % (at - 1, rule))
+    kept = [l for i, l in enumerate(lines) if i not in dropped]
+    return title, "\n".join(kept), changed
+
+
 def held_until(issue: Dict[str, Any]) -> float:
     """The ticket's Not before: time, 0 when it has none or it is unreadable."""
     try:
@@ -390,9 +504,9 @@ def held_until(issue: Dict[str, Any]) -> float:
 
 def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
                   linked: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Pull requests of loom:urgent and loom:regression tickets first, then the oldest."""
-    urgent = {n for n, issue in tickets.items()
-              if {"loom:urgent", "loom:regression"} & set(_labels(issue))}
+    """Pull requests of loom:urgent, loom:regression and loom:revert tickets
+    first, then the oldest."""
+    urgent = {n for n, issue in tickets.items() if set(FIRST) & set(_labels(issue))}
     ticket_of = {int(pr["number"]): n for n, pr in linked.items()}
     return sorted(prs, key=lambda p: (ticket_of.get(int(p["number"])) not in urgent,
                                       str(p.get("created_at") or "")))
@@ -511,7 +625,7 @@ class Factory:
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
         ticket that ask for tests?"""
-        if repo.lower() in self.no_test_repos:
+        if repo.lower() in self.no_test_repos or REVERT_LABEL in _labels(issue):
             return False
         if TESTS_NONE_RE.search(str(issue.get("body") or "")):
             return False
@@ -552,6 +666,17 @@ class Factory:
             _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
                  % (len(picked), repo, number))
 
+    def _mark_sensitive(self, repo: str, number: int, full: Dict[str, Any]) -> None:
+        """A sensitive-class pull request is never merged by the factory: mark
+        it needs-brain so the brain reviews and merges it (docs/MUSE.md,
+        Merge by change class). The mark is added once."""
+        if "needs-brain" in _labels(full):
+            return
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d is a sensitive change; marked needs-brain for the brain" % (repo, number))
+
     def _follow_up(self, repo: str, number: int, ticket: int, sha: str,
                    picked: Sequence[Dict[str, Any]], rounds: int) -> int:
         """The open follow-up issue for this pull request's deferred findings,
@@ -571,16 +696,17 @@ class Factory:
         return int(made.get("number") or 0)
 
     def _defer_minor(self, repo: str, number: int, ticket: int, sha: str,
-                     comments: Sequence[Dict[str, Any]]) -> bool:
+                     comments: Sequence[Dict[str, Any]], immediate: bool = False) -> bool:
         """Defer the open medium and low findings of a reviewed, green pull
-        request to a follow-up issue, then resolve them. True when it did."""
+        request to a follow-up issue, then resolve them. True when it did.
+        With `immediate` (docs, tests, or a revert) they defer at once."""
         owner, name = repo.split("/", 1)
         data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
                                                "number": number}) or {}
         threads = ((((data.get("repository") or {}).get("pullRequest") or {})
                     .get("reviewThreads") or {}).get("nodes") or [])
         rounds = fixes_of(comments)
-        picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds)
+        picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
             return False
         follow = self._follow_up(repo, number, ticket, sha, picked, rounds)
@@ -683,6 +809,11 @@ class Factory:
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
+        if class_of(full) == "sensitive":
+            # A change to the code that merges, closes or deploys never lands
+            # on the factory's say-so alone: mark it for the brain and stop.
+            self._mark_sensitive(repo, number, full)
+            return
         review = self._review_state(repo, number, sha, _ts(full.get("updated_at")))
         if review == "wait":
             return
@@ -700,17 +831,62 @@ class Factory:
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
+        immediate = class_of(full) in FAST_CLASSES
         if (faults == ["open review threads"] and review == "reviewed"
-                and self._defer_minor(repo, number, int(issue["number"]), sha, comments)):
+                and self._defer_minor(repo, number, int(issue["number"]), sha, comments,
+                                      immediate or REVERT_LABEL in _labels(issue))):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full)
-        if faults == ["failing checks"] and self._run_again(repo, number, sha):
+        if faults == ["failing checks"] and (
+                self._repair_body_leak(repo, number, full, issue, comments, sha)
+                or self._run_again(repo, number, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
                             ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
             self._land_or_ask_test(repo, number, full, issue, comments)
+
+    def _repair_body_leak(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any], comments: List[Dict[str, Any]],
+                          sha: str) -> bool:
+        """Rewrite the flagged lines of the pull request's text when every
+        failing check is a leak scan that failed on that text alone; once per
+        head commit. False leaves the pull request to the usual paths."""
+        marker = BODY_LEAK_MARKER % sha
+        if any(marker in str(c.get("body") or "") for c in comments):
+            return False
+        failed = [r for r in self._runs.get(sha, []) if r.get("conclusion") not in GREEN]
+        if not failed or not all(LEAK_CHECK_RE.search(str(r.get("name") or ""))
+                                 and (r.get("app") or {}).get("slug") == "github-actions"
+                                 for r in failed):
+            return False
+        hits: Dict[int, str] = {}
+        for run in failed:
+            try:
+                log = brain._job_log(self.gh, repo, int(run["id"]))
+            except (GitHubError, KeyError, TypeError, ValueError):
+                return False
+            found = body_leak_hits(log or [])
+            if found is None:
+                return False
+            hits.update(found)
+        fixed = repair_leak_text(str(full.get("title") or ""), str(full.get("body") or ""),
+                                 hits, repo)
+        if fixed is None:
+            return False
+        title, body, changed = fixed
+        self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
+                     {"title": title, "body": body})
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
+                     {"body": "%s\nThe leak scan on #%d failed on its title and body only, "
+                              "which the runner writes from this ticket, so the factory "
+                              "edited the text instead of sending it back:\n%s"
+                              % (marker, number, "\n".join("- " + c for c in changed))})
+        self.actions += 1
+        _say("rewrote %d flagged line(s) of %s#%d's text after a body-only leak scan"
+             % (len(changed), repo, number))
+        return True
 
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
                           issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
@@ -895,12 +1071,62 @@ class Factory:
         self.actions += 1
         _say("moved %s#%d off lane %s, at a limit, to %s" % (repo, number, old, lane))
 
-    # -- the pass --------------------------------------------------------
-    def run(self) -> None:
-        tickets = {repo: self._tickets(repo) for repo in self.repos}
+    # -- lane load -------------------------------------------------------
+    def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
+        """Count the briefed and running tickets on each lane, reading every
+        repo's tickets unless they are given."""
+        if tickets is None:
+            tickets = {repo: self._tickets(repo) for repo in self.repos}
         for issue in (i for found in tickets.values() for i in found.values()):
             if _state(issue) in ("briefed", "running"):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
+
+    def assign_queued(self) -> None:
+        """Give queued tickets free tier lanes, oldest first across repos."""
+        found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
+        self.count_load(found_by_repo)
+        queued = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
+                  if _state(issue) == "queued"]
+        for repo, issue in sorted(queued, key=lambda item: (
+                str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
+            if self.now < held_until(issue):
+                continue
+            lanes = [lane for lane in tier_lanes(issue, self._is_private(repo))
+                     if self._free(lane)]
+            if not lanes:
+                continue
+            lane = pick_lane(lanes, self.load)
+            difficulty = tickets.parse(issue.get("body"))[0]["Difficulty"]
+            self._guarded(self._assign_queued_one, repo, issue, lane, difficulty)
+
+    def _assign_queued_one(self, repo: str, issue: Dict[str, Any], lane: str,
+                           difficulty: str) -> None:
+        number = int(issue["number"])
+        self.move(self.gh, repo, number, "briefed", lane=lane,
+                  note="The station gave this queued ticket lane %s (tier %s)." %
+                       (lane, difficulty))
+        issue["labels"] = [{"name": x} for x in brain._moved_labels(
+            _labels(issue), "briefed", lane)]
+        self.load[lane] = self.load.get(lane, 0) + 1
+        _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, difficulty))
+
+    def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
+        """The first free lane of the difficulty tier the repo may use, else
+        its least-loaded lane that is up and not at a limit; None when the
+        tier has none. count_load first."""
+        private = self._is_private(repo)
+        lanes = [x for x in TIERS.get(difficulty, ()) if not (private and x in PUBLIC_ONLY)]
+        free = next((x for x in lanes if self._free(x)), None)
+        if free is not None:
+            return free
+        up = [x for x in lanes if x not in self.limited
+              and (self.available is None or x in self.available)]
+        return pick_lane(up, self.load) if up else None
+
+    # -- the pass --------------------------------------------------------
+    def run(self) -> None:
+        tickets = {repo: self._tickets(repo) for repo in self.repos}
+        self.count_load(tickets)
         for repo in self.repos:
             self._repo_pass(repo, tickets[repo])
 
@@ -949,3 +1175,11 @@ def due(state_dir: str, now: float) -> bool:
         json.dump({"ran": now}, fh)
     os.replace(tmp, path)
     return True
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["credit-slots"]:
+        print("\n".join(SHARED_CREDIT))
+    else:
+        sys.exit("usage: python3 -m bus.factory credit-slots")

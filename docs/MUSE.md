@@ -48,6 +48,10 @@ not looked hard enough yet. Each tick the brain:
   brief (docs/BRAIN.md, Regression slot). Never raise `LOOM_GOAL_CAP` for
   it. Link the next measured result in the goal's journal. Ordinary new
   work waits for the cap.
+- Leaves a red default branch after a lane merge to the station, which
+  reverts it (docs/BRAIN.md, Red default branch). Do not brief a second
+  revert for a commit a `loom:revert` ticket already names. A red commit
+  no lane merged is the brain's: the station only reports it.
 - Proves every change: a ticket is verified only when its proof shows on the
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.
@@ -193,6 +197,11 @@ live regression).
    and `brief --not-before` writes the line),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
+   A brief without `--lane` stays queued until the station gives it a free
+   lane of its Difficulty tier, oldest queued ticket first. Use `--lane LANE`
+   when the brain needs to choose the lane itself. A queued ticket without a
+   readable Difficulty line stays queued and appears in the goal's next
+   station standup as needing a difficulty.
 8. Triage the backlog. The station runs `python3 -m bus.brain triage
    OWNER/NAME --goal N` once an hour on every backlog goal home (the goal
    home onboard opens for a repo has a title starting `Backlog:`), with the
@@ -200,7 +209,9 @@ live regression).
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
    ticket under the goal, the rest get `loom:triage` and one comment naming
-   what is missing. The brain only rewrites `loom:triage` issues: take up to
+   what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
+   `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
+   takes what is left, and only rewrites `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket refs it, the original gets
@@ -323,6 +334,28 @@ updated first; a ticket marked "not checked for stuck" can still be passed to
 To set a model by hand on a first attempt or any other move, use
 `move OWNER/NAME#N --to briefed --lane LANE --model MODEL` or
 `fix OWNER/NAME#PR --ticket OWNER/NAME#N --file FINDINGS.md --lane LANE --model MODEL`.
+
+## Merge by change class
+
+Every lane pull request carries one change class (`class:<name>`, set by the
+runner from its changed files; docs/LANES.md). The merge rule follows it, so
+a cheap change lands fast and a dangerous one never lands on the factory's
+say-so alone:
+
+- `docs` and `tests`: the factory lands them on green checks and a review
+  pass on the head commit alone. A medium or low finding the review bot
+  opened is deferred to the follow-up issue at once, without waiting for a
+  fix round: it is style, not behavior.
+- `logic`: the rule above the class is unchanged: the factory lands a green,
+  reviewed pull request once its minor findings were asked for in a fix round
+  or it has had two rounds.
+- `sensitive`: the factory never merges it. It marks the pull request
+  `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
+  requests", and leaves it for the brain. A brain merges it with
+  `python3 -m bus.brain merge`, which for this class also requires that the
+  review check passed and no high or critical finding is open on the head
+  commit.
+- A pull request with no class label keeps the `logic` rule.
 
 ## Rules
 
