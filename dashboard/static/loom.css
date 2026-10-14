@@ -151,6 +151,17 @@ button { color: inherit; font: inherit; }
 .sheet-handle { width: 40px; height: 4px; margin: 0 auto 12px; border-radius: 4px; background: var(--line-strong); }
 .sheet-heading { display: flex; align-items: center; justify-content: space-between; }
 .sheet-heading h2 { font-size: 18px; }
+.backlog-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; }
+.backlog-filters label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.backlog-filters select, .backlog-filters button { min-height: 44px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
+.backlog-epic { margin-bottom: 12px; }
+.backlog-epic h2, .card h2 { font-size: 18px; }
+.backlog-epic ul { padding-left: 20px; }
+.backlog-epic li { padding: 4px 0; }
+.start-here { border-color: var(--accent); margin-bottom: 16px; }
+.start-here h2 { margin-bottom: 4px; }
+blockquote { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--accent); white-space: pre-wrap; }
+footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .more-sheet .nav-row { min-height: 52px; }
 @media (max-width: 959px) {
   .desktop-nav { display: none; }
