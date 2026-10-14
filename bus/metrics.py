@@ -6,12 +6,102 @@ import re
 import statistics
 import subprocess
 import sys
+import argparse
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterator, List, Sequence
 
-from .github import GitHub
+from .github import GitHub, GitHubError, token_from_env
 from .labels import LANES
+
+WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
+WAIT_WINDOW = 7 * 86400
+
+
+def ticket_waits(events: Sequence[Dict[str, Any]], now: float) -> Dict[str, float]:
+    """Return hours spent in each lifecycle state, including the current state."""
+    waits: Dict[str, float] = {}
+    current: str | None = None
+    entered: float | None = None
+    for event in sorted(events, key=lambda item: stamp(item.get("created_at"))):
+        kind = event.get("event")
+        label = (event.get("label") or {}).get("name")
+        state = label[5:] if isinstance(label, str) and label.startswith("loom:") else None
+        if state not in WAIT_STATES:
+            continue
+        at = stamp(event.get("created_at"))
+        if kind == "labeled":
+            if current is not None and entered is not None:
+                waits[current] = waits.get(current, 0.0) + max(0.0, at - entered) / 3600
+            current, entered = state, at
+        elif kind == "unlabeled" and state == current:
+            if entered is not None:
+                waits[current] = waits.get(current, 0.0) + max(0.0, at - entered) / 3600
+            current, entered = None, None
+    if current is not None and entered is not None:
+        waits[current] = waits.get(current, 0.0) + max(0.0, now - entered) / 3600
+    return waits
+
+
+def summarize_waits(tickets: Sequence[tuple[str, Dict[str, float]]]) -> tuple[List[Dict[str, Any]], str | None]:
+    """Summarize per-ticket hour maps and name the eligible median bottleneck."""
+    rows: List[Dict[str, Any]] = []
+    for state in WAIT_STATES:
+        samples = [(ticket, float(values[state])) for ticket, values in tickets if state in values]
+        if not samples:
+            rows.append({"state": state, "median_h": None, "worst_h": None,
+                         "worst_ticket": None, "n": 0})
+            continue
+        worst_ticket, worst_h = max(samples, key=lambda pair: pair[1])
+        rows.append({"state": state, "median_h": statistics.median(v for _, v in samples),
+                     "worst_h": worst_h, "worst_ticket": worst_ticket, "n": len(samples)})
+    candidates = [row for row in rows if row["n"] >= 3]
+    bottleneck = max(candidates, key=lambda row: row["median_h"])["state"] if candidates else None
+    return rows, bottleneck
+
+
+def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float) -> tuple[List[Dict[str, Any]], str | None]:
+    tickets: List[tuple[str, Dict[str, float]]] = []
+    since = datetime.fromtimestamp(now - WAIT_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for repo in repos:
+        issues = gh.paginate("/repos/%s/issues?state=all&labels=loom%%3Aticket&since=%s&per_page=100" % (repo, since))
+        for issue in issues:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            if stamp(issue.get("updated_at")) < now - WAIT_WINDOW:
+                continue
+            number = int(issue["number"])
+            events = gh.paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
+            tickets.append(("%s#%d" % (repo, number), ticket_waits(events, now)))
+    return summarize_waits(tickets)
+
+
+def waits_main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python3 -m bus.metrics")
+    sub = parser.add_subparsers(dest="command", required=True)
+    command = sub.add_parser("waits", help="show time spent in each ticket state")
+    command.add_argument("repos", nargs="+")
+    args = parser.parse_args(argv)
+    try:
+        home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+        gh = GitHub(token_from_env(), cache_dir=os.path.join(home, "state", "github-cache"))
+        rows, bottleneck = waits_for_repos(gh, args.repos, time.time())
+        print("state       median_h  worst_h  worst_ticket  n")
+        for row in rows:
+            print("%-11s %8s %7s  %-12s %d" % (
+                row["state"], "null" if row["median_h"] is None else "%.1f" % row["median_h"],
+                "null" if row["worst_h"] is None else "%.1f" % row["worst_h"],
+                row["worst_ticket"] or "null", row["n"]))
+        print("bottleneck: %s" % (bottleneck or "none"))
+        return 0
+    except (ValueError, OSError, GitHubError) as err:
+        print("error: %s" % err, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(waits_main())
 
 MARKER = "<!-- loom:metrics v1 -->"
 REPORT = "<!-- loom:report v1 -->"
