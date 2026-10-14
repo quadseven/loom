@@ -127,8 +127,9 @@ The station turns trusted
 ticket, with local paths removed from failure reasons; the runner adds
 `Refs <owner/name>#<number>` to the pull request. A limit or transient
 failure moves the ticket to another available lane as a new attempt, at most
-`LOOM_RETRY_MAX` times (default 2); a failed fix round goes back to
-`loom:pr`; a lane that hit its provider limit stays unavailable until the
+`LOOM_RETRY_MAX` times (default 2); a fix round that fails transiently goes
+back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
+factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
 `state/usage/` to clear it sooner). It reads `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the

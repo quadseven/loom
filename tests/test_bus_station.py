@@ -1666,6 +1666,17 @@ class RetryTest(Base):
                          "loom:pr and the pull request is unchanged.")
         self.assertEqual(self.listing("codex-2"), [])
 
+    def test_a_fix_brief_that_fails_its_work_goes_to_failed_so_the_factory_climbs(self):
+        self.heartbeat("codex-2")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[work] validation failed: the check exited 2", attempt=2, fix=fix)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.bodies()[-1], "Lane codex failed: [work] validation failed: the "
+                         "check exited 2. This was a fix round on pull request #99; the ticket "
+                         "is back at loom:failed and the pull request is unchanged.")
+        self.assertEqual(self.listing("codex-2"), [])
+
     def test_retry_chain_and_model_rules(self):
         self.assertEqual(station.failure_class("[limit] x"), "limit")
         self.assertEqual(station.failure_class("limit x"), "work")

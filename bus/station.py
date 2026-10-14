@@ -1675,11 +1675,17 @@ class Station:
             return True
         if fix_pr:
             # A fresh attempt would open a second pull request for the ticket.
-            self._relabel(repo, number, "loom:pr")
+            # A work failure goes to loom:failed, where the factory climbs the
+            # ladder and sends the fix to the next rung on the same pull request
+            # (factory.failed). Back at loom:pr the head is unchanged, so
+            # hand-back sent the same fix to the same lane every pass: 16
+            # rounds in 77 minutes on 2026-10-14. A transient failure retries.
+            state = "loom:failed" if klass == "work" else "loom:pr"
+            self._relabel(repo, number, state)
             self._comment(repo, number, "Lane %s failed: %s. This was a fix round on pull "
-                          "request #%s; the ticket is back at loom:pr and the pull request "
-                          "is unchanged." % (lane, reason, fix_pr))
-            _say("reported %s#%d fix failed, back to loom:pr: %s" % (repo, number, reason))
+                          "request #%s; the ticket is back at %s and the pull request "
+                          "is unchanged." % (lane, reason, fix_pr, state))
+            _say("reported %s#%d fix failed, back to %s: %s" % (repo, number, state, reason))
             return True
         note = ""
         if klass in RETRY_CLASSES:
