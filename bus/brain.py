@@ -77,27 +77,44 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     # GitHub GraphQL does not support a dynamic issue-number list as a top-level
     # node argument. Build aliases from the numbers while retaining one request.
     owner, name = repo.split("/", 1)
-    fields = []
-    for n in pr_ids:
-        fields.append("p%d: pullRequest(number:%d) { %s%s }" % (
-            n, n, READY_FIELDS, RULING_FIELDS if n in ruling else ""))
-    for n in goal_ids:
-        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n))
+    fields = _status_pr_fields(pr_ids, ruling) + _status_goal_fields(goal_ids)
     if goal_ids:
-        fields.append("defaultBranchRef { name }")
-        fields.append("merged: pullRequests(states:MERGED, first:10, "
-                      "orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { baseRefName } }")
+        fields += _status_trunk_fields()
     if not fields:
         return {"prs": {}, "goals": {}, "trunk": None, "merged": []}
     q = "query { repository(owner:%s, name:%s) { %s } }" % (
         _gql(owner), _gql(name), " ".join(fields))
     result = gh.graphql(q) or {}
     repo_data = result.get("repository") or {}
-    merged = [str(n.get("baseRefName") or "") for n in
-              ((repo_data.get("merged") or {}).get("nodes") or [])]
     return {"prs": {n: repo_data.get("p%d" % n) for n in pr_ids},
             "goals": {n: repo_data.get("g%d" % n) for n in goal_ids},
-            "trunk": (repo_data.get("defaultBranchRef") or {}).get("name"),
+            **_status_trunk_data(repo_data)}
+
+
+def _status_pr_fields(pr_ids: Sequence[int], ruling: Sequence[int]) -> List[str]:
+    """GraphQL aliases for the merge-ready fields of each open loom PR."""
+    return ["p%d: pullRequest(number:%d) { %s%s }" % (
+        n, n, READY_FIELDS, RULING_FIELDS if n in ruling else "") for n in pr_ids]
+
+
+def _status_goal_fields(goal_ids: Sequence[int]) -> List[str]:
+    """GraphQL aliases for the latest comments on each goal issue."""
+    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n)
+            for n in goal_ids]
+
+
+def _status_trunk_fields() -> List[str]:
+    """GraphQL fragments for the default branch and last 10 merged PR bases."""
+    return ["defaultBranchRef { name }",
+            "merged: pullRequests(states:MERGED, first:10, "
+            "orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { baseRefName } }"]
+
+
+def _status_trunk_data(repo_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The default branch name and base branches of the last 10 merged PRs."""
+    merged = [str(n.get("baseRefName") or "") for n in
+              ((repo_data.get("merged") or {}).get("nodes") or [])]
+    return {"trunk": (repo_data.get("defaultBranchRef") or {}).get("name"),
             "merged": merged}
 
 
@@ -390,14 +407,16 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
 
 
 def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optional[str]:
-    """Warn when most of the last 10 merged PRs target a branch that is neither
-    the default branch nor a goal home's declared Trunk."""
+    """Warn when more than half of the last 10 merged PRs target a branch that
+    is neither the default branch nor a goal home's declared Trunk."""
     trunks = {goal_trunk(g) for g in goals}
     trunks.discard(None)
     default = data.get("trunk")
     merged = data.get("merged") or []
     undeclared = [b for b in merged if b and b != default and b not in trunks]
-    if not merged or len(undeclared) <= len(merged) / 2:
+    # "Most" means strictly more than half; use integer arithmetic to avoid
+    # relying on the exact number of PRs GitHub returns.
+    if not merged or len(undeclared) * 2 <= len(merged):
         return None
     return Counter(undeclared).most_common(1)[0][0]
 
