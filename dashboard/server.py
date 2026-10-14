@@ -20,7 +20,7 @@ def _backlog_bytes():
         return None
     try:
         if urlsplit(source).scheme in ("http", "https"):
-            with urlopen(source, timeout=5) as response:
+            with urlopen(source, timeout=5) as response:  # noqa: S310 - scheme restricted above
                 return response.read()
         return Path(source).read_bytes()
     except (OSError, ValueError):
@@ -96,8 +96,8 @@ def _backlog_page(document, parsed, state):
         markings = epic.get("markings") or []
         if not isinstance(markings, list):
             markings = [markings]
-        marking_text = " · Markings: " + ", ".join(str(marking) for marking in markings) if markings else ""
-        out.append('<article class="card backlog-epic"><div class="label">%s</div><h2><a href="%s">%s</a></h2><p>%s · %s · %s</p><p>%s</p><p>Completeness: %d/%d · Next: %s (%d/%d criteria)</p><ul>' % (
+        marking_text = " | Markings: " + ", ".join(str(marking) for marking in markings) if markings else ""
+        out.append('<article class="card backlog-epic"><div class="label">%s</div><h2><a href="%s">%s</a></h2><p>%s | %s | %s</p><p>%s</p><p>Completeness: %d/%d | Next: %s (%d/%d criteria)</p><ul>' % (
             html.escape(str(epic.get("tier", "Cave"))), html.escape(_issue_url(epic), quote=True),
             html.escape(repo_num), html.escape(str(epic.get("title", ""))), html.escape(str(epic.get("tier", ""))),
             html.escape(str(epic.get("score", ""))), html.escape(str(epic.get("why", ""))),
@@ -107,7 +107,7 @@ def _backlog_page(document, parsed, state):
         for child in children:
             key = "%s#%s" % (child.get("repo", epic.get("repo", "")), child.get("number", ""))
             loom_state = states.get(key)
-            label = " · Loom: " + str(loom_state) if key in states and loom_state else ""
+            label = " | Loom: " + str(loom_state) if key in states and loom_state else ""
             out.append('<li><a href="%s">%s</a>%s</li>' % (html.escape(_issue_url({**epic, **child}), quote=True), html.escape(_repo_number({**epic, **child}) or str(child.get("title", ""))), html.escape(label)))
         out.append('</ul><p>Open children: %d</p></article>' % (len(children) - closed))
     for title, items in _health_inspectors(document):
@@ -136,7 +136,7 @@ def _needs_you(document, state, *, source_missing=False):
     for item in items:
         ask = item.get("ask") or item.get("body") or item.get("title", "")
         waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
-        out.append('<article class="card"><div class="label">%s · %s</div><h2><a href="%s">%s</a></h2><blockquote>%s</blockquote><p>%s · unblocks %s</p></article>' % (
+        out.append('<article class="card"><div class="label">%s | %s</div><h2><a href="%s">%s</a></h2><blockquote>%s</blockquote><p>%s | unblocks %s</p></article>' % (
             html.escape(str(item.get("queue", "needs_operator"))), waiting, html.escape(_issue_url(item), quote=True),
             html.escape(_repo_number(item)), html.escape(str(ask)), waiting, html.escape(str(item.get("unblocks", 0)))))
     counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
