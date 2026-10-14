@@ -41,6 +41,16 @@ def test_page_renders_all_views_as_links_with_one_active_view():
     assert 'data-more-open' in html
 
 
+def test_theme_toggle_names_the_theme_it_switches_to_and_the_current_one():
+    html = page("Floor", "floor", "<p>Content</p>", status="OK")
+    buttons = re.findall(r'<button class="theme-toggle"[^>]*aria-label="([^"]+)"[^>]*>([^<]+)</button>', html)
+    assert len(buttons) == 2  # Desktop sidebar and mobile top bar.
+    for label, text in buttons:
+        assert text in ("Light", "Dark")
+        assert label.startswith(text)  # The accessible name contains the visible word.
+        assert "theme is on" in label
+
+
 def _blocks(css):
     dark = re.search(r":root\s*\{(.*?)\n\}", css, re.S).group(1)
     light = re.search(r"@media \(prefers-color-scheme: light\)\s*\{\s*:root[^\{]*\{(.*?)\n  \}", css, re.S).group(1)
@@ -95,3 +105,11 @@ def test_shared_interactive_components_have_44px_minimum_targets():
         ]
         assert declarations, f"missing CSS rule for {selector}"
         assert any("min-height: 44px" in body for body in declarations), f"{selector} is too short"
+        # No later or more specific rule (a media query, a descendant selector) may shrink it again.
+        overrides = [
+            body for selectors, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css)
+            if any(part.strip().split()[-1:] == [selector] for part in selectors.split(","))
+        ]
+        for body in overrides:
+            for prop, size in re.findall(r"(?<![\w-])(min-height|height|min-width|width):\s*(\d+)px", body):
+                assert int(size) >= 44, f"{selector} has {prop}: {size}px"

@@ -130,7 +130,6 @@ button { color: inherit; font: inherit; }
   .desktop-nav { display: none; }
   .mobile-topbar { position: sticky; top: 0; z-index: 6; display: flex; height: 52px; align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--line); background: var(--bg); }
   .mobile-topbar .brand { min-height: 44px; padding: 0 4px; font-size: 18px; }
-  .mobile-topbar .theme-toggle { min-height: 40px; }
   .tick-status { gap: 5px; font-size: 10px; }
   .page-content { min-height: calc(100vh - 52px); margin: 0; padding: 20px 16px 112px; }
   .page-title { margin-bottom: 20px; }

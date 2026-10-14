@@ -57,12 +57,12 @@ def page(title: str, active: str, body: str, *, status: str) -> str:
     <a class="brand" href="/">loom.</a>
     <nav>{nav}</nav>
     <div class="tick-status"><span class="status-dot" aria-hidden="true"></span><span>Last tick</span><strong>{status_text}</strong></div>
-    <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme">Theme</button>
+    <button class="theme-toggle" type="button" data-theme-toggle aria-label="Light theme (dark theme is on)">Light</button>
   </aside>
   <header class="mobile-topbar">
     <a class="brand" href="/">loom.</a>
     <span class="tick-status"><span class="status-dot" aria-hidden="true"></span><span>Last tick</span><strong>{status_text}</strong></span>
-    <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme">Theme</button>
+    <button class="theme-toggle" type="button" data-theme-toggle aria-label="Light theme (dark theme is on)">Light</button>
   </header>
   <main class="page-content">
     <h1 class="page-title">{title_text}</h1>

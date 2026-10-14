@@ -20,19 +20,36 @@
     if (event.key === 'Escape' && sheet && !sheet.hidden) setSheet(false);
   });
 
+  const themeButtons = document.querySelectorAll('[data-theme-toggle]');
+
+  function currentTheme() {
+    return document.documentElement.dataset.theme
+      || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  }
+
+  // Each button names the theme it switches to; its aria-label also names the one showing.
+  function syncThemeButtons() {
+    const current = currentTheme();
+    const next = current === 'dark' ? 'light' : 'dark';
+    const word = next === 'dark' ? 'Dark' : 'Light';
+    themeButtons.forEach((button) => {
+      button.textContent = word;
+      button.setAttribute('aria-label', `${word} theme (${current} theme is on)`);
+    });
+  }
+
   function saveTheme(theme) {
     document.documentElement.dataset.theme = theme;
     document.cookie = `loom-theme=${theme}; Path=/; Max-Age=31536000; SameSite=Lax`;
+    syncThemeButtons();
   }
 
   const savedTheme = document.cookie.split('; ').find((part) => part.startsWith('loom-theme='));
   if (savedTheme) document.documentElement.dataset.theme = savedTheme.split('=')[1];
-  document.querySelectorAll('[data-theme-toggle]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const current = document.documentElement.dataset.theme
-        || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-      saveTheme(current === 'dark' ? 'light' : 'dark');
-    });
+  syncThemeButtons();
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', syncThemeButtons);
+  themeButtons.forEach((button) => {
+    button.addEventListener('click', () => saveTheme(currentTheme() === 'dark' ? 'light' : 'dark'));
   });
 
   function updateQuery(name, value) {
