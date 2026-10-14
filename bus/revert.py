@@ -356,7 +356,12 @@ class Reverts:
             self._decide(repo, "%s is red from %s, which no lane merged; nothing "
                                "reverted, left for a person or the brain" % (branch, short))
             return
-        failing = red_checks(self._check_runs(repo, sha), self.review_check)
+        failing = self._blaming(repo, sha, pr)
+        if not failing:
+            self._decide(repo, "%s is red from %s, but only from checks that never ran "
+                               "on #%d (scheduled or branch-only); nothing reverted"
+                         % (branch, short, int(pr["number"])))
+            return
         names = sorted({str(r.get("name")) for r in failing})
         open_ = [i for i in reverts if in_flight(i)]
         named = revert_shas(reverts).get(sha)
@@ -376,6 +381,18 @@ class Reverts:
                                "reverted, left for the brain" % (branch, short, int(pr["number"])))
         else:
             self._brief(repo, branch, sha, pr, names, red_since)
+
+    def _blaming(self, repo: str, sha: str, pr: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The failing checks on sha that also ran on the merged pull
+        request's head: only those can blame the merge. A scheduled check
+        attaches to whichever commit is the branch head when it runs, so one
+        failing for days lands on the newest merge (2026-10-14: a nightly
+        invariant check blamed a deploy and briefed its revert)."""
+        head = str((pr.get("head") or {}).get("sha") or "")
+        tested = {str(r.get("name")) for r in latest_runs(self._check_runs(repo, head),
+                                                          self.review_check)}
+        return [r for r in red_checks(self._check_runs(repo, sha), self.review_check)
+                if str(r.get("name")) in tested]
 
     def _pr_head_state(self, repo: str, pr: Dict[str, Any]) -> str:
         head = str((pr.get("head") or {}).get("sha") or "")
