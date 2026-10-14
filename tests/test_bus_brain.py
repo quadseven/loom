@@ -505,6 +505,15 @@ class BrainTests(unittest.TestCase):
             brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "opencode-go-3")
         self.assertEqual(len(fake.calls), 1)
 
+    def test_move_does_not_echo_an_invalid_model_from_the_issue(self):
+        issue = {"state": "open", "body": "Model: claude-sonnet-5-5\x1b[31m\n\nWork.",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:briefed"},
+                            {"name": "lane:claude"}]}
+        fake = Fake(reply(200, issue))
+        with self.assertRaisesRegex(ValueError, "^model is not a model id$"):
+            brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "opencode-go-3")
+        self.assertEqual(len(fake.calls), 1)
+
     def test_move_refusals(self):
         for labels in ([{"name": "loom:ticket"}, {"name": "loom:queued"}],):
             fake = Fake(reply(200, {"state": "open", "labels": labels}))
@@ -1427,6 +1436,16 @@ def item(number, body=BODY, labels=(), **extra):
     return out
 
 
+def rung_claim(login="example-brain"):
+    return {"body": "Claimed for lane claude (body sha256 0123456789ab)",
+            "created_at": "2030-01-01T00:00:00Z", "user": {"login": login}}
+
+
+def rungs(*ns, login="example-brain"):
+    """A rung marker then a claim on it, for each rung: the ticket ran there."""
+    return [c for n in ns for c in (rung_marker(n, login), rung_claim(login))]
+
+
 def rung_marker(n, login="example-brain"):
     return {"body": "<!-- loom:rung %d -->\nmoved" % n, "created_at": "2030-01-01T00:00:00Z",
             "user": {"login": login}}
@@ -1466,8 +1485,8 @@ class PastLastRungTests(unittest.TestCase):
         person = {"isResolved": False, "comments": {"nodes": [
             {"databaseId": 72, "author": {"__typename": "User", "login": "example-reviewer"}, "body": "why this?"}]}}
         done = {"isResolved": True, "comments": {"nodes": [{"author": self.BOT, "body": "low | old"}]}}
-        section, query = self.report([rung_marker(1), rung_marker(2), rung_marker(3)],
-                                     [rung_marker(1), rung_marker(2)], [answered, person, done])
+        section, query = self.report(rungs(1, 2, 3),
+                                     rungs(1, 2), [answered, person, done])
         lines = [l for l in section.splitlines() if l.strip()]
         self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable conflicting - 2 unresolved threads")
         self.assertEqual(lines[1], "  - high, comment 71: high | correctness | the cache is never cleared - "
@@ -1480,9 +1499,8 @@ class PastLastRungTests(unittest.TestCase):
         self.assertIn("p5: pullRequest(number:5) { %s }" % brain.READY_FIELDS, query)
 
     def test_restarted_or_untrusted_ladders_are_not_past_the_last_rung(self):
-        restarted = [rung_marker(1), rung_marker(2), rung_marker(3), rung_marker(0)]
-        stranger = [rung_marker(1, "example-stranger"), rung_marker(2, "example-stranger"),
-                    rung_marker(3, "example-stranger")]
+        restarted = rungs(1, 2, 3) + [rung_marker(0)]
+        stranger = rungs(1, 2, 3, login="example-stranger")
         for name, comments in (("restarted", restarted), ("stranger", stranger)):
             with self.subTest(name):
                 section, _ = self.report(comments)
@@ -1491,7 +1509,7 @@ class PastLastRungTests(unittest.TestCase):
     def test_an_unanswered_finding_says_so(self):
         thread = {"isResolved": False, "comments": {"nodes": [
             {"databaseId": 73, "author": self.BOT, "body": "**critical** | security | token logged"}]}}
-        section, _ = self.report([rung_marker(1), rung_marker(2), rung_marker(3)], threads=[thread])
+        section, _ = self.report(rungs(1, 2, 3), threads=[thread])
         self.assertIn("  - critical, comment 73: **critical** | security | token logged - no lane answer", section)
 
     def test_muse_names_the_section_status_prints(self):

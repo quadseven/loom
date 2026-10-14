@@ -1426,6 +1426,15 @@ class RetryTest(Base):
         self.assertIn("Lane: codex-2\n", text)
         self.assertNotIn("loom:failed", self.fake.names(12))
 
+    def test_runner_model_refusal_is_reported_as_transient(self):
+        self.heartbeat("anthropic")
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.failed(lane="opencode-go", body=body,
+                    reason="[transient] model claude-sonnet-5-5 is not an opencode-go model")
+        self.run_pass()
+        self.assertIn("lane:anthropic", self.fake.names(12))
+        self.assertIn("Automatic retry 1 of 2 (transient)", self.bodies()[-2])
+
     def test_a_retry_is_reported_once(self):
         self.heartbeat("codex-2")
         self.failed()
