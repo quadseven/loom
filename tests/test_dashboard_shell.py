@@ -61,7 +61,7 @@ def _resolve(value, variables):
 def _luminance(hex_color):
     channels = [int(hex_color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
     linear = [part / 12.92 if part <= .04045 else ((part + .055) / 1.055) ** 2.4 for part in channels]
-    return sum(weight * part for weight, part in zip((.2126, .7152, .0722), linear))
+    return sum(weight * part for weight, part in zip((.2126, .7152, .0722), linear, strict=True))
 
 
 def _contrast(foreground, background):
