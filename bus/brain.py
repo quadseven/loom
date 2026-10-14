@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
-from . import handoff, lock, proof, text, tickets
+from . import change_class, handoff, lock, proof, text, tickets
 from .labels import ESCALATION, LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -452,6 +452,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
+    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
+    lines += ["", "### Sensitive pull requests"]
+    lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
@@ -1117,8 +1120,9 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
-             ' commits(last:1) { nodes { commit { statusCheckRollup { state } } } } '
-             ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes { databaseId } } } }'
+             ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
+             ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
+             ' databaseId author { __typename login } body createdAt } } } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     return ((data.get("repository") or {}).get("pullRequest") or {})
@@ -1139,6 +1143,11 @@ def merge(gh: GitHub, repo: str, number: int,
         association: Optional[Tuple[str, int]] = None
     else:
         _validate_merge_pr(repo, pr, details)
+        if change_class.class_of(pr) == "sensitive":
+            from . import factory
+            bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
+                   or factory.DEFAULT_REVIEW_BOT)
+            _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
         association = _validate_ticket_association(gh, repo, number, pr, ticket, "pr")
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
@@ -1196,6 +1205,45 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -
             raise ValueError(reason)
 
 
+# A sensitive change (bus/change_class.py) is never merged by the factory; the
+# brain merges it only when the review check passed and no high or critical
+# finding is open on the head commit (docs/MUSE.md, Merge by change class).
+# The bot opens each finding with its severity line, "<symbol> high | ...".
+HIGH_RE = re.compile(r"^\W*(high|critical) \|")
+
+
+def _open_critical_finding(details: Dict[str, Any], bot: str) -> bool:
+    """A high or critical bot finding blocks this head when its thread is
+    unresolved or the finding was created after the latest head commit.
+    Resolving a newer finding alone does not show a fix-up commit. Missing
+    timestamps cannot prove that a fix-up commit followed the finding."""
+    committed = str(_head_commit(details).get("committedDate") or "")
+    threads = (details.get("reviewThreads") or {}).get("nodes") or []
+    for thread in threads:
+        comments = (thread.get("comments") or {}).get("nodes") or []
+        root = (comments[0] if comments else None) or {}
+        if not by_bot(root, bot) or not HIGH_RE.match(str(root.get("body") or "")):
+            continue
+        created = str(root.get("createdAt") or "")
+        if not thread.get("isResolved") or not committed or not created or created >= committed:
+            return True
+    return False
+
+
+def _validate_sensitive_merge(gh: GitHub, repo: str, details: Dict[str, Any],
+                              bot: str, check: str) -> None:
+    """What a sensitive-class pull request needs beyond the standard merge
+    checks: the review check passed on its head commit, and no high or
+    critical finding is open there."""
+    sha = str(details.get("headRefOid") or "")
+    if not sha or not _review_check_passed(gh, repo, sha, check):
+        raise ValueError("sensitive pull request: the review check %s has not passed "
+                         "on its head commit" % check)
+    if _open_critical_finding(details, bot):
+        raise ValueError("sensitive pull request: a high or critical finding is open "
+                         "on its head commit")
+
+
 def review_check_name(env: Optional[Dict[str, str]] = None) -> str:
     """The check run that must have run on a head before it lands: the
     operator's named review check, `LOOM_REVIEW_CHECK` (factory default)."""
@@ -1227,16 +1275,23 @@ def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str) -> bool:
     operator's rule is that every change is reviewed before it lands, and a
     green rollup alone does not prove the review check ever ran. Every page:
     a commit in a repo with a CI matrix has more runs than one page holds."""
-    for page in range(1, 11):
-        data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
-                       % (repo, sha, page)).data or {}
-        runs = data.get("check_runs") or []
-        for run in runs:
-            if run.get("name") == check:
-                return (run.get("status") == "completed"
-                        and run.get("conclusion") == "success")
-        if len(runs) < 100:
-            return False
+    try:
+        for page in range(1, 11):
+            data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
+                           % (repo, sha, page)).data or {}
+            if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
+                return False
+            runs = data["check_runs"]
+            for run in runs:
+                if not isinstance(run, dict):
+                    return False
+                if run.get("name") == check:
+                    return (run.get("status") == "completed"
+                            and run.get("conclusion") == "success")
+            if len(runs) < 100:
+                return False
+    except GitHubError:
+        return False
     return False
 
 

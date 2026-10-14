@@ -32,6 +32,14 @@ SUMMARY_FILE = ".loom/summary.md"
 DOC_EXTS = (".md", ".txt")
 
 
+def class_of(item: Dict[str, object]) -> str:
+    """The class label on a pull request, or empty when absent.
+    The highest-consequence label wins if more than one is present."""
+    names = {str(label.get("name") if isinstance(label, dict) else label)
+             for label in item.get("labels") or []}
+    return next((name for name in CLASSES if "class:" + name in names), "")
+
+
 def parse_patterns(text: str) -> List[str]:
     """Globs from a sensitive-paths file body; # comments and blanks ignored."""
     out: List[str] = []

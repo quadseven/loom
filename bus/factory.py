@@ -36,7 +36,13 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   bot's medium or low findings, each asked for in a fix round or after
   DEFER_AFTER rounds, files them in one loom:triage follow-up issue, answers
   and resolves each thread, and lands. High and critical findings, and
-  threads a person opened, still go back to the lane.
+  threads a person opened, still go back to the lane. A docs or tests change
+  defers such findings at once, with no fix round (its findings are style,
+  not behavior).
+- The merge rule follows the pull request's class:<name> label
+  (bus/change_class.py; docs/MUSE.md, Merge by change class). docs and tests
+  defer a minor finding at once; logic is the rule above; a sensitive change
+  is never merged here: it is marked needs-brain and left for the brain.
 - A pull request whose only fault is a failed Actions job gets that job run
   once more before it is sent back, since one flaky run should not cost a
   lane round.
@@ -88,7 +94,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, tickets
+from . import brain, change_class, tickets
 from .github import GitHub, GitHubError
 from .tickets import FIX_MARKER
 
@@ -157,6 +163,15 @@ REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadR
 # The bot opens each finding with its severity line, "<symbol> medium | ...".
 MINOR_RE = re.compile(r"^\W*(medium|low) \|")
 DEFER_AFTER = 2
+# The change class a lane pull request carries (bus/change_class.py): the
+# merge rule follows it (docs/MUSE.md, Merge by change class). Highest wins,
+# so sensitive is checked first; a pull request with no class keeps today's
+# rule.
+CLASSES = change_class.CLASSES
+# A class whose medium and low findings are deferred at once, without waiting
+# for a fix round: a docs or tests change lands on green checks and a review
+# pass alone, since its findings are style, not behavior.
+FAST_CLASSES = ("docs", "tests")
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Deferred review findings from %s#%d"
 # A file a pull request changes is code by its extension, and a test by a
@@ -231,6 +246,11 @@ def _state(issue: Dict[str, Any]) -> str:
     return next((x[5:] for x in _labels(issue) if x in states), "")
 
 
+def class_of(item: Dict[str, Any]) -> str:
+    """The change class a lane pull request carries, or empty when absent."""
+    return change_class.class_of(item)
+
+
 def _lane(issue: Dict[str, Any]) -> str:
     return next((x[5:] for x in _labels(issue) if x.startswith("lane:")), "")
 
@@ -297,16 +317,18 @@ def asked_threads(comments: Sequence[Dict[str, Any]]) -> set:
 
 
 def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
-               rounds: int) -> List[Dict[str, Any]]:
+               rounds: int, immediate: bool = False) -> List[Dict[str, Any]]:
     """The open threads to defer to a follow-up issue, or [] unless every open
     thread is a medium or low finding the review bot opened that a fix round
-    asked for, or the pull request has had DEFER_AFTER fix rounds."""
+    asked for, or the pull request has had DEFER_AFTER fix rounds. With
+    `immediate` (a docs or tests change) any such finding defers at once,
+    with no fix round."""
     still = [t for t in threads if not t.get("isResolved")]
 
     def minor(t: Dict[str, Any]) -> bool:
         root = _end(t, "root", 0)
         return (brain.by_bot(root, bot) and bool(MINOR_RE.match(str(root.get("body") or "")))
-                and (str(t.get("id")) in asked or rounds >= DEFER_AFTER))
+                and (immediate or str(t.get("id")) in asked or rounds >= DEFER_AFTER))
     return still if still and all(minor(t) for t in still) else []
 
 
@@ -637,6 +659,17 @@ class Factory:
             _say("resolved %d thread(s) on %s#%d that the review bot marked fixed"
                  % (len(picked), repo, number))
 
+    def _mark_sensitive(self, repo: str, number: int, full: Dict[str, Any]) -> None:
+        """A sensitive-class pull request is never merged by the factory: mark
+        it needs-brain so the brain reviews and merges it (docs/MUSE.md,
+        Merge by change class). The mark is added once."""
+        if "needs-brain" in _labels(full):
+            return
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d is a sensitive change; marked needs-brain for the brain" % (repo, number))
+
     def _follow_up(self, repo: str, number: int, ticket: int, sha: str,
                    picked: Sequence[Dict[str, Any]], rounds: int) -> int:
         """The open follow-up issue for this pull request's deferred findings,
@@ -656,18 +689,17 @@ class Factory:
         return int(made.get("number") or 0)
 
     def _defer_minor(self, repo: str, number: int, ticket: int, sha: str,
-                     comments: Sequence[Dict[str, Any]], at_once: bool = False) -> bool:
+                     comments: Sequence[Dict[str, Any]], immediate: bool = False) -> bool:
         """Defer the open medium and low findings of a reviewed, green pull
-        request to a follow-up issue, then resolve them; `at_once` (a revert)
-        does not wait for a fix round first. True when it did."""
+        request to a follow-up issue, then resolve them. True when it did.
+        With `immediate` (docs, tests, or a revert) they defer at once."""
         owner, name = repo.split("/", 1)
         data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
                                                "number": number}) or {}
         threads = ((((data.get("repository") or {}).get("pullRequest") or {})
                     .get("reviewThreads") or {}).get("nodes") or [])
         rounds = fixes_of(comments)
-        picked = deferrable(threads, self.review_bot, asked_threads(comments),
-                            max(rounds, DEFER_AFTER) if at_once else rounds)
+        picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
             return False
         follow = self._follow_up(repo, number, ticket, sha, picked, rounds)
@@ -770,6 +802,11 @@ class Factory:
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
+        if class_of(full) == "sensitive":
+            # A change to the code that merges, closes or deploys never lands
+            # on the factory's say-so alone: mark it for the brain and stop.
+            self._mark_sensitive(repo, number, full)
+            return
         review = self._review_state(repo, number, sha, _ts(full.get("updated_at")))
         if review == "wait":
             return
@@ -787,9 +824,10 @@ class Factory:
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
+        immediate = class_of(full) in FAST_CLASSES
         if (faults == ["open review threads"] and review == "reviewed"
                 and self._defer_minor(repo, number, int(issue["number"]), sha, comments,
-                                      at_once=REVERT_LABEL in _labels(issue))):
+                                      immediate or REVERT_LABEL in _labels(issue))):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and (
