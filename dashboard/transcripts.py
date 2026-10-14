@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 _ISSUE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$")
 _BRAIN = re.compile(r"^brain/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 _FIELDS = ("ticket", "slot", "model", "outcome", "started_at", "finished_at")
-EVENT_TEXT_MAX = 20000
+EVENT_TEXT_MAX = 5000
 
 
 def _zoned_time(value: str) -> bool:
@@ -73,10 +73,10 @@ _UPSERT = ("INSERT INTO transcripts (ticket, slot, model, outcome, started_at, f
            "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s) "
            "ON CONFLICT (ticket, slot, started_at) DO UPDATE SET model=EXCLUDED.model, "
            "outcome=EXCLUDED.outcome, finished_at=EXCLUDED.finished_at, events=EXCLUDED.events, "
-           "bytes=EXCLUDED.bytes, uploaded_at=now()")
-_LIST_ALL = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts ORDER BY started_at DESC LIMIT 100"
-_LIST_TICKET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE ticket=%s ORDER BY started_at DESC LIMIT 100"
-_ATTEMPTS = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE ticket=%s ORDER BY started_at ASC"
+           "bytes=EXCLUDED.bytes, uploaded_at=now() RETURNING id")
+_LIST_ALL = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts ORDER BY started_at DESC LIMIT 100"
+_LIST_TICKET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts WHERE ticket=%s ORDER BY started_at DESC LIMIT 100"
+_ATTEMPTS = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts WHERE ticket=%s ORDER BY started_at ASC"
 _GET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE id=%s"
 
 
@@ -94,7 +94,7 @@ class MemoryBackend:
             self.rows.append(row)
         row.update(body)
         row["bytes"] = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
-        return dict(row)
+        return {key: value for key, value in row.items() if key != "events"}
 
     def read(self, query: str, ticket: Optional[str] = None):
         rows = list(self.rows)
@@ -103,10 +103,13 @@ class MemoryBackend:
         rows.sort(key=lambda r: (r["started_at"], r["id"]), reverse=query != "attempts")
         if query == "list":
             rows = rows[:100]
-        return [dict(r) for r in rows]
+        return [{key: value for key, value in r.items() if key != "events"} for r in rows]
 
     def get(self, id_: int):
         return next((dict(r) for r in self.rows if r["id"] == id_), None)
+
+    def initialize(self):
+        return None
 
 
 class PostgresBackend:
@@ -123,15 +126,23 @@ class PostgresBackend:
         return self.dbapi.connect(host=config["LOOM_DB_HOST"], database=config["LOOM_DB_NAME"],
                                   user=config["LOOM_DB_USER"], password=config["LOOM_DB_PASSWORD"])
 
+    def initialize(self):
+        conn = self._connect()
+        try:
+            conn.cursor().execute(_CREATE)
+            conn.commit()
+        finally:
+            conn.close()
+
     def put(self, body):
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(_CREATE)
             cur.execute(_UPSERT, (body["ticket"], body["slot"], body["model"], body["outcome"],
                                   body["started_at"], body["finished_at"], json.dumps(body["events"]),
                                   len(json.dumps(body, ensure_ascii=False).encode("utf-8"))))
             conn.commit()
+            body["id"] = cur.fetchone()[0]
             return body
         finally:
             conn.close()
@@ -140,7 +151,6 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(_CREATE)
             cur.execute(_LIST_TICKET if query == "list" and ticket is not None else
                         _LIST_ALL if query == "list" else _ATTEMPTS,
                         (ticket,) if query == "attempts" or ticket is not None else ())
@@ -157,7 +167,6 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(_CREATE)
             cur.execute(_GET, (id_,))
             row = cur.fetchone()
             if row is None:
@@ -171,10 +180,17 @@ class PostgresBackend:
 
 
 def _backend():
+    if os.environ.get("LOOM_TRANSCRIPTS_MEMORY") == "1":
+        return MemoryBackend()
     if os.environ.get("LOOM_DB_PASSWORD") and importlib.util.find_spec("pg8000") is not None:
         import pg8000.dbapi
         return PostgresBackend(pg8000.dbapi)
-    return MemoryBackend()
+    missing = [key for key in ("LOOM_DB_HOST", "LOOM_DB_NAME", "LOOM_DB_USER", "LOOM_DB_PASSWORD")
+               if not os.environ.get(key)]
+    if missing:
+        raise RuntimeError("Transcript database is not configured; missing " + ", ".join(missing) +
+                           ". Set LOOM_TRANSCRIPTS_MEMORY=1 to explicitly use memory storage.")
+    raise RuntimeError("Transcript database requires the pg8000 package")
 
 
 class Store:
@@ -183,6 +199,9 @@ class Store:
 
     def upload(self, raw):
         return self.backend.put(validate(raw))
+
+    def initialize(self):
+        self.backend.initialize()
 
     def list(self, ticket=None):
         return self.backend.read("list", ticket)

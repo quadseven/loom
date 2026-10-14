@@ -44,9 +44,11 @@ class StoreTests(unittest.TestCase):
         store.upload(self.body("2026-10-13T11:00:00Z"))
         attempts = store.attempts("example/project#12")
         self.assertEqual(len(store.list()), 2)
+        self.assertTrue(all("events" not in row for row in attempts))
         self.assertEqual([row["attempt"] for row in attempts], [1, 2])
         self.assertEqual(attempts[0]["outcome"], "failed")
         self.assertEqual(store.get(attempts[0]["id"])["events"][0]["text"], "finished")
+        self.assertEqual(store.upload(self.body("2026-10-13T10:00:00Z"))["id"], attempts[0]["id"])
 
     def test_long_event_text_is_cut_and_marked(self):
         body = self.body()
@@ -64,7 +66,15 @@ class StoreTests(unittest.TestCase):
         with patch.dict(os.environ, {"LOOM_DB_PASSWORD": "present"}, clear=True), \
                 patch.object(transcripts.importlib.util, "find_spec", return_value=None), \
                 patch.dict(sys.modules, {"pg8000": None, "pg8000.dbapi": None}):
-            self.assertIsInstance(transcripts._backend(), transcripts.MemoryBackend)
+            with patch.dict(os.environ, {"LOOM_TRANSCRIPTS_MEMORY": "1"}):
+                self.assertIsInstance(transcripts._backend(), transcripts.MemoryBackend)
+
+    def test_unconfigured_store_fails_and_explicit_memory_store_works(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "LOOM_DB_PASSWORD"):
+                transcripts.Store()
+            with patch.dict(os.environ, {"LOOM_TRANSCRIPTS_MEMORY": "1"}):
+                self.assertIsInstance(transcripts.Store().backend, transcripts.MemoryBackend)
 
 
 if __name__ == "__main__":
