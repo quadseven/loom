@@ -667,7 +667,8 @@ Adding one takes:
   `sandbox-exec` and a key read from `LOOM_<LANE>_KEY_SSM`; a lane whose CLI
   or key is missing reports itself unavailable and takes no work.
 - A branch in `run_agent` that runs the lane's CLI with the brief and the
-  model. An API lane calls `api_agent <key var or -> <CLI...>`, which runs it
+  model. An API lane calls `api_agent <key var or -> <CLI...>`
+  (`lanes/agent_sandbox.sh`, shared with the triage rewriter), which runs it
   under the sandbox in a fresh scratch home with only its own key exported,
   and must be listed in `is_api_lane` (its transcripts are then archived).
 - A case in the `LANE:MODEL` model check, so a brief naming a model outside
