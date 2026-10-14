@@ -147,6 +147,24 @@ fi
 [ -z "${FAKE_AGENT_WEAKEN:-}" ] || { mkdir -p .loom; echo 'check: true' > .loom/validation.conf; }
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = probes ]; then
+  printf '# test\\n' > .test_write
+  mkdir -p bin
+  printf 'test bin in workspace\\n' > bin/test
+  printf 'fixed\\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = binref ]; then
+  mkdir -p bin
+  printf '#!/bin/sh\\n' > bin/tool
+  printf '#!/bin/sh\\n./bin/tool\\n' > run.sh
+  printf 'fixed\\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
 printf '%s\\n' "${FAKE_AGENT_TEXT:-fixed}" > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 git add fix.txt
@@ -442,6 +460,44 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
         self.assertFalse((self.inbox / "T042-fix-the-thing.md").exists())
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def pushed_files(self, branch="loom/T042-fix-the-thing"):
+        clone = Path(self._tmp.name) / "pushed-clone"
+        git("clone", "-q", str(self.remote), str(clone))
+        out = subprocess.run(["git", "diff", "--name-only", "main",
+                              "origin/%s" % branch],
+                             cwd=clone, capture_output=True, text=True,
+                             check=True)
+        return sorted(out.stdout.splitlines())
+
+    def run_log(self, name="T042-fix-the-thing.log"):
+        return (self.loom / "logs" / "codex" / name).read_text()
+
+    def test_probe_files_are_dropped_before_the_pr_opens(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="probes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The pushed branch carries only the real change.
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        # The run log names each file the runner dropped.
+        log = self.run_log()
+        self.assertIn("dropped sandbox probe file: .test_write", log)
+        self.assertIn("dropped sandbox probe file: bin/test", log)
+        # The PR Intent section names each file the runner dropped.
+        body = self.body.read_text()
+        self.assertIn("Dropped sandbox probe files: .test_write, bin/test",
+                      body)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_bin_file_the_diff_references_is_kept(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="binref")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["bin/tool", "fix.txt", "run.sh"])
+        self.assertNotIn("dropped sandbox probe file", self.run_log())
+        self.assertNotIn("Dropped sandbox probe files", self.body.read_text())
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_agent_commit_is_pushed_and_opened_as_a_chief_ready_pr(self):
