@@ -8,9 +8,114 @@ from urllib.parse import quote
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
-FOOTER = re.compile(r"Loom ticket ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#?(\d+), lane ([A-Za-z0-9_.-]+), model (.+?)\.(?:\s|$)")
-NUMBER = re.compile(r"^\d+\. (PASS|FAIL) (.+?): (.*?) \(target (.*?)\)$", re.M)
-REF = re.compile(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+def map_repo(repo: str) -> str:
+    """Map dot-separated repo names like owner.name back to owner/name."""
+    if "/" not in repo and "." in repo:
+        owner, _, name = repo.partition(".")
+        return f"{owner}/{name}"
+    return repo
+
+
+class _FooterMatch:
+    def __init__(self, raw_repo, number, lane, model, real_match):
+        self._repo = map_repo(raw_repo)
+        self._number = str(number)
+        self._lane = str(lane)
+        self._model = str(model)
+        self._real_match = real_match
+
+    def groups(self, default=None):
+        return (self._repo, self._number, self._lane, self._model)
+
+    def group(self, *args):
+        if not args or args == (0,):
+            return self._real_match.group(0)
+        if len(args) == 1:
+            idx = args[0]
+            if idx == 1:
+                return self._repo
+            if idx == 2:
+                return self._number
+            if idx == 3:
+                return self._lane
+            if idx == 4:
+                return self._model
+            return self._real_match.group(idx)
+        return tuple(self.group(idx) for idx in args)
+
+    def __getitem__(self, item):
+        return self.group(item)
+
+    def __bool__(self):
+        return True
+
+    def span(self, *args):
+        return self._real_match.span(*args)
+
+    def start(self, *args):
+        return self._real_match.start(*args)
+
+    def end(self, *args):
+        return self._real_match.end(*args)
+
+
+class _FooterPattern:
+    _RE = re.compile(
+        r"Loom ticket\s+([A-Za-z0-9_.-]+?)(?:#|-)(\d+)(?:-r\d+)?,?\s+lane\s+([A-Za-z0-9_.-]+),\s+model\s+(.+?)\.(?:\s|$)"
+    )
+
+    def search(self, string, *args, **kwargs):
+        m = self._RE.search(str(string or ""), *args, **kwargs)
+        if m is None:
+            return None
+        return _FooterMatch(m.group(1), m.group(2), m.group(3), m.group(4), m)
+
+    def match(self, string, *args, **kwargs):
+        m = self._RE.match(str(string or ""), *args, **kwargs)
+        if m is None:
+            return None
+        return _FooterMatch(m.group(1), m.group(2), m.group(3), m.group(4), m)
+
+    def finditer(self, string, *args, **kwargs):
+        for m in self._RE.finditer(str(string or ""), *args, **kwargs):
+            yield _FooterMatch(m.group(1), m.group(2), m.group(3), m.group(4), m)
+
+    def findall(self, string, *args, **kwargs):
+        return [m.groups() for m in self.finditer(string, *args, **kwargs)]
+
+    @property
+    def pattern(self):
+        return self._RE.pattern
+
+
+FOOTER = _FooterPattern()
+NUMBER = re.compile(r"^\d+\. (PASS|FAIL) (.+?): (.*?)(?: \(target (.*?)\))?$", re.M)
+REF = re.compile(r"(?:https?://[A-Za-z0-9_.-]+/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+REMOTE_HEARTBEAT_MARKER = "<!-- loom:remote-heartbeat v1"
+REMOTE_HEARTBEAT_RE = re.compile(r"<!-- loom:remote-heartbeat v1\s+([A-Za-z0-9_.-]+)(?:\s+([0-9.]+))?\s*-->")
+
+
+def parse_footer(body):
+    match = FOOTER.search(str(body or ""))
+    if not match:
+        return None
+    return match.groups()
+
+
+def parse_remote_heartbeats(comments):
+    beats = {}
+    for comment in comments or []:
+        body = str(comment.get("body") or "") if isinstance(comment, dict) else str(comment or "")
+        match = REMOTE_HEARTBEAT_RE.search(body)
+        if match:
+            lane = match.group(1).strip()
+            ts = match.group(2) if match.group(2) else ""
+            beats[lane] = {
+                "lane": lane,
+                "available": True,
+                "heartbeat": ts or "heartbeat available",
+            }
+    return beats
 
 
 def _ticket_href(repo: str, number: int) -> str:
@@ -40,15 +145,27 @@ def build_improvements(journals, tickets, metrics_comments):
             "metrics_available": bool(metrics)}
 
 
+def _is_none(text: str) -> bool:
+    clean = text.strip().strip(".").strip().lower()
+    return not clean or clean == "none"
+
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
 def _journal_records(journal, tickets, latest, previous):
     records = []
     body = str(journal.get("body") or "")
     if not body.startswith(JOURNAL_MARKER):
         return records
     for line in body.splitlines():
-        if not re.match(r"- (?:Waiting|Asks|Measure):", line, re.I):
+        match = re.match(r"^[ \t]*-?[ \t]*(?:Friction|Blockers?|Blocked)[ \t]*:[ \t]*(.+)$", line, re.I)
+        if not match:
             continue
-        friction = line.split(":", 1)[1].strip()
+        friction = match.group(1).strip()
+        if _is_none(friction):
+            continue
         ticket = _ticket_for_friction(journal, friction, body, tickets)
         state = (ticket or {}).get("state") or "not ticketed"
         moved = _moved_metric(ticket, state, latest, previous)
@@ -59,15 +176,57 @@ def _journal_records(journal, tickets, latest, previous):
 
 
 def _ticket_for_friction(journal, friction, body, tickets):
-    refs = REF.findall(friction) or REF.findall(body)
+    # 1. Direct ticket ref in friction line
+    refs = REF.findall(friction)
     for repo, number in refs:
         ticket = next((row for row in tickets if row.get("repo") == repo
                        and str(row.get("number")) == number), None)
         if ticket:
             return ticket
+
+    # 2. Match ticket that has a Refs to this journal comment
+    journal_url = journal.get("html_url") or ""
+    journal_id = str(journal.get("id") or "")
+    for row in tickets:
+        ticket_body = str(row.get("body") or "")
+        if journal_url and journal_url in ticket_body:
+            return row
+        if journal_id and ("issuecomment-" + journal_id) in ticket_body:
+            return row
+        if journal_id and re.search(r"Refs\b[^\n]*\b" + re.escape(journal_id) + r"\b", ticket_body):
+            return row
+
+    # 3. Match ticket whose Why section (or body) quotes the friction text
+    friction_clean = _clean_text(friction)
+    if friction_clean and len(friction_clean) > 8:
+        for row in tickets:
+            ticket_body = str(row.get("body") or "")
+            why_match = re.search(r"##\s*Why\s*\n(.*?)(?=\n##|\Z)", ticket_body, re.S | re.I)
+            why_text = why_match.group(1) if why_match else ticket_body
+            why_clean = _clean_text(why_text)
+            if friction_clean in why_clean or why_clean in friction_clean:
+                return row
+            f_words = [w for w in friction_clean.split() if len(w) > 3]
+            if len(f_words) >= 4:
+                matches = sum(1 for w in f_words if w in why_clean)
+                if matches >= len(f_words) * 0.75:
+                    return row
+
+    # 4. Refs in journal body
+    refs = REF.findall(body)
+    for repo, number in refs:
+        ticket = next((row for row in tickets if row.get("repo") == repo
+                       and str(row.get("number")) == number), None)
+        if ticket:
+            return ticket
+
+    # 5. Ticket referencing the journal's repo and issue_number
     if journal.get("repo") and journal.get("issue_number"):
-        return next((row for row in tickets
-                     if (journal["repo"], str(journal["issue_number"])) in row.get("refs", [])), None)
+        ticket = next((row for row in tickets
+                       if (journal["repo"], str(journal["issue_number"])) in row.get("refs", [])), None)
+        if ticket:
+            return ticket
+
     return None
 
 
@@ -99,7 +258,7 @@ def build_scoreboard(pull_requests):
         if tier not in ("easy", "medium", "hard", "frontier"):
             tier = "unknown"
         counts = tiers.setdefault(tier, {}).setdefault(model.strip(),
-            {"merged": 0, "open": 0, "closed": 0, "lane": lane})
+            {"merged": 0, "open": 0, "closed": 0, "lane": lane.strip()})
         state = str(pr.get("state") or "open").lower()
         key = "merged" if state == "closed" and pr.get("merged_at") else state
         if key in ("merged", "open", "closed"):
@@ -129,13 +288,20 @@ def render_improving(data):
     if not data["metrics_available"]:
         parts.append('<p class="empty-state">Daily metrics are missing: no metrics comment was found.</p>')
     else:
+        parts.append('<div class="factory-grid">')
         for name, current in data["latest"].items():
             old = data["previous"].get(name)
-            direction = ("better" if current["passed"] and not old["passed"] else
-                         "worse" if old["passed"] and not current["passed"] else
-                         "better" if current["passed"] else "worse") if old is not None else "previous value missing"
-            parts.append('<article class="card metric"><strong>%s</strong><span>%s</span><span>was %s / %s</span></article>' % (
-                esc(name), esc(current["value"]), esc(old["value"] if old is not None else "missing"), esc(direction)))
+            if old is not None:
+                direction = ("better" if current["passed"] and not old["passed"] else
+                             "worse" if old["passed"] and not current["passed"] else
+                             "better" if current["passed"] else "worse")
+                direction_class = "good" if direction == "better" else "bad"
+            else:
+                direction = "previous value missing"
+                direction_class = ""
+            parts.append('<article class="card metric factory-card"><span class="metric-val">%s</span><strong class="metric-name">%s</strong><span class="metric-prev %s">was %s / %s</span></article>' % (
+                esc(current["value"]), esc(name), esc(direction_class), esc(old["value"] if old is not None else "missing"), esc(direction)))
+        parts.append('</div>')
     parts.append("</section>")
     return "".join(parts)
 

@@ -433,8 +433,19 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
 
 def _lane_view_data(payload, tickets):
     comments = payload.get("lanes", [])
-    latest = max(comments, key=lambda c: str(c.get("created_at") or ""), default=None)
+    status_comments = [c for c in comments if str(c.get("body") or "").startswith(views.LANES_MARKER)]
+    latest = max(status_comments, key=lambda c: str(c.get("created_at") or ""), default=None)
     lane_rows = views.parse_lane_rows(latest.get("body") if latest else "")
+    remote_lanes = views.parse_remote_heartbeats(comments)
+    seen_lanes = {row["lane"] for row in lane_rows}
+    for lane_name, r_lane in remote_lanes.items():
+        if lane_name not in seen_lanes:
+            lane_rows.append(r_lane)
+            seen_lanes.add(lane_name)
+        else:
+            for row in lane_rows:
+                if row["lane"] == lane_name and r_lane.get("available"):
+                    row["available"] = True
     lanes = []
     for item in lane_rows:
         active = next((ticket for ticket in tickets if ticket.get("lane") == item["lane"]
@@ -445,6 +456,10 @@ def _lane_view_data(payload, tickets):
         lanes.append(item)
     prs = payload.get("pull_requests", [])
     tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
+    for row in tickets:
+        r = row.get("repo")
+        if r and "/" in r:
+            tickets_by_ref[(r.replace("/", "."), str(row.get("number")))] = row
     prepared = []
     footer = views.FOOTER
     anthropic = total = 0
@@ -453,6 +468,7 @@ def _lane_view_data(payload, tickets):
         if not match:
             continue
         repo, number, lane, model = match.groups()
+        repo = views.map_repo(repo)
         ticket = tickets_by_ref.get((repo, number))
         prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
         total += 1

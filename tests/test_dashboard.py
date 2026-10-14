@@ -255,5 +255,165 @@ class BacklogHelperTest(unittest.TestCase):
         self.assertIn("loom:human counts by repo", body)
 
 
+class LanesAndImprovingTest(unittest.TestCase):
+    def test_pull_request_footer_and_models_scoreboard(self):
+        from dashboard import views
+        from dashboard.server import _lane_view_data
+
+        pr_body = (
+            "## Summary\n"
+            "This fixes the issue.\n\n"
+            "---\n"
+            "Loom ticket quadseven.loom-282-r2, lane codex, model gpt-6-luna.\n"
+        )
+        match = views.FOOTER.search(pr_body)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.groups(), ("quadseven/loom", "282", "codex", "gpt-6-luna"))
+        self.assertEqual(views.parse_footer(pr_body), ("quadseven/loom", "282", "codex", "gpt-6-luna"))
+
+        prs = [
+            {"body": pr_body, "state": "closed", "merged_at": "2026-10-14T12:00:00Z", "difficulty": "medium"},
+            {"body": pr_body, "state": "open", "difficulty": "medium"},
+        ]
+        board = views.build_scoreboard(prs)
+        self.assertIn("medium", board)
+        self.assertIn("gpt-6-luna", board["medium"])
+        self.assertEqual(board["medium"]["gpt-6-luna"]["lane"], "codex")
+        self.assertEqual(board["medium"]["gpt-6-luna"]["merged"], 1)
+        self.assertEqual(board["medium"]["gpt-6-luna"]["open"], 1)
+
+        ticket = {"repo": "quadseven/loom", "number": 282, "difficulty": "medium", "state": "closed"}
+        payload = {
+            "pull_requests": [{"body": pr_body, "state": "closed", "merged_at": "2026-10-14T12:00:00Z"}],
+            "lanes": [],
+            "improving": {},
+        }
+        lane_data = _lane_view_data(payload, [ticket])
+        self.assertIn("medium", lane_data["scoreboard"])
+        self.assertEqual(lane_data["scoreboard"]["medium"]["gpt-6-luna"]["merged"], 1)
+        html_out = views.render_lanes(lane_data)
+        self.assertIn("gpt-6-luna", html_out)
+        self.assertIn("codex", html_out)
+        self.assertNotIn("Scoreboard is missing", html_out)
+
+    def test_remote_heartbeat_after_lane_status_comment(self):
+        from dashboard import views
+        from dashboard.server import _lane_view_data
+
+        status_comment = {
+            "created_at": "2026-10-14T12:00:00Z",
+            "body": (
+                "<!-- loom:lanes v1 -->\n"
+                "| lane | available | heartbeat |\n"
+                "| codex | yes | 1792004788.123 |\n"
+                "| agy | yes | 1792004788.123 |\n"
+            ),
+        }
+        remote_heartbeat_comment = {
+            "created_at": "2026-10-14T12:05:00Z",
+            "body": "<!-- loom:remote-heartbeat v1 muse 1792004788.123 -->\n",
+        }
+        payload = {
+            "lanes": [status_comment, remote_heartbeat_comment],
+            "pull_requests": [],
+            "improving": {},
+        }
+        lane_data = _lane_view_data(payload, [])
+        lanes_by_name = {lane["lane"]: lane for lane in lane_data["lanes"]}
+        self.assertIn("codex", lanes_by_name)
+        self.assertIn("agy", lanes_by_name)
+        self.assertIn("muse", lanes_by_name)
+        self.assertTrue(lanes_by_name["muse"]["available"])
+
+        html_out = views.render_lanes(lane_data)
+        self.assertNotIn("Lane status is missing", html_out)
+        self.assertIn("<strong>codex</strong>", html_out)
+        self.assertIn("<strong>agy</strong>", html_out)
+        self.assertIn("<strong>muse</strong>", html_out)
+
+    def test_improving_filters_none_lines_and_renders_nine_factory_numbers(self):
+        from dashboard import views
+
+        journal_comment = {
+            "id": 999123,
+            "html_url": "/repos/example-owner/sample/issues/1#issuecomment-999123",
+            "body": (
+                "<!-- loom:journal v1 -->\n"
+                "Friction: none.\n"
+                "Blocker: none\n"
+                "Waiting: none.\n"
+                "Asks: none.\n"
+                "Friction: Flaky test suite in worker runner\n"
+                "Friction: None.\n"
+            ),
+        }
+        tickets = [
+            {
+                "repo": "example-owner/sample",
+                "number": 42,
+                "title": "Fix flaky tests",
+                "state": "open",
+                "body": (
+                    "## Why\n"
+                    "Flaky test suite in worker runner causes retries.\n"
+                ),
+            }
+        ]
+        current_metrics = {
+            "body": (
+                "<!-- loom:metrics v1 -->\n"
+                "2026-10-14:\n"
+                "1. PASS Metric One: 42\n"
+                "2. PASS Metric Two: 10 (target 12)\n"
+                "3. PASS Metric Three: 85%\n"
+                "4. FAIL Metric Four: 12\n"
+                "5. PASS Metric Five: 100\n"
+                "6. PASS Metric Six: 5\n"
+                "7. PASS Metric Seven: 18\n"
+                "8. PASS Metric Eight: 0\n"
+                "9. PASS Metric Nine: 99\n"
+            )
+        }
+        previous_metrics = {
+            "body": (
+                "<!-- loom:metrics v1 -->\n"
+                "2026-10-13:\n"
+                "1. PASS Metric One: 40\n"
+                "2. FAIL Metric Two: 8 (target 12)\n"
+                "3. PASS Metric Three: 80%\n"
+                "4. FAIL Metric Four: 15\n"
+                "5. PASS Metric Five: 95\n"
+                "6. PASS Metric Six: 4\n"
+                "7. PASS Metric Seven: 15\n"
+                "8. PASS Metric Eight: 0\n"
+                "9. PASS Metric Nine: 95\n"
+            )
+        }
+
+        data = views.build_improvements([journal_comment], tickets, [current_metrics, previous_metrics])
+
+        self.assertEqual(len(data["records"]), 1)
+        card = data["records"][0]
+        self.assertEqual(card["friction"], "Flaky test suite in worker runner")
+        self.assertIsNotNone(card["ticket"])
+        self.assertEqual(card["ticket"]["number"], 42)
+
+        html_out = views.render_improving(data)
+        self.assertIn('"Flaky test suite in worker runner"', html_out)
+        self.assertNotIn('"none"', html_out.lower())
+        self.assertIn("#42 Fix flaky tests", html_out)
+        self.assertNotIn("ticket not found", html_out)
+
+        self.assertIn('class="factory-grid"', html_out)
+        self.assertEqual(html_out.count("factory-card"), 9)
+        for num_name in ("Metric One", "Metric Two", "Metric Three", "Metric Four",
+                         "Metric Five", "Metric Six", "Metric Seven", "Metric Eight", "Metric Nine"):
+            self.assertIn(num_name, html_out)
+        self.assertIn("was 40", html_out)
+        self.assertIn("was 8", html_out)
+        self.assertIn("was 80%", html_out)
+        self.assertIn("better", html_out)
+
+
 if __name__ == "__main__":
     unittest.main()
