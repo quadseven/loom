@@ -308,7 +308,10 @@ class Reverts:
         branch = str((self.gh.rest("GET", "/repos/%s" % repo).data or {}).get("default_branch") or "")
         if not branch:
             return
-        states = self._states(repo, branch)
+        self._judge(repo, branch, self._states(repo, branch), merged, reverts)
+
+    def _judge(self, repo: str, branch: str, states: List[Tuple[str, str]],
+               merged: List[Dict[str, Any]], reverts: List[Dict[str, Any]]) -> None:
         verdict, sha = bisect(states)
         if verdict in ("green", "running"):
             self._said.pop(repo, None)
@@ -418,16 +421,20 @@ class Reverts:
         if self._factory is not None:
             self._factory.load[lane] = self._factory.load.get(lane, 0) + 1
         if number:
-            note = ("The default branch `%s` turned red at %s, the merge of this ticket's "
-                    "pull request #%d: %s. Revert ticket #%d reverts it. This ticket "
-                    "goes back to `loom:briefed` on its lane once the revert lands, to "
-                    "redo the change on the new default branch."
-                    % (branch, short, int(pr["number"]), _failing(names), revert))
-            brain._check_written_text(note)
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+            self._tell_ticket(repo, branch, sha, pr, names, number, revert)
         self._decide(repo, "%s is red from %s (#%d, %s); briefed revert #%d on lane %s"
                      % (branch, short, int(pr["number"]), ", ".join(names) or "checks",
                         revert, lane))
+
+    def _tell_ticket(self, repo: str, branch: str, sha: str, pr: Dict[str, Any],
+                     names: List[str], number: int, revert: int) -> None:
+        note = ("The default branch `%s` turned red at %s, the merge of this ticket's "
+                "pull request #%d: %s. Revert ticket #%d reverts it. This ticket "
+                "goes back to `loom:briefed` on its lane once the revert lands, to "
+                "redo the change on the new default branch."
+                % (branch, sha[:12], int(pr["number"]), _failing(names), revert))
+        brain._check_written_text(note)
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
 
     def _body(self, branch: str, sha: str, pr: Dict[str, Any], names: List[str],
               red_since: float, difficulty: str, number: int) -> str:
