@@ -53,6 +53,9 @@ MANGLED_HOME_RE = re.compile(r"(?<![A-Za-z0-9_.-])-(?:Users|home)-[A-Za-z0-9._-]
 # fallback. A brain tick is filed as brain/<UTC start>.
 ISSUE_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$")
 BRIEF_NAME_RE = re.compile(r"^([A-Za-z0-9-]+)\.([A-Za-z0-9_.-]+?)-([0-9]+)(?:-r[0-9]+)?$")
+# A brief with no Model: line ran on its lane's default; the dashboard needs
+# a non-empty model, and a guessed name would be fabricated.
+MODEL_MISSING = "not recorded"
 START_RE = re.compile(r"^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\] \S+ start, lane ", re.M)
 ROLES = {"user": "user", "assistant": "assistant", "thinking": "thinking"}
 
@@ -85,7 +88,9 @@ def _input_text(tool: str, inp: Any) -> str:
 
 
 def _event(ts: Optional[str], role: str, kind: str, text: str) -> Dict[str, Any]:
-    return {"ts": ts, "role": role, "kind": kind,
+    # A log line with no time of its own sends "": the dashboard takes only
+    # strings, and refused a whole run for one null ts (2026-10-14).
+    return {"ts": ts or "", "role": role, "kind": kind,
             "text": _cap(scrub(text), tail=kind == "log")}
 
 
@@ -167,7 +172,8 @@ def run_body(home: Path, slot: str, ticket: str, outcome: str, model: str,
     # A log with no start line (an older runner, or one cut short) still
     # gives the run a start: the dashboard refuses a body without one.
     started = started or finished
-    return limit({"ticket": ticket_ref(ticket, issue), "slot": slot, "model": model, "outcome": outcome,
+    return limit({"ticket": ticket_ref(ticket, issue), "slot": slot,
+                  "model": model or MODEL_MISSING, "outcome": outcome,
                   "started_at": started, "finished_at": finished, "events": convert(events)})
 
 
