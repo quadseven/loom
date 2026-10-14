@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
 import unittest
 import unittest.mock
+from contextlib import redirect_stderr
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -386,6 +388,19 @@ class BrainTests(unittest.TestCase):
         self.assertTrue(payload["body"].startswith("Difficulty: hard\nModel: model-x\nBase: main\n\n"))
         self.assertEqual(fake.calls[3][1].split("api.github.com")[1], "/repos/%s/issues/1/sub_issues" % REPO)
         self.assertEqual(fake.calls[3][2], {"sub_issue_id": 202})
+
+    def test_a_brief_the_goal_refuses_as_a_sub_issue_gets_a_part_of_line(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "number": 7, "html_url": "https://example.com/ticket"}),
+                    reply(422, {"message": "sub-issue limit reached"}), reply(200, {}))
+        gh = GitHub("t", transport=fake)
+        with redirect_stderr(io.StringIO()) as err:
+            url = brain.brief(gh, REPO, 1, "Ticket", BODY, "codex", "hard")
+        self.assertEqual(url, "https://example.com/ticket")
+        method, path, payload = fake.calls[4]
+        self.assertEqual((method, path.split("api.github.com")[1]), ("PATCH", "/repos/%s/issues/7" % REPO))
+        self.assertEqual(payload["body"], fake.calls[2][2]["body"].rstrip("\n") + "\n\nPart of #1\n")
+        self.assertIn("Part of line", err.getvalue())
 
     def test_brief_uses_goal_trunk_as_default_base_and_explicit_base_wins(self):
         trunk_goal = dict(goal(), body="Trunk: side\n\n## Destination\n")
@@ -1385,11 +1400,12 @@ class Routes:
     """Replies by method and path; records every call. The issue list is
     served in pages of `page` items with Link headers."""
 
-    def __init__(self, issues, goal_children=(), page=100, refuse_sub_issue=()):
+    def __init__(self, issues, goal_children=(), page=100, refuse_sub_issue=(), search=None):
         self.issues = list(issues)
         self.goal_children = list(goal_children)
         self.page = page
         self.refuse_sub_issue = set(refuse_sub_issue)
+        self.search = search
         self.calls = []
 
     def __call__(self, method, url, headers, body):
@@ -1408,6 +1424,10 @@ class Routes:
                 headers["Link"] = '<https://api.github.com%s&page=%d>; rel="next"' % (
                     path.split("&page=")[0], start + self.page)
             return 200, headers, json.dumps(chunk).encode()
+        if method == "GET" and path.startswith("/search/issues?") and self.search is not None:
+            return reply(200, {"items": self.search})
+        if method == "PATCH" and "/issues/" in path:
+            return reply(200, {})
         if method == "POST" and path.endswith("/sub_issues"):
             if payload["sub_issue_id"] in self.refuse_sub_issue:
                 return reply(422, {"message": "already has a parent"})
@@ -1500,11 +1520,36 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {6: ["loom:triage"]})
         self.assertTrue(lines[0].startswith("#5 held"))
 
-    def test_an_issue_github_refuses_as_a_sub_issue_is_left_alone(self):
+    def test_an_issue_github_refuses_as_a_sub_issue_is_queued_with_a_part_of_line(self):
+        # A goal at GitHub's 100 sub-issue limit refuses the link (422); the
+        # ready issue is still queued, linked by one line added to its body.
         routes = Routes([item(5)], refuse_sub_issue={1005})
         lines = self.run_triage(routes)
-        self.assertEqual(routes.labelled(), {})
-        self.assertIn("skipped", lines[0])
+        self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
+        self.assertIn("queued", lines[0])
+        patches = [c for c in routes.calls if c[0] == "PATCH"]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0][1], "/repos/%s/issues/5" % REPO)
+        body = patches[0][2]["body"]
+        self.assertTrue(body.startswith(item(5)["body"].rstrip("\n")))
+        self.assertTrue(body.endswith("\n\nPart of #1\n"))
+        self.assertEqual(set(patches[0][2]), {"body"})
+
+    def test_goal_children_past_the_sub_issue_limit_add_part_of_issues(self):
+        full = [item(n, state="closed") for n in range(100, 200)]
+        found = [item(7, body="## Why\nx\n\nPart of #1\n"),
+                 item(8, body="Part of #10\n"),            # another goal
+                 item(9, body="see Part of #1 inline"),    # not a line of its own
+                 dict(item(11, body="Part of #1\n"), pull_request={}),
+                 item(150, state="closed", body="Part of #1\n")]  # already a sub-issue
+        routes = Routes([], goal_children=full, search=found)
+        children = brain.goal_children(GitHub("t", transport=routes), REPO, 1)
+        self.assertEqual(len(children), 101)
+        self.assertEqual(children[-1]["number"], 7)
+        # Below the limit no search is made (Routes refuses unexpected calls).
+        few = Routes([], goal_children=full[:3])
+        self.assertEqual(len(brain.goal_children(GitHub("t", transport=few), REPO, 1)), 3)
+        self.assertFalse(any(c[1].startswith("/search/") for c in few.calls))
 
     def test_bad_limit_and_bad_goal_write_nothing(self):
         routes = Routes([item(5)])
