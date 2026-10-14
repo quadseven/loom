@@ -700,10 +700,17 @@ def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
     """A public repo's ticket names another repo's issue in words: its PR body
     repeats the ticket, and the leak scan fails an owner/name#N there that no
     fix round can change. The repo is read only when such a reference is
-    present."""
+    present. A failed read is not caught: its GitHubError ends the command
+    through main's handler before anything is filed. A read that does not say
+    whether the repo is private refuses too, so the check never passes on an
+    answer it could not read."""
     if all(m.group(1).lower() == repo.lower() for m in _REPO_REF.finditer(text)):
         return
-    if (gh.rest("GET", "/repos/%s" % repo).data or {}).get("private") is False:
+    private = (gh.rest("GET", "/repos/%s" % repo).data or {}).get("private")
+    if not isinstance(private, bool):
+        raise ValueError("could not tell whether %s is public, so another repo's issue "
+                         "cannot be named as owner/name#N; name it in words" % repo)
+    if not private:
         raise ValueError("this repo is public: name another repo's issue in words "
                          "(for example \"issue 12 of another repo\"), not as owner/name#N")
 

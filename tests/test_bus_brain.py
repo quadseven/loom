@@ -9,7 +9,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, journal, proof, text, tickets
-from bus.github import GitHub
+from bus.github import GitHub, GitHubError
 
 REPO = "example-owner/example-repo"
 BODY = "## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n- [ ] done\n## Size\nS\n## Out of scope\n- none"
@@ -298,6 +298,21 @@ class BrainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "in words"):
             brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
         self.assertEqual([c[0] for c in fake.calls], ["GET"])
+
+    def test_a_foreign_reference_files_nothing_when_the_repo_cannot_be_read(self):
+        text = BODY.replace("why", "as in other-owner/other-repo#12")
+        # A failed read ends the brief with the GitHubError main reports.
+        fake = Fake(reply(404, {"message": "Not Found"}))
+        with self.assertRaises(GitHubError):
+            brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+        self.assertEqual([c[0] for c in fake.calls], ["GET"])
+        # A read that does not say whether the repo is private refuses too.
+        for data in ({}, None, {"private": None}):
+            with self.subTest(data=data):
+                fake = Fake(reply(200, data))
+                with self.assertRaisesRegex(ValueError, "could not tell"):
+                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+                self.assertEqual([c[0] for c in fake.calls], ["GET"])
 
     def test_a_brief_may_name_its_own_repos_issue_or_any_issue_in_a_private_repo(self):
         made = (reply(200, goal()), reply(200, []),
