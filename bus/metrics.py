@@ -9,7 +9,7 @@ import sys
 import argparse
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
 
 from .github import GitHub, GitHubError, token_from_env
@@ -63,7 +63,7 @@ def summarize_waits(tickets: Sequence[tuple[str, Dict[str, float]]]) -> tuple[Li
 
 def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float) -> tuple[List[Dict[str, Any]], str | None]:
     tickets: List[tuple[str, Dict[str, float]]] = []
-    since = datetime.fromtimestamp(now - WAIT_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = datetime.fromtimestamp(now - WAIT_WINDOW, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     for repo in repos:
         issues = gh.paginate("/repos/%s/issues?state=all&labels=loom%%3Aticket&since=%s&per_page=100" % (repo, since))
         for issue in issues:
@@ -99,9 +99,6 @@ def waits_main(argv: Sequence[str] | None = None) -> int:
         print("error: %s" % err, file=sys.stderr)
         return 2
 
-
-if __name__ == "__main__":
-    raise SystemExit(waits_main())
 
 MARKER = "<!-- loom:metrics v1 -->"
 REPORT = "<!-- loom:report v1 -->"
@@ -506,3 +503,8 @@ def render(numbers: Sequence[Number], today: str, streak: int) -> str:
         MARKER, today, passed, streak, projected.isoformat(),
         "\n".join("%d. %s" % (index, number.line())
                   for index, number in enumerate(numbers, 1)))
+
+
+if __name__ == "__main__":
+    # At the end, so every helper above is defined when the CLI runs.
+    raise SystemExit(waits_main())

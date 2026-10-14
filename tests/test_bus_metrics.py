@@ -343,3 +343,43 @@ class MetricsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class WaitsCommandTest(unittest.TestCase):
+    def test_the_waits_command_runs_as_the_module_entry_point(self):
+        # `python3 -m bus.metrics waits` once crashed with NameError: the
+        # entry point ran before the helpers it calls were defined. runpy
+        # runs the module the way -m does, top to bottom.
+        import runpy
+        import sys
+        import time
+        now = time.time()
+        updated = datetime.fromtimestamp(now - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        seen = []
+
+        class FakeGitHub:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def paginate(self, path):
+                seen.append(path)
+                if "/events" in path:
+                    return [{"event": "labeled", "label": {"name": "loom:queued"},
+                             "created_at": updated}]
+                return [{"number": 7, "updated_at": updated}]
+
+        out = io.StringIO()
+        with mock.patch("bus.github.GitHub", FakeGitHub), \
+                mock.patch("bus.github.token_from_env", lambda: "t"), \
+                mock.patch.object(sys, "argv", ["bus.metrics", "waits", "o/r"]), \
+                mock.patch.dict(os.environ, {"LOOM_HOME": tempfile.mkdtemp()}), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as done:
+            runpy.run_module("bus.metrics", run_name="__main__", alter_sys=True)
+        self.assertEqual(done.exception.code, 0)
+        self.assertIn("queued", out.getvalue())
+        # The since= window is UTC, not local time labelled Z.
+        since = [p for p in seen if "since=" in p][0].split("since=")[1].split("&")[0]
+        want = datetime.fromtimestamp(now - 7 * 86400, timezone.utc)
+        got = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertLess(abs((got - want).total_seconds()), 120)
