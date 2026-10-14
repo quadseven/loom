@@ -1837,10 +1837,10 @@ class Station:
             [LANES_MARKER, "Updated " + self._utc(self.now), "",
              "| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
+            + ["", "Remote claims: muse %d/%d" % (
+                self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
             + (["", summary.line()] if summary is not None else []))
-        claims = self._remote_claim_count("muse")
-        return body + "\n\nRemote claims: muse %d/%d" % (
-            claims, REMOTE_LANES["muse"]["slots"])
+        return body
 
     def _remote_claim_count(self, lane: str) -> int:
         saved = _read_json(os.path.join(self.state, "remote-status.json"), {}, strict=False)
