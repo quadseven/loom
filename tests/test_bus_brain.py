@@ -32,6 +32,9 @@ class Fake:
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 
+    def assert_all_used(self):
+        assert not self.replies, "unused replies: %s" % self.replies
+
 
 def goal():
     return {"number": 1, "id": 101, "state": "open", "title": "Goal", "labels": [{"name": "loom:goal"}]}
@@ -418,6 +421,16 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
 
+    def test_a_remote_lane_is_refused_for_any_state_but_queued(self):
+        # A limit hand-off or a fix round (briefed) must never land on a
+        # remote lane, which claims only new queued tickets.
+        for state in ("briefed", "running", "pr"):
+            with self.subTest(state=state):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "only works with --to queued"):
+                    brain.move(GitHub("t", transport=fake), REPO, 8, state, "muse")
+                self.assertEqual(fake.calls, [])
+
     def test_move_keeps_labels_and_swaps_lane(self):
         fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}, {"name": "lane:agy"}, {"name": "custom"}]}), reply(200, []))
         gh = GitHub("t", transport=fake)
@@ -444,6 +457,63 @@ class BrainTests(unittest.TestCase):
         fake = Fake(reply(200, {"state": "open", "labels": []}))
         with self.assertRaises(ValueError):
             brain.move(GitHub("t", transport=fake), REPO, 8, "queued", "codex")
+
+    def test_move_remote_lane_with_private_repo_raises_error(self):
+        repo = "org/private-repo"
+        fake = Fake(
+            reply(200, {"state": "open", "labels": []}),
+            reply(200, {"private": True})
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, repo, 8, "queued", "muse")
+        self.assertIn("this repo is private", str(ctx.exception))
+        self.assertIn("public", str(ctx.exception))
+        fake.assert_all_used()
+        self.assertFalse(any(call[0] in ("PUT", "POST", "PATCH", "DELETE") for call in fake.calls))
+
+    def test_move_remote_lane_with_non_queued_state_raises_error(self):
+        fake = Fake()
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "briefed", "muse")
+        self.assertIn("remote lane muse only works with --to queued", str(ctx.exception))
+        fake.assert_all_used()
+
+    def test_move_local_lane_with_queued_state_raises_error(self):
+        fake = Fake()
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "queued", "codex")
+        self.assertIn("local lane codex: use --to briefed instead", str(ctx.exception))
+        fake.assert_all_used()
+
+    def test_move_remote_lane_on_public_repo_succeeds(self):
+        fake = Fake(
+            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"private": False}),
+            reply(200, []),
+            reply(200, {}),
+            reply(201, {})
+        )
+        gh = GitHub("t", transport=fake)
+        brain.move(gh, REPO, 8, "queued", "muse", note="moving to muse")
+        self.assertEqual(len(fake.calls), 5)
+        self.assertEqual(fake.calls[3][2], {"labels": ["loom:ticket", "loom:queued", "lane:muse"]})
+        self.assertEqual(fake.calls[4][2], {"body": "moving to muse"})
+        fake.assert_all_used()
+
+    def test_move_remote_lane_with_pull_request_refuses(self):
+        fake = Fake(
+            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"private": False}),
+            reply(200, [{"number": 12, "state": "open"}])
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "queued", "muse")
+        self.assertIn("already has a pull request", str(ctx.exception))
+        fake.assert_all_used()
 
     def _merge_replies(self, changes=None):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
@@ -819,7 +889,7 @@ class FixTests(unittest.TestCase):
         self.assertNotIn("unittest", body)
         self.assertEqual(put[0], "PUT")
         self.assertEqual(put[2], {"labels": ["loom:ticket", "lane:codex", "custom", "loom:briefed"]})
-        # What the station will read back from it.
+         # What the station will read back from it.
         fix = tickets.parse_fix(REPO, body)
         self.assertEqual((fix.pr, fix.branch), (8, "loom/9-work"))
         self.assertIn("\n    ## Why\n", fix.findings)
@@ -1061,7 +1131,7 @@ class ModelFlagTests(unittest.TestCase):
         self.assertEqual(order, ["PATCH", "PUT"])
 
     def test_fix_refuses_an_unknown_lane_or_bad_model(self):
-        for kw in (dict(lane="bogus"), dict(model="bad model")):
+        for kw in (dict(lane="bogus"), dict(lane="muse"), dict(model="bad model")):
             fake = Fake()
             with self.assertRaises(ValueError):
                 brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "n", **kw)

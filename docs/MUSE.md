@@ -299,8 +299,9 @@ Anthropic credits, easy work on the free lanes and Spark, the credit spent
 on hard work):
 
 - Easy: on a public repo muse first, then agy (the operator's priority;
-  muse runs remotely); then `spark` (the local coder, model `spark/...`, any
-  repo, private ones included) when lane status shows it available, else a
+  muse runs remotely); then `spark` and `spark-2` (the local coders, one per
+  Spark box, `LOOM_SPARK_URL` and `LOOM_SPARK_2_URL`, model `spark/...`, any
+  repo, private ones included) when lane status shows them available, else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
   opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
   which trains on prompts).

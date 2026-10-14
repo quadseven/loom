@@ -318,6 +318,23 @@ class DashboardViewTest(unittest.TestCase):
         self.assertIn("Clear filters", empty)
         self.assertIn("No tickets match", empty)
 
+    def test_ticket_goal_filter_lists_only_that_goal(self):
+        from dashboard.server import _tickets
+        from urllib.parse import urlsplit
+        state = self.State()
+        state.data = {"example-owner/sample": self.State.data["example-owner/sample"] + [
+            {"repo": "example-owner/sample", "number": 41, "title": "Elsewhere ticket",
+             "state": "pr", "goal": "example-owner/sample#40", "lane": "codex",
+             "model": "model-x", "attempts": 1}]}
+        body = _tickets(state, urlsplit("/tickets?goal=example-owner%2Fsample%2340"))
+        self.assertIn("Elsewhere ticket", body)
+        self.assertNotIn("Sample ticket", body)
+        self.assertNotIn("Other ticket", body)
+        body = _tickets(state, urlsplit("/tickets?goal=example-owner%2Fsample%2330"))
+        self.assertIn("Sample ticket", body)
+        self.assertIn("Other ticket", body)
+        self.assertNotIn("Elsewhere ticket", body)
+
     def test_missing_backlog_reason(self):
         from dashboard.server import _floor
         import os

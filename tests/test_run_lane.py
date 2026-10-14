@@ -1855,6 +1855,24 @@ cat > /dev/null
         self.assertTrue(self.spark_beat()["available"])
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_the_spark_2_slot_runs_against_its_own_box(self):
+        # The second Spark box (2026-10-14: one sat idle with the coder warm).
+        inbox = self.loom / "briefs" / "spark-2"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark-2"))
+        result = self.run_lane("spark-2", LOOM_SPARK_2_URL="http://other-spark.example.invalid:8000/v1",
+                               **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("curl ") and "http://other-spark.example.invalid:8000/v1/models" in c
+                            for c in calls), calls)
+        self.assertFalse(any("spark.example.invalid:8000" in c and "other-spark" not in c
+                             for c in calls if c.startswith("curl ")), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["options"],
+                         {"baseURL": "http://other-spark.example.invalid:8000/v1"})
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_spark_lane_uses_the_window_its_endpoint_serves(self):
         # The first sparkles run thrashed in a fixed 32K window against a
         # server serving 262144; the window is a lane setting now.

@@ -507,7 +507,8 @@ $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" <
 # parked with a "limit:" reason, which the station hands to the next lane.
 LIMIT_HOLD=900
 LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
-SPARK_URL="${LOOM_SPARK_URL:-}"
+# A spark slot (spark-2) may name its own box: LOOM_SPARK_2_URL, else LOOM_SPARK_URL.
+SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_WHY=""
