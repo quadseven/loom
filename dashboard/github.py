@@ -82,6 +82,8 @@ class TicketStore:
                           "stale": False, "ready": False,
                           "improving": {"journals": [], "metrics_comments": []},
                           "lanes": [], "pull_requests": [], "dashboard_errors": []}
+        self.operator_items = []
+        self.human_counts = {}
         self.auth = "token" if token else "none"
         self._snapshot_lock = threading.Lock()
         self._refresh_lock = threading.Lock()
@@ -144,6 +146,24 @@ class TicketStore:
         return [ticket_record(repo, item) for item in issues
                 if isinstance(item, dict) and "pull_request" not in item
                 and "loom:ticket" in _label_names(item)]
+
+    def _read_operator_items(self):
+        items, human_counts = [], {}
+        for repo in self.repos:
+            try:
+                asks = self.gh.paginate("/repos/%s/issues?labels=needs-operator&state=open" % quote(repo, safe="/"))
+                humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
+            except (GitHubError, OSError, ValueError):
+                continue
+            human_counts[repo] = len([row for row in humans if isinstance(row, dict) and "pull_request" not in row])
+            for issue in asks:
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                items.append({"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
+                              "html_url": issue.get("html_url"), "ask": issue.get("body") or issue.get("title", ""),
+                              "waiting_since": issue.get("updated_at", "9999"), "waiting_since_source": "updated",
+                              "unblocks": 0, "queue": "needs_operator"})
+        return items, human_counts
 
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
         """Read optional view sources; errors stay visible without failing tickets."""
@@ -238,7 +258,12 @@ class TicketStore:
             data = dict(current["tickets"])
             errors = dict(current["errors"])
             stale = self._read_repos(data, errors) if not self._below_floor() else True
+            if self._below_floor():
+                operator_items, human_counts = self.operator_items, self.human_counts
+            else:
+                operator_items, human_counts = self._read_operator_items()
             snapshot = {"tickets": data, "errors": errors, "stale": stale, "ready": True}
+            self.operator_items, self.human_counts = operator_items, human_counts
             self._read_dashboard(snapshot)
             with self._snapshot_lock:
                 self._snapshot = snapshot
