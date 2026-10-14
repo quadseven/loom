@@ -1412,29 +1412,40 @@ class Routes:
         payload = json.loads(body) if body else None
         path = url.split("api.github.com")[1]
         self.calls.append((method, path, payload))
-        if method == "GET" and path == "/repos/%s/issues/1" % REPO:
+        answer = self._read(path) if method == "GET" else self._write(method, path, payload)
+        if answer is None:
+            raise AssertionError("unexpected %s %s" % (method, path))
+        return answer
+
+    def _read(self, path):
+        if path == "/repos/%s/issues/1" % REPO:
             return reply(200, goal())
-        if method == "GET" and "/issues/1/sub_issues" in path:
+        if "/issues/1/sub_issues" in path:
             return reply(200, self.goal_children)
-        if method == "GET" and path.startswith("/repos/%s/issues?" % REPO):
-            start = int(path.split("&page=")[1]) if "&page=" in path else 0
-            chunk = self.issues[start:start + self.page]
-            headers = {}
-            if start + self.page < len(self.issues):
-                headers["Link"] = '<https://api.github.com%s&page=%d>; rel="next"' % (
-                    path.split("&page=")[0], start + self.page)
-            return 200, headers, json.dumps(chunk).encode()
-        if method == "GET" and path.startswith("/search/issues?") and self.search is not None:
+        if path.startswith("/repos/%s/issues?" % REPO):
+            return self._issue_page(path)
+        if path.startswith("/search/issues?") and self.search is not None:
             return reply(200, {"items": self.search})
+        return None
+
+    def _issue_page(self, path):
+        start = int(path.split("&page=")[1]) if "&page=" in path else 0
+        chunk = self.issues[start:start + self.page]
+        headers = {}
+        if start + self.page < len(self.issues):
+            headers["Link"] = '<https://api.github.com%s&page=%d>; rel="next"' % (
+                path.split("&page=")[0], start + self.page)
+        return 200, headers, json.dumps(chunk).encode()
+
+    def _write(self, method, path, payload):
         if method == "PATCH" and "/issues/" in path:
             return reply(200, {})
-        if method == "POST" and path.endswith("/sub_issues"):
-            if payload["sub_issue_id"] in self.refuse_sub_issue:
-                return reply(422, {"message": "already has a parent"})
-            return reply(201, {})
+        if method == "POST" and path.endswith("/sub_issues") \
+                and payload["sub_issue_id"] in self.refuse_sub_issue:
+            return reply(422, {"message": "already has a parent"})
         if method == "POST":
             return reply(201, {})
-        raise AssertionError("unexpected %s %s" % (method, path))
+        return None
 
     def writes(self):
         return [c for c in self.calls if c[0] != "GET"]
