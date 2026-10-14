@@ -176,16 +176,16 @@ def _journal_records(journal, tickets, latest, previous):
     return records
 
 
-def _ticket_for_friction(journal, friction, body, tickets):
-    # 1. Direct ticket ref in friction line
-    refs = REF.findall(friction)
+def _find_ticket(tickets, refs):
     for repo, number in refs:
         ticket = next((row for row in tickets if row.get("repo") == repo
                        and str(row.get("number")) == number), None)
         if ticket:
             return ticket
+    return None
 
-    # 2. Match ticket that has a Refs to this journal comment
+
+def _ticket_refs_journal(tickets, journal):
     journal_url = journal.get("html_url") or ""
     journal_id = str(journal.get("id") or "")
     for row in tickets:
@@ -196,39 +196,42 @@ def _ticket_for_friction(journal, friction, body, tickets):
             return row
         if journal_id and re.search(r"Refs\b[^\n]*\b" + re.escape(journal_id) + r"\b", ticket_body):
             return row
-
-    # 3. Match ticket whose Why section (or body) quotes the friction text
-    friction_clean = _clean_text(friction)
-    if friction_clean and len(friction_clean) > 8:
-        for row in tickets:
-            ticket_body = str(row.get("body") or "")
-            why_match = re.search(r"##\s*Why\s*\n(.*?)(?=\n##|\Z)", ticket_body, re.S | re.I)
-            why_text = why_match.group(1) if why_match else ticket_body
-            why_clean = _clean_text(why_text)
-            if friction_clean in why_clean or why_clean in friction_clean:
-                return row
-            f_words = [w for w in friction_clean.split() if len(w) > 3]
-            if len(f_words) >= 4:
-                matches = sum(1 for w in f_words if w in why_clean)
-                if matches >= len(f_words) * 0.75:
-                    return row
-
-    # 4. Refs in journal body
-    refs = REF.findall(body)
-    for repo, number in refs:
-        ticket = next((row for row in tickets if row.get("repo") == repo
-                       and str(row.get("number")) == number), None)
-        if ticket:
-            return ticket
-
-    # 5. Ticket referencing the journal's repo and issue_number
-    if journal.get("repo") and journal.get("issue_number"):
-        ticket = next((row for row in tickets
-                       if (journal["repo"], str(journal["issue_number"])) in row.get("refs", [])), None)
-        if ticket:
-            return ticket
-
     return None
+
+
+def _why_quotes_friction(why_clean, friction_clean):
+    if friction_clean in why_clean or why_clean in friction_clean:
+        return True
+    words = [w for w in friction_clean.split() if len(w) > 3]
+    return len(words) >= 4 and sum(1 for w in words if w in why_clean) >= len(words) * 0.75
+
+
+def _ticket_quoting_friction(tickets, friction):
+    friction_clean = _clean_text(friction)
+    if not friction_clean or len(friction_clean) <= 8:
+        return None
+    for row in tickets:
+        ticket_body = str(row.get("body") or "")
+        why_match = re.search(r"##\s*Why\s*\n(.*?)(?=\n##|\Z)", ticket_body, re.S | re.I)
+        why_clean = _clean_text(why_match.group(1) if why_match else ticket_body)
+        if _why_quotes_friction(why_clean, friction_clean):
+            return row
+    return None
+
+
+def _ticket_for_journal_ids(tickets, journal):
+    if journal.get("repo") and journal.get("issue_number"):
+        return next((row for row in tickets
+                     if (journal["repo"], str(journal["issue_number"])) in row.get("refs", [])), None)
+    return None
+
+
+def _ticket_for_friction(journal, friction, body, tickets):
+    return (_find_ticket(tickets, REF.findall(friction))
+            or _ticket_refs_journal(tickets, journal)
+            or _ticket_quoting_friction(tickets, friction)
+            or _find_ticket(tickets, REF.findall(body))
+            or _ticket_for_journal_ids(tickets, journal))
 
 
 def _moved_metric(ticket, state, latest, previous):
@@ -267,45 +270,49 @@ def build_scoreboard(pull_requests):
     return tiers
 
 
-def render_improving(data):
+def _improvement_card(row):
     esc = html.escape
+    ticket = row["ticket"]
+    ref = row["journal"].get("html_url") or ""
+    journal = '<a href="%s">journal</a>' % esc(ref, True) if ref else "journal"
+    ticket_html = ('<a href="%s">#%s %s</a>' % (_ticket_href(ticket["repo"], ticket["number"]),
+                   esc(str(ticket["number"])), esc(str(ticket.get("title") or "ticket")))
+                   if ticket else "ticket not found")
+    moved = '<strong class="good">moved: %s</strong>' % esc(row["moved"]) if row["moved"] else ""
+    segments = "".join('<span class="%s"></span>' % (
+        "done" if index < row["stage"] else "current" if index == row["stage"] else "")
+        for index in range(4))
+    return '<article class="improvement"><div class="progress four">%s</div><p>"%s"</p><p>%s / %s / %s %s</p></article>' % (
+        segments, esc(row["friction"]), journal, ticket_html, esc(str(row["state"])), moved)
+
+
+def _factory_card(name, current, old):
+    esc = html.escape
+    if old is None:
+        direction, direction_class = "previous value missing", ""
+    else:
+        # Better or worse only when the target flips; a number that
+        # held its side of the target says so, never "better".
+        direction = ("better" if current["passed"] and not old["passed"] else
+                     "worse" if old["passed"] and not current["passed"] else
+                     "still passing" if current["passed"] else "still failing")
+        direction_class = "good" if current["passed"] else "bad"
+    return '<article class="card metric factory-card"><span class="metric-val">%s</span><strong class="metric-name">%s</strong><span class="metric-prev %s">was %s / %s</span></article>' % (
+        esc(current["value"]), esc(name), esc(direction_class), esc(old["value"] if old is not None else "missing"), esc(direction))
+
+
+def render_improving(data):
     parts = ['<section class="card"><h2>Noticed to moved</h2><div class="improvement-list">']
     if not data["records"]:
         parts.append('<p class="empty-state">No friction lines in the journals yet.</p>')
-    for row in data["records"]:
-        ticket = row["ticket"]
-        source = row["journal"]
-        ref = source.get("html_url") or ""
-        journal = '<a href="%s">journal</a>' % esc(ref, True) if ref else "journal"
-        ticket_html = ('<a href="%s">#%s %s</a>' % (_ticket_href(ticket["repo"], ticket["number"]),
-                       esc(str(ticket["number"])), esc(str(ticket.get("title") or "ticket")))
-                       if ticket else "ticket not found")
-        moved = '<strong class="good">moved: %s</strong>' % esc(row["moved"]) if row["moved"] else ""
-        segments = "".join('<span class="%s"></span>' % (
-            "done" if index < row["stage"] else "current" if index == row["stage"] else "")
-            for index in range(4))
-        parts.append('<article class="improvement"><div class="progress four">%s</div><p>"%s"</p><p>%s / %s / %s %s</p></article>' % (
-            segments, esc(row["friction"]), journal, ticket_html,
-            esc(str(row["state"])), moved))
+    parts.extend(_improvement_card(row) for row in data["records"])
     parts.append("</div></section><section><h2>Factory numbers</h2>")
     if not data["metrics_available"]:
         parts.append('<p class="empty-state">Daily metrics are missing: no metrics comment was found.</p>')
     else:
         parts.append('<div class="factory-grid">')
-        for name, current in data["latest"].items():
-            old = data["previous"].get(name)
-            if old is not None:
-                # Better or worse only when the target flips; a number that
-                # held its side of the target says so, never "better".
-                direction = ("better" if current["passed"] and not old["passed"] else
-                             "worse" if old["passed"] and not current["passed"] else
-                             "still passing" if current["passed"] else "still failing")
-                direction_class = "good" if current["passed"] else "bad"
-            else:
-                direction = "previous value missing"
-                direction_class = ""
-            parts.append('<article class="card metric factory-card"><span class="metric-val">%s</span><strong class="metric-name">%s</strong><span class="metric-prev %s">was %s / %s</span></article>' % (
-                esc(current["value"]), esc(name), esc(direction_class), esc(old["value"] if old is not None else "missing"), esc(direction)))
+        parts.extend(_factory_card(name, current, data["previous"].get(name))
+                     for name, current in data["latest"].items())
         parts.append('</div>')
     parts.append("</section>")
     return "".join(parts)

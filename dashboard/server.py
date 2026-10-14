@@ -604,53 +604,59 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     return server
 
 
-def _lane_view_data(payload, tickets):
-    comments = payload.get("lanes", [])
+def _merge_lane_rows(comments):
+    """Lane rows from the newest status comment, plus remote heartbeat lanes."""
     status_comments = [c for c in comments if str(c.get("body") or "").startswith(views.LANES_MARKER)]
     latest = max(status_comments, key=lambda c: str(c.get("created_at") or ""), default=None)
     lane_rows = views.parse_lane_rows(latest.get("body") if latest else "")
-    remote_lanes = views.parse_remote_heartbeats(comments)
-    seen_lanes = {row["lane"] for row in lane_rows}
-    for lane_name, r_lane in remote_lanes.items():
-        if lane_name not in seen_lanes:
-            lane_rows.append(r_lane)
-            seen_lanes.add(lane_name)
-        else:
-            for row in lane_rows:
-                if row["lane"] == lane_name and r_lane.get("available"):
-                    row["available"] = True
-    lanes = []
+    by_lane = {row["lane"]: row for row in lane_rows}
+    for lane_name, remote in views.parse_remote_heartbeats(comments).items():
+        if lane_name not in by_lane:
+            lane_rows.append(remote)
+            by_lane[lane_name] = remote
+        elif remote.get("available"):
+            by_lane[lane_name]["available"] = True
+    return lane_rows
+
+
+def _attach_active_tickets(lane_rows, tickets):
     for item in lane_rows:
         active = next((ticket for ticket in tickets if ticket.get("lane") == item["lane"]
                        and ticket.get("state") in ("running", "pr")), None)
         item.update({"ticket": active, "model": active.get("model") if active else None,
                      "quota": None,
                      "reason": None if item["available"] else "held reason missing from lane status comment"})
-        lanes.append(item)
-    prs = payload.get("pull_requests", [])
-    tickets_by_ref = {
-        (views.map_repo(str(row.get("repo") or "")), str(row.get("number"))): row
-        for row in tickets
-    }
+    return lane_rows
+
+
+def _footer_pull_requests(prs, tickets):
+    """Footer-bearing pull requests, each tagged with its ticket's difficulty."""
+    tickets_by_ref = {(views.map_repo(str(row.get("repo") or "")), str(row.get("number"))): row
+                      for row in tickets}
     prepared = []
-    footer = views.FOOTER
-    anthropic = total = 0
     for pr in prs:
-        match = footer.search(str(pr.get("body") or ""))
+        match = views.FOOTER.search(str(pr.get("body") or ""))
         if not match:
             continue
-        repo, number, lane, model = match.groups()
-        repo = views.map_repo(repo)
-        ticket = tickets_by_ref.get((repo, number))
+        repo, number, _lane, _model = match.groups()
+        ticket = tickets_by_ref.get((views.map_repo(repo), number))
         prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
-        total += 1
-        anthropic += lane.startswith("anthropic")
-    metric_rows = views.parse_metrics(payload.get("improving", {}).get("metrics_comments", []))
-    share = None
-    if metric_rows:
-        spread = metric_rows[0][1].get("Spread", {}).get("value", "")
-        match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
-        if match and int(match.group(2)):
-            share = round(100 * int(match.group(1)) / int(match.group(2)))
+    return prepared
+
+
+def _anthropic_share(metrics_comments):
+    metric_rows = views.parse_metrics(metrics_comments)
+    if not metric_rows:
+        return None
+    spread = metric_rows[0][1].get("Spread", {}).get("value", "")
+    match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
+    if match and int(match.group(2)):
+        return round(100 * int(match.group(1)) / int(match.group(2)))
+    return None
+
+
+def _lane_view_data(payload, tickets):
+    lanes = _attach_active_tickets(_merge_lane_rows(payload.get("lanes", [])), tickets)
+    prepared = _footer_pull_requests(payload.get("pull_requests", []), tickets)
     return {"lanes": lanes, "scoreboard": views.build_scoreboard(prepared),
-            "anthropic_share": share}
+            "anthropic_share": _anthropic_share(payload.get("improving", {}).get("metrics_comments", []))}
