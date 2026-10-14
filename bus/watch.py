@@ -447,7 +447,7 @@ class Watcher:
             except (GitHubError, OSError, ValueError) as err:
                 rec["due"] = kind
                 self.say("watch: could not tell a %s signature: %s" % (key.split(": ", 1)[0], err))
-                return
+                continue
             done[what] = done.get(what, 0) + 1
 
     # -- one pass --------------------------------------------------------

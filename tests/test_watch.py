@@ -183,6 +183,28 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 3600)
         self.assertEqual(len(self.gh.issues), 1)
 
+    def test_a_failed_filing_does_not_skip_another_due_signature(self):
+        other = "Connection refused"
+        self.append(LINE_403, LINE_403, LINE_403, other, other, other)
+        rest = self.gh.rest
+        failed = False
+
+        def fail_first_issue(method, path, body=None):
+            nonlocal failed
+            if method == "POST" and path == "/repos/%s/issues" % LANES_REPO and not failed:
+                failed = True
+                raise OSError("temporary failure")
+            return rest(method, path, body)
+
+        with mock.patch.object(self.gh, "rest", side_effect=fail_first_issue):
+            self.run_at(T0)
+
+        self.assertTrue(failed)
+        self.assertEqual([issue["title"] for issue in self.gh.issues.values()],
+                         ["station: " + watch.signature(other)])
+        self.assertEqual(self.saved()["sigs"]["station: " + watch.signature(LINE_403)]["due"],
+                         "file")
+
     def test_the_watchers_own_lines_never_count(self):
         line = "station: watch: filed %s#1 for a repeated station line: error" % LANES_REPO
         self.append(line, line, line)
