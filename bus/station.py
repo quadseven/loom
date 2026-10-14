@@ -2802,8 +2802,7 @@ class Station:
         ledger = brain.goal_ledger(goal, node, now, authors)
         if ledger["state"] != "overdue":
             return
-        children = self.gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" %
-                                    (repo, number))
+        children = brain.goal_children(self.gh, repo, number)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")))
         brain._check_written_text(body)
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
