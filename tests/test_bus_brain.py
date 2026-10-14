@@ -142,6 +142,71 @@ class BrainTests(unittest.TestCase):
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
 
+    def test_status_pull_request_lines_with_and_without_pending_brain_fix(self):
+        pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
+        authors = ["alice-example"]
+        comments_with = [{"user": {"login": "alice-example"},
+                          "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        fake_with = Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [pr]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, comments_with),
+            reply(200, []))
+        report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
+                                   env={}, authors=authors)
+        lines = report_with.splitlines()
+        at = lines.index("### Pull requests")
+        self.assertEqual(lines[at + 1], "- #4 PR - READY - pending brain fix")
+
+        comments_without = [{"user": {"login": "alice-example"},
+                             "body": "%s normal fix" % tickets.FIX_MARKER}]
+        fake_without = Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [pr]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, comments_without),
+            reply(200, []))
+        report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
+                                      env={}, authors=authors)
+        lines = report_without.splitlines()
+        at = lines.index("### Pull requests")
+        self.assertEqual(lines[at + 1], "- #4 PR - READY")
+
+    def test_pull_request_lines_helper_with_and_without_pending_brain_fix(self):
+        pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
+        data = {"prs": {4: ready_node()}}
+        bot = "grug-tribe"
+        authors = ["alice-example"]
+
+        with_fix = [{"user": {"login": "alice-example"},
+                     "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        gh_fix = GitHub("t", transport=Fake(reply(200, with_fix)))
+        lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
+        self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - READY - pending brain fix"])
+
+        without_fix = [{"user": {"login": "alice-example"},
+                        "body": "%s normal fix" % tickets.FIX_MARKER}]
+        gh_without = GitHub("t", transport=Fake(reply(200, without_fix)))
+        lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
+        self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
+
+        no_authors = GitHub("t", transport=Fake())
+        lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
+        self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
+
+    def test_sensitive_pr_lines_helper(self):
+        sensitive_pr = {"number": 4, "title": "Sensitive", "labels": [{"name": "class:sensitive"}]}
+        ordinary_pr = {"number": 5, "title": "Ordinary", "labels": []}
+        lines = brain._sensitive_pr_lines([sensitive_pr, ordinary_pr])
+        self.assertEqual(lines, ["### Sensitive pull requests", "- #4 Sensitive"])
+        empty = brain._sensitive_pr_lines([ordinary_pr])
+        self.assertEqual(empty, ["### Sensitive pull requests", "- none"])
+
     def test_status_lists_open_invariant_issues_for_the_report(self):
         gh = GitHub("t", transport=Fake(
             reply(200, [{"number": 7, "title": "Lane spark: 12 runs in 24 hours and none done",

@@ -451,6 +451,34 @@ def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optiona
     return Counter(undeclared).most_common(1)[0][0]
 
 
+def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
+                        data: Dict[str, Any], bot: str,
+                        authors: Sequence[str] = ()) -> List[str]:
+    """The pull request lines for status: heading, merge readiness for each
+    loom pull request, and the pending brain fix mark when one waits."""
+    lines = ["### Pull requests"]
+    for pr in prs:
+        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
+        try:
+            ticket = _ticket_association(repo, pr)
+        except ValueError:
+            ticket = None
+        if ticket is not None and authors:
+            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+            if _pending_brain_fix(comments, authors):
+                line += " - pending brain fix"
+        lines.append(line)
+    return lines
+
+
+def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
+    """The sensitive pull requests section for status."""
+    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
+    lines = ["### Sensitive pull requests"]
+    lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
+    return lines
+
+
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None) -> List[str]:
     issues = _issues(gh, repo)
@@ -472,21 +500,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors) + [""]
-    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + ["", "### Pull requests"]
-    for pr in prs:
-        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
-        try:
-            ticket = _ticket_association(repo, pr)
-        except ValueError:
-            ticket = None
-        if ticket is not None and authors:
-            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-            if _pending_brain_fix(comments, authors or ()):
-                line += " - pending brain fix"
-        lines.append(line)
-    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
-    lines += ["", "### Sensitive pull requests"]
-    lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
+    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped))
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or ())
+    lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
