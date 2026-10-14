@@ -290,9 +290,17 @@ class GitHub:
         url: Optional[str] = path
         while url:
             resp = self.rest("GET", url)
-            if isinstance(resp.data, list):
-                items.extend(resp.data)
-            url = _next_link(resp.headers.get("link", ""))
+            page = resp.data if isinstance(resp.data, list) else []
+            items.extend(page)
+            nxt = _next_link(resp.headers.get("link", ""))
+            if not nxt and resp.status == 304 and page and len(page) >= _per_page(url):
+                # A kept full page answers 304 with the link it was kept with.
+                # GitHub's ETag for a page does not change when items are
+                # added after it, so a list that grew past the page since
+                # (an issue's 101st comment) would never be read beyond it:
+                # ask for the following page, which has its own ETag.
+                nxt = _with_page(url, _page_of(url) + 1)
+            url = nxt
         return items
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
@@ -302,6 +310,23 @@ class GitHub:
         if data.get("errors"):
             raise GitHubError("graphql errors", resp.status, json.dumps(data["errors"]))
         return data.get("data")
+
+
+def _per_page(url: str) -> int:
+    m = re.search(r"[?&]per_page=(\d+)", url)
+    return int(m.group(1)) if m else 30
+
+
+def _page_of(url: str) -> int:
+    m = re.search(r"[?&]page=(\d+)", url)
+    return int(m.group(1)) if m else 1
+
+
+def _with_page(url: str, page: int) -> str:
+    """The URL asking for that page, replacing any page= it had."""
+    if re.search(r"[?&]page=\d+", url):
+        return re.sub(r"([?&])page=\d+", r"\g<1>page=%d" % page, url)
+    return url + ("&" if "?" in url else "?") + "page=%d" % page
 
 
 def _next_link(header: str) -> Optional[str]:
