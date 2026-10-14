@@ -3104,6 +3104,10 @@ class TranscriptUploadTest(Base):
         self.assertEqual(self.ledger()["anthropic-2/A"], "refused")
         self.assertIn("refused the transcript of anthropic-2/A (400)", out)
 
+    def test_a_wrong_token_is_retried_not_given_up(self):
+        self.assertNotIn(401, station.REFUSED_BODY)
+        self.assertNotIn(403, station.REFUSED_BODY)
+
     def test_a_run_with_no_ticket_is_skipped_and_the_next_still_sends(self):
         self.go()
         self.write(self.inbox("anthropic-2", "done", "T001-old-style.md"), "# Brief: T001\n")

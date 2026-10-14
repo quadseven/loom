@@ -338,12 +338,16 @@ def post_webhook(url: str, payload: Dict[str, Any]) -> None:
         raise OSError("the webhook answered %d" % status)
 
 
+# Answers about the body itself: sending the same body again cannot succeed.
+# A 401 or 403 is about the token, so those retry like a network error.
+REFUSED_BODY = (400, 413, 422)
+
+
 class UploadRefused(OSError):
-    """The dashboard read the body and refused it (a 4xx other than 408 and
-    429): sending the same body again cannot succeed."""
+    """The dashboard read the body and refused it (REFUSED_BODY)."""
 
     def __init__(self, status: int) -> None:
-        super().__init__("the transcript upload was refused with %d" % status)
+        super().__init__("the transcript upload answered %d" % status)
         self.status = status
 
 
@@ -364,10 +368,10 @@ def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
         err.close()
     except (urllib.error.URLError, OSError):
         raise OSError("the transcript upload failed to connect") from None
-    if status in (408, 429) or status >= 500:
-        raise OSError("the transcript upload answered %d" % status)
-    if not 200 <= status < 300:
+    if status in REFUSED_BODY:
         raise UploadRefused(status)
+    if not 200 <= status < 300:
+        raise OSError("the transcript upload answered %d" % status)
 
 
 class DiscordError(OSError):
