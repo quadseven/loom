@@ -116,6 +116,9 @@ DEFAULT_REVIEW_BOT = "grug-tribe"
 BOT_FIXED_PREFIX = "Fixed in "
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
+# The slots that draw on one API credit: an empty credit holds all of them.
+# run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
+SHARED_CREDIT = ANTHROPIC
 # The operator's ladder, 2026-10-12: "sonnet 5.5, or codex sol or opus 5.5
 # worst case". Each rung lists the lanes that serve it, best first.
 LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
@@ -1172,3 +1175,11 @@ def due(state_dir: str, now: float) -> bool:
         json.dump({"ran": now}, fh)
     os.replace(tmp, path)
     return True
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["credit-slots"]:
+        print("\n".join(SHARED_CREDIT))
+    else:
+        sys.exit("usage: python3 -m bus.factory credit-slots")
