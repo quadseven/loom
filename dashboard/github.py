@@ -153,73 +153,67 @@ class TicketStore:
                          "dashboard_errors": ["optional view sources were not refreshed because the GitHub request budget is below its floor"]})
             return
 
-        def goal_ref(value):
-            match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:#([0-9]+))?", value)
-            return (match.group(1), int(match.group(2)) if match.group(2) else None) if match else None
-
-        homes = [goal_ref(value) for value in os.environ.get("LOOM_IMPROVEMENT_HOMES", "").split()]
-        homes = [home for home in homes if home]
-        status_home = os.environ.get("LOOM_STATUS_REPO", "").strip()
-        if status_home and tickets.REPO_RE.fullmatch(status_home):
-            homes.append((status_home, None))
-        metrics_home = os.environ.get("LOOM_METRICS_GOAL", "").strip()
-        metrics_ref = goal_ref(metrics_home) if metrics_home else None
-        if metrics_ref:
-            homes.append(metrics_ref)
-        homes = list(dict.fromkeys(homes))
         journals, metric_comments, prs, lanes = [], [], [], []
         errors = []
+        homes, status_home = _dashboard_homes()
         for repo, issue_number in homes:
-            try:
-                if issue_number:
-                    issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), issue_number)).data
-                    issues = [issue] if isinstance(issue, dict) else []
-                else:
-                    issues = self.gh.paginate("/repos/%s/issues?state=all&labels=loom%%3Agoal&per_page=100" % quote(repo, safe="/"))
-                for issue in issues:
-                    if not isinstance(issue, dict) or "pull_request" in issue:
-                        continue
-                    comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
-                    for comment in comments:
-                        if not isinstance(comment, dict):
-                            continue
-                        body = str(comment.get("body") or "")
-                        comment.update({"repo": repo, "issue_number": issue["number"],
-                                        "issue_title": issue.get("title")})
-                        if body.startswith("<!-- loom:journal v1 -->"):
-                            journals.append(comment)
-                        if body.startswith("<!-- loom:metrics v1 -->"):
-                            metric_comments.append(comment)
-                        if body.startswith("<!-- loom:lanes v1 -->"):
-                            lanes.append(comment)
-            except (GitHubError, OSError, ValueError, KeyError) as exc:
-                errors.append("%s: %s" % (repo, self._error_reason(exc)))
+            self._read_dashboard_home(repo, issue_number, journals, metric_comments, lanes, errors)
         if status_home and tickets.REPO_RE.fullmatch(status_home):
-            try:
-                status_issues = self.gh.paginate(
-                    "/repos/%s/issues?state=open&labels=loom%%3Alanes&per_page=100"
-                    % quote(status_home, safe="/"))
-                for issue in status_issues:
-                    if not isinstance(issue, dict) or "pull_request" in issue:
-                        continue
-                    comments = self.gh.paginate("/repos/%s/issues/%d/comments"
-                                                % (quote(status_home, safe="/"), int(issue["number"])))
-                    for comment in comments:
-                        if isinstance(comment, dict) and str(comment.get("body") or "").startswith("<!-- loom:lanes v1 -->"):
-                            lanes.append(comment)
-            except (GitHubError, OSError, ValueError, KeyError) as exc:
-                errors.append("%s lane status: %s" % (status_home, self._error_reason(exc)))
+            self._read_lane_status(status_home, lanes, errors)
         for repo in self.repos:
-            try:
-                items = self.gh.paginate("/repos/%s/pulls?state=all&per_page=100" % quote(repo, safe="/"))
-                prs.extend(item for item in items if isinstance(item, dict))
-            except (GitHubError, OSError, ValueError) as exc:
-                errors.append("%s pull requests: %s" % (repo, self._error_reason(exc)))
+            self._read_pull_requests(repo, prs, errors)
         data["improving"] = {"journals": journals, "metrics_comments": metric_comments}
         data["lanes"] = lanes
         data["pull_requests"] = prs
         data["dashboard_errors"] = errors
 
+    def _read_dashboard_home(self, repo, issue_number, journals, metric_comments, lanes, errors):
+        try:
+            if issue_number:
+                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), issue_number)).data
+                issues = [issue] if isinstance(issue, dict) else []
+            else:
+                issues = self.gh.paginate("/repos/%s/issues?state=all&labels=loom%%3Agoal&per_page=100" % quote(repo, safe="/"))
+            for issue in issues:
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
+                for comment in comments:
+                    if not isinstance(comment, dict):
+                        continue
+                    body = str(comment.get("body") or "")
+                    comment.update({"repo": repo, "issue_number": issue["number"],
+                                    "issue_title": issue.get("title")})
+                    if body.startswith("<!-- loom:journal v1 -->"):
+                        journals.append(comment)
+                    if body.startswith("<!-- loom:metrics v1 -->"):
+                        metric_comments.append(comment)
+                    if body.startswith("<!-- loom:lanes v1 -->"):
+                        lanes.append(comment)
+        except (GitHubError, OSError, ValueError, KeyError) as exc:
+            errors.append("%s: %s" % (repo, self._error_reason(exc)))
+
+    def _read_lane_status(self, status_home, lanes, errors):
+        try:
+            status_issues = self.gh.paginate(
+                "/repos/%s/issues?state=open&labels=loom%%3Alanes&per_page=100"
+                % quote(status_home, safe="/"))
+            for issue in status_issues:
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                comments = self.gh.paginate("/repos/%s/issues/%d/comments"
+                                            % (quote(status_home, safe="/"), int(issue["number"])))
+                lanes.extend(comment for comment in comments if isinstance(comment, dict)
+                             and str(comment.get("body") or "").startswith("<!-- loom:lanes v1 -->"))
+        except (GitHubError, OSError, ValueError, KeyError) as exc:
+            errors.append("%s lane status: %s" % (status_home, self._error_reason(exc)))
+
+    def _read_pull_requests(self, repo, prs, errors):
+        try:
+            items = self.gh.paginate("/repos/%s/pulls?state=all&per_page=100" % quote(repo, safe="/"))
+            prs.extend(item for item in items if isinstance(item, dict))
+        except (GitHubError, OSError, ValueError) as exc:
+            errors.append("%s pull requests: %s" % (repo, self._error_reason(exc)))
     def _note_budget(self) -> None:
         remaining = self.gh.rate.get("core", (None, 0, 0))[0]
         if isinstance(remaining, int):
@@ -258,3 +252,20 @@ class TicketStore:
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
                 "dashboard_errors": snapshot.get("dashboard_errors", [])}
+
+
+def _dashboard_homes():
+    def goal_ref(value):
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:#([0-9]+))?", value)
+        return (match.group(1), int(match.group(2)) if match.group(2) else None) if match else None
+
+    homes = [goal_ref(value) for value in os.environ.get("LOOM_IMPROVEMENT_HOMES", "").split()]
+    homes = [home for home in homes if home]
+    status_home = os.environ.get("LOOM_STATUS_REPO", "").strip()
+    if status_home and tickets.REPO_RE.fullmatch(status_home):
+        homes.append((status_home, None))
+    metrics_home = os.environ.get("LOOM_METRICS_GOAL", "").strip()
+    metrics_ref = goal_ref(metrics_home) if metrics_home else None
+    if metrics_ref:
+        homes.append(metrics_ref)
+    return list(dict.fromkeys(homes)), status_home

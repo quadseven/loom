@@ -46,6 +46,12 @@ class LaneViewTest(unittest.TestCase):
         self.assertIn("held", html)
         self.assertIn("provider limit until reset", html)
 
+    def test_quota_is_integer_clamped_before_rendering(self):
+        rendered = render_lanes({"lanes": [{"lane": "codex-2", "available": True,
+                    "ticket": None, "model": "model-alpha", "quota": 120.8}],
+                    "scoreboard": {}, "anthropic_share": 0})
+        self.assertIn('style="width:100%"', rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

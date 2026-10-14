@@ -34,46 +34,56 @@ def build_improvements(journals, tickets, metrics_comments):
     metrics = parse_metrics(metrics_comments)
     latest = metrics[0][1] if metrics else {}
     previous = metrics[1][1] if len(metrics) > 1 else {}
-    records = []
-    for journal in journals:
-        body = str(journal.get("body") or "")
-        if not body.startswith(JOURNAL_MARKER):
-            continue
-        for line in body.splitlines():
-            if not re.match(r"- (?:Waiting|Asks|Measure):", line, re.I):
-                continue
-            friction = line.split(":", 1)[1].strip()
-            refs = REF.findall(friction)
-            if not refs:
-                refs = REF.findall(str(journal.get("body") or ""))
-            ticket = None
-            for repo, number in refs:
-                ticket = next((row for row in tickets if row.get("repo") == repo
-                               and str(row.get("number")) == number), None)
-                if ticket:
-                    break
-            if not ticket and journal.get("repo") and journal.get("issue_number"):
-                ticket = next((row for row in tickets
-                               if (journal["repo"], str(journal["issue_number"]))
-                               in row.get("refs", [])), None)
-                if ticket:
-                    repo, number = ticket["repo"], str(ticket["number"])
-            if not ticket:
-                repo, number, ticket = "", "", None
-            state = (ticket or {}).get("state") or "not ticketed"
-            moved = None
-            if ticket and state in ("shipped", "merged", "verified"):
-                moved = next((name for name, value in latest.items()
-                              if name in previous and value["value"] != previous[name]["value"]), None)
-            stage = 0 if not ticket else 1
-            if ticket and state in ("shipped", "merged", "verified"):
-                stage = 2
-            if moved:
-                stage = 4
-            records.append({"friction": friction, "journal": journal, "ticket": ticket,
-                            "state": state, "moved": moved, "stage": stage})
+    records = [record for journal in journals
+               for record in _journal_records(journal, tickets, latest, previous)]
     return {"records": records, "latest": latest, "previous": previous,
             "metrics_available": bool(metrics)}
+
+
+def _journal_records(journal, tickets, latest, previous):
+    records = []
+    body = str(journal.get("body") or "")
+    if not body.startswith(JOURNAL_MARKER):
+        return records
+    for line in body.splitlines():
+        if not re.match(r"- (?:Waiting|Asks|Measure):", line, re.I):
+            continue
+        friction = line.split(":", 1)[1].strip()
+        ticket = _ticket_for_friction(journal, friction, body, tickets)
+        state = (ticket or {}).get("state") or "not ticketed"
+        moved = _moved_metric(ticket, state, latest, previous)
+        stage = _improvement_stage(ticket, state, moved)
+        records.append({"friction": friction, "journal": journal, "ticket": ticket,
+                        "state": state, "moved": moved, "stage": stage})
+    return records
+
+
+def _ticket_for_friction(journal, friction, body, tickets):
+    refs = REF.findall(friction) or REF.findall(body)
+    for repo, number in refs:
+        ticket = next((row for row in tickets if row.get("repo") == repo
+                       and str(row.get("number")) == number), None)
+        if ticket:
+            return ticket
+    if journal.get("repo") and journal.get("issue_number"):
+        return next((row for row in tickets
+                     if (journal["repo"], str(journal["issue_number"])) in row.get("refs", [])), None)
+    return None
+
+
+def _moved_metric(ticket, state, latest, previous):
+    if not ticket or state not in ("shipped", "merged", "verified"):
+        return None
+    return next((name for name, value in latest.items()
+                 if name in previous and value["value"] != previous[name]["value"]), None)
+
+
+def _improvement_stage(ticket, state, moved):
+    if moved:
+        return 4
+    if ticket and state in ("shipped", "merged", "verified"):
+        return 2
+    return 1 if ticket else 0
 
 
 def build_scoreboard(pull_requests):
@@ -157,7 +167,7 @@ def render_lanes(data):
         ticket = lane.get("ticket")
         ticket_html = ('<a href="%s">%s</a>' % (_ticket_href(ticket["repo"], ticket["number"]), esc(str(ticket["title"] or "ticket"))) if ticket else "")
         quota = lane.get("quota")
-        quota_html = '<div class="quota"><span style="width:%d%%"></span></div>' % max(0, min(100, quota)) if quota is not None else '<small>quota missing</small>'
+        quota_html = '<div class="quota"><span style="width:%d%%"></span></div>' % max(0, min(100, int(quota))) if quota is not None else '<small>quota missing</small>'
         parts.append('<article class="card lane-card"><strong>%s</strong><span>%s / %s</span><p>%s %s</p>%s</article>' % (
             esc(lane["lane"]), esc(availability), esc(lane.get("model") or "model missing"),
             ticket_html, esc(reason), quota_html))
