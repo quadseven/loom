@@ -846,6 +846,20 @@ class Queued(Base):
         worker.assign_queued()
         return worker
 
+    def test_queued_ladder_model_uses_a_compatible_lane(self):
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.queued(7, body=body)
+        self.assign(available=["opencode-go-3", "claude"])
+        self.assertEqual(self.lane(7), "claude")
+        self.assertEqual(self.gh.issues[7]["body"], body)
+
+    def test_queued_ladder_model_waits_when_only_incompatible_lanes_are_free(self):
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.queued(7, body=body)
+        self.assign(available=["opencode-go-3"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertEqual(self.gh.issues[7]["body"], body)
+
     def test_private_medium_uses_the_least_loaded_available_tier_lane(self):
         self.queued(7)
         with mock.patch("bus.factory._say") as say:
@@ -985,18 +999,27 @@ class Tickets(Base):
 
     def test_a_public_easy_ticket_may_go_to_the_muse_spark_slot_and_a_private_one_never(self):
         self.gh.private = False
-        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3"))
+        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3"))
         self.assertEqual(self.lane(7), "opencode-go-4")
         self.assertIn("opencode-go-4", factory.PUBLIC_ONLY)
 
+    def test_muse_then_agy_take_public_easy_and_medium_tickets_first(self):
+        # The operator's priority (2026-10-14): Muse's and agy's allowances
+        # are spent first; a private repo's ticket never reaches either.
+        self.assertEqual(factory.TIERS["easy"][:2], ("muse", "agy"))
+        self.assertEqual(factory.TIERS["medium"][:2], ("muse", "agy"))
+        self.assertEqual(factory.lanes_of("easy", True)[0], "spark")
+        self.assertEqual(factory.lanes_of("medium", True)[0], "codex")
+
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
-        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai"))
+        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                                "openrouter", "workersai"))
         self.assertEqual(self.lane(7), "zen")
 
     def test_an_easy_ticket_never_goes_to_claude_or_anthropic(self):
         self.gh.private = False
-        self.limited_easy(busy=factory.TIERS["easy"][1:])
+        self.limited_easy(busy=[x for x in factory.TIERS["easy"] if x != "spark"])
         self.assertEqual(self.lane(7), "spark")
         self.assertEqual([c for c in self.gh.comments[7]], [])
 

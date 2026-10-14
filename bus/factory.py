@@ -137,9 +137,13 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
 TIERS: Dict[str, Tuple[str, ...]] = {
-    "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai",
-             "zen", "zai", "agy", "muse"),
-    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC + ("muse",),
+    # The operator's priority (2026-10-14): Muse and agy first on public
+    # repos, so their allowances are spent before the rest. Both are public
+    # only, so a private repo's ticket still starts at spark or codex.
+    "easy": ("muse", "agy", "spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+             "openrouter", "workersai", "zen", "zai"),
+    "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
+               "opencode-go-4") + ANTHROPIC,
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
@@ -1131,6 +1135,13 @@ class Factory:
                         and self._up(_lane(issue)))):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
 
+    def _queued_model_lane(self, repo: str, model: str) -> Optional[str]:
+        from .station import model_lanes, needs_public_repo
+        return next((candidate for candidate in model_lanes(model)
+                     if self._free(candidate)
+                     and (not needs_public_repo(candidate, model)
+                          or not self._is_private(repo))), None)
+
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
         the tier is up), oldest first across repos."""
@@ -1141,6 +1152,17 @@ class Factory:
         for repo, issue in sorted(queued, key=lambda item: (
                 str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
             if self.now < held_until(issue):
+                continue
+            model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+            if model_match:
+                model = model_match.group(1)
+                lane = self._queued_model_lane(repo, model)
+                if lane is None:
+                    _say("%s#%s waits: no free lane takes model %s"
+                         % (repo, issue["number"], model))
+                    continue
+                self._guarded(self._assign_queued_one, repo, issue, lane,
+                              "model %s" % model)
                 continue
             assigned = _lane(issue)
             if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
