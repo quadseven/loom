@@ -6,6 +6,7 @@ import re
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -217,6 +218,15 @@ class DashboardSourceHygiene(unittest.TestCase):
 
 
 class BacklogHelperTest(unittest.TestCase):
+    def test_backlog_source_rejects_http_and_private_hosts(self):
+        from dashboard.server import _backlog_bytes
+        with patch.dict(os.environ, {"LOOM_BACKLOG_SOURCE": "http://example.com/backlog.json"}):
+            self.assertIsNone(_backlog_bytes())
+        with patch.dict(os.environ, {"LOOM_BACKLOG_SOURCE": "https://127.0.0.1/backlog.json"}), \
+                patch("dashboard.server.build_opener") as open_url:
+            self.assertIsNone(_backlog_bytes())
+            open_url.assert_not_called()
+
     def test_health_inspectors_report_each_problem_kind(self):
         from dashboard.server import _health_inspectors
         document = {"epics": [
