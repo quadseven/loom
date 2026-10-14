@@ -70,6 +70,10 @@ targets moved. No green CI alone.
 Every 2 hours, five lines to the owner: metric deltas, cleared in order, top
 blocker, shipped and verified, next. Decisions indexed daily per goal doc.
 
+## Documentation
+
+- **SDLC.md**: The 8-stage Software Development Life Cycle-brief, run, PR, review, merge, after merge, deploy, verify. Shows how a change moves from ticket to verified.
+
 ## Ask policy
 
 Loom asks the owner only for: irreversible actions, rule conflicts,

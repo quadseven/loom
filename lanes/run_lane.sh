@@ -207,7 +207,47 @@ section() {
   awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
-# Chief's format: ## Why, ## Summary, ## Acceptance criteria, Size:, ## Out of scope.
+# Chief's format: ## Intent (the change class), ## Why, ## Summary,
+# ## Acceptance criteria, Size:, ## Out of scope.
+INTENT_CLASS=""
+INTENT_TEXT=""
+SENSITIVE_FILE=.loom/sensitive-paths
+SUMMARY_FILE=.loom/summary.md
+
+# What the agent is told about the Intent summary: one line per behavior
+# change in .loom/summary.md, else the runner falls back to the ticket's
+# What section. The file itself is never committed.
+summary_note() {
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. If there is no behavior change, leave the file out.\n' "$SUMMARY_FILE"
+}
+
+# The ## Intent section for the top of a new lane PR body: the change
+# class, one line per behavior change, and the counts of files by class.
+# Sensitive globs come from SENSITIVE_FILE on the base revision; a missing
+# file means no sensitive class. Sets INTENT_CLASS and INTENT_TEXT.
+prepare_intent() {
+  local brief="$1" files_tmp sens_tmp sum_tmp what_tmp out
+  INTENT_CLASS="logic"
+  INTENT_TEXT=""
+  files_tmp="$(mktemp)" sens_tmp="$(mktemp)" sum_tmp="$(mktemp)" what_tmp="$(mktemp)"
+  safe_git diff --name-only "$BASE" HEAD 2>/dev/null | sed '/^[[:space:]]*$/d' > "$files_tmp"
+  safe_git cat-file blob "$BASE:$SENSITIVE_FILE" 2>/dev/null > "$sens_tmp"
+  if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
+    cp "$WORKDIR/$TICKET.summary.md" "$sum_tmp"
+  elif [ -f "$TREE/$SUMMARY_FILE" ]; then
+    cat "$TREE/$SUMMARY_FILE" > "$sum_tmp" 2>/dev/null
+  fi
+  section What "$brief" > "$what_tmp" 2>/dev/null
+  out="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.change_class --files "$files_tmp" --sensitive "$sens_tmp" --summary "$sum_tmp" --what "$what_tmp" 2>/dev/null)"
+  rm -f "$files_tmp" "$sens_tmp" "$sum_tmp" "$what_tmp"
+  [ -n "$out" ] || return 0
+  INTENT_CLASS="$(printf '%s' "$out" | tail -1 | sed 's/^class://')"
+  case "$INTENT_CLASS" in sensitive|logic|tests|docs) ;;
+    *) INTENT_CLASS="logic" ;;
+  esac
+  INTENT_TEXT="$(printf '%s' "$out" | sed '$d')"
+}
+
 pr_body() {
   local size issue refs=""
   issue="$(field Issue "$1" || true)"
@@ -215,8 +255,9 @@ pr_body() {
   size="$(section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
-  printf '## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
-    "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
+  [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
+  printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
+    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
     "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
@@ -1048,7 +1089,7 @@ markers_left() {
 
 run_agent() {
   local brief_text
-  brief_text="$(cat "$1")$(validation_note)"
+  brief_text="$(cat "$1")$(validation_note)$(summary_note)"
   AGENT_EXTRA_ENV=""
   is_api_lane && fresh_agent_home
   case "$LANE" in
@@ -1374,6 +1415,15 @@ for BRIEF in "$INBOX"/*.md; do
   # A sandboxed agent cannot write .git, so it leaves its work in the tree.
   REPLIES_FILE=""
   if [ -n "$FIX_PR" ]; then capture_replies; else rm -f "$TREE/.loom/replies.json"; fi
+  # The Intent summary is runner metadata, never part of the change: keep it
+  # out of the commit so it cannot skew the change class.
+  rm -f "$WORKDIR/$TICKET.summary.md"
+  if [ -f "$TREE/$SUMMARY_FILE" ] && [ ! -L "$TREE/$SUMMARY_FILE" ]; then
+    cp "$TREE/$SUMMARY_FILE" "$WORKDIR/$TICKET.summary.md" 2>/dev/null || true
+    rm -f "$TREE/$SUMMARY_FILE"
+  else
+    rm -f "$TREE/$SUMMARY_FILE"
+  fi
   # During a merge the branch is already checked out, and the commit
   # completes the merge.
   if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
@@ -1470,8 +1520,11 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
+  INTENT_CLASS=""
+  INTENT_TEXT=""
+  prepare_intent "$BRIEF" >> "$LOG" 2>&1
   if ! timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
-       --body "$(pr_body "$BRIEF" "$TICKET")" >> "$LOG" 2>&1; then
+       --label "class:$INTENT_CLASS" --body "$(pr_body "$BRIEF" "$TICKET")" >> "$LOG" 2>&1; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed"; continue
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET done" >> "$LOG"
