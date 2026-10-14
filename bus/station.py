@@ -1435,6 +1435,9 @@ class Station:
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
         ready = self._ready_marker(comments)
+        if brain._pending_brain_fix(comments, self.s.authors):
+            self._move_fix_to_lane(repo, number, lane, names)
+            return
         if self._fix_pending(names, comments, sha):
             return
         self._clear_stale_ready(repo, number, names, ready, sha)
