@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from bus.github import GitHub
 from dashboard.github import TicketStore
+from dashboard import views
 from dashboard.server import make_server
 
 
@@ -413,6 +414,25 @@ class LanesAndImprovingTest(unittest.TestCase):
         self.assertIn("was 8", html_out)
         self.assertIn("was 80%", html_out)
         self.assertIn("better", html_out)
+
+
+class FactoryNumberDirectionTest(unittest.TestCase):
+    def render(self, was, now):
+        data = {"records": [], "metrics_available": True,
+                "latest": {"Flow": {"value": "v2", "passed": now}},
+                "previous": {"Flow": {"value": "v1", "passed": was}}}
+        return views.render_improving(data)
+
+    def test_a_number_that_held_its_side_says_still(self):
+        self.assertIn("was v1 / still passing", self.render(True, True))
+        self.assertIn("was v1 / still failing", self.render(False, False))
+
+    def test_a_flip_says_better_or_worse(self):
+        self.assertIn("was v1 / better", self.render(False, True))
+        self.assertIn("was v1 / worse", self.render(True, False))
+
+    def test_no_friction_lines_says_so(self):
+        self.assertIn("No friction lines in the journals yet.", self.render(True, True))
 
 
 if __name__ == "__main__":

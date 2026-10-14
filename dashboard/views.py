@@ -270,6 +270,8 @@ def build_scoreboard(pull_requests):
 def render_improving(data):
     esc = html.escape
     parts = ['<section class="card"><h2>Noticed to moved</h2><div class="improvement-list">']
+    if not data["records"]:
+        parts.append('<p class="empty-state">No friction lines in the journals yet.</p>')
     for row in data["records"]:
         ticket = row["ticket"]
         source = row["journal"]
@@ -293,10 +295,12 @@ def render_improving(data):
         for name, current in data["latest"].items():
             old = data["previous"].get(name)
             if old is not None:
+                # Better or worse only when the target flips; a number that
+                # held its side of the target says so, never "better".
                 direction = ("better" if current["passed"] and not old["passed"] else
                              "worse" if old["passed"] and not current["passed"] else
-                             "better" if current["passed"] else "worse")
-                direction_class = "good" if direction == "better" else "bad"
+                             "still passing" if current["passed"] else "still failing")
+                direction_class = "good" if current["passed"] else "bad"
             else:
                 direction = "previous value missing"
                 direction_class = ""
