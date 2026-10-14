@@ -108,9 +108,18 @@ class Collector:
         # A GitHubError is left to propagate on purpose: counting a failed
         # lookup as "no review check" would fail the Quality number on an API
         # blip. Station._post_metrics_comment catches it and retries the pass.
-        data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs" % (repo, sha)).data
-        checks = data.get("check_runs", []) if isinstance(data, dict) else []
-        return any(c.get("name") == self.review_check for c in checks)
+        # Every page: GitHub returns 30 check runs by default, and a commit in
+        # a repo with a CI matrix has more, so the review check can sit past
+        # the first page (two reviewed merges counted as unreviewed, 2026-10-13).
+        for page in range(1, 11):
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
+                                % (repo, sha, page)).data
+            checks = data.get("check_runs", []) if isinstance(data, dict) else []
+            if any(c.get("name") == self.review_check for c in checks):
+                return True
+            if len(checks) < 100:
+                return False
+        return False
 
     def _finished(self, lane: str, kind: str) -> Iterator[str]:
         """Paths of the briefs a lane finished in the window under done/ or failed/."""

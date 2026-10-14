@@ -31,7 +31,8 @@ flowchart LR
 3. **Ticket.** An issue with Why, What, exactly three acceptance checks
    (one names a test that fails without the fix, one is the live proof),
    Size and Out of scope.
-4. **Station.** Runs once a minute on the lane machine. It hands each
+4. **Station.** Runs once a minute on the lane machine (`LOOM_STATION_INTERVAL`
+   seconds). It hands each
    ticket to a free lane and reports the outcome back on the ticket.
 5. **Lane.** One agent CLI on one subscription or API key, in its own clone
    and branch. It never merges; the runner pushes and opens the pull
@@ -66,7 +67,7 @@ findings back with `bus.brain fix`.
 | Operator | answers asks, edits goals | anywhere |
 
 Lanes: codex, claude, anthropic, opencode-go, openrouter, zen, zai,
-workersai, agy and spark (a local vLLM coder you host yourself), plus extra slots (anthropic-2 to anthropic-8, codex-2, opencode-go-2, opencode-go-3)
+workersai, agy and spark (a local vLLM coder you host yourself), plus extra slots (anthropic-2 to anthropic-8, codex-2, opencode-go-2, opencode-go-3, opencode-go-4)
 that run in parallel. Hard work goes to paid lanes; providers that train on
 prompts take public repos only.
 

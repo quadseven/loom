@@ -651,6 +651,12 @@ class Tickets(Base):
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
         self.assertEqual(self.model(6), "claude-sonnet-5-5")
 
+    def test_a_failed_medium_ticket_skips_unavailable_anthropic_lanes(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.go(available=["codex", "codex-2", "opencode-go"])
+        self.assertIn(self.lane(6), ("codex", "codex-2", "opencode-go"))
+        self.assertNotIn("anthropic", self.lane(6))
+
     def test_failed_tickets_spread_past_a_busy_sonnet_lane(self):
         for n in (1, 2, 3, 4):
             self.gh.ticket(n, "failed", lane="zai")
@@ -721,12 +727,18 @@ class Tickets(Base):
         self.assertFalse(any(factory.RUNG_RE.search(c["body"]) for c in self.gh.comments[7]))
 
     def test_a_private_easy_ticket_never_goes_to_a_public_only_lane(self):
-        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "openrouter", "workersai"))
+        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai"))
         self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
+
+    def test_a_public_easy_ticket_may_go_to_the_muse_spark_slot_and_a_private_one_never(self):
+        self.gh.private = False
+        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3"))
+        self.assertEqual(self.lane(7), "opencode-go-4")
+        self.assertIn("opencode-go-4", factory.PUBLIC_ONLY)
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
-        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "openrouter", "workersai"))
+        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai"))
         self.assertEqual(self.lane(7), "zen")
 
     def test_an_easy_ticket_never_goes_to_claude_or_anthropic(self):
@@ -747,7 +759,7 @@ class Tickets(Base):
         self.assertEqual(sorted((self.lane(7), self.lane(8))), ["codex-2", "opencode-go"])
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3"), 20):
+        for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"), 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])
         self.assertEqual(self.lane(7), "anthropic")

@@ -164,6 +164,7 @@ small="$(printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | sed -nE 's/.*"small_model"
 port="$(printf '%s' "$args" | sed -nE 's/.*PROBE_PORT=([0-9]+).*/\\1/p')"
 if [ -n "$port" ] && /usr/bin/nc -z -w 1 127.0.0.1 "$port" > /dev/null 2>&1; then lo=reachable; else lo=denied; fi
 printf 'account=%s\\n' "${CLOUDFLARE_ACCOUNT_ID:-none}" >> "$TMPDIR/agent.log"
+printf 'tempvars=%s|%s|%s|%s\\n' "$HOME" "$TMPDIR" "$TMP" "$TEMP" >> "$TMPDIR/agent.log"
 procs="$(ps -axo args= 2>/dev/null)"
 case "$procs" in *"$key"*) argv=key-visible ;; *) argv=clean ;; esac
 printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secret=%s argv=%s sock=%s osa=%s lo=%s small=%s\\n' "$args" \\
@@ -187,6 +188,8 @@ echo '{"transcript": "the whole conversation"}' > "$HOME/.local/share/opencode/s
 # opencode 1.18 keeps sessions in SQLite.
 echo "sqlite session store" > "$HOME/.local/share/opencode/opencode.db"
 echo "sqlite wal" > "$HOME/.local/share/opencode/opencode.db-wal"
+(cd "$HOME" && mkdir -p .local/share/opencode/log)
+echo "request failed: HTTP 400" > "$HOME/.local/share/opencode/log/opencode.log"
 ln -s "$real_home/.ssh/id_planted" "$HOME/.local/share/opencode/storage/session/leak.json" 2>/dev/null
 # A link for a whole directory: .claude -> a directory outside the home.
 ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
@@ -611,6 +614,17 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
 
+    def test_empty_api_credit_holds_the_lane_for_24_hours(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        before = int(time.time())
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="Credit balance is too low")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("out of credit", beat["reason"])
+        self.assertGreaterEqual(beat["retry_at"], before + 86400)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 86400)
+
     def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="early-limit")
@@ -1018,8 +1032,53 @@ cat > /dev/null
         self.assertFalse((self.home / "hooked").exists())
         # opencode's helper (title) agent must not fall back to a paid model.
         self.assertIn("small=openrouter/vendor/model:free", agent[0])
+        self.assertIn(f"tempvars={self.loom}/run/openrouter-home|{self.loom}/run/openrouter-home/tmp|{self.loom}/run/openrouter-home/tmp|{self.loom}/run/openrouter-home/tmp", self.calls())
+        config = next(line.removeprefix("config=") for line in self.calls()
+                      if line.startswith("config="))
+        self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
         self.assertNotIn(f"home={self.home} ", agent[0])
         self.assertIn("lane openrouter, model openrouter/vendor/model:free", self.body.read_text())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_opencode_temp_paths_and_external_directory_denial_keep_the_sandbox_boundary(self):
+        profile_file = str(Path(self._tmp.name) / "sandbox.profile")
+        self.write_tool(
+            self.bin / "sandbox-exec",
+            "#!/bin/sh\n[ \"$1\" = -p ] || exit 91\nprintf '%s' \"$2\" > "
+            + shlex.quote(profile_file)
+            + "\nshift 2\nexec \"$@\"\n",
+        )
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(
+            BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        result = self.run_lane(
+            "opencode-go",
+            LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+            FAKE_SECRET__k_oc="fake-oc-key",
+            LOOM_OPENCODE_GO_MODEL="opencode-go/model-free",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        home = self.loom / "run" / "opencode-go-home"
+        calls = self.calls()
+        temp_dir = home / "tmp"
+        self.assertIn(f"tempvars={home}|{temp_dir}|{temp_dir}|{temp_dir}", calls)
+        config = next(line.removeprefix("config=") for line in calls if line.startswith("config="))
+        self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
+        profile = Path(profile_file).read_text()
+        writes = [line for line in profile.splitlines() if "file-write*" in line]
+        scratch = home.resolve()
+        self.assertEqual(len(writes), 3)
+        self.assertEqual(writes[0], f'(deny file-read* file-write* (subpath "{self.home.resolve()}"))')
+        allowed = re.fullmatch(
+            r'\(allow file-read\* file-write\* \(subpath "(.+)"\) \(subpath "(.+)"\)\)',
+            writes[1],
+        )
+        self.assertIsNotNone(allowed)
+        tree, profile_scratch = allowed.groups()
+        self.assertTrue(tree.endswith("/worktrees/T042-fix-the-thing"), tree)
+        self.assertEqual(profile_scratch, str(scratch))
+        self.assertEqual(writes[2], f'(deny file-write* (subpath "{tree}/.git"))')
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
@@ -1063,6 +1122,8 @@ cat > /dev/null
         self.assertIn("the whole conversation", files["s1.json"].read_text())
         self.assertIn("opencode.db", files)
         self.assertIn("opencode.db-wal", files)
+        self.assertIn("opencode.log", files)
+        self.assertIn("HTTP 400", files["opencode.log"].read_text())
         for p in (self.loom / "logs").rglob("*"):
             if p.is_file() and not p.is_symlink():
                 self.assertNotIn("private key", p.read_text())
@@ -1570,6 +1631,7 @@ cat > /dev/null
         self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
         self.assertEqual(provider["options"], {"baseURL": "http://spark.example.invalid:8000/v1"})
         self.assertEqual(list(provider["models"]), ["coder-test"])
+        self.assertEqual(provider["models"]["coder-test"]["limit"], {"context": 32768, "output": 4096})
         self.assertIn("lane spark, model spark/coder-test", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.spark_beat()["available"])

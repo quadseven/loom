@@ -99,8 +99,10 @@ live regression).
 2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
-   unlock" gets its report in the report step this tick, whatever else
-   waits: keep time for it. Each lane pull request's line ends in `READY`
+   unlock" gets its report in the report step this tick, in every scope,
+   including live. If the brain cannot write it, the station posts the
+   data-only report; never hand an owed report to another brain. Each lane
+   pull request's line ends in `READY`
    or `blocked:` and its blockers; take that verdict as given rather than
    re-deriving it from the review list.
    Then read, on each goal home, the operator notes newer than its last
@@ -251,12 +253,18 @@ on hard work):
 
 - Easy: `spark` (the local vLLM coder, model `spark/...`, any repo, private
   ones included) when lane status shows it available, else a free lane:
-  opencode-go, openrouter, workersai, or zen, zai and agy on public repos
-  only. Never anthropic or claude for an easy ticket.
-- Medium: codex or opencode-go first; an anthropic slot only when every codex
-  and opencode-go slot already holds work.
+  opencode-go, openrouter, workersai, or zen, zai, agy and opencode-go-4
+  on public repos only (opencode-go-4 is Muse Spark, which trains on prompts).
+  Never anthropic or claude for an easy ticket.
+- Medium: codex or opencode-go first (opencode-go-4 on public repos only); an
+  anthropic slot only when every codex and opencode-go slot already holds work.
 - Hard: anthropic, claude or codex, never a free lane or spark. Keep the
   anthropic slots busy with hard work while the credit lasts.
+
+An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
+brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
+its hold expires. When the API credit is gone, route hard work to codex and
+the claude lane.
 
 Spark takes one ticket at a time and steps aside while its box is hot: the
 factory moves its waiting tickets to a free lane in the same tier as above
@@ -264,8 +272,9 @@ factory moves its waiting tickets to a free lane in the same tier as above
 when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
-anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 and opencode-go-3 are
-opencode-go (opencode-go-3 runs its own model, so leave Model: off its briefs). Each takes one
+anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 to opencode-go-4 are
+opencode-go (opencode-go-3 and opencode-go-4 run their own models, so leave Model: off
+their briefs; opencode-go-4 is Muse Spark, which trains on prompts: public repos only). Each takes one
 ticket at a time, so spread work across every free slot of a lane rather
 than queueing it behind one. Keep every anthropic slot busy while its credits
 last.

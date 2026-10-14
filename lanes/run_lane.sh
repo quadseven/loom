@@ -162,6 +162,7 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 # at the last lines only, so a ticket that is about rate limits does not
 # read as one.
 LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+OUT_OF_CREDIT_RE='credit balance is too low|insufficient[ _](credit|balance|funds)|payment required|(http|status|code|error)[^0-9a-z]{0,3}402([^0-9]|$)'
 NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network error|fetch failed|connection (reset|refused|closed)|could not resolve host|overloaded|service unavailable|bad gateway|gateway timeout|internal server error|(http|status|code|error)[^0-9a-z]{0,3}(500|502|503|504|529)([^0-9]|$)'
 # When the provider says its limit lifts: an epoch after "limit reached|" or a
 # "reset" key, or a "retry after" / "try again in" / "resets in" duration.
@@ -181,7 +182,9 @@ classify_failure() {
   shopt -s nocasematch
   if [[ "$out" =~ $LIMIT_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
-    if [[ "$out" =~ $EPOCH_RE ]]; then
+    if [[ "$out" =~ $OUT_OF_CREDIT_RE ]]; then
+      RETRY_AT=$((now + LIMIT_WAIT_MAX))
+    elif [[ "$out" =~ $EPOCH_RE ]]; then
       RETRY_AT="${BASH_REMATCH[2]}"
     elif [[ "$out" =~ $AFTER_RE ]]; then
       n="${BASH_REMATCH[2]}"
@@ -386,7 +389,8 @@ api_agent() {
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
     # shellcheck disable=SC2030 # deliberately local to the agent's subshell
-    export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
+    export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" \
+      TMP="$AGENT_HOME/tmp" TEMP="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     [ "$key_var" = - ] || export "$key_var=$key"
     # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
     while IFS= read -r kv; do [ -z "$kv" ] || export "${kv?}"; done <<< "$extra"
@@ -578,9 +582,9 @@ opencode_config() {
   # OpenAI-compatible provider named spark at LOOM_SPARK_URL (checked in
   # spark_ready), serving the one model after "spark/". No key.
   local provider="" id="${MODEL#spark/}"
-  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\"}}}}"
+  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": 32768, \"output\": 4096}}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
-}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\"$provider}"
+}OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": {\"external_directory\": \"deny\"}$provider}"
 }
 
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
@@ -806,7 +810,8 @@ validation_note() {
 }
 
 # Keep the agent's session transcripts (Claude Code .jsonl; opencode's SQLite
-# session store and older session json) in logs/<lane>/<ticket>/ before the next run wipes its scratch home.
+# session store, older session json, and diagnostic log directory) in
+# logs/<lane>/<ticket>/ before the next run wipes its scratch home.
 # The agent controls everything in that home, so: enter each parent directory
 # and refuse it unless its real path is the expected one (no link on the way;
 # once inside, a later swap of the name cannot move us), then hand rsync the
@@ -825,7 +830,8 @@ archive_transcripts() {
       mkdir -p "$dest/$parent"
       if ! rsync -a --no-links --prune-empty-dirs --include='*/' --include='*.json' \
           --include='*.jsonl' --include='opencode.db' --include='opencode.db-wal' \
-          --include='opencode.db-shm' --exclude='*' "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
+          --include='opencode.db-shm' --include='log/***' --exclude='*' \
+          "$leaf" "$dest/$parent/" >> "$LOG" 2>&1; then
         echo "[$(date -u +%FT%TZ)] $TICKET: archiving $parent/$leaf failed; transcript may be incomplete" >> "$LOG"
       fi
     )
@@ -1341,14 +1347,20 @@ for BRIEF in "$INBOX"/*.md; do
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
   FAIL_CLASS=work
+  FAILURE_OUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
-    classify_failure "$STATUS" "$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)" "$EDITED"
+    classify_failure "$STATUS" "$FAILURE_OUT" "$EDITED"
   fi
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
     # this lane the retry. The rest of the inbox waits for the reset.
-    heartbeat false "provider limit reached; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
-    park "$BRIEF" "agent exited $STATUS: provider limit reached; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
+      LIMIT_REASON="out of credit"
+    else
+      LIMIT_REASON="provider limit reached"
+    fi
+    heartbeat false "$LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
     break
   fi
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi

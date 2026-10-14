@@ -112,6 +112,83 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(t.calls[0][2]["If-None-Match"], '"abc"')
         self.assertEqual(gh.requests, 1)
 
+    def test_a_repeated_get_sends_the_kept_etag_and_a_304_is_the_kept_answer(self):
+        path = "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % REPO
+        t = Scripted(reply(200, [{"number": 1}], {"ETag": '"v1"'}),
+                     reply(304, None, {"ETag": '"v1"'}))
+        with tempfile.TemporaryDirectory() as d:
+            gh = GitHub("tok", transport=t, cache_dir=d)
+            first = gh.rest("GET", path)
+            again = gh.rest("GET", path)
+        self.assertNotIn("If-None-Match", t.calls[0][2])
+        self.assertEqual(t.calls[1][2]["If-None-Match"], '"v1"')
+        self.assertEqual(first.data, [{"number": 1}])
+        self.assertEqual((again.status, again.data), (304, [{"number": 1}]))
+        # Both are requests; only the first counted against the budget.
+        self.assertEqual((gh.requests, gh.not_modified), (2, 1))
+        self.assertEqual(gh.kinds, {"issues list": 1})
+
+    def test_a_changed_list_replaces_the_kept_answer(self):
+        t = Scripted(reply(200, [1], {"ETag": '"v1"'}), reply(200, [1, 2], {"ETag": '"v2"'}),
+                     reply(304))
+        with tempfile.TemporaryDirectory() as d:
+            gh = GitHub("tok", transport=t, cache_dir=d)
+            gh.rest("GET", "/x")
+            gh.rest("GET", "/x")
+            self.assertEqual(gh.rest("GET", "/x").data, [1, 2])
+        self.assertEqual([c[2].get("If-None-Match") for c in t.calls], [None, '"v1"', '"v2"'])
+
+    def test_pages_are_kept_with_their_next_links(self):
+        nxt = '<https://api.github.com/p?page=2>; rel="next"'
+        t = Scripted(reply(200, [1, 2], {"ETag": '"a"', "Link": nxt}),
+                     reply(200, [3], {"ETag": '"b"'}), reply(304), reply(304))
+        with tempfile.TemporaryDirectory() as d:
+            gh = GitHub("tok", transport=t, cache_dir=d)
+            self.assertEqual(gh.paginate("/p"), [1, 2, 3])
+            self.assertEqual(gh.paginate("/p"), [1, 2, 3])
+        self.assertEqual(t.calls[3][1], "https://api.github.com/p?page=2")
+        self.assertEqual(t.calls[3][2]["If-None-Match"], '"b"')
+        self.assertEqual(gh.not_modified, 2)
+
+    def test_without_a_cache_no_etag_is_sent(self):
+        t = Scripted(reply(200, [1], {"ETag": '"v1"'}), reply(200, [1], {"ETag": '"v1"'}))
+        gh = GitHub("tok", transport=t)
+        gh.rest("GET", "/x")
+        gh.rest("GET", "/x")
+        self.assertNotIn("If-None-Match", t.calls[1][2])
+
+    def test_requests_are_counted_by_kind(self):
+        t = Scripted(*[reply(200, [])] * 7)
+        gh = GitHub("tok", transport=t)
+        for method, path in (("GET", "/repos/%s/issues?state=open" % REPO),
+                             ("GET", "/repos/%s/pulls?state=open" % REPO),
+                             ("GET", "/repos/%s/issues/3/comments" % REPO),
+                             ("GET", "/repos/%s/commits/abc/check-runs?per_page=100" % REPO),
+                             ("GET", "/repos/%s/commits/abc/status" % REPO),
+                             ("POST", "/graphql"),
+                             ("POST", "/repos/%s/issues/3/comments" % REPO)):
+            gh.rest(method, path, {"query": "q"} if path == "/graphql" else None)
+        self.assertEqual(gh.kinds, {"issues list": 1, "pulls list": 1, "comments": 1,
+                                    "check runs": 2, "graphql": 1, "writes": 1})
+
+    def test_the_rate_limit_is_read_even_from_a_refusal(self):
+        limit = {"X-RateLimit-Remaining": "0", "X-RateLimit-Limit": "5000",
+                 "X-RateLimit-Reset": "1900000000", "X-RateLimit-Resource": "core"}
+        gh = GitHub("tok", transport=Scripted(reply(403, {"message": "rate limit"}, limit)))
+        with self.assertRaises(GitHubError):
+            gh.rest("GET", "/x")
+        self.assertEqual(gh.rate, {"core": (0, 5000, 1900000000)})
+
+    def test_unused_kept_answers_are_pruned(self):
+        t = Scripted(reply(200, [1], {"ETag": '"v1"'}))
+        with tempfile.TemporaryDirectory() as d:
+            gh = GitHub("tok", transport=t, cache_dir=d)
+            gh.rest("GET", "/x")
+            self.assertEqual(gh.prune_cache(3600), 0)
+            self.assertEqual(gh.prune_cache(3600, now=os.stat(
+                os.path.join(d, os.listdir(d)[0])).st_mtime + 3601), 1)
+            self.assertEqual(os.listdir(d), [])
+
     def test_error_and_ok_statuses(self):
         gh = GitHub("tok", transport=Scripted(reply(404, {"message": "no"}), reply(422, {})))
         with self.assertRaises(GitHubError) as cm:
@@ -190,7 +267,7 @@ class LabelTests(unittest.TestCase):
             {"name": "needs-operator", "color": "000000", "description": "x"},  # foreign: untouched
             {"name": "bug", "color": "ffffff", "description": None},            # foreign
         ]
-        replies = [reply(200, existing)] + [reply(201, {})] * 40
+        replies = [reply(200, existing)] + [reply(201, {})] * (len(labels.LABELS) + 5)
         t = Scripted(*replies)
         gh = GitHub("tok", transport=t)
         changed = labels.ensure_labels(gh, REPO)
@@ -210,7 +287,7 @@ class LabelTests(unittest.TestCase):
 
     def test_foreign_label_with_other_prefix_never_patched(self):
         existing = [{"name": "needs-operator", "color": "111111", "description": "mine"}]
-        t = Scripted(reply(200, existing), *[reply(201, {})] * 40)
+        t = Scripted(reply(200, existing), *[reply(201, {})] * (len(labels.LABELS) + 5))
         labels.ensure_labels(GitHub("tok", transport=t), REPO)
         self.assertFalse([c for c in t.calls if c[0] == "PATCH"])
 
