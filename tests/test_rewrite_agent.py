@@ -25,6 +25,11 @@ ANSWER = '{"action": "skip", "reason": "fake"}'
 FAKE_OPENCODE = r"""#!/usr/bin/env bash
 [ "${1:-}" = --version ] && { echo "@VERSION@"; exit 0; }
 log=@LOG@
+if [ "${1:-}" = serve ]; then
+  exec python3 -c 'import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2]))); s.listen(5); time.sleep(120)' "$3" "$5"
+fi
 prompt="$(cat)"
 key="${OPENCODE_API_KEY:-}"
 case "$(ps -axo args= 2>/dev/null)" in *"${key:-no-key-set}"*) argv=key-visible ;; *) argv=clean ;; esac
@@ -181,11 +186,13 @@ class RewriteAgentTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.agent_log.exists())
 
-    def test_opencode_2_runs_standalone(self):
+    def test_opencode_2_runs_against_its_own_server(self):
         self.write_fake_opencode("opencode v2.0.28")
         result = self.run_wrapper()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.agent()["argv"], f"run --standalone --auto -m {MODEL} --format json")
+        argv = self.agent()["argv"]
+        self.assertRegex(argv, rf"^run --server http://127\.0\.0\.1:\d+ --auto -m {re.escape(MODEL)} --format json$")
+        self.assertNotIn("--standalone", argv)
 
     def test_the_lanes_and_the_rewriter_share_one_sandbox(self):
         shared = LANES / "agent_sandbox.sh"

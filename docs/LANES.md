@@ -413,8 +413,8 @@ loopback connection; they cannot query the viewer or any other local service.
 - API-lane session transcripts (Claude Code `.jsonl`, opencode's `opencode.db`)
   are copied to `logs/<lane>/<ticket>/` after each run, before the next run
   wipes the scratch home. Links are never followed.
-- No background processes: launchd starts a pass every minute and a lock
-  keeps one pass per lane.
+- launchd starts a pass every minute and a lock keeps one pass per lane.
+  An opencode 2.0 pass starts a temporary server and stops it when the run ends.
 
 ### One slot on opencode 2.0
 
@@ -431,9 +431,11 @@ LOOM_OPENCODE_GO_3_OPENCODE=/path/to/opencode2/bin/opencode lanes/mac/install.sh
 `LOOM_<SLOT>_OPENCODE` (or `LOOM_<LANE>_OPENCODE` for every slot of a lane)
 names the opencode binary; without it a lane runs `opencode` from PATH. Before
 each run the runner asks the binary for `--version`; when it prints
-`opencode v2.` the run adds `--standalone --auto`, because 2.0's `run`
-otherwise talks to a shared background service, which the sandbox (no
-loopback) refuses and which would mix lanes' sessions. The sandbox lets the
+`opencode v2.` the runner starts `opencode serve` with a fresh password on a
+random high loopback port inside the agent's sandbox. It allows only that
+port through the sandbox's loopback deny, waits up to 15 seconds for the
+server, and calls `run --server` with `--auto`. The server stops when the run
+ends, including on failure or timeout. The sandbox lets the
 agent read the named binary's real directory, exactly as it does the default
 one; a binary that needs files outside that directory will not start there.
 The transcript is archived and shown on the viewer like a 1.x one. To go

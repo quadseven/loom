@@ -40,7 +40,7 @@
 # LOOM_CHECK_TIMEOUT (seconds per validation step, default 1800; see
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
-# from PATH; a 2.x binary runs --standalone --auto),
+# from PATH; a 2.x binary uses a private server inside its sandbox),
 # LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
