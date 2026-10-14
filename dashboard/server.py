@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import ssl
 import statistics
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -51,7 +52,7 @@ def _backlog(state):
         return None, "LOOM_BACKLOG_SOURCE is not set"
     try:
         if source.startswith(("https://", "http://")):
-            with urlopen(source, timeout=5) as response:
+            with urlopen(source, timeout=5, context=ssl.create_default_context()) as response:  # noqa: S310 - scheme is restricted above
                 data = json.loads(response.read().decode("utf-8"))
         else:
             with open(source, encoding="utf-8") as handle:
