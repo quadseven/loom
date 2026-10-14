@@ -144,14 +144,28 @@ lane_setting() {
 # is the epoch time a provider limit lifts; until then every pass stays
 # unavailable without reading the key or taking a brief.
 BEAT="$LOOM_HOME/state/usage/$SLOT.json"
-heartbeat() {
-  local reason retry=""
+write_beat() {
+  local slot="$1" reason retry=""
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
-  reason="$(printf '%s' "$2" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
-  [[ "${3:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $3"
+  reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
+  [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
   mkdir -p "$LOOM_HOME/state/usage"
   printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s}\n' \
-    "$SLOT" "$(date +%s)" "$1" "$reason" "$retry" > "$BEAT.tmp" && mv "$BEAT.tmp" "$BEAT"
+    "$slot" "$(date +%s)" "$2" "$reason" "$retry" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
+    mv "$LOOM_HOME/state/usage/$slot.json.tmp" "$LOOM_HOME/state/usage/$slot.json"
+}
+heartbeat() { write_beat "$SLOT" "$@"; }
+
+# An empty API credit holds every slot that shares it, not only the one that
+# hit it: each gets the same unavailable heartbeat until $1. The shared set
+# is bus/factory.py's, so the factory and this runner agree on it.
+hold_shared_credit() {
+  local until="$1" slots slot
+  slots="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.factory credit-slots 2>/dev/null)" || return 0
+  case $'\n'"$slots"$'\n' in *$'\n'"$SLOT"$'\n'*) ;; *) return 0 ;; esac
+  for slot in $slots; do
+    write_beat "$slot" false "limit: out of credit; unavailable until $(utc "$until")" "$until"
+  done
 }
 
 utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
@@ -591,7 +605,8 @@ mark_limit() {
 # ahead than LIMIT_HOLD (a clock that was wrong) is ignored.
 limit_held() {
   local ends why now
-  read -r ends why < "$LIMIT_FILE" 2>/dev/null || return 1
+  [ -f "$LIMIT_FILE" ] || return 1
+  read -r ends why < "$LIMIT_FILE" || return 1
   now="$(date +%s)"
   [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
   LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
@@ -1397,10 +1412,11 @@ for BRIEF in "$INBOX"/*.md; do
     # this lane the retry. The rest of the inbox waits for the reset.
     if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
+      hold_shared_credit "$RETRY_AT"
     else
       LIMIT_REASON="provider limit reached"
     fi
-    heartbeat false "$LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
     break
   fi

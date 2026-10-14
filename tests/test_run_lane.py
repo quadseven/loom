@@ -640,6 +640,55 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertGreaterEqual(beat["retry_at"], before + 86400)
         self.assertLessEqual(beat["retry_at"], int(time.time()) + 86400)
 
+    def source_functions(self, *names):
+        text = RUNNER.read_text()
+        found = {n: re.search(r"^%s\(\) \{(\n.*?^\}|[^\n]*\})\n" % n, text, re.S | re.M) for n in names}
+        missing = [n for n, m in found.items() if m is None]
+        self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
+        return "".join(found[n].group(0) for n in names)
+
+    def hold_credit(self, slot, until=4102444800):
+        script = self.source_functions("write_beat", "utc", "hold_shared_credit") + (
+            'heartbeat() { :; }\nhold_shared_credit "$1"')
+        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": slot,
+               "LOOM_ROOT": str(RUNNER.parent.parent)}
+        return subprocess.run(["bash", "-c", script, "bash", str(until)], env=env,
+                              capture_output=True, text=True, check=True)
+
+    def beats(self):
+        usage = self.loom / "state" / "usage"
+        return {p.stem: json.loads(p.read_text()) for p in usage.glob("*.json")}
+
+    def test_empty_credit_on_one_anthropic_slot_holds_all_eight(self):
+        self.hold_credit("anthropic-3")
+        beats = self.beats()
+        self.assertEqual(sorted(beats), sorted(["anthropic"] + ["anthropic-%d" % n for n in range(2, 9)]))
+        for beat in beats.values():
+            self.assertFalse(beat["available"])
+            self.assertEqual(beat["retry_at"], 4102444800)
+            self.assertTrue(beat["reason"].startswith("limit: out of credit"))
+
+    def test_empty_credit_on_a_slot_outside_the_shared_credit_holds_only_itself(self):
+        self.hold_credit("codex")
+        self.assertEqual(self.beats(), {})
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="Credit balance is too low")
+        self.assertEqual(list(self.beats()), ["codex"])
+
+    def test_a_usage_limit_on_one_anthropic_slot_holds_only_that_slot(self):
+        # A usage limit (not credit) goes through the same path as codex's: one heartbeat.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="limit")
+        self.assertEqual(list(self.beats()), ["codex"])
+
+    def test_a_missing_limit_file_prints_nothing(self):
+        script = self.source_functions("limit_held", "utc") + (
+            'LIMIT_FILE="$LOOM_HOME/state/usage/x.limit" LIMIT_HOLD=900\nlimit_held; echo "rc=$?"')
+        result = subprocess.run(["bash", "-c", script], env={**self.lane_env(), "LOOM_HOME": str(self.loom)},
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "rc=1")
+        self.assertEqual(result.stderr, "")
+
     def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="early-limit")
