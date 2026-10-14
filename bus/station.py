@@ -1096,20 +1096,27 @@ class Station:
                 _say("could not list %s: %s" % (repo, err))
                 continue
             for issue in found:
-                lane = _lane_of(issue)
-                if lane in by_lane:
-                    by_lane[lane].append((repo, issue))
-                elif lane:
-                    model = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
-                    if model and not lane_takes_model(lane, model.group(1)):
-                        if free:
-                            by_lane[free[0]].append((repo, issue))
-                        else:
-                            try:
-                                self._try_ticket(repo, lane, issue, free)
-                            except (GitHubError, OSError) as err:
-                                _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
+                self._add_claim_candidate(by_lane, free, repo, issue)
         return by_lane
+
+    def _add_claim_candidate(self, by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]],
+                             free: List[str], repo: str, issue: Dict[str, Any]) -> None:
+        lane = _lane_of(issue)
+        if lane in by_lane:
+            by_lane[lane].append((repo, issue))
+            return
+        if not lane:
+            return
+        model = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+        if not model or lane_takes_model(lane, model.group(1)):
+            return
+        if free:
+            by_lane[free[0]].append((repo, issue))
+            return
+        try:
+            self._try_ticket(repo, lane, issue, free)
+        except (GitHubError, OSError) as err:
+            _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
 
     def _record_slot_sample(self, idle: bool) -> None:
         if not self.s.metrics_goal:
@@ -1147,26 +1154,32 @@ class Station:
             return False
         model = headers.get("Model", "")
         if model and labelled_lane and not lane_takes_model(labelled_lane, model):
-            target = next((candidate for candidate in model_lanes(model)
-                           if candidate in free and self._inbox_empty(candidate)
-                           and (not needs_public_repo(candidate, model) or self._public(repo))), None)
-            names = [name for name in _label_names(fresh) if not name.startswith("lane:")]
-            if target is None:
-                names = [name for name in names if name != BRIEFED] + ["loom:queued"]
-                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, issue["number"]),
-                             {"labels": names})
-                self._comment(repo, int(issue["number"]),
-                              "Model %s waits for a free compatible lane." % model)
-                _say("%s#%s waits: no free lane takes model %s" % (repo, issue["number"], model))
+            lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
+            if lane is None:
                 return False
-            names.append("lane:" + target)
-            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, issue["number"]),
-                         {"labels": names})
-            fresh["labels"] = [{"name": name} for name in names]
-            _say("moved %s#%s from lane %s to lane %s for model %s"
-                 % (repo, issue["number"], labelled_lane, target, model))
-            lane = target
         return self._claim(repo, lane, fresh)
+
+    def _route_model_claim(self, repo: str, issue: Dict[str, Any], lane: str,
+                           model: str, free: List[str]) -> Optional[str]:
+        target = next((candidate for candidate in model_lanes(model)
+                       if candidate in free and self._inbox_empty(candidate)
+                       and (not needs_public_repo(candidate, model) or self._public(repo))), None)
+        number = int(issue["number"])
+        names = [name for name in _label_names(issue) if not name.startswith("lane:")]
+        if target is None:
+            names = [name for name in names if name != BRIEFED] + ["loom:queued"]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": names})
+            self._comment(repo, number, "Model %s waits for a free compatible lane." % model)
+            _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
+            return None
+        names.append("lane:" + target)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names})
+        issue["labels"] = [{"name": name} for name in names]
+        _say("moved %s#%d from lane %s to lane %s for model %s"
+             % (repo, number, lane, target, model))
+        return target
 
     # -- outcomes -------------------------------------------------------
     def _finished_briefs(self):

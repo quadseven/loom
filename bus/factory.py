@@ -1131,6 +1131,13 @@ class Factory:
                         and self._up(_lane(issue)))):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
 
+    def _queued_model_lane(self, repo: str, model: str) -> Optional[str]:
+        from .station import model_lanes, needs_public_repo
+        return next((candidate for candidate in model_lanes(model)
+                     if self._free(candidate)
+                     and (not needs_public_repo(candidate, model)
+                          or not self._is_private(repo))), None)
+
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
         the tier is up), oldest first across repos."""
@@ -1144,12 +1151,8 @@ class Factory:
                 continue
             model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
             if model_match:
-                from .station import model_lanes, needs_public_repo
                 model = model_match.group(1)
-                lane = next((candidate for candidate in model_lanes(model)
-                             if self._free(candidate)
-                             and (not needs_public_repo(candidate, model)
-                                  or not self._is_private(repo))), None)
+                lane = self._queued_model_lane(repo, model)
                 if lane is None:
                     _say("%s#%s waits: no free lane takes model %s"
                          % (repo, issue["number"], model))
