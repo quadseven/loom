@@ -904,6 +904,15 @@ class TextAndCloseTests(unittest.TestCase):
     def test_slash_commands_without_the_at_sign_pass(self):
         text.check("/%s improve" % text.REVIEW_BOT_SHORT_NAME)
 
+    def test_an_operator_note_with_phone_punctuation_passes(self):
+        # A phone keyboard types curly quotes; the shared checks must not
+        # refuse them. Only the lane answer path requires ASCII.
+        text.check("Don\u2019t stop the \u201cbig\u201d run")
+
+    def test_an_absolute_local_path_is_refused(self):
+        with self.assertRaises(ValueError):
+            text.check("see /Users/someone/notes.txt")
+
     def test_close_completed_needs_verified(self):
         fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}))
         with self.assertRaises(ValueError):

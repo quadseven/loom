@@ -40,8 +40,6 @@ def scrub_paths(text: str) -> str:
 
 def check(text: str) -> None:
     """Raise ValueError for text the brain must never post."""
-    if not text.isascii():
-        raise ValueError("text is not ASCII")
     if LOCAL_PATH_RE.search(text):
         raise ValueError("text contains an absolute path")
     if _HANDLE.search(text):
