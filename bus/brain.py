@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
-from . import change_class, handoff, lock, proof, text, tickets
+from . import change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
 from .labels import ESCALATION, LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -558,6 +558,21 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
         raise ValueError("title is one line")
     if any(section not in body for section in SECTIONS):
         raise ValueError("body must contain all required sections")
+    found = plan_problems(body)
+    if found:
+        raise ValueError("the pull request this brief makes would fail the review "
+                         "bot's plan checks: " + "; ".join(found))
+
+
+def plan_problems(body: str) -> List[str]:
+    """What the pull request body a lane generates from this brief would
+    fail in the review bot's plan checks (bus/hunt_plan.py), with the Size
+    read the way the runner reads it."""
+    try:
+        sized = hunt_plan.with_size_letter(body)
+    except ValueError as exc:
+        return [str(exc)]
+    return hunt_plan.problems(pr_repair._render_generated(sized, "lane", "model", "ticket"))
 
 
 def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
@@ -883,6 +898,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if base is None:
         goal_issue = _goal_issue(gh, repo, goal)
         base = goal_trunk(goal_issue)
+    body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before)
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
@@ -944,6 +960,9 @@ def missing_sections(body: Optional[str]) -> List[str]:
             tickets.parse(body)
         except ValueError as exc:
             missing.append("a body the runner accepts (%s)" % exc)
+    if not missing:
+        missing.extend("a pull request body the review bot accepts (%s)" % found
+                       for found in plan_problems(body or ""))
     return missing
 
 
