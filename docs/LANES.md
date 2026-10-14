@@ -13,6 +13,11 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   lane default (`LOOM_<LANE>_MODEL`). The PR footer names the lane and the
   model. A model outside the lane's family is refused; the `openrouter`,
   `zen` and `zai` lanes run free models only.
+- A lane may set LOOM_<SLOT>_MODELS to an ordered, space-separated model
+  list. Unpinned briefs use the first model not currently limited. A provider
+  quota records a reset for that model; the lane remains available while
+  another model is ready. A brief with a Model: line always keeps that model.
+  Account-wide out-of-credit limits still hold the lane.
 - Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
