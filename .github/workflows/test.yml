@@ -28,7 +28,9 @@ jobs:
         run: |
           set -o pipefail
           python -B -m unittest discover -s tests -v 2>&1 | tee unittest.out
-          if grep -qE "\.\.\. skipped |skipped=[0-9]" unittest.out; then
+          # The one opt-in skip: the real-binary test needs LOOM_TEST_OPENCODE2,
+          # which CI does not have. Any other skip fails the run.
+          if grep -E "\.\.\. skipped " unittest.out | grep -qv "LOOM_TEST_OPENCODE2"; then
             echo "::error::a test skipped; the sandbox tests must run in CI"
             exit 1
           fi
