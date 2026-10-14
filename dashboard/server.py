@@ -115,9 +115,9 @@ def _conveyor(state, rows):
         median = stats.get("median_h") if wait_rows else (statistics.median(sample) if sample else None)
         worst = stats.get("worst_h")
         mark = " bottleneck" if name == bottleneck and name not in ("verified", "failed") else ""
-        note = ("<small>median %.1fh%s</small>" % (median, " · worst %.1fh" % worst if worst is not None else "")) if median is not None else "<small>%s</small>" % html.escape(getattr(state, "waits_error", "median unavailable"))
+        note = ("<small>median %.1fh%s</small>" % (median, " | worst %.1fh" % worst if worst is not None else "")) if median is not None else "<small>%s</small>" % html.escape(getattr(state, "waits_error", "median unavailable"))
         if name == bottleneck:
-            note = "<small>bottleneck - median %.1fh%s</small>" % (median, " · worst %.1fh" % worst if worst is not None else "")
+            note = "<small>bottleneck - median %.1fh%s</small>" % (median, " | worst %.1fh" % worst if worst is not None else "")
         cards.append('<a class="step-card state-%s%s" href="/tickets?state=%s"><strong>%d</strong><span>%s</span>%s</a>' % (
             name, mark, name, len(by_state[name]), name, note))
     return "".join(cards), bottleneck
