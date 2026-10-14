@@ -36,6 +36,8 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # that is one tick (REPORT_GRACE) past due is overdue.
 REPORT_EVERY = 2 * 3600
 REPORT_GRACE = 30 * 60
+TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
+STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
@@ -1863,6 +1865,74 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
                          % (holder, lock_repo))
 
 
+def _step_record(message: str) -> Dict[str, Any]:
+    """Read the recorded step fields from one lock commit message."""
+    current_holder = re.search(r"holder=(\S+)", message)
+    record = {"holder": current_holder.group(1) if current_holder else None,
+              "started_at": None,
+              "step": None, "step_index": None, "steps": list(TICK_STEPS), "notes": []}
+    encoded = next((line[len(STEP_MARKER):] for line in message.splitlines()
+                    if line.startswith(STEP_MARKER)), "")
+    if encoded:
+        try:
+            saved = json.loads(encoded)
+            record.update({k: saved[k] for k in ("started_at", "step", "step_index", "notes")})
+        except (ValueError, TypeError, KeyError):
+            pass
+    return record
+
+
+def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
+              note: Optional[str] = None, holder: Optional[str] = None,
+              now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Read the tick record, or append one step to the current lock commit."""
+    now = now or datetime.now(timezone.utc)
+    ref_path = "/repos/%s/git/ref/heads/%s" % (lock_repo, lock.LOCK_BRANCH)
+    ref = gh.rest("GET", ref_path, ok=(404,))
+    if ref.status == 404:
+        return _step_record("")
+    sha = ref.data["object"]["sha"]
+    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha), ok=(404,))
+    if commit.status == 404:
+        return _step_record("")
+    message = str(commit.data.get("message") or "")
+    record = _step_record(message)
+    if step is None:
+        return record
+    if step not in TICK_STEPS:
+        raise ValueError("step must be one of %s" % ", ".join(TICK_STEPS))
+    lock_info = lock._read_lock(gh, lock_repo)
+    if lock_info is None or lock_info[0] != holder or lock_info[1] is None or lock_info[1] <= now:
+        raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
+                         % (holder, lock_repo))
+    at = _iso(now)
+    if step == "lock" or not record["started_at"]:
+        record["started_at"] = at
+        record["notes"] = []
+    record["step"] = step
+    record["step_index"] = TICK_STEPS.index(step) + 1
+    if note:
+        if "\n" in note or "\r" in note:
+            raise ValueError("note must be one line")
+        record["notes"].append({"ts": at, "step": step, "text": note})
+    record["holder"] = holder
+    clean = "\n".join(line for line in message.splitlines() if not line.startswith(STEP_MARKER))
+    new_message = clean + "\n" + STEP_MARKER + json.dumps(
+        {k: record[k] for k in ("started_at", "step", "step_index", "notes")}, separators=(",", ":"))
+    created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
+        "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
+    gh.rest("PATCH", ref_path, {"sha": created.data["sha"], "force": True})
+    return record
+
+
+def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(tick_step(gh, _repo(args.lock_repo), args.name,
+                                   args.note, args.holder), sort_keys=True))
+    except GitHubError as exc:
+        print("brain step write failed: %s" % exc, file=sys.stderr)
+
+
 def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
                    ) -> List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]:
     # Nothing is caught here: a GitHubError ends the command through main's
@@ -2199,6 +2269,7 @@ def parser() -> argparse.ArgumentParser:
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True)
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True)
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
+    st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -2294,6 +2365,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate}
+COMMANDS["step"] = _cmd_step
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

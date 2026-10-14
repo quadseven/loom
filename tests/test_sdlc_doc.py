@@ -21,6 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "SDLC.md"
+MUSE = ROOT / "docs" / "MUSE.md"
 
 sys.path.insert(0, str(ROOT))
 
@@ -113,6 +114,18 @@ class SdlcDoc(unittest.TestCase):
                              "one ticket written out as #N: %s" % line)
             self.assertNotIn(cited[0], merged,
                              "already merged, so not planned: %s" % line)
+
+    def test_each_muse_tick_step_records_its_name_first(self):
+        text = MUSE.read_text(encoding="utf-8")
+        for step in ("lock", "status", "merge", "verify", "failed", "asks",
+                     "brief", "triage", "journal", "unlock"):
+            with self.subTest(step=step):
+                number = 10 if step == "unlock" else {"lock": 1, "status": 2,
+                    "merge": 3, "verify": 4, "failed": 5, "asks": 6,
+                    "brief": 7, "triage": 8, "journal": 9}[step]
+                end = r"(?=\n%d\.|\Z)" % (number + 1)
+                self.assertRegex(text, r"(?ms)^%d\..*?python3 -m bus\.brain step %s.*?%s"
+                                 % (number, step, end))
 
 
 if __name__ == "__main__":
