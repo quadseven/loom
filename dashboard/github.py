@@ -119,36 +119,49 @@ class TicketStore:
         if self._refresh_thread is not None:
             self._refresh_thread.join(timeout=2)
 
+    def _below_floor(self) -> bool:
+        return self._last_remaining is not None and self._last_remaining < self.budget_floor
+
+    @staticmethod
+    def _error_reason(exc: Exception) -> str:
+        reason = str(exc)
+        if isinstance(exc, GitHubError) and exc.body:
+            try:
+                detail = json.loads(exc.body).get("message")
+            except (ValueError, AttributeError):
+                detail = None
+            if detail:
+                reason += ": " + str(detail)
+        return reason
+
+    def _read_repo(self, repo: str) -> List[Dict[str, Any]]:
+        # Every request goes through bus.github's transport, which applies its TIMEOUT.
+        issues = self.gh.paginate("/repos/%s/issues?labels=loom%%3Aticket&state=all" % quote(repo, safe="/"))
+        return [ticket_record(repo, item) for item in issues
+                if isinstance(item, dict) and "pull_request" not in item
+                and "loom:ticket" in _label_names(item)]
+
+    def _note_budget(self) -> None:
+        remaining = self.gh.rate.get("core", (None, 0, 0))[0]
+        if isinstance(remaining, int):
+            self._last_remaining = remaining
+
     def refresh(self) -> None:
         with self._refresh_lock:
             current = self._snapshot
             data = dict(current["tickets"])
             errors = dict(current["errors"])
-            stale = self._last_remaining is not None and self._last_remaining < self.budget_floor
-            if not stale:
-                for repo in self.repos:
-                    if self._last_remaining is not None and self._last_remaining < self.budget_floor:
-                        stale = True
-                        break
-                    try:
-                        issues = self.gh.paginate("/repos/%s/issues?labels=loom%%3Aticket&state=all" % quote(repo, safe="/"))
-                        data[repo] = [ticket_record(repo, item) for item in issues
-                                      if isinstance(item, dict) and "pull_request" not in item
-                                      and "loom:ticket" in _label_names(item)]
-                        errors.pop(repo, None)
-                    except (GitHubError, OSError, ValueError) as exc:
-                        reason = str(exc)
-                        if isinstance(exc, GitHubError) and exc.body:
-                            try:
-                                detail = json.loads(exc.body).get("message")
-                            except (ValueError, AttributeError):
-                                detail = None
-                            if detail:
-                                reason += ": " + str(detail)
-                        errors[repo] = reason
-                    remaining = self.gh.rate.get("core", (None, 0, 0))[0]
-                    if isinstance(remaining, int):
-                        self._last_remaining = remaining
+            stale = self._below_floor()
+            for repo in ([] if stale else self.repos):
+                if self._below_floor():
+                    stale = True
+                    break
+                try:
+                    data[repo] = self._read_repo(repo)
+                    errors.pop(repo, None)
+                except (GitHubError, OSError, ValueError) as exc:
+                    errors[repo] = self._error_reason(exc)
+                self._note_budget()
             snapshot = {"tickets": data, "errors": errors, "stale": stale, "ready": True}
             with self._snapshot_lock:
                 self._snapshot = snapshot

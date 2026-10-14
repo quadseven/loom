@@ -150,6 +150,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(t.calls[3][2]["If-None-Match"], '"b"')
         self.assertEqual(gh.not_modified, 2)
 
+    def test_a_kept_full_page_still_reads_the_page_added_after_it(self):
+        # 2026-10-14: an issue's comments grew past 100 while page 1 stayed
+        # the same, so page 1 kept answering 304 with its old (empty) link
+        # and the station never read comment 101 on, posting the daily
+        # metrics line again every pass.
+        t = Scripted(reply(200, [1, 2], {"ETag": '"a"'}),   # first read: full, no next
+                     reply(304),                              # later: page 1 unchanged
+                     reply(200, [3], {"ETag": '"b"'}),        # the page added since
+                     reply(304), reply(304))                  # next read: both kept
+        with tempfile.TemporaryDirectory() as d:
+            gh = GitHub("tok", transport=t, cache_dir=d)
+            self.assertEqual(gh.paginate("/p?per_page=2"), [1, 2])
+            self.assertEqual(gh.paginate("/p?per_page=2"), [1, 2, 3])
+            self.assertEqual(t.calls[2][1], "https://api.github.com/p?per_page=2&page=2")
+            self.assertEqual(gh.paginate("/p?per_page=2"), [1, 2, 3])
+        # Page 2 is not full, so the third read stops there: five requests.
+        self.assertEqual(len(t.calls), 5)
+
     def test_without_a_cache_no_etag_is_sent(self):
         t = Scripted(reply(200, [1], {"ETag": '"v1"'}), reply(200, [1], {"ETag": '"v1"'}))
         gh = GitHub("tok", transport=t)

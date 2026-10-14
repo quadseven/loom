@@ -73,6 +73,32 @@ tickets and pull requests like any other work.
   is already open; add the new evidence there instead.
 - Review the other brains' Loom pull requests like any lane PR.
 
+## Remote pull lane
+
+The `muse` lane runs on a remote VM and pulls its ticket from GitHub. It does
+not use the station's local brief inbox. A scheduled lane task runs these
+steps on each tick:
+
+1. Pull the Loom checkout, publish availability with
+   `python3 -m bus.lane heartbeat --lane muse`, then run
+   `python3 -m bus.lane claim --lane muse`.
+   The command returns the oldest eligible public ticket and its rendered
+   brief. If there is no work, end the tick.
+2. Clone that repository, check out the brief's `loom/<n>-<slug>` branch,
+   then read the brief and make its change.
+3. Run the repository's `.loom/validation.conf` check, commit and push the
+   branch. Keep a heartbeat current while working with
+   `python3 -m bus.lane heartbeat OWNER/NAME#N --lane muse`.
+4. Open the pull request with `python3 -m bus.lane pr OWNER/NAME#N
+   --base BASE`. The command writes the standard Intent section, class label
+   and ticket reference, then moves the ticket to `loom:pr`.
+5. Journal one line on the ticket describing the result.
+
+Claims expire after two hours without a heartbeat. A claim without a pull
+request expires after three hours and returns to `loom:queued` with a
+`[transient]` reason. The brain tick remains a separate process and follows
+the regular brain instructions above.
+
 ## Handing off stage work
 
 Every brain may stop short: out of budget, out of time, or out of scope.
@@ -274,11 +300,13 @@ on hard work):
 
 - Easy: `spark` (the local vLLM coder, model `spark/...`, any repo, private
   ones included) when lane status shows it available, else a free lane:
-  opencode-go, openrouter, workersai, or zen, zai, agy and opencode-go-4
-  on public repos only (opencode-go-4 is Muse Spark, which trains on prompts).
+  opencode-go, openrouter, workersai, or zen, zai, agy, opencode-go-4 and muse
+  on public repos only (opencode-go-4 is Muse Spark, which trains on prompts;
+  muse runs remotely).
   Never anthropic or claude for an easy ticket.
 - Medium: codex or opencode-go first (opencode-go-4 on public repos only); an
-  anthropic slot only when every codex and opencode-go slot already holds work.
+  anthropic slot only when every codex and opencode-go slot already holds work;
+  then muse on public repos only.
 - Hard: anthropic, claude or codex, never a free lane or spark. Keep the
   anthropic slots busy with hard work while the credit lasts.
 

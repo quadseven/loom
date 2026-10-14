@@ -111,13 +111,19 @@ class DashboardTest(unittest.TestCase):
             threading.Event().wait(0.01)
         before = len(self.api_calls)
         self.get_json("/api/tickets")
-        self.get_json("/")
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        try:
+            connection.request("GET", "/")
+            connection.getresponse().read()
+        finally:
+            connection.close()
         self.assertEqual(len(self.api_calls), before)
 
     def test_conditional_request_and_budget_floor_stale_response(self):
         self.store.refresh()
         self.store.budget_floor = 20
         before = len(self.api_calls)
+        self.store.refresh()
         payload = self.get_json("/api/tickets")
         self.assertEqual(len(self.api_calls), before)
         self.assertTrue(payload["stale"])

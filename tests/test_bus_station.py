@@ -616,7 +616,9 @@ class BudgetTest(Base):
         transport, _ = self.low(remaining=4000)
         _, err = self.passes(transport)
         self.assertEqual(len(self.gets("loom:pr")), 2)
-        self.assertEqual(len(self.gets("loom:lanes")), 1)
+        # One lookup finds the status issue; the other reads the remote
+        # lane heartbeat from that issue's comments.
+        self.assertEqual(len(self.gets("loom:lanes")), 2)
         self.assertNotIn("budget low", err)
         self.assertIn("budget 4000 of 5000 left", err)
 
