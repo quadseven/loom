@@ -34,7 +34,7 @@ def _body_field(body: str, key: str) -> Optional[str]:
 def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     names = _label_names(issue)
     body = str(issue.get("body") or "")
-    goal_match = re.search(r"^(?:Part of|Refs)[ \t]+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#?(\d+)", body, re.M)
+    goal_match = re.search(r"^[ \t]*(?:Part of|Refs)[ \t]+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#?(\d+)", body, re.M)
     goal = None
     if goal_match:
         goal = (goal_match.group(1) or repo) + "#" + goal_match.group(2)
