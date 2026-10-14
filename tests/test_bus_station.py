@@ -69,6 +69,15 @@ class FakeGitHub:
         self.replies = []
         self.resolved = []
         self.open_issues = []
+        # Issues of other repos, read by an After: line: (repo, number) -> issue.
+        self.foreign = {}
+
+    def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
+        """An issue in another repo, as an After: line that names one reads it."""
+        self.foreign[(repo, number)] = {
+            "number": number, "title": "Elsewhere", "state": state, "state_reason": reason,
+            "body": "", "user": {"login": "alice-example"},
+            "labels": [{"name": "loom:ticket"}] + [{"name": x} for x in labels]}
 
     def add_goal(self, number, journals=(), title="Goal"):
         """journals: (login, age in seconds) pairs, posted as journal comments."""
@@ -149,6 +158,10 @@ class FakeGitHub:
             return self._graphql(data)
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private})
+        other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
+        if other and other.group(1) != REPO:
+            found = self.foreign.get((other.group(1), int(other.group(2))))
+            return reply(200, found) if found else reply(404, {"message": "Not Found"})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
             return self._post_page(data)
@@ -197,6 +210,9 @@ class FakeGitHub:
         if "labels=loom%3Amerged" in query or "labels=loom:merged&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:merged" in self.names(i["number"])])
+        if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:ticket" in self.names(i["number"])])
         if "needs-operator" in query:
             return self._list_asks(headers)
         if "loom:human" in query:
@@ -271,6 +287,8 @@ class FakeGitHub:
                 return reply(200, self.events[n])
             found = {None: self.issues, "events": self.events, "comments": self.comments}
             if sub in found:
+                if sub is None and n not in found[sub]:
+                    return reply(404, {"message": "Not Found"})
                 return reply(200, found[sub][n])
         if method == "POST" and sub == "comments":
             self.comments[n].append({"body": data["body"]})
@@ -1053,6 +1071,66 @@ class ClaimTest(Base):
         self.fake.add(12, body="Not before: tomorrow\n" + BODY)
         self.run_pass()
         self.assertEqual(self.listing(), [])
+
+    def test_a_ticket_waits_for_the_tickets_its_after_line_names(self):
+        self.settings.factory_on = True  # the pass that gives the queued ticket a lane
+        self.fake.add(5, title="Land the package", state="pr")
+        self.fake.add(12, state="queued", body="After: #5\n" + BODY)
+        self.run_pass()
+        self.assertIn("loom:briefed", self.fake.names(12))
+        self.run_pass()  # its dependency has not merged, so no lane takes it
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:briefed", self.fake.names(12))
+        # The dependency merges: the next pass claims the ticket.
+        self.fake.issues[5]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"},
+                                          {"name": "lane:codex"}]
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_a_ticket_already_briefed_waits_too(self):
+        self.fake.add(5, title="Land the package", state="pr")
+        self.fake.add(12, body="After: #5\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.fake.paths("PUT"), [])
+
+    def test_a_dependency_of_another_repo_is_read_from_there(self):
+        self.fake.add_foreign("other-owner/other-repo", 5, labels=("loom:merged",))
+        self.fake.add(12, body="After: other-owner/other-repo#5\n" + BODY)
+        self.run_pass()
+        self.assertIn("/repos/other-owner/other-repo/issues/5", self.fake.paths())
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
+    def test_a_dependency_closed_not_planned_releases_the_hold(self):
+        self.fake.add(5, title="Dropped", state="queued")
+        self.fake.issues[5]["state"] = "closed"
+        self.fake.issues[5]["state_reason"] = "not_planned"
+        self.fake.add(12, body="After: #5\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        said = [c["body"] for c in self.fake.comments[12]]
+        self.assertEqual(len(said), 2, said)
+        self.assertIn("<!-- loom:after-release 5 -->", said[0])
+        self.assertIn("#5 was closed as not planned", said[0])
+
+    def test_the_release_is_said_once_however_many_passes_run(self):
+        self.fake.add(5, title="Dropped")
+        self.fake.issues[5]["state"] = "closed"
+        self.fake.issues[5]["state_reason"] = "not_planned"
+        self.fake.add(12, body="After: #5\n" + BODY)
+        self.run_pass()
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:briefed"},
+                                          {"name": "lane:codex"}]
+        self.run_pass()
+        self.assertEqual(sum("loom:after-release" in str(c["body"])
+                             for c in self.fake.comments[12]), 1)
+
+    def test_an_after_line_that_cannot_be_read_holds_the_ticket(self):
+        self.fake.add(12, body="After: #404\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:briefed", self.fake.names(12))
 
     def test_the_oldest_trusted_ticket_wins_and_untrusted_ones_are_skipped(self):
         self.fake.add(5, author="stranger", created="2030-01-01T00:00:00Z")
