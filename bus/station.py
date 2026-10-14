@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import metrics
+from . import revert
 from . import spend
 from . import text as _text
 from . import tickets
@@ -965,8 +966,10 @@ class Station:
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]]) -> None:
         """Claim the oldest ticket for one free lane that can be claimed."""
-        # A regression fix (bus.brain brief --regresses) goes first.
+        # A revert of a red default branch (bus/revert.py) goes first, then
+        # a regression fix (bus.brain brief --regresses).
         cands = sorted(found, key=lambda c: (
+            factory.REVERT_LABEL not in _label_names(c[1]),
             REGRESSION not in _label_names(c[1]),
             str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
         for repo, issue in cands:
@@ -2952,13 +2955,26 @@ class Station:
         factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
         if not self.s.factory_on or not factory.due(self.state, self.now):
             return
+        self._factory().run()
+
+    def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
-        factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
-                        review_check=self.s.review_check,
-                        review_bot=self.s.review_bot,
-                        limited=self.limited_lanes(),
-                        no_test_repos=self.s.no_test_repos,
-                        available=[x for x in LANES if self._heartbeat_ok(x)]).run()
+        return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                               review_check=self.s.review_check,
+                               review_bot=self.s.review_bot,
+                               limited=self.limited_lanes(),
+                               no_test_repos=self.s.no_test_repos,
+                               available=[x for x in LANES if self._heartbeat_ok(x)])
+
+    def watch_default_branches(self) -> None:
+        """Revert a lane merge that turned a default branch red (bus/revert.py),
+        every pass, with the factory: LOOM_FACTORY=0 turns both off."""
+        if not self.s.factory_on:
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        revert.Reverts(self.gh, repos, self.now, trusted=self.s.authors,
+                       review_check=self.s.review_check, lanes=self._factory,
+                       state_dir=self.state).run()
 
     def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
         dated = {}
@@ -3167,7 +3183,7 @@ class Station:
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
-                     self.run_factory):
+                     self.watch_default_branches, self.run_factory):
             if self._deferred():
                 break
             try:

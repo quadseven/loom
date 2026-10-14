@@ -95,6 +95,7 @@ if [ "$1 $2" = "pr edit" ]; then
   exit 0
 fi
 if [ "$1 $2" = "pr create" ]; then
+  case " $* " in *" --label "*) [ -z "${FAKE_GH_NO_LABELS:-}" ] || { echo "could not add label: 'class:logic' not found" >&2; exit 1; } ;; esac
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY"; shift; done
   echo "https://github.com/example/repo/pull/7"
 fi
@@ -447,6 +448,18 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("fix.txt", files)
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_repo_without_the_class_labels_still_gets_its_pr(self):
+        # gh pr create fails outright on a label the repo lacks; the label is
+        # added after, best effort.
+        self.drop_brief()
+        result = self.run_lane(FAKE_GH_NO_LABELS="1", FAKE_GH_EDIT_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+        create = [c for c in self.calls() if c.startswith("gh pr create")]
+        self.assertEqual(len(create), 1)
+        self.assertNotIn("--label", create[0])
+        self.assertTrue(any(c.startswith("gh pr edit") and "--add-label class:" in c for c in self.calls()))
 
     def test_brief_base_branch_is_cloned_and_targeted_by_the_pr(self):
         # The remote's default branch is not where work lands: seed one with
