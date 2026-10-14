@@ -3697,9 +3697,26 @@ class Station:
         except OSError as err:
             _say("prune_trees failed: %s" % err)
         try:
-            usage.write(self.s.home, usage.collect(self.s.home, now=self.now))
+            records = usage.collect(self.s.home, now=self.now)
+            usage.write(self.s.home, records)
+            self.upload_usage_limits(records)
         except OSError as err:
             _say("could not write usage limits: %s" % err)
+
+    def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
+        """Send the current limits snapshot using the transcript upload token."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        url = self.s.transcript_url.removesuffix("/api/transcripts") + "/api/usage"
+        token = self._transcript_token()
+        if token is None:
+            return
+        try:
+            self.upload(url, token, records)
+        except UploadRefused as err:
+            _say("the dashboard refused the usage snapshot (%d)" % err.status)
+        except Exception as err:  # noqa: BLE001
+            _say("usage snapshot upload failed (%s)" % type(err).__name__)
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
