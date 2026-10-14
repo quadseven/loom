@@ -96,6 +96,12 @@ Briefs, logs and keys never go to GitHub: this repo is public.
 3. Point a brain at it: the installed brain tick, or Muse with docs/MUSE.md.
 4. Test: `python -B -m unittest discover -s tests -v`.
 
+The station scans its own log, the brain log, and each present lane service log
+for repeated errors. Three matching lines in 30 minutes create a `loom:triage`
+issue in `LOOM_STATUS_REPO`. To choose logs explicitly, copy `watch.example`,
+edit its `name=path` lines, and set `LOOM_WATCH` to that file's path when
+installing the station. Paths in the file are relative to `LOOM_HOME`.
+
 ## Rules
 
 - One ticket, one branch, one pull request. Lanes never merge.

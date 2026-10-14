@@ -32,6 +32,7 @@ from . import spend
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
 from .github import GitHub, GitHubError, _OPENER
@@ -224,7 +225,8 @@ class Settings:
                  no_test_repos: Sequence[str] = (),
                  metrics_goal: str = "",
                  transcript_url: str = "",
-                 transcript_token_ssm: str = "") -> None:
+                 transcript_token_ssm: str = "",
+                 watch_config: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -248,6 +250,7 @@ class Settings:
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
         self.transcript_token_ssm = transcript_token_ssm
+        self.watch_config = watch_config
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -292,7 +295,8 @@ class Settings:
                    no_test_repos=words("LOOM_NO_TEST_REPOS"),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
-                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip())
+                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
+                   watch_config=env.get("LOOM_WATCH", "").strip())
 
 
 def _origin_repo() -> str:
@@ -3099,6 +3103,11 @@ class Station:
             _say("could not keep the GitHub budget: %s" % err)
 
     def run_pass(self) -> None:
+        try:
+            watch.watch(self.gh, self.s.home, self.state, self.s.status_repo,
+                        self.now, self.s.watch_config or None, _say)
+        except (GitHubError, OSError, ValueError, KeyError) as err:
+            _say("watch failed: %s" % type(err).__name__)
         self.finish_claims()
         self.report_outcomes()
         if not self._deferred():

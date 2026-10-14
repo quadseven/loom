@@ -1,0 +1,5 @@
+# Set LOOM_WATCH to the path of your copy of this file.
+# Paths are relative to LOOM_HOME unless absolute.
+station=logs/station.log
+brain=logs/brain.log
+codex=logs/codex-service.log

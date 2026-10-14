@@ -179,6 +179,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_NO_TEST_REPOS</key><string>$(xml "${LOOM_NO_TEST_REPOS:-}")</string>
     <key>LOOM_TRANSCRIPT_URL</key><string>$(xml "${LOOM_TRANSCRIPT_URL:-}")</string>
     <key>LOOM_TRANSCRIPT_TOKEN_SSM</key><string>$(xml "${LOOM_TRANSCRIPT_TOKEN_SSM:-}")</string>
+    <key>LOOM_WATCH</key><string>$(xml "${LOOM_WATCH:-}")</string>
   </dict>
 </dict>
 </plist>
