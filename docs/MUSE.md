@@ -197,6 +197,11 @@ live regression).
    and `brief --not-before` writes the line),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
+   A brief without `--lane` stays queued until the station gives it a free
+   lane of its Difficulty tier, oldest queued ticket first. Use `--lane LANE`
+   when the brain needs to choose the lane itself. A queued ticket without a
+   readable Difficulty line stays queued and appears in the goal's next
+   station standup as needing a difficulty.
 8. Triage the backlog. The station runs `python3 -m bus.brain triage
    OWNER/NAME --goal N` once an hour on every backlog goal home (the goal
    home onboard opens for a repo has a title starting `Backlog:`), with the

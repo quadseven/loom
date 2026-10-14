@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 from bus import factory, station
 from bus.github import Response
@@ -93,6 +94,9 @@ class FakeGitHub:
         return self._write(method, path, body)
 
     def _get(self, path):
+        m = re.search(r"/issues/(\d+)$", path)
+        if m:
+            return Response(200, self.issues[int(m.group(1))])
         m = re.search(r"/pulls/(\d+)$", path)
         if m:
             return Response(200, self.pulls[int(m.group(1))])
@@ -829,6 +833,57 @@ class Trust(Base):
         self.assertEqual((self.lane(5), self.model(5)), ("codex", None))
 
 
+class Queued(Base):
+    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n", age=0):
+        self.gh.ticket(number, "queued", body=body)
+        self.gh.issues[number]["labels"] = [
+            {"name": "loom:ticket"}, {"name": "loom:queued"}]
+        self.gh.issues[number]["created_at"] = iso(age)
+
+    def assign(self, limited=(), available=None):
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 limited=limited, available=available)
+        worker.assign_queued()
+        return worker
+
+    def test_private_medium_uses_the_least_loaded_available_tier_lane(self):
+        self.queued(7)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=["codex-2", "opencode-go-4"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertEqual(self.lane(7), "codex-2")
+        self.assertIn("lane codex-2", self.gh.comments[7][-1]["body"])
+        say.assert_called_once_with("gave queued %s#7 lane codex-2 (tier medium)" % REPO)
+
+    def test_busy_briefed_lane_is_passed_over(self):
+        self.gh.ticket(6, "briefed", lane="codex")
+        self.queued(7)
+        self.assign(available=["codex", "codex-2"])
+        self.assertEqual(self.lane(7), "codex-2")
+
+    def test_future_not_before_stays_queued(self):
+        self.queued(7, body="Not before: 2099-01-01T00:00:00Z\nDifficulty: medium\n\n## Why\nx\n")
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_missing_difficulty_stays_queued(self):
+        self.queued(7, body="## Why\nx\n")
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_oldest_takes_the_free_lane_first(self):
+        self.queued(7, age=60)
+        self.queued(8, age=600)
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_limited_and_unavailable_lanes_are_passed_over(self):
+        self.queued(7)
+        self.assign(limited=["codex"], available=["codex", "codex-2"])
+        self.assertEqual(self.lane(7), "codex-2")
+
+
 class Tickets(Base):
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
         self.gh.ticket(6, "failed", lane="zai")
@@ -1099,6 +1154,18 @@ class Helpers(unittest.TestCase):
             factory.Factory = real
         self.assertEqual(calls, [((REPO,), ("alice-example",), "Review", (),
                                   ("example-org/no-tests",)), "ran"])
+
+    def test_the_station_assigns_queued_on_every_pass(self):
+        with tempfile.TemporaryDirectory() as home:
+            settings = station.Settings(home, [REPO], ["alice-example"], [], factory_on=True)
+            st = station.Station(FakeGitHub(), settings, now=NOW)
+            with mock.patch.object(st, "_factory") as make_factory:
+                st.assign_queued()
+                st.assign_queued()
+                self.assertEqual(make_factory.return_value.assign_queued.call_count, 2)
+                settings.factory_on = False
+                st.assign_queued()
+                self.assertEqual(make_factory.return_value.assign_queued.call_count, 2)
 
 
 if __name__ == "__main__":
