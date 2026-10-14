@@ -46,6 +46,13 @@ class ChangeClassTest(unittest.TestCase):
         self.assertIn("Files:", body)
         self.assertIn("## Why\nx", body)
 
+    def test_degenerate_dot_slash_path_never_sensitive(self):
+        self.assertFalse(change_class.is_sensitive("./", ["/"]))
+        self.assertFalse(change_class.is_sensitive("./", [".github/"]))
+        self.assertFalse(change_class.is_sensitive("a/b.py", ["/"]))
+        self.assertTrue(change_class.is_sensitive(
+            ".github/workflows/ci.yml", [".github/"]))
+
     def test_behavior_lines_fall_back_to_what(self):
         self.assertEqual(change_class.behavior_lines("", "Make it work.\n\nAgain."),
                          ["Make it work.", "Again."])

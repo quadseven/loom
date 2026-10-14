@@ -93,12 +93,16 @@ def is_sensitive(path: str, patterns: Sequence[str]) -> bool:
     if not p or not patterns:
         return False
     norm = p[2:] if p.startswith("./") else p
+    if not norm:
+        return False
     for pat in patterns:
         pat = (pat or "").strip()
         if not pat:
             continue
         if pat.endswith("/"):
             prefix = pat.rstrip("/")
+            if not prefix:
+                continue
             if norm == prefix or norm.startswith(prefix + "/"):
                 return True
             continue
