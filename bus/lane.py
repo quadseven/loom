@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -57,6 +58,18 @@ def _pull_for(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
     found = gh.paginate("/repos/%s/pulls?state=all&head=%s"
                         % (repo, quote("%s:%s" % (owner, branch), safe="")))
     return next((p for p in found if isinstance(p, dict)), None)
+
+
+def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
+    owner = repo.split("/", 1)[0]
+    found = gh.paginate("/repos/%s/pulls?state=all&head=%s"
+                        % (repo, quote("%s:%s" % (owner, branch), safe="")))
+    for p in found:
+        if isinstance(p, dict) and (p.get("state") == "open"
+                                    or p.get("merged_at") is not None
+                                    or p.get("merged") is True):
+            return p
+    return None
 
 
 def _to_pr(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str) -> None:
@@ -140,20 +153,42 @@ def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
 def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
           now: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """Claim the oldest public queued issue assigned to a configured lane."""
+    if not repos:
+        raise ValueError("claim requires --repos or LOOM_REPOS")
     if lane not in REMOTE_LANES:
         raise ValueError("unknown remote lane: %s" % lane)
     now = time.time() if now is None else now
-    if _recover_and_count(gh, repos, lane, now) >= REMOTE_LANES[lane]["slots"]:
-        return None
-    for repo, issue in _candidates(gh, repos, lane):
-        recent = [at for _, at in _claims(_comments(gh, repo, int(issue["number"])), lane)
-                  if now - at < CLAIM_AGE]
-        if len(recent) >= REMOTE_LANES[lane]["slots"]:
-            continue
-        result = _take(gh, repo, issue, lane, now)
-        print(json.dumps(result))
-        return result
-    return None
+    active = _recover_and_count(gh, repos, lane, now)
+    candidates = _candidates(gh, repos, lane)
+    skipped: List[str] = []
+    claimed_result: Optional[Dict[str, Any]] = None
+
+    if active >= REMOTE_LANES[lane]["slots"]:
+        for repo, issue in candidates:
+            skipped.append("#%s skipped: lane slots full" % issue["number"])
+    else:
+        for repo, issue in candidates:
+            branch = tickets.branch_for(int(issue["number"]), str(issue.get("title") or ""))
+            pr = _open_or_merged_pull(gh, repo, branch)
+            if pr is not None:
+                skipped.append("#%s skipped: branch %s already has pull request #%s" %
+                               (issue["number"], branch, pr.get("number", "")))
+                continue
+            recent = [at for _, at in _claims(_comments(gh, repo, int(issue["number"])), lane)
+                      if now - at < CLAIM_AGE]
+            if len(recent) >= REMOTE_LANES[lane]["slots"]:
+                skipped.append("#%s skipped: claim active" % issue["number"])
+                continue
+            claimed_result = _take(gh, repo, issue, lane, now)
+            break
+
+    summary = "scanned %d repos, found %d candidates" % (len(repos), len(candidates))
+    if skipped:
+        summary += ": " + "; ".join(skipped)
+    print(summary, file=sys.stderr)
+    if claimed_result:
+        print(json.dumps(claimed_result))
+    return claimed_result
 
 
 def heartbeat(gh: GitHub, repo: str, number: int, lane: str = "muse",
@@ -278,7 +313,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         gh = GitHub(token_from_env())
         if args.command == "claim":
-            result = claim(gh, args.repos.replace(",", " ").split(), args.lane)
+            repos = [r for r in args.repos.replace(",", " ").split() if r]
+            if not repos:
+                raise ValueError("claim requires --repos or LOOM_REPOS")
+            result = claim(gh, repos, args.lane)
             return 0 if result else 1
         repo, _, raw = args.ticket.partition("#")
         if args.command == "heartbeat" and not args.ticket:

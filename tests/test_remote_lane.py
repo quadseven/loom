@@ -1,4 +1,5 @@
 import base64
+import io
 import os
 import re
 import sys
@@ -149,6 +150,33 @@ class RemoteLaneTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "plan checks"):
             self.open_pr(gh)
         self.assertFalse([c for c in gh.calls if c[0] == "POST" and c[1].endswith("/pulls")])
+
+    def test_claim_skips_queued_ticket_whose_branch_has_a_pull_request(self):
+        gh = FakeGitHub()
+        gh.pulls = [{"number": 99, "state": "open"}]
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            got = lane.claim(gh, ["example/project"], now=1000)
+        self.assertIsNone(got)
+        self.assertEqual(labels(gh)[-1], "loom:queued")
+        self.assertIn("scanned 1 repos, found 1 candidates", buf.getvalue())
+        self.assertIn("#4 skipped: branch loom/4-add-a-feature already has pull request #99", buf.getvalue())
+
+    def test_claim_with_no_repos_exits_2(self):
+        with mock.patch.dict(os.environ, {"LOOM_REPOS": ""}):
+            buf = io.StringIO()
+            with mock.patch("sys.stderr", buf):
+                code = lane.main(["claim", "--lane", "muse", "--repos", ""])
+            self.assertEqual(code, 2)
+            self.assertIn("error: claim requires --repos or LOOM_REPOS", buf.getvalue())
+
+    def test_claim_prints_stderr_line_per_run(self):
+        gh = FakeGitHub()
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            got = lane.claim(gh, ["example/project"], now=1000)
+        self.assertIsNotNone(got)
+        self.assertIn("scanned 1 repos, found 1 candidates", buf.getvalue())
 
 
 class TakesTest(unittest.TestCase):

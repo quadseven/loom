@@ -1161,9 +1161,12 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
     if state not in STATES:
         raise ValueError("invalid state")
     if lane is not None:
-        if lane in REMOTE_LANES and state != "queued":
-            raise ValueError("remote lane %s only works with --to queued" % lane)
-        if lane not in LANES and lane not in REMOTE_LANES:
+        if lane in REMOTE_LANES:
+            if state != "queued":
+                raise ValueError("remote lane %s only works with --to queued" % lane)
+        elif state == "queued":
+            raise ValueError("local lane %s: use --to briefed instead" % lane)
+        elif state != "briefed" or lane not in LANES:
             raise ValueError("lane is valid only for briefed and must be known")
     if model is not None and state != "briefed":
         raise ValueError("model is valid only for briefing")
@@ -1241,6 +1244,18 @@ def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
     return comment
 
 
+def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
+    owner = repo.split("/", 1)[0]
+    found = gh.paginate("/repos/%s/pulls?state=all&head=%s"
+                        % (repo, quote("%s:%s" % (owner, branch), safe="")))
+    for p in found:
+        if isinstance(p, dict) and (p.get("state") == "open"
+                                    or p.get("merged_at") is not None
+                                    or p.get("merged") is True):
+            return p
+    return None
+
+
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
          record: Optional[Dict[str, Any]] = None,
@@ -1251,21 +1266,18 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     _check_move_args(state, lane, note, model)
     if (state == "verified") != (record is not None):
         raise ValueError("verified needs a proof record, and no other state takes one")
-    
-    if lane in REMOTE_LANES:
-        if state != "queued":
-            raise ValueError("remote lane %s only works with --to queued" % lane)
-        repo_info = gh.rest("GET", "/repos/%s" % repo).data
-        if repo_info.get("private") is True:
-            raise ValueError("this repo is public: name another repo's issue in words instead of a link")
-    
-    if state == "queued" and lane not in REMOTE_LANES:
-        raise ValueError("local lane %s: use --to briefed instead" % lane)
-    
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
-    if lane is not None:
+    if state == "queued" and lane in REMOTE_LANES:
+        repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
+        if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+            raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
+        branch = tickets.branch_for(number, str(issue.get("title") or ""))
+        pr = _open_or_merged_pull(gh, repo, branch)
+        if pr is not None:
+            raise ValueError("ticket branch %s already has a pull request" % branch)
+    if lane is not None and state == "briefed":
         from .station import model_lanes
         body = str(issue.get("body") or "").split("\n\n", 1)[0]
         match = re.search(r"^Model:\s*(\S+)\s*$", body, re.M)

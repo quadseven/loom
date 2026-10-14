@@ -457,11 +457,12 @@ class BrainTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         with self.assertRaises(ValueError) as ctx:
             brain.move(gh, repo, 8, "queued", "muse")
-        self.assertIn("this repo is public", str(ctx.exception))
+        self.assertIn("this repo is private", str(ctx.exception))
+        self.assertIn("public", str(ctx.exception))
         fake.assert_all_used()
 
     def test_move_remote_lane_with_non_queued_state_raises_error(self):
-        fake = Fake(reply(200, {"state": "open", "labels": []}))
+        fake = Fake()
         gh = GitHub("t", transport=fake)
         with self.assertRaises(ValueError) as ctx:
             brain.move(gh, REPO, 8, "briefed", "muse")
@@ -469,7 +470,7 @@ class BrainTests(unittest.TestCase):
         fake.assert_all_used()
 
     def test_move_local_lane_with_queued_state_raises_error(self):
-        fake = Fake(reply(200, {"state": "open", "labels": []}))
+        fake = Fake()
         gh = GitHub("t", transport=fake)
         with self.assertRaises(ValueError) as ctx:
             brain.move(gh, REPO, 8, "queued", "codex")
@@ -478,12 +479,29 @@ class BrainTests(unittest.TestCase):
 
     def test_move_remote_lane_on_public_repo_succeeds(self):
         fake = Fake(
+            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
             reply(200, {"private": False}),
-            reply(200, {"state": "open", "labels": []})
+            reply(200, []),
+            reply(200, {}),
+            reply(201, {})
         )
         gh = GitHub("t", transport=fake)
-        brain.move(gh, REPO, 8, "queued", "muse")
-        self.assertEqual(len(fake.calls), 2)
+        brain.move(gh, REPO, 8, "queued", "muse", note="moving to muse")
+        self.assertEqual(len(fake.calls), 5)
+        self.assertEqual(fake.calls[3][2], {"labels": ["loom:ticket", "loom:queued", "lane:muse"]})
+        self.assertEqual(fake.calls[4][2], {"body": "moving to muse"})
+        fake.assert_all_used()
+
+    def test_move_remote_lane_with_pull_request_refuses(self):
+        fake = Fake(
+            reply(200, {"state": "open", "title": "My Title", "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"private": False}),
+            reply(200, [{"number": 12, "state": "open"}])
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(ValueError) as ctx:
+            brain.move(gh, REPO, 8, "queued", "muse")
+        self.assertIn("already has a pull request", str(ctx.exception))
         fake.assert_all_used()
 
     def _merge_replies(self, changes=None):
@@ -864,44 +882,6 @@ class FixTests(unittest.TestCase):
         fix = tickets.parse_fix(REPO, body)
         self.assertEqual((fix.pr, fix.branch), (8, "loom/9-work"))
         self.assertIn("\n    ## Why\n", fix.findings)
-
-    def test_move_remote_lane_remote_valid(self):
-        gh = GitHub("t", transport=Fake([
-            {"method": "GET", "path": "/repos/quadseven/loom", "reply": {"private": False}},
-            {"method": "GET", "path": "/repos/quadseven/loom/issues/1", "reply": {
-                "id": 1, "number": 1, "title": "Test", "state": "open",
-                "labels": [{"name": "loom:ticket"}, {"name": "lane:codex"}]
-            }},
-            {"method": "PATCH", "path": "/repos/quadseven/loom/issues/1", "reply": {
-                "id": 1, "number": 1, "title": "Test", "state": "open",
-                "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}, {"name": "lane:muse"}]
-            }},
-        ]))
-        move(gh, REPO, 1, "queued", "muse", None, None)
-        calls = gh.transport._calls
-        _patch = [c for c in calls if c["method"] == "PATCH"]
-        self.assertEqual(len(_patch), 1)
-        self.assertIn({"name": "loom:queued"}, _patch[0]["data"]["labels"])
-        self.assertIn({"name": "lane:muse"}, _patch[0]["data"]["labels"])
-
-    def test_move_remote_lane_private_repo_refuses(self):
-        gh = GitHub("t", transport=Fake([
-            {"method": "GET", "path": "/repos/quadseven/loom", "reply": {"private": True}},
-        ]))
-        with self.assertRaises(ValueError) as ctx:
-            move(gh, REPO, 1, "queued", "muse", None, None)
-        self.assertIn("this repo is public", str(ctx.exception))
-
-    def test_move_local_lane_to_queued_refuses(self):
-        gh = GitHub("t", transport=Fake([
-            {"method": "GET", "path": "/repos/quadseven/loom/issues/1", "reply": {
-                "id": 1, "number": 1, "title": "Test", "state": "open",
-                "labels": [{"name": "loom:ticket"}, {"name": "lane:codex"}]
-            }},
-        ]))
-        with self.assertRaises(ValueError) as ctx:
-            move(gh, REPO, 1, "queued", "codex", None, None)
-        self.assertIn("local lane codex: use --to briefed instead", str(ctx.exception))
 
 
 class TextAndCloseTests(unittest.TestCase):
