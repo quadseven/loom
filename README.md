@@ -78,7 +78,7 @@ prompts take public repos only.
 - `lanes/` - the lane runner, the Mac installer and the brain tick
 - `docs/` - how each part works: BRAIN.md (the bus and labels), MUSE.md
   (what a brain tick does), LANES.md (lanes, station, brain tick),
-  BRIEF_FORMAT.md (tickets)
+  BRIEF_FORMAT.md (tickets), SDLC.md (the 8-stage life cycle from ticket to verified)
 - `dispatch/` - the older local dispatcher
 - `tests/` - the suite CI runs
 
