@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
@@ -349,6 +352,38 @@ class BrainTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex", **kw)
                 self.assertEqual(fake.calls, [])
+
+    def test_brief_refuses_an_after_value_that_is_not_a_list_of_tickets(self):
+        for bad in ("5", "", "#a", "#5,", "owner#5", "#5\nRepo: evil/repo"):
+            with self.subTest(after=repr(bad)):
+                fake = Fake(reply(200, goal()))
+                with self.assertRaisesRegex(ValueError, "After:"):
+                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY,
+                                "codex", after=bad)
+                self.assertEqual(fake.calls, [])
+
+    def test_brief_refuses_a_malformed_after_from_the_command_line(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = os.path.join(home, "brief.md")
+            with open(path, "w") as fh:
+                fh.write(BODY)
+            err = io.StringIO()
+            with unittest.mock.patch("bus.brain.token_from_env", return_value="t"), \
+                    unittest.mock.patch("bus.brain.GitHub") as client, \
+                    contextlib.redirect_stderr(err):
+                client.return_value.requests = 0
+                code = brain.main(["brief", REPO, "--goal", "1", "--title", "Ticket",
+                                   "--file", path, "--lane", "codex", "--after", "5"])
+        self.assertEqual(code, 1)
+        self.assertIn("After:", err.getvalue())
+
+    def test_a_brief_that_waits_on_other_tickets_files_the_after_line(self):
+        made = (reply(200, goal()), reply(200, []),
+                reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        fake = Fake(*made)
+        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex",
+                    after="#5, other-owner/other-repo#7")
+        self.assertTrue(fake.calls[2][2]["body"].startswith("After: #5, other-owner/other-repo#7\n"))
 
     @staticmethod
     def _children(*states):
@@ -1860,6 +1895,79 @@ class RegressionSlotTests(unittest.TestCase):
         args = brain.parser().parse_args(["brief", REPO, "--goal", "1", "--title", "T",
                                           "--file", "b.md", "--regresses", "5"])
         self.assertEqual(args.regresses, 5)
+
+
+class HeldTicketsTest(unittest.TestCase):
+    """The After: line: what status lists, and when it counts as stuck."""
+
+    def dependency(self, number=5, state="pr"):
+        return {"number": number, "state": "open", "title": "Land the package",
+                "body": BODY, "created_at": "2029-12-01T00:00:00Z",
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
+
+    def waiting(self, number=12, after="#5", briefed=OLD, state="briefed"):
+        return {"number": number, "state": "open", "title": "Add the screen",
+                "body": "After: %s\nDifficulty: easy\n\n%s" % (after, BODY),
+                "created_at": "2029-12-01T00:00:00Z", "updated_at": "2029-12-01T00:00:00Z",
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state},
+                           {"name": "lane:claude"}]}, \
+            [event("labeled", "loom:" + state, briefed)]
+
+    def routes(self, *issues, events=(), comments=()):
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, list(issues)),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, []),
+                  ("GET", "/issues/12/events"): reply(200, list(events)),
+                  ("GET", "/issues/12/comments"): reply(200, list(comments))}
+        routes.update(lanes_routes(()))
+        return routes
+
+    def status_for(self, *issues, events=(), now=None):
+        """status over these issues, at `now` (the real clock when None)."""
+        routes = self.routes(*issues, events=events)
+        return brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO, now=now)
+
+    def ticket_line(self, report, number=12):
+        """The ticket's own line under #### briefed, not its Held one."""
+        tickets = report.split("### Held tickets")[0].split("### Tickets")[1]
+        return next(line for line in tickets.splitlines() if line.startswith("- #%d " % number))
+
+    def test_status_lists_a_ticket_with_what_it_waits_for(self):
+        waiting, events = self.waiting()
+        report = self.status_for(self.dependency(), waiting, events=events)
+        self.assertIn("### Held tickets\n- #12 Add the screen - waits for #5 (pr)", report)
+        # A ticket in another repo, and one this repo no longer has open.
+        waiting, events = self.waiting(after="other-owner/other-repo#5, #404")
+        report = self.status_for(self.dependency(), waiting, events=events)
+        self.assertIn("- #12 Add the screen - waits for other-owner/other-repo#5 "
+                      "(unreadable), #404 (unreadable)", report)
+
+    def test_status_lists_no_held_ticket_when_every_dependency_is_merged(self):
+        report = self.status_for(self.dependency(state="merged"), self.waiting()[0])
+        self.assertIn("### Held tickets\n- none", report)
+        self.assertNotIn("### Held tickets\n- #12", report)
+
+    def test_a_hold_of_more_than_two_days_is_reported_as_stuck(self):
+        waiting, events = self.waiting(briefed=OLD)
+        report = self.status_for(self.dependency(), waiting, events=events)
+        line = self.ticket_line(report)
+        self.assertIn("REPEATEDLY STUCK (held by After: #5 for more than 48h", line)
+        self.assertIn("waiting on #5", line)
+
+    def test_a_short_hold_is_neither_stuck_nor_a_stall(self):
+        waiting, events = self.waiting(briefed="2030-01-01T00:00:00Z")
+        report = self.status_for(self.dependency(), waiting, events=events,
+                                 now=datetime(2030, 1, 1, 1, tzinfo=timezone.utc))
+        self.assertNotIn("REPEATEDLY STUCK", self.ticket_line(report))
+        self.assertIn("### Held tickets\n- #12 Add the screen - waits for #5 (pr)", report)
+
+    def test_escalate_refuses_a_ticket_that_is_waiting_on_another(self):
+        routes = ticket_routes(stuck_ticket("failed", body="After: #5\n" + BODY), TWICE, [])
+        routes[("GET", "/repos/%s/issues/5" % REPO)] = reply(200, self.dependency())
+        fake = Routed(routes)
+        with self.assertRaisesRegex(ValueError, "held by After: #5"):
+            brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [])
+        self.assertEqual(fake.sent("PUT", "/issues/9/labels"), [])
 
 
 if __name__ == "__main__":

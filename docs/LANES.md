@@ -136,7 +136,15 @@ spend" below).
 
 Hold: a ticket whose header has `Not before: 2026-10-13T17:00:00Z` (UTC) is
 not claimed before that time, and the factory does not count it as stalled
-until then; the line is left out of the brief the lane reads.
+until then; the line is left out of the brief the lane reads. A ticket whose
+header has `After: #5, owner/name#7` waits for the tickets it builds on: it
+is not claimed while any of them is still open without `loom:merged`,
+`loom:shipped` or `loom:verified`, and the factory counts it as neither
+stalled nor late (one holding it for more than 48 hours is reported to the
+brain, like a stuck ticket). A named ticket closed as not planned never
+merges, so it stops holding and the station says so in one comment. That line
+is left out of the brief too: by the time a lane reads it, it is settled
+(docs/BRAIN.md, "When a ticket may run").
 
 Factory: at most every 5 minutes the station runs `bus/factory.py` over
 `LOOM_REPOS`, with no model. A lane pull request (a `loom/` branch whose

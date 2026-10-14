@@ -199,7 +199,9 @@ live regression).
 7. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,
-   and `brief --not-before` writes the line),
+   and `brief --not-before` writes the line), and any ticket that builds on
+   work not merged yet (`brief --after '#5, owner/name#7'` writes the line,
+   and the station holds the ticket until each of them is merged),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
    A brief without `--lane` stays queued until the station gives it a free

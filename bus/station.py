@@ -46,6 +46,9 @@ BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
+# The comment a ticket carries once a ticket it waited on was closed as not
+# planned and stopped holding it.
+AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
@@ -653,6 +656,8 @@ class Station:
         self._seen: Dict[str, set] = {}
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
+        # The tickets named by After: lines, read once a pass.
+        self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
         # The GitHub budget as the last pass left it, and the reset it was
         # last reported low for.
         self._budget: Optional[Dict[str, Any]] = None
@@ -1046,6 +1051,36 @@ class Station:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"at": self.now, "idle": idle}) + "\n")
 
+    def _dependency(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
+        """The ticket an After: line names, read once a pass and kept for the
+        next lane's pass; None when it cannot be read, which holds."""
+        key = "%s#%d" % (repo, number)
+        if key not in self._depends:
+            try:
+                self._depends[key] = self._issue(repo, number)
+            except GitHubError as err:
+                _say("could not read %s: %s" % (key, err))
+                self._depends[key] = None
+        return self._depends[key]
+
+    def _release_hold(self, repo: str, issue: Dict[str, Any],
+                      released: List[tickets.After]) -> None:
+        """Say on the ticket that an After: line no longer holds it, once per
+        ticket that was closed as not planned."""
+        number = int(issue["number"])
+        said = {m.group(1) for c in self.gh.paginate(
+            "/repos/%s/issues/%d/comments" % (repo, number)) if isinstance(c, dict)
+            for m in [AFTER_RELEASE_RE.match(str(c.get("body") or ""))] if m}
+        for dep in released:
+            if str(dep.number) in said:
+                continue
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+                "body": "<!-- loom:after-release %d -->\nNot held by After: any more: "
+                        "%s was closed as not planned, so this ticket no longer waits "
+                        "for it." % (dep.number, dep.short)})
+            _say("%s#%d is no longer held by %s, closed as not planned"
+                 % (repo, number, dep.short))
+
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         if self._skip_known(repo, issue):
             return False
@@ -1061,6 +1096,13 @@ class Station:
         ok, reason = self._check_trust(repo, issue)
         if not ok:
             self._refuse(repo, issue, reason)
+            return False
+        waiting, released = tickets.after_holds(repo, headers, self._dependency)
+        if released and not waiting:
+            self._release_hold(repo, issue, released)
+        if waiting:
+            _say("%s#%s waits for %s" % (repo, issue["number"], ", ".join(
+                "%s (%s)" % (a.short, a.why) for a in waiting)))
             return False
         fresh = self._issue(repo, int(issue["number"]))
         if not self._still_ours(fresh, lane):

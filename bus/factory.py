@@ -109,6 +109,9 @@ from .tickets import FIX_MARKER
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
+# A ticket held by its After: line this long, with none of the tickets it
+# waits for merged, is reported to the brain once like a stuck ticket.
+HOLD_STUCK = 48 * 3600
 # A head commit with no review check this long after its push is logged once
 # per pass as waiting on a review that may never come; it is never merged.
 REVIEW_GRACE = 1800
@@ -587,11 +590,26 @@ class Factory:
         self.landed: set = set()
         self.updated: set = set()
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
+        # The tickets named by After: lines, read once a pass.
+        self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
         login = str((item.get("user") or {}).get("login") or "").lower()
         return bool(login) and login in self.trusted
+
+    def _dependency(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
+        """The ticket an After: line names, read once a pass; None when it
+        cannot be read, which keeps the hold."""
+        key = "%s#%d" % (repo, number)
+        if key not in self._depends:
+            try:
+                data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                self._depends[key] = data if isinstance(data, dict) else None
+            except GitHubError as err:
+                _say("could not read %s: %s" % (key, err))
+                self._depends[key] = None
+        return self._depends[key]
 
     def _tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         data = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
@@ -1024,11 +1042,50 @@ class Factory:
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
+        waiting = self.held_by(repo, issue)
+        if waiting:
+            # Waiting for another ticket is not this one's fault: it is not
+            # stalled, so it climbs nothing, and only a long hold is reported.
+            self._tell_held(repo, issue, waiting)
+            return
         if _lane(issue) in self.limited:
             self._step_aside(repo, issue)
             return
         if not self._spread(repo, issue):
             self._unclaimed(repo, issue)
+
+    def held_by(self, repo: str, issue: Dict[str, Any]) -> List[tickets.After]:
+        """The After: tickets of this one that are not merged yet."""
+        try:
+            headers, _ = tickets.parse(issue.get("body"))
+        except ValueError:
+            return []  # an unusable brief is the station's to refuse
+        return tickets.after_holds(repo, headers, self._dependency)[0]
+
+    def _tell_held(self, repo: str, issue: Dict[str, Any],
+                   waiting: Sequence[tickets.After]) -> None:
+        """Report a ticket held by After: for more than HOLD_STUCK to the
+        brain, once (needs-brain says it was reported)."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        since = self._briefed_since(repo, issue)
+        if not since or self.now - since < HOLD_STUCK:
+            return
+        number = int(issue["number"])
+        waiting_for = ", ".join(a.short for a in waiting)
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+            "Held %.0f hours by After: waiting for %s. The station never claims a "
+            "ticket whose After: tickets are not merged, so this one is not late and "
+            "not stuck: the brain checks that %s is still coming, re-briefs this "
+            "ticket without it, or closes it." % (
+                (self.now - since) / 3600, waiting_for,
+                waiting_for if len(waiting) == 1 else "they are")})
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d has waited %.0f hours for %s; reported to the brain"
+             % (repo, number, (self.now - since) / 3600, waiting_for))
 
     def _briefed_since(self, repo: str, issue: Dict[str, Any]) -> float:
         """When the ticket was last labeled briefed, or its hold ended if
