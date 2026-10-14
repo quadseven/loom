@@ -139,6 +139,14 @@ class BrainTickTest(unittest.TestCase):
         self.assertTrue((self.home / "brain" / "loom" / "docs" / "MUSE.md").exists())
         self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
 
+    def test_the_agent_records_its_steps_as_the_wrapper_holder(self):
+        _, calls = self.tick()
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertIn("python3 -m bus.brain step NAME --holder lane-machine "
+                      "--lock-repo example/loom", claude[0])
+        self.assertEqual("python3 -m bus.brain step unlock --holder lane-machine "
+                         "--lock-repo example/loom", calls[-2])
+
     def test_a_failed_agent_still_unlocks(self):
         _, calls = self.tick(FAKE_CLAUDE_EXIT="2")
         self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
