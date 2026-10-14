@@ -1139,6 +1139,19 @@ cat > /dev/null
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    def test_opencode_go_model_mismatch_is_transient(self):
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(
+            BRIEF.replace("Lane: codex", "Lane: opencode-go")
+            .replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-5-5"))
+        result = self.run_lane("opencode-go", LOOM_OPENCODE_GO_MODEL="opencode-go/model-free",
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               FAKE_SECRET__k_oc="fake-oc-key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [transient] model claude-sonnet-5-5 is not an opencode-go model", log)
+
     def api_lane(self, lane, extra="", **env):
         planted = self.home / ".ssh" / "id_planted"
         planted.parent.mkdir(parents=True, exist_ok=True)
