@@ -41,7 +41,7 @@ def _journals(state) -> tuple[list[dict], str | None]:
     result = []
     errors = []
     homes = set()
-    for repo, rows in state.data.items():
+    for _, rows in state.data.items():
         for row in rows or []:
             goal = row.get("goal")
             if goal:
