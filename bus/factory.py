@@ -1142,6 +1142,21 @@ class Factory:
                 str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
             if self.now < held_until(issue):
                 continue
+            model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+            if model_match:
+                from .station import model_lanes, needs_public_repo
+                model = model_match.group(1)
+                lane = next((candidate for candidate in model_lanes(model)
+                             if self._free(candidate)
+                             and (not needs_public_repo(candidate, model)
+                                  or not self._is_private(repo))), None)
+                if lane is None:
+                    _say("%s#%s waits: no free lane takes model %s"
+                         % (repo, issue["number"], model))
+                    continue
+                self._guarded(self._assign_queued_one, repo, issue, lane,
+                              "model %s" % model)
+                continue
             assigned = _lane(issue)
             if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
                 continue  # A live remote assignment stays queued for its pull worker.

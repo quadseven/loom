@@ -1251,7 +1251,7 @@ for BRIEF in "$INBOX"/*.md; do
     openrouter:openrouter/*:free) ;;
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
     opencode-go:opencode-go/*) ;;
-    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model"; continue ;;
+    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model" transient; continue ;;
     zen:opencode/*-free) ;;
     zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
