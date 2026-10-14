@@ -850,6 +850,31 @@ class FixTests(unittest.TestCase):
         self.refused(fix_pr(), fix_ticket("merged"))
         self.refused(fix_pr(), dict(fix_ticket(), state="closed"))
 
+    def test_fix_accepts_a_running_ticket_and_marks_it_as_a_brain_fix(self):
+        runs = {"check_runs": []}
+        threads = {"reviewThreads": {"nodes": []}}
+        fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("running")),
+                    reply(200, runs), reply(200, {"statuses": []}),
+                    reply(200, {"data": {"repository": {"pullRequest": threads}}}),
+                    reply(201, {}))
+        brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "fix this")
+        posted = next(c for c in fake.calls if c[0] == "POST" and "/comments" in c[1])
+        self.assertIn(brain.BRAIN_FIX_MARKER, posted[2]["body"])
+        self.assertFalse(any(c[0] == "PUT" for c in fake.calls))
+
+    def test_pending_brain_fix_is_replaced_by_the_newest_until_a_claim(self):
+        comments = [
+            {"user": {"login": "alice-example"},
+             "body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> first"},
+            {"user": {"login": "alice-example"},
+             "body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> second"},
+        ]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+        self.assertFalse(brain._pending_brain_fix(comments + [
+            {"user": {"login": "station"},
+             "body": "Claimed for lane codex (body sha256 0123456789ab)"}],
+            ["alice-example"]))
+
     def test_fix_refuses_notes_the_brain_must_never_post(self):
         with self.assertRaises(ValueError):
             brain.fix(GitHub("t", transport=Fake()), REPO, 8, (REPO, 9), "This does not fix #9")
