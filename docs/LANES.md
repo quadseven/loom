@@ -415,6 +415,16 @@ loopback connection; they cannot query the viewer or any other local service.
   wipes the scratch home. Links are never followed.
 - launchd starts a pass every minute and a lock keeps one pass per lane.
   An opencode 2.0 pass starts a temporary server and stops it when the run ends.
+- A usage limit `opencode run` would retry silently is asked for directly.
+  With `LOOM_<SLOT>_PROBE_URL` set (the installer sets OpenCode Go's chat
+  endpoint for the opencode-go lanes, and `LOOM_OPENCODE_GO_PROBE_HEADER`
+  `x-opencode-session`), the runner sends one `max_tokens` 1 request for the
+  run's model before each run, and again after a run that timed out (exit
+  124). The key goes to curl on stdin, never in argv or a log. A 429 naming
+  `GoUsageLimitError` holds the lane 12 hours (heartbeat `limit: the
+  provider's weekly limit ...` with a `retry_at`) and hands the brief on as
+  `[limit]`; any other answer lets the run go ahead. Another provider can
+  name its own endpoint in the same setting.
 
 ### One slot on opencode 2.0
 
