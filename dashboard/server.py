@@ -279,10 +279,8 @@ def _dispatch_get(handler, state):
         return handler.send_bytes(200, asset.read_bytes(), content_type)
     if path in ("/improving", "/lanes"):
         return _send_dashboard_view(handler, state, path)
-    if path == "/brain":
-        return handler.send_page(page("Brain", "brain", insights.brain_page(state), status="live"))
-    if path == "/hot-spots":
-        return handler.send_page(page("Hot spots", "hot-spots", insights.hotspots_page(state), status="live"))
+    if path in ("/brain", "/hot-spots"):
+        return _send_insights_view(handler, state, path)
     if path in ("/", "/tickets"):
         tickets = state.response()["tickets"]
         data = tickets if path == "/" else _ticket_page(state, parsed)
@@ -291,6 +289,12 @@ def _dispatch_get(handler, state):
     if detail is not None:
         return handler.send_page(detail[0], detail[1])
     return handler.send_text(404, "not found")
+
+
+def _send_insights_view(handler, state, path):
+    if path == "/brain":
+        return handler.send_page(page("Brain", "brain", insights.brain_page(state), status="live"))
+    return handler.send_page(page("Hot spots", "hot-spots", insights.hotspots_page(state), status="live"))
 
 
 def _send_dashboard_view(handler, state, path):
