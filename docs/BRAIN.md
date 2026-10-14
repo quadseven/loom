@@ -168,6 +168,35 @@ wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
 a readable Difficulty line appear in the goal's next station standup as
 needing a difficulty.
 
+### Agent rewrites
+
+The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).
+Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
+repos) to command lines that read a prompt on stdin and print one JSON object,
+for example an opencode run on an OpenCode Go model or a codex exec. The prompt
+holds the issue (title, body, labels, last 10 comments) and the ticket format
+above. The answer is one of:
+
+```json
+{"action": "brief", "title": "...", "difficulty": "easy|medium|hard", "body": "..."}
+{"action": "human", "ask": "..."}
+{"action": "skip", "reason": "..."}
+```
+
+Code checks the answer before anything is written: the body has every brief
+section, checkboxes under Acceptance criteria, no header lines, and passes the
+written-text check; difficulty is one of the three. A brief is filed queued
+(no lane) with `brief --refs M`; a human ask goes through `human`; a skip or
+an invalid answer writes nothing and is logged. The original issue is never
+closed, retitled or edited.
+
+A repo that is not public (or whose visibility cannot be read) only ever uses
+the private command, because the public one may run a provider that trains on
+prompts; with the private command empty the repo is skipped. The station runs
+at most 5 rewrites per backlog goal home per hour (and 5 per pass), oldest
+first, under the budget floor rule. `state/station/rewrite.json` records each
+attempt; an issue that did not become a ticket is not tried again for a day.
+
 ## Proof
 
 A ticket moves to `loom:verified` only with a proof record, and closes as

@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import metrics
+from . import rewrite
 from . import revert
 from . import spend
 from . import text as _text
@@ -115,6 +116,13 @@ REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
 # A backlog goal home is triaged at most this often.
 TRIAGE_INTERVAL = 3600
+# Agent rewrites of loom:triage issues: per backlog goal home per hour, per
+# pass (each one waits on an agent command), and how long before an issue
+# whose rewrite did not produce a ticket is tried again.
+REWRITE_PER_HOUR = 5
+REWRITE_PER_PASS = 5
+REWRITE_RETRY = 24 * 3600
+REWRITE_TIMEOUT = 600
 # Through the bot, a report is one short line (the goal's short name and the
 # report's first line) with a thread on it holding the full report.
 SHORT_NAME_RE = re.compile(r"^[ \t]*Short name:[ \t]*(\S.*?)[ \t]*$", re.M | re.I)
@@ -221,7 +229,9 @@ class Settings:
                  metrics_goal: str = "",
                  transcript_url: str = "",
                  transcript_token_ssm: str = "",
-                 watched: Optional[List[Tuple[str, str]]] = None) -> None:
+                 watched: Optional[List[Tuple[str, str]]] = None,
+                 rewrite_cmd: str = "",
+                 rewrite_private_cmd: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -247,6 +257,8 @@ class Settings:
         self.transcript_token_ssm = transcript_token_ssm
         # (component, log path) pairs bus/watch.py reads each pass.
         self.watched = watch.components(home) if watched is None else watched
+        self.rewrite_cmd = rewrite_cmd
+        self.rewrite_private_cmd = rewrite_private_cmd
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -297,7 +309,9 @@ class Settings:
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
-                   watched=watched)
+                   watched=watched,
+                   rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
+                   rewrite_private_cmd=env.get("LOOM_REWRITE_PRIVATE_CMD", "").strip())
 
 
 def _origin_repo() -> str:
@@ -2368,6 +2382,92 @@ class Station:
             state[key] = self.now
         _write_json(path, state)
 
+    # -- agent rewrites of loom:triage issues ----------------------------
+    def _rewrite_goals(self) -> List[Tuple[str, str, int]]:
+        """(ledger key, repo, goal) for the backlog goal homes triage knows."""
+        state = _read_json(os.path.join(self.state, "triage.json"), {}, strict=False)
+        goals = []
+        for key in state if isinstance(state, dict) else []:
+            repo, _, num = key.rpartition("#")
+            if repo and num.isdigit():
+                goals.append((key, repo, int(num)))
+        return goals
+
+    def _rewrite_command(self, repo: str, cache: Dict[str, str]) -> str:
+        """The agent command for a repo; "" skips it. A repo that cannot be
+        shown to be public counts as private."""
+        if repo not in cache:
+            cache[repo] = rewrite.command_for(
+                self.s.rewrite_cmd, self.s.rewrite_private_cmd, not self._public(repo))
+        return cache[repo]
+
+    def _rewrite_goal(self, key: str, repo: str, goal: int, rec: Dict[str, Any],
+                      budget: int, cmds: Dict[str, str]) -> int:
+        """Rewrite oldest-first what the goal's hourly allowance and the
+        pass allow; returns how many rewrites ran."""
+        runs = [t for t in rec.get("runs", []) if isinstance(t, (int, float))
+                and 0 <= self.now - t < 3600]
+        rec["runs"] = runs
+        tried = rec.setdefault("tried", {})
+        for number in [n for n, at in tried.items() if not isinstance(at, (int, float))
+                       or not 0 <= self.now - at < REWRITE_RETRY]:
+            del tried[number]
+        room = min(REWRITE_PER_HOUR - len(runs), budget)
+        if room <= 0:
+            return 0
+        cmd = self._rewrite_command(repo, cmds)
+        if not cmd:
+            _say("rewrite %s: no agent command for this repo; skipped" % key)
+            return 0
+        done = 0
+        for issue in rewrite.candidates(self.gh, repo):
+            if done >= room or self._deferred():
+                break
+            number = int(issue["number"])
+            if str(number) in tried:
+                continue
+            runs.append(self.now)
+            tried[str(number)] = self.now
+            done += 1
+            try:
+                action = rewrite.rewrite_issue(self.gh, repo, goal, issue, cmd,
+                                               REWRITE_TIMEOUT)
+            except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
+                _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
+                continue
+            _say("rewrite %s#%d: %s" % (repo, number, action))
+        return done
+
+    def rewrite_triaged(self) -> None:
+        """Rewrite loom:triage issues in backlog goal homes with the agent
+        command from LOOM_REWRITE_CMD (public repos) or
+        LOOM_REWRITE_PRIVATE_CMD (private ones). At most REWRITE_PER_HOUR a
+        goal an hour, oldest first; every attempt is kept in rewrite.json, so
+        an issue that did not become a ticket waits REWRITE_RETRY before
+        another try."""
+        if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd):
+            return
+        path = os.path.join(self.state, "rewrite.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        goals = self._rewrite_goals()
+        for stale in [k for k in state if k not in {g[0] for g in goals}]:
+            del state[stale]
+        budget = REWRITE_PER_PASS
+        cmds: Dict[str, str] = {}
+        for key, repo, goal in goals:
+            rec = state.get(key)
+            if not isinstance(rec, dict):
+                rec = state[key] = {}
+            try:
+                budget -= self._rewrite_goal(key, repo, goal, rec, budget, cmds)
+            except (GitHubError, OSError) as err:
+                _say("rewrite %s failed: %s" % (key, err))
+            _write_json(path, state)
+            if budget <= 0 or self._deferred():
+                break
+
     # -- log watch -------------------------------------------------------
     def watch_logs(self) -> None:
         """Read each component's new log lines and file one loom:triage issue
@@ -3195,7 +3295,8 @@ class Station:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.triage_backlogs, self.post_metrics,
+                     self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
                      self.watch_default_branches, self.run_factory):
             if self._deferred():
