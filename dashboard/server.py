@@ -35,9 +35,9 @@ def _all_tickets(state):
             continue
         matching = []
         for pr in prs:
-            match = views.FOOTER.search(str(pr.get("body") or ""))
-            if match and match.group(1) == row.get("repo") and match.group(2) == str(row.get("number")):
-                matching.append((str(pr.get("updated_at") or ""), match.group(4)))
+            parsed = views.footer(pr.get("body"))
+            if parsed and parsed[0] == row.get("repo") and parsed[1] == str(row.get("number")):
+                matching.append((str(pr.get("updated_at") or ""), parsed[3]))
         if matching:
             row["model"] = max(matching)[1]
     return rows
@@ -608,7 +608,7 @@ def _send_dashboard_view(handler, state, path):
         body = views.render_improving(data)
         title, active = "Improving", "improving"
     else:
-        body = views.render_lanes(_lane_view_data(payload, tickets))
+        body = views.render_lanes(_lane_view_data(payload, tickets, state=state))
         title, active = "Lanes and models", "lanes"
     if payload.get("dashboard_errors"):
         body += '<p class="empty-state">Some dashboard sources could not be read: %s</p>' % html.escape("; ".join(payload["dashboard_errors"]))
@@ -628,32 +628,79 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     return server
 
 
-def _lane_view_data(payload, tickets):
+def _newest_lane_models(prs):
+    """Each lane's model and time from its newest lane pull request footer."""
+    newest = {}
+    for pr in prs:
+        parsed = views.footer(pr.get("body"))
+        if not parsed:
+            continue
+        when = str(pr.get("created_at") or pr.get("updated_at") or "")
+        if parsed[2] not in newest or when >= newest[parsed[2]]["time"]:
+            newest[parsed[2]] = {"model": parsed[3], "time": when}
+    return newest
+
+
+def _usage_rows(payload, state):
+    """The usage records: the payload's, else the server's usage store."""
+    rows = payload.get("usage")
+    if rows is None:
+        providers = getattr(getattr(state, "usage", None), "providers", None)
+        rows = [row for items in providers.values() for row in items] if isinstance(providers, dict) else []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _lane_quota(lane, rows):
+    """The highest used percentage among the usage records for a lane: those
+    naming it, or its provider (the lane name without a -N slot suffix)."""
+    provider = re.sub(r"-[0-9]+$", "", lane)
+    used = []
+    for row in rows:
+        named = lane in (row.get("lanes") or []) or row.get("provider") in (lane, provider)
+        try:
+            used += [float(row["used_pct"])] if named and row.get("used_pct") is not None else []
+        except (TypeError, ValueError):
+            continue
+    return max(used) if used else None
+
+
+def _lane_view_data(payload, tickets, state=None):
     comments = payload.get("lanes", [])
     latest = max(comments, key=lambda c: str(c.get("created_at") or ""), default=None)
     lane_rows = views.parse_lane_rows(latest.get("body") if latest else "")
+    prs = payload.get("pull_requests", [])
+    newest_pr_for_lane = _newest_lane_models(prs)
+    usage_records = _usage_rows(payload, state)
+
     lanes = []
     for item in lane_rows:
-        active = next((ticket for ticket in tickets if ticket.get("lane") == item["lane"]
+        lane_name = item["lane"]
+        active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
                        and ticket.get("state") in ("running", "pr")), None)
-        item.update({"ticket": active, "model": active.get("model") if active else None,
-                     "quota": None,
-                     "reason": None if item["available"] else "held reason missing from lane status comment"})
+
+        model_info = newest_pr_for_lane.get(lane_name)
+        model_display = None
+        if model_info:
+            age_str = views.format_age(model_info["time"])
+            model_display = "%s (%s)" % (model_info["model"], age_str) if age_str else model_info["model"]
+        lane_quota = _lane_quota(lane_name, usage_records)
+
+        item.update({
+            "ticket": active,
+            "model": model_display,
+            "quota": lane_quota,
+            "reason": None if item["available"] else "held reason missing from lane status comment",
+        })
         lanes.append(item)
-    prs = payload.get("pull_requests", [])
+
     tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
     prepared = []
-    footer = views.FOOTER
-    anthropic = total = 0
     for pr in prs:
-        match = footer.search(str(pr.get("body") or ""))
-        if not match:
+        parsed = views.footer(pr.get("body"))
+        if not parsed:
             continue
-        repo, number, lane, model = match.groups()
-        ticket = tickets_by_ref.get((repo, number))
+        ticket = tickets_by_ref.get(parsed[:2])
         prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
-        total += 1
-        anthropic += lane.startswith("anthropic")
     metric_rows = views.parse_metrics(payload.get("improving", {}).get("metrics_comments", []))
     share = None
     if metric_rows:
