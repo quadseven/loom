@@ -252,3 +252,10 @@ class TicketRef(Fixture):
         self.assertEqual(body["ticket"], "example/loom#7")
         self.assertTrue(body["started_at"] and body["finished_at"])
         self.assertEqual(body["started_at"], body["finished_at"])
+
+
+class EventShape(Fixture):
+    def test_an_event_with_no_time_sends_an_empty_string(self):
+        events = transcripts.convert([{"kind": "log", "ts": None, "text": "runner line"}])
+        self.assertEqual(events[0]["ts"], "")
+        self.assertTrue(all(isinstance(e[k], str) for e in events for k in ("ts", "role", "kind", "text")))
