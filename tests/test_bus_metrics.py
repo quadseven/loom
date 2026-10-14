@@ -100,6 +100,43 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(result), 9)
         self.assertTrue(all(n.passed for n in result), [n.line() for n in result])
 
+    def test_ticket_waits_include_reentered_state_and_current_state(self):
+        events = []
+        for kind, state, hours in (("labeled", "queued", 0), ("labeled", "briefed", 2),
+                                   ("labeled", "running", 5), ("labeled", "pr", 9),
+                                   ("labeled", "running", 10), ("labeled", "pr", 12),
+                                   ("labeled", "merged", 15)):
+            events.append({"event": kind, "label": label("loom:" + state),
+                           "created_at": iso(NOW - (15 - hours) * 3600)})
+        waits = metrics.ticket_waits(events, NOW)
+        self.assertEqual(waits, {"queued": 2, "briefed": 3, "running": 6,
+                                 "pr": 4, "merged": 0})
+
+    def test_wait_summaries_bottleneck_and_empty_states(self):
+        tickets = [("r#1", {"queued": 1, "running": 10}),
+                   ("r#2", {"queued": 2, "running": 20}),
+                   ("r#3", {"queued": 3, "running": 30}),
+                   ("r#4", {"queued": 4})]
+        rows, bottleneck = metrics.summarize_waits(tickets)
+        by_state = {row["state"]: row for row in rows}
+        self.assertEqual(by_state["queued"]["median_h"], 2.5)
+        self.assertEqual(by_state["queued"]["worst_h"], 4)
+        self.assertEqual(by_state["queued"]["worst_ticket"], "r#4")
+        self.assertEqual(by_state["queued"]["n"], 4)
+        self.assertEqual(by_state["running"]["n"], 3)
+        self.assertEqual(bottleneck, "running")
+        self.assertEqual(by_state["pr"], {"state": "pr", "median_h": None,
+                                           "worst_h": None, "worst_ticket": None, "n": 0})
+
+    def test_state_with_fewer_than_three_tickets_cannot_be_bottleneck(self):
+        rows, bottleneck = metrics.summarize_waits([
+            ("r#1", {"queued": 1, "running": 100}),
+            ("r#2", {"queued": 2, "running": 200}),
+            ("r#3", {"queued": 3}),
+        ])
+        self.assertEqual(bottleneck, "queued")
+        self.assertEqual(next(row for row in rows if row["state"] == "running")["n"], 2)
+
     def test_each_target_can_fail(self):
         changes = [
             lambda: self.gh.pr.update(state="open", created_at=iso(NOW - 30000), merged_at=None),
@@ -306,3 +343,43 @@ class MetricsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class WaitsCommandTest(unittest.TestCase):
+    def test_the_waits_command_runs_as_the_module_entry_point(self):
+        # `python3 -m bus.metrics waits` once crashed with NameError: the
+        # entry point ran before the helpers it calls were defined. runpy
+        # runs the module the way -m does, top to bottom.
+        import runpy
+        import sys
+        import time
+        now = time.time()
+        updated = datetime.fromtimestamp(now - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        seen = []
+
+        class FakeGitHub:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def paginate(self, path):
+                seen.append(path)
+                if "/events" in path:
+                    return [{"event": "labeled", "label": {"name": "loom:queued"},
+                             "created_at": updated}]
+                return [{"number": 7, "updated_at": updated}]
+
+        out = io.StringIO()
+        with mock.patch("bus.github.GitHub", FakeGitHub), \
+                mock.patch("bus.github.token_from_env", lambda: "t"), \
+                mock.patch.object(sys, "argv", ["bus.metrics", "waits", "o/r"]), \
+                mock.patch.dict(os.environ, {"LOOM_HOME": tempfile.mkdtemp()}), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as done:
+            runpy.run_module("bus.metrics", run_name="__main__", alter_sys=True)
+        self.assertEqual(done.exception.code, 0)
+        self.assertIn("queued", out.getvalue())
+        # The since= window is UTC, not local time labelled Z.
+        since = [p for p in seen if "since=" in p][0].split("since=")[1].split("&")[0]
+        want = datetime.fromtimestamp(now - 7 * 86400, timezone.utc)
+        got = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertLess(abs((got - want).total_seconds()), 120)

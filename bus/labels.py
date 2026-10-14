@@ -17,8 +17,17 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
          "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
-         "opencode-go-4"]
+         "opencode-go-4",
+         # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
+         "spark-2"]
 LANES = LANES + SLOTS
+# Remote lanes pull ticket work from GitHub and have no local station inbox.
+# beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
+# on its own schedule (about every 30 minutes), not every minute like a
+# local runner, so its window is longer than HEARTBEAT_MAX_AGE.
+REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1,
+                         "beat_max": 2 * 3600}}
+LANES += list(REMOTE_LANES)
 
 # The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
 # rung, lowest first. Lanes stand in for each other on the same provider:
@@ -54,6 +63,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "loom:digest": {"color": "ededed", "description": "The issue holding the daily asks digest"},
+    "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},

@@ -104,6 +104,7 @@ from urllib.parse import quote
 
 from . import brain, change_class, tickets
 from .github import GitHub, GitHubError
+from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER
 
 FACTORY_CHECK = 300
@@ -139,9 +140,13 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
 TIERS: Dict[str, Tuple[str, ...]] = {
-    "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai",
-             "zen", "zai", "agy"),
-    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC,
+    # The operator's priority (2026-10-14): Muse and agy first on public
+    # repos, so their allowances are spent before the rest. Both are public
+    # only, so a private repo's ticket still starts at spark or codex.
+    "easy": ("muse", "agy", "spark", "spark-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+             "openrouter", "workersai", "zen", "zai"),
+    "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
+               "opencode-go-4") + ANTHROPIC,
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
@@ -153,7 +158,7 @@ TIERS: Dict[str, Tuple[str, ...]] = {
 FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
-PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4")
+PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.
@@ -639,19 +644,22 @@ class Factory:
         return self._up(lane) and self.load.get(lane, 0) == 0
 
     def _tier_move(self, repo: str, issue: Dict[str, Any],
-                   old: str = "") -> Tuple[Optional[str], str]:
+                   old: str = "", allow_remote: bool = True) -> Tuple[Optional[str], str]:
         """(lane, fallback) for a tier move off lane `old`: the first free lane
         of the ticket's tier, with fallback ""; else, when no lane of its tier
         is up, the first free lane of its FALLBACK tiers in order, with
         fallback saying so. (None, "") when it should wait."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
-        own = [x for x in lanes_of(difficulty, private) if x != old]
+        own = [x for x in lanes_of(difficulty, private)
+               if x != old and (allow_remote or x not in REMOTE_LANES)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._up(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
-            lane = next((x for x in lanes_of(tier, private) if x != old and self._free(x)), None)
+            fallback_lanes = [x for x in lanes_of(tier, private)
+                              if x != old and (allow_remote or x not in REMOTE_LANES)]
+            lane = next((x for x in fallback_lanes if self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
         return None, ""
@@ -834,8 +842,17 @@ class Factory:
             if self._climb(repo, issue, comments, why) is None:
                 self._give_up(repo, issue, why)
                 return
-        self.fix(self.gh, repo, int(pr["number"]), (repo, number),
-                 TEST_NOTES if no_test else FIX_NOTES)
+        lane = None
+        if _lane(issue) in REMOTE_LANES:
+            lane, _ = self._tier_move(repo, issue, allow_remote=False)
+            if lane is None:
+                lane = LADDER[0][0][0]
+        if lane is not None:
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
+                     TEST_NOTES if no_test else FIX_NOTES, lane=lane)
+        else:
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
+                     TEST_NOTES if no_test else FIX_NOTES)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
@@ -1151,7 +1168,7 @@ class Factory:
         if rung:
             lane = next((x for x in LADDER[rung - 1][0] if x != old and self._free(x)), None)
         else:
-            lane, fallback = self._tier_move(repo, issue, old)
+            lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None:
             _say("%s#%d waits on lane %s, at a limit: no free lane in its %s"
                  % (repo, number, old, "rung" if rung else "tier"))
@@ -1182,8 +1199,17 @@ class Factory:
         if tickets is None:
             tickets = {repo: self._tickets(repo) for repo in self.repos}
         for issue in (i for found in tickets.values() for i in found.values()):
-            if _state(issue) in ("briefed", "running"):
+            if (_state(issue) in ("briefed", "running")
+                    or (_state(issue) == "queued" and _lane(issue) in REMOTE_LANES
+                        and self._up(_lane(issue)))):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
+
+    def _queued_model_lane(self, repo: str, model: str) -> Optional[str]:
+        from .station import model_lanes, needs_public_repo
+        return next((candidate for candidate in model_lanes(model)
+                     if self._free(candidate)
+                     and (not needs_public_repo(candidate, model)
+                          or not self._is_private(repo))), None)
 
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
@@ -1196,7 +1222,24 @@ class Factory:
                 str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
             if self.now < held_until(issue):
                 continue
-            lane, fallback = self._tier_move(repo, issue)
+            model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+            if model_match:
+                model = model_match.group(1)
+                lane = self._queued_model_lane(repo, model)
+                if lane is None:
+                    _say("%s#%s waits: no free lane takes model %s"
+                         % (repo, issue["number"], model))
+                    continue
+                self._guarded(self._assign_queued_one, repo, issue, lane,
+                              "model %s" % model)
+                continue
+            assigned = _lane(issue)
+            if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
+                continue  # A live remote assignment stays queued for its pull worker.
+            if assigned in REMOTE_LANES:
+                lane, fallback = self._tier_move(repo, issue, old=assigned)
+            else:
+                lane, fallback = self._tier_move(repo, issue)
             if lane is None:
                 continue
             tier = difficulty_of(issue) + (", " + fallback if fallback else "")
@@ -1205,6 +1248,16 @@ class Factory:
     def _assign_queued_one(self, repo: str, issue: Dict[str, Any], lane: str,
                            tier: str) -> None:
         number = int(issue["number"])
+        if lane in REMOTE_LANES:
+            self.move(self.gh, repo, number, "queued", lane=lane,
+                      note="The station reserved this queued ticket for remote lane %s (tier %s)."
+                           % (lane, tier))
+            issue["labels"] = [{"name": x} for x in brain._moved_labels(
+                _labels(issue), "queued", lane)]
+            self.load[lane] = self.load.get(lane, 0) + 1
+            _say("reserved queued %s#%d for remote lane %s (tier %s)"
+                 % (repo, number, lane, tier))
+            return
         self.move(self.gh, repo, number, "briefed", lane=lane,
                   note="The station gave this queued ticket lane %s (tier %s)." %
                        (lane, tier))

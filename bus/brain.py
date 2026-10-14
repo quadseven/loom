@@ -12,9 +12,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
-from . import change_class, handoff, lock, proof, text, tickets
-from .labels import ESCALATION, LANES, rung_lanes
+from . import change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
+from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
+
+BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 
 STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 # Tickets that hold a lane slot: waiting for a lane, in one, or back from one.
@@ -34,6 +36,8 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # that is one tick (REPORT_GRACE) past due is overdue.
 REPORT_EVERY = 2 * 3600
 REPORT_GRACE = 30 * 60
+TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
+STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
@@ -133,6 +137,8 @@ RULING_FIELDS = (
     " mergeable rulingThreads: reviewThreads(first:100) { nodes { isResolved"
     " comments(first:50) { nodes { databaseId author { __typename login } body } } } }")
 PAST_RUNG_HEADING = "### Past the last rung"
+# Open issues the station filed for a broken factory invariant (bus/invariants.py).
+INVARIANTS_HEADING = "### Invariants broken"
 # Ticketless pull requests a trusted login opened, listed for the brain.
 ADOPT_HEADING = "### Pull requests without a ticket"
 ADOPT_MARKER = "<!-- loom:adopt v1 -->"
@@ -381,6 +387,22 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> st
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
 
+def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
+    allowed = {a.lower() for a in authors}
+    last_claim = newest = -1
+    for i, comment in enumerate(comments):
+        if not isinstance(comment, dict):
+            continue
+        body = str(comment.get("body") or "")
+        if _CLAIM.fullmatch(body.strip()):
+            last_claim = i
+        if (tickets._login(comment.get("user")) in allowed
+                and body.startswith(FIX_MARKER)
+                and BRAIN_FIX_MARKER in body):
+            newest = i
+    return newest > last_claim
+
+
 def _one_line(value: Any, limit: int = 200) -> str:
     line = " ".join(str(value or "").split())
     return line if len(line) <= limit else line[:limit - 3] + "..."
@@ -490,7 +512,17 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets) + ["", "### Pull requests"]
-    lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
+    for pr in prs:
+        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
+        try:
+            ticket = _ticket_association(repo, pr)
+        except ValueError:
+            ticket = None
+        if ticket is not None and authors:
+            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+            if _pending_brain_fix(comments, authors or ()):
+                line += " - pending brain fix"
+        lines.append(line)
     sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
     lines += ["", "### Sensitive pull requests"]
     lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
@@ -498,6 +530,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += ["", ADOPT_HEADING]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
+    lines += ["", INVARIANTS_HEADING]
+    lines += ["- #%s %s" % (i["number"], i.get("title", ""))
+              for i in issues if "loom:invariant" in _labels(i)] or ["- none"]
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "needs-operator" in _labels(i)]
@@ -597,6 +632,21 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
         raise ValueError("title is one line")
     if any(section not in body for section in SECTIONS):
         raise ValueError("body must contain all required sections")
+    found = plan_problems(body)
+    if found:
+        raise ValueError("the pull request this brief makes would fail the review "
+                         "bot's plan checks: " + "; ".join(found))
+
+
+def plan_problems(body: str) -> List[str]:
+    """What the pull request body a lane generates from this brief would
+    fail in the review bot's plan checks (bus/hunt_plan.py), with the Size
+    read the way the runner reads it."""
+    try:
+        sized = hunt_plan.with_size_letter(body)
+    except ValueError as exc:
+        return [str(exc)]
+    return hunt_plan.problems(pr_repair._render_generated(sized, "lane", "model", "ticket"))
 
 
 def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
@@ -619,12 +669,89 @@ def _goal_issue(gh: GitHub, repo: str, goal: int) -> Dict[str, Any]:
     return issue
 
 
+# GitHub refuses a 101st sub-issue (422), so a ticket also names its goal
+# with a "Part of #N" line, the parentage rule the backlog board uses too.
+SEARCH_PAGES = 10
+SUB_ISSUE_LIMIT = 100
+
+
+def part_of_line(goal: int) -> str:
+    return "Part of #%d" % goal
+
+
+def _names_goal(body: Any, goal: int) -> bool:
+    return bool(re.search(r"^Part of #%d(?!\d)" % goal, str(body or ""), re.M))
+
+
+def _with_part_of(body: str, goal: int) -> str:
+    """The body with a Part of line for the goal, added once at the end."""
+    if _names_goal(body, goal):
+        return body
+    return body.rstrip("\n") + "\n\n" + part_of_line(goal) + "\n"
+
+
+def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo whose body has a Part of #goal line
+    (search, then the label and the exact line checked here: the search
+    also matches loose words)."""
+    q = quote('repo:%s is:issue label:loom:ticket in:body "%s"' % (repo, part_of_line(goal)))
+    url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
+    found: List[Dict[str, Any]] = []
+    for _ in range(SEARCH_PAGES):
+        if not url:
+            break
+        resp = gh.rest("GET", url)
+        data = resp.data if isinstance(resp.data, dict) else {}
+        # Anyone can open an issue that says Part of #N in a public repo, but
+        # only someone with write access can label it: a Part of issue counts
+        # only as a loom:ticket, as a sub-issue link counts only when made by
+        # someone who may write.
+        found.extend(item for item in data.get("items") or []
+                     if isinstance(item, dict) and "pull_request" not in item
+                     and "loom:ticket" in _labels(item)
+                     and _names_goal(item.get("body"), goal))
+        url = _next_link(resp.headers.get("link", ""))
+    return found
+
+
 def _goal_children(gh: GitHub, repo: str, goal: int,
                    issue: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """The sub-issues of an open loom:goal issue; ValueError for anything else."""
+    """The tickets of an open loom:goal issue: its sub-issues, plus issues
+    whose body says Part of #goal (past GitHub's 100 sub-issue limit);
+    ValueError for anything that is not an open goal."""
     if issue is None:
         issue = _goal_issue(gh, repo, goal)
-    return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
+    return goal_children(gh, repo, goal)
+
+
+def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """Sub-issues of the goal, then, once the goal holds GitHub's limit of
+    sub-issues (the only way a ticket gets a Part of line instead), the Part
+    of #goal issues not already listed. Below the limit it costs no search."""
+    children = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal)))
+    if len(children) < SUB_ISSUE_LIMIT:
+        return children
+    seen = {int(c.get("number") or 0) for c in children if isinstance(c, dict)}
+    for item in _part_of_issues(gh, repo, goal):
+        number = int(item.get("number") or 0)
+        if number and number not in seen:
+            children.append(item)
+            seen.add(number)
+    return children
+
+
+def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
+    """Add the issue as a sub-issue of the goal. False when GitHub refuses it
+    (422, for example a goal already at its 100 sub-issue limit): the Part of
+    line is then the only link, which goal_children reads."""
+    try:
+        gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
+                {"sub_issue_id": issue["id"]})
+    except GitHubError as exc:
+        if exc.status != 422:
+            raise
+        return False
+    return True
 
 
 def _in_flight(issue: Dict[str, Any]) -> bool:
@@ -727,8 +854,11 @@ def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
         names.append("lane:" + lane)
     issue = gh.rest("POST", "/repos/%s/issues" % repo, {
         "title": title, "body": body, "labels": names + list(extra)}).data
-    gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
-            {"sub_issue_id": issue["id"]})
+    if not _link_to_goal(gh, repo, goal, issue):
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
+                {"body": _with_part_of(body, goal)})
+        print("#%s is linked to goal #%d by a Part of line: GitHub refused it as a "
+              "sub-issue" % (issue.get("number"), goal), file=sys.stderr)
     return issue
 
 
@@ -850,6 +980,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if base is None:
         goal_issue = _goal_issue(gh, repo, goal)
         base = goal_trunk(goal_issue)
+    body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after)
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
@@ -911,6 +1042,9 @@ def missing_sections(body: Optional[str]) -> List[str]:
             tickets.parse(body)
         except ValueError as exc:
             missing.append("a body the runner accepts (%s)" % exc)
+    if not missing:
+        missing.extend("a pull request body the review bot accepts (%s)" % found
+                       for found in plan_problems(body or ""))
     return missing
 
 
@@ -958,7 +1092,9 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
     the goal, while the goal has room; the rest get loom:triage and one
     comment naming what is missing. Only labels, sub-issue links and that
-    comment are written: an issue is never closed, retitled or edited.
+    comment are written, plus a Part of line at the end of a ready issue's
+    body when GitHub refuses the sub-issue link: an issue is never closed or
+    retitled, and nothing else in it is edited.
     Returns one line per issue looked at.
     """
     if limit < 1:
@@ -980,15 +1116,11 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
                 continue
-            try:
-                gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
-                        {"sub_issue_id": issue["id"]})
-            except GitHubError as exc:
-                if exc.status != 422:
-                    raise
-                lines.append("#%d skipped: GitHub refused it as a sub-issue of #%d"
-                             % (number, goal))
-                continue
+            if not _link_to_goal(gh, repo, goal, issue):
+                # The goal is at GitHub's sub-issue limit (or refused it for
+                # another reason): the Part of line links it instead.
+                gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                        {"body": _with_part_of(str(issue.get("body") or ""), goal)})
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:ticket", "loom:queued"]})
             in_flight += 1
@@ -1110,10 +1242,18 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
                      model: Optional[str] = None) -> None:
     if state not in STATES:
         raise ValueError("invalid state")
-    if lane is not None and (state != "briefed" or lane not in LANES):
-        raise ValueError("lane is valid only for briefed and must be known")
+    if lane is not None:
+        if lane not in LANES:
+            raise ValueError("lane is valid only for briefed and must be known")
+        if lane in REMOTE_LANES:
+            if state != "queued":
+                raise ValueError("remote lane %s only works with --to queued" % lane)
+        elif state == "queued":
+            raise ValueError("local lane %s: use --to briefed instead" % lane)
+        elif state != "briefed":
+            raise ValueError("lane is valid only for briefed and must be known")
     if model is not None and state != "briefed":
-        raise ValueError("model is valid only for briefed")
+        raise ValueError("model is valid only for briefing")
     _check_model(model)
     if note is not None:
         _check_written_text(note)
@@ -1188,6 +1328,31 @@ def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
     return comment
 
 
+def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
+    owner = repo.split("/", 1)[0]
+    found = gh.paginate("/repos/%s/pulls?state=all&head=%s"
+                        % (repo, quote("%s:%s" % (owner, branch), safe="")))
+    for p in found:
+        if isinstance(p, dict) and (p.get("state") == "open"
+                                    or p.get("merged_at") is not None
+                                    or p.get("merged") is True):
+            return p
+    return None
+
+
+def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
+                        lane: str) -> None:
+    """Refuse a queued move to a remote lane that the lane could never claim:
+    a private repo for a public-only lane, or a ticket whose branch already
+    has a pull request (a fix round, which remote lanes do not run)."""
+    repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+        raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
+    branch = tickets.branch_for(number, str(issue.get("title") or ""))
+    if _open_or_merged_pull(gh, repo, branch) is not None:
+        raise ValueError("ticket branch %s already has a pull request" % branch)
+
+
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
          record: Optional[Dict[str, Any]] = None,
@@ -1201,6 +1366,17 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
+    if state == "queued" and lane in REMOTE_LANES:
+        _check_remote_queue(gh, repo, number, issue, lane)
+    if lane is not None and state == "briefed":
+        from .station import model_lanes
+        body = str(issue.get("body") or "").split("\n\n", 1)[0]
+        match = re.search(r"^Model:\s*(\S+)\s*$", body, re.M)
+        effective_model = model or (match.group(1) if match else None)
+        if effective_model and lane not in model_lanes(effective_model):
+            raise ValueError("lane %s cannot run model %s; compatible lanes: %s" %
+                             (lane, effective_model,
+                              ", ".join(model_lanes(effective_model)) or "none"))
     kept = _moved_labels(_labels(issue), state, lane)
     if record is not None:
         comment = _proof_comment(gh, repo, issue, record)
@@ -1618,7 +1794,8 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
         (ticket[0] == repo, "ticket and pull request must be in the same repository"),
         (_ticket_association(repo, pr) == ticket, "pull request is not linked to the ticket"),
         (issue.get("state") == "open" and "loom:ticket" in names, "ticket is not an open loom:ticket"),
-        ("loom:pr" in names, "ticket is not loom:pr"),
+        (bool({"loom:briefed", "loom:running", "loom:pr"} & set(names)),
+         "ticket is not loom:briefed, loom:running or loom:pr"),
         (sum(1 for x in names if x.startswith("lane:")) == 1, "ticket must have exactly one lane label"),
     ]
     for ok, reason in rules:
@@ -1628,7 +1805,8 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
 
 def _fix_body(repo: str, number: int, branch: str, notes: str,
               checks: List[Tuple[str, str]], threads: List[Dict[str, Any]]) -> str:
-    out = [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch), ""]
+    out = [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch),
+           BRAIN_FIX_MARKER, ""]
     if notes.strip():
         out += [notes.strip(), ""]
     if checks or threads:
@@ -1660,6 +1838,8 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     another lane and model when given (the body's Model: line is rewritten)."""
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
+    if lane is not None and lane in REMOTE_LANES:
+        raise ValueError("remote lane %s only works with --to queued" % lane)
     _check_model(model)
     _check_written_text(notes)
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
@@ -1669,7 +1849,9 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     checks = _failing_checks(gh, repo, sha) if sha else []
     threads = _open_threads(gh, repo, number)
     body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
-    kept = _moved_labels(_labels(issue), "briefed", lane)
+    state = next((x.split(":", 1)[1] for x in _labels(issue)
+                  if x in ("loom:briefed", "loom:running", "loom:pr")), "pr")
+    kept = _moved_labels(_labels(issue), "briefed", lane) if state == "pr" else None
     if model is not None:
         _set_model(gh, ticket[0], ticket[1], issue, model)
     posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
@@ -1677,7 +1859,8 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     print("brain: posted loom:fix comment %s on %s#%d"
           % (comment_id if comment_id is not None else "with unknown id", ticket[0], ticket[1]),
           file=sys.stderr)
-    gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
+    if kept is not None:
+        gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
 
 
 def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:
@@ -1727,6 +1910,74 @@ def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None
     if current is None or current[0] != holder or current[1] is None or current[1] <= now:
         raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
                          % (holder, lock_repo))
+
+
+def _step_record(message: str) -> Dict[str, Any]:
+    """Read the recorded step fields from one lock commit message."""
+    current_holder = re.search(r"holder=(\S+)", message)
+    record = {"holder": current_holder.group(1) if current_holder else None,
+              "started_at": None,
+              "step": None, "step_index": None, "steps": list(TICK_STEPS), "notes": []}
+    encoded = next((line[len(STEP_MARKER):] for line in message.splitlines()
+                    if line.startswith(STEP_MARKER)), "")
+    if encoded:
+        try:
+            saved = json.loads(encoded)
+            record.update({k: saved[k] for k in ("started_at", "step", "step_index", "notes")})
+        except (ValueError, TypeError, KeyError):
+            pass
+    return record
+
+
+def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
+              note: Optional[str] = None, holder: Optional[str] = None,
+              now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Read the tick record, or append one step to the current lock commit."""
+    now = now or datetime.now(timezone.utc)
+    ref_path = "/repos/%s/git/ref/heads/%s" % (lock_repo, lock.LOCK_BRANCH)
+    ref = gh.rest("GET", ref_path, ok=(404,))
+    if ref.status == 404:
+        return _step_record("")
+    sha = ref.data["object"]["sha"]
+    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha), ok=(404,))
+    if commit.status == 404:
+        return _step_record("")
+    message = str(commit.data.get("message") or "")
+    record = _step_record(message)
+    if step is None:
+        return record
+    if step not in TICK_STEPS:
+        raise ValueError("step must be one of %s" % ", ".join(TICK_STEPS))
+    lock_info = lock._read_lock(gh, lock_repo)
+    if lock_info is None or lock_info[0] != holder or lock_info[1] is None or lock_info[1] <= now:
+        raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
+                         % (holder, lock_repo))
+    at = _iso(now)
+    if step == "lock" or not record["started_at"]:
+        record["started_at"] = at
+        record["notes"] = []
+    record["step"] = step
+    record["step_index"] = TICK_STEPS.index(step) + 1
+    if note:
+        if "\n" in note or "\r" in note:
+            raise ValueError("note must be one line")
+        record["notes"].append({"ts": at, "step": step, "text": note})
+    record["holder"] = holder
+    clean = "\n".join(line for line in message.splitlines() if not line.startswith(STEP_MARKER))
+    new_message = clean + "\n" + STEP_MARKER + json.dumps(
+        {k: record[k] for k in ("started_at", "step", "step_index", "notes")}, separators=(",", ":"))
+    created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
+        "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
+    gh.rest("PATCH", ref_path, {"sha": created.data["sha"], "force": True})
+    return record
+
+
+def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
+    try:
+        print(json.dumps(tick_step(gh, _repo(args.lock_repo), args.name,
+                                   args.note, args.holder), sort_keys=True))
+    except GitHubError as exc:
+        print("brain step write failed: %s" % exc, file=sys.stderr)
 
 
 def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
@@ -2116,6 +2367,7 @@ def parser() -> argparse.ArgumentParser:
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True)
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True)
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
+    st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
@@ -2211,6 +2463,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate}
+COMMANDS["step"] = _cmd_step
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

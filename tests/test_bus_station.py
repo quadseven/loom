@@ -634,7 +634,9 @@ class BudgetTest(Base):
         transport, _ = self.low(remaining=4000)
         _, err = self.passes(transport)
         self.assertEqual(len(self.gets("loom:pr")), 2)
-        self.assertEqual(len(self.gets("loom:lanes")), 1)
+        # One lookup finds the status issue; the other reads the remote
+        # lane heartbeat from that issue's comments.
+        self.assertEqual(len(self.gets("loom:lanes")), 2)
         self.assertNotIn("budget low", err)
         self.assertIn("budget 4000 of 5000 left", err)
 
@@ -662,8 +664,9 @@ class BudgetTest(Base):
         self.assertEqual(len(self.gets("loom:pr")), 6)
 
 
-READY_BODY = ("## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n"
-              "- [ ] done\n## Size\nS\n## Out of scope\n- none")
+READY_BODY = ("## Why\nThe page query is slow for every visitor.\n## What\nwhat\n"
+              "## Acceptance criteria\n- [ ] done\n- [ ] tested\n- [ ] live\n"
+              "## Size\nS\n## Out of scope\n- none")
 
 
 class TriageTest(Base):
@@ -852,6 +855,15 @@ class HandBackTest(unittest.TestCase):
         self.assertEqual(len(self.gh.comments), 1)
         self.assertIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
 
+    def test_pending_brain_fix_is_queued_before_automatic_hand_back(self):
+        self.gh.comments.append({"user": {"login": AUTHORS[0]},
+                                 "body": tickets.FIX_MARKER + "\n" +
+                                         brain.BRAIN_FIX_MARKER + "\nManual review finding"})
+        self.run_hand_back(checks=[("lint", "automatic check finding")])
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+        self.assertNotIn("loom:pr", [x["name"] for x in self.gh.issue["labels"]])
+
     def test_fix_round_cap_adds_needs_brain(self):
         self.gh.comments.extend({"user": {"login": "alice-example"},
                                  "body": tickets.FIX_MARKER + "\n<!-- loom:fix-head %s -->" % (str(i) * 40)}
@@ -900,8 +912,9 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        # Reconciliation, PR review polling, and the goal scan still run.
-        self.assertEqual(self.run_pass().requests, 4)
+        # Reconciliation, PR review polling, the goal scan and the invariant
+        # check's read of open pull requests (their plan checks) still run.
+        self.assertEqual(self.run_pass().requests, 5)
 
 
 class TicketsTest(unittest.TestCase):
@@ -994,6 +1007,36 @@ class TrustTest(unittest.TestCase):
 
 
 class ClaimTest(Base):
+    def test_a_mismatched_model_moves_to_a_compatible_lane_before_claim(self):
+        self.heartbeat("opencode-go-3")
+        self.heartbeat("claude")
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        self.run_pass()
+        self.assertEqual(self.listing("opencode-go-3"), [])
+        self.assertEqual(self.listing("claude"), ["example-owner.example-repo-12.md"])
+        self.assertIn("lane:claude", self.fake.names(12))
+        self.assertIn("Claimed for lane claude", self.fake.comments[12][-1]["body"])
+
+    def test_a_mismatched_model_waits_queued_without_a_free_compatible_lane(self):
+        self.heartbeat("opencode-go-3")
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        self.run_pass()
+        self.assertEqual(self.listing("opencode-go-3"), [])
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("claude-sonnet-5-5", self.fake.comments[12][-1]["body"])
+        self.assertEqual(self.fake.issues[12]["body"], body)
+
+    def test_a_mismatched_model_is_queued_even_when_no_lane_is_free(self):
+        body = BODY.replace("Model: model-x", "Model: claude-sonnet-5-5")
+        self.fake.add(12, lane="opencode-go-3", body=body)
+        self.write(self.inbox("codex", "other.md"), "busy\n")
+        self.run_pass()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12][-1]["body"],
+                         "Model claude-sonnet-5-5 waits for a free compatible lane.")
+
     def test_a_trusted_ticket_becomes_a_brief_and_is_claimed(self):
         self.fake.add(12)
         self.run_pass()
@@ -1878,7 +1921,9 @@ class OutcomeTest(Base):
         self.assertNotIn("agent exited 1", body)
 
     def limited(self, lane="spark", fix_body=None):
-        self.fake.add(12, state="running", lane=lane)
+        self.fake.add(12, state="running", lane=lane,
+                      body=BODY.replace("Model: model-x", "Model: spark/test")
+                      if lane == "spark" else BODY)
         self.fake.comments[99] = []
         fix = tickets.parse_fix(REPO, fix_body) if fix_body else None
         name = tickets.ticket_name(REPO, 12, 1)
@@ -2121,7 +2166,8 @@ class SpendTest(Base):
         self.assertFalse(st._heartbeat_ok("anthropic"))
         self.assertFalse(st._heartbeat_ok("anthropic-4"))
         self.assertTrue(st._heartbeat_ok("codex"))
-        self.fake.add(12, lane="anthropic-4")
+        self.fake.add(12, lane="anthropic-4",
+                      body=BODY.replace("Model: model-x", "Model: claude-sonnet-5-5"))
         st.run_pass()
         self.assertEqual(self.listing("anthropic-4"), [])
         self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
@@ -2522,6 +2568,89 @@ class HumanDigestTest(AsksTest):
         self.assertEqual(text.splitlines(), [
             "Waiting on you (3):", other, "- C u3", "  Ask.", "- A u1", "  Ask.",
             REPO, "- B u2", "  Ask."])
+
+
+class ReportDigestTest(Base):
+    """Two digests a day (operator, 2026-10-14) instead of every report."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.webhook_ssm = "/example/webhook"
+        self.settings.report_digest = ((10, 0), (21, 0))
+        self.settings.authors = list(AUTHORS)
+        self.sent = []
+        day = time.localtime()
+        self.base = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 0, 0, 0, 0, 0, -1))
+
+    def at(self, hour, minute=0, days=0):
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=self.base + days * 86400 + hour * 3600 + minute * 60,
+                        read_secret=lambda n, r: URL,
+                        post=lambda url, payload: self.sent.append(payload)).run_pass()
+
+    def goal(self, number, title):
+        self.fake.add(number, title=title, state="goal")
+        self.fake.issues[number]["labels"] = [{"name": "loom:goal"}]
+
+    def report(self, number, ident, first):
+        self.fake.comments[number].append({"id": ident, "body": station.REPORT_MARKER + "\n" + first + "\nmore",
+            "user": {"login": AUTHORS[0]},
+            "html_url": "https://github.com/%s/issues/%d#issuecomment-%d" % (REPO, number, ident)})
+
+    def test_one_digest_at_each_time_lists_movers_and_counts_quiet_goals(self):
+        self.goal(40, "Goal forty")
+        self.goal(41, "Goal forty-one")
+        self.goal(42, "Goal forty-two")
+        self.at(9, 0)            # switching on before 10:00 sends nothing
+        self.at(9, 30)
+        self.report(40, 100, "2 merged, 1 verified since the last report.")
+        self.report(41, 101, "Nothing moved since the last report.")
+        self.report(41, 102, "Nothing moved since the last report.")
+        self.at(9, 59)
+        self.assertEqual(self.sent, [])
+        self.at(10, 1)
+        self.at(10, 30)          # the same time is never sent twice
+        self.assertEqual(len(self.sent), 1)
+        text = self.sent[0]["content"]
+        self.assertIn("Loom morning digest", text)
+        self.assertIn("Moving, 1 goal:", text)
+        self.assertIn("**Goal forty** 2 merged, 1 verified since the last report.", text)
+        self.assertIn("Quiet: 2 goals, nothing moved.", text)
+        self.assertNotIn("forty-one", text)
+        self.at(21, 5)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("Loom evening digest", self.sent[1]["content"])
+        self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
+
+    def test_each_report_is_not_forwarded_on_its_own(self):
+        self.goal(40, "Goal forty")
+        self.at(10, 1)           # first pass: records the time, sends nothing
+        for minute in range(2, 50, 6):
+            self.report(40, 200 + minute, "1 merged since the last report.")
+            self.at(10, minute)
+        self.assertEqual(self.sent, [])
+
+    def test_the_digest_carries_the_latest_daily_factory_numbers(self):
+        self.goal(40, "Goal forty")
+        self.settings.metrics_goal = "%s#40" % REPO
+        self.fake.comments[40].append({"id": 90, "body": "<!-- loom:metrics v1 -->\n2026-10-13: 3/9 pass; streak 0 day(s)",
+                                       "user": {"login": AUTHORS[0]}})
+        self.fake.comments[40].append({"id": 91, "body": "<!-- loom:metrics v1 -->\n2026-10-14: 4/9 pass; streak 0 day(s)",
+                                       "user": {"login": AUTHORS[0]}})
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=self.base + 10 * 3600, read_secret=lambda n, r: URL,
+                             post=lambda url, payload: None)
+        self.assertEqual(st._digest_factory_line(), "Factory 2026-10-14: 4/9 numbers pass; streak 0 of 7.")
+        self.settings.metrics_goal = ""
+        self.assertEqual(st._digest_factory_line(), "")
+
+    def test_digest_times_parse_and_turn_off(self):
+        self.assertEqual(station.parse_digest_times("10:00, 21:00"), ((10, 0), (21, 0)))
+        self.assertEqual(station.parse_digest_times("25:00 9:5 x"), ())
+        self.assertEqual(station.Settings.from_env({"LOOM_REPOS": REPO}).report_digest,
+                         ((10, 0), (21, 0)))
+        self.assertEqual(station.Settings.from_env({"LOOM_REPOS": REPO,
+                                                    "LOOM_REPORT_DIGEST_TIMES": ""}).report_digest, ())
 
 
 class ReportsTest(Base):

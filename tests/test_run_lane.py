@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bus import pr_repair, text, tickets  # noqa: E402
+from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
@@ -546,6 +546,16 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue(self.body.read_text().rstrip("\n").endswith(
             "lane codex, model gpt-test-default.\nRefs example/repo#42"))
 
+    def test_pr_body_writes_a_word_size_as_the_review_bots_letter(self):
+        # Chief accepts only XS, S, M, L: "Size: Medium" held five lane PRs
+        # on 2026-10-14. The body the runner opens passes every plan check.
+        self.drop_brief(text=BRIEF.replace("S: one function.", "Medium"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\nSize: M\n", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()
         self.run_lane()
@@ -668,6 +678,48 @@ class LaneRunnerTest(unittest.TestCase):
         self.run_lane()
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
+
+    def test_a_limited_ladder_model_falls_back_on_the_next_pass(self):
+        models = "gpt-test-high gpt-test-low"
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        first = self.run_lane(LOOM_CODEX_MODELS=models, FAKE_AGENT="say",
+                              FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertTrue(beat["available"])
+        self.assertIn("gpt-test-high", beat["reason"])
+        self.assertIn("--model gpt-test-high", "\n".join(self.calls()))
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        second = self.run_lane(LOOM_CODEX_MODELS=models)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        calls = "\n".join(self.calls())
+        self.assertIn("--model gpt-test-low", calls)
+
+    def test_a_ladder_holds_only_when_every_model_is_limited(self):
+        models = "gpt-test-high gpt-test-low"
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(LOOM_CODEX_MODELS=models, FAKE_AGENT="say",
+                      FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 2 hours")
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        self.run_lane(LOOM_CODEX_MODELS=models, FAKE_AGENT="say",
+                      FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 3 hours")
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("gpt-test-high until", beat["reason"])
+        self.assertIn("gpt-test-low until", beat["reason"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_ticket_model_is_not_swapped_for_a_ladder_model(self):
+        self.drop_brief("T042-fix-the-thing.md",
+                        BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-test-high"))
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / "codex.models").write_text(
+            "gpt-test-high %d provider-limit\n" % (int(time.time()) + 3600))
+        result = self.run_lane(LOOM_CODEX_MODELS="gpt-test-high gpt-test-low")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = "\n".join(self.calls())
+        self.assertNotIn("--model gpt-test-low", calls)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def test_empty_api_credit_holds_the_lane_for_24_hours(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
@@ -1086,6 +1138,19 @@ cat > /dev/null
         self.run_lane()
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_opencode_go_model_mismatch_is_transient(self):
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(
+            BRIEF.replace("Lane: codex", "Lane: opencode-go")
+            .replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-5-5"))
+        result = self.run_lane("opencode-go", LOOM_OPENCODE_GO_MODEL="opencode-go/model-free",
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               FAKE_SECRET__k_oc="fake-oc-key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [transient] model claude-sonnet-5-5 is not an opencode-go model", log)
 
     def api_lane(self, lane, extra="", **env):
         planted = self.home / ".ssh" / "id_planted"
@@ -1788,6 +1853,44 @@ cat > /dev/null
         self.assertIn("lane spark, model spark/coder-test", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.spark_beat()["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_the_spark_2_slot_runs_against_its_own_box(self):
+        # The second Spark box (2026-10-14: one sat idle with the coder warm).
+        inbox = self.loom / "briefs" / "spark-2"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark-2"))
+        result = self.run_lane("spark-2", LOOM_SPARK_2_URL="http://other-spark.example.invalid:8000/v1",
+                               **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("curl ") and "http://other-spark.example.invalid:8000/v1/models" in c
+                            for c in calls), calls)
+        self.assertFalse(any("spark.example.invalid:8000" in c and "other-spark" not in c
+                             for c in calls if c.startswith("curl ")), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["options"],
+                         {"baseURL": "http://other-spark.example.invalid:8000/v1"})
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_uses_the_window_its_endpoint_serves(self):
+        # The first sparkles run thrashed in a fixed 32K window against a
+        # server serving 262144; the window is a lane setting now.
+        _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT="131072", LOOM_SPARK_OUTPUT="16384",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
+                         {"context": 131072, "output": 16384})
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
+        _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
+                         {"context": 32768, "output": 4096})
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_spark_lane_takes_the_brief_model_line(self):

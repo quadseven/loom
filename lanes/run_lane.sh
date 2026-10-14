@@ -269,7 +269,11 @@ pr_body() {
   local size issue refs=""
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
-  size="$(section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
+  # The size as the review bot's letter (Medium -> M), so its plan check
+  # passes whatever word the brief used; an unknown size is kept as written.
+  size="$(section Size "$1" | head -1)"
+  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan size "$size" 2>/dev/null ||
+    printf '%s' "$size" | awk '{print $1}' | tr -d ':')"
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
@@ -503,7 +507,8 @@ $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" <
 # parked with a "limit:" reason, which the station hands to the next lane.
 LIMIT_HOLD=900
 LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
-SPARK_URL="${LOOM_SPARK_URL:-}"
+# A spark slot (spark-2) may name its own box: LOOM_SPARK_2_URL, else LOOM_SPARK_URL.
+SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_WHY=""
@@ -568,7 +573,7 @@ PROBE_HOLD=43200
 # 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
 # MODEL; 1 for any other answer, no answer, or no probe configured.
 provider_at_limit() {
-  local url header session model body out code limit_name
+  local url header session model body out code limit_name headers retry_after stamp
   url="$(lane_setting PROBE_URL)" header="$(lane_setting PROBE_HEADER)"
   [ -n "$url" ] && [ -n "$API_KEY" ] || return 1
   [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 1
@@ -581,13 +586,29 @@ provider_at_limit() {
   model="${MODEL#*/}"
   [[ "$model" =~ ^[A-Za-z0-9._:/@-]+$ ]] || return 1
   body="$(printf '{"model": "%s", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}' "$model")"
-  out="$(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" |
-    curl -s -K - -X POST --max-time "$PROBE_TIMEOUT" -w '\n%{http_code}' \
+  headers="$LOOM_HOME/state/usage/$SLOT.probe-headers"
+  mkdir -p "$LOOM_HOME/state/usage"
+  if ! out="$(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" |
+    curl -s -K - -D "$headers" -X POST --max-time "$PROBE_TIMEOUT" -w '\n%{http_code}' \
       -H 'Content-Type: application/json' ${header:+-H "$header: $session"} \
-      --data-binary "$body" "$url" 2>/dev/null)" || return 1
+      --data-binary "$body" "$url" 2>/dev/null)"; then
+    rm -f "$headers"
+    return 1
+  fi
   code="${out##*$'\n'}" body="${out%$'\n'*}"
-  [ "$code" = 429 ] && [[ "$body" == *GoUsageLimitError* ]] || return 1
+  if [ "$code" != 429 ] || [[ "$body" != *GoUsageLimitError* ]]; then
+    rm -f "$headers"
+    return 1
+  fi
   limit_name="$(printf '%s' "$body" | sed -nE 's/.*"limitName" *: *"([A-Za-z0-9_-]+)".*/\1/p' | head -1)"
+  retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
+  rm -f "$headers"
+  retry_after="$(printf '%s' "$retry_after" | tr -cd '[:alnum:], :-')"
+  stamp="$(date +%s)"
+  [[ "$retry_after" =~ ^[0-9]+$ ]] && retry_after=$((stamp + retry_after))
+  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s"}\n' \
+    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
+    mv -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 GoUsageLimitError)"
   return 0
 }
@@ -598,6 +619,39 @@ hold_provider_limit() {
   LIMIT_UNTIL=$(( $(date +%s) + PROBE_HOLD ))
   LIMITED=1
   heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")" "$LIMIT_UNTIL"
+}
+
+# Model ladders keep usage limits per model so a slot can continue on the
+# next configured model. Each row is model, reset epoch, and safe reason.
+MODEL_LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.models"
+model_limit_until() {
+  local model="$1" now saved_model ends
+  now="$(date +%s)"
+  [ -f "$MODEL_LIMIT_FILE" ] || return 1
+  while read -r saved_model ends _; do
+    [ "$saved_model" = "$model" ] && [[ "$ends" =~ ^[0-9]+$ ]] &&
+      [ "$ends" -gt "$now" ] && { printf '%s' "$ends"; return 0; }
+  done < "$MODEL_LIMIT_FILE"
+  return 1
+}
+record_model_limit() {
+  local model="$1" ends="$2" why="$3" tmp
+  tmp="$MODEL_LIMIT_FILE.tmp"
+  mkdir -p "$(dirname "$MODEL_LIMIT_FILE")"
+  { [ ! -f "$MODEL_LIMIT_FILE" ] || awk -v m="$model" '$1 != m' "$MODEL_LIMIT_FILE"
+    printf '%s %s %s\n' "$model" "$ends" "$(printf '%s' "$why" | tr -cd '[:alnum:] ._:-')"; } > "$tmp"
+  mv "$tmp" "$MODEL_LIMIT_FILE"
+}
+ladder_reason() {
+  local models="$1" model ends why="" first=1
+  for model in $models; do
+    if ends="$(model_limit_until "$model")"; then
+      [ "$first" -eq 1 ] || why="$why, "
+      why="$why$model until $(utc "$ends")"
+      first=0
+    fi
+  done
+  printf '%s' "$why"
 }
 
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
@@ -1180,7 +1234,8 @@ done
 # A provider limit hit by an earlier pass holds until its retry time. A
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
-if [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
+CONFIGURED_MODELS="$(lane_setting MODELS)"
+if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
   heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
@@ -1233,8 +1288,28 @@ for BRIEF in "$INBOX"/*.md; do
   [ -n "$BASE_BRANCH" ] && PR_BASE_ARGS=(--base "$BASE_BRANCH")
   # The model: the brief's Model: line, else the lane default. Passed to the
   # CLI explicitly so the PR names what actually ran.
-  MODEL="$(field Model "$BRIEF" || true)"
-  [ -n "$MODEL" ] || MODEL="$(lane_setting MODEL)"
+  PINNED_MODEL="$(field Model "$BRIEF" || true)"
+  MODEL="$PINNED_MODEL"
+  if [ -z "$MODEL" ]; then
+    MODEL="$(lane_setting MODEL)"
+    if [ -n "$CONFIGURED_MODELS" ]; then
+      MODEL=""
+      for candidate in $CONFIGURED_MODELS; do
+        if ! model_limit_until "$candidate" >/dev/null; then MODEL="$candidate"; break; fi
+      done
+      if [ -z "$MODEL" ]; then
+        WHY="$(ladder_reason "$CONFIGURED_MODELS")"
+        MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE" 2>/dev/null)"
+        heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
+        park "$BRIEF" "limit: all models limited: $WHY" limit; continue
+      fi
+    fi
+  elif [ -n "$CONFIGURED_MODELS" ] && [ -n "$PINNED_MODEL" ]; then
+    if PINNED_UNTIL="$(model_limit_until "$PINNED_MODEL")"; then
+      park "$BRIEF" "limit: requested model $PINNED_MODEL limited until $(utc "$PINNED_UNTIL")" limit
+      continue
+    fi
+  fi
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/@-]*$ ]]; then
     park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
   fi
@@ -1247,7 +1322,7 @@ for BRIEF in "$INBOX"/*.md; do
     openrouter:openrouter/*:free) ;;
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
     opencode-go:opencode-go/*) ;;
-    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model"; continue ;;
+    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model" transient; continue ;;
     zen:opencode/*-free) ;;
     zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
@@ -1259,6 +1334,11 @@ for BRIEF in "$INBOX"/*.md; do
     agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
+  if [ -n "$CONFIGURED_MODELS" ] && [ -z "$PINNED_MODEL" ]; then
+    WHY="$(ladder_reason "$CONFIGURED_MODELS")"
+    if [ -n "$WHY" ]; then heartbeat true "model $MODEL in use; limited: $WHY"
+    else heartbeat true "model $MODEL in use"; fi
+  fi
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
@@ -1374,10 +1454,25 @@ for BRIEF in "$INBOX"/*.md; do
     if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
+      heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    elif [ -n "$CONFIGURED_MODELS" ]; then
+      LIMIT_REASON="provider limit reached"
+      record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
+      WHY="$(ladder_reason "$CONFIGURED_MODELS")"
+      MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
+      AVAILABLE_MODEL=""
+      for candidate in $CONFIGURED_MODELS; do
+        if ! model_limit_until "$candidate" >/dev/null; then AVAILABLE_MODEL="$candidate"; break; fi
+      done
+      if [ -n "$AVAILABLE_MODEL" ]; then
+        heartbeat true "model $AVAILABLE_MODEL available; limited: $WHY"
+      else
+        heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
+      fi
     else
       LIMIT_REASON="provider limit reached"
+      heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
-    heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
     break
   fi
@@ -1502,8 +1597,15 @@ for BRIEF in "$INBOX"/*.md; do
   prepare_intent "$BRIEF" >> "$LOG" 2>&1
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
+  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  # Briefs are checked when filed, so this only fires on a brief filed
+  # before that check or edited by hand: the PR still opens (the work is
+  # done), and the log names what the review bot will hold it for.
+  if ! PLAN_PROBLEMS="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)"; then
+    echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$PLAN_PROBLEMS" | tr '\n' ';')" >> "$LOG"
+  fi
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
-       --body "$(pr_body "$BRIEF" "$TICKET")" 2>> "$LOG")"; then
+       --body "$PR_BODY" 2>> "$LOG")"; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed" transient; continue
   fi
   echo "$PR_URL" >> "$LOG"
