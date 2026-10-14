@@ -78,6 +78,9 @@ done
 trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1' EXIT
 # launchd stops a job with SIGTERM; exiting on it runs the EXIT trap.
 trap 'exit 143' TERM INT
+bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
+brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
+brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record lock step"
 
 if [ -d "$WORK/loom/.git" ]; then
   git -C "$WORK/loom" pull -q --ff-only >> "$LOG" 2>&1 || { say "could not update $WORK/loom"; beat failed 1; exit 1; }
@@ -116,4 +119,5 @@ STARTED="$(date +%s)"
   --permission-mode bypassPermissions "$PROMPT" < /dev/null) >> "$LOG" 2>&1
 code=$?
 say "tick end (exit $code)"
+brain step unlock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record unlock step"
 if [ "$code" = 0 ]; then beat ok 0; else beat failed "$code"; fi

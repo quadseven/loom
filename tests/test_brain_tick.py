@@ -128,6 +128,8 @@ class BrainTickTest(unittest.TestCase):
         run, calls = self.tick()
         self.assertEqual(0, run.returncode)
         self.assertIn("-m bus lock", calls[0])
+        self.assertEqual("python3 -m bus.brain step lock --holder lane-machine "
+                         "--lock-repo example/loom", calls[1])
         claude = [c for c in calls if c.startswith("claude ")]
         self.assertEqual(1, len(claude))
         self.assertIn("--model claude-opus-5-5", claude[0])
