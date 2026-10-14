@@ -1,9 +1,9 @@
 """Rewrite a loom:triage issue into a ticket with a configured agent command.
 
-The command reads a prompt on stdin and prints one JSON object. Code checks
-the answer before anything is written to GitHub, so the agent can be a free
-or subscription model: it only drafts. The original issue is never closed,
-retitled or edited; brain.brief and brain.human add a comment and labels.
+The command reads a prompt on stdin and prints one JSON object. Code validates
+the draft, then files a queued ticket or a human ask. The agent can be a free
+or subscription model because it only drafts. The original issue is never
+closed, retitled or edited; brain.brief and brain.human add a comment and labels.
 """
 from __future__ import annotations
 
@@ -42,7 +42,9 @@ def brief_format() -> str:
     """The ticket body format, from the Ticket issues section of docs/BRAIN.md."""
     with open(DOCS, encoding="utf-8") as fh:
         text = fh.read()
-    start = text.index("## Ticket issues")
+    start = text.find("## Ticket issues")
+    if start == -1:
+        raise Invalid("docs/BRAIN.md has no '## Ticket issues' section")
     end = text.find("\n### ", start)
     return text[start:end if end != -1 else len(text)].strip()
 

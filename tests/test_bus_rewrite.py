@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -64,6 +65,9 @@ class FakeGitHub:
             self.created.append(data)
             return reply(201, {"id": 9000 + len(self.created), "number": 500 + len(self.created),
                                "html_url": "https://github.com/%s/issues/%d" % (REPO, 500)})
+        return self._issue_request(method, path, rest, data)
+
+    def _issue_request(self, method, path, rest, data):
         m = re.fullmatch(r"issues/(\d+)(?:/(\w+)(?:/(.*))?)?", rest)
         if not m:
             raise AssertionError("unexpected call %s %s" % (method, path))
@@ -162,6 +166,17 @@ class RewriteIssueTest(Base):
         self.assertIn("It is slow.", prompt)
         self.assertIn("## Acceptance criteria", prompt)
         self.assertIn("Difficulty: easy | medium | hard", prompt)
+
+    def test_missing_brief_format_section_writes_nothing_and_logs_why(self):
+        self.fake.add_triage(7)
+        docs = os.path.join(self._tmp.name, "BRAIN.md")
+        with open(docs, "w") as fh:
+            fh.write("# Brain\n")
+        with mock.patch.object(rewrite, "DOCS", docs):
+            err = self.run_station(self.station(cmd=self.agent(BRIEF)))
+        self.assertIn("docs/BRAIN.md has no '## Ticket issues' section", err)
+        self.assertEqual(self.fake.created, [])
+        self.assertEqual(self.fake.writes_to(7), [])
 
     def test_the_answer_may_come_in_a_code_fence_with_chatter(self):
         text = "Here you go:\n```json\n%s\n```\nDone." % json.dumps(BRIEF)
