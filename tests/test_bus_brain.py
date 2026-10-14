@@ -98,6 +98,61 @@ class BrainTests(unittest.TestCase):
                 lock_repo=REPO, name="merge", note=None, holder="muse", show=False))
         self.assertIn("brain step write failed", err.getvalue())
 
+
+class SensitiveResumeTests(unittest.TestCase):
+    NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+
+    def make_gh(self, entries):
+        prs = []
+        details = {}
+        for n, age, checks, _ in entries:
+            prs.append({"number": n, "title": "PR%d" % n,
+                        "created_at": (self.NOW - brain.timedelta(hours=age)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "labels": [{"name": "needs-brain"}, {"name": "class:sensitive"}],
+                        "head": {"ref": "loom/%d-fix" % n, "sha": "sha%d" % n}})
+            details[n] = {"headRefOid": "sha%d" % n,
+                          "commits": {"nodes": [{"commit": {
+                              "statusCheckRollup": {"state": checks}}}]},
+                          "reviewThreads": {"nodes": [
+                              {"isResolved": False}, {"isResolved": True}]}}
+
+        def transport(method, url, headers, body):
+            path = url.split("api.github.com")[1].split("?")[0]
+            if path == "/repos/%s/pulls" % REPO:
+                return reply(200, prs)
+            if path.startswith("/repos/%s/commits/" % REPO) and path.endswith("/check-runs"):
+                sha = path.split("/")[-2]
+                n = int(sha[3:])
+                passed = next(row[3] for row in entries if row[0] == n)
+                runs = [{"name": brain.review_check_name({}), "status": "completed",
+                         "conclusion": "success" if passed else "failure"}] if passed else []
+                return reply(200, {"check_runs": runs})
+            if path.startswith("/repos/%s/issues/" % REPO):
+                n = int(path.rsplit("/", 1)[1])
+                return reply(200, {"title": "Ticket%d" % n})
+            if path == "/graphql":
+                query = json.loads(body)["query"]
+                n = int(query.split("pullRequest(number:")[1].split(")")[0])
+                return reply(200, {"data": {"repository": {"p": details[n]}}})
+            raise AssertionError("unexpected %s %s" % (method, path))
+        return GitHub("t", transport=transport)
+
+    def test_only_old_green_reviewed_sensitive_prs_are_listed_with_ticket_and_threads(self):
+        entries = [(1, 3, "SUCCESS", True), (2, 1, "SUCCESS", True),
+                   (3, 4, "FAILURE", True), (4, 5, "SUCCESS", False)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries), [REPO], self.NOW, {})
+        items = [line for line in lines if line.startswith("- resume sensitive")]
+        self.assertEqual(1, len(items))
+        self.assertIn("%s#1 ticket %s#1 Ticket1 - PR1 - 3h old - 1 open review threads" %
+                      (REPO, REPO), items[0])
+
+    def test_sensitive_resume_is_capped_at_five_oldest_first(self):
+        entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries), [REPO], self.NOW, {})
+        numbers = [int(line.split("#")[1].split()[0]) for line in lines
+                   if line.startswith("- resume sensitive")]
+        self.assertEqual([7, 6, 5, 4, 3], numbers)
+
     def test_goal_trunk_reads_the_trunk_line_from_a_goal_body(self):
         self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
