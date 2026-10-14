@@ -277,10 +277,10 @@ echo fixed > fix.txt
 # submodule at its pinned revision, fails on a "broken" fix.txt, and, like a
 # formatter, strips trailing spaces from fix.txt.
 CONTRACT = """# The same steps CI runs.
-interpreter: python3.12
+interpreter: loom-test-python
 submodules: yes
-setup: python3.12 -c 'open(".prepared", "w").write("ok")'
-check: test -f .prepared && python3.12 check.py
+setup: loom-test-python -c 'open(".prepared", "w").write("ok")'
+check: test -f .prepared && loom-test-python check.py
 """
 CHECK_PY = """import pathlib, sys
 assert pathlib.Path("vendor/sub/value.txt").read_text() == "v1\\n", "submodule not at its pin"
@@ -389,7 +389,9 @@ class LaneRunnerTest(unittest.TestCase):
         brief.write_text("## Fix\nFixed\n### Thread F1 (comment 1) at test.py:10\n"
                          "Fixed\n### Thread F2 (comment 2) at test.py:20\n"
                          "Fixing: example/repo#12\n")
-        script = 'source <(sed -n "/^fix_items() {/,/^}/p" "$1"); fix_items "$2"'
+        # eval, not source <(...): bash 3.2 (macOS, as CI runs it) sources
+        # nothing from a process substitution.
+        script = 'eval "$(sed -n "/^fix_items() {/,/^}/p" "$1")"; fix_items "$2"'
         result = subprocess.run(["bash", "-c", script, "bash", str(RUNNER), str(brief)],
                                 capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.strip(),
@@ -2142,10 +2144,12 @@ exit %d
 
     def run_contract_lane(self, interpreter=True, **env):
         """A codex pass that may clone file:// submodules; with interpreter,
-        python3.12 is on PATH."""
+        loom-test-python is on PATH. The name exists on no machine, so the
+        test without it does not depend on the host's Pythons (the CI runner
+        has a python3.12 on its PATH)."""
         path = self.lane_env()["PATH"]
         if interpreter:
-            self.write_tool(Path(self._tmp.name) / "pybin" / "python3.12",
+            self.write_tool(Path(self._tmp.name) / "pybin" / "loom-test-python",
                             f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
             path = f"{Path(self._tmp.name) / 'pybin'}:{path}"
         return self.run_lane(PATH=path, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="protocol.file.allow",
@@ -2171,7 +2175,7 @@ exit %d
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
-        self.assertIn("setup failed: interpreter python3.12 is not on PATH", self.lane_log())
+        self.assertIn("setup failed: interpreter loom-test-python is not on PATH", self.lane_log())
         self.assertEqual([(r["phase"], r["ok"]) for r in self.records()], [("prepare", False)])
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
@@ -2188,7 +2192,7 @@ exit %d
         self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records],
                          [("prepare", 0, True), ("setup", 0, True), ("baseline", 0, True), ("final", 0, True)])
         self.assertIn(pinned, records[0]["detail"])
-        self.assertEqual(records[-1]["command"], "test -f .prepared && python3.12 check.py")
+        self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
         head = subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", "loom/T042-fix-the-thing"],
                               capture_output=True, text=True, check=True).stdout.strip()
         self.assertEqual(records[-1]["revision"], head)
@@ -2236,7 +2240,7 @@ exit %d
         result = self.run_contract_lane(FAKE_AGENT="edit", FAKE_AGENT_TEXT="broken", FAKE_AGENT_WEAKEN="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
-        self.assertEqual(self.records()[-1]["command"], "test -f .prepared && python3.12 check.py")
+        self.assertEqual(self.records()[-1]["command"], "test -f .prepared && loom-test-python check.py")
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
     def test_a_fix_run_checks_against_the_base_branchs_contract_not_the_pull_requests(self):
@@ -2256,7 +2260,7 @@ exit %d
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
         records = [json.loads(line) for line in path.read_text().splitlines()]
-        self.assertEqual(records[-1]["command"], "test -f .prepared && python3.12 check.py")
+        self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
         self.assertFalse(records[-1]["ok"])
 
     def test_a_contract_with_an_unknown_line_is_a_setup_failure(self):
