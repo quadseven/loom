@@ -1090,8 +1090,13 @@ class Factory:
             _say("%s#%d stalled on lane %s: no other lane of its %s is available"
                  % (repo, number, old, "rung" if rung else "tier"))
             return
-        lane = pick_lane(lanes, self.load)
-        hours = (self.now - since) / 3600
+        self._move_stalled(repo, issue, pick_lane(lanes, self.load),
+                           (self.now - since) / 3600, rung)
+
+    def _move_stalled(self, repo: str, issue: Dict[str, Any], lane: str,
+                      hours: float, rung: int) -> None:
+        """Relabel a stalled ticket onto `lane` and say why; no rung marker."""
+        number, old = int(issue["number"]), _lane(issue)
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
