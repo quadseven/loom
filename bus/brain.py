@@ -16,6 +16,8 @@ from . import change_class, handoff, hunt_plan, lock, pr_repair, proof, text, ti
 from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
+BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
+
 STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 # Tickets that hold a lane slot: waiting for a lane, in one, or back from one.
 # Merged and shipped tickets wait on a deploy or a live check, not on a lane,
@@ -133,6 +135,8 @@ RULING_FIELDS = (
     " mergeable rulingThreads: reviewThreads(first:100) { nodes { isResolved"
     " comments(first:50) { nodes { databaseId author { __typename login } body } } } }")
 PAST_RUNG_HEADING = "### Past the last rung"
+# Open issues the station filed for a broken factory invariant (bus/invariants.py).
+INVARIANTS_HEADING = "### Invariants broken"
 # Ticketless pull requests a trusted login opened, listed for the brain.
 ADOPT_HEADING = "### Pull requests without a ticket"
 ADOPT_MARKER = "<!-- loom:adopt v1 -->"
@@ -344,6 +348,22 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> st
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
 
+def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
+    allowed = {a.lower() for a in authors}
+    last_claim = newest = -1
+    for i, comment in enumerate(comments):
+        if not isinstance(comment, dict):
+            continue
+        body = str(comment.get("body") or "")
+        if _CLAIM.fullmatch(body.strip()):
+            last_claim = i
+        if (tickets._login(comment.get("user")) in allowed
+                and body.startswith(FIX_MARKER)
+                and BRAIN_FIX_MARKER in body):
+            newest = i
+    return newest > last_claim
+
+
 def _one_line(value: Any, limit: int = 200) -> str:
     line = " ".join(str(value or "").split())
     return line if len(line) <= limit else line[:limit - 3] + "..."
@@ -451,7 +471,17 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + ["", "### Pull requests"]
-    lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
+    for pr in prs:
+        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
+        try:
+            ticket = _ticket_association(repo, pr)
+        except ValueError:
+            ticket = None
+        if ticket is not None and authors:
+            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+            if _pending_brain_fix(comments, authors or ()):
+                line += " - pending brain fix"
+        lines.append(line)
     sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
     lines += ["", "### Sensitive pull requests"]
     lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
@@ -459,6 +489,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += ["", ADOPT_HEADING]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
+    lines += ["", INVARIANTS_HEADING]
+    lines += ["- #%s %s" % (i["number"], i.get("title", ""))
+              for i in issues if "loom:invariant" in _labels(i)] or ["- none"]
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "needs-operator" in _labels(i)]
@@ -1712,7 +1745,8 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
         (ticket[0] == repo, "ticket and pull request must be in the same repository"),
         (_ticket_association(repo, pr) == ticket, "pull request is not linked to the ticket"),
         (issue.get("state") == "open" and "loom:ticket" in names, "ticket is not an open loom:ticket"),
-        ("loom:pr" in names, "ticket is not loom:pr"),
+        (bool({"loom:briefed", "loom:running", "loom:pr"} & set(names)),
+         "ticket is not loom:briefed, loom:running or loom:pr"),
         (sum(1 for x in names if x.startswith("lane:")) == 1, "ticket must have exactly one lane label"),
     ]
     for ok, reason in rules:
@@ -1722,7 +1756,8 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
 
 def _fix_body(repo: str, number: int, branch: str, notes: str,
               checks: List[Tuple[str, str]], threads: List[Dict[str, Any]]) -> str:
-    out = [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch), ""]
+    out = [FIX_MARKER, "Pull request: %s#%d, branch %s" % (repo, number, branch),
+           BRAIN_FIX_MARKER, ""]
     if notes.strip():
         out += [notes.strip(), ""]
     if checks or threads:
@@ -1765,7 +1800,9 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     checks = _failing_checks(gh, repo, sha) if sha else []
     threads = _open_threads(gh, repo, number)
     body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
-    kept = _moved_labels(_labels(issue), "briefed", lane)
+    state = next((x.split(":", 1)[1] for x in _labels(issue)
+                  if x in ("loom:briefed", "loom:running", "loom:pr")), "pr")
+    kept = _moved_labels(_labels(issue), "briefed", lane) if state == "pr" else None
     if model is not None:
         _set_model(gh, ticket[0], ticket[1], issue, model)
     posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})
@@ -1773,7 +1810,8 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     print("brain: posted loom:fix comment %s on %s#%d"
           % (comment_id if comment_id is not None else "with unknown id", ticket[0], ticket[1]),
           file=sys.stderr)
-    gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
+    if kept is not None:
+        gh.rest("PUT", "/repos/%s/issues/%d/labels" % ticket, {"labels": kept})
 
 
 def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:

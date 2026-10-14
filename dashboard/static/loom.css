@@ -101,6 +101,32 @@ button { color: inherit; font: inherit; }
 .mobile-topbar, .mobile-tabs { display: none; }
 .ticket-row, .card { border: 1px solid var(--line); border-radius: 10px; background: var(--row); padding: 12px 14px; }
 .ticket-row:hover, .card:hover { border-color: var(--line-strong); background: var(--raised); }
+.section { margin: 0 0 28px; }
+.section h2, .card h2 { margin: 0 0 12px; font-size: 16px; font-weight: 500; }
+.standup { margin: 0 0 28px; color: var(--body); font-size: clamp(20px, 2.4vw, 28px); font-weight: 500; letter-spacing: -.015em; }
+.conveyor { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 7px; }
+.step-card { display: grid; min-height: 104px; align-content: start; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.step-card strong { font: 600 22px var(--font-mono); font-variant-numeric: tabular-nums; }
+.step-card span { font: 11px var(--font-mono); }
+.step-card small { color: var(--muted); font: 10px/1.35 var(--font-mono); }
+.step-card.bottleneck { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.bottleneck-note { color: var(--accent); font: 12px var(--font-mono); }
+.floor-columns { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, .8fr); gap: 24px; align-items: start; }
+.floor-aside { display: grid; gap: 10px; }
+.ticket-grid, .goal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 8px; }
+.ticket-row { display: grid; gap: 7px; }
+.ticket-top, .ticket-bottom { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ticket-title { color: var(--body-on-row); font-size: 14px; line-height: 1.4; }
+.ticket-bottom .progress { flex: 1; }
+.empty-state { padding: 22px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--muted); text-align: center; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }
+.chips .chip { font-size: 11px; }
+.goal-card h2 { margin: 6px 0 12px; font-size: 17px; }
+.goal-card > a:last-child { color: var(--accent); }
+.metric { font: 600 30px/1.1 var(--font-mono); font-variant-numeric: tabular-nums; }
+.sparkline { display: flex; height: 44px; align-items: end; gap: 5px; margin: 14px 0; }
+.sparkline i { width: 12px; min-height: 3px; border-radius: 2px 2px 0 0; background: var(--accent); }
+.stale-note { padding: 8px 12px; border: 1px solid var(--accent); border-radius: 8px; color: var(--accent); }
 .ticket-title { color: var(--body-on-row); font-size: 14px; line-height: 1.4; }
 .machine-fact, .label, .chip { font-family: var(--font-mono); }
 .machine-fact { color: var(--muted-on-bg); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -148,6 +174,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .tab-link { display: flex; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: 11px var(--font-mono); }
   .tab-link[aria-current="page"] { background: var(--raised); color: var(--text); }
 }
+@media (max-width: 720px) { .floor-columns { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
 
 .improvement-list, .lane-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 8px; }

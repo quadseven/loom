@@ -154,7 +154,9 @@ done
 # private repos the same with a model whose provider does not train on
 # prompts, such as opencode-go/kimi-k2.7-code, never a public-only one), and
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
-# its merged tickets move to loom:shipped once a deploy carries them). Runs from
+# its merged tickets move to loom:shipped once a deploy carries them), and
+# LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
+# are filed on, and the review bot's plan check, docs/LANES.md Invariants). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -207,6 +209,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_WATCH</key><string>$(xml "${LOOM_WATCH:-}")</string>
     <key>LOOM_REWRITE_CMD</key><string>$(xml "${LOOM_REWRITE_CMD:-}")</string>
     <key>LOOM_REWRITE_PRIVATE_CMD</key><string>$(xml "${LOOM_REWRITE_PRIVATE_CMD:-}")</string>
+    <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
+    <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
   </dict>
 </dict>
 </plist>

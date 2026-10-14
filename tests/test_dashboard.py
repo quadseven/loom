@@ -204,6 +204,60 @@ class DashboardTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_floor_backlog_bottleneck_and_ticket_links(self):
+        import os
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as fixture:
+            json.dump({"tickets": [{"id": "sample#1"}, {"id": "sample#2"}]}, fixture)
+            fixture.flush()
+            prior = os.environ.get("LOOM_BACKLOG_SOURCE")
+            os.environ["LOOM_BACKLOG_SOURCE"] = fixture.name
+            self.store.waits = {"queued": [1, 2, 3], "pr": [5, 6, 8]}
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+                try:
+                    connection.request("GET", "/")
+                    body = connection.getresponse().read().decode()
+                finally:
+                    connection.close()
+            finally:
+                if prior is None:
+                    os.environ.pop("LOOM_BACKLOG_SOURCE", None)
+                else:
+                    os.environ["LOOM_BACKLOG_SOURCE"] = prior
+        self.assertIn("<strong>2</strong>", body)
+        self.assertIn("bottleneck", body)
+        self.assertIn('href="/t/example-owner/sample/31"', body)
+
+    def test_ticket_state_filter_and_empty_clear_filters(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        try:
+            connection.request("GET", "/tickets?state=pr")
+            body = connection.getresponse().read().decode()
+            self.assertIn("Sample ticket", body)
+            self.assertNotIn("queued", body)
+            connection.request("GET", "/tickets?state=verified")
+            body = connection.getresponse().read().decode()
+            self.assertIn("Clear filters", body)
+            self.assertIn("No tickets match these filters", body)
+        finally:
+            connection.close()
+
+    def test_missing_backlog_source_is_not_reported_as_zero(self):
+        import os
+        prior = os.environ.pop("LOOM_BACKLOG_SOURCE", None)
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+            try:
+                connection.request("GET", "/")
+                body = connection.getresponse().read().decode()
+            finally:
+                connection.close()
+        finally:
+            if prior is not None:
+                os.environ["LOOM_BACKLOG_SOURCE"] = prior
+        self.assertIn("not looked", body)
+        self.assertIn("LOOM_BACKLOG_SOURCE is not set", body)
+
 
 class DashboardSourceHygiene(unittest.TestCase):
     def test_dashboard_has_no_hostname_ip_or_home_path(self):
@@ -218,7 +272,108 @@ class DashboardSourceHygiene(unittest.TestCase):
                 self.assertIsNone(pattern.search(source), str(path))
 
 
+class DashboardViewTest(unittest.TestCase):
+    class State:
+        stale = False
+        context = {}
+        waits = {"queued": [1, 2, 3], "pr": [5, 6, 8]}
+        data = {"example-owner/sample": [
+            {"repo": "example-owner/sample", "number": 31, "title": "Sample ticket",
+             "state": "pr", "goal": "example-owner/sample#30", "lane": "codex",
+             "model": "model-x", "attempts": 1},
+            {"repo": "example-owner/sample", "number": 32, "title": "Other ticket",
+             "state": "briefed", "goal": "example-owner/sample#30", "lane": None,
+             "model": None, "attempts": 1},
+        ]}
+
+        def response(self):
+            return {"tickets": self.data}
+
+    def test_floor_bottleneck_and_links(self):
+        from dashboard.server import _floor
+        import os
+        prior = os.environ.get("LOOM_BACKLOG_SOURCE")
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as fixture:
+            json.dump({"tickets": [{"id": "sample#1"}, {"id": "sample#2"}]}, fixture)
+            fixture.flush()
+            os.environ["LOOM_BACKLOG_SOURCE"] = fixture.name
+            try:
+                body = _floor(self.State())
+            finally:
+                if prior is None:
+                    os.environ.pop("LOOM_BACKLOG_SOURCE", None)
+                else:
+                    os.environ["LOOM_BACKLOG_SOURCE"] = prior
+        self.assertIn('<strong>2</strong><span>backlog</span>', body)
+        self.assertIn("bottleneck", body)
+        self.assertIn('href="/t/example-owner/sample/31"', body)
+        self.assertIn('href="/t/example-owner/sample/32"', body)
+
+    def test_ticket_filters_and_empty_state(self):
+        from dashboard.server import _tickets
+        from urllib.parse import urlsplit
+        pr = _tickets(self.State(), urlsplit("/tickets?state=pr"))
+        self.assertIn("Sample ticket", pr)
+        self.assertNotIn("Other ticket", pr)
+        empty = _tickets(self.State(), urlsplit("/tickets?state=verified"))
+        self.assertIn("Clear filters", empty)
+        self.assertIn("No tickets match", empty)
+
+    def test_ticket_goal_filter_lists_only_that_goal(self):
+        from dashboard.server import _tickets
+        from urllib.parse import urlsplit
+        state = self.State()
+        state.data = {"example-owner/sample": self.State.data["example-owner/sample"] + [
+            {"repo": "example-owner/sample", "number": 41, "title": "Elsewhere ticket",
+             "state": "pr", "goal": "example-owner/sample#40", "lane": "codex",
+             "model": "model-x", "attempts": 1}]}
+        body = _tickets(state, urlsplit("/tickets?goal=example-owner%2Fsample%2340"))
+        self.assertIn("Elsewhere ticket", body)
+        self.assertNotIn("Sample ticket", body)
+        self.assertNotIn("Other ticket", body)
+        body = _tickets(state, urlsplit("/tickets?goal=example-owner%2Fsample%2330"))
+        self.assertIn("Sample ticket", body)
+        self.assertIn("Other ticket", body)
+        self.assertNotIn("Elsewhere ticket", body)
+
+    def test_ticket_filters_without_params(self):
+        from dashboard.server import _tickets
+        from urllib.parse import urlsplit
+        body = _tickets(self.State(), urlsplit("/tickets"))
+        self.assertIn("Sample ticket", body)
+        self.assertIn("Other ticket", body)
+        self.assertIn('href="/tickets?state=pr"', body)
+        self.assertIn('href="/tickets?state=briefed"', body)
+        self.assertNotIn("Clear filters", body)
+
+    def test_missing_backlog_reason(self):
+        from dashboard.server import _floor
+        import os
+        prior = os.environ.pop("LOOM_BACKLOG_SOURCE", None)
+        try:
+            body = _floor(self.State())
+        finally:
+            if prior is not None:
+                os.environ["LOOM_BACKLOG_SOURCE"] = prior
+        self.assertIn("not looked", body)
+        self.assertIn("LOOM_BACKLOG_SOURCE is not set", body)
+
+
 class BacklogHelperTest(unittest.TestCase):
+    def test_https_backlog_opener_verifies_certificates(self):
+        import ssl
+        from dashboard.server import _RejectRedirects, _backlog_bytes
+        with patch.dict(os.environ, {"LOOM_BACKLOG_SOURCE": "https://example.com/backlog.json"}), \
+                patch("dashboard.server.socket.getaddrinfo", return_value=[(None, None, None, None, ("192.0.2.1", 443))]), \
+                patch("dashboard.server.ipaddress.ip_address", return_value=unittest.mock.Mock(is_global=True)), \
+                patch("dashboard.server.build_opener") as build_opener:
+            _backlog_bytes()
+        handlers = build_opener.call_args.args
+        self.assertIn(_RejectRedirects, handlers)
+        https = next(handler for handler in handlers if hasattr(handler, "_context"))
+        self.assertEqual(https._context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(https._context.check_hostname)
+
     def test_backlog_source_rejects_http_and_private_hosts(self):
         from dashboard.server import _backlog_bytes
         with patch.dict(os.environ, {"LOOM_BACKLOG_SOURCE": "http://example.com/backlog.json"}):
