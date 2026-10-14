@@ -62,7 +62,7 @@ class _FooterMatch:
 
 class _FooterPattern:
     _RE = re.compile(
-        r"Loom ticket\s+([A-Za-z0-9_.-]+?)(?:#|-)(\d+)(?:-r\d+)?,?\s+lane\s+([A-Za-z0-9_.-]+),\s+model\s+(.+?)\.(?:\s|$)"
+        r"Loom ticket\s+([A-Za-z0-9_./-]+?)(?:#|-)(\d+)(?:-r\d+)?,?\s+lane\s+([A-Za-z0-9_.-]+),\s+model\s+(.+?)\.(?:\s|$)"
     )
 
     def search(self, string, *args, **kwargs):
