@@ -2957,9 +2957,14 @@ class TranscriptUploadTest(Base):
             st.upload_transcripts()
         return err.getvalue()
 
+    def ref(self, name):
+        """The ticket each finished brief names in its Issue: line, one per name."""
+        self.issues = getattr(self, "issues", {})
+        return "%s#%d" % (REPO, self.issues.setdefault(name, 100 + len(self.issues)))
+
     def finish(self, name="T1", kind="done", lane="anthropic-2"):
         self.write(self.inbox(lane, kind, name + ".md"),
-                   "# Brief: %s\n\nModel: model-x\nIssue: %s#12\n" % (name, REPO))
+                   "# Brief: %s\n\nModel: model-x\nIssue: %s\n" % (name, self.ref(name)))
         self.write(os.path.join(self.home, "logs", lane, name + ".log"),
                    "[2026-10-13T09:00:00Z] %s start, lane %s\nagent said hi from /Users/someone\n"
                    % (name, lane))
@@ -2977,7 +2982,7 @@ class TranscriptUploadTest(Base):
         url, token, body = self.sent[0]
         self.assertEqual((url, token), (UPLOAD_URL, UPLOAD_TOKEN))
         self.assertEqual({k: body[k] for k in ("ticket", "slot", "model", "outcome", "started_at")},
-                         {"ticket": "T1", "slot": "anthropic-2", "model": "model-x",
+                         {"ticket": self.ref("T1"), "slot": "anthropic-2", "model": "model-x",
                           "outcome": "done", "started_at": "2026-10-13T09:00:00Z"})
         self.assertEqual([e["kind"] for e in body["events"]], ["log"])
         self.assertIn("agent said hi from <path>", body["events"][0]["text"])
@@ -2988,7 +2993,7 @@ class TranscriptUploadTest(Base):
         self.go()
         self.finish("NEW")
         self.go()
-        self.assertEqual([b["ticket"] for _, _, b in self.sent], ["NEW"])
+        self.assertEqual([b["ticket"] for _, _, b in self.sent], [self.ref("NEW")])
         self.assertEqual(self.ledger()["anthropic-2/OLD"], "old")
 
     def test_a_failed_upload_is_retried_on_the_next_pass(self):
@@ -3023,7 +3028,7 @@ class TranscriptUploadTest(Base):
         self.go()
         self.assertEqual(self.sent, [])
         self.go()
-        self.assertEqual(sorted(b["ticket"] for _, _, b in self.sent), ["A", "B"])
+        self.assertEqual(sorted(b["ticket"] for _, _, b in self.sent), sorted([self.ref("A"), self.ref("B")]))
 
     def test_nothing_is_sent_without_both_settings(self):
         for url, ssm in (("", "/example/transcript-token"), (UPLOAD_URL, "")):
@@ -3073,8 +3078,8 @@ class TranscriptUploadTest(Base):
         self.brain_tick(3000, outcome="failed")
         self.go()
         self.assertEqual([(b["slot"], b["ticket"], b["model"], b["outcome"]) for _, _, b in self.sent],
-                         [("brain", "1970-01-01T00:33:20Z", "model-b", "ok"),
-                          ("brain", "1970-01-01T00:50:00Z", "model-b", "failed")])
+                         [("brain", "brain/1970-01-01T00:33:20Z", "model-b", "ok"),
+                          ("brain", "brain/1970-01-01T00:50:00Z", "model-b", "failed")])
         self.assertEqual([e["text"] for e in self.sent[0][2]["events"]], ["tick 2000"])
 
     def test_a_skipped_brain_tick_uploads_nothing(self):
