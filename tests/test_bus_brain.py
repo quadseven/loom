@@ -988,6 +988,15 @@ class TextAndCloseTests(unittest.TestCase):
     def test_slash_commands_without_the_at_sign_pass(self):
         text.check("/%s improve" % text.REVIEW_BOT_SHORT_NAME)
 
+    def test_an_operator_note_with_phone_punctuation_passes(self):
+        # A phone keyboard types curly quotes; the shared checks must not
+        # refuse them. Only the lane answer path requires ASCII.
+        text.check("Don\u2019t stop the \u201cbig\u201d run")
+
+    def test_an_absolute_local_path_is_refused(self):
+        with self.assertRaises(ValueError):
+            text.check("see /Users/someone/notes.txt")
+
     def test_close_completed_needs_verified(self):
         fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}))
         with self.assertRaises(ValueError):
@@ -2083,6 +2092,16 @@ class RegressionSlotTests(unittest.TestCase):
         args = brain.parser().parse_args(["brief", REPO, "--goal", "1", "--title", "T",
                                           "--file", "b.md", "--regresses", "5"])
         self.assertEqual(args.regresses, 5)
+
+
+class AnsweredStatusTests(unittest.TestCase):
+    def test_answered_tickets_have_a_brain_status_section(self):
+        issue = {"number": 17, "title": "Diagnosis", "created_at": "2026-10-14T00:00:00Z",
+                 "labels": [{"name": label} for label in
+                            ("loom:ticket", "loom:answered", "lane:codex")]}
+        lines = brain._ticket_lines([issue], datetime(2026, 10, 14, tzinfo=timezone.utc))
+        index = lines.index("#### answered")
+        self.assertEqual(lines[index + 1], "- #17 Diagnosis - lane:codex - 0h")
 
 
 if __name__ == "__main__":

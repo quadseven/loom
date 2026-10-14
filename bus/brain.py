@@ -18,7 +18,7 @@ from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 
-STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
+STATES = ("queued", "briefed", "running", "pr", "answered", "failed", "merged", "shipped", "verified")
 # Tickets that hold a lane slot: waiting for a lane, in one, or back from one.
 # Merged and shipped tickets wait on a deploy or a live check, not on a lane,
 # so they never count against a goal's cap.

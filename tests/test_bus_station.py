@@ -1827,6 +1827,20 @@ class OutcomeTest(Base):
         self.assertEqual(self.fake.comments[12], [])
         self.assertIn("loom:running", self.fake.names(12))
 
+    def test_answered_done_is_acknowledged_without_a_pull_request_lookup(self):
+        self.fake.add(12, state="running")
+        self.fake.issues[12]["body"] = "Deliverable: answer\n" + BODY
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex"))
+        self.fake.issues[12]["labels"] = [
+            {"name": label} for label in ("loom:ticket", "lane:codex", "loom:answered")]
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:answered"])
+        self.assertEqual(self.fake.comments[12], [])
+        self.assertFalse(any("/pulls?head=" in path for path in self.fake.paths("GET")))
+
     def test_failed_is_reported_once_with_paths_scrubbed(self):
         name = self.finished("failed")
         self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
