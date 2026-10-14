@@ -85,7 +85,9 @@ def _input_text(tool: str, inp: Any) -> str:
 
 
 def _event(ts: Optional[str], role: str, kind: str, text: str) -> Dict[str, Any]:
-    return {"ts": ts, "role": role, "kind": kind,
+    # A log line with no time of its own sends "": the dashboard takes only
+    # strings, and refused a whole run for one null ts (2026-10-14).
+    return {"ts": ts or "", "role": role, "kind": kind,
             "text": _cap(scrub(text), tail=kind == "log")}
 
 
