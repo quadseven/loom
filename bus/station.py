@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
@@ -30,6 +31,7 @@ from . import metrics
 from . import spend
 from . import text as _text
 from . import tickets
+from . import transcripts
 from .brain import HUMAN_MARKER
 from . import brain
 from .github import GitHub, GitHubError, _OPENER
@@ -73,9 +75,7 @@ BRANCH_MOVED = "branch moved:"
 # threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
 REVIEW_AGAIN = "/grug improve"
 LANE_SAID_MAX = 2500
-# An absolute path: a run of non-space characters starting with a slash (not
-# the slash inside a word such as owner/name).
-PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
+PATH_RE = _text.PATH_RE
 # Credential shapes that must not reach a public comment: provider key
 # prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
 SECRET_RE = re.compile(
@@ -180,9 +180,19 @@ CHECKMARK = "%E2%9C%85"  # U+2705, URL-encoded for the reactions path
 GOAL_REF_RE = re.compile(r"(?<![A-Za-z0-9._/-])([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)\b")
 NUMBER_REF_RE = re.compile(r"(?<![A-Za-z0-9._/-])#([0-9]+)\b")
 TITLE_WORD_MIN = 4
+# Transcript uploads (docs/LANES.md, "Transcript uploads"): a run that fails
+# to upload this many times is given up. One pass uploads at most
+# UPLOAD_PER_PASS runs and stops at the first failure (the dashboard is
+# likely down), so uploads cannot hold the station's lock for long.
+UPLOAD_TRIES = 5
+UPLOAD_PER_PASS = 10
 
 SecretReader = Callable[[str, str], str]
 Poster = Callable[[str, Dict[str, Any]], None]
+# (URL, bearer token, body) -> None; raises on any failure.
+Uploader = Callable[[str, str, Dict[str, Any]], None]
+# A finished run: (ledger key, brain tick start or None, body builder).
+Run = Tuple[str, Optional[float], Callable[[], Dict[str, Any]]]
 # (method, path under the API, bot token, JSON body or None) -> parsed reply.
 DiscordCall = Callable[[str, str, str, Optional[Dict[str, Any]]], Any]
 
@@ -210,7 +220,9 @@ class Settings:
                  review_check: str = factory.DEFAULT_REVIEW_CHECK,
                  review_bot: str = factory.DEFAULT_REVIEW_BOT,
                  no_test_repos: Sequence[str] = (),
-                 metrics_goal: str = "") -> None:
+                 metrics_goal: str = "",
+                 transcript_url: str = "",
+                 transcript_token_ssm: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -232,6 +244,8 @@ class Settings:
         self.review_bot = review_bot
         self.no_test_repos = list(no_test_repos)
         self.metrics_goal = metrics_goal
+        self.transcript_url = transcript_url
+        self.transcript_token_ssm = transcript_token_ssm
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -274,7 +288,9 @@ class Settings:
                    review_bot=(env.get("LOOM_REVIEW_BOT", "").strip()
                                or factory.DEFAULT_REVIEW_BOT),
                    no_test_repos=words("LOOM_NO_TEST_REPOS"),
-                   metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip())
+                   metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
+                   transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
+                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip())
 
 
 def _origin_repo() -> str:
@@ -290,7 +306,8 @@ def _origin_repo() -> str:
 
 
 def read_ssm(name: str, region: str) -> str:
-    """A SecureString parameter, read the way lanes/run_lane.sh reads keys."""
+    """A SecureString parameter, read the way lanes/run_lane.sh reads keys.
+    The read is bounded by POST_TIMEOUT, so a hung call cannot stall a pass."""
     out = subprocess.run(
         ["aws", "ssm", "get-parameter", "--region", region, "--name", name,
          "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
@@ -317,6 +334,27 @@ def post_webhook(url: str, payload: Dict[str, Any]) -> None:
         raise OSError("the webhook post failed to connect") from None
     if not 200 <= status < 300:
         raise OSError("the webhook answered %d" % status)
+
+
+def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
+    """POST one transcript to the dashboard. Errors never carry the URL or
+    the token."""
+    if not url.startswith("https://"):
+        raise OSError("the transcript URL is not https")
+    req = urllib.request.Request(  # noqa: S310 - https only, checked above
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "loom-station",
+                 "Authorization": "Bearer " + token})
+    try:
+        with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
+            status = resp.status
+    except urllib.error.HTTPError as err:
+        status = err.code
+        err.close()
+    except (urllib.error.URLError, OSError):
+        raise OSError("the transcript upload failed to connect") from None
+    if not 200 <= status < 300:
+        raise OSError("the transcript upload answered %d" % status)
 
 
 class DiscordError(OSError):
@@ -504,7 +542,7 @@ def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]
 
 
 def scrub(reason: str) -> str:
-    text = PATH_RE.sub("<path>", " ".join(reason.split()))
+    text = _text.scrub_paths(" ".join(reason.split()))
     return text[:REASON_MAX]
 
 
@@ -528,11 +566,17 @@ class Station:
                  now: Optional[float] = None,
                  read_secret: Optional[SecretReader] = None,
                  post: Optional[Poster] = None,
-                 discord: Optional[DiscordCall] = None) -> None:
+                 discord: Optional[DiscordCall] = None,
+                 upload: Optional[Uploader] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
+        self.upload = upload or post_transcript
+        # Where Claude Code and codex keep their sessions (the claude lane's
+        # and the brain's transcripts, and codex rollouts).
+        self.claude_projects = Path.home() / ".claude" / "projects"
+        self.codex_sessions = Path.home() / ".codex" / "sessions"
         self.discord = discord or discord_call
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
@@ -2224,6 +2268,105 @@ class Station:
         ledger["_checked"] = self.now
         _write_json(path, ledger)
 
+    # -- transcript uploads ---------------------------------------------
+    def _transcript_runs(self) -> List[Run]:
+        """(ledger key, brain tick start or None, body builder) for every
+        finished run: each brief in a slot's done/ or failed/, and the last
+        brain tick once state/brain.json says it ended (ok or failed, with
+        the start time brain.sh records)."""
+        home = Path(self.s.home)
+        runs: List[Run] = []
+        for lane, kind, path, name in self._finished_briefs():
+            def body(lane=lane, kind=kind, path=path, name=name) -> Dict[str, Any]:
+                with open(path, encoding="utf-8") as fh:
+                    model = self._field(fh.read(), "Model")
+                return transcripts.run_body(home, lane, name, kind, model,
+                                            self.claude_projects, self.codex_sessions)
+            runs.append(("%s/%s" % (lane, name), None, body))
+        tick = self._brain()
+        last = tick[0] if tick else {}
+        started, at = last.get("started"), last.get("at")
+        if (last.get("outcome") in ("ok", "failed")
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        for v in (started, at))):
+            def brain_body() -> Dict[str, Any]:
+                return transcripts.brain_body(home, started, at, last["outcome"],
+                                              str(last.get("model") or ""), self.claude_projects)
+            runs.append(("brain", float(started), brain_body))
+        return runs
+
+    @staticmethod
+    def _uploaded(ledger: Dict[str, Any], key: str, tick: Optional[float]) -> Any:
+        """The ledger's record of a run: "sent", "old", "gave up", or the
+        number of failed tries so far. The brain keeps one entry, its last
+        tick's."""
+        rec = ledger.get(key)
+        if tick is None:
+            return rec if rec is not None else 0
+        if isinstance(rec, dict) and rec.get("started") == tick:
+            return rec.get("result", 0)
+        return 0
+
+    @staticmethod
+    def _record(ledger: Dict[str, Any], key: str, tick: Optional[float], result: Any) -> None:
+        ledger[key] = result if tick is None else {"started": tick, "result": result}
+
+    def _transcript_token(self) -> Optional[str]:
+        try:
+            return self.read_secret(self.s.transcript_token_ssm, self.s.region)
+        # Deliberately broad, as in _webhook: an error text must never carry
+        # the secret; only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not read the transcript token parameter (%s); next pass"
+                 % type(err).__name__)
+            return None
+
+    def upload_transcripts(self) -> None:
+        """Upload each finished run's transcript to the dashboard once. A
+        failed upload is tried again on the next pass, UPLOAD_TRIES times in
+        all. The first pass records the runs already finished as old: only
+        runs that finish after uploads are turned on are sent."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        path = os.path.join(self.state, "transcripts.json")
+        ledger = _read_json(path, None)
+        first = ledger is None
+        if first:
+            ledger = {}
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        token: Optional[str] = None
+        sent = 0
+        for key, tick, build in self._transcript_runs():
+            rec = self._uploaded(ledger, key, tick)
+            if first:
+                self._record(ledger, key, tick, "old")
+                continue
+            if not isinstance(rec, int) or isinstance(rec, bool) or sent >= UPLOAD_PER_PASS:
+                continue
+            if token is None:
+                token = self._transcript_token()
+                if token is None:
+                    return
+            try:
+                self.upload(self.s.transcript_url, token, build())
+                result: Any = "sent"
+                sent += 1
+            # Deliberately broad, as in _send: an error text can carry the URL
+            # or the token; only the type is logged, once, when giving up.
+            except Exception as err:  # noqa: BLE001
+                result = rec + 1
+                if result >= UPLOAD_TRIES:
+                    _say("gave up uploading the transcript of %s after %d tries (%s)"
+                         % (key, UPLOAD_TRIES, type(err).__name__))
+                    result = "gave up"
+            self._record(ledger, key, tick, result)
+            _write_json(path, ledger)
+            if result != "sent":
+                return
+        if first:
+            _write_json(path, ledger)
+
     def post_overdue_standups(self) -> None:
         """Post a data-only report when an open goal has gone overdue."""
         now = brain.datetime.fromtimestamp(self.now, brain.timezone.utc)
@@ -2897,7 +3040,8 @@ class Station:
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.post_metrics,
-                     self.watch_brain, self.relay_operator, self.run_factory):
+                     self.watch_brain, self.upload_transcripts, self.relay_operator,
+                     self.run_factory):
             if self._deferred():
                 break
             try:

@@ -16,6 +16,14 @@ _CLOSING = re.compile(
     r"(?:#[0-9]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+"
     r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+)",
     re.IGNORECASE)
+# An absolute path: a run of non-space characters starting with a slash (not
+# the slash inside a word such as owner/name).
+PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
+
+
+def scrub_paths(text: str) -> str:
+    """The text with every local path replaced by <path>."""
+    return PATH_RE.sub("<path>", text)
 
 
 def check(text: str) -> None:

@@ -40,11 +40,19 @@ say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 # The station reads these to tell the operator when the brain stops ticking:
 # state/brain.json holds the last tick (outcome ok, skipped or failed, with the
 # agent's exit code), and state/brain-ok is touched by every tick that ended
-# well, a skip for a held lock included (another brain is acting).
+# well, a skip for a held lock included (another brain is acting). A tick
+# that ran the agent also records when the agent started and its model; the
+# station uploads that session's transcript once brain.json says it ended.
 STATE="$LOOM_HOME/state"
+STARTED=""
 beat() {
+  local extra=""
+  if [ -n "$STARTED" ]; then
+    extra=", \"started\": $STARTED"
+    [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]] && extra="$extra, \"model\": \"$MODEL\""
+  fi
   mkdir -p "$STATE"
-  printf '{"at": %s, "outcome": "%s", "exit": %s}\n' "$(date +%s)" "$1" "$2" > "$STATE/brain.json.tmp" &&
+  printf '{"at": %s, "outcome": "%s", "exit": %s%s}\n' "$(date +%s)" "$1" "$2" "$extra" > "$STATE/brain.json.tmp" &&
     mv "$STATE/brain.json.tmp" "$STATE/brain.json"
   case "$1" in ok|skipped) touch "$STATE/brain-ok" ;; esac
 }
@@ -99,6 +107,7 @@ journal as MUSE.md says."
 fi
 
 say "tick start (model $MODEL, scope $SCOPE)"
+STARTED="$(date +%s)"
 (cd "$WORK" && timeout "$((MINUTES * 60))" claude -p --model "$MODEL" \
   --permission-mode bypassPermissions "$PROMPT" < /dev/null) >> "$LOG" 2>&1
 code=$?

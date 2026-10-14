@@ -20,9 +20,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The repo root, for the one transcript parser the station also uses.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import render  # noqa: E402
-import transcripts  # noqa: E402
+from bus import sessions as transcripts  # noqa: E402
 
 CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
 ROUTE = re.compile(r"^/t/([a-z0-9-]+)/([A-Za-z0-9._-]+)$")

@@ -1,6 +1,7 @@
 """Read each lane's own session record into one list of chat events.
 
 Event kinds: user, assistant, thinking, tool (with tool, input, output), log.
+Each event carries ts, the UTC time the CLI recorded for it, or None.
 Sources, per lane:
   claude      Claude Code .jsonl under the operator's ~/.claude/projects, in
               the project directory named after the ticket's worktree.
@@ -11,6 +12,9 @@ Sources, per lane:
 A slot (opencode-go-3) reads as its lane, from its own logs/<slot>/.
 Without a transcript, the lane log (what the CLI printed) is the record.
 
+One parser for every reader: the viewer (lanes/viewer/serve.py) shows these
+events, and the station (bus/transcripts.py) uploads them.
+
 Transcript files are written by agents, so they are untrusted: names are
 validated, SQLite is opened read-only and immutable, and nothing is executed.
 """
@@ -20,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 LANES = ("codex", "claude", "openrouter", "opencode-go", "anthropic")
@@ -36,8 +41,25 @@ def provider(slot: str) -> str | None:
 def load_events(slot: str, ticket: str, loom: Path, claude_projects: Path,
                 codex_sessions: Path) -> list[dict]:
     """Events for one ticket of a lane or one of its slots (logs/<slot>/)."""
+    if provider(slot) is None:
+        raise ValueError(f"unsafe lane or ticket: {slot!r} {ticket!r}")
+    events = session_events(slot, ticket, loom, claude_projects, codex_sessions)
+    return events or log_events(loom / "logs" / slot / f"{ticket}.log")
+
+
+def log_events(log: Path) -> list[dict]:
+    """The lane log as one event, or none when there is no log."""
+    if not log.is_file() or log.is_symlink():
+        return []
+    return [{"kind": "log", "text": log.read_text(errors="replace"), "ts": None}]
+
+
+def session_events(slot: str, ticket: str, loom: Path, claude_projects: Path,
+                   codex_sessions: Path) -> list[dict]:
+    """The CLI's own session record for one ticket, without the log fallback;
+    none for a lane that keeps no transcript."""
     lane = provider(slot)
-    if lane is None or not TICKET.match(ticket) or ticket in (".", ".."):
+    if not SLOT.match(slot) or not TICKET.match(ticket) or ticket in (".", ".."):
         raise ValueError(f"unsafe lane or ticket: {slot!r} {ticket!r}")
     archive = loom / "logs" / slot / ticket
     events: list[dict] = []
@@ -46,10 +68,9 @@ def load_events(slot: str, ticket: str, loom: Path, claude_projects: Path,
         # Claude Code names the project dir after the cwd with "/" and "." as
         # "-", so distinct tickets can share one; keep only sessions whose
         # recorded cwd is this ticket's worktree.
-        project = claude_projects / tree.replace("/", "-").replace(".", "-")
-        events = _claude_dir(project, cwd=tree)
+        events = claude_dir(project_dir(claude_projects, Path(tree)), cwd=tree)
     elif lane == "anthropic":
-        events = _claude_dir(archive)
+        events = claude_dir(archive)
     elif lane in ("openrouter", "opencode-go"):
         db = archive / ".local" / "share" / "opencode" / "opencode.db"
         if db.is_file():
@@ -58,18 +79,26 @@ def load_events(slot: str, ticket: str, loom: Path, claude_projects: Path,
         rollout = _codex_rollout(codex_sessions, loom / "worktrees" / ticket)
         if rollout:
             events = codex_events(rollout.read_text(errors="replace").splitlines())
-    if not events:
-        log = loom / "logs" / slot / f"{ticket}.log"
-        if log.is_file():
-            events = [{"kind": "log", "text": log.read_text(errors="replace")}]
     return events
 
 
-def _claude_dir(root: Path, cwd: str | None = None) -> list[dict]:
+def project_dir(claude_projects: Path, cwd: Path) -> Path:
+    """Claude Code's project directory for sessions started in cwd: the path
+    with "/" and "." as "-"."""
+    return claude_projects / str(cwd).replace("/", "-").replace(".", "-")
+
+
+def claude_dir(root: Path, cwd: str | None = None, since: float | None = None,
+               until: float | None = None) -> list[dict]:
+    """Every Claude Code session under root, oldest first: only those that
+    recorded cwd when given, and only files last written between since and
+    until (epoch seconds) when given."""
     if not root.is_dir():
         return []
     files = sorted((p for p in root.rglob("*.jsonl") if p.is_file() and not p.is_symlink()),
                    key=lambda p: p.stat().st_mtime)
+    files = [p for p in files if (since is None or p.stat().st_mtime >= since)
+             and (until is None or p.stat().st_mtime <= until)]
     events: list[dict] = []
     for f in files:
         lines = f.read_text(errors="replace").splitlines()
@@ -101,10 +130,20 @@ def _text(content) -> str:
     return ""
 
 
-def _claude_user(content, calls: dict) -> list[dict]:
+def _stamp(value) -> str | None:
+    """A recorded time as UTC ISO 8601: an ISO string as written, or epoch
+    milliseconds; None for anything else."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value / 1000))
+    return None
+
+
+def _claude_user(content, calls: dict, ts: str | None = None) -> list[dict]:
     """A user row: the prompt text, or tool results joined to their calls."""
     if isinstance(content, str):
-        return [{"kind": "user", "text": content}]
+        return [{"kind": "user", "text": content, "ts": ts}]
     out = []
     for c in content or []:
         if not isinstance(c, dict):
@@ -112,19 +151,20 @@ def _claude_user(content, calls: dict) -> list[dict]:
         if c.get("type") == "tool_result" and c.get("tool_use_id") in calls:
             calls[c["tool_use_id"]]["output"] = _text(c.get("content"))
         elif c.get("type") == "text":
-            out.append({"kind": "user", "text": c.get("text", "")})
+            out.append({"kind": "user", "text": c.get("text", ""), "ts": ts})
     return out
 
 
-def _claude_block(c: dict, calls: dict) -> dict | None:
+def _claude_block(c: dict, calls: dict, ts: str | None = None) -> dict | None:
     """One block of an assistant row as an event (tool calls are remembered)."""
     t = c.get("type")
     if t == "text" and c.get("text", "").strip():
-        return {"kind": "assistant", "text": c["text"]}
+        return {"kind": "assistant", "text": c["text"], "ts": ts}
     if t == "thinking" and c.get("thinking", "").strip():
-        return {"kind": "thinking", "text": c["thinking"]}
+        return {"kind": "thinking", "text": c["thinking"], "ts": ts}
     if t == "tool_use":
-        call = {"kind": "tool", "tool": c.get("name", "?"), "input": c.get("input") or {}, "output": ""}
+        call = {"kind": "tool", "tool": c.get("name", "?"), "input": c.get("input") or {}, "output": "",
+                "ts": ts}
         calls[c.get("id", "")] = call
         return call
     return None
@@ -136,11 +176,12 @@ def claude_events(lines: list[str]) -> list[dict]:
     calls: dict[str, dict] = {}
     for row in _rows(lines):
         content = (row.get("message") or {}).get("content")
+        ts = _stamp(row.get("timestamp"))
         if row.get("type") == "user":
-            events += _claude_user(content, calls)
+            events += _claude_user(content, calls, ts)
         elif row.get("type") == "assistant":
             for c in content or []:
-                ev = _claude_block(c, calls) if isinstance(c, dict) else None
+                ev = _claude_block(c, calls, ts) if isinstance(c, dict) else None
                 if ev:
                     events.append(ev)
     return events
@@ -159,35 +200,37 @@ def opencode_events(db: Path) -> list[dict]:
             return _opencode2_events(con.execute(
                 "select type, data from session_message order by seq").fetchall())
         rows = con.execute(
-            "select m.data, p.data from part p join message m on m.id = p.message_id "
+            "select m.data, p.data, p.time_created from part p join message m on m.id = p.message_id "
             "order by p.time_created, p.id").fetchall()
     except sqlite3.Error:
         return []
     finally:
         con.close()
     events: list[dict] = []
-    for mdata, pdata in rows:
+    for mdata, pdata, created in rows:
         try:
             role = json.loads(mdata).get("role")
             part = json.loads(pdata)
         except ValueError:
             continue
-        kind = part.get("type")
+        kind, ts = part.get("type"), _stamp(created)
         if kind == "text" and part.get("text", "").strip():
-            events.append({"kind": "user" if role == "user" else "assistant", "text": part["text"]})
+            events.append({"kind": "user" if role == "user" else "assistant", "text": part["text"],
+                           "ts": ts})
         elif kind == "reasoning" and part.get("text", "").strip():
-            events.append({"kind": "thinking", "text": part["text"]})
+            events.append({"kind": "thinking", "text": part["text"], "ts": ts})
         elif kind == "tool":
             state = part.get("state") or {}
             events.append({"kind": "tool", "tool": part.get("tool", "?"),
                            "input": state.get("input") or {},
-                           "output": state.get("output") or state.get("error") or ""})
+                           "output": state.get("output") or state.get("error") or "", "ts": ts})
     return events
 
 
 def _opencode2_events(rows: list) -> list[dict]:
     """opencode 2.0 session_message rows (type, data): a user row's data.text,
-    an assistant row's data.content[] of text, reasoning and tool items."""
+    an assistant row's data.content[] of text, reasoning and tool items. The
+    rows carry no time the station relies on, so ts is None."""
     events: list[dict] = []
     for kind, raw in rows:
         try:
@@ -199,7 +242,7 @@ def _opencode2_events(rows: list) -> list[dict]:
         if kind == "user":
             text = data.get("text")
             if isinstance(text, str) and text.strip():
-                events.append({"kind": "user", "text": text})
+                events.append({"kind": "user", "text": text, "ts": None})
         elif kind == "assistant":
             for c in data.get("content") or []:
                 ev = _opencode2_item(c) if isinstance(c, dict) else None
@@ -211,16 +254,16 @@ def _opencode2_events(rows: list) -> list[dict]:
 def _opencode2_item(c: dict) -> dict | None:
     t, text = c.get("type"), c.get("text")
     if t == "text" and isinstance(text, str) and text.strip():
-        return {"kind": "assistant", "text": text}
+        return {"kind": "assistant", "text": text, "ts": None}
     if t == "reasoning" and isinstance(text, str) and text.strip():
-        return {"kind": "thinking", "text": text}
+        return {"kind": "thinking", "text": text, "ts": None}
     if t == "tool":
         state = c.get("state") if isinstance(c.get("state"), dict) else {}
         out = state.get("content") or state.get("error") or ""
         if not isinstance(out, str):
             out = _text(out) if isinstance(out, list) else json.dumps(out)
         return {"kind": "tool", "tool": c.get("name", "?"), "input": state.get("input") or {},
-                "output": out}
+                "output": out, "ts": None}
     return None
 
 
@@ -243,19 +286,20 @@ def _codex_rollout(sessions: Path, tree: Path) -> Path | None:
     return best
 
 
-def _codex_item(p: dict) -> dict | None:
+def _codex_item(p: dict, ts: str | None = None) -> dict | None:
     """A codex response item as an event; outputs are handled by the caller."""
     t = p.get("type")
     if t == "message" and p.get("role") in ("user", "assistant"):
         text = _text(p.get("content"))
-        return {"kind": p["role"], "text": text} if text.strip() else None
+        return {"kind": p["role"], "text": text, "ts": ts} if text.strip() else None
     if t == "reasoning":
         text = _text(p.get("summary"))
-        return {"kind": "thinking", "text": text} if text.strip() else None
+        return {"kind": "thinking", "text": text, "ts": ts} if text.strip() else None
     if t in ("custom_tool_call", "function_call"):
         raw = p.get("input") or p.get("arguments") or ""
         return {"kind": "tool", "tool": p.get("name", "?"),
-                "input": {"command": raw if isinstance(raw, str) else json.dumps(raw)}, "output": ""}
+                "input": {"command": raw if isinstance(raw, str) else json.dumps(raw)}, "output": "",
+                "ts": ts}
     return None
 
 
@@ -272,7 +316,7 @@ def codex_events(lines: list[str]) -> list[dict]:
                 out = p.get("output")
                 last_call["output"] = out if isinstance(out, str) else _text(out)
             continue
-        ev = _codex_item(p)
+        ev = _codex_item(p, _stamp(row.get("timestamp")))
         if ev:
             events.append(ev)
             if ev["kind"] == "tool":

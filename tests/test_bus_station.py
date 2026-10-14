@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2917,3 +2918,207 @@ class BotReportsTest(Base):
         self.comment(42, 102, "should stay on GitHub")
         self.go()
         self.assertEqual(self.discord.sent, [])
+
+
+UPLOAD_URL = "https://dashboard.example.com/api/transcripts?key=QUERY-SECRET"
+UPLOAD_TOKEN = "UPLOAD-TOKEN-SECRET"
+
+
+class TranscriptUploadTest(Base):
+    """bus/station.py upload_transcripts: each finished run goes to the
+    dashboard once, failures are retried, and nothing goes without settings."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.transcript_url = UPLOAD_URL
+        self.settings.transcript_token_ssm = "/example/transcript-token"
+        self.sent = []
+        self.fail = 0
+        self.reads = 0
+        self.projects = os.path.join(self._tmp.name, "claude-projects")
+
+    def read_secret(self, name, region):
+        self.reads += 1
+        self.assertEqual(name, "/example/transcript-token")
+        return UPLOAD_TOKEN
+
+    def upload(self, url, token, body):
+        if self.fail:
+            self.fail -= 1
+            raise OSError("connect to %s with %s failed" % (url, token))
+        self.sent.append((url, token, body))
+
+    def go(self, read_secret=None):
+        err = io.StringIO()
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             read_secret=read_secret or self.read_secret, upload=self.upload)
+        st.claude_projects = Path(self.projects)
+        with contextlib.redirect_stderr(err):
+            st.upload_transcripts()
+        return err.getvalue()
+
+    def finish(self, name="T1", kind="done", lane="anthropic-2"):
+        self.write(self.inbox(lane, kind, name + ".md"),
+                   "# Brief: %s\n\nModel: model-x\nIssue: %s#12\n" % (name, REPO))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[2026-10-13T09:00:00Z] %s start, lane %s\nagent said hi from /Users/someone\n"
+                   % (name, lane))
+
+    def ledger(self):
+        with open(os.path.join(self.home, "state", "station", "transcripts.json")) as fh:
+            return json.load(fh)
+
+    def test_a_finished_run_uploads_once_with_scrubbed_events(self):
+        self.go()  # the first pass only records what had already finished
+        self.finish()
+        self.go()
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        url, token, body = self.sent[0]
+        self.assertEqual((url, token), (UPLOAD_URL, UPLOAD_TOKEN))
+        self.assertEqual({k: body[k] for k in ("ticket", "slot", "model", "outcome", "started_at")},
+                         {"ticket": "T1", "slot": "anthropic-2", "model": "model-x",
+                          "outcome": "done", "started_at": "2026-10-13T09:00:00Z"})
+        self.assertEqual([e["kind"] for e in body["events"]], ["log"])
+        self.assertIn("agent said hi from <path>", body["events"][0]["text"])
+        self.assertEqual(self.ledger()["anthropic-2/T1"], "sent")
+
+    def test_runs_finished_before_uploads_were_turned_on_are_not_sent(self):
+        self.finish("OLD", kind="failed")
+        self.go()
+        self.finish("NEW")
+        self.go()
+        self.assertEqual([b["ticket"] for _, _, b in self.sent], ["NEW"])
+        self.assertEqual(self.ledger()["anthropic-2/OLD"], "old")
+
+    def test_a_failed_upload_is_retried_on_the_next_pass(self):
+        self.go()
+        self.finish()
+        self.fail = 1
+        log = self.go()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.ledger()["anthropic-2/T1"], 1)
+        self.assertEqual(log, "")
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.ledger()["anthropic-2/T1"], "sent")
+
+    def test_a_run_is_given_up_after_five_failures_with_one_line(self):
+        self.go()
+        self.finish()
+        self.fail = 99
+        logs = "".join(self.go() for _ in range(7))
+        self.assertEqual(self.ledger()["anthropic-2/T1"], "gave up")
+        self.assertEqual(logs.count("\n"), 1)
+        self.assertIn("gave up uploading the transcript of anthropic-2/T1 after 5 tries (OSError)", logs)
+        for secret in (UPLOAD_TOKEN, "QUERY-SECRET", "dashboard.example.com"):
+            self.assertNotIn(secret, logs)
+        self.assertEqual(self.fail, 94)
+
+    def test_a_failed_upload_ends_the_pass_so_a_down_dashboard_costs_one_timeout(self):
+        self.go()
+        self.finish("A")
+        self.finish("B")
+        self.fail = 1
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.go()
+        self.assertEqual(sorted(b["ticket"] for _, _, b in self.sent), ["A", "B"])
+
+    def test_nothing_is_sent_without_both_settings(self):
+        for url, ssm in (("", "/example/transcript-token"), (UPLOAD_URL, "")):
+            self.settings.transcript_url, self.settings.transcript_token_ssm = url, ssm
+            self.go()
+            self.finish()
+            self.go()
+        self.assertEqual((self.sent, self.reads), ([], 0))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.home, "state", "station", "transcripts.json")))
+
+    def test_an_unreadable_or_hung_token_read_skips_the_pass_without_the_secret(self):
+        import subprocess
+
+        def hung(name, region):
+            raise subprocess.TimeoutExpired(["aws", "ssm"], 30, output=UPLOAD_TOKEN)
+        self.go()
+        self.finish()
+        log = self.go(read_secret=hung)
+        self.assertIn("could not read the transcript token parameter (TimeoutExpired)", log)
+        self.assertNotIn(UPLOAD_TOKEN, log)
+        self.assertNotIn("anthropic-2/T1", self.ledger())  # not counted as a try
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_the_token_is_read_only_when_there_is_something_to_send(self):
+        self.go()
+        self.go()
+        self.assertEqual(self.reads, 0)
+
+    def brain_tick(self, started, outcome="ok"):
+        work = os.path.join(self.home, "brain")
+        project = os.path.join(self.projects, work.replace("/", "-").replace(".", "-"))
+        self.write(os.path.join(project, "s%d.jsonl" % started), json.dumps(
+            {"type": "user", "cwd": work, "message": {"content": "tick %d" % started}}) + "\n")
+        os.utime(os.path.join(project, "s%d.jsonl" % started), (started + 10, started + 10))
+        self.write(os.path.join(self.home, "state", "brain.json"), json.dumps(
+            {"at": started + 20, "outcome": outcome, "exit": 0, "started": started,
+             "model": "model-b"}))
+
+    def test_each_finished_brain_tick_uploads_once(self):
+        self.brain_tick(1000)
+        self.go()  # already finished when uploads were turned on
+        self.brain_tick(2000)
+        self.go()
+        self.go()
+        self.brain_tick(3000, outcome="failed")
+        self.go()
+        self.assertEqual([(b["slot"], b["ticket"], b["model"], b["outcome"]) for _, _, b in self.sent],
+                         [("brain", "1970-01-01T00:33:20Z", "model-b", "ok"),
+                          ("brain", "1970-01-01T00:50:00Z", "model-b", "failed")])
+        self.assertEqual([e["text"] for e in self.sent[0][2]["events"]], ["tick 2000"])
+
+    def test_a_skipped_brain_tick_uploads_nothing(self):
+        self.go()
+        self.write(os.path.join(self.home, "state", "brain.json"),
+                   json.dumps({"at": 5000, "outcome": "skipped", "exit": 0}))
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_the_pass_runs_with_the_station(self):
+        self.go()
+        self.finish(lane="codex")
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, read_secret=self.read_secret, upload=self.upload)
+        with contextlib.redirect_stderr(io.StringIO()):
+            st.run_pass()
+        self.assertEqual([b["slot"] for _, _, b in self.sent], ["codex"])
+
+    def test_settings_come_from_the_environment(self):
+        s = station.Settings.from_env({"LOOM_TRANSCRIPT_URL": " %s " % UPLOAD_URL,
+                                       "LOOM_TRANSCRIPT_TOKEN_SSM": " /x/token "})
+        self.assertEqual((s.transcript_url, s.transcript_token_ssm), (UPLOAD_URL, "/x/token"))
+
+    def test_install_passes_both_settings_to_the_station(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "lanes", "mac", "install.sh")) as fh:
+            text = fh.read()
+        for name in ("LOOM_TRANSCRIPT_URL", "LOOM_TRANSCRIPT_TOKEN_SSM"):
+            self.assertIn('<key>%s</key><string>$(xml "${%s:-}")</string>' % (name, name), text)
+
+
+class PostTranscriptTest(unittest.TestCase):
+    def test_only_https_and_errors_never_carry_the_url_or_token(self):
+        with self.assertRaises(OSError) as ctx:
+            station.post_transcript("http://dashboard.example.com/x?key=Q", UPLOAD_TOKEN, {})
+        self.assertNotIn("dashboard", str(ctx.exception))
+
+    def test_a_refused_upload_names_only_the_status(self):
+        import urllib.error
+
+        def refuse(req, timeout):
+            self.assertEqual(req.get_header("Authorization"), "Bearer " + UPLOAD_TOKEN)
+            raise urllib.error.HTTPError(req.full_url, 401, "no", {}, io.BytesIO(b""))
+        with mock.patch.object(station._OPENER, "open", refuse):
+            with self.assertRaises(OSError) as ctx:
+                station.post_transcript(UPLOAD_URL, UPLOAD_TOKEN, {"events": []})
+        self.assertEqual(str(ctx.exception), "the transcript upload answered 401")
