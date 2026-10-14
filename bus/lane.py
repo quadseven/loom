@@ -9,7 +9,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import change_class, tickets
+from . import change_class, hunt_plan, pr_repair, tickets
 from .github import GitHub, GitHubError, token_from_env
 from .labels import REMOTE_LANES
 
@@ -50,8 +50,27 @@ def _hand_back(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
             {"body": "[transient] %s" % reason})
 
 
+def _pull_for(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
+    """The pull request whose head is the ticket branch, open or closed, or
+    None. One request: GitHub filters by head instead of listing every pull."""
+    owner = repo.split("/", 1)[0]
+    found = gh.paginate("/repos/%s/pulls?state=all&head=%s"
+                        % (repo, quote("%s:%s" % (owner, branch), safe="")))
+    return next((p for p in found if isinstance(p, dict)), None)
+
+
+def _to_pr(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str) -> None:
+    labels = [x for x in _names(issue) if x not in ("loom:running", "loom:queued")]
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+            {"labels": labels + ["loom:pr"]})
+
+
 def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
                        now: float) -> int:
+    """Tickets the remote lane holds and still works on. A held ticket whose
+    branch already has a pull request moves to loom:pr; one with no pull
+    request goes back to the queue when its last heartbeat is older than
+    CLAIM_AGE or its first claim older than PR_AGE."""
     active = 0
     for repo in repos:
         found = gh.paginate("/repos/%s/issues?state=open&labels=loom:running,lane:%s"
@@ -59,22 +78,63 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
         for issue in found:
             if not isinstance(issue, dict) or "pull_request" in issue:
                 continue
-            number = int(issue["number"])
-            comments = _comments(gh, repo, number)
-            claims = _claims(comments, lane)
+            claims = [at for _, at in _claims(_comments(gh, repo, int(issue["number"])), lane)]
             if not claims:
                 continue
-            latest = max(at for _, at in claims)
-            branch = tickets.branch_for(number, str(issue.get("title") or ""))
-            has_pr = any(str((p.get("head") or {}).get("ref") or "") == branch
-                         for p in gh.paginate("/repos/%s/pulls?state=all&per_page=100" % repo))
-            if (not has_pr and now - latest > PR_AGE) or now - latest > CLAIM_AGE:
+            branch = tickets.branch_for(int(issue["number"]), str(issue.get("title") or ""))
+            if _pull_for(gh, repo, branch) is not None:
+                _to_pr(gh, repo, issue, lane)
+                continue
+            if now - max(claims) > CLAIM_AGE or now - min(claims) > PR_AGE:
                 _hand_back(gh, repo, issue, lane,
                            "remote lane claim expired without a pull request")
                 continue
-            if not has_pr:
-                active += 1
+            active += 1
     return active
+
+
+def _candidates(gh: GitHub, repos: Sequence[str], lane: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """(repo, issue) for each public queued ticket assigned to the lane in one
+    of its tiers, oldest first."""
+    found: List[Tuple[str, str, Dict[str, Any]]] = []
+    for repo in repos:
+        if not tickets.REPO_RE.fullmatch(repo):
+            raise ValueError("expected OWNER/NAME, got %r" % repo)
+        info = gh.rest("GET", "/repos/%s" % repo).data
+        if not isinstance(info, dict) or info.get("private") is not False:
+            continue
+        for item in gh.paginate("/repos/%s/issues?state=open&labels=loom:queued,lane:%s"
+                                % (repo, quote(lane, safe=""))):
+            if _takes(item, lane):
+                found.append((str(item.get("created_at") or ""), repo, item))
+    found.sort(key=lambda row: (row[0], row[1], int(row[2]["number"])))
+    return [(repo, item) for _, repo, item in found]
+
+
+def _takes(item: Any, lane: str) -> bool:
+    if not isinstance(item, dict) or "pull_request" in item:
+        return False
+    names = _names(item)
+    if "loom:queued" not in names or "lane:" + lane not in names:
+        return False
+    try:
+        difficulty = tickets.parse(item.get("body"))[0].get("Difficulty", "")
+    except ValueError:
+        return False
+    return difficulty in REMOTE_LANES[lane]["tiers"]
+
+
+def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
+          now: float) -> Dict[str, Any]:
+    number = int(issue["number"])
+    labels = [x for x in _names(issue) if x != "loom:queued"] + ["loom:running"]
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+        "body": "<!-- loom:remote-claim v1 %s %d %.3f -->" % (lane, number, now)})
+    info = gh.rest("GET", "/repos/%s" % repo).data
+    default = str((info.get("default_branch") if isinstance(info, dict) else "") or "main")
+    return {"repo": repo, "number": number, "base": default,
+            "brief": tickets.render_brief(repo, issue, lane)}
 
 
 def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
@@ -83,44 +143,14 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
     if lane not in REMOTE_LANES:
         raise ValueError("unknown remote lane: %s" % lane)
     now = time.time() if now is None else now
-    active = _recover_and_count(gh, repos, lane, now)
-    if active >= REMOTE_LANES[lane]["slots"]:
+    if _recover_and_count(gh, repos, lane, now) >= REMOTE_LANES[lane]["slots"]:
         return None
-    candidates = []
-    for repo in repos:
-        if not tickets.REPO_RE.fullmatch(repo):
-            raise ValueError("expected OWNER/NAME, got %r" % repo)
-        info = gh.rest("GET", "/repos/%s" % repo).data
-        if not isinstance(info, dict) or info.get("private") is not False:
-            continue
-        found = gh.paginate("/repos/%s/issues?state=open&labels=loom:queued,lane:%s"
-                            % (repo, quote(lane, safe="")))
-        for item in found:
-            if (isinstance(item, dict) and "pull_request" not in item
-                    and "loom:queued" in _names(item) and "lane:" + lane in _names(item)):
-                try:
-                    difficulty = tickets.parse(item.get("body"))[0].get("Difficulty", "")
-                except ValueError:
-                    continue
-                if difficulty not in REMOTE_LANES[lane]["tiers"]:
-                    continue
-                candidates.append((str(item.get("created_at") or ""), repo, item))
-    for _, repo, issue in sorted(candidates, key=lambda row: (row[0], row[1], int(row[2]["number"]))):
-        number = int(issue["number"])
-        comments = _comments(gh, repo, number)
-        recent = [at for _, at in _claims(comments, lane) if now - at < CLAIM_AGE]
+    for repo, issue in _candidates(gh, repos, lane):
+        recent = [at for _, at in _claims(_comments(gh, repo, int(issue["number"])), lane)
+                  if now - at < CLAIM_AGE]
         if len(recent) >= REMOTE_LANES[lane]["slots"]:
             continue
-        labels = [x for x in _names(issue) if x != "loom:queued"] + ["loom:running"]
-        gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
-        at = now
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "<!-- loom:remote-claim v1 %s %d %.3f -->" % (lane, number, at)})
-        repo_info = gh.rest("GET", "/repos/%s" % repo).data
-        default = str((repo_info.get("default_branch") if isinstance(repo_info, dict) else "")
-                      or "main")
-        brief = tickets.render_brief(repo, issue, lane)
-        result = {"repo": repo, "number": number, "base": default, "brief": brief}
+        result = _take(gh, repo, issue, lane, now)
         print(json.dumps(result))
         return result
     return None
@@ -152,8 +182,16 @@ def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",
             "body": "The station keeps lane status current here."}).data
     if not isinstance(issue, dict) or "number" not in issue:
         raise ValueError("could not locate the lane status issue")
-    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, issue["number"]), {
-        "body": "<!-- loom:remote-heartbeat v1 %s %.3f -->" % (lane, now)})
+    body = "<!-- loom:remote-heartbeat v1 %s %.3f -->" % (lane, now)
+    # One comment per lane, edited in place: a heartbeat every tick must not
+    # grow the status issue by a comment each time.
+    mine = re.compile(r"^<!-- loom:remote-heartbeat v1 %s [0-9.]+ -->$" % re.escape(lane))
+    for comment in _comments(gh, repo, int(issue["number"])):
+        if mine.fullmatch(str(comment.get("body") or "").strip()) and comment.get("id"):
+            gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(comment["id"])),
+                    {"body": body})
+            return
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, issue["number"]), {"body": body})
 
 
 def _git(*args: str) -> str:
@@ -166,6 +204,27 @@ def _git(*args: str) -> str:
 def _what(body: str) -> str:
     match = re.search(r"^## What\s*\n(.*?)(?=^## |\Z)", body, re.M | re.S)
     return match.group(1).strip() if match else ""
+
+
+def pr_body(repo: str, issue: Dict[str, Any], kind: str, counts: Dict[str, int],
+            lane: str = "muse") -> str:
+    """The pull request body every lane writes (lanes/run_lane.sh pr_body,
+    rendered by bus/pr_repair.py): the Intent section, Why, Summary,
+    Acceptance criteria, Size, Out of scope, the Loom footer and a Refs line.
+    Never a closing keyword: the ticket closes only once it is verified.
+    ValueError when the body would fail the review bot's plan checks."""
+    number = int(issue["number"])
+    brief = tickets.render_brief(repo, issue, lane)
+    model = os.environ.get("LOOM_%s_MODEL" % lane.upper().replace("-", "_"), lane)
+    body = pr_repair._render_generated(brief, lane, model, tickets.ticket_name(repo, number))
+    intent = change_class.render_intent(kind, change_class.behavior_lines(
+        "", _what(str(issue.get("body") or ""))), counts)
+    body = change_class.with_intent(body, intent)
+    found = hunt_plan.problems(body)
+    if found:
+        raise ValueError("the pull request body would fail the review bot's plan checks: "
+                         + "; ".join(found) + " (fix the ticket's brief sections)")
+    return body
 
 
 def open_pr(gh: GitHub, repo: str, number: int, base: str,
@@ -185,11 +244,7 @@ def open_pr(gh: GitHub, repo: str, number: int, base: str,
         import base64
         patterns = change_class.parse_patterns(base64.b64decode(patterns_data["content"]).decode("utf-8"))
     kind = change_class.classify(files, patterns)
-    counts = change_class.count_by_class(files, patterns)
-    intent = change_class.render_intent(kind, change_class.behavior_lines(
-        "", _what(str(issue.get("body") or ""))), counts)
-    body = change_class.with_intent(
-        "Closes #%d\n\nRefs #%d" % (number, number), intent)
+    body = pr_body(repo, issue, kind, change_class.count_by_class(files, patterns))
     made = gh.rest("POST", "/repos/%s/pulls" % repo, {
         "title": title or str(issue.get("title") or ""), "head": branch,
         "base": base, "body": body}).data

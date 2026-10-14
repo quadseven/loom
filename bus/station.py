@@ -576,6 +576,13 @@ def lane_takes_model(lane: str, model: str) -> bool:
     return any(fnmatch.fnmatchcase(model, p) for p in LANE_MODELS.get(lane, []))
 
 
+def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
+    """Whether a remote lane's last heartbeat still counts as up: within its
+    configured beat_max (labels.REMOTE_LANES), else HEARTBEAT_MAX_AGE."""
+    window = REMOTE_LANES.get(lane, {}).get("beat_max", HEARTBEAT_MAX_AGE)
+    return at is not None and -60 <= now - at <= window
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only."""
@@ -963,8 +970,7 @@ class Station:
         if lane in REMOTE_LANES:
             if lane not in self._remote_beats:
                 self._remote_beats[lane] = self._remote_heartbeat(lane)
-            at = self._remote_beats[lane]
-            return at is not None and -60 <= self.now - at <= HEARTBEAT_MAX_AGE
+            return remote_beat_fresh(lane, self._remote_beats[lane], self.now)
         # Credit under the floor stops the anthropic slots even before their
         # runner next reports it.
         if lane.split("-")[0] == "anthropic" and self._anthropic_spend().under_floor():

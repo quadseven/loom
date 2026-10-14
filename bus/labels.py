@@ -20,7 +20,11 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          "opencode-go-4"]
 LANES = LANES + SLOTS
 # Remote lanes pull ticket work from GitHub and have no local station inbox.
-REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1}}
+# beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
+# on its own schedule (about every 30 minutes), not every minute like a
+# local runner, so its window is longer than HEARTBEAT_MAX_AGE.
+REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1,
+                         "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
 # The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
