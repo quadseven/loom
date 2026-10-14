@@ -9,6 +9,24 @@ from urllib.parse import quote
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
+REMOTE_HEARTBEAT_MARKER = "<!-- loom:remote-heartbeat v1"
+REMOTE_HEARTBEAT_RE = re.compile(r"<!-- loom:remote-heartbeat v1\s+([A-Za-z0-9_.-]+)(?:\s+([0-9.]+))?\s*-->")
+
+
+def parse_remote_heartbeats(comments):
+    beats = {}
+    for comment in comments or []:
+        body = str(comment.get("body") or "") if isinstance(comment, dict) else str(comment or "")
+        match = REMOTE_HEARTBEAT_RE.search(body)
+        if match:
+            lane = match.group(1).strip()
+            ts = match.group(2) if match.group(2) else ""
+            beats[lane] = {
+                "lane": lane,
+                "available": True,
+                "heartbeat": ts or "heartbeat available",
+            }
+    return beats
 # A lane pull request's footer names its ticket in the runner's form,
 # owner.name-N or owner.name-N-rK (bus/tickets.ticket_name), or as
 # owner/name#N, at the start of a line. An owner never has a dot, so the
@@ -24,8 +42,8 @@ def footer(text):
         return None
     owner, name, number, lane, model = match.groups()
     return "%s/%s" % (owner, name), number, lane, model.strip()
-NUMBER = re.compile(r"^\d+\. (PASS|FAIL) (.+?): (.*?) \(target (.*?)\)$", re.M)
-REF = re.compile(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+NUMBER = re.compile(r"^\d+\. (PASS|FAIL) (.+?): (.*?)(?: \(target (.*?)\))?$", re.M)
+REF = re.compile(r"(?:https?://[A-Za-z0-9_.-]+/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
 
 def _ticket_href(repo: str, number: int) -> str:
@@ -55,15 +73,27 @@ def build_improvements(journals, tickets, metrics_comments):
             "metrics_available": bool(metrics)}
 
 
+def _is_none(text: str) -> bool:
+    clean = text.strip().strip(".").strip().lower()
+    return not clean or clean == "none"
+
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
 def _journal_records(journal, tickets, latest, previous):
     records = []
     body = str(journal.get("body") or "")
     if not body.startswith(JOURNAL_MARKER):
         return records
     for line in body.splitlines():
-        if not re.match(r"- (?:Waiting|Asks|Measure):", line, re.I):
+        match = re.match(r"^[ \t]*-?[ \t]*(?:Friction|Blockers?|Blocked)[ \t]*:[ \t]*(.+)$", line, re.I)
+        if not match:
             continue
-        friction = line.split(":", 1)[1].strip()
+        friction = match.group(1).strip()
+        if _is_none(friction):
+            continue
         ticket = _ticket_for_friction(journal, friction, body, tickets)
         state = (ticket or {}).get("state") or "not ticketed"
         moved = _moved_metric(ticket, state, latest, previous)
@@ -73,17 +103,62 @@ def _journal_records(journal, tickets, latest, previous):
     return records
 
 
-def _ticket_for_friction(journal, friction, body, tickets):
-    refs = REF.findall(friction) or REF.findall(body)
+def _find_ticket(tickets, refs):
     for repo, number in refs:
         ticket = next((row for row in tickets if row.get("repo") == repo
                        and str(row.get("number")) == number), None)
         if ticket:
             return ticket
+    return None
+
+
+def _ticket_refs_journal(tickets, journal):
+    journal_url = journal.get("html_url") or ""
+    journal_id = str(journal.get("id") or "")
+    for row in tickets:
+        ticket_body = str(row.get("body") or "")
+        if journal_url and journal_url in ticket_body:
+            return row
+        if journal_id and ("issuecomment-" + journal_id) in ticket_body:
+            return row
+        if journal_id and re.search(r"Refs\b[^\n]*\b" + re.escape(journal_id) + r"\b", ticket_body):
+            return row
+    return None
+
+
+def _why_quotes_friction(why_clean, friction_clean):
+    if friction_clean in why_clean or why_clean in friction_clean:
+        return True
+    words = [w for w in friction_clean.split() if len(w) > 3]
+    return len(words) >= 4 and sum(1 for w in words if w in why_clean) >= len(words) * 0.75
+
+
+def _ticket_quoting_friction(tickets, friction):
+    friction_clean = _clean_text(friction)
+    if not friction_clean or len(friction_clean) <= 8:
+        return None
+    for row in tickets:
+        ticket_body = str(row.get("body") or "")
+        why_match = re.search(r"##\s*Why\s*\n(.*?)(?=\n##|\Z)", ticket_body, re.S | re.I)
+        why_clean = _clean_text(why_match.group(1) if why_match else ticket_body)
+        if _why_quotes_friction(why_clean, friction_clean):
+            return row
+    return None
+
+
+def _ticket_for_journal_ids(tickets, journal):
     if journal.get("repo") and journal.get("issue_number"):
         return next((row for row in tickets
                      if (journal["repo"], str(journal["issue_number"])) in row.get("refs", [])), None)
     return None
+
+
+def _ticket_for_friction(journal, friction, body, tickets):
+    return (_find_ticket(tickets, REF.findall(friction))
+            or _ticket_refs_journal(tickets, journal)
+            or _ticket_quoting_friction(tickets, friction)
+            or _find_ticket(tickets, REF.findall(body))
+            or _ticket_for_journal_ids(tickets, journal))
 
 
 def _moved_metric(ticket, state, latest, previous):
@@ -114,7 +189,7 @@ def build_scoreboard(pull_requests):
         if tier not in ("easy", "medium", "hard", "frontier"):
             tier = "unknown"
         counts = tiers.setdefault(tier, {}).setdefault(model.strip(),
-            {"merged": 0, "open": 0, "closed": 0, "lane": lane})
+            {"merged": 0, "open": 0, "closed": 0, "lane": lane.strip()})
         state = str(pr.get("state") or "open").lower()
         key = "merged" if state == "closed" and pr.get("merged_at") else state
         if key in ("merged", "open", "closed"):
@@ -122,35 +197,50 @@ def build_scoreboard(pull_requests):
     return tiers
 
 
-def render_improving(data):
+def _improvement_card(row):
     esc = html.escape
+    ticket = row["ticket"]
+    ref = row["journal"].get("html_url") or ""
+    journal = '<a href="%s">journal</a>' % esc(ref, True) if ref else "journal"
+    ticket_html = ('<a href="%s">#%s %s</a>' % (_ticket_href(ticket["repo"], ticket["number"]),
+                   esc(str(ticket["number"])), esc(str(ticket.get("title") or "ticket")))
+                   if ticket else "ticket not found")
+    moved = '<strong class="good">moved: %s</strong>' % esc(row["moved"]) if row["moved"] else ""
+    segments = "".join('<span class="%s"></span>' % (
+        "done" if index < row["stage"] else "current" if index == row["stage"] else "")
+        for index in range(4))
+    return '<article class="improvement"><div class="progress four">%s</div><p>"%s"</p><p>%s / %s / %s %s</p></article>' % (
+        segments, esc(row["friction"]), journal, ticket_html, esc(str(row["state"])), moved)
+
+
+def _factory_card(name, current, old):
+    esc = html.escape
+    if old is None:
+        direction, direction_class = "previous value missing", ""
+    else:
+        # Better or worse only when the target flips; a number that
+        # held its side of the target says so, never "better".
+        direction = ("better" if current["passed"] and not old["passed"] else
+                     "worse" if old["passed"] and not current["passed"] else
+                     "still passing" if current["passed"] else "still failing")
+        direction_class = "good" if current["passed"] else "bad"
+    return '<article class="card metric factory-card"><span class="metric-val">%s</span><strong class="metric-name">%s</strong><span class="metric-prev %s">was %s / %s</span></article>' % (
+        esc(current["value"]), esc(name), esc(direction_class), esc(old["value"] if old is not None else "missing"), esc(direction))
+
+
+def render_improving(data):
     parts = ['<section class="card"><h2>Noticed to moved</h2><div class="improvement-list">']
-    for row in data["records"]:
-        ticket = row["ticket"]
-        source = row["journal"]
-        ref = source.get("html_url") or ""
-        journal = '<a href="%s">journal</a>' % esc(ref, True) if ref else "journal"
-        ticket_html = ('<a href="%s">#%s %s</a>' % (_ticket_href(ticket["repo"], ticket["number"]),
-                       esc(str(ticket["number"])), esc(str(ticket.get("title") or "ticket")))
-                       if ticket else "ticket not found")
-        moved = '<strong class="good">moved: %s</strong>' % esc(row["moved"]) if row["moved"] else ""
-        segments = "".join('<span class="%s"></span>' % (
-            "done" if index < row["stage"] else "current" if index == row["stage"] else "")
-            for index in range(4))
-        parts.append('<article class="improvement"><div class="progress four">%s</div><p>"%s"</p><p>%s / %s / %s %s</p></article>' % (
-            segments, esc(row["friction"]), journal, ticket_html,
-            esc(str(row["state"])), moved))
+    if not data["records"]:
+        parts.append('<p class="empty-state">No friction lines in the journals yet.</p>')
+    parts.extend(_improvement_card(row) for row in data["records"])
     parts.append("</div></section><section><h2>Factory numbers</h2>")
     if not data["metrics_available"]:
         parts.append('<p class="empty-state">Daily metrics are missing: no metrics comment was found.</p>')
     else:
-        for name, current in data["latest"].items():
-            old = data["previous"].get(name)
-            direction = ("better" if current["passed"] and not old["passed"] else
-                         "worse" if old["passed"] and not current["passed"] else
-                         "better" if current["passed"] else "worse") if old is not None else "previous value missing"
-            parts.append('<article class="card metric"><strong>%s</strong><span>%s</span><span>was %s / %s</span></article>' % (
-                esc(name), esc(current["value"]), esc(old["value"] if old is not None else "missing"), esc(direction)))
+        parts.append('<div class="factory-grid">')
+        parts.extend(_factory_card(name, current, data["previous"].get(name))
+                     for name, current in data["latest"].items())
+        parts.append('</div>')
     parts.append("</section>")
     return "".join(parts)
 

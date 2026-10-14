@@ -628,6 +628,21 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     return server
 
 
+def _merge_lane_rows(comments):
+    """Lane rows from the newest status comment, plus remote heartbeat lanes."""
+    status_comments = [c for c in comments if str(c.get("body") or "").startswith(views.LANES_MARKER)]
+    latest = max(status_comments, key=lambda c: str(c.get("created_at") or ""), default=None)
+    lane_rows = views.parse_lane_rows(latest.get("body") if latest else "")
+    by_lane = {row["lane"]: row for row in lane_rows}
+    for lane_name, remote in views.parse_remote_heartbeats(comments).items():
+        if lane_name not in by_lane:
+            lane_rows.append(remote)
+            by_lane[lane_name] = remote
+        elif remote.get("available"):
+            by_lane[lane_name]["available"] = True
+    return lane_rows
+
+
 def _newest_lane_models(prs):
     """Each lane's model and time from its newest lane pull request footer."""
     newest = {}
@@ -665,9 +680,7 @@ def _lane_quota(lane, rows):
 
 
 def _lane_view_data(payload, tickets, state=None):
-    comments = payload.get("lanes", [])
-    latest = max(comments, key=lambda c: str(c.get("created_at") or ""), default=None)
-    lane_rows = views.parse_lane_rows(latest.get("body") if latest else "")
+    lane_rows = _merge_lane_rows(payload.get("lanes", []))
     prs = payload.get("pull_requests", [])
     newest_pr_for_lane = _newest_lane_models(prs)
     usage_records = _usage_rows(payload, state)
@@ -677,7 +690,6 @@ def _lane_view_data(payload, tickets, state=None):
         lane_name = item["lane"]
         active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
                        and ticket.get("state") in ("running", "pr")), None)
-
         model_info = newest_pr_for_lane.get(lane_name)
         model_display = None
         if model_info:

@@ -7,7 +7,7 @@ from dashboard.views import (build_improvements, build_scoreboard, render_lanes,
 
 class ImprovingViewTest(unittest.TestCase):
     def test_journal_link_and_moved_only_when_metric_changed(self):
-        journal = {"body": "<!-- loom:journal v1 -->\n- Waiting: reduce repeat failures in example-owner/sample#8",
+        journal = {"body": "<!-- loom:journal v1 -->\n- Friction: reduce repeat failures in example-owner/sample#8",
                    "repo": "example-owner/sample", "issue_number": 30,
                    "html_url": "https://github.com/example-owner/sample/issues/30#issuecomment-1"}
         tickets = [{"repo": "example-owner/sample", "number": 8, "title": "Reduce repeat failures",

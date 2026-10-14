@@ -222,7 +222,7 @@ class TicketStore:
                         reports.append(comment)
                     if body.startswith("<!-- loom:metrics v1 -->"):
                         metric_comments.append(comment)
-                    if body.startswith("<!-- loom:lanes v1 -->"):
+                    if body.startswith("<!-- loom:lanes v1 -->") or body.startswith("<!-- loom:remote-heartbeat v1"):
                         lanes.append(comment)
         except (GitHubError, OSError, ValueError, KeyError) as exc:
             errors.append("%s: %s" % (repo, self._error_reason(exc)))
@@ -238,7 +238,8 @@ class TicketStore:
                 comments = self.gh.paginate("/repos/%s/issues/%d/comments"
                                             % (quote(status_home, safe="/"), int(issue["number"])))
                 lanes.extend(comment for comment in comments if isinstance(comment, dict)
-                             and str(comment.get("body") or "").startswith("<!-- loom:lanes v1 -->"))
+                             and (str(comment.get("body") or "").startswith("<!-- loom:lanes v1 -->")
+                                  or str(comment.get("body") or "").startswith("<!-- loom:remote-heartbeat v1")))
         except (GitHubError, OSError, ValueError, KeyError) as exc:
             errors.append("%s lane status: %s" % (status_home, self._error_reason(exc)))
 
