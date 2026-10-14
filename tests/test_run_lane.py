@@ -389,10 +389,10 @@ class LaneRunnerTest(unittest.TestCase):
         brief.write_text("## Fix\nFixed\n### Thread F1 (comment 1) at test.py:10\n"
                          "Fixed\n### Thread F2 (comment 2) at test.py:20\n"
                          "Fixing: example/repo#12\n")
-        # eval, not source <(...): bash 3.2 (macOS, as CI runs it) sources
-        # nothing from a process substitution.
-        script = 'eval "$(sed -n "/^fix_items() {/,/^}/p" "$1")"; fix_items "$2"'
-        result = subprocess.run(["bash", "-c", script, "bash", str(RUNNER), str(brief)],
+        # The function text goes to bash -c directly: bash 3.2 (macOS, as CI
+        # runs it) sources nothing from a process substitution.
+        function = re.search(r"^fix_items\(\) \{\n.*?^\}\n", RUNNER.read_text(), re.S | re.M).group(0)
+        result = subprocess.run(["bash", "-c", function + 'fix_items "$1"', "bash", str(brief)],
                                 capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.strip(),
                          "Thread F1 (comment 1) at test.py:10 [fixed]; "
