@@ -446,5 +446,124 @@ class BacklogHelperTest(unittest.TestCase):
         self.assertIn("loom:human counts by repo", body)
 
 
+class LaneCardsTest(unittest.TestCase):
+    def test_status_comment_renders_heartbeat_time_and_never_heartbeat_available(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "Updated 2026-10-14 20:17:00Z\n\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 2026-10-14 20:17:00Z |\n"
+            "| claude | yes | 20:17Z |\n"
+            "| agy | no | 2026-10-14 19:45:00Z |\n"
+        )
+        payload = {"lanes": [{"body": comment, "created_at": "2026-10-14T20:17:00Z"}],
+                   "pull_requests": [], "tickets": {}}
+        data = _lane_view_data(payload, [])
+        body = render_lanes(data)
+        self.assertNotIn("heartbeat available", body)
+        self.assertIn("heartbeat 20:17Z", body)
+        self.assertIn("heartbeat 19:45Z", body)
+        for lane in ("codex", "claude", "agy"):
+            self.assertIn(lane, body)
+
+    def test_running_ticket_has_separator_before_heartbeat_line(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 20:17Z |\n"
+        )
+        tickets = [{"repo": "example-owner/sample", "number": 362, "title": "Lane cards",
+                    "state": "running", "lane": "codex"}]
+        payload = {"lanes": [{"body": comment}], "pull_requests": [], "tickets": {}}
+        data = _lane_view_data(payload, tickets)
+        body = render_lanes(data)
+        self.assertIn("Lane cards</a> - heartbeat 20:17Z", body)
+
+    def test_pull_request_footer_shows_model_and_missing_says_model_missing(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 20:17Z |\n"
+            "| claude | yes | 20:17Z |\n"
+        )
+        prs = [{
+            "body": "Fixes #1\n\nLoom ticket example-owner/sample#31, lane codex, model gpt-6-sol.\n",
+            "created_at": "2026-10-14T12:00:00Z",
+        }]
+        payload = {"lanes": [{"body": comment}], "pull_requests": prs, "tickets": {}}
+        data = _lane_view_data(payload, [])
+        body = render_lanes(data)
+        self.assertIn("gpt-6-sol", body)
+        self.assertIn("model missing", body)
+
+    def test_usage_record_shows_quota_bar_and_missing_says_quota_missing(self):
+        from dashboard.views import render_lanes
+        from dashboard.server import _lane_view_data
+        comment = (
+            "<!-- loom:lanes v1 -->\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 20:17Z |\n"
+            "| claude | yes | 20:17Z |\n"
+        )
+        usage = [
+            {"provider": "codex", "lanes": ["codex"], "window": "weekly", "used_pct": 65,
+             "as_of": "2026-10-14T12:00:00Z", "source": "test"}
+        ]
+        payload = {"lanes": [{"body": comment}], "pull_requests": [], "tickets": {}, "usage": usage}
+        data = _lane_view_data(payload, [])
+        body = render_lanes(data)
+        self.assertIn('<div class="quota"><span style="width:65%"></span></div>', body)
+        self.assertIn("quota missing", body)
+
+    def test_lanes_http_route_integration(self):
+        from dashboard.server import _dispatch_get
+        from dashboard.usage import Store
+        class State:
+            stale = False
+            usage = Store()
+            def response(self):
+                comment = (
+                    "<!-- loom:lanes v1 -->\n"
+                    "| lane | available | heartbeat (UTC) |\n"
+                    "|---|---|---|\n"
+                    "| codex | yes | 20:17Z |\n"
+                    "| claude | yes | 20:17Z |\n"
+                )
+                prs = [{
+                    "body": "Loom ticket example-owner/sample#31, lane codex, model gpt-6-sol.\n",
+                    "created_at": "2026-10-14T12:00:00Z",
+                }]
+                return {"tickets": {}, "lanes": [{"body": comment}], "pull_requests": prs,
+                        "stale": False, "dashboard_errors": []}
+        state = State()
+        state.usage.upload([
+            {"provider": "codex", "lanes": ["codex"], "window": "5-hour", "used_pct": 42,
+             "as_of": "2026-10-14T12:00:00Z", "source": "test"}
+        ])
+        class Handler:
+            path = "/lanes"
+            def send_page(self, body, code=200):
+                self.result = (code, body)
+        handler = Handler()
+        _dispatch_get(handler, state)
+        body = handler.result[1]
+        self.assertNotIn("heartbeat available", body)
+        self.assertIn("heartbeat 20:17Z", body)
+        self.assertIn("gpt-6-sol", body)
+        self.assertIn('<div class="quota"><span style="width:42%"></span></div>', body)
+        self.assertIn("quota missing", body)
+        self.assertIn("model missing", body)
+
+
 if __name__ == "__main__":
     unittest.main()

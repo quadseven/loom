@@ -308,6 +308,8 @@ class TicketStore:
     def response(self) -> Dict[str, Any]:
         with self._snapshot_lock:
             snapshot = self._snapshot
+        store = getattr(self, "usage", None)
+        usage_rows = [row for items in getattr(store, "providers", {}).values() for row in items] if store else []
         return {"tickets": snapshot["tickets"], "errors": snapshot["errors"],
                 "stale": snapshot["stale"], "auth": self.auth,
                 "improving": snapshot.get("improving", {}),
@@ -317,7 +319,8 @@ class TicketStore:
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),
                 "operator_items": list(self.operator_items),
-                "dashboard_errors": snapshot.get("dashboard_errors", [])}
+                "dashboard_errors": snapshot.get("dashboard_errors", []),
+                "usage": usage_rows}
 
 
 def _floor_context(reports, journals, asks, errors):
