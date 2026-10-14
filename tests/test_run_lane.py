@@ -1855,6 +1855,26 @@ cat > /dev/null
         self.assertTrue(self.spark_beat()["available"])
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_uses_the_window_its_endpoint_serves(self):
+        # The first sparkles run thrashed in a fixed 32K window against a
+        # server serving 262144; the window is a lane setting now.
+        _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT="131072", LOOM_SPARK_OUTPUT="16384",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
+                         {"context": 131072, "output": 16384})
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
+        _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
+                         {"context": 32768, "output": 4096})
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_spark_lane_takes_the_brief_model_line(self):
         brief = BRIEF.replace("Lane: codex", "Lane: spark\nModel: spark/other-coder")
         inbox = self.loom / "briefs" / "spark"
