@@ -64,8 +64,10 @@ Neither needs a model:
   2026-10-13 were the bot's own "Fixed in" threads).
 - A round where the lane made no change and explained why waits for the
   review it asked for, up to REVIEW_GRACE, before the round is judged.
-- A failed ticket climbs the ladder, and so does a ticket left briefed for
-  BRIEFED_STALL with no lane claiming it.
+- A failed ticket climbs the ladder. A ticket left briefed for BRIEFED_STALL
+  with no lane claiming it does not: it never ran, so it moves to the
+  least-loaded other lane of its tier (a ladder ticket, of its rung), writing
+  no rung marker.
 - Each pass gives the oldest queued tickets free lanes in their difficulty
   tier, leaving held tickets and tickets without a readable tier queued.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
@@ -169,6 +171,8 @@ RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
 FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
 CLAIM_RE = re.compile(r"^Claimed for lane ")
+# The factory's own note when it moves a stalled ticket to another lane.
+STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
@@ -391,14 +395,25 @@ def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
 
 def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     """The rungs the ticket has run on since its ladder last started (the
-    newest rung 0 marker). A rung skipped because its lanes were busy is not
-    tried: on 2026-10-13 a restart wave filled the claude and codex lanes,
-    tickets spilled straight to rung 3 and gave up after one more round."""
+    newest rung 0 marker). A rung counts once a claim follows its marker: a
+    rung skipped because its lanes were busy, or one the ticket sat briefed
+    on with no lane claiming it, is not tried (on 2026-10-13 a restart wave
+    filled the claude and codex lanes, tickets spilled straight to rung 3 and
+    gave up after one more round; on 2026-10-14 a ticket that never ran
+    climbed past the last rung)."""
     tried: set = set()
+    pending: set = set()
     for c in comments:
-        for m in RUNG_RE.finditer(str(c.get("body") or "")):
+        body = str(c.get("body") or "")
+        if CLAIM_RE.match(body):
+            tried |= pending
+            pending = set()
+        for m in RUNG_RE.finditer(body):
             rung = int(m.group(1))
-            tried = set() if rung == 0 else tried | {rung}
+            if rung == 0:
+                tried, pending = set(), set()
+            else:
+                pending = pending | {rung}
     return tried
 
 
@@ -1086,10 +1101,10 @@ class Factory:
         names = _labels(issue)
         if "needs-brain" in names:
             return
-        since = self._briefed_since(repo, issue)
+        number = int(issue["number"])
+        since = self._briefed_since(repo, issue, self._comments(repo, number))
         if not since or self.now - since < HOLD_STUCK:
             return
-        number = int(issue["number"])
         waiting_for = ", ".join(a.short for a in waiting)
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
             "Held %.0f hours by After: waiting for %s. The station never claims a "
@@ -1104,31 +1119,68 @@ class Factory:
         _say("%s#%d has waited %.0f hours for %s; reported to the brain"
              % (repo, number, (self.now - since) / 3600, waiting_for))
 
-    def _briefed_since(self, repo: str, issue: Dict[str, Any]) -> float:
-        """When the ticket was last labeled briefed, or its hold ended if
-        later; 0 when it never was."""
+    def _briefed_since(self, repo: str, issue: Dict[str, Any],
+                       comments: List[Dict[str, Any]]) -> float:
+        """When the ticket's wait on its lane began: the newest of its last
+        loom:briefed label, any lane: label, and the factory's own stall-move
+        note, or its hold's end if later; 0 when it never was briefed. A
+        moved ticket thus waits a full BRIEFED_STALL on its new lane."""
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
-        since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
-                     and e.get("event") == "labeled"
-                     and (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
-        return max(since, held_until(issue)) if since else since
+        named = [e for e in events if isinstance(e, dict) and e.get("event") == "labeled"]
+        since = max((_ts(e.get("created_at")) for e in named
+                     if (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
+        if not since:
+            return since
+        moved = [_ts(e.get("created_at")) for e in named
+                 if str((e.get("label") or {}).get("name") or "").startswith("lane:")]
+        moved += [_ts(c.get("created_at")) for c in comments
+                  if STALL_MOVE_RE.match(str(c.get("body") or ""))]
+        return max([since, held_until(issue)] + moved)
+
+    def _stall_lanes(self, repo: str, issue: Dict[str, Any], rung: int) -> List[str]:
+        """The other available lanes a stalled ticket may move to: those of
+        its rung, or of its difficulty tier. Never up the ladder."""
+        old = _lane(issue)
+        pool = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
+        return [x for x in pool if x != old and self._up(x)]
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
-        """A ticket briefed BRIEFED_STALL with no lane claiming it climbs."""
+        """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
+        least-loaded other lane of its tier (or of its rung), with no rung
+        marker: it never ran, so it has not failed on any model. With no such
+        lane it stays briefed, and the stall is said once per pass."""
         number = int(issue["number"])
-        since = self._briefed_since(repo, issue)
+        comments = self._comments(repo, number)
+        since = self._briefed_since(repo, issue, comments)
         if not since or self.now - since < BRIEFED_STALL:
             return
-        comments = self._comments(repo, number)
         if any(CLAIM_RE.match(str(c.get("body") or "")) and _ts(c.get("created_at")) >= since
                for c in comments):
             return
-        hours = (self.now - since) / 3600
-        why = "briefed %.0f hours on lane %s with no claim" % (hours, _lane(issue))
-        lane = self._climb(repo, issue, comments, why, failed_here=False)
-        if lane is None:
-            self._give_up(repo, issue, why)
+        old = _lane(issue)
+        rung = current_rung(issue)
+        lanes = self._stall_lanes(repo, issue, rung)
+        if not lanes:
+            _say("%s#%d stalled on lane %s: no other lane of its %s is available"
+                 % (repo, number, old, "rung" if rung else "tier"))
             return
+        self._move_stalled(repo, issue, pick_lane(lanes, self.load),
+                           (self.now - since) / 3600, rung)
+
+    def _move_stalled(self, repo: str, issue: Dict[str, Any], lane: str,
+                      hours: float, rung: int) -> None:
+        """Relabel a stalled ticket onto `lane` and say why; no rung marker."""
+        number, old = int(issue["number"]), _lane(issue)
+        kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+            "body": "Not a failure (briefed %.0f hours on lane %s with no claim): the "
+                    "factory moved this ticket to lane %s, %s." % (
+                        hours, old, lane,
+                        "on the same rung" if rung else "in its difficulty tier")})
+        self.load[old] = self.load.get(old, 0) - 1
+        self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
         _say("moved stalled %s#%d to %s" % (repo, number, lane))
 

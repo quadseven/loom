@@ -27,7 +27,20 @@ WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
 from . import views
 
 def _all_tickets(state):
-    return [row for rows in state.response()["tickets"].values() if rows for row in rows]
+    payload = state.response()
+    rows = [row for tickets in payload["tickets"].values() if tickets for row in tickets]
+    prs = payload.get("pull_requests", [])
+    for row in rows:
+        if row.get("model"):
+            continue
+        matching = []
+        for pr in prs:
+            match = views.FOOTER.search(str(pr.get("body") or ""))
+            if match and match.group(1) == row.get("repo") and match.group(2) == str(row.get("number")):
+                matching.append((str(pr.get("updated_at") or ""), match.group(4)))
+        if matching:
+            row["model"] = max(matching)[1]
+    return rows
 
 
 def _ticket_href(row):
@@ -83,21 +96,28 @@ def _backlog(state):
 def _conveyor(state, rows):
     by_state = {name: [row for row in rows if row.get("state") == name] for name in STATES}
     waits = getattr(state, "waits", None)
-    waiting = [(name, waits.get(name)) for name in WAIT_STATES
-               if isinstance(waits, dict) and isinstance(waits.get(name), list)
-               and len(waits[name]) >= 3]
-    bottleneck = max(waiting, key=lambda pair: statistics.median(pair[1]))[0] if waiting else None
+    response = state.response()
+    wait_rows = {row.get("state"): row for row in response.get("wait_rows", []) if isinstance(row, dict)}
+    waiting = [(name, wait_rows[name].get("median_h")) for name in WAIT_STATES
+               if name in wait_rows and wait_rows[name].get("n", 0) >= 3
+               and wait_rows[name].get("median_h") is not None]
+    if not wait_rows:
+        waiting = [(name, statistics.median(waits[name])) for name in WAIT_STATES
+                   if isinstance(waits, dict) and isinstance(waits.get(name), list) and len(waits[name]) >= 3]
+    bottleneck = max(waiting, key=lambda pair: pair[1])[0] if waiting else None
     backlog_count, backlog_error = _backlog(state)
     cards = ['<a class="step-card" href="/backlog"><strong>%s</strong><span>backlog</span><small>%s</small></a>' % (
         str(backlog_count) if backlog_count is not None else "not looked",
         "open epic and ready issues" if backlog_error is None else html.escape(backlog_error))]
     for name in STATES:
         sample = waits.get(name, []) if isinstance(waits, dict) else []
-        median = statistics.median(sample) if sample else None
-        mark = " bottleneck" if name == bottleneck else ""
-        note = ("<small>median %.1fh</small>" % median) if median is not None else "<small>median unavailable</small>"
+        stats = wait_rows.get(name, {})
+        median = stats.get("median_h") if wait_rows else (statistics.median(sample) if sample else None)
+        worst = stats.get("worst_h")
+        mark = " bottleneck" if name == bottleneck and name not in ("verified", "failed") else ""
+        note = ("<small>median %.1fh%s</small>" % (median, " | worst %.1fh" % worst if worst is not None else "")) if median is not None else "<small>%s</small>" % html.escape(getattr(state, "waits_error", "median unavailable"))
         if name == bottleneck:
-            note = "<small>bottleneck - median %.1fh</small>" % median
+            note = "<small>bottleneck - median %.1fh%s</small>" % (median, " | worst %.1fh" % worst if worst is not None else "")
         cards.append('<a class="step-card state-%s%s" href="/tickets?state=%s"><strong>%d</strong><span>%s</span>%s</a>' % (
             name, mark, name, len(by_state[name]), name, note))
     return "".join(cards), bottleneck
@@ -107,12 +127,16 @@ def _floor(state):
     rows = _all_tickets(state)
     conveyor, bottleneck = _conveyor(state, rows)
     moving = [row for row in rows if row.get("state") in ("running", "pr", "briefed", "merged", "shipped")]
-    context = getattr(state, "context", {}) or {}
-    reports = context.get("reports", [])
-    report_line = reports[0] if reports else "No goal report has been loaded yet."
-    brain = context.get("journal") or "Journal not looked"
+    context = getattr(state, "context", None) or state.response().get("floor_context", {})
+    report_line = html.escape(str(context.get("report_headline") or ("not looked: " + str(context.get("report_reason") or "no goal report found"))))
+    report_time = context.get("report_time")
+    if report_time:
+        report_line += " <small>%s</small>" % html.escape(str(report_time))
+    brain = context.get("journal_step") or ("not looked: " + str(context.get("journal_reason") or "no goal journal found"))
+    if context.get("journal_holder") or context.get("journal_time"):
+        brain += " (%s%s%s)" % (context.get("journal_holder") or "", ", " if context.get("journal_holder") and context.get("journal_time") else "", context.get("journal_time") or "")
     hunt = context.get("hunt") or "Start here not looked"
-    parts = ['<section class="standup">%s</section>' % html.escape(str(report_line)),
+    parts = ['<section class="standup">%s</section>' % report_line,
              '<section class="section"><h2>Conveyor</h2><div class="conveyor">%s</div>' % conveyor]
     if bottleneck:
         parts.append('<p class="bottleneck-note">%s is the bottleneck: longest median wait.</p>' % html.escape(bottleneck))
@@ -122,11 +146,11 @@ def _floor(state):
     parts.append('<section class="card"><h2>Hunt - start here</h2><p>%s</p></section>' % html.escape(str(hunt)))
     since = context.get("since_report") or {}
     parts.append('<section class="card"><h2>Since last report</h2>%s</section>' % "".join(
-        '<p><b>%s</b> %s</p>' % (html.escape(key), html.escape(str(since.get(key, "not looked"))))
-        for key in ("well", "not well", "stuck", "next")))
+        '<p><b>%s</b> %s</p>' % (html.escape(label), html.escape(str(since.get(key, "not looked: " + str(context.get("report_reason") or "section missing")))))
+        for key, label in (("well", "Going well"), ("not well", "Not going well"), ("stuck", "Still stuck"), ("next", "Next"))))
     needs = context.get("needs_you")
     parts.append('<section class="card"><h2>Needs you</h2><strong>%s</strong> - <a href="/needs-you">View asks</a></section></aside></div>' % (
-        str(needs) if isinstance(needs, int) else "not looked"))
+        str(needs) if isinstance(needs, int) else "not looked: " + str(context.get("needs_you_reason") or "needs-operator source unavailable")))
     return page("Floor", "floor", "".join(parts), status="snapshot")
 
 

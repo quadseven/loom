@@ -1373,6 +1373,7 @@ def move(gh: GitHub, repo: str, number: int, state: str,
         body = str(issue.get("body") or "").split("\n\n", 1)[0]
         match = re.search(r"^Model:\s*(\S+)\s*$", body, re.M)
         effective_model = model or (match.group(1) if match else None)
+        _check_model(effective_model)
         if effective_model and lane not in model_lanes(effective_model):
             raise ValueError("lane %s cannot run model %s; compatible lanes: %s" %
                              (lane, effective_model,
