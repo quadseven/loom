@@ -5,6 +5,7 @@ import os
 import sys
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1314,6 +1315,70 @@ class PastLastRungTests(unittest.TestCase):
         step = muse.split('"%s"' % heading, 1)[1].split("\n6. ", 1)[0]
         self.assertIn("up to 3", step)
         self.assertIn("never resolve a thread a person opened", " ".join(step.lower().split()))
+
+
+class VerifyDueTests(unittest.TestCase):
+    NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+    LIVE = "- [ ] Live: the dashboard shows the new column"
+
+    def issue(self, number, state="loom:shipped", body=None):
+        return {"number": number, "title": "T%d" % number,
+                "labels": [{"name": "loom:ticket"}, {"name": state}],
+                "body": body if body is not None else "## Acceptance criteria\n- [ ] Tests\n" + self.LIVE,
+                "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z"}
+
+    def gh(self, issues, shipped):
+        """shipped maps a ticket number to the hour of 2030-01-02 it shipped."""
+        def transport(method, url, headers, body):
+            path = url.split("api.github.com")[1].split("?")[0]
+            if path == "/repos/%s/issues" % REPO:
+                return reply(200, issues)
+            if path.endswith("/events"):
+                number = int(path.split("/")[-2])
+                return reply(200, [{"event": "labeled", "label": {"name": "loom:shipped"},
+                                    "created_at": "2030-01-02T%02d:00:00Z" % shipped[number]}])
+            raise AssertionError("unexpected %s" % path)
+        return GitHub("t", transport=transport)
+
+    def test_lists_a_shipped_ticket_with_its_age_and_live_line(self):
+        gh = self.gh([self.issue(5)], {5: 6})
+        lines = brain._verify_due_lines(brain.verify_due(gh, REPO, [self.issue(5)], self.NOW), self.NOW)
+        self.assertEqual(lines[0], "### Verify due")
+        self.assertEqual(lines[1], "- #5 T5 - shipped 6h ago - Live: the dashboard shows the new column")
+
+    def test_a_ticket_without_a_live_line_says_so(self):
+        self.assertIn("no Live criterion", brain.live_criterion("## Acceptance criteria\n- [ ] Tests"))
+
+    def test_a_verified_or_unshipped_ticket_never_appears(self):
+        tickets = [self.issue(1, "loom:verified"), self.issue(2, "loom:merged"), self.issue(3)]
+        gh = self.gh(tickets, {3: 1})
+        due = brain.verify_due(gh, REPO, tickets, self.NOW)
+        self.assertEqual([3], [int(i["number"]) for _, i in due])
+        self.assertEqual(["- none"], brain._verify_due_lines([], self.NOW)[1:])
+
+    def test_resume_returns_five_oldest_first(self):
+        tickets = [self.issue(n) for n in range(1, 9)]
+        shipped = {n: 10 - n for n in range(1, 9)}  # 8 shipped earliest
+        out = "\n".join(brain._verify_resume_lines(self.gh(tickets, shipped), [REPO], self.NOW))
+        found = [int(x.split("#")[1].split()[0]) for x in out.splitlines() if x.startswith("- resume verify")]
+        self.assertEqual([8, 7, 6, 5, 4], found)
+        self.assertIn("shipped 10h ago: Live: the dashboard", out)
+
+    def test_status_prints_the_section(self):
+        issues = [self.issue(5)]
+        inner = self.gh(issues, {5: 6}).transport
+
+        def transport(method, url, headers, body):
+            path = url.split("api.github.com")[1].split("?")[0]
+            if path.endswith("/pulls"):
+                return reply(200, [])
+            if path == "/graphql":
+                return reply(200, {"data": {"repository": {}}})
+            return inner(method, url, headers, body)
+        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={},
+                              now=self.NOW, authors=[])
+        section = report.split("### Verify due", 1)[1].split("###", 1)[0]
+        self.assertIn("- #5 T5 - shipped 6h ago - Live: the dashboard shows the new column", section)
 
 
 class Routes:

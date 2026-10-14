@@ -194,6 +194,12 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("run timeout 120 python3 -m bus.brain resume $LOOM_REPOS --holder lane-machine "
                       "--lock-repo example/loom", claude)
         self.assertIn("Spend at most 13 minutes on them", claude)
+        # The verify share: up to a third of the tick, proof only from evidence
+        # seen in the tick, otherwise a note naming the missing evidence.
+        self.assertIn("up to 5 verify-due tickets", claude)
+        self.assertIn("spend up to a third of the tick on them", claude)
+        self.assertIn("only from evidence you saw in this tick", claude)
+        self.assertIn("naming what evidence is missing", claude)
         _, calls = self.tick()
         claude = [c for c in calls if c.startswith("claude ")][-1]
         self.assertNotIn("Do only what needs this machine", claude)
