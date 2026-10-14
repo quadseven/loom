@@ -61,6 +61,8 @@ that talks to GitHub about tickets.
 | `loom:urgent` | With `needs-operator`: forward now, not in the daily batch. |
 | `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
+| `loom:revert` | A ticket the station filed to revert the merge that turned a default branch red (see Red default branch). Claimed and landed before every other ticket. |
+| `class:logic` | A change to behavior; every revert ticket carries it. |
 
 A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
@@ -103,6 +105,29 @@ keyword. The station checks those references and the conventional branch
 number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
+
+### Trunk branch
+
+A goal home may carry a `Trunk: <branch>` line near the top of its body:
+
+```markdown
+Trunk: side
+
+## Destination
+...
+```
+
+Use it when the repo's default branch is not where Loom work lands, for
+example a fork whose default branch tracks upstream while all of its own work
+merges into a long-lived side branch. When a goal home names a Trunk,
+`bus.brain brief` uses it as the ticket's `Base:` unless `--base` is given
+explicitly, the lane runner checks out from it, and pull requests opened for
+tickets target it. `bus.brain status` warns when more than half of the repo's last 10
+merged pull requests target a branch that is neither the default branch nor a
+declared Trunk, so the operator knows to add the line.
+
+`bus.brain onboard` does not write a Trunk line; add it by hand once you know
+where the repo's work actually lands.
 
 ## Onboarding a repo
 
@@ -296,6 +321,11 @@ the account, the brain included.
   rest (reconciliation, hand-back, lane status, asks, standups, goal
   reports, metrics, the brain watch, the Discord relay and the factory)
   waits for the reset. The station says so once per rate limit window.
+- The revert pass (see Red default branch) reads, per repo, the same page of
+  recently closed pull requests reconciliation reads; only in a repo with a
+  lane pull request merged in the last 6 hours does it read further: the
+  repo, its default branch's 30 newest commits, and one check-run page per
+  commit from the head back to the last green one.
 - Each pass logs one line: `requests: N, M counted (by endpoint kind), K
   answered 304 (not counted); budget R of L left, resets T`.
 - Writes happen only on claims, outcomes, status changes and asks.
@@ -384,6 +414,49 @@ fixes a measured regression of ticket M:
 - Briefing the same regression again while its ticket is in flight files
   nothing and prints that ticket.
 
+## Red default branch
+
+Lanes merge as soon as their own pull request is green and reviewed: there
+is no merge queue and no global lock. Two changes that are each green can
+still break the default branch together, so the station watches the
+branch after the merge instead (bus/revert.py, every pass, off with
+`LOOM_FACTORY=0`):
+
+- For each repo with a lane pull request merged in the last 6 hours, it
+  reads the check runs of the default branch's newest commits through the
+  API, from the head back to the last green commit. No checkout. The
+  review check is left out, since it reviews and does not test. A commit
+  with no check runs is waited on for 30 minutes, then skipped as
+  untested.
+- When the newest tested commit is red, the first red commit after the
+  last green one is the culprit. A commit before it that is still running
+  is waited on, since it may be the culprit.
+- The culprit is reverted only when all of these hold: it is the merge of
+  a trusted lane pull request whose head was green; it has been red for
+  30 minutes, so a newer commit had time to turn the branch green; no other
+  `loom:revert` ticket is in flight in the repo; and no revert ticket names
+  it yet. A red commit no lane merged is reported once and left for a
+  person or the brain.
+- The revert is a ticket titled `Revert <sha>: <title>`, labelled
+  `loom:revert` and `class:logic`, with no `Model:` line (rung 0). It goes
+  to the first free lane of the easy tier the repo may use, or of the next
+  tier up when no easy lane is up. Its What is `git revert --no-edit <sha>`.
+  Its acceptance criteria are the failing checks passing. Its body says
+  `Tests: none needed (...)` and `Reverted ticket: #N`.
+- The station claims it first. The factory lands it first, on green and
+  reviewed, deferring its medium and low findings at once instead of after
+  a fix round. A high or critical finding still sends it back.
+- The reverted ticket gets a comment naming the red check and the revert
+  ticket. Once the revert reaches `loom:merged`, the ticket goes back to
+  `loom:briefed` on its own lane, to redo the change on the new default
+  branch. Its comment is marked `<!-- loom:redo R -->`, so the move
+  happens once.
+- Each decision is one `revert:` line in the station log, said again only
+  when it changes.
+- The station's auto-deploy of Loom itself (lanes/mac/station.sh) does not
+  deploy a head that would bring in a commit an in-flight revert ticket
+  names. It waits for the revert, or for the ticket to land.
+
 ## Merge-ready
 
 A lane pull request is merge-ready if and only if all four hold:
@@ -423,6 +496,36 @@ decides merge-ready, so consequence decides the rule:
   this class also requires that the review check passed and that no high or
   critical finding is open on the head commit.
 - A pull request with no class label keeps the `logic` rule.
+
+## Pull requests without a ticket
+
+A pull request with no ticket (no `Refs` line and no `loom/` branch) that a
+`LOOM_BRIEF_AUTHORS` login opened is not a lane pull request: no ticket
+moves and nothing briefs it. A brain is allowed to write one while
+shipping, and it must not be left for the operator. Such a fix either goes
+through `brief` like any other work, or is merged with `--adopt`.
+
+`python3 -m bus.brain merge OWNER/NAME#PR --adopt` squash-merges a
+ticketless pull request when all of these hold:
+
+- its author is in `LOOM_BRIEF_AUTHORS`;
+- its head and base are both in the same repo, so a fork is refused;
+- it is not a draft, and it has no ticket (a linked ticket is refused:
+  merge that without `--adopt`);
+- its head commit's check rollup is `SUCCESS`;
+- the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) ran and
+  passed on the head commit, because every change is reviewed before it
+  lands;
+- every review thread is resolved.
+
+It pins the head SHA in the squash merge, deletes the branch only after
+GitHub confirms the merge, and comments on the pull request that it was
+adopted.
+
+`python3 -m bus.brain status` lists these under "Pull requests without a
+ticket", one line per open pull request from a trusted author with no
+ticket, ending in `READY` or `blocked:` and every blocker exactly as a lane
+pull request's line, so a brain sees them and adopts them.
 
 ## Journal
 

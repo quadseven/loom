@@ -28,10 +28,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import metrics
+from . import revert
 from . import spend
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
 from .github import GitHub, GitHubError, _OPENER
@@ -76,13 +78,7 @@ BRANCH_MOVED = "branch moved:"
 REVIEW_AGAIN = "/grug improve"
 LANE_SAID_MAX = 2500
 PATH_RE = _text.PATH_RE
-# Credential shapes that must not reach a public comment: provider key
-# prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
-SECRET_RE = re.compile(
-    r"(?i)\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat|xox[a-z]|glpat|AKIA|ASIA)[-_A-Za-z0-9]{12,}"
-    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
-    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+"
-    r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
+SECRET_RE = _text.SECRET_RE
 REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
@@ -117,6 +113,8 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 REPORT_CHECK = 300
 REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
+# A backlog goal home is triaged at most this often.
+TRIAGE_INTERVAL = 3600
 # Through the bot, a report is one short line (the goal's short name and the
 # report's first line) with a thread on it holding the full report.
 SHORT_NAME_RE = re.compile(r"^[ \t]*Short name:[ \t]*(\S.*?)[ \t]*$", re.M | re.I)
@@ -222,7 +220,8 @@ class Settings:
                  no_test_repos: Sequence[str] = (),
                  metrics_goal: str = "",
                  transcript_url: str = "",
-                 transcript_token_ssm: str = "") -> None:
+                 transcript_token_ssm: str = "",
+                 watched: Optional[List[Tuple[str, str]]] = None) -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -246,6 +245,8 @@ class Settings:
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
         self.transcript_token_ssm = transcript_token_ssm
+        # (component, log path) pairs bus/watch.py reads each pass.
+        self.watched = watch.components(home) if watched is None else watched
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -265,6 +266,11 @@ class Settings:
         except ValueError:
             retry_max = RETRY_MAX
         retry_max = max(retry_max, 0)
+        try:
+            watched = watch.components(home, env.get("LOOM_WATCH", ""))
+        except ValueError as err:
+            _say("ignoring LOOM_WATCH: %s" % err)
+            watched = watch.components(home)
         try:
             budget = spend.Budget.from_env(env)
         except ValueError as err:
@@ -290,7 +296,8 @@ class Settings:
                    no_test_repos=words("LOOM_NO_TEST_REPOS"),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
-                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip())
+                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
+                   watched=watched)
 
 
 def _origin_repo() -> str:
@@ -336,6 +343,19 @@ def post_webhook(url: str, payload: Dict[str, Any]) -> None:
         raise OSError("the webhook answered %d" % status)
 
 
+# Answers about the body itself: sending the same body again cannot succeed.
+# A 401 or 403 is about the token, so those retry like a network error.
+REFUSED_BODY = (400, 413, 422)
+
+
+class UploadRefused(OSError):
+    """The dashboard read the body and refused it (REFUSED_BODY)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__("the transcript upload answered %d" % status)
+        self.status = status
+
+
 def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
     """POST one transcript to the dashboard. Errors never carry the URL or
     the token."""
@@ -353,6 +373,8 @@ def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
         err.close()
     except (urllib.error.URLError, OSError):
         raise OSError("the transcript upload failed to connect") from None
+    if status in REFUSED_BODY:
+        raise UploadRefused(status)
     if not 200 <= status < 300:
         raise OSError("the transcript upload answered %d" % status)
 
@@ -944,8 +966,10 @@ class Station:
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]]) -> None:
         """Claim the oldest ticket for one free lane that can be claimed."""
-        # A regression fix (bus.brain brief --regresses) goes first.
+        # A revert of a red default branch (bus/revert.py) goes first, then
+        # a regression fix (bus.brain brief --regresses).
         cands = sorted(found, key=lambda c: (
+            factory.REVERT_LABEL not in _label_names(c[1]),
             REGRESSION not in _label_names(c[1]),
             str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
         for repo, issue in cands:
@@ -2268,6 +2292,93 @@ class Station:
         ledger["_checked"] = self.now
         _write_json(path, ledger)
 
+    # -- backlog triage --------------------------------------------------
+    def _backlog_scan_due(self, state: Dict[str, Any]) -> bool:
+        scanned = state.get("_scanned")
+        return (not isinstance(scanned, (int, float)) or isinstance(scanned, bool)
+                or not 0 <= self.now - scanned < TRIAGE_INTERVAL)
+
+    def _backlog_goals(self, state: Dict[str, Any]
+                       ) -> Optional[Dict[str, Tuple[str, int, Any]]]:
+        """Backlog goal homes and their last triage time. The list is fetched
+        once an hour; stale cache entries are dropped from *state*. Returns
+        None when the list cannot be read, after logging the failure."""
+        if not self._backlog_scan_due(state):
+            goals: Dict[str, Tuple[str, int, Any]] = {}
+            for key, last in state.items():
+                if key == "_scanned":
+                    continue
+                repo, num = key.rsplit("#", 1)
+                goals[key] = (repo, int(num), last)
+            return goals
+        try:
+            homes = self._goal_homes()
+        except (GitHubError, OSError) as err:
+            _say("could not list goal homes for triage: %s" % err)
+            return None
+        goals = {}
+        keep = {"_scanned"}
+        for repo, goal in homes:
+            title = str(goal.get("title") or "")
+            if not title.startswith("Backlog:"):
+                continue
+            number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            keep.add(key)
+            goals[key] = (repo, number, state.get(key))
+        for stale in [k for k in state if k not in keep]:
+            del state[stale]
+        state["_scanned"] = self.now
+        return goals
+
+    def _triage_recent(self, last: Any) -> bool:
+        return (isinstance(last, (int, float)) and not isinstance(last, bool)
+                and 0 <= self.now - last < TRIAGE_INTERVAL)
+
+    def _run_triage(self, key: str, repo: str, number: int) -> None:
+        lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
+        queued = sum(1 for line in lines if " queued under #" in line)
+        triage_count = sum(1 for line in lines if " loom:triage" in line)
+        held = sum(1 for line in lines if " held:" in line)
+        _say("triage %s: %d queued, %d triage, %d held" % (
+            key, queued, triage_count, held))
+
+    def triage_backlogs(self) -> None:
+        """Run brain.triage once an hour on every backlog goal home.
+
+        A backlog goal is the goal home onboard opens: its title starts with
+        "Backlog:". The last run time per goal is kept in triage.json so a
+        restart does not repeat a run. Goal homes are re-read at most once an
+        hour, so a pass that does no triage costs no extra GitHub calls."""
+        path = os.path.join(self.state, "triage.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        goals = self._backlog_goals(state)
+        if goals is None:
+            return
+        for key, (repo, number, last) in goals.items():
+            if self._triage_recent(last):
+                continue
+            try:
+                self._run_triage(key, repo, number)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("triage %s failed: %s" % (key, err))
+                continue
+            state[key] = self.now
+        _write_json(path, state)
+
+    # -- log watch -------------------------------------------------------
+    def watch_logs(self) -> None:
+        """Read each component's new log lines and file one loom:triage issue
+        in the lanes repo per new repeated error (bus/watch.py). The logs are
+        read every pass; below the budget floor filing waits for the reset."""
+        repo = self.s.status_repo
+        if not repo or not tickets.REPO_RE.fullmatch(repo):
+            return
+        watch.Watcher(self.gh, repo, self.s.watched, os.path.join(self.state, "watch.json"),
+                      self.now, _say, write=not self._deferred()).run()
+
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
         """(ledger key, brain tick start or None, body builder) for every
@@ -2279,9 +2390,10 @@ class Station:
         for lane, kind, path, name in self._finished_briefs():
             def body(lane=lane, kind=kind, path=path, name=name) -> Dict[str, Any]:
                 with open(path, encoding="utf-8") as fh:
-                    model = self._field(fh.read(), "Model")
-                return transcripts.run_body(home, lane, name, kind, model,
-                                            self.claude_projects, self.codex_sessions)
+                    text = fh.read()
+                return transcripts.run_body(home, lane, name, kind, self._field(text, "Model"),
+                                            self.claude_projects, self.codex_sessions,
+                                            issue=self._field(text, "Issue"))
             runs.append(("%s/%s" % (lane, name), None, body))
         tick = self._brain()
         last = tick[0] if tick else {}
@@ -2349,9 +2461,26 @@ class Station:
                 if token is None:
                     return
             try:
-                self.upload(self.s.transcript_url, token, build())
+                body = build()
+            except ValueError as err:
+                # A run with no ticket (a brief from before tickets) can never
+                # be filed; skip it for good and keep going.
+                _say("skipped the transcript of %s: %s" % (key, err))
+                self._record(ledger, key, tick, "no ticket")
+                _write_json(path, ledger)
+                continue
+            try:
+                self.upload(self.s.transcript_url, token, body)
                 result: Any = "sent"
                 sent += 1
+            except UploadRefused as err:
+                # The dashboard is up and refused this body: give it up now and
+                # send the next, so one bad run never blocks the rest.
+                _say("the dashboard refused the transcript of %s (%d); given up"
+                     % (key, err.status))
+                self._record(ledger, key, tick, "refused")
+                _write_json(path, ledger)
+                continue
             # Deliberately broad, as in _send: an error text can carry the URL
             # or the token; only the type is logged, once, when giving up.
             except Exception as err:  # noqa: BLE001
@@ -2826,13 +2955,26 @@ class Station:
         factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
         if not self.s.factory_on or not factory.due(self.state, self.now):
             return
+        self._factory().run()
+
+    def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
-        factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
-                        review_check=self.s.review_check,
-                        review_bot=self.s.review_bot,
-                        limited=self.limited_lanes(),
-                        no_test_repos=self.s.no_test_repos,
-                        available=[x for x in LANES if self._heartbeat_ok(x)]).run()
+        return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                               review_check=self.s.review_check,
+                               review_bot=self.s.review_bot,
+                               limited=self.limited_lanes(),
+                               no_test_repos=self.s.no_test_repos,
+                               available=[x for x in LANES if self._heartbeat_ok(x)])
+
+    def watch_default_branches(self) -> None:
+        """Revert a lane merge that turned a default branch red (bus/revert.py),
+        every pass, with the factory: LOOM_FACTORY=0 turns both off."""
+        if not self.s.factory_on:
+            return
+        repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
+        revert.Reverts(self.gh, repos, self.now, trusted=self.s.authors,
+                       review_check=self.s.review_check, lanes=self._factory,
+                       state_dir=self.state).run()
 
     def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
         dated = {}
@@ -3039,15 +3181,19 @@ class Station:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.post_metrics,
+                     self.forward_reports, self.triage_backlogs, self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
-                     self.run_factory):
+                     self.watch_default_branches, self.run_factory):
             if self._deferred():
                 break
             try:
                 step()
             except (GitHubError, OSError) as err:
                 _say("%s failed: %s" % (step.__name__, err))
+        try:
+            self.watch_logs()
+        except (GitHubError, OSError) as err:
+            _say("watch_logs failed: %s" % err)
         try:
             self.prune_trees()
         except OSError as err:

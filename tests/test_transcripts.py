@@ -63,7 +63,7 @@ class Fixture(unittest.TestCase):
 
     def body(self, slot, ticket="T1", outcome="done"):
         return transcripts.run_body(self.home, slot, ticket, outcome, "model-x",
-                                    self.projects, self.codex)
+                                    self.projects, self.codex, issue="example/repo#1")
 
 
 class Formats(Fixture):
@@ -77,7 +77,7 @@ class Formats(Fixture):
         self.assertEqual(body["events"][0]["ts"], "2026-10-13T10:00:00.000Z")
         self.assertEqual(body["events"][3]["text"], "Bash\ncommand: cat <path>")
         self.assertEqual({k: body[k] for k in ("ticket", "slot", "model", "outcome")},
-                         {"ticket": "T1", "slot": "anthropic-2", "model": "model-x",
+                         {"ticket": "example/repo#1", "slot": "anthropic-2", "model": "model-x",
                           "outcome": "done"})
 
     def test_the_claude_lane_reads_the_worktree_session_in_claude_home(self):
@@ -217,7 +217,7 @@ class Brain(Fixture):
         os.utime(project / "tick.jsonl", (2000, 2000))
         body = transcripts.brain_body(self.home, 1500, 2100, "ok", "model-x", self.projects)
         self.assertEqual((body["slot"], body["ticket"], body["outcome"]),
-                         ("brain", "1970-01-01T00:25:00Z", "ok"))
+                         ("brain", "brain/1970-01-01T00:25:00Z", "ok"))
         texts = [e["text"] for e in body["events"]]
         self.assertIn("Done.", texts)
         self.assertNotIn("old tick", texts)
@@ -225,3 +225,43 @@ class Brain(Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TicketRef(Fixture):
+    """The dashboard accepts only owner/name#N (or brain/<time>) as a ticket:
+    on 2026-10-14 every upload answered 400 "invalid ticket" because the body
+    carried the brief's file name."""
+
+    def test_the_issue_line_is_the_ticket(self):
+        self.assertEqual(transcripts.ticket_ref("anything", "quadseven/wow-overseer#931"),
+                         "quadseven/wow-overseer#931")
+
+    def test_the_brief_name_is_the_fallback_also_for_a_retry_and_a_dashed_repo(self):
+        self.assertEqual(transcripts.ticket_ref("example.loom-229"), "example/loom#229")
+        self.assertEqual(transcripts.ticket_ref("example.wow-overseer-931-r3"),
+                         "example/wow-overseer#931")
+
+    def test_a_name_with_no_ticket_is_refused(self):
+        with self.assertRaises(ValueError):
+            transcripts.ticket_ref("T1", "not a ref")
+
+    def test_a_run_body_carries_the_ref_and_a_start_even_without_a_start_line(self):
+        self.write(self.home / "briefs/codex/done/example.loom-7.md", "# Brief\n")
+        body = transcripts.run_body(self.home, "codex", "example.loom-7", "done", "m",
+                                    self.projects, self.codex)
+        self.assertEqual(body["ticket"], "example/loom#7")
+        self.assertTrue(body["started_at"] and body["finished_at"])
+        self.assertEqual(body["started_at"], body["finished_at"])
+
+
+class EventShape(Fixture):
+    def test_an_event_with_no_time_sends_an_empty_string(self):
+        events = transcripts.convert([{"kind": "log", "ts": None, "text": "runner line"}])
+        self.assertEqual(events[0]["ts"], "")
+        self.assertTrue(all(isinstance(e[k], str) for e in events for k in ("ts", "role", "kind", "text")))
+
+    def test_a_brief_with_no_model_says_not_recorded(self):
+        self.write(self.home / "briefs/codex/done/example.loom-8.md", "# Brief\n")
+        body = transcripts.run_body(self.home, "codex", "example.loom-8", "done", "",
+                                    self.projects, self.codex)
+        self.assertEqual(body["model"], "not recorded")
