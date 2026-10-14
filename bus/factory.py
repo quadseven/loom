@@ -35,12 +35,11 @@ Neither needs a model:
   body says "Tests: none needed (<reason>)" skip the check. The send-back is
   a finding round: it climbs only when the next round still adds no test.
 - A reviewed, green pull request whose only open threads are the review
-  bot's medium or low findings, each asked for in a fix round or after
-  DEFER_AFTER rounds, files them in one loom:triage follow-up issue, answers
-  and resolves each thread, and lands. High and critical findings, and
-  threads a person opened, still go back to the lane. A docs or tests change
-  defers such findings at once, with no fix round (its findings are style,
-  not behavior).
+  bot's medium or low findings files them in one loom:triage follow-up
+  issue, answers and resolves each thread, and lands, with no fix round
+  (2026-10-14: 64% of 361 fix rounds were review threads, most of them
+  medium). High and critical findings, and threads a person opened, still
+  go back to the lane.
 - The merge rule follows the pull request's class:<name> label
   (bus/change_class.py; docs/MUSE.md, Merge by change class). docs and tests
   defer a minor finding at once; logic is the rule above; a sensitive change
@@ -195,10 +194,6 @@ DEFER_AFTER = 2
 # so sensitive is checked first; a pull request with no class keeps today's
 # rule.
 CLASSES = change_class.CLASSES
-# A class whose medium and low findings are deferred at once, without waiting
-# for a fix round: a docs or tests change lands on green checks and a review
-# pass alone, since its findings are style, not behavior.
-FAST_CLASSES = ("docs", "tests")
 DEFER_LABEL = "loom:triage"
 DEFER_TITLE = "Deferred review findings from %s#%d"
 # A file a pull request changes is code by its extension, and a test by a
@@ -904,10 +899,14 @@ class Factory:
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
-        immediate = class_of(full) in FAST_CLASSES
+        # Medium and low findings never send a pull request back on their own
+        # (2026-10-14: 64% of 361 fix rounds were review threads, most of them
+        # medium; "high-complexity" alone was 220 of ~1000 findings). They go
+        # to the follow-up issue at once, for every class; high and critical
+        # findings and failing checks still send it back.
         if (faults == ["open review threads"] and review == "reviewed"
                 and self._defer_minor(repo, number, int(issue["number"]), sha, comments,
-                                      immediate or REVERT_LABEL in _labels(issue))):
+                                      True)):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and (

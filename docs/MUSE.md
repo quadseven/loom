@@ -397,12 +397,13 @@ a cheap change lands fast and a dangerous one never lands on the factory's
 say-so alone:
 
 - `docs` and `tests`: the factory lands them on green checks and a review
-  pass on the head commit alone. A medium or low finding the review bot
-  opened is deferred to the follow-up issue at once, without waiting for a
-  fix round: it is style, not behavior.
-- `logic`: the rule above the class is unchanged: the factory lands a green,
-  reviewed pull request once its minor findings were asked for in a fix round
-  or it has had two rounds.
+  pass on the head commit alone.
+- `logic`: the factory lands a green, reviewed pull request whose only open
+  findings are medium or low.
+- For both rules a medium or low finding the review bot opened is deferred to
+  the follow-up issue at once, with no fix round (2026-10-14: 64% of 361 fix
+  rounds were review threads, most of them medium). A high or critical
+  finding still sends the pull request back.
 - `sensitive`: the factory never merges it. It marks the pull request
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
   requests", and leaves it for the brain. A brain merges it with
