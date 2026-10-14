@@ -1,12 +1,12 @@
 """Dashboard HTTP and GitHub behavior using a local API stub."""
 import json
+import http.client
 import re
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from bus.github import GitHub
 from dashboard.github import TicketStore
@@ -55,12 +55,15 @@ class DashboardTest(unittest.TestCase):
         self.api_thread.start()
         self.cache = tempfile.TemporaryDirectory()
         def local_transport(method, url, headers, body):
-            request = Request(url, data=body, method=method, headers=headers)
+            parsed = urlsplit(url)
+            connection = http.client.HTTPConnection(parsed.hostname, parsed.port)
             try:
-                with urlopen(request) as response:
-                    return response.status, dict(response.headers.items()), response.read()
-            except HTTPError as error:
-                return error.code, dict(error.headers.items()), error.read()
+                connection.request(method, parsed.path + ("?" + parsed.query if parsed.query else ""),
+                                   body=body, headers=headers)
+                response = connection.getresponse()
+                return response.status, dict(response.headers.items()), response.read()
+            finally:
+                connection.close()
         gh = GitHub("", api="http://127.0.0.1:%d" % self.api.server_port,
                     cache_dir=self.cache.name, transport=local_transport)
         self.store = TicketStore(["example-owner/sample", "example-owner/failing"], gh=gh, budget_floor=5)
@@ -76,8 +79,13 @@ class DashboardTest(unittest.TestCase):
         self.cache.cleanup()
 
     def get_json(self, path):
-        with urlopen("http://127.0.0.1:%d%s" % (self.server.server_port, path)) as response:
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
             return json.loads(response.read().decode())
+        finally:
+            connection.close()
 
     def test_api_returns_tickets_and_failed_repo_reason(self):
         payload = self.get_json("/api/tickets")
@@ -108,11 +116,17 @@ class DashboardTest(unittest.TestCase):
 
     def test_routes_and_unknown_path(self):
         self.get_json("/api/tickets")
-        with urlopen("http://127.0.0.1:%d/tickets?state=pr&goal=example-owner%%2Fsample%%2330" % self.server.server_port) as response:
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        try:
+            connection.request("GET", "/tickets?state=pr&goal=example-owner%2Fsample%2330")
+            response = connection.getresponse()
             self.assertIn(b"Sample ticket", response.read())
-        with self.assertRaises(HTTPError) as error:
-            urlopen("http://127.0.0.1:%d/unknown" % self.server.server_port)
-        self.assertEqual(error.exception.code, 404)
+            connection.request("GET", "/unknown")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 404)
+            response.read()
+        finally:
+            connection.close()
 
 
 class DashboardSourceHygiene(unittest.TestCase):

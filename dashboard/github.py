@@ -101,7 +101,9 @@ class TicketStore:
                 self.errors[repo] = reason
                 if self.data[repo] is None:
                     self.data[repo] = None
-            self._last_remaining = self.gh.rate.get("core", (None, 0, 0))[0]
+            remaining = self.gh.rate.get("core", (None, 0, 0))[0]
+            if isinstance(remaining, int):
+                self._last_remaining = remaining
         self.ready = True
 
     def response(self) -> Dict[str, Any]:

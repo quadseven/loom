@@ -10,9 +10,28 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .github import TicketStore
 
 
-def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
-    state = store or TicketStore()
+def _ticket_page(state, parsed):
+    params = parse_qs(parsed.query)
+    tickets = state.response()["tickets"]
+    records = [row for repo_rows in tickets.values() if repo_rows
+               for row in repo_rows if (not params.get("state") or row["state"] == params["state"][0])
+               and (not params.get("goal") or row["goal"] == params["goal"][0])]
+    return {"filtered": records}
 
+
+def _ticket_detail(state, path):
+    match = re.fullmatch(r"/t/([^/]+)/([^/]+)/([0-9]+)", path)
+    if not match:
+        return None
+    repo = "%s/%s" % (unquote(match.group(1)), unquote(match.group(2)))
+    number = int(match.group(3))
+    rows = state.data.get(repo)
+    row = next((item for item in rows or [] if item["number"] == number), None)
+    body = "<h1>%s</h1>" % html.escape(row["title"]) if row else "<h1>Ticket not found</h1>"
+    return body, 200 if row else 404
+
+
+def _handler_for(state):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlsplit(self.path)
@@ -24,24 +43,16 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
             if path == "/api/tickets":
                 state.refresh()
                 return self.send_json(200, state.response())
-            if path == "/":
+            if path in ("/", "/tickets"):
                 state.refresh()
-                return self.send_page(self.ticket_list(state.response()["tickets"]))
-            if path == "/tickets":
-                state.refresh()
-                params = parse_qs(parsed.query)
                 tickets = state.response()["tickets"]
-                records = [row for repo_rows in tickets.values() if repo_rows
-                           for row in repo_rows if (not params.get("state") or row["state"] == params["state"][0])
-                           and (not params.get("goal") or row["goal"] == params["goal"][0])]
-                return self.send_page(self.ticket_list({"filtered": records}))
-            match = re.fullmatch(r"/t/([^/]+)/([^/]+)/([0-9]+)", path)
-            if match:
-                repo, number = "%s/%s" % (unquote(match.group(1)), unquote(match.group(2))), int(match.group(3))
+                data = tickets if path == "/" else _ticket_page(state, parsed)
+                return self.send_page(self.ticket_list(data))
+            detail = _ticket_detail(state, path)
+            if detail is not None:
                 state.refresh()
-                rows = state.data.get(repo)
-                row = next((item for item in rows or [] if item["number"] == number), None)
-                return self.send_page("<h1>%s</h1>" % html.escape(row["title"]) if row else "<h1>Ticket not found</h1>", 200 if row else 404)
+                detail = _ticket_detail(state, path)
+                return self.send_page(detail[0], detail[1])
             return self.send_text(404, "not found")
 
         def ticket_list(self, repos):
@@ -80,4 +91,9 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
         def log_message(self, fmt, *args):
             pass
 
-    return ThreadingHTTPServer((host, port), Handler)
+    return Handler
+
+
+def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
+    state = store or TicketStore()
+    return ThreadingHTTPServer((host, port), _handler_for(state))
