@@ -1594,6 +1594,9 @@ class Station:
         if not self._repo_ok(repo):
             return True
         if kind == "done":
+            if self._field(text, "Deliverable") == "answer":
+                _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
+                return True
             branch = self._field(text, "Branch")
             prs = self.gh.rest("GET", "/repos/%s/pulls?head=%s:%s&state=all"
                                % (repo, repo.split("/")[0], branch)).data

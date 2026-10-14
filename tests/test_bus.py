@@ -62,7 +62,7 @@ class FakeGit:
         if method == "GET" and path.startswith("git/commits/"):
             return reply(200, self.commits[path.split("/")[-1]])
         if method == "POST" and path == "git/commits":
-            assert data["parents"] == []
+            assert len(data["parents"]) <= 1
             self.n += 1
             sha = "n%d" % self.n
             self.commits[sha] = {"message": data["message"], "tree": {"sha": data["tree"]}}
@@ -76,6 +76,10 @@ class FakeGit:
         if method == "DELETE" and path.startswith("git/refs/"):
             self.refs.pop(path[len("git/refs/"):], None)
             return reply(204)
+        if method == "PATCH" and path.startswith("git/ref/"):
+            ref = path[len("git/ref/"):]
+            self.refs[ref] = data["sha"]
+            return reply(200, {})
         raise AssertionError("unexpected call %s %s" % (method, path))
 
     def lock_message(self):
@@ -376,8 +380,15 @@ class LockTests(unittest.TestCase):
         self.assertFalse(lock.release(gh, REPO, "tick-2"))
         self.assertIn("heads/loom-lock/brain", g.refs)
         self.assertTrue(lock.release(gh, REPO, "tick-1"))
-        self.assertNotIn("heads/loom-lock/brain", g.refs)
+        self.assertIn("heads/loom-lock/brain", g.refs)
         self.assertFalse(lock.release(gh, REPO, "tick-1"))
+
+    def test_release_with_unreadable_expiry_returns_false(self):
+        g = FakeGit()
+        g.seed_lock("tick-1", "invalid")
+        gh = GitHub("tok", transport=g)
+        self.assertFalse(lock.release(gh, REPO, "tick-1"))
+        self.assertIn("heads/loom-lock/brain", g.refs)
 
     def test_holder_validation(self):
         gh = GitHub("tok", transport=FakeGit())
