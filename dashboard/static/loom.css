@@ -108,7 +108,7 @@ button { color: inherit; font: inherit; }
 .step-card { display: grid; min-height: 104px; align-content: start; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .step-card strong { font: 600 22px var(--font-mono); font-variant-numeric: tabular-nums; }
 .step-card span { font: 11px var(--font-mono); }
-.step-card small { color: var(--muted); font: 10px/1.35 var(--font-mono); }
+.step-card small { color: var(--muted); font: 10px/1.35 var(--font-mono); overflow-wrap: anywhere; }
 .step-card.bottleneck { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 .bottleneck-note { color: var(--accent); font: 12px var(--font-mono); }
 .floor-columns { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, .8fr); gap: 24px; align-items: start; }
