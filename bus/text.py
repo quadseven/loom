@@ -19,6 +19,11 @@ _CLOSING = re.compile(
 # An absolute path: a run of non-space characters starting with a slash (not
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
+# Refuse common absolute filesystem paths while allowing slash commands such
+# as /grug and URLs that happen to contain //.
+LOCAL_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])/(?:Users|home|private|tmp|var|etc|opt|System|Volumes)/\S*",
+    re.IGNORECASE)
 # Credential shapes that must not reach a public comment: provider key
 # prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
 SECRET_RE = re.compile(
@@ -35,6 +40,8 @@ def scrub_paths(text: str) -> str:
 
 def check(text: str) -> None:
     """Raise ValueError for text the brain must never post."""
+    if LOCAL_PATH_RE.search(text):
+        raise ValueError("text contains an absolute path")
     if _HANDLE.search(text):
         raise ValueError("text mentions the review bot's short name after an at-sign")
     if _CLOSING.search(text):

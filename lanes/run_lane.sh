@@ -1268,6 +1268,11 @@ for BRIEF in "$INBOX"/*.md; do
   # Optional: the branch work starts from and the PR targets. Default is the
   # remote's default branch, which is not always where work lands.
   BASE_BRANCH="$(field Base "$BRIEF" || true)"
+  DELIVERABLE="$(field Deliverable "$BRIEF" || true)"
+  ISSUE_REF="$(field Issue "$BRIEF" || true)"
+  ISSUE_NUMBER="${ISSUE_REF##*#}"
+  [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || ISSUE_NUMBER="$(printf '%s' "$TICKET" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p')"
+  [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && ISSUE_NUMBER="$((10#$ISSUE_NUMBER))"
   LOG="$LOGDIR/$TICKET.log"
 
   # Ticket names become paths in the sandbox profile and the clone.
@@ -1281,6 +1286,12 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ -n "$BASE_BRANCH" ] && ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     park "$BRIEF" "brief Base: is not a branch name"; continue
+  fi
+  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ]; then
+    park "$BRIEF" "brief Deliverable: must be answer"; continue
+  fi
+  if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+    park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
   fi
   BASE_ARGS=()
   [ -n "$BASE_BRANCH" ] && BASE_ARGS=(--branch "$BASE_BRANCH")
@@ -1477,6 +1488,45 @@ for BRIEF in "$INBOX"/*.md; do
     break
   fi
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
+  if [ "$DELIVERABLE" = answer ]; then
+    ANSWER="$TREE/.loom/answer.md"
+    if [ ! -d "$TREE/.loom" ] || [ -L "$TREE/.loom" ] || [ ! -f "$ANSWER" ] || [ -L "$ANSWER" ]; then
+      park "$BRIEF" "no answer written"; continue
+    fi
+    ANSWER_TEXT="$(PYTHONPATH="$REPO_ROOT" python3 - "$ANSWER" 2> "$LOGDIR/$TICKET.answer-error" <<'PY'
+import sys
+from pathlib import Path
+from bus import text
+path = Path(sys.argv[1])
+try:
+    data = path.read_bytes()
+    if len(data) > 32768: raise ValueError("answer is too large")
+    value = data.decode("utf-8")
+    if not value.strip(): raise ValueError("answer is empty")
+    if not value.isascii(): raise ValueError("answer is not ASCII")
+    text.check(value)
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(1)
+sys.stdout.write(value)
+PY
+    )"
+    if [ "$?" -ne 0 ]; then
+      REASON="$(cat "$LOGDIR/$TICKET.answer-error" 2>/dev/null)"
+      [ -n "$REASON" ] || REASON="answer could not be read"
+      park "$BRIEF" "answer refused: $REASON"; continue
+    fi
+    rm -f "$LOGDIR/$TICKET.answer-error"
+    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$ANSWER_TEXT" >> "$LOG" 2>&1; then
+      park "$BRIEF" "answer comment failed" transient; continue
+    fi
+    if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+      park "$BRIEF" "answer posted but ticket label update failed" transient; continue
+    fi
+    echo "[$(date -u +%FT%TZ)] $TICKET done, answer posted" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
+  fi
   TITLE="$(sed -n 's/^# T[0-9]*: //p' "$BRIEF" | head -1)"
   [ -n "$FIX_PR" ] && TITLE="${TITLE:-$TICKET}: address the findings on #$FIX_PR"
   keep_answers
