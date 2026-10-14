@@ -104,6 +104,29 @@ number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
 
+### Trunk branch
+
+A goal home may carry a `Trunk: <branch>` line near the top of its body:
+
+```markdown
+Trunk: side
+
+## Destination
+...
+```
+
+Use it when the repo's default branch is not where Loom work lands, for
+example a fork whose default branch tracks upstream while all of its own work
+merges into a long-lived side branch. When a goal home names a Trunk,
+`bus.brain brief` uses it as the ticket's `Base:` unless `--base` is given
+explicitly, the lane runner checks out from it, and pull requests opened for
+tickets target it. `bus.brain status` warns when most of the repo's last 10
+merged pull requests target a branch that is neither the default branch nor a
+declared Trunk, so the operator knows to add the line.
+
+`bus.brain onboard` does not write a Trunk line; add it by hand once you know
+where the repo's work actually lands.
+
 ## Onboarding a repo
 
 `python3 -m bus.brain onboard <owner/name> [--review-check NAME]` readies a
