@@ -19,6 +19,9 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
          "opencode-go-4"]
 LANES = LANES + SLOTS
+# Remote lanes pull ticket work from GitHub and have no local station inbox.
+REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 1}}
+LANES += list(REMOTE_LANES)
 
 # The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
 # rung, lowest first. Lanes stand in for each other on the same provider:

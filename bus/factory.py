@@ -104,6 +104,7 @@ from urllib.parse import quote
 
 from . import brain, change_class, tickets
 from .github import GitHub, GitHubError
+from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER
 
 FACTORY_CHECK = 300
@@ -137,8 +138,8 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # hot spark lane went up the ladder to claude, the operator's subscription.
 TIERS: Dict[str, Tuple[str, ...]] = {
     "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai",
-             "zen", "zai", "agy"),
-    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC,
+             "zen", "zai", "agy", "muse"),
+    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC + ("muse",),
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
@@ -150,7 +151,7 @@ TIERS: Dict[str, Tuple[str, ...]] = {
 FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
-PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4")
+PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.
@@ -1125,7 +1126,9 @@ class Factory:
         if tickets is None:
             tickets = {repo: self._tickets(repo) for repo in self.repos}
         for issue in (i for found in tickets.values() for i in found.values()):
-            if _state(issue) in ("briefed", "running"):
+            if (_state(issue) in ("briefed", "running")
+                    or (_state(issue) == "queued" and _lane(issue) in REMOTE_LANES
+                        and self._up(_lane(issue)))):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
 
     def assign_queued(self) -> None:
@@ -1139,7 +1142,13 @@ class Factory:
                 str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
             if self.now < held_until(issue):
                 continue
-            lane, fallback = self._tier_move(repo, issue)
+            assigned = _lane(issue)
+            if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
+                continue  # A live remote assignment stays queued for its pull worker.
+            if assigned in REMOTE_LANES:
+                lane, fallback = self._tier_move(repo, issue, old=assigned)
+            else:
+                lane, fallback = self._tier_move(repo, issue)
             if lane is None:
                 continue
             tier = difficulty_of(issue) + (", " + fallback if fallback else "")
@@ -1148,6 +1157,16 @@ class Factory:
     def _assign_queued_one(self, repo: str, issue: Dict[str, Any], lane: str,
                            tier: str) -> None:
         number = int(issue["number"])
+        if lane in REMOTE_LANES:
+            self.move(self.gh, repo, number, "queued", lane=lane,
+                      note="The station reserved this queued ticket for remote lane %s (tier %s)."
+                           % (lane, tier))
+            issue["labels"] = [{"name": x} for x in brain._moved_labels(
+                _labels(issue), "queued", lane)]
+            self.load[lane] = self.load.get(lane, 0) + 1
+            _say("reserved queued %s#%d for remote lane %s (tier %s)"
+                 % (repo, number, lane, tier))
+            return
         self.move(self.gh, repo, number, "briefed", lane=lane,
                   note="The station gave this queued ticket lane %s (tier %s)." %
                        (lane, tier))
