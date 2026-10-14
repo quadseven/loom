@@ -642,8 +642,10 @@ class LaneRunnerTest(unittest.TestCase):
 
     def source_functions(self, *names):
         text = RUNNER.read_text()
-        return "".join(re.search(r"^%s\(\) \{(\n.*?^\}|[^\n]*\})\n" % n, text, re.S | re.M).group(0)
-                       for n in names)
+        found = {n: re.search(r"^%s\(\) \{(\n.*?^\}|[^\n]*\})\n" % n, text, re.S | re.M) for n in names}
+        missing = [n for n, m in found.items() if m is None]
+        self.assertFalse(missing, "function not found in runner: %s" % ", ".join(missing))
+        return "".join(found[n].group(0) for n in names)
 
     def hold_credit(self, slot, until=4102444800):
         script = self.source_functions("write_beat", "utc", "hold_shared_credit") + (
