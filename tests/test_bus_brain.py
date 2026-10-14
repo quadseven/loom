@@ -449,6 +449,15 @@ class BrainTests(unittest.TestCase):
         brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=env)
         self.assertEqual(fake.calls[-1][0], "POST")
 
+    def test_review_check_passed_reads_past_the_first_page(self):
+        first = [{"name": "check-%d" % i, "status": "completed", "conclusion": "success"}
+                 for i in range(100)]
+        second = [{"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]
+        fake = Fake(reply(200, {"check_runs": first}), reply(200, {"check_runs": second}))
+        passed = brain._review_check_passed(GitHub("t", transport=fake), REPO, "head1",
+                                            "Grug - Elder")
+        self.assertTrue(passed)
+
     def test_adopt_refuses_a_ticket_supplied_with_it(self):
         fake = Fake()
         with self.assertRaises(ValueError):

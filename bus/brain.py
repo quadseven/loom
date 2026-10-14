@@ -1115,6 +1115,11 @@ def _pr_author(pr: Dict[str, Any]) -> str:
 def _ticketless(repo: str, pr: Dict[str, Any]) -> bool:
     """The pull request has no ticket: no Refs line and no loom branch. A
     reference to another repo or a conflicting pair still has a ticket."""
+    # _ticket_association raises only for those two cases: a conflicting pair
+    # of references, or a ticket in another repository. Both mean the pull
+    # request is not cleanly ticketless, so False ("has a ticket") is the
+    # deliberate answer, not a swallowed bug: it keeps the pull request out of
+    # the adopt list and out of an --adopt merge.
     try:
         return _ticket_association(repo, pr) is None
     except ValueError:
@@ -1124,12 +1129,18 @@ def _ticketless(repo: str, pr: Dict[str, Any]) -> bool:
 def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str) -> bool:
     """The named review check ran and passed on this head commit. The
     operator's rule is that every change is reviewed before it lands, and a
-    green rollup alone does not prove the review check ever ran."""
-    data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
-                   % (repo, sha)).data or {}
-    for run in data.get("check_runs") or []:
-        if run.get("name") == check:
-            return run.get("status") == "completed" and run.get("conclusion") == "success"
+    green rollup alone does not prove the review check ever ran. Every page:
+    a commit in a repo with a CI matrix has more runs than one page holds."""
+    for page in range(1, 11):
+        data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100&page=%d"
+                       % (repo, sha, page)).data or {}
+        runs = data.get("check_runs") or []
+        for run in runs:
+            if run.get("name") == check:
+                return (run.get("status") == "completed"
+                        and run.get("conclusion") == "success")
+        if len(runs) < 100:
+            return False
     return False
 
 
