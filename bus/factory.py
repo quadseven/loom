@@ -163,6 +163,8 @@ RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
 FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
 CLAIM_RE = re.compile(r"^Claimed for lane ")
+# The factory's own note when it moves a stalled ticket to another lane.
+STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
@@ -1043,14 +1045,30 @@ class Factory:
         if not self._spread(repo, issue):
             self._unclaimed(repo, issue)
 
-    def _briefed_since(self, repo: str, issue: Dict[str, Any]) -> float:
-        """When the ticket was last labeled briefed, or its hold ended if
-        later; 0 when it never was."""
+    def _briefed_since(self, repo: str, issue: Dict[str, Any],
+                       comments: List[Dict[str, Any]]) -> float:
+        """When the ticket's wait on its lane began: the newest of its last
+        loom:briefed label, any lane: label, and the factory's own stall-move
+        note, or its hold's end if later; 0 when it never was briefed. A
+        moved ticket thus waits a full BRIEFED_STALL on its new lane."""
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
-        since = max((_ts(e.get("created_at")) for e in events if isinstance(e, dict)
-                     and e.get("event") == "labeled"
-                     and (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
-        return max(since, held_until(issue)) if since else since
+        named = [e for e in events if isinstance(e, dict) and e.get("event") == "labeled"]
+        since = max((_ts(e.get("created_at")) for e in named
+                     if (e.get("label") or {}).get("name") == "loom:briefed"), default=0.0)
+        if not since:
+            return since
+        moved = [_ts(e.get("created_at")) for e in named
+                 if str((e.get("label") or {}).get("name") or "").startswith("lane:")]
+        moved += [_ts(c.get("created_at")) for c in comments
+                  if STALL_MOVE_RE.match(str(c.get("body") or ""))]
+        return max([since, held_until(issue)] + moved)
+
+    def _stall_lanes(self, repo: str, issue: Dict[str, Any], rung: int) -> List[str]:
+        """The other available lanes a stalled ticket may move to: those of
+        its rung, or of its difficulty tier. Never up the ladder."""
+        old = _lane(issue)
+        pool = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
+        return [x for x in pool if x != old and self._up(x)]
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
@@ -1058,20 +1076,16 @@ class Factory:
         marker: it never ran, so it has not failed on any model. With no such
         lane it stays briefed, and the stall is said once per pass."""
         number = int(issue["number"])
-        since = self._briefed_since(repo, issue)
+        comments = self._comments(repo, number)
+        since = self._briefed_since(repo, issue, comments)
         if not since or self.now - since < BRIEFED_STALL:
             return
-        comments = self._comments(repo, number)
         if any(CLAIM_RE.match(str(c.get("body") or "")) and _ts(c.get("created_at")) >= since
                for c in comments):
             return
         old = _lane(issue)
         rung = current_rung(issue)
-        if rung:
-            lanes = [x for x in LADDER[rung - 1][0] if x != old and self._up(x)]
-        else:
-            lanes = [x for x in tier_lanes(issue, self._is_private(repo))
-                     if x != old and self._up(x)]
+        lanes = self._stall_lanes(repo, issue, rung)
         if not lanes:
             _say("%s#%d stalled on lane %s: no other lane of its %s is available"
                  % (repo, number, old, "rung" if rung else "tier"))

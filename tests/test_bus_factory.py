@@ -957,6 +957,22 @@ class Tickets(Base):
             self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
         self.assertEqual(self.gh.issues[7]["body"].count("Model:"), 0)
 
+    def test_a_moved_stalled_ticket_waits_a_full_stall_on_its_new_lane(self):
+        self.stalled(7)
+        self.go()
+        self.assertEqual(self.lane(7), "codex-2")
+        self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:codex-2"},
+                                  "created_at": iso(0)})
+        self.go()
+        self.assertEqual((self.lane(7), len(self.gh.comments[7])), ("codex-2", 1))
+
+    def test_a_moved_stalled_ticket_moves_again_after_another_stall(self):
+        self.stalled(7)
+        self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:codex"},
+                                  "created_at": iso(factory.BRIEFED_STALL + 60)})
+        self.go()
+        self.assertEqual(self.lane(7), "codex-2")
+
     def test_a_stall_with_no_available_lane_stays_briefed(self):
         self.stalled(7)
         self.go(available=["codex"])
