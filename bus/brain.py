@@ -458,10 +458,59 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
+    lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "needs-operator" in _labels(i)]
     return lines
+
+
+VERIFY_DUE_HEADING = "### Verify due"
+VERIFY_RESUME_MAX = 5
+_LIVE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]*)?(?:\[[ xX]\][ \t]*)?(Live\b.*?)[ \t]*$", re.M)
+
+
+def live_criterion(body: Optional[str]) -> str:
+    """The ticket's acceptance line that starts with Live, or a note that it has none."""
+    found = _LIVE_LINE.search(body or "")
+    return _one_line(found.group(1), 300) if found else "(no Live criterion on the ticket)"
+
+
+def _shipped_at(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[datetime]:
+    """When loom:shipped was last applied; the issue's update time if the
+    events do not say."""
+    events = gh.paginate("/repos/%s/issues/%s/events" % (repo, issue["number"]))
+    stamps = [_stamp(e.get("created_at")) for e in events
+              if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == "loom:shipped"]
+    stamps = [x for x in stamps if x]
+    return max(stamps) if stamps else _stamp(issue.get("updated_at"))
+
+
+def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime
+               ) -> List[Tuple[datetime, Dict[str, Any]]]:
+    """Open loom:shipped tickets, oldest ship first. A verified ticket carries
+    loom:verified instead, so it never appears."""
+    due = []
+    for issue in tickets:
+        names = _labels(issue)
+        if "loom:shipped" not in names or "loom:verified" in names:
+            continue
+        due.append((_shipped_at(gh, repo, issue) or now, issue))
+    return sorted(due, key=lambda x: (x[0], int(x[1]["number"])))
+
+
+def _since(shipped: datetime, now: datetime) -> str:
+    hours = max(0, int((now - shipped).total_seconds() // 3600))
+    return "%dh" % hours
+
+
+def _verify_due_lines(due: List[Tuple[datetime, Dict[str, Any]]], now: datetime) -> List[str]:
+    lines = [VERIFY_DUE_HEADING]
+    for shipped, issue in due:
+        lines.append("- #%s %s - shipped %s ago - %s" % (
+            issue["number"], issue.get("title", ""), _since(shipped, now),
+            live_criterion(issue.get("body"))))
+    return lines if due else lines + ["- none"]
 
 
 def _lane_status(gh: GitHub, lanes_repo: str) -> str:
@@ -1678,6 +1727,21 @@ def _freshness_line(peers: List[Dict[str, Any]]) -> str:
                 window, handoff.journal_holder(newest) or "unnamed", newest.get("at") or "unknown time"))
 
 
+def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime) -> List[str]:
+    """Up to VERIFY_RESUME_MAX shipped tickets across `repos`, oldest ship
+    first: after stage work, before new briefs."""
+    due: List[Tuple[datetime, str, Dict[str, Any]]] = []
+    for repo in repos:
+        tickets = [i for i in _issues(gh, repo) if "loom:ticket" in _labels(i)]
+        due += [(at, repo, issue) for at, issue in verify_due(gh, repo, tickets, now)]
+    due.sort(key=lambda x: (x[0], x[1], int(x[2]["number"])))
+    out = ["", "## Verify due (up to %d, oldest ship first)" % VERIFY_RESUME_MAX]
+    for shipped, repo, issue in due[:VERIFY_RESUME_MAX]:
+        out.append("- resume verify %s#%s shipped %s ago: %s" % (
+            repo, issue["number"], _since(shipped, now), live_criterion(issue.get("body"))))
+    return out if due else out + ["- none"]
+
+
 def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
            now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> str:
     """What the lock holder may finish for other brains: the live resume items
@@ -1692,7 +1756,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
                [j for _, _, found in goals for j in found], holder, now))]
     for repo, issue, found in goals:
         out += _goal_resume_lines(gh, repo, issue, found)
-    return "\n".join(out)
+    return "\n".join(out + _verify_resume_lines(gh, repos, now))
 
 
 STUCK_STATES = ("failed", "briefed", "pr")

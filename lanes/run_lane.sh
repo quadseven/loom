@@ -1442,7 +1442,7 @@ for BRIEF in "$INBOX"/*.md; do
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$(pr_body "$BRIEF" "$TICKET")" 2>> "$LOG")"; then
-    park "$BRIEF" "pr create failed; branch $BRANCH is pushed"; continue
+    park "$BRIEF" "pr create failed; branch $BRANCH is pushed" transient; continue
   fi
   echo "$PR_URL" >> "$LOG"
   if [ -n "$INTENT_CLASS" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "class:$INTENT_CLASS" >> "$LOG" 2>&1; then

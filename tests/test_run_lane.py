@@ -95,6 +95,7 @@ if [ "$1 $2" = "pr edit" ]; then
   exit 0
 fi
 if [ "$1 $2" = "pr create" ]; then
+  [ -z "${FAKE_GH_CREATE_FAIL:-}" ] || { echo "pr create blew up" >&2; exit 1; }
   case " $* " in *" --label "*) [ -z "${FAKE_GH_NO_LABELS:-}" ] || { echo "could not add label: 'class:logic' not found" >&2; exit 1; } ;; esac
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY"; shift; done
   echo "https://github.com/example/repo/pull/7"
@@ -486,6 +487,15 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(len(create), 1)
         self.assertNotIn("--label", create[0])
         self.assertTrue(any(c.startswith("gh pr edit") and "--add-label class:" in c for c in self.calls()))
+
+    def test_a_failed_pr_create_is_parked_as_transient(self):
+        # The agent's work is done and pushed; only the pull request is missing.
+        self.drop_brief()
+        result = self.run_lane(FAKE_GH_CREATE_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [transient] pr create failed",
+                      (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text())
 
     def test_brief_base_branch_is_cloned_and_targeted_by_the_pr(self):
         # The remote's default branch is not where work lands: seed one with
