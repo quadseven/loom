@@ -105,7 +105,7 @@ class SensitiveResumeTests(unittest.TestCase):
     def make_gh(self, entries):
         prs = []
         details = {}
-        for n, age, checks, review_pass in entries:
+        for n, age, checks, _ in entries:
             prs.append({"number": n, "title": "PR%d" % n,
                         "created_at": (self.NOW - brain.timedelta(hours=age)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "labels": [{"name": "needs-brain"}, {"name": "class:sensitive"}],

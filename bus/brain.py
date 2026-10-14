@@ -1994,46 +1994,49 @@ def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime) -> Lis
     return out if due else out + ["- none"]
 
 
+def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
+                     check: str) -> Optional[Dict[str, Any]]:
+    """A needs-brain sensitive pull request older than 2 hours whose checks
+    are green and whose review check passed on its head, with its ticket;
+    None otherwise."""
+    if "needs-brain" not in _labels(pr) or "class:sensitive" not in _labels(pr):
+        return None
+    created = _stamp(str(pr.get("created_at") or ""))
+    if created is None or (now - created).total_seconds() <= 2 * 3600:
+        return None
+    try:
+        ticket = _ticket_association(repo, pr)
+    except ValueError:
+        return None
+    if ticket is None:
+        return None
+    owner, name = repo.split("/", 1)
+    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
+                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
+    details = (data.get("repository") or {}).get("p") or {}
+    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    if not _checks_green(details) or not sha or not _review_check_passed(gh, repo, sha, check):
+        return None
+    return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details}
+
+
 def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
                             env: Optional[Dict[str, str]]) -> List[str]:
     """Ready sensitive PRs needing brain attention, oldest first."""
-    ready: List[Tuple[datetime, str, Dict[str, Any], Tuple[str, int], Dict[str, Any]]] = []
     check = review_check_name(env)
-    for repo in repos:
-        prs = gh.paginate("/repos/%s/pulls?state=open" % repo)
-        for pr in prs:
-            if "needs-brain" not in _labels(pr) or "class:sensitive" not in _labels(pr):
-                continue
-            created = _stamp(str(pr.get("created_at") or ""))
-            if created is None or (now - created).total_seconds() <= 2 * 3600:
-                continue
-            try:
-                ticket = _ticket_association(repo, pr)
-            except ValueError:
-                continue
-            if ticket is None:
-                continue
-            number = int(pr["number"])
-            owner, name = repo.split("/", 1)
-            data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
-                              % (_gql(owner), _gql(name), number, READY_FIELDS)) or {}
-            details = ((data.get("repository") or {}).get("p") or {})
-            head = _head_commit(details)
-            sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
-            if (not _checks_green(details) or not sha
-                    or not _review_check_passed(gh, repo, sha, check)):
-                continue
-            ticket_issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
-            ready.append((created, repo, pr, ticket, {
-                "details": details, "ticket_title": str(ticket_issue.get("title") or ""),
-                "head": head}))
-    ready.sort(key=lambda item: (item[0], item[1], int(item[2]["number"])))
+    ready = [item for repo in repos
+             for item in (_ready_sensitive(gh, repo, pr, now, check)
+                          for pr in gh.paginate("/repos/%s/pulls?state=open" % repo))
+             if item is not None]
+    ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
     out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
-    for created, repo, pr, ticket, extra in ready[:SENSITIVE_RESUME_MAX]:
-        threads = (extra["details"].get("reviewThreads") or {}).get("nodes") or []
+    for item in ready[:SENSITIVE_RESUME_MAX]:
+        pr, ticket = item["pr"], item["ticket"]
+        title = str((gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}).get("title") or "")
+        threads = (item["details"].get("reviewThreads") or {}).get("nodes") or []
         open_threads = sum(1 for thread in threads if not thread.get("isResolved"))
         out.append("- resume sensitive %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
-            repo, pr["number"], ticket[0], ticket[1], extra["ticket_title"],
+            item["repo"], pr["number"], ticket[0], ticket[1], title,
             pr.get("title", ""), _age(pr, now), open_threads))
     return out if ready else out + ["- none"]
 
