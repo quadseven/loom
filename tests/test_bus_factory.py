@@ -177,8 +177,12 @@ class Base(unittest.TestCase):
     def go(self, limited=(), no_test_repos=(), available=None):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
-        def fix(gh, repo, number, ticket, notes):
+        def fix(gh, repo, number, ticket, notes, lane=None, model=None):
             f.notes = notes
+            if lane:
+                gh.issues[ticket[1]]["labels"] = [
+                    x for x in gh.issues[ticket[1]]["labels"] if not x["name"].startswith("lane:")
+                ] + [{"name": "lane:" + lane}]
             self.fixed.append((number, ticket, gh.issues[ticket[1]]["labels"][:]))
         def move(gh, repo, number, state, lane=None, note=None):
             self.moved.append((number, state, lane))
@@ -298,6 +302,14 @@ class PullRequests(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertEqual((self.lane(5), self.model(5)), ("codex", None))
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+
+    def test_a_fix_round_on_a_remote_lane_moves_to_a_local_lane(self):
+        self.gh.ticket(5, "pr", lane="muse")
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertNotEqual(self.lane(5), "muse")
+        self.assertEqual(self.lane(5), "codex")
 
     def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")

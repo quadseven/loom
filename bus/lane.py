@@ -186,8 +186,6 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
     if skipped:
         summary += ": " + "; ".join(skipped)
     print(summary, file=sys.stderr)
-    if claimed_result:
-        print(json.dumps(claimed_result))
     return claimed_result
 
 
@@ -317,6 +315,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise ValueError("claim requires --repos or LOOM_REPOS")
             gh = GitHub(token_from_env())
             result = claim(gh, repos, args.lane)
+            if result:
+                print(json.dumps(result))
             return 0 if result else 1
         repo, _, raw = args.ticket.partition("#") if args.ticket else ("", "", "")
         if args.command == "heartbeat" and not args.ticket:

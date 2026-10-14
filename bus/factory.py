@@ -829,8 +829,12 @@ class Factory:
             lane, _ = self._tier_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
-        self.fix(self.gh, repo, int(pr["number"]), (repo, number),
-                 TEST_NOTES if no_test else FIX_NOTES, lane=lane)
+        if lane is not None:
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
+                     TEST_NOTES if no_test else FIX_NOTES, lane=lane)
+        else:
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
+                     TEST_NOTES if no_test else FIX_NOTES)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 

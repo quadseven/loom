@@ -1161,12 +1161,14 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
     if state not in STATES:
         raise ValueError("invalid state")
     if lane is not None:
+        if lane not in LANES:
+            raise ValueError("lane is valid only for briefed and must be known")
         if lane in REMOTE_LANES:
             if state != "queued":
                 raise ValueError("remote lane %s only works with --to queued" % lane)
         elif state == "queued":
             raise ValueError("local lane %s: use --to briefed instead" % lane)
-        elif state != "briefed" or lane not in LANES:
+        elif state != "briefed":
             raise ValueError("lane is valid only for briefed and must be known")
     if model is not None and state != "briefed":
         raise ValueError("model is valid only for briefing")

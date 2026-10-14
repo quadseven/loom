@@ -179,6 +179,19 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertIn("scanned 1 repos, found 1 candidates", buf.getvalue())
 
+    def test_claim_command_prints_json_on_claim(self):
+        gh = FakeGitHub()
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch("bus.lane.token_from_env", return_value="dummy"):
+            with mock.patch("bus.lane.GitHub", return_value=gh):
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                    code = lane.main(["claim", "--lane", "muse", "--repos", "example/project"])
+        self.assertEqual(code, 0)
+        self.assertIn("scanned 1 repos, found 1 candidates", err.getvalue())
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["number"], 4)
+
 
 class TakesTest(unittest.TestCase):
     def test_a_queued_ticket_with_no_or_empty_body_is_skipped_not_a_crash(self):

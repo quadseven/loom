@@ -460,6 +460,7 @@ class BrainTests(unittest.TestCase):
         self.assertIn("this repo is private", str(ctx.exception))
         self.assertIn("public", str(ctx.exception))
         fake.assert_all_used()
+        self.assertFalse(any(call[0] in ("PUT", "POST", "PATCH", "DELETE") for call in fake.calls))
 
     def test_move_remote_lane_with_non_queued_state_raises_error(self):
         fake = Fake()
