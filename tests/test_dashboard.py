@@ -1,5 +1,6 @@
 """Dashboard HTTP and GitHub behavior using a local API stub."""
 import json
+import os
 import http.client
 import re
 import tempfile
@@ -91,6 +92,42 @@ class DashboardTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_backlog_bytes_order_start_here_and_health_inspectors(self):
+        fixture = {
+            "generated_at": "today", "judged_by": "Cave", "repos": [], "totals": {},
+            "epics": [
+                {"repo": "example-owner/sample", "number": 10, "title": "First", "tier": "Elder", "why": "why", "score": 4,
+                 "state": "open", "next": {"number": 11, "title": "First next"}, "children": [
+                     {"repo": "example-owner/sample", "number": 11, "state": "closed", "parent": 10},
+                     {"repo": "example-owner/sample", "number": 12, "state": "closed"}]},
+                {"repo": "example-owner/sample", "number": 20, "title": "[odd] title", "tier": "Cave", "children": []},
+            ], "needs_operator": [], "ready_for_human": [], "queue_comments_read": []}
+        raw = json.dumps(fixture, separators=(",", ":")).encode()
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(raw)
+            source.flush()
+            prior = os.environ.get("LOOM_BACKLOG_SOURCE")
+            os.environ["LOOM_BACKLOG_SOURCE"] = source.name
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+                connection.request("GET", "/backlog.json")
+                response = connection.getresponse()
+                self.assertEqual(response.read(), raw)
+                self.assertEqual(response.getheader("Content-Type"), "application/json")
+                connection.request("GET", "/backlog")
+                body = connection.getresponse().read().decode()
+                self.assertLess(body.index("First next"), body.index("[odd] title"))
+                self.assertIn("First next", body[body.index("Start here"):])
+                self.assertIn("Finished children, open epic", body)
+                self.assertIn("Children without parent link", body)
+                self.assertIn("Nonstandard titles", body)
+                connection.close()
+            finally:
+                if prior is None:
+                    os.environ.pop("LOOM_BACKLOG_SOURCE", None)
+                else:
+                    os.environ["LOOM_BACKLOG_SOURCE"] = prior
+
     def test_api_returns_tickets_and_failed_repo_reason(self):
         payload = self.get_json("/api/tickets")
         row = payload["tickets"]["example-owner/sample"][0]
@@ -177,6 +214,35 @@ class DashboardSourceHygiene(unittest.TestCase):
             source = path.read_text(encoding="utf-8")
             for pattern in (hostname, ip_address, home_path):
                 self.assertIsNone(pattern.search(source), str(path))
+
+
+class BacklogHelperTest(unittest.TestCase):
+    def test_health_inspectors_report_each_problem_kind(self):
+        from dashboard.server import _health_inspectors
+        document = {"epics": [
+            {"repo": "example-owner/sample", "number": 1, "title": "Open epic", "state": "open",
+             "children": [{"number": 2, "state": "closed"}]},
+            {"repo": "example-owner/sample", "number": 3, "title": "[odd]", "children": []},
+        ]}
+        reports = dict(_health_inspectors(document))
+        self.assertEqual(len(reports["Finished children, open epic"]), 1)
+        self.assertEqual(len(reports["Children without parent link"]), 1)
+        self.assertEqual(len(reports["Nonstandard titles"]), 1)
+
+    def test_needs_you_deduplicates_orders_and_marks_updated_idle(self):
+        from dashboard.server import _needs_you
+        class State:
+            operator_items = []
+            human_counts = {"example-owner/sample": 2}
+        payload = {"needs_operator": [{"repo": "example-owner/sample", "number": 3, "title": "dupe", "ask": "Exact ask", "waiting_since": "2026-01", "waiting_since_source": "updated", "unblocks": 8},
+                                      {"repo": "example-owner/sample", "number": 4, "title": "next", "waiting_since": "2026-02", "unblocks": 7}],
+                   "ready_for_human": [{"repo": "example-owner/sample", "number": 4, "title": "duplicate"}]}
+        body = _needs_you(payload, State())
+        self.assertEqual(body.count("example-owner/sample#3"), 1)
+        self.assertLess(body.index("#3"), body.index("#4"))
+        self.assertIn("idle", body)
+        self.assertIn("Exact ask", body)
+        self.assertIn("loom:human counts by repo", body)
 
 
 if __name__ == "__main__":
