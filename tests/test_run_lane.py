@@ -10,9 +10,11 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import sys
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -178,6 +180,8 @@ printf 'config=%s\\n' "${OPENCODE_CONFIG_CONTENT:-none}" >> "$TMPDIR/agent.log"
 # A brief carrying AGENT_FAIL=1 ends the run with an error, as a dropped
 # connection would.
 case "$args" in *AGENT_FAIL=1*) exit 3 ;; esac
+# AGENT_TIMEOUT=1 ends it as `timeout` does when the run outlasts its limit.
+case "$args" in *AGENT_TIMEOUT=1*) exit 124 ;; esac
 # Real CLIs fstat their stdout and stderr (Bun does on start).
 if /usr/bin/perl -e 'exit((stat(STDOUT) && stat(STDERR)) ? 0 : 1)'; then
   fds=ok; else fds=denied; fi
@@ -1776,6 +1780,126 @@ cat > /dev/null
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
         self.assertFalse(self.spark_beat()["available"])
         self.assertFalse(self.spark_beat()["reason"].startswith("limit"))
+
+    GO_LIMIT = (429, '{"type": "GoUsageLimitError", "limitName": "weekly", '
+                     '"message": "Weekly usage limit reached"}')
+
+    def provider(self, *answers):
+        """A fake OpenCode Go chat endpoint on loopback. Answers each POST with
+        the next (status, body) of answers (the last repeats) and records the
+        request; real curl runs behind a wrapper that records its argv."""
+        requests, queue = [], list(answers)
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                requests.append({"path": self.path, "headers": dict(self.headers),
+                                 "body": json.loads(body)})
+                status, text = queue.pop(0) if len(queue) > 1 else queue[0]
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(text.encode())
+
+            def log_message(self, format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.write_tool(self.bin / "curl", '#!/usr/bin/env bash\nprintf \'curl %s\\n\' "$*" >> "$FAKE_LOG"\n'
+                        'exec /usr/bin/curl "$@"\n')
+        return requests, {
+            "LOOM_OPENCODE_GO_KEY_SSM": "/k/go", "FAKE_SECRET__k_go": "fake-go-key-s3cr3t",
+            "LOOM_OPENCODE_GO_MODEL": "opencode-go/kimi-k2.7-code",
+            "LOOM_OPENCODE_GO_PROBE_URL": "http://127.0.0.1:%d/zen/go/v1/chat/completions" % server.server_port,
+            "LOOM_OPENCODE_GO_PROBE_HEADER": "x-opencode-session"}
+
+    def go_log(self):
+        return (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+
+    def assert_key_kept_out(self, result):
+        """The key reached the provider's header, never an argv, the lane log or output."""
+        for where in (self.go_log(), result.stdout, result.stderr, *self.calls()):
+            if where.startswith("opencode "):
+                continue  # the agent's own record of the key it was handed
+            self.assertNotIn("fake-go-key-s3cr3t", where)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_go_usage_limit_before_the_run_holds_the_lane_12_hours_and_hands_the_brief_on(self):
+        requests, env = self.provider(self.GO_LIMIT)
+        before = int(time.time())
+        inbox, result = self.api_lane("opencode-go", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()), self.calls())
+        self.assertFalse((self.loom / "worktrees" / "T042-fix-the-thing").exists())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [limit] limit: the provider's weekly limit (429 GoUsageLimitError)", self.go_log())
+        beat = self.beat("opencode-go")
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: "), beat)
+        self.assertIn("weekly", beat["reason"])
+        self.assertTrue(before + 43200 <= beat["retry_at"] <= int(time.time()) + 43200)
+        # One small request for the run's model, keyed and with a session header.
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["path"], "/zen/go/v1/chat/completions")
+        self.assertEqual(requests[0]["body"]["model"], "kimi-k2.7-code")
+        self.assertEqual(requests[0]["body"]["max_tokens"], 1)
+        self.assertEqual(requests[0]["headers"]["Authorization"], "Bearer fake-go-key-s3cr3t")
+        self.assertTrue(requests[0]["headers"].get("x-opencode-session"))
+        self.assert_key_kept_out(result)
+        # The next pass asks nothing and keeps saying which limit holds.
+        (inbox / "T043-next.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
+        self.run_lane("opencode-go", **env)
+        self.assertEqual(len(requests), 1)
+        self.assertTrue((inbox / "T043-next.md").exists())
+        self.assertIn("weekly", self.beat("opencode-go")["reason"])
+        self.assertTrue(self.beat("opencode-go")["reason"].startswith("limit: "))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_provider_that_answers_lets_the_run_go_ahead(self):
+        requests, env = self.provider((200, '{"choices": [{"message": {"content": "p"}}]}'))
+        inbox, result = self.api_lane("opencode-go", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat("opencode-go")["available"])
+        self.assert_key_kept_out(result)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_429_that_is_not_a_go_usage_limit_lets_the_run_go_ahead(self):
+        _, env = self.provider((429, '{"type": "RateLimitError"}'))
+        inbox, _ = self.api_lane("opencode-go", **env)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat("opencode-go")["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_timed_out_run_then_a_go_usage_limit_parks_as_a_limit(self):
+        requests, env = self.provider((200, "{}"), self.GO_LIMIT)
+        before = int(time.time())
+        inbox, result = self.api_lane("opencode-go", extra="AGENT_TIMEOUT=1\n", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(any(c.startswith("opencode ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [limit] limit: the provider's weekly limit (429 GoUsageLimitError) "
+                      "(agent exited 124)", self.go_log())
+        self.assertNotIn("[transient]", self.go_log())
+        beat = self.beat("opencode-go")
+        self.assertFalse(beat["available"])
+        self.assertIn("weekly", beat["reason"])
+        self.assertTrue(before + 43200 <= beat["retry_at"] <= int(time.time()) + 43200)
+        self.assert_key_kept_out(result)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_timed_out_run_while_the_provider_answers_stays_transient(self):
+        requests, env = self.provider((200, "{}"))
+        inbox, _ = self.api_lane("opencode-go", extra="AGENT_TIMEOUT=1\n", **env)
+        self.assertEqual(len(requests), 2)
+        self.assertIn("failed: [transient] agent exited 124", self.go_log())
+        self.assertTrue(self.beat("opencode-go")["available"])
 
     def test_lane_without_its_credential_reports_unavailable_and_keeps_its_briefs(self):
         inbox, result = self.api_lane(

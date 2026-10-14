@@ -33,6 +33,10 @@ LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
 LOOM_OPENCODE_GO_3_MODEL="${LOOM_OPENCODE_GO_3_MODEL:-opencode-go/deepseek-v4.1-flash}"
 LOOM_OPENCODE_GO_4_MODEL="${LOOM_OPENCODE_GO_4_MODEL:-opencode-go/muse-spark-1.3-contributor}"
+# OpenCode Go's chat endpoint, asked for its usage limit before each run
+# (opencode run retries a limit silently until the run times out).
+LOOM_OPENCODE_GO_PROBE_URL="${LOOM_OPENCODE_GO_PROBE_URL:-https://opencode.ai/zen/go/v1/chat/completions}"
+LOOM_OPENCODE_GO_PROBE_HEADER="${LOOM_OPENCODE_GO_PROBE_HEADER:-x-opencode-session}"
 LOOM_ANTHROPIC_MODEL="${LOOM_ANTHROPIC_MODEL:-claude-sonnet-5-5}"
 LOOM_ZEN_MODEL="${LOOM_ZEN_MODEL:-opencode/space-bunny-free}"
 LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
@@ -40,7 +44,8 @@ LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwe
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
 LOOM_SPARK_URL="${LOOM_SPARK_URL:-}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
-export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL LOOM_ANTHROPIC_MODEL \
+export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
+  LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_MODEL
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"

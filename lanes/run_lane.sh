@@ -41,6 +41,9 @@
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
 # from PATH; a 2.x binary runs --standalone --auto),
+# LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
+# endpoint, asked for a usage limit before each run and after a timeout; see
+# provider_at_limit),
 # LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
@@ -551,7 +554,48 @@ spark_ready() {
     *) return 1 ;;
   esac
 }
+# A provider whose CLI retries a usage limit silently instead of failing
+# (opencode run against OpenCode Go, 2026-10-14: every run ended exit 124)
+# is asked directly. LOOM_<SLOT>_PROBE_URL names the provider's
+# OpenAI-compatible chat endpoint and LOOM_<SLOT>_PROBE_HEADER an optional
+# session header to send (OpenCode Go: x-opencode-session); a lane without
+# the URL is never probed. One request, max_tokens 1, for the run's model.
+# The key goes to curl as a config file on stdin, written by the printf
+# builtin, so it reaches no process's argv and no log.
+PROBE_TIMEOUT=20
+PROBE_HOLD=43200
 
+# 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
+# MODEL; 1 for any other answer, no answer, or no probe configured.
+provider_at_limit() {
+  local url header session body out code limit_name
+  url="$(lane_setting PROBE_URL)" header="$(lane_setting PROBE_HEADER)"
+  [ -n "$url" ] && [ -n "$API_KEY" ] || return 1
+  [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 1
+  [ -z "$header" ] || [[ "$header" =~ ^[A-Za-z0-9-]+$ ]] || return 1
+  # A quote, backslash or newline would end the key's line in curl's config.
+  case "$API_KEY" in *'"'*|*\\*|*$'\n'*) return 1 ;; esac
+  session="loom-probe-$SLOT-$(date +%s)-$$"
+  # MODEL passed the lane's allowlist: no quote or backslash can reach here.
+  body="$(printf '{"model": "%s", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}' "${MODEL#*/}")"
+  out="$(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" |
+    curl -s -K - -X POST --max-time "$PROBE_TIMEOUT" -w '\n%{http_code}' \
+      -H 'Content-Type: application/json' ${header:+-H "$header: $session"} \
+      --data-binary "$body" "$url" 2>/dev/null)" || return 1
+  code="${out##*$'\n'}" body="${out%$'\n'*}"
+  [ "$code" = 429 ] && [[ "$body" == *GoUsageLimitError* ]] || return 1
+  limit_name="$(printf '%s' "$body" | sed -nE 's/.*"limitName" *: *"([A-Za-z0-9_-]+)".*/\1/p' | head -1)"
+  LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 GoUsageLimitError)"
+  return 0
+}
+
+# Hold this lane PROBE_HOLD seconds through the heartbeat's retry_at, and
+# hand on every brief still in the inbox this pass.
+hold_provider_limit() {
+  LIMIT_UNTIL=$(( $(date +%s) + PROBE_HOLD ))
+  LIMITED=1
+  heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")" "$LIMIT_UNTIL"
+}
 
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
 # PATH. One slot can try a new major version (its installer would overwrite
@@ -1130,10 +1174,13 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_T
   fi
 done
 
-# A provider limit hit by an earlier pass holds until its retry time.
+# A provider limit hit by an earlier pass holds until its retry time. A
+# reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
 if [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
-  heartbeat false "provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" "$LIMIT_UNTIL"
+  HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
+  heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
   exit 0
 fi
 
@@ -1250,6 +1297,13 @@ for BRIEF in "$INBOX"/*.md; do
     CLONE_ARGS=(${BASE_ARGS[@]+"${BASE_ARGS[@]}"})
   fi
 
+  # A provider at its usage limit gets no run: the lane is held and the
+  # brief handed on before anything is cloned.
+  if provider_at_limit; then
+    hold_provider_limit
+    park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
+  fi
+
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
@@ -1295,6 +1349,11 @@ for BRIEF in "$INBOX"/*.md; do
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
+    park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
+  fi
+  # A run that timed out may have been retrying a usage limit all along.
+  if [ "$STATUS" -eq 124 ] && provider_at_limit; then
+    hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
   EDITED=""
