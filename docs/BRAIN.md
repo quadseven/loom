@@ -622,6 +622,11 @@ Tick <UTC time>, <holder>
 - Cost: <GitHub requests>, <minutes>
 ```
 
+A step that failed or ran degraded adds a line `- Step <name>: failed <why>`
+or `- Step <name>: degraded <why>` (the step names are in docs/MUSE.md); a
+brain whose two newest ticks both carry one is an invariant breach
+(docs/LANES.md, Invariants).
+
 A journal may also carry handoff lines (docs/MUSE.md, Handing off stage
 work), each an HTML comment:
 

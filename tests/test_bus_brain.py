@@ -92,6 +92,15 @@ class BrainTests(unittest.TestCase):
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
 
+    def test_status_lists_open_invariant_issues_for_the_report(self):
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 7, "title": "Lane spark: 12 runs in 24 hours and none done",
+                         "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}]}]),
+            reply(200, []), reply(200, [])))
+        lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
+        at = lines.index(brain.INVARIANTS_HEADING)
+        self.assertEqual(lines[at + 1], "- #7 Lane spark: 12 runs in 24 hours and none done")
+
     def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
         goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"},
@@ -840,6 +849,31 @@ class FixTests(unittest.TestCase):
     def test_fix_refuses_a_ticket_that_is_not_waiting_on_its_pr(self):
         self.refused(fix_pr(), fix_ticket("merged"))
         self.refused(fix_pr(), dict(fix_ticket(), state="closed"))
+
+    def test_fix_accepts_a_running_ticket_and_marks_it_as_a_brain_fix(self):
+        runs = {"check_runs": []}
+        threads = {"reviewThreads": {"nodes": []}}
+        fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("running")),
+                    reply(200, runs), reply(200, {"statuses": []}),
+                    reply(200, {"data": {"repository": {"pullRequest": threads}}}),
+                    reply(201, {}))
+        brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "fix this")
+        posted = next(c for c in fake.calls if c[0] == "POST" and "/comments" in c[1])
+        self.assertIn(brain.BRAIN_FIX_MARKER, posted[2]["body"])
+        self.assertFalse(any(c[0] == "PUT" for c in fake.calls))
+
+    def test_pending_brain_fix_is_replaced_by_the_newest_until_a_claim(self):
+        comments = [
+            {"user": {"login": "alice-example"},
+             "body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> first"},
+            {"user": {"login": "alice-example"},
+             "body": "<!-- loom:fix v1 -->\n<!-- loom:brain-fix v1 --> second"},
+        ]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+        self.assertFalse(brain._pending_brain_fix(comments + [
+            {"user": {"login": "station"},
+             "body": "Claimed for lane codex (body sha256 0123456789ab)"}],
+            ["alice-example"]))
 
     def test_fix_refuses_notes_the_brain_must_never_post(self):
         with self.assertRaises(ValueError):
