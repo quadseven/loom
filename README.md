@@ -122,3 +122,10 @@ in `LOOM_BRAIN_STEP_FILE`); without a current step, progress is shown as not
 recorded. Journal comments, issue timelines, and station outcome comments
 provide the remaining view data. A source that is unavailable is labeled as
 missing in the view.
+Set `LOOM_IMPROVEMENT_HOMES` to the space-separated `OWNER/NAME` repositories
+whose goal journals and child tickets feed `/improving`; set
+`LOOM_METRICS_GOAL=OWNER/NAME#N` for the daily factory numbers. Improvement
+homes may also be specific goal issues as `OWNER/NAME#N`. Set
+`LOOM_STATUS_REPO=OWNER/NAME` to read the station's lane status comment for
+`/lanes`. `.env.example` lists the dashboard variables with placeholder
+values.
