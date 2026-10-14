@@ -34,6 +34,7 @@ from . import spend
 from . import text as _text
 from . import tickets
 from . import transcripts
+from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
 from .github import GitHub, GitHubError, _OPENER
@@ -78,13 +79,7 @@ BRANCH_MOVED = "branch moved:"
 REVIEW_AGAIN = "/grug improve"
 LANE_SAID_MAX = 2500
 PATH_RE = _text.PATH_RE
-# Credential shapes that must not reach a public comment: provider key
-# prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
-SECRET_RE = re.compile(
-    r"(?i)\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat|xox[a-z]|glpat|AKIA|ASIA)[-_A-Za-z0-9]{12,}"
-    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
-    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+"
-    r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
+SECRET_RE = _text.SECRET_RE
 REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
@@ -234,6 +229,7 @@ class Settings:
                  metrics_goal: str = "",
                  transcript_url: str = "",
                  transcript_token_ssm: str = "",
+                 watched: Optional[List[Tuple[str, str]]] = None,
                  rewrite_cmd: str = "",
                  rewrite_private_cmd: str = "") -> None:
         self.home = home
@@ -259,6 +255,8 @@ class Settings:
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
         self.transcript_token_ssm = transcript_token_ssm
+        # (component, log path) pairs bus/watch.py reads each pass.
+        self.watched = watch.components(home) if watched is None else watched
         self.rewrite_cmd = rewrite_cmd
         self.rewrite_private_cmd = rewrite_private_cmd
 
@@ -280,6 +278,11 @@ class Settings:
         except ValueError:
             retry_max = RETRY_MAX
         retry_max = max(retry_max, 0)
+        try:
+            watched = watch.components(home, env.get("LOOM_WATCH", ""))
+        except ValueError as err:
+            _say("ignoring LOOM_WATCH: %s" % err)
+            watched = watch.components(home)
         try:
             budget = spend.Budget.from_env(env)
         except ValueError as err:
@@ -306,6 +309,7 @@ class Settings:
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
+                   watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
                    rewrite_private_cmd=env.get("LOOM_REWRITE_PRIVATE_CMD", "").strip())
 
@@ -2464,6 +2468,17 @@ class Station:
             if budget <= 0 or self._deferred():
                 break
 
+    # -- log watch -------------------------------------------------------
+    def watch_logs(self) -> None:
+        """Read each component's new log lines and file one loom:triage issue
+        in the lanes repo per new repeated error (bus/watch.py). The logs are
+        read every pass; below the budget floor filing waits for the reset."""
+        repo = self.s.status_repo
+        if not repo or not tickets.REPO_RE.fullmatch(repo):
+            return
+        watch.Watcher(self.gh, repo, self.s.watched, os.path.join(self.state, "watch.json"),
+                      self.now, _say, write=not self._deferred()).run()
+
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
         """(ledger key, brain tick start or None, body builder) for every
@@ -3276,6 +3291,10 @@ class Station:
                 step()
             except (GitHubError, OSError) as err:
                 _say("%s failed: %s" % (step.__name__, err))
+        try:
+            self.watch_logs()
+        except (GitHubError, OSError) as err:
+            _say("watch_logs failed: %s" % err)
         try:
             self.prune_trees()
         except OSError as err:

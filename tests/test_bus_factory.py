@@ -39,6 +39,8 @@ class FakeGitHub:
         self.files = {}
         self.filed = []
         self.private = True
+        self.logs = {}
+        self.requests = 0
 
     def ticket(self, number, state, lane="codex", body="Difficulty: medium\n\n## Why\nx\n"):
         self.issues[number] = {"number": number, "state": "open", "body": body, "user": ME,
@@ -49,11 +51,12 @@ class FakeGitHub:
 
     def pull(self, number, ticket, created=3600, mergeable=True, green=True,
              resolved=True, runs=(("unittest", "completed"), (factory.DEFAULT_REVIEW_CHECK, "completed")),
-             updated=3600, files=("bus/a.py", "tests/test_a.py")):
+             updated=3600, files=("bus/a.py", "tests/test_a.py"), labels=()):
         sha = "sha%d" % number
         self.files[number] = list(files)
         self.pulls[number] = {
             "number": number, "state": "open", "draft": False, "body": "", "user": ME,
+            "labels": [{"name": x} for x in labels],
             "head": {"ref": "loom/%d-some-title" % ticket, "sha": sha,
                      "repo": {"full_name": REPO}},
             "base": {"ref": "main", "repo": {"full_name": REPO}},
@@ -109,7 +112,13 @@ class FakeGitHub:
         m = re.search(r"/actions/runs/(\d+)$", path)
         if m:
             return Response(200, {"run_attempt": self.attempts.get(m.group(1), 1)})
+        m = re.search(r"/actions/jobs/(\d+)/logs$", path)
+        if m:
+            return Response(302, None, headers={"location": "https://logs.example.com/" + m.group(1)})
         raise AssertionError("unexpected GET %s" % path)
+
+    def transport(self, method, url, headers, body):
+        return 200, {}, self.logs[url.rsplit("/", 1)[1]].encode("utf-8")
 
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
@@ -123,11 +132,19 @@ class FakeGitHub:
         if m:
             number = int(m.group(1))
             if m.group(2) == "/labels":
-                self.issues[number]["labels"] = [{"name": x} for x in body["labels"]]
+                if number in self.issues:
+                    self.issues[number]["labels"] = [{"name": x} for x in body["labels"]]
+                else:
+                    have = [x["name"] for x in self.pulls[number].get("labels", [])]
+                    self.pulls[number]["labels"] = [
+                        {"name": x} for x in dict.fromkeys(have + list(body["labels"]))]
             elif m.group(2) == "/comments":
                 self.comments[number].append({"body": body["body"], "created_at": iso(0), "user": ME})
             elif method == "PATCH":
                 self.issues[number]["body"] = body["body"]
+        m = re.search(r"/pulls/(\d+)$", path)
+        if m and method == "PATCH":
+            self.pulls[int(m.group(1))].update(body)
         return Response(200, {})
 
     def graphql(self, query, variables=None):
@@ -470,6 +487,113 @@ class PullRequests(Base):
         self.assertEqual((self.merged, self.fixed), ([], []))
 
 
+LEAK_JOB = "leak-scan / Scan diff and PR/issue text for private identifiers"
+LEAK_BODY = ("Implements the ticket.\n\nThe shape follows example-org/other-repo#12 closely.\n"
+             "It ran on build-box.example.internal.\n\nRefs %s#5\n" % REPO)
+CLEAN = "leak guard: clean (9 shape patterns, deny-list not configured, %d lines scanned)"
+HIT = "  %s:%d  [%s] %s - why"
+TEXT = "/home/runner/work/_temp/text.md"
+
+
+def leak_log(diff_hits=(), text_hits=()):
+    """A leak-scan job log as GitHub serves it: stamped lines, two sections."""
+    lines = ["##[group]Run set -euo pipefail", "##[endgroup]", "--- PR diff ---"]
+    lines += ["BLOCKED: private infrastructure identifiers found", ""] if diff_hits else [CLEAN % 40]
+    lines += [HIT % ("abc...def", n, rule, "'x'") for n, rule in diff_hits]
+    lines.append("--- title and body ---")
+    lines += ["BLOCKED: private infrastructure identifiers found", ""] if text_hits else [CLEAN % 8]
+    lines += [HIT % (TEXT, n, rule, "'x'") for n, rule in text_hits]
+    lines += ["", "This repo is PUBLIC.", "##[error]leak scan found private identifiers",
+              "##[error]Process completed with exit code 1."]
+    return "\n".join("2026-10-13T12:00:%02d.1234567Z %s" % (i % 60, l) for i, l in enumerate(lines))
+
+
+BODY_ONLY = leak_log(text_hits=[(4, "private-issue-ref"), (5, "private-hostname")])
+
+
+class LeakScanText(Base):
+    """A leak scan that fails on the pull request's text alone is fixed in the
+    text by the factory; anything else still goes to the lane."""
+
+    def leaky(self, log, comments=()):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5].extend(comments)
+        self.gh.pull(50, 5, green=False)
+        self.gh.pulls[50].update(title="Ticket title", body=LEAK_BODY)
+        self.gh.runs["sha50"] = [
+            {"id": 901, "name": LEAK_JOB, "status": "completed", "conclusion": "failure",
+             "app": {"slug": "github-actions"},
+             "details_url": "https://github.com/%s/actions/runs/77/job/901" % REPO},
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "success"}]
+        self.gh.logs["901"] = log
+        self.gh.attempts["77"] = 2
+
+    def pr_edits(self):
+        return [w for w in self.gh.writes if w[0] == "PATCH" and w[1].endswith("/pulls/50")]
+
+    def test_a_body_only_failure_edits_the_body_and_sends_nothing_to_the_lane(self):
+        self.leaky(BODY_ONLY)
+        self.gh.attempts["77"] = 1
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+        self.assertEqual(len(self.pr_edits()), 1)
+        self.assertEqual(self.gh.pulls[50]["body"],
+                         "Implements the ticket.\n\nThe shape follows issue 12 of another repo "
+                         "closely.\n\nRefs %s#5" % REPO)
+        self.assertEqual(self.gh.pulls[50]["title"], "Ticket title")
+        note = self.gh.comments[5][-1]["body"]
+        self.assertIn(factory.BODY_LEAK_MARKER % "sha50", note)
+        self.assertIn("body line 3: put a cross-repo issue reference in words", note)
+        self.assertIn("body line 4: dropped (flagged as private-hostname)", note)
+        # The comment names lines, never the flagged text.
+        self.assertNotIn("other-repo", note)
+        self.assertNotIn("build-box", note)
+
+    def test_a_diff_failure_still_goes_back_to_the_lane(self):
+        self.leaky(leak_log(diff_hits=[(10, "private-issue-ref")],
+                            text_hits=[(4, "private-issue-ref")]))
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.pr_edits(), [])
+
+    def test_a_second_failure_on_the_same_head_is_not_edited_again(self):
+        self.leaky(BODY_ONLY)
+        self.go()
+        self.assertEqual(len(self.pr_edits()), 1)
+        self.gh.pulls[50]["body"] = LEAK_BODY
+        self.go()
+        self.assertEqual(len(self.pr_edits()), 1)
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_another_failing_check_goes_back_to_the_lane(self):
+        self.leaky(BODY_ONLY)
+        self.gh.runs["sha50"].append(
+            {"id": 902, "name": "unittest", "status": "completed", "conclusion": "failure",
+             "app": {"slug": "github-actions"},
+             "details_url": "https://github.com/%s/actions/runs/77/job/902" % REPO})
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.pr_edits(), [])
+
+    def test_a_flagged_title_reference_is_put_in_words(self):
+        fixed = factory.repair_leak_text("Port example-org/other-repo#3", "a\nb",
+                                         {1: "private-issue-ref"}, REPO)
+        self.assertEqual(fixed, ("Port issue 3 of another repo", "a\nb",
+                                 ["title: put a cross-repo issue reference in words"]))
+        # A title cannot be dropped, nor a line past the end found.
+        self.assertIsNone(factory.repair_leak_text("t", "a", {1: "private-hostname"}, REPO))
+        self.assertIsNone(factory.repair_leak_text("t", "a", {3: "private-hostname"}, REPO))
+
+    def test_the_same_repos_reference_reads_as_this_repo(self):
+        self.assertEqual(factory.refs_in_words("see %s#4 and example-repo#5 and ab/cd#6" % REPO, REPO),
+                         "see issue 4 of this repo and issue 5 of this repo and issue 6 of another repo")
+
+    def test_a_log_that_is_not_a_leak_scan_is_not_read_as_one(self):
+        self.assertIsNone(factory.body_leak_hits(["FAILED (errors=1)"]))
+        self.assertIsNone(factory.body_leak_hits(leak_log().split("\n")))
+
+
 BOT = {"__typename": "Bot", "login": "grug-tribe"}
 FIXED = "Fixed in 1234567: the flagged code changed and this review does not raise it again."
 NO_CHANGE = "Lane claude made no change for the fix to #50 and said why on the pull request"
@@ -640,6 +764,45 @@ class DeferredFindings(Base):
         self.assertEqual(len(self.gh.filed), 1)
         self.assertTrue([w for w in self.gh.writes if w[0] == "REPLY"][0][2].startswith("Deferred to #777: "))
         self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_docs_pull_request_defers_a_medium_finding_at_once(self):
+        self.gh.pulls[50]["labels"] = [{"name": "class:docs"}]
+        self.finding(MEDIUM, asked=())
+        self.go()
+        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+        self.assertEqual(self.fixed, [])
+
+    def test_a_tests_pull_request_defers_a_low_finding_at_once(self):
+        self.gh.pulls[50]["labels"] = [{"name": "class:tests"}]
+        self.finding("low | _style_ | `nit`", asked=())
+        self.go()
+        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+
+    def test_a_logic_pull_request_keeps_todays_rule_for_a_minor_finding(self):
+        self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
+        self.finding(MEDIUM, asked=())
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged, len(self.fixed)), ([], [], 1))
+
+
+class ChangeClasses(Base):
+    def test_a_sensitive_pull_request_is_left_for_the_brain_and_marked(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive",))
+        self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("POST", "/repos/%s/issues/50/labels" % REPO, {"labels": ["needs-brain"]}),
+                      self.gh.writes)
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertIn("class:sensitive", names)
+        self.assertIn("needs-brain", names)
+
+    def test_a_sensitive_pull_request_already_marked_is_left_alone(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
+        self.go()
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/labels")], [])
+        self.assertEqual(self.merged, [])
 
 
 class Trust(Base):

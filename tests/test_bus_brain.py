@@ -9,7 +9,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, journal, proof, text, tickets
-from bus.github import GitHub
+from bus.github import GitHub, GitHubError
 
 REPO = "example-owner/example-repo"
 BODY = "## Why\nwhy\n## What\nwhat\n## Acceptance criteria\n- [ ] done\n## Size\nS\n## Out of scope\n- none"
@@ -71,6 +71,19 @@ class BrainTests(unittest.TestCase):
         report = brain.status(gh, [REPO], REPO, env={})
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
+
+    def test_status_lists_a_sensitive_pull_request(self):
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [{"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work"},
+                         "labels": [{"name": "class:sensitive"}]}]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, [])))
+        lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
+        at = lines.index("### Sensitive pull requests")
+        self.assertEqual(lines[at + 1], "- #4 Sensitive")
 
     def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
@@ -292,6 +305,40 @@ class BrainTests(unittest.TestCase):
                     brain.brief(gh, REPO, 1, "Ticket", text, lane)
                 self.assertFalse(any(call[0] == "POST" for call in fake.calls))
 
+    def test_a_public_repo_brief_refuses_another_repos_issue_reference(self):
+        text = BODY.replace("why", "as in other-owner/other-repo#12")
+        fake = Fake(reply(200, {"private": False}))
+        with self.assertRaisesRegex(ValueError, "in words"):
+            brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+        self.assertEqual([c[0] for c in fake.calls], ["GET"])
+
+    def test_a_foreign_reference_files_nothing_when_the_repo_cannot_be_read(self):
+        text = BODY.replace("why", "as in other-owner/other-repo#12")
+        # A failed read ends the brief with the GitHubError main reports.
+        fake = Fake(reply(404, {"message": "Not Found"}))
+        with self.assertRaises(GitHubError):
+            brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+        self.assertEqual([c[0] for c in fake.calls], ["GET"])
+        # A read that does not say whether the repo is private refuses too.
+        for data in ({}, None, {"private": None}):
+            with self.subTest(data=data):
+                fake = Fake(reply(200, data))
+                with self.assertRaisesRegex(ValueError, "could not tell"):
+                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+                self.assertEqual([c[0] for c in fake.calls], ["GET"])
+
+    def test_a_brief_may_name_its_own_repos_issue_or_any_issue_in_a_private_repo(self):
+        made = (reply(200, goal()), reply(200, []),
+                reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        own = BODY.replace("why", "as in %s#12" % REPO.upper())
+        # Its own reference: the repo is not even read.
+        self.assertEqual(brain.brief(GitHub("t", transport=Fake(*made)), REPO, 1, "Ticket",
+                                     own, "codex"), "https://example.com/ticket")
+        foreign = BODY.replace("why", "as in other-owner/other-repo#12")
+        fake = Fake(reply(200, {"private": True}), *made)
+        self.assertEqual(brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket",
+                                     foreign, "codex"), "https://example.com/ticket")
+
     def test_brief_refuses_header_values_the_runner_would_refuse(self):
         bad = [dict(model="x\nRepo: evil/repo"), dict(model="bad model"), dict(base="-x"),
                dict(base="main\nBranch: loom/evil")]
@@ -447,6 +494,99 @@ class BrainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             brain.merge(GitHub("t", transport=fake), REPO, 8)
         self.assertFalse(any("/git/refs/" in call[1] for call in fake.calls))
+
+    def _sensitive_replies(self, finding=None):
+        details = {"commits": {"nodes": [{"commit": {
+            "committedDate": "2030-01-01T00:00:00Z",
+            "statusCheckRollup": {"state": "SUCCESS"}}}]},
+            "reviewThreads": {"nodes": [] if finding is None else [finding]}}
+        return self._merge_replies({"pr": {"labels": [{"name": "class:sensitive"}]},
+                                    "details": details})
+
+    def _passing_check(self):
+        return reply(200, {"check_runs": [{"name": brain.review_check_name(),
+                                           "status": "completed", "conclusion": "success"}]})
+
+    def test_merge_refuses_a_sensitive_pr_with_an_open_high_finding(self):
+        # The finding is unresolved on the head commit: the head is committed
+        # at 00:00 and the finding at 00:10, so no fix-up commit came after it.
+        high = {"id": "T1", "isResolved": True, "comments": {"nodes": [
+            {"author": {"__typename": "Bot", "login": "grug-tribe"},
+             "body": "\U0001f525 high | _correctness_ | `null-deref`",
+             "createdAt": "2030-01-01T00:10:00Z"}]}}
+        pr, query = self._sensitive_replies(high)
+        fake = Fake(pr, query, self._passing_check())
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("high or critical finding", str(caught.exception))
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_resolved_high_finding_without_a_head_commit_date(self):
+        high = {"id": "T1", "isResolved": True, "comments": {"nodes": [
+            {"author": {"__typename": "Bot", "login": "grug-tribe"},
+             "body": "high | _correctness_ | `missing-date`",
+             "createdAt": "2030-01-01T00:10:00Z"}]}}
+        pr, query = self._sensitive_replies(high)
+        payload = json.loads(query[2])
+        payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"].pop("committedDate")
+        query = reply(200, payload)
+        fake = Fake(pr, query, self._passing_check())
+        with self.assertRaisesRegex(ValueError, "high or critical finding"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_sensitive_pr_without_a_passed_review_check(self):
+        pr, query = self._sensitive_replies()
+        checks = reply(200, {"check_runs": [{"name": "unittest", "status": "completed",
+                                             "conclusion": "success"}]})
+        fake = Fake(pr, query, checks)
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("review check", str(caught.exception))
+
+    def test_merge_refuses_a_sensitive_pr_when_the_check_read_fails(self):
+        # The check-runs read itself fails: the merge refuses with the named
+        # review-check error, not the stranger's GitHubError the read raised.
+        pr, query = self._sensitive_replies()
+        fake = Fake(pr, query, reply(500, {"message": "boom"}))
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("review check", str(caught.exception))
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_sensitive_pr_when_the_check_read_is_malformed(self):
+        # A malformed check-runs answer is a check that did not pass, not a
+        # crash: the reply is a list where the reader expects an object.
+        pr, query = self._sensitive_replies()
+        fake = Fake(pr, query, reply(200, [1]))
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("review check", str(caught.exception))
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_a_sensitive_pr_with_a_passed_review_and_no_high_finding_merges(self):
+        pr, query = self._sensitive_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, self._passing_check(), reply(200, issue),
+                    reply(200, {"merged": True}), reply(204), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        self.assertTrue(result["merged"])
+
+    def test_a_logic_pr_with_a_resolved_high_finding_keeps_todays_rule(self):
+        high = {"id": "T1", "isResolved": True, "comments": {"nodes": [
+            {"author": {"__typename": "Bot", "login": "grug-tribe"},
+             "body": "high | _correctness_ | `null-deref`",
+             "createdAt": "2030-01-01T00:10:00Z"}]}}
+        pr, query = self._merge_replies({"details": {
+            "commits": {"nodes": [{"commit": {
+                "committedDate": "2030-01-01T00:00:00Z",
+                "statusCheckRollup": {"state": "SUCCESS"}}}]},
+            "reviewThreads": {"nodes": [high]}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
+                    reply(204), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        self.assertTrue(result["merged"])
 
     TRUSTED = {"LOOM_BRIEF_AUTHORS": "example-brain"}
 
