@@ -414,7 +414,9 @@ say-so alone:
   finding still sends the pull request back.
 - `sensitive`: the factory never merges it. It marks the pull request
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
-  requests", and leaves it for the brain. A brain merges it with
+  requests", and leaves the merge to the brain. Its conflicts, failing
+  checks, high findings and missing tests still go back to its lane, and its
+  medium and low findings are deferred, as for any class. A brain merges it with
   `python3 -m bus.brain merge`, which for this class also requires that the
   review check passed and no high or critical finding is open on the head
   commit.

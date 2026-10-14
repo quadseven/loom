@@ -827,6 +827,20 @@ class ChangeClasses(Base):
         self.assertIn("class:sensitive", names)
         self.assertIn("needs-brain", names)
 
+    def test_a_sensitive_pull_request_with_a_conflict_goes_back_to_its_lane(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, labels=("class:sensitive", "needs-brain"))
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_sensitive_pull_request_with_failing_checks_goes_back_to_its_lane(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False, labels=("class:sensitive", "needs-brain"))
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual(len(self.fixed), 1)
+
     def test_a_sensitive_pull_request_already_marked_is_left_alone(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
