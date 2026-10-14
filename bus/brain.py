@@ -1258,6 +1258,19 @@ def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[st
     return None
 
 
+def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
+                        lane: str) -> None:
+    """Refuse a queued move to a remote lane that the lane could never claim:
+    a private repo for a public-only lane, or a ticket whose branch already
+    has a pull request (a fix round, which remote lanes do not run)."""
+    repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+        raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
+    branch = tickets.branch_for(number, str(issue.get("title") or ""))
+    if _open_or_merged_pull(gh, repo, branch) is not None:
+        raise ValueError("ticket branch %s already has a pull request" % branch)
+
+
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
          record: Optional[Dict[str, Any]] = None,
@@ -1272,13 +1285,7 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
     if state == "queued" and lane in REMOTE_LANES:
-        repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
-        if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
-            raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
-        branch = tickets.branch_for(number, str(issue.get("title") or ""))
-        pr = _open_or_merged_pull(gh, repo, branch)
-        if pr is not None:
-            raise ValueError("ticket branch %s already has a pull request" % branch)
+        _check_remote_queue(gh, repo, number, issue, lane)
     if lane is not None and state == "briefed":
         from .station import model_lanes
         body = str(issue.get("body") or "").split("\n\n", 1)[0]

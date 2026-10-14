@@ -164,7 +164,7 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
     claimed_result: Optional[Dict[str, Any]] = None
 
     if active >= REMOTE_LANES[lane]["slots"]:
-        for repo, issue in candidates:
+        for _repo, issue in candidates:
             skipped.append("#%s skipped: lane slots full" % issue["number"])
     else:
         for repo, issue in candidates:

@@ -421,6 +421,16 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
 
+    def test_a_remote_lane_is_refused_for_any_state_but_queued(self):
+        # A limit hand-off or a fix round (briefed) must never land on a
+        # remote lane, which claims only new queued tickets.
+        for state in ("briefed", "running", "pr"):
+            with self.subTest(state=state):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "only works with --to queued"):
+                    brain.move(GitHub("t", transport=fake), REPO, 8, state, "muse")
+                self.assertEqual(fake.calls, [])
+
     def test_move_keeps_labels_and_swaps_lane(self):
         fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}, {"name": "lane:agy"}, {"name": "custom"}]}), reply(200, []))
         gh = GitHub("t", transport=fake)
