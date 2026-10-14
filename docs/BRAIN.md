@@ -173,8 +173,15 @@ runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
 for a later run. Any other issue gets `loom:triage` and one comment naming
 what is missing. Triage writes labels, sub-issue links and that comment
-only: it never closes, retitles or edits an issue, because an automated
-pass over old issues over-calls work as done.
+only: it never closes or retitles an issue, and edits nothing but the one
+line below, because an automated pass over old issues over-calls work as
+done.
+
+GitHub holds at most 100 sub-issues under one issue and refuses the next one
+(422). A ticket a goal refuses that way, from `brief` or triage, gets a
+`Part of #N` line at the end of its body instead, and a goal's tickets are
+its sub-issues plus, once it holds 100, the issues whose body has that line
+(one search). The backlog board reads parentage the same way.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
