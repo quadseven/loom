@@ -48,6 +48,10 @@ not looked hard enough yet. Each tick the brain:
   brief (docs/BRAIN.md, Regression slot). Never raise `LOOM_GOAL_CAP` for
   it. Link the next measured result in the goal's journal. Ordinary new
   work waits for the cap.
+- Leaves a red default branch after a lane merge to the station, which
+  reverts it (docs/BRAIN.md, Red default branch). Do not brief a second
+  revert for a commit a `loom:revert` ticket already names. A red commit
+  no lane merged is the brain's: the station only reports it.
 - Proves every change: a ticket is verified only when its proof shows on the
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.

@@ -56,6 +56,9 @@ runs from the station at most every FACTORY_CHECK seconds and needs no model:
   A limit is not a failure, so it never climbs; with no free lane the ticket
   waits where it is for its lane to come back.
 - Past the last rung the ticket is left failed for the brain, with a note.
+- A revert ticket (bus/revert.py, REVERT_LABEL) lands first, on green: its
+  medium and low findings are deferred at once instead of after a fix round,
+  and it needs no test of its own (the failing check it fixes is its test).
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
 survives restarts and any brain can read where a ticket stands.
@@ -159,6 +162,9 @@ NO_TEST_HEADING = "### Test: the change has no test"
 ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
+# bus/revert.py's revert tickets, landed first and on green.
+REVERT_LABEL = "loom:revert"
+FIRST = ("loom:urgent", "loom:regression", REVERT_LABEL)
 
 FIX_NOTES = """The factory sent this pull request back: it has failing checks, open \
 review threads or a conflict with the default branch, listed below.
@@ -390,9 +396,9 @@ def held_until(issue: Dict[str, Any]) -> float:
 
 def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
                   linked: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Pull requests of loom:urgent and loom:regression tickets first, then the oldest."""
-    urgent = {n for n, issue in tickets.items()
-              if {"loom:urgent", "loom:regression"} & set(_labels(issue))}
+    """Pull requests of loom:urgent, loom:regression and loom:revert tickets
+    first, then the oldest."""
+    urgent = {n for n, issue in tickets.items() if set(FIRST) & set(_labels(issue))}
     ticket_of = {int(pr["number"]): n for n, pr in linked.items()}
     return sorted(prs, key=lambda p: (ticket_of.get(int(p["number"])) not in urgent,
                                       str(p.get("created_at") or "")))
@@ -511,7 +517,7 @@ class Factory:
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
         ticket that ask for tests?"""
-        if repo.lower() in self.no_test_repos:
+        if repo.lower() in self.no_test_repos or REVERT_LABEL in _labels(issue):
             return False
         if TESTS_NONE_RE.search(str(issue.get("body") or "")):
             return False
@@ -571,16 +577,18 @@ class Factory:
         return int(made.get("number") or 0)
 
     def _defer_minor(self, repo: str, number: int, ticket: int, sha: str,
-                     comments: Sequence[Dict[str, Any]]) -> bool:
+                     comments: Sequence[Dict[str, Any]], at_once: bool = False) -> bool:
         """Defer the open medium and low findings of a reviewed, green pull
-        request to a follow-up issue, then resolve them. True when it did."""
+        request to a follow-up issue, then resolve them; `at_once` (a revert)
+        does not wait for a fix round first. True when it did."""
         owner, name = repo.split("/", 1)
         data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
                                                "number": number}) or {}
         threads = ((((data.get("repository") or {}).get("pullRequest") or {})
                     .get("reviewThreads") or {}).get("nodes") or [])
         rounds = fixes_of(comments)
-        picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds)
+        picked = deferrable(threads, self.review_bot, asked_threads(comments),
+                            max(rounds, DEFER_AFTER) if at_once else rounds)
         if not picked:
             return False
         follow = self._follow_up(repo, number, ticket, sha, picked, rounds)
@@ -701,7 +709,8 @@ class Factory:
         details = brain._pr_graphql(self.gh, repo, number)
         faults = pr_faults(details, full)
         if (faults == ["open review threads"] and review == "reviewed"
-                and self._defer_minor(repo, number, int(issue["number"]), sha, comments)):
+                and self._defer_minor(repo, number, int(issue["number"]), sha, comments,
+                                      at_once=REVERT_LABEL in _labels(issue))):
             details = brain._pr_graphql(self.gh, repo, number)
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and self._run_again(repo, number, sha):
@@ -895,12 +904,33 @@ class Factory:
         self.actions += 1
         _say("moved %s#%d off lane %s, at a limit, to %s" % (repo, number, old, lane))
 
-    # -- the pass --------------------------------------------------------
-    def run(self) -> None:
-        tickets = {repo: self._tickets(repo) for repo in self.repos}
+    # -- lane load -------------------------------------------------------
+    def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
+        """Count the briefed and running tickets on each lane, reading every
+        repo's tickets unless they are given."""
+        if tickets is None:
+            tickets = {repo: self._tickets(repo) for repo in self.repos}
         for issue in (i for found in tickets.values() for i in found.values()):
             if _state(issue) in ("briefed", "running"):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
+
+    def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
+        """The first free lane of the difficulty tier the repo may use, else
+        its least-loaded lane that is up and not at a limit; None when the
+        tier has none. count_load first."""
+        private = self._is_private(repo)
+        lanes = [x for x in TIERS.get(difficulty, ()) if not (private and x in PUBLIC_ONLY)]
+        free = next((x for x in lanes if self._free(x)), None)
+        if free is not None:
+            return free
+        up = [x for x in lanes if x not in self.limited
+              and (self.available is None or x in self.available)]
+        return pick_lane(up, self.load) if up else None
+
+    # -- the pass --------------------------------------------------------
+    def run(self) -> None:
+        tickets = {repo: self._tickets(repo) for repo in self.repos}
+        self.count_load(tickets)
         for repo in self.repos:
             self._repo_pass(repo, tickets[repo])
 

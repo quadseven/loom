@@ -58,6 +58,8 @@ LABELS: Dict[str, Dict[str, str]] = {
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
+    "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
+    "class:logic": {"color": "c5def5", "description": "A change to behavior"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",

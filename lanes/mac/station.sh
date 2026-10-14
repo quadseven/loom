@@ -5,7 +5,9 @@
 # lanes and the brain run from this checkout too. It moves only by
 # fast-forward, only from a clean checkout on LOOM_DEPLOY_BRANCH (default
 # main), and only to a head whose CI check (LOOM_DEPLOY_CHECK, default
-# unittest) passed; a newer head with CI running or failing waits. The update
+# unittest) passed; a newer head with CI running or failing waits, and so
+# does one that would bring in a commit an in-flight revert ticket names
+# (bus/revert.py: a merge that turned the branch red). The update
 # runs here, before Python, so a station a bad merge broke still receives the
 # fix merged after it. LOOM_DEPLOY=0 turns it off.
 set -uo pipefail
@@ -33,6 +35,16 @@ deploy() {
   verdict="$(timeout 30 gh api "repos/$slug/commits/$target/check-runs?check_name=$CHECK" \
     --jq '[.check_runs[].conclusion] | if length == 0 then "none" elif all(. == "success") then "success" else "other" end' 2>/dev/null)"
   [ "$verdict" = success ] || return 0
+  local named sha
+  named="$(timeout 30 gh api "repos/$slug/issues?labels=loom:revert&state=open&per_page=100" \
+    --jq '.[] | select([.labels[].name] | any(. == "loom:merged" or . == "loom:shipped" or . == "loom:verified") | not) | .body' 2>/dev/null)" ||
+    { say "not deploying: could not read the revert tickets"; return 0; }
+  for sha in $(printf '%s\n' "$named" | sed -nE 's/.*git revert --no-edit ([0-9a-f]{40}).*/\1/p'); do
+    if g merge-base --is-ancestor "$sha" "$target" 2>/dev/null &&
+       ! g merge-base --is-ancestor "$sha" "$head" 2>/dev/null; then
+      say "not deploying: ${sha:0:12} is named by a revert ticket"; return 0
+    fi
+  done
   if g merge -q --ff-only "$target"; then
     say "deployed $(g rev-parse --short HEAD): $(g log -1 --format=%s HEAD | cut -c1-100)"
   fi
