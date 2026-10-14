@@ -182,6 +182,41 @@ class BrainTests(unittest.TestCase):
                       "reviewThreads(first:100)", "isResolved", "createdAt", "__typename"):
             self.assertIn(field, query)
 
+    def _ticketless_pr(self, **extra):
+        pr = {"number": 6, "title": "Build fix", "state": "open", "draft": False,
+              "user": {"login": "example-brain"}, "body": "A build fix.",
+              "head": {"ref": "fix/build", "sha": "head1", "repo": {"full_name": REPO}},
+              "base": {"repo": {"full_name": REPO}}}
+        pr.update(extra)
+        return pr
+
+    def _ticketless_report(self, node, env=None):
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, []),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [self._ticketless_pr()]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p6": node}}})}
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env=env or {"LOOM_BRIEF_AUTHORS": "example-brain"})
+        return report.split(brain.ADOPT_HEADING, 1)[1].split("\n###", 1)[0]
+
+    def test_status_lists_a_trusted_ticketless_pull_request_with_its_state(self):
+        self.assertIn("- #6 Build fix - READY", self._ticketless_report(ready_node()))
+        blocked = self._ticketless_report(ready_node(threads=[{"isResolved": False}]))
+        self.assertIn("- #6 Build fix - blocked: 1 unresolved threads", blocked)
+
+    def test_status_does_not_list_an_untrusted_or_ticketed_pull_request(self):
+        env = {"LOOM_BRIEF_AUTHORS": "someone-else"}
+        self.assertNotIn("#6", self._ticketless_report(ready_node(), env=env))
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, []),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                      self._ticketless_pr(body="Refs %s#9" % REPO)]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p6": ready_node()}}})}
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        section = report.split(brain.ADOPT_HEADING, 1)[1].split("\n###", 1)[0]
+        self.assertNotIn("#6", section)
+
     def test_brief_refusals_create_nothing(self):
         cases = [
             ("## Why\nmissing", "codex", 0),
@@ -337,6 +372,98 @@ class BrainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             brain.merge(GitHub("t", transport=fake), REPO, 8)
         self.assertFalse(any("/git/refs/" in call[1] for call in fake.calls))
+
+    TRUSTED = {"LOOM_BRIEF_AUTHORS": "example-brain"}
+
+    def _adopt_replies(self, changes=None):
+        """A ticketless pull request on a non-loom branch, a trusted author,
+        the review check on its head, then the merge path's own answers."""
+        changes = changes or {}
+        pr = {"state": "open", "draft": False, "body": "A build fix.",
+              "user": {"login": "example-brain"},
+              "head": {"ref": "fix/build", "sha": "head1", "repo": {"full_name": REPO}},
+              "base": {"repo": {"full_name": REPO}}, "mergeable": True}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "fix/build",
+                   "headRefOid": "head1", "headRepository": {"nameWithOwner": REPO},
+                   "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
+                   "reviewThreads": {"nodes": []}}
+        pr.update(changes.get("pr", {}))
+        details.update(changes.get("details", {}))
+        runs = changes.get("runs")
+        if runs is None:
+            runs = [{"name": "unittest", "status": "completed", "conclusion": "success"},
+                    {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]
+        return (reply(200, pr), reply(200, {"data": {"repository": {"pullRequest": details}}}),
+                reply(200, {"check_runs": runs}))
+
+    def _merge_replies_for_adopt(self, changes=None):
+        return self._adopt_replies(changes) + (reply(200, {"merged": True}),
+                                               reply(204), reply(201, {}))
+
+    def test_adopt_merges_a_trusted_green_reviewed_threadless_pr_without_a_ticket(self):
+        fake = Fake(*self._merge_replies_for_adopt())
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=self.TRUSTED)
+        self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
+                                  "ticket": None, "head_sha": "head1"})
+        self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "head1"})
+        self.assertIn("/git/refs/heads/fix/build", fake.calls[4][1])
+        # The pull request is told it was adopted, after the branch is deleted.
+        self.assertEqual(fake.calls[-1][0], "POST")
+        self.assertIn(brain.ADOPT_MARKER, fake.calls[-1][2]["body"])
+
+    def test_adopt_refuses_a_pull_request_that_already_has_a_ticket(self):
+        fake = Fake(*self._adopt_replies({"pr": {"body": "Refs %s#9" % REPO}}))
+        with self.assertRaises(ValueError):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=self.TRUSTED)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_adopt_refusals_do_not_call_merge(self):
+        cases = [
+            ("an untrusted author", {"pr": {"user": {"login": "example-stranger"}}}),
+            ("no author", {"pr": {"user": {}}}),
+            ("a draft", {"pr": {"draft": True}}),
+            ("a fork", {"pr": {"head": {"ref": "fix/build", "sha": "head1",
+                                        "repo": {"full_name": "someone/fork"}}}}),
+            ("a conflict", {"pr": {"mergeable": False}}),
+            ("a conflicting rollup", {"details": {"mergeable": "CONFLICTING"}}),
+            ("a red check", {"details": {"commits": {"nodes": [
+                {"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}}}),
+            ("no review check on the head", {"runs": [
+                {"name": "unittest", "status": "completed", "conclusion": "success"}]}),
+            ("a failed review check", {"runs": [
+                {"name": "Grug - Elder", "status": "completed", "conclusion": "failure"}]}),
+            ("an unresolved thread", {"details": {"reviewThreads": {
+                "nodes": [{"isResolved": False}]}}}),
+        ]
+        for name, case in cases:
+            with self.subTest(name=name):
+                fake = Fake(*self._adopt_replies(case))
+                with self.assertRaises(ValueError):
+                    brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=self.TRUSTED)
+                self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_adopt_uses_the_named_review_check_from_the_environment(self):
+        runs = [{"name": "My Review", "status": "completed", "conclusion": "success"}]
+        fake = Fake(*self._merge_replies_for_adopt({"runs": runs}))
+        env = dict(self.TRUSTED, LOOM_REVIEW_CHECK="My Review")
+        brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=env)
+        self.assertEqual(fake.calls[-1][0], "POST")
+
+    def test_review_check_passed_reads_past_the_first_page(self):
+        first = [{"name": "check-%d" % i, "status": "completed", "conclusion": "success"}
+                 for i in range(100)]
+        second = [{"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]
+        fake = Fake(reply(200, {"check_runs": first}), reply(200, {"check_runs": second}))
+        passed = brain._review_check_passed(GitHub("t", transport=fake), REPO, "head1",
+                                            "Grug - Elder")
+        self.assertTrue(passed)
+
+    def test_adopt_refuses_a_ticket_supplied_with_it(self):
+        fake = Fake()
+        with self.assertRaises(ValueError):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        adopt=True, env=self.TRUSTED)
+        self.assertEqual(fake.calls, [])
 
     def test_reply_and_resolve_right_thread(self):
         details = {"reviewThreads": {"nodes": [{"id": "THREAD", "comments": {"nodes": [{"databaseId": 42}]}}]}}

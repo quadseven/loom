@@ -137,7 +137,12 @@ live regression).
    Merge only PRs labeled `loom:ready`: confirm checks are green, no review-bot
    threads are unresolved, and the verdict applies to the current head SHA. Then run
    `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N`,
-   which moves the ticket to `loom:merged`. Merged is not deployed: the
+   which moves the ticket to `loom:merged`. A fix you wrote during a ship
+   that carries no ticket (a `loom/`-less branch a trusted login opened) is
+   not listed among the lane pull requests: adopt it with
+   `python3 -m bus.brain merge OWNER/NAME#PR --adopt`, under the rules in
+   docs/BRAIN.md (Pull requests without a ticket), rather than leave it for
+   the operator. Merged is not deployed: the
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
