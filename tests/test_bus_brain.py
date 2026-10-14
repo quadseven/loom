@@ -41,6 +41,11 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
 
 
 class BrainTests(unittest.TestCase):
+    def test_goal_trunk_reads_the_trunk_line_from_a_goal_body(self):
+        self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
+        self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
+        self.assertIsNone(brain.goal_trunk({"body": None}))
+
     def test_status_sections_and_request_ceiling(self):
         gh = GitHub("t", transport=Fake(
             reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"},
@@ -182,6 +187,61 @@ class BrainTests(unittest.TestCase):
                       "reviewThreads(first:100)", "isResolved", "createdAt", "__typename"):
             self.assertIn(field, query)
 
+    def test_status_flags_a_repo_whose_recent_merges_target_an_undeclared_branch(self):
+        goal_issue = {"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"}
+        merged = [{"baseRefName": "side"} for _ in range(7)] + [{"baseRefName": "main"} for _ in range(3)]
+        fake = Fake(reply(200, [goal_issue]), reply(200, []),
+                    reply(200, {"data": {"repository": {
+                        "g1": {"comments": {"nodes": []}},
+                        "defaultBranchRef": {"name": "main"},
+                        "merged": {"nodes": merged}}}}),
+                    reply(200, []))
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        self.assertIn("warning: work merges into side; set Trunk: side on the goal home", report)
+
+    def test_status_does_not_flag_a_repo_whose_recent_merges_match_the_default_branch(self):
+        goal_issue = {"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"}
+        merged = [{"baseRefName": "main"} for _ in range(10)]
+        fake = Fake(reply(200, [goal_issue]), reply(200, []),
+                    reply(200, {"data": {"repository": {
+                        "g1": {"comments": {"nodes": []}},
+                        "defaultBranchRef": {"name": "main"},
+                        "merged": {"nodes": merged}}}}),
+                    reply(200, []))
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        self.assertNotIn("warning: work merges into", report)
+
+    def test_status_does_not_flag_a_repo_whose_recent_merges_match_the_declared_trunk(self):
+        goal_issue = {"number": 1, "title": "Goal", "body": "Trunk: side\n\n## Destination\n",
+                      "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"}
+        merged = [{"baseRefName": "side"} for _ in range(10)]
+        fake = Fake(reply(200, [goal_issue]), reply(200, []),
+                    reply(200, {"data": {"repository": {
+                        "g1": {"comments": {"nodes": []}},
+                        "defaultBranchRef": {"name": "main"},
+                        "merged": {"nodes": merged}}}}),
+                    reply(200, []))
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        self.assertNotIn("warning: work merges into", report)
+
+    def test_status_warns_only_when_more_than_half_of_merges_are_undeclared(self):
+        goal_issue = {"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"}
+        for undeclared_count, should_warn in ((5, False), (6, True)):
+            with self.subTest(undeclared_count=undeclared_count):
+                merged = ([{"baseRefName": "side"} for _ in range(undeclared_count)]
+                          + [{"baseRefName": "main"} for _ in range(10 - undeclared_count)])
+                fake = Fake(reply(200, [goal_issue]), reply(200, []),
+                            reply(200, {"data": {"repository": {
+                                "g1": {"comments": {"nodes": []}},
+                                "defaultBranchRef": {"name": "main"},
+                                "merged": {"nodes": merged}}}}),
+                            reply(200, []))
+                report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+                if should_warn:
+                    self.assertIn("warning: work merges into side", report)
+                else:
+                    self.assertNotIn("warning: work merges into", report)
+
     def _ticketless_pr(self, **extra):
         pr = {"number": 6, "title": "Build fix", "state": "open", "draft": False,
               "user": {"login": "example-brain"}, "body": "A build fix.",
@@ -278,6 +338,21 @@ class BrainTests(unittest.TestCase):
         self.assertTrue(payload["body"].startswith("Difficulty: hard\nModel: model-x\nBase: main\n\n"))
         self.assertEqual(fake.calls[3][1].split("api.github.com")[1], "/repos/%s/issues/1/sub_issues" % REPO)
         self.assertEqual(fake.calls[3][2], {"sub_issue_id": 202})
+
+    def test_brief_uses_goal_trunk_as_default_base_and_explicit_base_wins(self):
+        trunk_goal = dict(goal(), body="Trunk: side\n\n## Destination\n")
+        fake = Fake(reply(200, trunk_goal), reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        gh = GitHub("t", transport=fake)
+        url = brain.brief(gh, REPO, 1, "Ticket", BODY, "codex")
+        self.assertEqual(url, "https://example.com/ticket")
+        payload = fake.calls[2][2]
+        self.assertTrue(payload["body"].startswith("Base: side\n\n"))
+        fake2 = Fake(reply(200, trunk_goal), reply(200, []),
+                     reply(201, {"id": 203, "html_url": "https://example.com/ticket2"}), reply(201, {}))
+        url2 = brain.brief(GitHub("t", transport=fake2), REPO, 1, "Ticket", BODY, "codex", base="explicit")
+        self.assertEqual(url2, "https://example.com/ticket2")
+        self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
 
     def test_move_keeps_labels_and_swaps_lane(self):
         fake = Fake(reply(200, {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}, {"name": "lane:agy"}, {"name": "custom"}]}), reply(200, []))

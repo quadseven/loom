@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import re
@@ -37,7 +38,16 @@ LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
 TRIAGE_LIMIT = 25
+# A goal home may name the branch work merges into, when that branch is not the
+# repository's default branch. The line lives in the goal body's header area.
+_TRUNK_RE = re.compile(r"^Trunk:[ \t]*([A-Za-z0-9._][A-Za-z0-9._/-]*)[ \t]*$", re.M)
 _check_written_text = text.check
+
+
+def goal_trunk(issue: Dict[str, Any]) -> Optional[str]:
+    """The Trunk: branch named in a goal home's body, or None."""
+    match = _TRUNK_RE.search(str(issue.get("body") or ""))
+    return match.group(1) if match else None
 
 
 def _repo(value: str) -> str:
@@ -61,24 +71,51 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     goal_ids = [int(x["number"]) for x in goals]
     # A single query fetches every PR's merge-ready data (READY_FIELDS), plus
     # comments on the goal issues for journal timestamps, plus RULING_FIELDS
-    # for the pull requests of tickets past the last rung.
+    # for the pull requests of tickets past the last rung. When the repo has
+    # goals, it also fetches the default branch and the last 10 merged PRs so
+    # status can warn when work is landing on an undeclared trunk.
     # GitHub GraphQL does not support a dynamic issue-number list as a top-level
     # node argument. Build aliases from the numbers while retaining one request.
     owner, name = repo.split("/", 1)
-    fields = []
-    for n in pr_ids:
-        fields.append("p%d: pullRequest(number:%d) { %s%s }" % (
-            n, n, READY_FIELDS, RULING_FIELDS if n in ruling else ""))
-    for n in goal_ids:
-        fields.append("g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n))
+    fields = _status_pr_fields(pr_ids, ruling) + _status_goal_fields(goal_ids)
+    if goal_ids:
+        fields += _status_trunk_fields()
     if not fields:
-        return {"prs": {}, "goals": {}}
+        return {"prs": {}, "goals": {}, "trunk": None, "merged": []}
     q = "query { repository(owner:%s, name:%s) { %s } }" % (
         _gql(owner), _gql(name), " ".join(fields))
     result = gh.graphql(q) or {}
     repo_data = result.get("repository") or {}
     return {"prs": {n: repo_data.get("p%d" % n) for n in pr_ids},
-            "goals": {n: repo_data.get("g%d" % n) for n in goal_ids}}
+            "goals": {n: repo_data.get("g%d" % n) for n in goal_ids},
+            **_status_trunk_data(repo_data)}
+
+
+def _status_pr_fields(pr_ids: Sequence[int], ruling: Sequence[int]) -> List[str]:
+    """GraphQL aliases for the merge-ready fields of each open loom PR."""
+    return ["p%d: pullRequest(number:%d) { %s%s }" % (
+        n, n, READY_FIELDS, RULING_FIELDS if n in ruling else "") for n in pr_ids]
+
+
+def _status_goal_fields(goal_ids: Sequence[int]) -> List[str]:
+    """GraphQL aliases for the latest comments on each goal issue."""
+    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n)
+            for n in goal_ids]
+
+
+def _status_trunk_fields() -> List[str]:
+    """GraphQL fragments for the default branch and last 10 merged PR bases."""
+    return ["defaultBranchRef { name }",
+            "merged: pullRequests(states:MERGED, first:10, "
+            "orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { baseRefName } }"]
+
+
+def _status_trunk_data(repo_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The default branch name and base branches of the last 10 merged PRs."""
+    merged = [str(n.get("baseRefName") or "") for n in
+              ((repo_data.get("merged") or {}).get("nodes") or [])]
+    return {"trunk": (repo_data.get("defaultBranchRef") or {}).get("name"),
+            "merged": merged}
 
 
 # What merge_ready reads for one pull request: the head commit's time and
@@ -377,6 +414,21 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
     return found
 
 
+def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optional[str]:
+    """Warn when more than half of the last 10 merged PRs target a branch that
+    is neither the default branch nor a goal home's declared Trunk."""
+    trunks = {goal_trunk(g) for g in goals}
+    trunks.discard(None)
+    default = data.get("trunk")
+    merged = data.get("merged") or []
+    undeclared = [b for b in merged if b and b != default and b not in trunks]
+    # "Most" means strictly more than half; use integer arithmetic to avoid
+    # relying on the exact number of PRs GitHub returns.
+    if not merged or len(undeclared) * 2 <= len(merged):
+        return None
+    return Counter(undeclared).most_common(1)[0][0]
+
+
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None) -> List[str]:
     issues = _issues(gh, repo)
@@ -393,7 +445,11 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     pr_of = _ticket_prs(repo, prs)
     ruling = [int(pr_of[int(i["number"])]["number"]) for i in past if int(i["number"]) in pr_of]
     data = _graphql_status(gh, repo, prs + adoptable, goals, ruling)
-    lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data, now, authors) + [""]
+    lines = ["", "## %s" % repo, ""]
+    warn = _trunk_warning(goals, data)
+    if warn:
+        lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
+    lines += _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
@@ -459,16 +515,24 @@ def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
 
 
-def _goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """The sub-issues of an open loom:goal issue; ValueError for anything else."""
+def _goal_issue(gh: GitHub, repo: str, goal: int) -> Dict[str, Any]:
+    """An open loom:goal issue; ValueError for anything else."""
     try:
-        goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
     except GitHubError as exc:
         if exc.status == 404:
             raise ValueError("goal must be an open loom:goal issue") from None
         raise
-    if goal_issue.get("state") != "open" or "loom:goal" not in _labels(goal_issue):
+    if issue.get("state") != "open" or "loom:goal" not in _labels(issue):
         raise ValueError("goal must be an open loom:goal issue")
+    return issue
+
+
+def _goal_children(gh: GitHub, repo: str, goal: int,
+                   issue: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """The sub-issues of an open loom:goal issue; ValueError for anything else."""
+    if issue is None:
+        issue = _goal_issue(gh, repo, goal)
     return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))
 
 
@@ -478,13 +542,15 @@ def _in_flight(issue: Dict[str, Any]) -> bool:
             and any(state in names for state in IN_FLIGHT))
 
 
-def _goal_in_flight(gh: GitHub, repo: str, goal: int) -> int:
+def _goal_in_flight(gh: GitHub, repo: str, goal: int,
+                    issue: Optional[Dict[str, Any]] = None) -> int:
     """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
-    return sum(1 for i in _goal_children(gh, repo, goal) if _in_flight(i))
+    return sum(1 for i in _goal_children(gh, repo, goal, issue) if _in_flight(i))
 
 
-def _check_goal_capacity(gh: GitHub, repo: str, goal: int) -> None:
-    count = _goal_in_flight(gh, repo, goal)
+def _check_goal_capacity(gh: GitHub, repo: str, goal: int,
+                         issue: Optional[Dict[str, Any]] = None) -> None:
+    count = _goal_in_flight(gh, repo, goal, issue)
     cap = goal_cap()
     if count >= cap:
         raise ValueError("goal already has %d tickets in flight (cap %d); only a measured "
@@ -597,10 +663,10 @@ def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
 
 def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
                       lane: Optional[str], model: Optional[str], full_body: str,
-                      regressed: int) -> str:
+                      regressed: int, issue: Optional[Dict[str, Any]] = None) -> str:
     """Admit a brief for a measured regression of a shipped ticket; see brief."""
     evidence = _regression_evidence(body, regressed)
-    children = _goal_children(gh, repo, goal)
+    children = _goal_children(gh, repo, goal, issue)
     held = _regression_attempt(children, regressed)
     if held is not None:
         return str(held.get("html_url", ""))
@@ -644,7 +710,10 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     a new ticket is filed. Past the cap it is admitted through the goal's one
     regression slot, with a comment on the goal saying why; ordinary briefs
     still count it and wait. A second brief for a regression already in
-    flight files nothing and returns that ticket."""
+    flight files nothing and returns that ticket.
+
+    When the goal home names a Trunk branch and no explicit --base is given,
+    the ticket uses that branch as its base."""
     _check_brief_args(title, body, lane, model, base)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
@@ -653,13 +722,17 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if refs is not None:
         body = body.rstrip("\n") + "\n\nRefs #%d\n" % refs
     _check_written_text(title + "\n" + body)
+    if refs is not None:
+        _check_rewritable(gh, repo, refs)
+    goal_issue: Optional[Dict[str, Any]] = None
+    if base is None:
+        goal_issue = _goal_issue(gh, repo, goal)
+        base = goal_trunk(goal_issue)
     full_body = _ticket_body(body, difficulty, model, base, not_before)
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
-                                 regresses)
-    if refs is not None:
-        _check_rewritable(gh, repo, refs)
-    _check_goal_capacity(gh, repo, goal)
+                                 regresses, goal_issue)
+    _check_goal_capacity(gh, repo, goal, goal_issue)
     issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
