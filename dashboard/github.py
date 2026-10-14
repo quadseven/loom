@@ -185,7 +185,10 @@ class TicketStore:
             data = dict(current["tickets"])
             errors = dict(current["errors"])
             stale = self._read_repos(data, errors) if not self._below_floor() else True
-            operator_items, human_counts = self._read_operator_items()
+            if self._below_floor():
+                operator_items, human_counts = self.operator_items, self.human_counts
+            else:
+                operator_items, human_counts = self._read_operator_items()
             snapshot = {"tickets": data, "errors": errors, "stale": stale, "ready": True}
             self.operator_items, self.human_counts = operator_items, human_counts
             with self._snapshot_lock:
