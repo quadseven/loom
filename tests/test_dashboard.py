@@ -68,6 +68,10 @@ class DashboardTest(unittest.TestCase):
                     cache_dir=self.cache.name, transport=local_transport)
         self.store = TicketStore(["example-owner/sample", "example-owner/failing"], gh=gh, budget_floor=5)
         self.server = make_server(port=0, store=self.store)
+        for _ in range(200):
+            if self.store.ready:
+                break
+            threading.Event().wait(0.01)
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
 
@@ -94,11 +98,24 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(row["goal"], "example-owner/sample#30")
         self.assertEqual(row["lane"], "codex-2")
         self.assertEqual(row["difficulty"], "medium")
+        self.assertIsNone(row["attempts"])
+        self.assertIsNone(row["rung"])
+        self.assertEqual(payload["auth"], "none")
         self.assertIn("example-owner/failing", payload["errors"])
         self.assertIn("403", payload["errors"]["example-owner/failing"])
 
-    def test_conditional_request_and_budget_floor_stale_response(self):
+    def test_requests_serve_background_snapshot_without_refreshing(self):
+        for _ in range(100):
+            if self.store.ready:
+                break
+            threading.Event().wait(0.01)
+        before = len(self.api_calls)
         self.get_json("/api/tickets")
+        self.get_json("/")
+        self.assertEqual(len(self.api_calls), before)
+
+    def test_conditional_request_and_budget_floor_stale_response(self):
+        self.store.refresh()
         self.store.budget_floor = 20
         before = len(self.api_calls)
         payload = self.get_json("/api/tickets")
@@ -113,6 +130,16 @@ class DashboardTest(unittest.TestCase):
         conditional.refresh()
         conditional.refresh()
         self.assertEqual(self.api_calls[-1]["etag"], '"snapshot-1"')
+
+    def test_part_of_only_is_goal_and_indentation_is_allowed(self):
+        from dashboard.github import ticket_record
+        row = ticket_record("example-owner/sample", {
+            "body": "    Part of #30\nRefs #31", "labels": [],
+        })
+        self.assertEqual(row["goal"], "example-owner/sample#30")
+        self.assertIsNone(ticket_record("example-owner/sample", {
+            "body": "Refs #31", "labels": [],
+        })["goal"])
 
     def test_routes_and_unknown_path(self):
         self.get_json("/api/tickets")

@@ -41,17 +41,13 @@ def _handler_for(state):
             if path == "/readyz":
                 return self.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
             if path == "/api/tickets":
-                state.refresh()
                 return self.send_json(200, state.response())
             if path in ("/", "/tickets"):
-                state.refresh()
                 tickets = state.response()["tickets"]
                 data = tickets if path == "/" else _ticket_page(state, parsed)
                 return self.send_page(self.ticket_list(data))
             detail = _ticket_detail(state, path)
             if detail is not None:
-                state.refresh()
-                detail = _ticket_detail(state, path)
                 return self.send_page(detail[0], detail[1])
             return self.send_text(404, "not found")
 
@@ -96,4 +92,12 @@ def _handler_for(state):
 
 def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     state = store or TicketStore()
-    return ThreadingHTTPServer((host, port), _handler_for(state))
+
+    class DashboardHTTPServer(ThreadingHTTPServer):
+        def server_close(self):
+            state.stop_background()
+            super().server_close()
+
+    server = DashboardHTTPServer((host, port), _handler_for(state))
+    state.start_background()
+    return server
