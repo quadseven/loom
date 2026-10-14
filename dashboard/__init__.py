@@ -1,1 +1,1 @@
-"""Shared HTML shell for the Loom dashboard."""
+"""A small, server-rendered Loom ticket dashboard, with a shared HTML shell."""
