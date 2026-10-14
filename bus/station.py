@@ -117,6 +117,8 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 REPORT_CHECK = 300
 REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
+# A backlog goal home is triaged at most this often.
+TRIAGE_INTERVAL = 3600
 # Through the bot, a report is one short line (the goal's short name and the
 # report's first line) with a thread on it holding the full report.
 SHORT_NAME_RE = re.compile(r"^[ \t]*Short name:[ \t]*(\S.*?)[ \t]*$", re.M | re.I)
@@ -2268,6 +2270,61 @@ class Station:
         ledger["_checked"] = self.now
         _write_json(path, ledger)
 
+    # -- backlog triage --------------------------------------------------
+    def triage_backlogs(self) -> None:
+        """Run brain.triage once an hour on every backlog goal home.
+
+        A backlog goal is the goal home onboard opens: its title starts with
+        "Backlog:". The last run time per goal is kept in triage.json so a
+        restart does not repeat a run. Goal homes are re-read at most once an
+        hour, so a pass that does no triage costs no extra GitHub calls."""
+        path = os.path.join(self.state, "triage.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        scanned = state.get("_scanned")
+        scan_due = (not isinstance(scanned, (int, float)) or isinstance(scanned, bool)
+                    or not 0 <= self.now - scanned < TRIAGE_INTERVAL)
+        goals: Dict[str, Tuple[str, int, Any]] = {}
+        if scan_due:
+            try:
+                homes = self._goal_homes()
+            except (GitHubError, OSError) as err:
+                _say("could not list goal homes for triage: %s" % err)
+                return
+            for repo, goal in homes:
+                title = str(goal.get("title") or "")
+                if not title.startswith("Backlog:"):
+                    continue
+                number = int(goal["number"])
+                key = "%s#%d" % (repo, number)
+                goals[key] = (repo, number, state.get(key))
+            state = {k: v for k, v in state.items()
+                     if k == "_scanned" or k in goals}
+            state["_scanned"] = self.now
+        else:
+            for key, last in state.items():
+                if key == "_scanned":
+                    continue
+                repo, num = key.rsplit("#", 1)
+                goals[key] = (repo, int(num), last)
+        for key, (repo, number, last) in goals.items():
+            if (isinstance(last, (int, float)) and not isinstance(last, bool)
+                    and 0 <= self.now - last < TRIAGE_INTERVAL):
+                continue
+            try:
+                lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("triage %s failed: %s" % (key, err))
+                continue
+            queued = sum(1 for line in lines if " queued under #" in line)
+            triage_count = sum(1 for line in lines if " loom:triage" in line)
+            held = sum(1 for line in lines if " held:" in line)
+            _say("triage %s: %d queued, %d triage, %d held" % (
+                key, queued, triage_count, held))
+            state[key] = self.now
+        _write_json(path, state)
+
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
         """(ledger key, brain tick start or None, body builder) for every
@@ -3039,7 +3096,7 @@ class Station:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.post_metrics,
+                     self.forward_reports, self.triage_backlogs, self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
                      self.run_factory):
             if self._deferred():
