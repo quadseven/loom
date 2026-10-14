@@ -13,6 +13,11 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   lane default (`LOOM_<LANE>_MODEL`). The PR footer names the lane and the
   model. A model outside the lane's family is refused; the `openrouter`,
   `zen` and `zai` lanes run free models only.
+- A lane may set LOOM_<SLOT>_MODELS to an ordered, space-separated model
+  list. Unpinned briefs use the first model not currently limited. A provider
+  quota records a reset for that model; the lane remains available while
+  another model is ready. A brief with a Model: line always keeps that model.
+  Account-wide out-of-credit limits still hold the lane.
 - Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
@@ -232,8 +237,18 @@ spread target. Use the keys in `.env.example` as setup placeholders.
 The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
 its previous metrics comments can be trusted for the streak.
 
-Reports: the station also reads comments on open `loom:goal` issues in each
-`LOOM_REPOS` repo. On first run it records the newest report comment per repo
+Reports: by default the station sends a digest, not each report:
+`LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
+At each time it sends one message: every goal home whose latest report since
+the last digest says something moved, as its short name, the report's first
+line and a link; a count of the goal homes where nothing moved; and the
+factory's daily numbers, which then no longer go out on their own. Each time
+is sent once, and a failed send is tried again on the next pass. Switching
+the digest on sends nothing until the next digest time. Setting
+`LOOM_REPORT_DIGEST_TIMES` empty forwards each report as below.
+
+Each report on its own: the station also reads comments on open `loom:goal`
+issues in each `LOOM_REPOS` repo. On first run it records the newest report comment per repo
 without sending old reports; later `<!-- loom:report v1 -->` comments from
 `LOOM_BRIEF_AUTHORS` are sent to the same webhook, without a mention. A
 successful send advances the per-repo ledger, while a failed send is retried

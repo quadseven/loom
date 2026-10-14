@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
 from . import change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
-from .labels import ESCALATION, LANES, rung_lanes
+from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
@@ -1165,10 +1165,18 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
                      model: Optional[str] = None) -> None:
     if state not in STATES:
         raise ValueError("invalid state")
-    if lane is not None and (state != "briefed" or lane not in LANES):
-        raise ValueError("lane is valid only for briefed and must be known")
+    if lane is not None:
+        if lane not in LANES:
+            raise ValueError("lane is valid only for briefed and must be known")
+        if lane in REMOTE_LANES:
+            if state != "queued":
+                raise ValueError("remote lane %s only works with --to queued" % lane)
+        elif state == "queued":
+            raise ValueError("local lane %s: use --to briefed instead" % lane)
+        elif state != "briefed":
+            raise ValueError("lane is valid only for briefed and must be known")
     if model is not None and state != "briefed":
-        raise ValueError("model is valid only for briefed")
+        raise ValueError("model is valid only for briefing")
     _check_model(model)
     if note is not None:
         _check_written_text(note)
@@ -1243,6 +1251,31 @@ def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
     return comment
 
 
+def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
+    owner = repo.split("/", 1)[0]
+    found = gh.paginate("/repos/%s/pulls?state=all&head=%s"
+                        % (repo, quote("%s:%s" % (owner, branch), safe="")))
+    for p in found:
+        if isinstance(p, dict) and (p.get("state") == "open"
+                                    or p.get("merged_at") is not None
+                                    or p.get("merged") is True):
+            return p
+    return None
+
+
+def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
+                        lane: str) -> None:
+    """Refuse a queued move to a remote lane that the lane could never claim:
+    a private repo for a public-only lane, or a ticket whose branch already
+    has a pull request (a fix round, which remote lanes do not run)."""
+    repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+        raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
+    branch = tickets.branch_for(number, str(issue.get("title") or ""))
+    if _open_or_merged_pull(gh, repo, branch) is not None:
+        raise ValueError("ticket branch %s already has a pull request" % branch)
+
+
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
          record: Optional[Dict[str, Any]] = None,
@@ -1256,7 +1289,9 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
-    if lane is not None:
+    if state == "queued" and lane in REMOTE_LANES:
+        _check_remote_queue(gh, repo, number, issue, lane)
+    if lane is not None and state == "briefed":
         from .station import model_lanes
         body = str(issue.get("body") or "").split("\n\n", 1)[0]
         match = re.search(r"^Model:\s*(\S+)\s*$", body, re.M)
@@ -1724,6 +1759,8 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     another lane and model when given (the body's Model: line is rewritten)."""
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
+    if lane is not None and lane in REMOTE_LANES:
+        raise ValueError("remote lane %s only works with --to queued" % lane)
     _check_model(model)
     _check_written_text(notes)
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}

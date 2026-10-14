@@ -137,9 +137,13 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
 TIERS: Dict[str, Tuple[str, ...]] = {
-    "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai",
-             "zen", "zai", "agy", "muse"),
-    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC + ("muse",),
+    # The operator's priority (2026-10-14): Muse and agy first on public
+    # repos, so their allowances are spent before the rest. Both are public
+    # only, so a private repo's ticket still starts at spark or codex.
+    "easy": ("muse", "agy", "spark", "spark-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+             "openrouter", "workersai", "zen", "zai"),
+    "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
+               "opencode-go-4") + ANTHROPIC,
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
@@ -622,19 +626,22 @@ class Factory:
         return self._up(lane) and self.load.get(lane, 0) == 0
 
     def _tier_move(self, repo: str, issue: Dict[str, Any],
-                   old: str = "") -> Tuple[Optional[str], str]:
+                   old: str = "", allow_remote: bool = True) -> Tuple[Optional[str], str]:
         """(lane, fallback) for a tier move off lane `old`: the first free lane
         of the ticket's tier, with fallback ""; else, when no lane of its tier
         is up, the first free lane of its FALLBACK tiers in order, with
         fallback saying so. (None, "") when it should wait."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
-        own = [x for x in lanes_of(difficulty, private) if x != old]
+        own = [x for x in lanes_of(difficulty, private)
+               if x != old and (allow_remote or x not in REMOTE_LANES)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._up(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
-            lane = next((x for x in lanes_of(tier, private) if x != old and self._free(x)), None)
+            fallback_lanes = [x for x in lanes_of(tier, private)
+                              if x != old and (allow_remote or x not in REMOTE_LANES)]
+            lane = next((x for x in fallback_lanes if self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
         return None, ""
@@ -817,8 +824,17 @@ class Factory:
             if self._climb(repo, issue, comments, why) is None:
                 self._give_up(repo, issue, why)
                 return
-        self.fix(self.gh, repo, int(pr["number"]), (repo, number),
-                 TEST_NOTES if no_test else FIX_NOTES)
+        lane = None
+        if _lane(issue) in REMOTE_LANES:
+            lane, _ = self._tier_move(repo, issue, allow_remote=False)
+            if lane is None:
+                lane = LADDER[0][0][0]
+        if lane is not None:
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
+                     TEST_NOTES if no_test else FIX_NOTES, lane=lane)
+        else:
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
+                     TEST_NOTES if no_test else FIX_NOTES)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
@@ -1095,7 +1111,7 @@ class Factory:
         if rung:
             lane = next((x for x in LADDER[rung - 1][0] if x != old and self._free(x)), None)
         else:
-            lane, fallback = self._tier_move(repo, issue, old)
+            lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None:
             _say("%s#%d waits on lane %s, at a limit: no free lane in its %s"
                  % (repo, number, old, "rung" if rung else "tier"))

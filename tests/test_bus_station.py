@@ -2483,6 +2483,89 @@ class HumanDigestTest(AsksTest):
             REPO, "- B u2", "  Ask."])
 
 
+class ReportDigestTest(Base):
+    """Two digests a day (operator, 2026-10-14) instead of every report."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.webhook_ssm = "/example/webhook"
+        self.settings.report_digest = ((10, 0), (21, 0))
+        self.settings.authors = list(AUTHORS)
+        self.sent = []
+        day = time.localtime()
+        self.base = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 0, 0, 0, 0, 0, -1))
+
+    def at(self, hour, minute=0, days=0):
+        gh = GitHub("token", transport=self.fake)
+        station.Station(gh, self.settings, now=self.base + days * 86400 + hour * 3600 + minute * 60,
+                        read_secret=lambda n, r: URL,
+                        post=lambda url, payload: self.sent.append(payload)).run_pass()
+
+    def goal(self, number, title):
+        self.fake.add(number, title=title, state="goal")
+        self.fake.issues[number]["labels"] = [{"name": "loom:goal"}]
+
+    def report(self, number, ident, first):
+        self.fake.comments[number].append({"id": ident, "body": station.REPORT_MARKER + "\n" + first + "\nmore",
+            "user": {"login": AUTHORS[0]},
+            "html_url": "https://github.com/%s/issues/%d#issuecomment-%d" % (REPO, number, ident)})
+
+    def test_one_digest_at_each_time_lists_movers_and_counts_quiet_goals(self):
+        self.goal(40, "Goal forty")
+        self.goal(41, "Goal forty-one")
+        self.goal(42, "Goal forty-two")
+        self.at(9, 0)            # switching on before 10:00 sends nothing
+        self.at(9, 30)
+        self.report(40, 100, "2 merged, 1 verified since the last report.")
+        self.report(41, 101, "Nothing moved since the last report.")
+        self.report(41, 102, "Nothing moved since the last report.")
+        self.at(9, 59)
+        self.assertEqual(self.sent, [])
+        self.at(10, 1)
+        self.at(10, 30)          # the same time is never sent twice
+        self.assertEqual(len(self.sent), 1)
+        text = self.sent[0]["content"]
+        self.assertIn("Loom morning digest", text)
+        self.assertIn("Moving, 1 goal:", text)
+        self.assertIn("**Goal forty** 2 merged, 1 verified since the last report.", text)
+        self.assertIn("Quiet: 2 goals, nothing moved.", text)
+        self.assertNotIn("forty-one", text)
+        self.at(21, 5)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("Loom evening digest", self.sent[1]["content"])
+        self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
+
+    def test_each_report_is_not_forwarded_on_its_own(self):
+        self.goal(40, "Goal forty")
+        self.at(10, 1)           # first pass: records the time, sends nothing
+        for minute in range(2, 50, 6):
+            self.report(40, 200 + minute, "1 merged since the last report.")
+            self.at(10, minute)
+        self.assertEqual(self.sent, [])
+
+    def test_the_digest_carries_the_latest_daily_factory_numbers(self):
+        self.goal(40, "Goal forty")
+        self.settings.metrics_goal = "%s#40" % REPO
+        self.fake.comments[40].append({"id": 90, "body": "<!-- loom:metrics v1 -->\n2026-10-13: 3/9 pass; streak 0 day(s)",
+                                       "user": {"login": AUTHORS[0]}})
+        self.fake.comments[40].append({"id": 91, "body": "<!-- loom:metrics v1 -->\n2026-10-14: 4/9 pass; streak 0 day(s)",
+                                       "user": {"login": AUTHORS[0]}})
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=self.base + 10 * 3600, read_secret=lambda n, r: URL,
+                             post=lambda url, payload: None)
+        self.assertEqual(st._digest_factory_line(), "Factory 2026-10-14: 4/9 numbers pass; streak 0 of 7.")
+        self.settings.metrics_goal = ""
+        self.assertEqual(st._digest_factory_line(), "")
+
+    def test_digest_times_parse_and_turn_off(self):
+        self.assertEqual(station.parse_digest_times("10:00, 21:00"), ((10, 0), (21, 0)))
+        self.assertEqual(station.parse_digest_times("25:00 9:5 x"), ())
+        self.assertEqual(station.Settings.from_env({"LOOM_REPOS": REPO}).report_digest,
+                         ((10, 0), (21, 0)))
+        self.assertEqual(station.Settings.from_env({"LOOM_REPOS": REPO,
+                                                    "LOOM_REPORT_DIGEST_TIMES": ""}).report_digest, ())
+
+
 class ReportsTest(Base):
     def setUp(self):
         super().setUp()

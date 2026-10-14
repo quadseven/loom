@@ -34,6 +34,7 @@ from . import metrics
 from . import rewrite
 from . import revert
 from . import spend
+from . import usage
 from . import text as _text
 from . import tickets
 from . import transcripts
@@ -116,6 +117,11 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
 REPORT_CHECK = 300
+# The operator's two reading times (2026-10-14: "Twice a day. Morning and
+# evening. 10am and 9pm"): one digest of every goal's reports each, instead of
+# each report as it is posted. LOOM_REPORT_DIGEST_TIMES="" turns it off.
+DIGEST_TIMES = "10:00,21:00"
+DIGEST_FIRST_LOOKBACK = 12 * 3600
 REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
 # A backlog goal home is triaged at most this often.
@@ -228,6 +234,17 @@ IDLE_SCAN = 600
 CACHE_KEEP = 24 * 3600
 
 
+def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:
+    """Local HH:MM times from a comma or space separated list, sorted; any
+    entry that is not a valid time is left out."""
+    times = set()
+    for item in str(raw or "").replace(",", " ").split():
+        m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", item)
+        if m:
+            times.add((int(m.group(1)), int(m.group(2))))
+    return tuple(sorted(times))
+
+
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
@@ -248,8 +265,12 @@ class Settings:
                  rewrite_private_cmd: str = "",
                  self_repo: str = "",
                  invariant_goal: str = "",
-                 plan_check: str = invariants.DEFAULT_PLAN_CHECK) -> None:
+                 plan_check: str = invariants.DEFAULT_PLAN_CHECK,
+                 report_digest: Sequence[Tuple[int, int]] = ()) -> None:
         self.home = home
+        # Local times (hour, minute) to send one digest of every goal's
+        # reports; empty forwards each report as it is posted.
+        self.report_digest = tuple(report_digest)
         self.repos = repos
         self.authors = authors
         self.owners = owners
@@ -294,6 +315,7 @@ class Settings:
 
         def words(name: str) -> List[str]:
             return env.get(name, "").replace(",", " ").split()
+        report_digest = parse_digest_times(env.get("LOOM_REPORT_DIGEST_TIMES", DIGEST_TIMES))
         try:
             hour = int(env.get("LOOM_DIGEST_HOUR", "").strip() or 9)
         except ValueError:
@@ -321,6 +343,7 @@ class Settings:
                    webhook_ssm=env.get("LOOM_DISCORD_WEBHOOK_SSM", "").strip(),
                    mention=env.get("LOOM_DISCORD_MENTION", "").strip(),
                    digest_hour=hour,
+                   report_digest=report_digest,
                    region=env.get("LOOM_AWS_REGION", "").strip() or "us-east-1",
                    retry_max=retry_max,
                    channel_id=env.get("LOOM_DISCORD_CHANNEL_ID", "").strip(),
@@ -2533,8 +2556,135 @@ class Station:
             start = checked - REPORT_OVERLAP
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
 
+    def _due_digest(self) -> Optional[Tuple[str, str]]:
+        """(slot id, label) of the latest digest time today that has passed,
+        or None before the first one."""
+        local = time.localtime(self.now)
+        passed = [(h, m) for h, m in self.s.report_digest
+                  if (local.tm_hour, local.tm_min) >= (h, m)]
+        if not passed:
+            return None
+        h, m = passed[-1]
+        label = "morning" if h < 12 else ("afternoon" if h < 18 else "evening")
+        return "%s %02d:%02d" % (time.strftime("%Y-%m-%d", local), h, m), label
+
+    def _digest_lines(self, since: str, after_id: int = 0) -> Tuple[List[str], int, int]:
+        """One line per goal home whose latest report since `since` (and with
+        a comment id above after_id, so no report is told twice) says
+        something moved, the count of goal homes with nothing to say, and the
+        highest report id read."""
+        moving, quiet, top = [], 0, after_id
+        allowed = {a.lower() for a in self.s.authors}
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = self._goal_issues(repo)
+            latest: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+            for ident, issue, comment in self._report_comments(repo, issues, since):
+                author = str((comment.get("user") or {}).get("login") or "").lower()
+                if author in allowed and ident > after_id:
+                    latest[int(issue["number"])] = (issue, comment)
+                    top = max(top, ident)
+            quiet += len(issues) - len(latest)
+            for issue, comment in latest.values():
+                body = self._report_body(comment)
+                first = next((x.lstrip("#").strip() for x in body.splitlines()
+                              if x.lstrip("#").strip()), "")
+                if not first or first.lower().startswith("nothing moved"):
+                    quiet += 1
+                    continue
+                moving.append("- **%s** %s <%s>" % (
+                    self._short_name(issue), first[:SHORT_LINE_MAX],
+                    self._report_link(issue, comment)))
+        return moving, quiet, top
+
+    def _digest_factory_line(self) -> str:
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)",
+                           self.s.metrics_goal)
+        if not ref:
+            return ""
+        path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        dated = self._dated_metrics(path)
+        if not dated:
+            return ""
+        day = max(dated)
+        passed, streak = dated[day]
+        return "Factory %s: %d/9 numbers pass; streak %d of 7." % (day, passed, streak)
+
+    def _digest_send(self, text: str) -> bool:
+        """Every chunk of the digest to the channel, as the bot or through
+        the webhook; False when any chunk failed or the secret is unreadable."""
+        if self._bot_reports():
+            token = self._bot_token()
+            if token is None:
+                return False
+            for part in self._chunks(text):
+                ok, _ = self._bot(token, "POST", "/channels/%s/messages" % self.s.channel_id,
+                                  {"content": part, "allowed_mentions": {"parse": []},
+                                   "flags": SUPPRESS_EMBEDS})
+                if not ok:
+                    return False
+            return True
+        url = self._webhook()
+        if url is None:
+            return False
+        return all(self._send(url, part, mention=False) for part in self._chunks(text))
+
+    def send_report_digest(self) -> None:
+        """At each digest time, one message: the goals that moved since the
+        last digest with their report's first line and link, a count of the
+        quiet ones, and the factory's daily numbers. Sent once per time; a
+        failed send is tried again on the next pass."""
+        due = self._due_digest()
+        path = os.path.join(self.state, "reports.json")
+        ledger = _read_json(path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        if "_digest_slot" not in ledger:
+            # First pass with a digest: start from now, and count a digest
+            # time already past today as sent, so switching on mid-day sends
+            # nothing until the next digest time.
+            ledger["_digest_slot"] = due[0] if due else ""
+            ledger["_digest_since"] = self.now
+            _write_json(path, ledger)
+            return
+        if due is None:
+            return
+        slot, label = due
+        if ledger.get("_digest_slot") == slot:
+            return
+        last = ledger.get("_digest_since")
+        start = last if isinstance(last, (int, float)) and not isinstance(last, bool) \
+            else self.now - DIGEST_FIRST_LOOKBACK
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start))
+        seen = ledger.get("_digest_last_id")
+        after = seen if isinstance(seen, int) and not isinstance(seen, bool) else 0
+        moving, quiet, top = self._digest_lines(since, after)
+        lines = ["**Loom %s digest** (%s)" % (label, slot[11:])]
+        if moving:
+            lines.append("Moving, %d goal%s:" % (len(moving), "" if len(moving) == 1 else "s"))
+            lines += moving
+        else:
+            lines.append("No goal moved since the last digest.")
+        if quiet:
+            lines.append("Quiet: %d goal%s, nothing moved." % (quiet, "" if quiet == 1 else "s"))
+        factory_line = self._digest_factory_line()
+        if factory_line:
+            lines.append(factory_line)
+        if not self._digest_send("\n".join(lines)):
+            _say("report digest %s not sent; next pass tries again" % slot)
+            return
+        ledger["_digest_slot"] = slot
+        ledger["_digest_since"] = self.now
+        ledger["_digest_last_id"] = top
+        _write_json(path, ledger)
+        _say("sent the %s report digest: %d moving, %d quiet" % (label, len(moving), quiet))
+
     def forward_reports(self) -> None:
         if not (self.s.webhook_ssm or self._bot_reports()):
+            return
+        if self.s.report_digest:
+            self.send_report_digest()
             return
         path = os.path.join(self.state, "reports.json")
         ledger = _read_json(path, {})
@@ -3634,7 +3784,8 @@ class Station:
         dated = self._dated_metrics(path)
         if today not in dated:
             self._post_metrics_comment(path, today, dated)
-        if today in dated:
+        if today in dated and not self.s.report_digest:
+            # With a report digest the day's numbers ride in it instead.
             passed, streak = dated[today]
             line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
             self._metrics_notice(today, "discord", line)
@@ -3790,6 +3941,27 @@ class Station:
             self.prune_trees()
         except OSError as err:
             _say("prune_trees failed: %s" % err)
+        try:
+            records = usage.collect(self.s.home, now=self.now)
+            usage.write(self.s.home, records)
+            self.upload_usage_limits(records)
+        except OSError as err:
+            _say("could not write usage limits: %s" % err)
+
+    def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
+        """Send the current limits snapshot using the transcript upload token."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        url = self.s.transcript_url.removesuffix("/api/transcripts") + "/api/usage"
+        token = self._transcript_token()
+        if token is None:
+            return
+        try:
+            self.upload(url, token, records)
+        except UploadRefused as err:
+            _say("the dashboard refused the usage snapshot (%d)" % err.status)
+        except Exception as err:  # noqa: BLE001
+            _say("usage snapshot upload failed (%s)" % type(err).__name__)
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:

@@ -43,10 +43,16 @@ LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
 LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwen3.8-27b}"
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
 LOOM_SPARK_URL="${LOOM_SPARK_URL:-}"
+# The second spark slot's box (spark-2); empty uses LOOM_SPARK_URL.
+LOOM_SPARK_2_URL="${LOOM_SPARK_2_URL:-}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
+# The context and output window the spark endpoint serves (lanes/agent_sandbox.sh).
+LOOM_SPARK_CONTEXT="${LOOM_SPARK_CONTEXT:-32768}"
+LOOM_SPARK_OUTPUT="${LOOM_SPARK_OUTPUT:-4096}"
 export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
   LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
-  LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_MODEL
+  LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_MODEL \
+  LOOM_SPARK_CONTEXT LOOM_SPARK_OUTPUT
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
 # Checked before anything is installed.
@@ -62,7 +68,7 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
-  codex-2 opencode-go-2 opencode-go-3 opencode-go-4)
+  codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
@@ -128,7 +134,8 @@ done
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
 # with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
-# LOOM_DIGEST_HOUR, LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
+# LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
+# default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
 # ticket, default 2), and LOOM_DISCORD_CHANNEL_ID,
 # LOOM_DISCORD_BOT_TOKEN_SSM and LOOM_DISCORD_DEFAULT_GOAL (talking to the
 # brain from Discord, docs/LANES.md), and LOOM_ANTHROPIC_BUDGET_USD,
@@ -185,6 +192,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
+    <key>LOOM_REPORT_DIGEST_TIMES</key><string>$(xml "${LOOM_REPORT_DIGEST_TIMES-10:00,21:00}")</string>
     <key>LOOM_METRICS_GOAL</key><string>$(xml "${LOOM_METRICS_GOAL:-}")</string>
     <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
     <key>LOOM_RETRY_MAX</key><string>$(xml "${LOOM_RETRY_MAX:-}")</string>

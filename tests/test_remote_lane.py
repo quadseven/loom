@@ -1,4 +1,6 @@
 import base64
+import io
+import json
 import os
 import re
 import sys
@@ -149,6 +151,47 @@ class RemoteLaneTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "plan checks"):
             self.open_pr(gh)
         self.assertFalse([c for c in gh.calls if c[0] == "POST" and c[1].endswith("/pulls")])
+
+    def test_claim_skips_queued_ticket_whose_branch_has_a_pull_request(self):
+        gh = FakeGitHub()
+        gh.pulls = [{"number": 99, "state": "open"}]
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            got = lane.claim(gh, ["example/project"], now=1000)
+        self.assertIsNone(got)
+        self.assertIn("loom:queued", labels(gh))
+        self.assertNotIn("loom:running", labels(gh))
+        self.assertIn("scanned 1 repos, found 1 candidates", buf.getvalue())
+        self.assertIn("#4 skipped: branch loom/4-add-a-feature already has pull request #99", buf.getvalue())
+
+    def test_claim_with_no_repos_exits_2(self):
+        with mock.patch.dict(os.environ, {"LOOM_REPOS": ""}):
+            buf = io.StringIO()
+            with mock.patch("sys.stderr", buf):
+                code = lane.main(["claim", "--lane", "muse", "--repos", ""])
+            self.assertEqual(code, 2)
+            self.assertIn("error: claim requires --repos or LOOM_REPOS", buf.getvalue())
+
+    def test_claim_prints_stderr_line_per_run(self):
+        gh = FakeGitHub()
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            got = lane.claim(gh, ["example/project"], now=1000)
+        self.assertIsNotNone(got)
+        self.assertIn("scanned 1 repos, found 1 candidates", buf.getvalue())
+
+    def test_claim_command_prints_json_on_claim(self):
+        gh = FakeGitHub()
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch("bus.lane.token_from_env", return_value="dummy"):
+            with mock.patch("bus.lane.GitHub", return_value=gh):
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                    code = lane.main(["claim", "--lane", "muse", "--repos", "example/project"])
+        self.assertEqual(code, 0)
+        self.assertIn("scanned 1 repos, found 1 candidates", err.getvalue())
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["number"], 4)
 
 
 class TakesTest(unittest.TestCase):

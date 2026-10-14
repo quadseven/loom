@@ -305,15 +305,17 @@ Choose only lanes that lane status shows as available, by the ticket's
 Anthropic credits, easy work on the free lanes and Spark, the credit spent
 on hard work):
 
-- Easy: `spark` (the local vLLM coder, model `spark/...`, any repo, private
-  ones included) when lane status shows it available, else a free lane:
-  opencode-go, openrouter, workersai, or zen, zai, agy, opencode-go-4 and muse
-  on public repos only (opencode-go-4 is Muse Spark, which trains on prompts;
-  muse runs remotely).
+- Easy: on a public repo muse first, then agy (the operator's priority;
+  muse runs remotely); then `spark` and `spark-2` (the local coders, one per
+  Spark box, `LOOM_SPARK_URL` and `LOOM_SPARK_2_URL`, model `spark/...`, any
+  repo, private ones included) when lane status shows them available, else a
+  free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
+  opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
+  which trains on prompts).
   Never anthropic or claude for an easy ticket.
-- Medium: codex or opencode-go first (opencode-go-4 on public repos only); an
-  anthropic slot only when every codex and opencode-go slot already holds work;
-  then muse on public repos only.
+- Medium: on a public repo muse first, then agy; then codex or opencode-go
+  (opencode-go-4 on public repos only); an anthropic slot only when every
+  codex and opencode-go slot already holds work.
 - Hard: anthropic, claude or codex, never a free lane or spark. Keep the
   anthropic slots busy with hard work while the credit lasts.
 
