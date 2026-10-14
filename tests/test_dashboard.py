@@ -102,8 +102,11 @@ class DashboardTest(unittest.TestCase):
         self.assertIsNone(row["rung"])
         self.assertEqual(payload["auth"], "none")
         self.assertIn("example-owner/failing", payload["errors"])
-        self.assertTrue(payload["errors"]["example-owner/failing"].endswith(": stub read failure"))
-        self.assertIn("403", payload["errors"]["example-owner/failing"])
+        # The whole reason: the request, GitHub's status and its own message.
+        self.assertEqual(
+            payload["errors"]["example-owner/failing"],
+            "GET /repos/example-owner/failing/issues?labels=loom%3Aticket&state=all&per_page=100"
+            " -> 403: stub read failure")
 
     def test_requests_serve_background_snapshot_without_refreshing(self):
         for _ in range(100):
