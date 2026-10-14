@@ -200,6 +200,11 @@ echo fixed > fix.txt
 
 # opencode 2.0 says which major version it is on --version.
 FAKE_OPENCODE_2 = FAKE_OPENCODE.replace('echo "1.18.4"', 'echo "opencode v2.0.28"')
+FAKE_OPENCODE_2 = FAKE_OPENCODE_2.replace(
+    '[ "${1:-}" = --version ] && { echo "opencode v2.0.28"; exit 0; }',
+    '[ "${1:-}" = --version ] && { echo "opencode v2.0.28"; exit 0; }\n'
+    '[ "${1:-}" = serve ] && { printf "opencode %s\\n" "$*" >> "$TMPDIR/agent.log"; '
+    'echo $$ > "$TMPDIR/server.pid"; exec /bin/sleep 30; }')
 
 # Fake aws: `ssm get-parameter --name N` prints $FAKE_SECRET_<N with / as _>
 # or fails like a missing parameter.
@@ -1549,10 +1554,38 @@ cat > /dev/null
         return str(path)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
-    def test_a_slot_on_opencode_2_runs_it_standalone(self):
+    def test_a_slot_on_opencode_2_uses_a_private_server_port(self):
+        self.write_tool(self.bin / "nc", "#!/bin/sh\nexit 0\n")
         run = self.slot_run("opencode-go-3", LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
-        self.assertIn("run --standalone --auto -m opencode-go/deepseek-v4.1-flash", run)
+        self.assertRegex(run, r"serve --hostname 127\.0\.0\.1 --port 5[0-9]{4}")
+        self.assertRegex(run, r"run --server http://127\.0\.0\.1:5[0-9]{4} --auto -m opencode-go/deepseek-v4\.1-flash")
+        self.assertNotIn("run --port", run)
         self.assertIn("secret=denied", run)
+        self.assertNotIn("OPENCODE_PASSWORD", run)
+        self.assertIn('(deny network-outbound (remote ip "localhost:*"))', run)
+        self.assertRegex(run, r'\(allow network-outbound \(remote ip "localhost:5[0-9]{4}"\)\)')
+        pid_file = self.loom / "run" / "opencode-go-3-home" / "tmp" / "server.pid"
+        self.assertTrue(pid_file.exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+
+    @unittest.skipUnless(os.environ.get("LOOM_TEST_OPENCODE2"),
+                         "set LOOM_TEST_OPENCODE2 to a real opencode v2 binary")
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "requires macOS sandbox-exec")
+    def test_real_opencode_2_reaches_the_model_step_inside_the_sandbox(self):
+        binary = os.environ["LOOM_TEST_OPENCODE2"]
+        inbox = self.loom / "briefs" / "opencode-go-3"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "T042-fix-the-thing.md").write_text(
+            BRIEF.replace("Lane: codex", "Lane: opencode-go-3"))
+        result = self.run_lane(
+            "opencode-go-3", LOOM_OPENCODE_GO_3_OPENCODE=binary,
+            LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash",
+            LOOM_OPENCODE_GO_3_KEY_SSM="/k/oc", FAKE_SECRET__k_oc="invalid-test-key",
+            AGENT_TIMEOUT="30")
+        output = result.stdout + result.stderr + self.calls()
+        self.assertIn("model", output.lower())
+        self.assertNotIn("transport:", output.lower())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_sibling_slot_keeps_the_default_opencode(self):
