@@ -176,6 +176,7 @@ LANE_MODELS = {
     "zen": ["opencode/*-free"],
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],
+    "spark": ["spark/?*"],
     "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
 }
 # Operator messages in the Discord channel become notes on a goal home, and
@@ -574,6 +575,13 @@ def lane_takes_model(lane: str, model: str) -> bool:
     if lane == "codex":
         return not any(fnmatch.fnmatchcase(model, p) for p in CLAUDE_MODELS)
     return any(fnmatch.fnmatchcase(model, p) for p in LANE_MODELS.get(lane, []))
+
+
+def model_lanes(model: str) -> List[str]:
+    """Compatible lanes, with the model ladder's lanes first when applicable."""
+    rung = next((lanes for lanes, rung_model in factory.LADDER if rung_model == model), ())
+    return [lane for lane in dict.fromkeys([*rung, *LANES])
+            if lane not in REMOTE_LANES and lane_takes_model(lane, model)]
 
 
 def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
@@ -1051,15 +1059,17 @@ class Station:
         free = [lane for lane in LANES if lane not in REMOTE_LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         if not free:
+            self._claim_candidates([])
             self._record_slot_sample(False)
             return
         by_lane = self._claim_candidates(free)
         for lane in free:
-            self._claim_for_lane(lane, by_lane[lane])
+            self._claim_for_lane(lane, by_lane[lane], free)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in free))
 
-    def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]]) -> None:
+    def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
+                        free: List[str]) -> None:
         """Claim the oldest ticket for one free lane that can be claimed."""
         # A revert of a red default branch (bus/revert.py) goes first, then
         # a regression fix (bus.brain brief --regresses).
@@ -1069,7 +1079,7 @@ class Station:
             str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
         for repo, issue in cands:
             try:
-                if self._try_ticket(repo, lane, issue):
+                if self._try_ticket(repo, lane, issue, free):
                     return
             except (GitHubError, OSError) as err:
                 _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
@@ -1086,10 +1096,27 @@ class Station:
                 _say("could not list %s: %s" % (repo, err))
                 continue
             for issue in found:
-                lane = _lane_of(issue)
-                if lane in by_lane:
-                    by_lane[lane].append((repo, issue))
+                self._add_claim_candidate(by_lane, free, repo, issue)
         return by_lane
+
+    def _add_claim_candidate(self, by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]],
+                             free: List[str], repo: str, issue: Dict[str, Any]) -> None:
+        lane = _lane_of(issue)
+        if lane in by_lane:
+            by_lane[lane].append((repo, issue))
+            return
+        if not lane:
+            return
+        model = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+        if not model or lane_takes_model(lane, model.group(1)):
+            return
+        if free:
+            by_lane[free[0]].append((repo, issue))
+            return
+        try:
+            self._try_ticket(repo, lane, issue, free)
+        except (GitHubError, OSError) as err:
+            _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
 
     def _record_slot_sample(self, idle: bool) -> None:
         if not self.s.metrics_goal:
@@ -1099,7 +1126,8 @@ class Station:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"at": self.now, "idle": idle}) + "\n")
 
-    def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
+    def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
+                    free: List[str]) -> bool:
         if self._skip_known(repo, issue):
             return False
         try:
@@ -1116,14 +1144,42 @@ class Station:
             self._refuse(repo, issue, reason)
             return False
         fresh = self._issue(repo, int(issue["number"]))
-        if not self._still_ours(fresh, lane):
+        labelled_lane = _lane_of(issue)
+        if not self._still_ours(fresh, labelled_lane or lane):
             _say("%s#%s changed before the claim; leaving it" % (repo, issue["number"]))
             return False
         if (fresh.get("body") or "") != (issue.get("body") or "") \
                 or fresh.get("updated_at") != issue.get("updated_at"):
             _say("%s#%s changed since it was checked; next pass" % (repo, issue["number"]))
             return False
+        model = headers.get("Model", "")
+        if model and labelled_lane and not lane_takes_model(labelled_lane, model):
+            lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
+            if lane is None:
+                return False
         return self._claim(repo, lane, fresh)
+
+    def _route_model_claim(self, repo: str, issue: Dict[str, Any], lane: str,
+                           model: str, free: List[str]) -> Optional[str]:
+        target = next((candidate for candidate in model_lanes(model)
+                       if candidate in free and self._inbox_empty(candidate)
+                       and (not needs_public_repo(candidate, model) or self._public(repo))), None)
+        number = int(issue["number"])
+        names = [name for name in _label_names(issue) if not name.startswith("lane:")]
+        if target is None:
+            names = [name for name in names if name != BRIEFED] + ["loom:queued"]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": names})
+            self._comment(repo, number, "Model %s waits for a free compatible lane." % model)
+            _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
+            return None
+        names.append("lane:" + target)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names})
+        issue["labels"] = [{"name": name} for name in names]
+        _say("moved %s#%d from lane %s to lane %s for model %s"
+             % (repo, number, lane, target, model))
+        return target
 
     # -- outcomes -------------------------------------------------------
     def _finished_briefs(self):

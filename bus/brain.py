@@ -1253,6 +1253,15 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
+    if lane is not None:
+        from .station import model_lanes
+        body = str(issue.get("body") or "").split("\n\n", 1)[0]
+        match = re.search(r"^Model:\s*(\S+)\s*$", body, re.M)
+        effective_model = model or (match.group(1) if match else None)
+        if effective_model and lane not in model_lanes(effective_model):
+            raise ValueError("lane %s cannot run model %s; compatible lanes: %s" %
+                             (lane, effective_model,
+                              ", ".join(model_lanes(effective_model)) or "none"))
     kept = _moved_labels(_labels(issue), state, lane)
     if record is not None:
         comment = _proof_comment(gh, repo, issue, record)

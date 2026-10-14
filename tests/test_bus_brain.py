@@ -466,6 +466,15 @@ class BrainTests(unittest.TestCase):
         brain.move(gh, REPO, 8, "briefed", "codex")
         self.assertEqual(fake.calls[1][2], {"labels": ["loom:ticket", "custom", "loom:briefed", "lane:codex"]})
 
+    def test_move_refuses_a_lane_that_cannot_run_the_model(self):
+        issue = {"state": "open", "body": "Model: claude-sonnet-5-5\n\nWork.",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:briefed"},
+                            {"name": "lane:claude"}]}
+        fake = Fake(reply(200, issue))
+        with self.assertRaisesRegex(ValueError, "compatible lanes: claude, anthropic"):
+            brain.move(GitHub("t", transport=fake), REPO, 8, "briefed", "opencode-go-3")
+        self.assertEqual(len(fake.calls), 1)
+
     def test_move_refusals(self):
         for labels in ([{"name": "loom:ticket"}, {"name": "loom:queued"}],):
             fake = Fake(reply(200, {"state": "open", "labels": labels}))
