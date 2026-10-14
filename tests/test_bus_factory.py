@@ -846,6 +846,20 @@ class Queued(Base):
         worker.assign_queued()
         return worker
 
+    def test_queued_ladder_model_uses_a_compatible_lane(self):
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.queued(7, body=body)
+        self.assign(available=["opencode-go-3", "claude"])
+        self.assertEqual(self.lane(7), "claude")
+        self.assertEqual(self.gh.issues[7]["body"], body)
+
+    def test_queued_ladder_model_waits_when_only_incompatible_lanes_are_free(self):
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.queued(7, body=body)
+        self.assign(available=["opencode-go-3"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertEqual(self.gh.issues[7]["body"], body)
+
     def test_private_medium_uses_the_least_loaded_available_tier_lane(self):
         self.queued(7)
         with mock.patch("bus.factory._say") as say:
