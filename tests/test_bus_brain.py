@@ -2001,5 +2001,15 @@ class RegressionSlotTests(unittest.TestCase):
         self.assertEqual(args.regresses, 5)
 
 
+class AnsweredStatusTests(unittest.TestCase):
+    def test_answered_tickets_have_a_brain_status_section(self):
+        issue = {"number": 17, "title": "Diagnosis", "created_at": "2026-10-14T00:00:00Z",
+                 "labels": [{"name": label} for label in
+                            ("loom:ticket", "loom:answered", "lane:codex")]}
+        lines = brain._ticket_lines([issue], datetime(2026, 10, 14, tzinfo=timezone.utc))
+        index = lines.index("#### answered")
+        self.assertEqual(lines[index + 1], "- #17 Diagnosis - lane:codex - 0h")
+
+
 if __name__ == "__main__":
     unittest.main()
