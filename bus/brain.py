@@ -1096,11 +1096,17 @@ def _review_check_name(env: Optional[Dict[str, str]] = None) -> str:
 
 
 def _review_check_passed(gh: GitHub, repo: str, sha: str, name: str) -> bool:
-    """The review check has a successful run on this commit."""
+    """The review check has a successful run on this commit. A read that
+    fails, or comes back malformed, counts as not passed: a sensitive merge
+    refuses with its named error instead of dying on a stranger's."""
     from . import factory
-    runs = (gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
-            or {}).get("check_runs") or []
-    return any(r.get("name") == name and r.get("conclusion") in factory.GREEN for r in runs)
+    try:
+        runs = (gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
+                or {}).get("check_runs") or []
+    except Exception:
+        return False
+    return any(isinstance(r, dict) and r.get("name") == name
+               and r.get("conclusion") in factory.GREEN for r in runs)
 
 
 def _open_critical_finding(details: Dict[str, Any], bot: str) -> bool:

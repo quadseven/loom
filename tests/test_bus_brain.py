@@ -386,6 +386,26 @@ class BrainTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8)
         self.assertIn("review check", str(caught.exception))
 
+    def test_merge_refuses_a_sensitive_pr_when_the_check_read_fails(self):
+        # The check-runs read itself fails: the merge refuses with the named
+        # review-check error, not the stranger's GitHubError the read raised.
+        pr, query = self._sensitive_replies()
+        fake = Fake(pr, query, reply(500, {"message": "boom"}))
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("review check", str(caught.exception))
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_sensitive_pr_when_the_check_read_is_malformed(self):
+        # A malformed check-runs answer is a check that did not pass, not a
+        # crash: the reply is a list where the reader expects an object.
+        pr, query = self._sensitive_replies()
+        fake = Fake(pr, query, reply(200, [1]))
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("review check", str(caught.exception))
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_a_sensitive_pr_with_a_passed_review_and_no_high_finding_merges(self):
         pr, query = self._sensitive_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
