@@ -2402,13 +2402,16 @@ class Station:
                     if self._within(t, 3600)]
             if kept:
                 state["goals"][key] = kept
+        self._rewrite_recent_entries(saved, state)
+        return state
+
+    def _rewrite_recent_entries(self, saved: Dict[str, Any], state: Dict[str, Any]) -> None:
         for key, entry in (saved.get("issues") or {}).items():
             if isinstance(entry, dict) and self._within(entry.get("at"), REWRITE_RETRY):
                 state["issues"][key] = entry
         for key, entry in (saved.get("told") or {}).items():
             if isinstance(entry, list) and len(entry) == 2 and self._within(entry[1], 3600):
                 state["told"][key] = entry
-        return state
 
     def _pass_over(self, state: Dict[str, Any], key: str, why: str) -> None:
         """Say why a goal home gets no rewrite, once an hour per reason."""

@@ -89,8 +89,11 @@ class Repo:
             return self.reply(200, found)
         if method == "POST" and rest == "issues":
             return self.create(payload)
+        return self.issue_call(method, rest, path, payload)
+
+    def issue_call(self, method, rest, path, payload):
         parts = rest.split("/")
-        if parts[0] != "issues" or not parts[1].isdigit():
+        if len(parts) < 2 or parts[0] != "issues" or not parts[1].isdigit():
             raise AssertionError("unexpected %s %s" % (method, path))
         n, sub = int(parts[1]), "/".join(parts[2:])
         if method == "GET" and sub == "":
@@ -106,6 +109,9 @@ class Repo:
         if method == "POST" and sub == "comments":
             self.comments[n].append({"body": payload["body"]})
             return self.reply(201, {})
+        return self.label_call(method, path, n, sub, payload)
+
+    def label_call(self, method, path, n, sub, payload):
         if method == "POST" and sub == "labels":
             for name in payload["labels"]:
                 if name not in self.names(n):
@@ -170,7 +176,7 @@ class RewriteTests(AgentCase):
     def assert_original_untouched(self, repo, number):
         # Only a comment, labels added and loom:triage removed: never a PATCH
         # (close, retitle, edit) and never a PUT replacing its labels.
-        for method, path, payload in repo.writes(number):
+        for method, path, _ in repo.writes(number):
             if method == "POST":
                 self.assertTrue(path.endswith(("/comments", "/labels")), path)
             else:

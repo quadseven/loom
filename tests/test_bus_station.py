@@ -157,15 +157,18 @@ class FakeGitHub:
             return self._issues_and_status(method, rest, parts.query, headers, data)
         m = re.match(r"issues/(\d+)/labels/(.+)$", rest)
         if m and method == "DELETE":
-            n, name = int(m.group(1)), unquote(m.group(2))
-            self.issues[n]["labels"] = [x for x in self.issues[n]["labels"] if x["name"] != name]
-            return reply(200, [])
+            return self._delete_label(int(m.group(1)), unquote(m.group(2)))
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def _delete_label(self, number, name):
+        self.issues[number]["labels"] = [x for x in self.issues[number]["labels"]
+                                         if x["name"] != name]
+        return reply(200, [])
 
     def _post_page(self, data):
         if self.page_error:
