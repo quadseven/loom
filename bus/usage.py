@@ -40,37 +40,47 @@ def _utc_epoch(value: Any, now: float, relative: bool = True) -> Optional[str]:
     return None
 
 
-def codex_records(lanes: List[str], sessions: Path, now: float) -> List[Dict[str, Any]]:
+def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
+    info = item.get("payload", item) if isinstance(item, dict) else {}
+    if isinstance(info, dict) and isinstance(info.get("info"), dict):
+        info = info["info"]
+    limits = info.get("rate_limits") if isinstance(info, dict) else None
+    if not isinstance(limits, dict):
+        return {}
+    found = {}
+    for key, label in (("primary", "5-hour"), ("secondary", "weekly")):
+        window = limits.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = window.get("used_percent")
+        if isinstance(used, (int, float)) and not isinstance(used, bool):
+            reset = window.get("resets_at")
+            relative = reset is None
+            if reset is None:
+                reset = window.get("resets_in_seconds")
+            if reset is None and isinstance(window.get("window_minutes"), (int, float)):
+                reset = window["window_minutes"] * 60
+            found[label] = {"used": float(used), "reset": _utc_epoch(reset, now, relative)}
+    return found
+
+
+def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]]:
     found: Dict[str, Dict[str, Any]] = {}
     for path in sorted(sessions.glob("**/*.jsonl")):
         try:
             with path.open(encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     try:
-                        item = json.loads(line)
+                        found.update(_codex_limits(json.loads(line), now))
                     except ValueError:
                         continue
-                    info = item.get("payload", item) if isinstance(item, dict) else {}
-                    if isinstance(info, dict) and isinstance(info.get("info"), dict):
-                        info = info["info"]
-                    limits = info.get("rate_limits") if isinstance(info, dict) else None
-                    if not isinstance(limits, dict):
-                        continue
-                    for key, label in (("primary", "5-hour"), ("secondary", "weekly")):
-                        window = limits.get(key)
-                        if not isinstance(window, dict):
-                            continue
-                        used = window.get("used_percent")
-                        if isinstance(used, (int, float)) and not isinstance(used, bool):
-                            reset = window.get("resets_at")
-                            relative = reset is None
-                            if reset is None:
-                                reset = window.get("resets_in_seconds")
-                            if reset is None and isinstance(window.get("window_minutes"), (int, float)):
-                                reset = window["window_minutes"] * 60
-                            found[label] = {"used": float(used), "reset": _utc_epoch(reset, now, relative)}
         except OSError:
             continue
+    return found
+
+
+def codex_records(lanes: List[str], sessions: Path, now: float) -> List[Dict[str, Any]]:
+    found = _read_codex_sessions(sessions, now)
     return [_record("codex", lanes, window, data["used"], None, "percent", data["reset"],
                     "codex session logs", now) for window, data in found.items()] or [
         _record("codex", lanes, "all", None, None, None, None, "codex session logs", now,
@@ -94,13 +104,7 @@ def _not_exposed(provider: str, lanes: List[str], now: float) -> List[Dict[str, 
                     "not exposed", now, "not exposed yet")]
 
 
-def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float] = None,
-            lane_names: Optional[List[str]] = None,
-            sessions: Optional[Path] = None,
-            adapters: Optional[Dict[str, Callable[[str, List[str], Dict[str, str], float], List[Dict[str, Any]]]]] = None) -> List[Dict[str, Any]]:
-    env = dict(os.environ if env is None else env)
-    now = time.time() if now is None else now
-    lane_names = labels.LANES if lane_names is None else lane_names
+def _provider_groups(lane_names: List[str]) -> Dict[str, List[str]]:
     grouped: Dict[str, List[str]] = {}
     for lane in lane_names:
         if lane in labels.REMOTE_LANES:
@@ -118,6 +122,25 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
         else:
             provider = lane
         grouped.setdefault(provider, []).append(lane)
+    return grouped
+
+
+def _collect_provider(provider: str, slots: List[str], registry: Dict[str, Any],
+                      home: str, env: Dict[str, str], now: float) -> List[Dict[str, Any]]:
+    adapter = registry.get(provider)
+    if adapter:
+        return adapter(home, slots, env, now)
+    return _not_exposed(provider, slots, now)
+
+
+def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float] = None,
+            lane_names: Optional[List[str]] = None,
+            sessions: Optional[Path] = None,
+            adapters: Optional[Dict[str, Callable[[str, List[str], Dict[str, str], float], List[Dict[str, Any]]]]] = None) -> List[Dict[str, Any]]:
+    env = dict(os.environ if env is None else env)
+    now = time.time() if now is None else now
+    lane_names = labels.LANES if lane_names is None else lane_names
+    grouped = _provider_groups(lane_names)
     records = []
     registry = {
         "anthropic": lambda _home, slots, settings, stamp: anthropic_records(_home, slots, settings, stamp),
@@ -129,9 +152,7 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
     registry.update(adapters or {})
     for provider, slots in grouped.items():
         try:
-            adapter = registry.get(provider)
-            records.extend(adapter(home, slots, env, now) if adapter else
-                           _not_exposed(provider, slots, now))
+            records.extend(_collect_provider(provider, slots, registry, home, env, now))
         except Exception as err:
             records.append(_record(provider, slots, "all", None, None, None, None,
                                    "adapter", now, "adapter error: %s" % type(err).__name__))
