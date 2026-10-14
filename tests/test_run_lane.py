@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bus import pr_repair, text, tickets  # noqa: E402
+from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
@@ -545,6 +545,16 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.body.read_text().rstrip("\n").endswith(
             "lane codex, model gpt-test-default.\nRefs example/repo#42"))
+
+    def test_pr_body_writes_a_word_size_as_the_review_bots_letter(self):
+        # Chief accepts only XS, S, M, L: "Size: Medium" held five lane PRs
+        # on 2026-10-14. The body the runner opens passes every plan check.
+        self.drop_brief(text=BRIEF.replace("S: one function.", "Medium"))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\nSize: M\n", body)
+        self.assertEqual(hunt_plan.problems(body), [])
 
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()
