@@ -715,6 +715,11 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     When the goal home names a Trunk branch and no explicit --base is given,
     the ticket uses that branch as its base."""
     _check_brief_args(title, body, lane, model, base)
+    repo_data = gh.rest("GET", "/repos/%s" % repo).data or {}
+    if repo_data.get("private") is False:
+        foreign = re.search(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#\d+", title + "\n" + body)
+        if foreign and foreign.group(1).lower() != repo.lower():
+            raise ValueError("public-repo ticket text must describe foreign issues in words, not as owner/name#N references")
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     if refs is not None and regresses is not None:

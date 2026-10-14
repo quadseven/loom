@@ -706,11 +706,41 @@ class Factory:
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and self._run_again(repo, number, sha):
             return
+        if faults == ["failing checks"] and self._repair_body_leak(repo, number, full, issue, comments, sha):
+            return
         if faults:
             self._send_back(repo, full, issue, comments,
                             ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
             self._land_or_ask_test(repo, number, full, issue, comments)
+
+    def _repair_body_leak(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any], comments: List[Dict[str, Any]],
+                          sha: str) -> bool:
+        """Rewrite a body-only leak-scan failure once for this head."""
+        marker = "<!-- loom:body-leak-repaired %s -->" % sha
+        if any(marker in str(c.get("body") or "") for c in comments):
+            return False
+        failed = [r for r in self._runs.get(sha, [])
+                  if r.get("conclusion") in ("failure", "timed_out")]
+        report = "\n".join(str((r.get("output") or {}).get("text") or "") for r in failed)
+        if not report or not re.search(r"title and body", report, re.I):
+            return False
+        if re.search(r"diff(?:erence)?(?: section)?[^\n]*(?:fail|hit|detect)|diff section", report, re.I):
+            return False
+        body = str(full.get("body") or "")
+        repo_ref = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+        found = repo_ref.findall(body)
+        if not found:
+            return False
+        rewritten = repo_ref.sub(lambda m: ("issue %s of this repository" % m.group(2)
+            if m.group(1).lower() == repo.lower() else "issue %s of another repository" % m.group(2)), body)
+        self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"body": rewritten})
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
+                     {"body": marker + "\nThe factory rewrote repository issue references in the pull request body after a body-only leak-scan failure."})
+        self.actions += 1
+        _say("repaired body-only leak scan on %s#%d at %s" % (repo, number, sha[:12]))
+        return True
 
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
                           issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
