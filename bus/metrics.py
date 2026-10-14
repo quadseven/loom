@@ -138,17 +138,34 @@ class Collector:
         info = entry.stat()
         return max(info.st_mtime, info.st_ctime)
 
-    def local_runs(self) -> tuple[Dict[str, int], Dict[str, Dict[str, int]], int]:
+    def local_runs(self) -> tuple[Dict[str, int], Dict[str, Dict[str, int]], int, int]:
         counts: Dict[str, int] = {lane: 0 for lane in LANES}
         failures: Dict[str, Dict[str, int]] = {}
         unlinked = 0
+        left_out = 0
         for lane in LANES:
             for kind in ("done", "failed"):
                 for path in self._finished(lane, kind):
                     counts[lane] += 1
                     if kind == "failed":
-                        unlinked += self._failed_run(path, failures)
-        return counts, failures, unlinked
+                        # Only a failure at the work counts toward Escalation; a
+                        # provider limit or a transient push failure says nothing
+                        # about the model.
+                        if self._failure_kind(lane, path) == "work":
+                            unlinked += self._failed_run(path, failures)
+                        else:
+                            left_out += 1
+        return counts, failures, unlinked, left_out
+
+    def _failure_kind(self, lane: str, path: str) -> str:
+        """The kind the runner tagged the ticket's last failure with; work if untagged."""
+        log = os.path.join(self.home, "logs", lane, os.path.basename(path)[:-len(".md")] + ".log")
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                kinds = re.findall(r"^.*\bfailed: \[(work|limit|transient)\]", fh.read(), re.M)
+        except OSError:
+            return "work"
+        return kinds[-1] if kinds else "work"
 
     @staticmethod
     def _failed_run(path: str, failures: Dict[str, Dict[str, int]]) -> int:
@@ -316,13 +333,13 @@ class Collector:
     def collect(self) -> List[Number]:
         total = Totals()
         self._scan(total)
-        runs, failures, parked_without_ticket = self.local_runs()
+        runs, failures, parked_without_ticket, left_out = self.local_runs()
         total.faults += parked_without_ticket
         return [
             flow_number(total),
             throughput_number(total),
             spread_number(runs, *self.slot_samples()),
-            escalation_number(failures),
+            escalation_number(failures, left_out),
             quality_number(total),
             autonomy_number(total),
             visibility_number(total),
@@ -358,9 +375,10 @@ def spread_number(runs: Dict[str, int], idle: int, samples: int) -> Number:
                   "Anthropic <=50%; idle 0", ok)
 
 
-def escalation_number(failures: Dict[str, Dict[str, int]]) -> Number:
+def escalation_number(failures: Dict[str, Dict[str, int]], left_out: int = 0) -> Number:
     repeat = sum(any(n >= 2 for n in models.values()) for models in failures.values())
-    return Number("Escalation", "%d tickets failed twice on one model" % repeat,
+    return Number("Escalation", "%d tickets failed twice on one model doing the work; "
+                  "%d failures left out as limit or transient" % (repeat, left_out),
                   "0", repeat == 0)
 
 

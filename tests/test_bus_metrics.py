@@ -162,6 +162,45 @@ class MetricsTest(unittest.TestCase):
                 fh.write("Issue: %s#2\nModel: model-x\n" % REPO)
             os.utime(path, (NOW - 1000, NOW - 1000))
 
+    def _tag_failures(self, *kinds):
+        folder = os.path.join(self.home, "logs", "codex")
+        os.makedirs(folder, exist_ok=True)
+        for n, kind in enumerate(kinds, 1):
+            if kind:
+                with open(os.path.join(folder, "%d.log" % n), "w") as fh:
+                    fh.write("[t] %d failed: [work] first\n[t] %d failed: [%s] last\n" % (n, n, kind))
+
+    def escalation(self):
+        return next(n for n in self.numbers() if n.name == "Escalation")
+
+    def test_two_limit_failures_on_one_model_do_not_count(self):
+        self._two_failures()
+        self._tag_failures("limit", "limit")
+        number = self.escalation()
+        self.assertIn("0 tickets failed twice", number.value)
+        self.assertIn("2 failures left out", number.value)
+        self.assertTrue(number.passed)
+
+    def test_two_work_failures_on_one_model_count(self):
+        self._two_failures()
+        self._tag_failures("work", "work")
+        number = self.escalation()
+        self.assertIn("1 tickets failed twice", number.value)
+        self.assertIn("0 failures left out", number.value)
+        self.assertFalse(number.passed)
+
+    def test_a_failure_with_no_tag_line_counts_as_work(self):
+        self._two_failures()
+        self._tag_failures(None, "work")
+        self.assertIn("1 tickets failed twice", self.escalation().value)
+
+    def test_a_limit_and_a_work_failure_do_not_make_a_repeat(self):
+        self._two_failures()
+        self._tag_failures("transient", "work")
+        number = self.escalation()
+        self.assertIn("0 tickets failed twice", number.value)
+        self.assertIn("1 failures left out", number.value)
+
     def _past_rung(self):
         self.gh.ticket["state"] = "open"
         self.gh.ticket["labels"].append(label("loom:failed"))
