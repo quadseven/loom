@@ -142,7 +142,15 @@ opencode_config() {
   # spark_ready), serving the one model after "spark/". No key.
   local provider="" id="${MODEL#spark/}" permission="${OPENCODE_PERMISSION:-}"
   [ -n "$permission" ] || permission='{"external_directory": "deny"}'
-  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": 32768, \"output\": 4096}}}}}"
+  # The window the endpoint serves (LOOM_SPARK_CONTEXT, LOOM_SPARK_OUTPUT;
+  # whole numbers, else the vLLM defaults below). A window smaller than the
+  # server's makes the agent compact and lose its place on a large repo: the
+  # first sparkles run (2026-10-14) re-read files 190 times in 32K and
+  # committed nothing, against a server serving 262144.
+  local ctx="${LOOM_SPARK_CONTEXT:-32768}" out="${LOOM_SPARK_OUTPUT:-4096}"
+  [[ "$ctx" =~ ^[1-9][0-9]{3,6}$ ]] || ctx=32768
+  [[ "$out" =~ ^[1-9][0-9]{2,5}$ ]] || out=4096
+  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": $permission$provider}"
 }

@@ -620,6 +620,39 @@ hold_provider_limit() {
   heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")" "$LIMIT_UNTIL"
 }
 
+# Model ladders keep usage limits per model so a slot can continue on the
+# next configured model. Each row is model, reset epoch, and safe reason.
+MODEL_LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.models"
+model_limit_until() {
+  local model="$1" now saved_model ends
+  now="$(date +%s)"
+  [ -f "$MODEL_LIMIT_FILE" ] || return 1
+  while read -r saved_model ends _; do
+    [ "$saved_model" = "$model" ] && [[ "$ends" =~ ^[0-9]+$ ]] &&
+      [ "$ends" -gt "$now" ] && { printf '%s' "$ends"; return 0; }
+  done < "$MODEL_LIMIT_FILE"
+  return 1
+}
+record_model_limit() {
+  local model="$1" ends="$2" why="$3" tmp
+  tmp="$MODEL_LIMIT_FILE.tmp"
+  mkdir -p "$(dirname "$MODEL_LIMIT_FILE")"
+  { [ ! -f "$MODEL_LIMIT_FILE" ] || awk -v m="$model" '$1 != m' "$MODEL_LIMIT_FILE"
+    printf '%s %s %s\n' "$model" "$ends" "$(printf '%s' "$why" | tr -cd '[:alnum:] ._:-')"; } > "$tmp"
+  mv "$tmp" "$MODEL_LIMIT_FILE"
+}
+ladder_reason() {
+  local models="$1" model ends why="" first=1
+  for model in $models; do
+    if ends="$(model_limit_until "$model")"; then
+      [ "$first" -eq 1 ] || why="$why, "
+      why="$why$model until $(utc "$ends")"
+      first=0
+    fi
+  done
+  printf '%s' "$why"
+}
+
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
 # PATH. One slot can try a new major version (its installer would overwrite
 # the binary every other opencode lane runs) without moving the rest.
@@ -1200,7 +1233,8 @@ done
 # A provider limit hit by an earlier pass holds until its retry time. A
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
-if [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
+CONFIGURED_MODELS="$(lane_setting MODELS)"
+if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
   heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
@@ -1253,8 +1287,28 @@ for BRIEF in "$INBOX"/*.md; do
   [ -n "$BASE_BRANCH" ] && PR_BASE_ARGS=(--base "$BASE_BRANCH")
   # The model: the brief's Model: line, else the lane default. Passed to the
   # CLI explicitly so the PR names what actually ran.
-  MODEL="$(field Model "$BRIEF" || true)"
-  [ -n "$MODEL" ] || MODEL="$(lane_setting MODEL)"
+  PINNED_MODEL="$(field Model "$BRIEF" || true)"
+  MODEL="$PINNED_MODEL"
+  if [ -z "$MODEL" ]; then
+    MODEL="$(lane_setting MODEL)"
+    if [ -n "$CONFIGURED_MODELS" ]; then
+      MODEL=""
+      for candidate in $CONFIGURED_MODELS; do
+        if ! model_limit_until "$candidate" >/dev/null; then MODEL="$candidate"; break; fi
+      done
+      if [ -z "$MODEL" ]; then
+        WHY="$(ladder_reason "$CONFIGURED_MODELS")"
+        MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE" 2>/dev/null)"
+        heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
+        park "$BRIEF" "limit: all models limited: $WHY" limit; continue
+      fi
+    fi
+  elif [ -n "$CONFIGURED_MODELS" ] && [ -n "$PINNED_MODEL" ]; then
+    if PINNED_UNTIL="$(model_limit_until "$PINNED_MODEL")"; then
+      park "$BRIEF" "limit: requested model $PINNED_MODEL limited until $(utc "$PINNED_UNTIL")" limit
+      continue
+    fi
+  fi
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/@-]*$ ]]; then
     park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
   fi
@@ -1267,7 +1321,7 @@ for BRIEF in "$INBOX"/*.md; do
     openrouter:openrouter/*:free) ;;
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
     opencode-go:opencode-go/*) ;;
-    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model"; continue ;;
+    opencode-go:*) park "$BRIEF" "model $MODEL is not an opencode-go model" transient; continue ;;
     zen:opencode/*-free) ;;
     zen:*) park "$BRIEF" "zen lane runs free models only (opencode/...-free), not $MODEL"; continue ;;
     zai:zai/glm-4.7-flash|zai:zai/glm-4.5-flash) ;;
@@ -1279,6 +1333,11 @@ for BRIEF in "$INBOX"/*.md; do
     agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
+  if [ -n "$CONFIGURED_MODELS" ] && [ -z "$PINNED_MODEL" ]; then
+    WHY="$(ladder_reason "$CONFIGURED_MODELS")"
+    if [ -n "$WHY" ]; then heartbeat true "model $MODEL in use; limited: $WHY"
+    else heartbeat true "model $MODEL in use"; fi
+  fi
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
@@ -1394,10 +1453,25 @@ for BRIEF in "$INBOX"/*.md; do
     if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
+      heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    elif [ -n "$CONFIGURED_MODELS" ]; then
+      LIMIT_REASON="provider limit reached"
+      record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
+      WHY="$(ladder_reason "$CONFIGURED_MODELS")"
+      MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
+      AVAILABLE_MODEL=""
+      for candidate in $CONFIGURED_MODELS; do
+        if ! model_limit_until "$candidate" >/dev/null; then AVAILABLE_MODEL="$candidate"; break; fi
+      done
+      if [ -n "$AVAILABLE_MODEL" ]; then
+        heartbeat true "model $AVAILABLE_MODEL available; limited: $WHY"
+      else
+        heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
+      fi
     else
       LIMIT_REASON="provider limit reached"
+      heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
-    heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
     break
   fi

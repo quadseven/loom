@@ -150,6 +150,59 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(t.calls[3][2]["If-None-Match"], '"b"')
         self.assertEqual(gh.not_modified, 2)
 
+    def test_a_kept_full_page_still_reads_the_page_added_after_it(self):
+        # 2026-10-14: an issue's comments grew past 100 while page 1 stayed
+        # the same, so page 1 kept answering 304 with its old (empty) link
+        # and the station never read comment 101 on, posting the daily
+        # metrics line again every pass.
+        t = Scripted(reply(200, [1, 2], {"ETag": '"a"'}),   # first read: full, no next
+                     reply(304),                              # later: page 1 unchanged
+                     reply(200, [3], {"ETag": '"b"'}),        # the page added since
+                     reply(304), reply(304))                  # next read: both kept
+        with tempfile.TemporaryDirectory() as d:
+            gh = GitHub("tok", transport=t, cache_dir=d)
+            self.assertEqual(gh.paginate("/p?per_page=2"), [1, 2])
+            self.assertEqual(gh.paginate("/p?per_page=2"), [1, 2, 3])
+            self.assertEqual(t.calls[2][1], "https://api.github.com/p?per_page=2&page=2")
+            self.assertEqual(gh.paginate("/p?per_page=2"), [1, 2, 3])
+        # Page 2 is not full, so the third read stops there: five requests.
+        self.assertEqual(len(t.calls), 5)
+
+    def test_a_read_survives_a_dropped_connection_and_a_write_is_never_repeated(self):
+        # 2026-10-14: GitHub closed connections in the middle of a status
+        # burst (IncompleteRead) and one dropped read failed the whole tick.
+        import http.client
+        drops = []
+
+        def dropping(method, url, headers, body):
+            drops.append(method)
+            if len(drops) == 1:
+                raise GitHubError("request failed: %r" % http.client.IncompleteRead(b""), 0, "")
+            if len(drops) == 2:
+                return 503, {}, b""
+            return 200, {}, b'[{"number": 1}]'
+
+        slept = []
+        gh = GitHub("tok", transport=dropping, sleep=slept.append)
+        self.assertEqual(gh.rest("GET", "/x").data, [{"number": 1}])
+        self.assertEqual(len(drops), 3)
+        self.assertEqual(slept, [2.0, 6.0])
+        self.assertEqual(gh.requests, 3)
+        drops.clear()
+        with self.assertRaises(GitHubError):
+            gh.rest("POST", "/x", {"a": 1})
+        self.assertEqual(drops, ["POST"])  # a write is tried once
+
+    def test_incomplete_read_from_the_wire_is_a_github_error(self):
+        import http.client
+        from unittest import mock
+        from bus import github as gh_mod
+        with mock.patch.object(gh_mod._OPENER, "open",
+                               side_effect=http.client.IncompleteRead(b"x", 10)):
+            with self.assertRaises(GitHubError) as caught:
+                gh_mod.urllib_transport("GET", "https://api.github.com/x", {}, None)
+        self.assertEqual(caught.exception.status, 0)
+
     def test_without_a_cache_no_etag_is_sent(self):
         t = Scripted(reply(200, [1], {"ETag": '"v1"'}), reply(200, [1], {"ETag": '"v1"'}))
         gh = GitHub("tok", transport=t)

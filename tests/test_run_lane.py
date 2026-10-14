@@ -679,6 +679,48 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
 
+    def test_a_limited_ladder_model_falls_back_on_the_next_pass(self):
+        models = "gpt-test-high gpt-test-low"
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        first = self.run_lane(LOOM_CODEX_MODELS=models, FAKE_AGENT="say",
+                              FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertTrue(beat["available"])
+        self.assertIn("gpt-test-high", beat["reason"])
+        self.assertIn("--model gpt-test-high", "\n".join(self.calls()))
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        second = self.run_lane(LOOM_CODEX_MODELS=models)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        calls = "\n".join(self.calls())
+        self.assertIn("--model gpt-test-low", calls)
+
+    def test_a_ladder_holds_only_when_every_model_is_limited(self):
+        models = "gpt-test-high gpt-test-low"
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(LOOM_CODEX_MODELS=models, FAKE_AGENT="say",
+                      FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 2 hours")
+        self.drop_brief("T043-next.md", BRIEF.replace("T042", "T043"))
+        self.run_lane(LOOM_CODEX_MODELS=models, FAKE_AGENT="say",
+                      FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 3 hours")
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("gpt-test-high until", beat["reason"])
+        self.assertIn("gpt-test-low until", beat["reason"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_ticket_model_is_not_swapped_for_a_ladder_model(self):
+        self.drop_brief("T042-fix-the-thing.md",
+                        BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-test-high"))
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / "codex.models").write_text(
+            "gpt-test-high %d provider-limit\n" % (int(time.time()) + 3600))
+        result = self.run_lane(LOOM_CODEX_MODELS="gpt-test-high gpt-test-low")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = "\n".join(self.calls())
+        self.assertNotIn("--model gpt-test-low", calls)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
     def test_empty_api_credit_holds_the_lane_for_24_hours(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         before = int(time.time())
@@ -1096,6 +1138,19 @@ cat > /dev/null
         self.run_lane()
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_opencode_go_model_mismatch_is_transient(self):
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(
+            BRIEF.replace("Lane: codex", "Lane: opencode-go")
+            .replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-5-5"))
+        result = self.run_lane("opencode-go", LOOM_OPENCODE_GO_MODEL="opencode-go/model-free",
+                               LOOM_OPENCODE_GO_KEY_SSM="/k/oc",
+                               FAKE_SECRET__k_oc="fake-oc-key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [transient] model claude-sonnet-5-5 is not an opencode-go model", log)
 
     def api_lane(self, lane, extra="", **env):
         planted = self.home / ".ssh" / "id_planted"
@@ -1798,6 +1853,26 @@ cat > /dev/null
         self.assertIn("lane spark, model spark/coder-test", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.spark_beat()["available"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_uses_the_window_its_endpoint_serves(self):
+        # The first sparkles run thrashed in a fixed 32K window against a
+        # server serving 262144; the window is a lane setting now.
+        _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT="131072", LOOM_SPARK_OUTPUT="16384",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
+                         {"context": 131072, "output": 16384})
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
+        _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
+                         {"context": 32768, "output": 4096})
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_spark_lane_takes_the_brief_model_line(self):
