@@ -145,7 +145,8 @@ class BrainTests(unittest.TestCase):
         lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
 
-        lines_pure = brain._pull_request_lines(REPO, [pr], data)
+        no_authors = GitHub("t", transport=Fake())
+        lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
         self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
 
     def test_sensitive_pr_lines_helper(self):
