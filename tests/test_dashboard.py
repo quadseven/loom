@@ -179,5 +179,63 @@ class DashboardSourceHygiene(unittest.TestCase):
                 self.assertIsNone(pattern.search(source), str(path))
 
 
+class InsightViews(unittest.TestCase):
+    def test_brain_renders_fixture_step_and_preserves_handoff_markers(self):
+        from dashboard.insights import brain_page
+        from pathlib import Path
+        import os
+        old_home = os.environ.get("LOOM_HOME")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.environ["LOOM_HOME"] = tmp
+                state_dir = Path(tmp) / "state"
+                state_dir.mkdir()
+                (state_dir / "brain-step.json").write_text(json.dumps({
+                    "current": "merge", "done": ["lock", "status"],
+                    "next_move": "Merge the reviewed change.",
+                    "ranking": [{"text": "A measured regression", "members_affected": 3, "hours_lost": 2}],
+                    "markers": ["done example-org/project#42 --stage merge --holder runner"],
+                }))
+                class State:
+                    data = {}
+                    class GitHub:
+                        pass
+                    gh = GitHub()
+                rendered = brain_page(State())
+                self.assertIn('class="step current" aria-current="step"><span>merge</span>', rendered)
+                self.assertIn("done example-org/project#42 --stage merge --holder runner", rendered)
+                self.assertIn("3 members affected times 2 hours lost", rendered)
+        finally:
+            if old_home is None:
+                os.environ.pop("LOOM_HOME", None)
+            else:
+                os.environ["LOOM_HOME"] = old_home
+
+    def test_missing_step_record_is_not_assumed_to_be_step_one(self):
+        from dashboard.insights import progress_html
+        self.assertIn("not recorded", progress_html({}))
+        self.assertNotIn('class="step current"', progress_html({}))
+
+    def test_lane_failure_rate_flags_more_than_twenty_percent_in_text(self):
+        from dashboard.insights import lane_failure_rates
+        now = 1_800_000_000
+        comments = [
+            {"created_at": "2027-01-15T08:00:00Z", "body": "lane: codex outcome: failed"},
+            {"created_at": "2027-01-15T09:00:00Z", "body": "lane: codex outcome: done"},
+            {"created_at": "2027-01-15T10:00:00Z", "body": "lane: codex outcome: done"},
+            {"created_at": "2027-01-15T11:00:00Z", "body": "lane: codex outcome: done"},
+            {"created_at": "2027-01-15T12:00:00Z", "body": "lane: codex outcome: done"},
+        ]
+        rows = lane_failure_rates(comments, now)
+        row = next(item for item in rows if item["lane"] == "codex")
+        self.assertFalse(row["high"])
+        comments.append({"created_at": "2027-01-15T13:00:00Z", "body": "lane: codex outcome: failed"})
+        row = next(item for item in lane_failure_rates(comments, now) if item["lane"] == "codex")
+        self.assertTrue(row["high"])
+        self.assertGreater(row["rate"], 0.2)
+        from dashboard.insights import lane_failure_html
+        self.assertIn("high failure rate", lane_failure_html([row]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -115,4 +115,10 @@ space-separated list of `OWNER/NAME` repositories. Set
 `LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
 the dashboard also checks the standard GitHub CLI authentication. Set
 `LOOM_DASHBOARD_BUDGET_FLOOR` to change the remaining-request threshold below
-which the last ticket snapshot is served as stale. The default is 500.
+which the last ticket snapshot is served as stale. The default is 500. The
+`/brain` and `/hot-spots` views use the same repositories and GitHub token.
+Brain step progress comes from `$LOOM_HOME/state/brain-step.json` (or the path
+in `LOOM_BRAIN_STEP_FILE`); without a current step, progress is shown as not
+recorded. Journal comments, issue timelines, and station outcome comments
+provide the remaining view data. A source that is unavailable is labeled as
+missing in the view.

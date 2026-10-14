@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .github import TicketStore
+from . import insights
+from .shell import page
 
 
 def _ticket_page(state, parsed):
@@ -42,6 +44,10 @@ def _handler_for(state):
                 return self.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
             if path == "/api/tickets":
                 return self.send_json(200, state.response())
+            if path == "/brain":
+                return self.send_page(page("Brain", "brain", insights.brain_page(state), status="Live"))
+            if path == "/hot-spots":
+                return self.send_page(page("Hot spots", "hot-spots", insights.hotspots_page(state), status="Live"))
             if path in ("/", "/tickets"):
                 tickets = state.response()["tickets"]
                 data = tickets if path == "/" else _ticket_page(state, parsed)

@@ -138,3 +138,41 @@ button { color: inherit; font: inherit; }
   .tab-link[aria-current="page"] { background: var(--raised); color: var(--text); }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+
+.insight-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 390px), 1fr)); gap: 16px; }
+.panel { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.panel h2 { margin: 0 0 12px; font-size: 17px; }
+.panel h2:not(:first-child) { margin-top: 22px; }
+.panel p { margin: 0 0 10px; color: var(--body); }
+.panel .muted, .missing { color: var(--muted); font-size: 13px; }
+.wide { grid-column: 1 / -1; }
+.tick-steps { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; margin: 0; padding: 0; list-style: none; }
+.tick-steps .step { min-width: 0; padding: 9px 7px; border: 1px solid var(--line); border-radius: 7px; background: var(--raised); font: 11px var(--font-mono); text-align: center; overflow-wrap: anywhere; }
+.tick-steps .done { border-color: var(--good); color: var(--good); }
+.tick-steps .current { border-color: var(--accent); color: var(--accent); }
+.tick-steps .ahead { color: var(--muted); }
+.thought { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.thought b, .thought time, .markers code, .ranking small, .recent time { font: 11px var(--font-mono); }
+.thought time { color: var(--muted); text-align: right; }
+.thought p { grid-column: 1 / -1; margin: 0; }
+.good { color: var(--good); } .bad, .high { color: var(--bad); } .accent { color: var(--accent); }
+.markers { display: grid; gap: 8px; }
+.markers code { display: block; padding: 8px; border-radius: 6px; background: var(--code); color: var(--body); overflow-wrap: anywhere; }
+.ranking, .recent, .wait-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ranking li, .recent li, .wait-list li { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 9px 0; border-top: 1px solid var(--line); }
+.ranking li > div { display: grid; flex: 1; gap: 4px; }
+.ranking small, .recent p { color: var(--muted); }
+.recent li { display: grid; grid-template-columns: auto 1fr auto; }
+.recent p { grid-column: 1 / -1; margin: 0; font-size: 13px; }
+.recent time { color: var(--muted); }
+.wait-list .bottleneck { border-left: 3px solid var(--accent); padding-left: 8px; }
+.wait-list li span { text-align: right; }
+.wait-list .high { color: var(--bad); }
+@media (max-width: 520px) { .tick-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); } .wide { grid-column: auto; } .recent li { grid-template-columns: 1fr auto; } }
+
+.lane-rates { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.lane-rates li { display: flex; min-width: 0; flex-direction: column; align-items: center; gap: 5px; text-align: center; }
+.lane-rates li > span:last-child { font: 10px var(--font-mono); overflow-wrap: anywhere; }
+.rate-bar { display: flex; width: 100%; height: 52px; align-items: flex-end; overflow: hidden; border-radius: 6px; background: var(--raised); }
+.rate-bar i { display: block; width: 100%; min-height: 2px; background: var(--good); }
+.lane-rates .high .rate-bar i { background: var(--bad); }
