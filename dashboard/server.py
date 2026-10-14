@@ -35,9 +35,9 @@ def _all_tickets(state):
             continue
         matching = []
         for pr in prs:
-            match = views.FOOTER.search(str(pr.get("body") or ""))
-            if match and match.group(1) == row.get("repo") and match.group(2) == str(row.get("number")):
-                matching.append((str(pr.get("updated_at") or ""), match.group(4)))
+            parsed = views.footer(pr.get("body"))
+            if parsed and parsed[0] == row.get("repo") and parsed[1] == str(row.get("number")):
+                matching.append((str(pr.get("updated_at") or ""), parsed[3]))
         if matching:
             row["model"] = max(matching)[1]
     return rows
@@ -628,50 +628,49 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     return server
 
 
+def _newest_lane_models(prs):
+    """Each lane's model and time from its newest lane pull request footer."""
+    newest = {}
+    for pr in prs:
+        parsed = views.footer(pr.get("body"))
+        if not parsed:
+            continue
+        when = str(pr.get("created_at") or pr.get("updated_at") or "")
+        if parsed[2] not in newest or when >= newest[parsed[2]]["time"]:
+            newest[parsed[2]] = {"model": parsed[3], "time": when}
+    return newest
+
+
+def _usage_rows(payload, state):
+    """The usage records: the payload's, else the server's usage store."""
+    rows = payload.get("usage")
+    if rows is None:
+        providers = getattr(getattr(state, "usage", None), "providers", None)
+        rows = [row for items in providers.values() for row in items] if isinstance(providers, dict) else []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _lane_quota(lane, rows):
+    """The highest used percentage among the usage records for a lane: those
+    naming it, or its provider (the lane name without a -N slot suffix)."""
+    provider = re.sub(r"-[0-9]+$", "", lane)
+    used = []
+    for row in rows:
+        named = lane in (row.get("lanes") or []) or row.get("provider") in (lane, provider)
+        try:
+            used += [float(row["used_pct"])] if named and row.get("used_pct") is not None else []
+        except (TypeError, ValueError):
+            continue
+    return max(used) if used else None
+
+
 def _lane_view_data(payload, tickets, state=None):
     comments = payload.get("lanes", [])
     latest = max(comments, key=lambda c: str(c.get("created_at") or ""), default=None)
     lane_rows = views.parse_lane_rows(latest.get("body") if latest else "")
     prs = payload.get("pull_requests", [])
-    footer = views.FOOTER
-
-    newest_pr_for_lane = {}
-    for pr in prs:
-        body = str(pr.get("body") or "")
-        match = footer.search(body)
-        if not match:
-            continue
-        _, _, pr_lane, pr_model = match.groups()
-        pr_lane = pr_lane.strip()
-        pr_time = str(pr.get("created_at") or pr.get("updated_at") or "")
-        existing = newest_pr_for_lane.get(pr_lane)
-        if existing is None or pr_time >= existing["time"]:
-            newest_pr_for_lane[pr_lane] = {
-                "model": pr_model.strip(),
-                "time": pr_time,
-                "created_at": pr.get("created_at") or pr.get("updated_at"),
-            }
-
-    usage_records = payload.get("usage")
-    if usage_records is None and state is not None:
-        store = getattr(state, "usage", None)
-        if store is not None:
-            providers = getattr(store, "providers", {})
-            if isinstance(providers, dict):
-                usage_records = [row for items in providers.values() for row in items]
-        elif isinstance(state, dict):
-            usage_records = state.get("usage")
-    if not usage_records:
-        home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
-        limits_path = os.path.join(home, "state", "usage", "limits.json")
-        try:
-            with open(limits_path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if isinstance(data, list):
-                    usage_records = data
-        except (OSError, ValueError):
-            pass
-    usage_records = usage_records or []
+    newest_pr_for_lane = _newest_lane_models(prs)
+    usage_records = _usage_rows(payload, state)
 
     lanes = []
     for item in lane_rows:
@@ -680,32 +679,11 @@ def _lane_view_data(payload, tickets, state=None):
                        and ticket.get("state") in ("running", "pr")), None)
 
         model_info = newest_pr_for_lane.get(lane_name)
+        model_display = None
         if model_info:
-            age_str = views.format_age(model_info.get("created_at"))
+            age_str = views.format_age(model_info["time"])
             model_display = "%s (%s)" % (model_info["model"], age_str) if age_str else model_info["model"]
-        else:
-            model_display = None
-
-        lane_quota = None
-        lane_used_pcts = []
-        provider_prefix = re.sub(r"-[0-9]+$", "", lane_name)
-        for rec in usage_records:
-            if not isinstance(rec, dict):
-                continue
-            rec_lanes = rec.get("lanes")
-            matches = False
-            if isinstance(rec_lanes, list) and lane_name in rec_lanes:
-                matches = True
-            elif rec.get("provider") in (lane_name, provider_prefix):
-                matches = True
-            if matches and rec.get("used_pct") is not None:
-                try:
-                    lane_used_pcts.append(float(rec["used_pct"]))
-                except (ValueError, TypeError):
-                    pass
-
-        if lane_used_pcts:
-            lane_quota = max(lane_used_pcts)
+        lane_quota = _lane_quota(lane_name, usage_records)
 
         item.update({
             "ticket": active,
@@ -717,16 +695,12 @@ def _lane_view_data(payload, tickets, state=None):
 
     tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
     prepared = []
-    anthropic = total = 0
     for pr in prs:
-        match = footer.search(str(pr.get("body") or ""))
-        if not match:
+        parsed = views.footer(pr.get("body"))
+        if not parsed:
             continue
-        repo, number, lane, model = match.groups()
-        ticket = tickets_by_ref.get((repo, number))
+        ticket = tickets_by_ref.get(parsed[:2])
         prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
-        total += 1
-        anthropic += lane.startswith("anthropic")
     metric_rows = views.parse_metrics(payload.get("improving", {}).get("metrics_comments", []))
     share = None
     if metric_rows:

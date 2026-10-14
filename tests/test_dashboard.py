@@ -505,6 +505,21 @@ class LaneCardsTest(unittest.TestCase):
         self.assertIn("gpt-6-sol", body)
         self.assertIn("model missing", body)
 
+    def test_the_runners_ticket_name_footer_names_the_lanes_model(self):
+        from dashboard.views import footer, render_lanes
+        from dashboard.server import _lane_view_data
+        self.assertEqual(footer("Loom ticket example-owner.my-repo-31-r2, lane codex-2, model gpt-6-sol."),
+                         ("example-owner/my-repo", "31", "codex-2", "gpt-6-sol"))
+        quoted = "The footer reads `Loom ticket example-owner.my-repo-31, lane codex, model gpt-6-luna.` (doc)"
+        self.assertIsNone(footer(quoted))
+        comment = ("<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n"
+                   "|---|---|---|\n| codex-2 | yes | 20:17Z |\n")
+        prs = [{"body": "Loom ticket example-owner.my-repo-31-r2, lane codex-2, model gpt-6-sol.\n",
+                "created_at": "2026-10-14T12:00:00Z"}]
+        body = render_lanes(_lane_view_data({"lanes": [{"body": comment}], "pull_requests": prs,
+                                             "tickets": {}}, []))
+        self.assertIn("gpt-6-sol", body)
+
     def test_usage_record_shows_quota_bar_and_missing_says_quota_missing(self):
         from dashboard.views import render_lanes
         from dashboard.server import _lane_view_data

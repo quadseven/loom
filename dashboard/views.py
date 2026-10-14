@@ -9,7 +9,21 @@ from urllib.parse import quote
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
-FOOTER = re.compile(r"Loom ticket ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#?(\d+), lane ([A-Za-z0-9_.-]+), model (.+?)\.(?:\s|$)")
+# A lane pull request's footer names its ticket in the runner's form,
+# owner.name-N or owner.name-N-rK (bus/tickets.ticket_name), or as
+# owner/name#N, at the start of a line. An owner never has a dot, so the
+# first dot splits it; a model id is one token.
+FOOTER = re.compile(r"^Loom ticket ([A-Za-z0-9-]+)[./]([A-Za-z0-9_.-]+?)(?:#|-)(\d+)(?:-r\d+)?, "
+                    r"lane ([A-Za-z0-9_.-]+), model (\S+?)\.(?:\s|$)", re.M)
+
+
+def footer(text):
+    """(repo, number, lane, model) from a lane pull request footer, or None."""
+    match = FOOTER.search(str(text or ""))
+    if not match:
+        return None
+    owner, name, number, lane, model = match.groups()
+    return "%s/%s" % (owner, name), number, lane, model.strip()
 NUMBER = re.compile(r"^\d+\. (PASS|FAIL) (.+?): (.*?) \(target (.*?)\)$", re.M)
 REF = re.compile(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
@@ -92,10 +106,10 @@ def build_scoreboard(pull_requests):
     tiers = {}
     for pr in pull_requests:
         body = str(pr.get("body") or "")
-        match = FOOTER.search(body)
-        if not match:
+        parsed = footer(body)
+        if not parsed:
             continue
-        repo, number, lane, model = match.groups()
+        repo, number, lane, model = parsed
         tier = str(pr.get("tier") or pr.get("difficulty") or "unknown").lower()
         if tier not in ("easy", "medium", "hard", "frontier"):
             tier = "unknown"
