@@ -114,8 +114,14 @@ class PostgresBackend:
         self.dbapi = module
 
     def _connect(self):
-        return self.dbapi.connect(host=os.environ["LOOM_DB_HOST"], database=os.environ["LOOM_DB_NAME"],
-                                  user=os.environ["LOOM_DB_USER"], password=os.environ["LOOM_DB_PASSWORD"])
+        config = {}
+        for key in ("LOOM_DB_HOST", "LOOM_DB_NAME", "LOOM_DB_USER", "LOOM_DB_PASSWORD"):
+            value = os.environ.get(key)
+            if not value:
+                raise self.dbapi.Error("Missing required database configuration: " + key)
+            config[key] = value
+        return self.dbapi.connect(host=config["LOOM_DB_HOST"], database=config["LOOM_DB_NAME"],
+                                  user=config["LOOM_DB_USER"], password=config["LOOM_DB_PASSWORD"])
 
     def put(self, body):
         conn = self._connect()
@@ -139,7 +145,7 @@ class PostgresBackend:
                         _LIST_ALL if query == "list" else _ATTEMPTS,
                         (ticket,) if query == "attempts" or ticket is not None else ())
             names = [column[0] for column in cur.description]
-            rows = [dict(zip(names, row)) for row in cur.fetchall()]
+            rows = [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
             for row in rows:
                 if isinstance(row.get("events"), str):
                     row["events"] = json.loads(row["events"])
@@ -156,7 +162,7 @@ class PostgresBackend:
             row = cur.fetchone()
             if row is None:
                 return None
-            result = dict(zip([c[0] for c in cur.description], row))
+            result = dict(zip([c[0] for c in cur.description], row, strict=True))
             if isinstance(result.get("events"), str):
                 result["events"] = json.loads(result["events"])
             return result
