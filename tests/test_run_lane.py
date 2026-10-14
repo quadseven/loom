@@ -590,6 +590,15 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("--model gpt-test-default", agent[0])
         self.assertIn("lane codex, model gpt-test-default", self.body.read_text())
 
+    def test_the_agent_is_told_to_work_test_first_and_run_the_suite(self):
+        self.drop_brief()
+        self.run_lane()
+        prompt = self.log.read_text()
+        self.assertIn("## How to work", prompt)
+        self.assertIn("Work test-first", prompt)
+        self.assertIn("run the repo's full test suite", prompt)
+        self.assertIn("cyclomatic complexity under 15", prompt)
+
     def test_pr_body_ends_with_refs_for_a_station_brief(self):
         self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo#42\n"))
         result = self.run_lane()

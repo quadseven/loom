@@ -719,8 +719,15 @@ class DeferredFindings(Base):
         self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual((self.merged, self.fixed), ([(50, (REPO, 5))], []))
 
-    def test_a_new_medium_finding_on_the_first_round_goes_back_to_the_lane(self):
+    def test_a_new_medium_finding_on_the_first_round_is_deferred_not_sent_back(self):
         self.finding(MEDIUM, asked=(ASKED_OTHER,))
+        self.go()
+        self.assertEqual((len(self.gh.filed), self.merged, self.fixed),
+                         (1, [(50, (REPO, 5))], []))
+
+    def test_a_high_finding_on_a_logic_pull_request_still_goes_back(self):
+        self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
+        self.finding(HIGH, asked=())
         self.go()
         self.assertEqual((self.gh.filed, self.merged, len(self.fixed)), ([], [], 1))
 
@@ -794,11 +801,13 @@ class DeferredFindings(Base):
         self.go()
         self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
 
-    def test_a_logic_pull_request_keeps_todays_rule_for_a_minor_finding(self):
+    def test_a_logic_pull_request_defers_a_minor_finding_without_a_fix_round(self):
+        # 2026-10-14: medium findings no longer cost a fix round on any class.
         self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
         self.finding(MEDIUM, asked=())
         self.go()
-        self.assertEqual((self.gh.filed, self.merged, len(self.fixed)), ([], [], 1))
+        self.assertEqual((len(self.gh.filed), self.merged, self.fixed),
+                         (1, [(50, (REPO, 5))], []))
 
 
 class ChangeClasses(Base):
