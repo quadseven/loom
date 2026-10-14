@@ -113,6 +113,46 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(row["remaining"], 7.5)
         self.assertEqual(row["note"], "floor USD 1.00")
 
+    def test_spark_hold_uses_absolute_end_time(self):
+        directory = Path(self.home) / "state" / "usage"
+        directory.mkdir(parents=True)
+        now = 1_800_000_000
+        end = now + 600
+        (directory / "spark.limit").write_text("%s endpoint refused\n" % end)
+
+        row = usage._spark_records(self.home, ["spark"], {}, now)[0]
+
+        self.assertEqual(row["resets_at"], "2027-01-15T08:10:00+00:00")
+        self.assertEqual(row["note"], "endpoint refused")
+
+    def test_expired_spark_hold_is_reported_as_no_active_hold(self):
+        directory = Path(self.home) / "state" / "usage"
+        directory.mkdir(parents=True)
+        now = 1_800_000_000
+        (directory / "spark.limit").write_text("%s endpoint refused\n" % (now - 3600))
+
+        row = usage._spark_records(self.home, ["spark"], {}, now)[0]
+
+        self.assertIsNone(row["used_pct"])
+        self.assertIsNone(row["resets_at"])
+        self.assertEqual(row["note"], "no active hold")
+
+    def test_spark_slots_read_their_own_limit_files(self):
+        directory = Path(self.home) / "state" / "usage"
+        directory.mkdir(parents=True)
+        now = 1_800_000_000
+        (directory / "spark.limit").write_text("%s reason one\n" % (now + 600))
+        (directory / "spark-2.limit").write_text("%s reason two\n" % (now + 1200))
+
+        rows = usage._spark_records(self.home, ["spark", "spark-2"], {}, now)
+
+        self.assertEqual([row["lanes"] for row in rows], [["spark"], ["spark-2"]])
+        self.assertEqual([row["source"] for row in rows], [
+            "state/usage/spark.limit", "state/usage/spark-2.limit"])
+        self.assertEqual([row["resets_at"] for row in rows], [
+            "2027-01-15T08:10:00+00:00", "2027-01-15T08:20:00+00:00"])
+        self.assertEqual([row["note"] for row in rows], ["reason one", "reason two"])
+
 
 if __name__ == "__main__":
     unittest.main()
