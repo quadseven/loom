@@ -21,7 +21,7 @@ BASE_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 DIFFICULTIES = ("easy", "medium", "hard")
 
-HEADER_RE = re.compile(r"(Difficulty|Model|Base|Not before|After):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -32,7 +32,7 @@ AFTER_RE = re.compile(r"%s(?:[ \t]*,[ \t]*%s)*" % (_AFTER_ITEM, _AFTER_ITEM))
 _AFTER_REF_RE = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#([0-9]+)")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
-FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR):")
+FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable):")
 SLUG_MAX = 40
 
 
@@ -73,6 +73,8 @@ _HEADER_RULES = {
     "After": (lambda v: bool(AFTER_RE.fullmatch(v)),
               lambda v: "After: %r is not a list of tickets like '#5' or "
                         "'owner/name#7, #8'" % v),
+    "Deliverable": (lambda v: v == "answer",
+                    lambda v: "Deliverable: must be answer"),
 }
 
 

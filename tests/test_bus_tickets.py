@@ -255,7 +255,7 @@ class AfterLineTest(unittest.TestCase):
         self.assertEqual(after_refs({}), [])
 
     def test_a_value_that_is_not_a_list_of_tickets_is_refused(self):
-        for bad in ("5", "", "#a", "#5,", "#5 #7", "owner#5", "a/b/c#5", "#5; #7"):
+        for bad in ("5", "1,2", "", "#a", "#5,", "#5 #7", "owner#5", "a/b/c#5", "#5; #7"):
             with self.assertRaisesRegex(ValueError, "After:", msg=bad):
                 after_refs({"After": bad})
 

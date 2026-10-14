@@ -45,6 +45,7 @@ that talks to GitHub about tickets.
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
+| `loom:answered` | The runner posted a diagnosis answer; the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
 | `needs-brain` | The automatic fix round limit was reached; review this ticket in full. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
@@ -368,7 +369,9 @@ whose pull request is no longer open is parked as failed.
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
 
-- Done: label `loom:pr`, comment with the pull request link.
+- Done: for code work, label `loom:pr` and comment with the pull request link;
+  for `Deliverable: answer`, keep `loom:answered` and the runner's answer
+  comment for the brain to review.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
 - Limited (a reason starting `limit:` after its class, the spark lane's

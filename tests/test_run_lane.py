@@ -120,6 +120,11 @@ if [ "${FAKE_AGENT:-commit}" = say ]; then
   exit "${FAKE_EXIT:-1}"
 fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
+  mkdir -p .loom
+  printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
   echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
   exit 1
@@ -454,6 +459,52 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("\nSize: S\n", body)
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_answer_deliverable_posts_comment_and_does_not_push_or_open_pr(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+        result = self.run_lane(FAKE_AGENT="answer-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("gh issue comment 42") for c in calls), calls)
+        self.assertTrue(any("configured retry limit" in c for c in calls if c.startswith("gh issue comment")))
+        self.assertTrue(any(c.startswith("gh issue edit 42") and "loom:answered" in c for c in calls))
+        self.assertFalse(any(c.startswith("gh pr create") or c.startswith("gh pr comment") for c in calls))
+        self.assertFalse(any(c.startswith("git push") for c in calls))
+        pushed = subprocess.run(["git", "ls-remote", "--heads", str(self.remote),
+                                 "loom/T042-fix-the-thing"], capture_output=True,
+                                text=True, check=True).stdout
+        self.assertEqual(pushed, "")
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_answer_deliverable_refuses_local_paths_and_closing_keywords(self):
+        for answer, reason in (("See /Users/person/private/file", "absolute path"),
+                               ("This fixes #42", "closing keyword")):
+            with self.subTest(reason=reason):
+                self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer"))
+                result = self.run_lane(FAKE_AGENT="answer-file", FAKE_ANSWER_TEXT=answer)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+                self.assertIn(reason, log)
+                self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
+                failed = list((self.inbox / "failed").glob("*.md"))
+                self.assertTrue(failed)
+                failed[0].rename(self.inbox / failed[0].name)
+
+    def test_answer_deliverable_without_file_fails_as_no_answer_written(self):
+        brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer")
+        self.drop_brief(text=brief)
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("no answer written", log)
+
+    def test_no_deliverable_header_and_no_commit_still_fails(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="noop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("agent made no commit", log)
+        self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
 
     def test_a_body_the_runner_wrote_is_current_to_the_pr_repair_helper(self):
         # The body comes from run_lane.sh::pr_body, not from pr_repair's own
