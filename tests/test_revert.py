@@ -168,6 +168,25 @@ class Bisect(Base):
         self.assertEqual(log.count("\n"), 1)
         self.assertIn("briefed revert #900 on lane spark", log)
 
+    def test_a_scheduled_check_that_never_ran_on_the_pull_request_reverts_nothing(self):
+        # 2026-10-14: a nightly check failing for days attached to the newest
+        # merge on the branch head and briefed a revert of a good deploy.
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("green", ago=4000),
+                      run("red", ago=3500, name="nightly invariants", run_id=2), ago=4200)
+        log = self.go()
+        self.assertEqual(self.gh.filed, [])
+        self.assertIn("only from checks that never ran on #41", log)
+
+    def test_a_check_that_ran_on_the_pull_request_still_reverts(self):
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=4000),
+                      run("red", ago=3500, name="nightly invariants", run_id=2), ago=4200)
+        self.go()
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("check `unittest` fails", self.gh.comments[4][-1]["body"])
+        self.assertNotIn("nightly invariants", self.gh.comments[4][-1]["body"])
+
     def test_a_red_a_later_commit_fixes_within_30_minutes_reverts_nothing(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=1500), ago=1600)
