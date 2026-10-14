@@ -245,6 +245,46 @@ work_note() {
   printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Commit your work. A run that ends with no commit fails the ticket.\n'
 }
 
+# Lists the files the agent's commits added (BASE..HEAD) that only probe the
+# sandbox -- an empty or one-line added file named .test* or under a new
+# top-level bin/, referenced nowhere else in the diff -- and removes them
+# from the branch. A never-pushed branch is rebuilt without them so no
+# commit carries them; a fix round (already pushed, or mid-merge) gets a
+# removal commit on top so the push stays fast-forward. Names each file
+# dropped on stdout and sets DROPPED_FILES to the newline-separated paths.
+# A helper failure is a no-op: the run continues and the review bot and
+# factory stay the backstop.
+drop_probe_files() {
+  local probes f stamp
+  DROPPED_FILES=""
+  probes="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.probe_drop "$TREE" "$BASE" HEAD 2>/dev/null)" || return 0
+  [ -n "$probes" ] || return 0
+  stamp="$(date -u +%FT%TZ)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rm -f "$TREE/$f"
+    printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
+  done <<EOF
+$probes
+EOF
+  DROPPED_FILES="$probes"
+  if [ -z "$FIX_PR" ] && [ -z "$CONFLICTS" ]; then
+    safe_git reset -q --soft "$BASE" || return 1
+    safe_git add -A || return 1
+    safe_git diff --cached --quiet && return 0
+    safe_git commit -qm "${TITLE:-$TICKET}" || return 1
+  else
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      safe_git rm -q -r -- "$f" 2>/dev/null || true
+    done <<EOF
+$probes
+EOF
+    safe_git diff --cached --quiet && return 0
+    safe_git commit -qm "Drop sandbox probe files: ${probes//$'\n'/, }" || return 1
+  fi
+}
+
 # The ## Intent section for the top of a new lane PR body: the change
 # class, one line per behavior change, and the counts of files by class.
 # Sensitive globs come from SENSITIVE_FILE on the base revision; a missing
@@ -1562,6 +1602,13 @@ PY
     fi
   fi
   COMMITTED=0
+  # A lane pull request never carries the files its agent wrote to probe
+  # the sandbox. Before validation, push and PR, the runner drops those
+  # files from the agent's commits and names each one in the run log (and,
+  # for a new PR, in the Intent section).
+  if ! drop_probe_files >> "$LOG" 2>&1; then
+    park "$BRIEF" "could not drop sandbox probe files"; continue
+  fi
   if [ "$(safe_git rev-parse "$BRANCH")" != "$BASE" ]; then
     COMMITTED=1
   fi
@@ -1652,6 +1699,11 @@ PY
   INTENT_CLASS=""
   INTENT_TEXT=""
   prepare_intent "$BRIEF" >> "$LOG" 2>&1
+  # Name every sandbox probe file the runner dropped, per the ticket.
+  if [ -n "$DROPPED_FILES" ]; then
+    INTENT_TEXT="${INTENT_TEXT}
+- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+  fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
   PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
