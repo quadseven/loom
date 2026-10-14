@@ -1537,11 +1537,13 @@ class TriageTests(unittest.TestCase):
 
     def test_goal_children_past_the_sub_issue_limit_add_part_of_issues(self):
         full = [item(n, state="closed") for n in range(100, 200)]
-        found = [item(7, body="## Why\nx\n\nPart of #1\n"),
-                 item(8, body="Part of #10\n"),            # another goal
-                 item(9, body="see Part of #1 inline"),    # not a line of its own
-                 dict(item(11, body="Part of #1\n"), pull_request={}),
-                 item(150, state="closed", body="Part of #1\n")]  # already a sub-issue
+        ticket = ["loom:ticket"]
+        found = [item(7, body="## Why\nx\n\nPart of #1\n", labels=ticket),
+                 item(8, body="Part of #10\n", labels=ticket),            # another goal
+                 item(9, body="see Part of #1 inline", labels=ticket),    # not its own line
+                 dict(item(11, body="Part of #1\n", labels=ticket), pull_request={}),
+                 item(12, body="Part of #1\n"),     # anyone's issue: no loom:ticket label
+                 item(150, state="closed", body="Part of #1\n", labels=ticket)]  # a sub-issue
         routes = Routes([], goal_children=full, search=found)
         children = brain.goal_children(GitHub("t", transport=routes), REPO, 1)
         self.assertEqual(len(children), 101)

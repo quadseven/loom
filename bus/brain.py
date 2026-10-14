@@ -602,9 +602,10 @@ def _with_part_of(body: str, goal: int) -> str:
 
 
 def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """Issues in the repo whose body has a Part of #goal line (search, then
-    the exact line checked here: the search also matches loose words)."""
-    q = quote('repo:%s is:issue in:body "%s"' % (repo, part_of_line(goal)))
+    """loom:ticket issues in the repo whose body has a Part of #goal line
+    (search, then the label and the exact line checked here: the search
+    also matches loose words)."""
+    q = quote('repo:%s is:issue label:loom:ticket in:body "%s"' % (repo, part_of_line(goal)))
     url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
     found: List[Dict[str, Any]] = []
     for _ in range(SEARCH_PAGES):
@@ -612,8 +613,13 @@ def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
             break
         resp = gh.rest("GET", url)
         data = resp.data if isinstance(resp.data, dict) else {}
+        # Anyone can open an issue that says Part of #N in a public repo, but
+        # only someone with write access can label it: a Part of issue counts
+        # only as a loom:ticket, as a sub-issue link counts only when made by
+        # someone who may write.
         found.extend(item for item in data.get("items") or []
                      if isinstance(item, dict) and "pull_request" not in item
+                     and "loom:ticket" in _labels(item)
                      and _names_goal(item.get("body"), goal))
         url = _next_link(resp.headers.get("link", ""))
     return found
