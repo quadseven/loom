@@ -82,11 +82,13 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_a_free_lock_does_not_wait(self):
         self.write_lock(99999999)
-        start = time.time()
-        result = self.run_install(LOOM_STATION_WAIT="100")
-        elapsed = time.time() - start
+        sleep_log = self.tmp / "sleep.log"
+        fake_sleep = self.bin / "sleep"
+        fake_sleep.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$SLEEP_LOG\"\n")
+        fake_sleep.chmod(0o755)
+        result = self.run_install(LOOM_STATION_WAIT="100", SLEEP_LOG=str(sleep_log))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(elapsed, 1.0)
+        self.assertFalse(sleep_log.exists(), "the installer waited despite a free lock")
         self.assertNotIn("installing anyway", result.stdout)
         self.assertIn("installed com.loom.station", result.stdout)
 
