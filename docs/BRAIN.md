@@ -42,7 +42,7 @@ that talks to GitHub about tickets.
 | `loom:goal` | The goal's home issue. |
 | `loom:ticket` | Every ticket issue. |
 | `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, oldest first; a future `Not before:` or missing Difficulty keeps it queued. |
-| `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. |
+| `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:answered` | The runner posted a diagnosis answer; the brain reviews it, then closes/verifies the ticket or briefs it again. |
@@ -95,6 +95,8 @@ Body: the brief sections from docs/BRIEF_FORMAT.md, preceded by optional
 header lines:
 
 ```markdown
+Not before: <UTC time like 2026-10-13T17:00:00Z, optional>
+After: #<number> | owner/name#<number>, ... (optional)
 Difficulty: easy | medium | hard
 Model: <model id, optional>
 Base: <branch, optional>
@@ -127,6 +129,29 @@ keyword. The station checks those references and the conventional branch
 number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
+
+### When a ticket may run
+
+Two header lines say when a ticket may run, and neither reaches the brief the
+lane reads. `bus.brain brief --not-before` writes `Not before: <UTC time>`;
+`--after` writes `After:`, the tickets this one builds on.
+
+`After: #5, owner/name#7` holds the ticket until every ticket it names is
+merged, that is, until its state label is `loom:merged`, `loom:shipped` or
+`loom:verified` (the station reconciles pull requests to that state before it
+claims anything). A named ticket that is still open without one of those
+labels holds the ticket too, and so does one that cannot be read at all. The
+hold is a claim-time rule, not a state: the ticket keeps its lane and its
+`loom:briefed` label, and the factory does not count it as stalled, so it
+climbs no rung of the model ladder.
+
+Two things end a hold early. A named ticket closed as not planned is never
+going to merge, so it stops holding, and the station says so on the ticket in
+one comment. A hold older than 48 hours is reported to the brain like a stuck
+ticket: one comment naming the tickets it waits for, and `needs-brain`. The
+brain then checks the dependency is still coming, re-briefs the ticket without
+it, or closes it. `bus.brain status` lists what every held ticket waits for,
+and `bus.brain escalate` refuses a held ticket: waiting is not being stuck.
 
 ### Trunk branch
 
@@ -306,6 +331,8 @@ empty, it takes the oldest trusted briefed ticket for that lane, a
 `loom:regression` ticket before any other:
 
 1. Re-read the issue. It must still be open, `loom:briefed` and that lane's.
+   It must also be past its `Not before:` time, and every ticket its
+   `After:` line names must be merged (see When a ticket may run).
 2. Replace its labels in one call (`loom:briefed` out, `loom:running` in;
    everything else kept), then comment
    `Claimed for lane <lane> (body sha256 <first 12>)`.
@@ -524,8 +551,8 @@ branch after the merge instead (bus/revert.py, every pass, off with
   Its acceptance criteria are the failing checks passing. Its body says
   `Tests: none needed (...)` and `Reverted ticket: #N`.
 - The station claims it first. The factory lands it first, on green and
-  reviewed, deferring its medium and low findings at once instead of after
-  a fix round. A high or critical finding still sends it back.
+  reviewed, deferring its medium and low findings at once like any lane
+  pull request. A high or critical finding still sends it back.
 - The reverted ticket gets a comment naming the red check and the revert
   ticket. Once the revert reaches `loom:merged`, the ticket goes back to
   `loom:briefed` on its own lane, to redo the change on the new default

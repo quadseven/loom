@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
@@ -98,6 +100,61 @@ class BrainTests(unittest.TestCase):
                 lock_repo=REPO, name="merge", note=None, holder="muse", show=False))
         self.assertIn("brain step write failed", err.getvalue())
 
+
+class SensitiveResumeTests(unittest.TestCase):
+    NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+
+    def make_gh(self, entries):
+        prs = []
+        details = {}
+        for n, age, checks, _ in entries:
+            prs.append({"number": n, "title": "PR%d" % n,
+                        "created_at": (self.NOW - brain.timedelta(hours=age)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "labels": [{"name": "needs-brain"}, {"name": "class:sensitive"}],
+                        "head": {"ref": "loom/%d-fix" % n, "sha": "sha%d" % n}})
+            details[n] = {"headRefOid": "sha%d" % n,
+                          "commits": {"nodes": [{"commit": {
+                              "statusCheckRollup": {"state": checks}}}]},
+                          "reviewThreads": {"nodes": [
+                              {"isResolved": False}, {"isResolved": True}]}}
+
+        def transport(method, url, headers, body):
+            path = url.split("api.github.com")[1].split("?")[0]
+            if path == "/repos/%s/pulls" % REPO:
+                return reply(200, prs)
+            if path.startswith("/repos/%s/commits/" % REPO) and path.endswith("/check-runs"):
+                sha = path.split("/")[-2]
+                n = int(sha[3:])
+                passed = next(row[3] for row in entries if row[0] == n)
+                runs = [{"name": brain.review_check_name({}), "status": "completed",
+                         "conclusion": "success" if passed else "failure"}] if passed else []
+                return reply(200, {"check_runs": runs})
+            if path.startswith("/repos/%s/issues/" % REPO):
+                n = int(path.rsplit("/", 1)[1])
+                return reply(200, {"title": "Ticket%d" % n})
+            if path == "/graphql":
+                query = json.loads(body)["query"]
+                n = int(query.split("pullRequest(number:")[1].split(")")[0])
+                return reply(200, {"data": {"repository": {"p": details[n]}}})
+            raise AssertionError("unexpected %s %s" % (method, path))
+        return GitHub("t", transport=transport)
+
+    def test_only_old_green_reviewed_sensitive_prs_are_listed_with_ticket_and_threads(self):
+        entries = [(1, 3, "SUCCESS", True), (2, 1, "SUCCESS", True),
+                   (3, 4, "FAILURE", True), (4, 5, "SUCCESS", False)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries), [REPO], self.NOW, {})
+        items = [line for line in lines if line.startswith("- resume sensitive")]
+        self.assertEqual(1, len(items))
+        self.assertIn("%s#1 ticket %s#1 Ticket1 - PR1 - 3h old - 1 open review threads" %
+                      (REPO, REPO), items[0])
+
+    def test_sensitive_resume_is_capped_at_five_oldest_first(self):
+        entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries), [REPO], self.NOW, {})
+        numbers = [int(line.split("#")[1].split()[0]) for line in lines
+                   if line.startswith("- resume sensitive")]
+        self.assertEqual([7, 6, 5, 4, 3], numbers)
+
     def test_goal_trunk_reads_the_trunk_line_from_a_goal_body(self):
         self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
@@ -141,6 +198,71 @@ class BrainTests(unittest.TestCase):
         lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
+
+    def test_status_pull_request_lines_with_and_without_pending_brain_fix(self):
+        pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
+        authors = ["alice-example"]
+        comments_with = [{"user": {"login": "alice-example"},
+                          "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        fake_with = Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [pr]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, comments_with),
+            reply(200, []))
+        report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
+                                   env={}, authors=authors)
+        lines = report_with.splitlines()
+        at = lines.index("### Pull requests")
+        self.assertEqual(lines[at + 1], "- #4 PR - READY - pending brain fix")
+
+        comments_without = [{"user": {"login": "alice-example"},
+                             "body": "%s normal fix" % tickets.FIX_MARKER}]
+        fake_without = Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [pr]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, comments_without),
+            reply(200, []))
+        report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
+                                      env={}, authors=authors)
+        lines = report_without.splitlines()
+        at = lines.index("### Pull requests")
+        self.assertEqual(lines[at + 1], "- #4 PR - READY")
+
+    def test_pull_request_lines_helper_with_and_without_pending_brain_fix(self):
+        pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
+        data = {"prs": {4: ready_node()}}
+        bot = "grug-tribe"
+        authors = ["alice-example"]
+
+        with_fix = [{"user": {"login": "alice-example"},
+                     "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        gh_fix = GitHub("t", transport=Fake(reply(200, with_fix)))
+        lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
+        self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - READY - pending brain fix"])
+
+        without_fix = [{"user": {"login": "alice-example"},
+                        "body": "%s normal fix" % tickets.FIX_MARKER}]
+        gh_without = GitHub("t", transport=Fake(reply(200, without_fix)))
+        lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
+        self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
+
+        no_authors = GitHub("t", transport=Fake())
+        lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
+        self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
+
+    def test_sensitive_pr_lines_helper(self):
+        sensitive_pr = {"number": 4, "title": "Sensitive", "labels": [{"name": "class:sensitive"}]}
+        ordinary_pr = {"number": 5, "title": "Ordinary", "labels": []}
+        lines = brain._sensitive_pr_lines([sensitive_pr, ordinary_pr])
+        self.assertEqual(lines, ["### Sensitive pull requests", "- #4 Sensitive"])
+        empty = brain._sensitive_pr_lines([ordinary_pr])
+        self.assertEqual(empty, ["### Sensitive pull requests", "- none"])
 
     def test_status_lists_open_invariant_issues_for_the_report(self):
         gh = GitHub("t", transport=Fake(
@@ -414,6 +536,38 @@ class BrainTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex", **kw)
                 self.assertEqual(fake.calls, [])
+
+    def test_brief_refuses_an_after_value_that_is_not_a_list_of_tickets(self):
+        for bad in ("5", "", "#a", "#5,", "owner#5", "#5\nRepo: evil/repo"):
+            with self.subTest(after=repr(bad)):
+                fake = Fake(reply(200, goal()))
+                with self.assertRaisesRegex(ValueError, "After:"):
+                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY,
+                                "codex", after=bad)
+                self.assertEqual(fake.calls, [])
+
+    def test_brief_refuses_a_malformed_after_from_the_command_line(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = os.path.join(home, "brief.md")
+            with open(path, "w") as fh:
+                fh.write(BODY)
+            err = io.StringIO()
+            with unittest.mock.patch("bus.brain.token_from_env", return_value="t"), \
+                    unittest.mock.patch("bus.brain.GitHub") as client, \
+                    contextlib.redirect_stderr(err):
+                client.return_value.requests = 0
+                code = brain.main(["brief", REPO, "--goal", "1", "--title", "Ticket",
+                                   "--file", path, "--lane", "codex", "--after", "5"])
+        self.assertEqual(code, 1)
+        self.assertIn("After:", err.getvalue())
+
+    def test_a_brief_that_waits_on_other_tickets_files_the_after_line(self):
+        made = (reply(200, goal()), reply(200, []),
+                reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        fake = Fake(*made)
+        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex",
+                    after="#5, other-owner/other-repo#7")
+        self.assertTrue(fake.calls[2][2]["body"].startswith("After: #5, other-owner/other-repo#7\n"))
 
     @staticmethod
     def _children(*states):
@@ -1436,6 +1590,16 @@ def item(number, body=BODY, labels=(), **extra):
     return out
 
 
+def rung_claim(login="example-brain"):
+    return {"body": "Claimed for lane claude (body sha256 0123456789ab)",
+            "created_at": "2030-01-01T00:00:00Z", "user": {"login": login}}
+
+
+def rungs(*ns, login="example-brain"):
+    """A rung marker then a claim on it, for each rung: the ticket ran there."""
+    return [c for n in ns for c in (rung_marker(n, login), rung_claim(login))]
+
+
 def rung_marker(n, login="example-brain"):
     return {"body": "<!-- loom:rung %d -->\nmoved" % n, "created_at": "2030-01-01T00:00:00Z",
             "user": {"login": login}}
@@ -1475,8 +1639,8 @@ class PastLastRungTests(unittest.TestCase):
         person = {"isResolved": False, "comments": {"nodes": [
             {"databaseId": 72, "author": {"__typename": "User", "login": "example-reviewer"}, "body": "why this?"}]}}
         done = {"isResolved": True, "comments": {"nodes": [{"author": self.BOT, "body": "low | old"}]}}
-        section, query = self.report([rung_marker(1), rung_marker(2), rung_marker(3)],
-                                     [rung_marker(1), rung_marker(2)], [answered, person, done])
+        section, query = self.report(rungs(1, 2, 3),
+                                     rungs(1, 2), [answered, person, done])
         lines = [l for l in section.splitlines() if l.strip()]
         self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable conflicting - 2 unresolved threads")
         self.assertEqual(lines[1], "  - high, comment 71: high | correctness | the cache is never cleared - "
@@ -1489,9 +1653,8 @@ class PastLastRungTests(unittest.TestCase):
         self.assertIn("p5: pullRequest(number:5) { %s }" % brain.READY_FIELDS, query)
 
     def test_restarted_or_untrusted_ladders_are_not_past_the_last_rung(self):
-        restarted = [rung_marker(1), rung_marker(2), rung_marker(3), rung_marker(0)]
-        stranger = [rung_marker(1, "example-stranger"), rung_marker(2, "example-stranger"),
-                    rung_marker(3, "example-stranger")]
+        restarted = rungs(1, 2, 3) + [rung_marker(0)]
+        stranger = rungs(1, 2, 3, login="example-stranger")
         for name, comments in (("restarted", restarted), ("stranger", stranger)):
             with self.subTest(name):
                 section, _ = self.report(comments)
@@ -1500,7 +1663,7 @@ class PastLastRungTests(unittest.TestCase):
     def test_an_unanswered_finding_says_so(self):
         thread = {"isResolved": False, "comments": {"nodes": [
             {"databaseId": 73, "author": self.BOT, "body": "**critical** | security | token logged"}]}}
-        section, _ = self.report([rung_marker(1), rung_marker(2), rung_marker(3)], threads=[thread])
+        section, _ = self.report(rungs(1, 2, 3), threads=[thread])
         self.assertIn("  - critical, comment 73: **critical** | security | token logged - no lane answer", section)
 
     def test_muse_names_the_section_status_prints(self):
@@ -2103,6 +2266,79 @@ class RegressionSlotTests(unittest.TestCase):
         self.assertEqual(args.regresses, 5)
 
 
+class HeldTicketsTest(unittest.TestCase):
+    """The After: line: what status lists, and when it counts as stuck."""
+
+    def dependency(self, number=5, state="pr"):
+        return {"number": number, "state": "open", "title": "Land the package",
+                "body": BODY, "created_at": "2029-12-01T00:00:00Z",
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
+
+    def waiting(self, number=12, after="#5", briefed=OLD, state="briefed"):
+        return {"number": number, "state": "open", "title": "Add the screen",
+                "body": "After: %s\nDifficulty: easy\n\n%s" % (after, BODY),
+                "created_at": "2029-12-01T00:00:00Z", "updated_at": "2029-12-01T00:00:00Z",
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state},
+                           {"name": "lane:claude"}]}, \
+            [event("labeled", "loom:" + state, briefed)]
+
+    def routes(self, *issues, events=(), comments=()):
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, list(issues)),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, []),
+                  ("GET", "/issues/12/events"): reply(200, list(events)),
+                  ("GET", "/issues/12/comments"): reply(200, list(comments))}
+        routes.update(lanes_routes(()))
+        return routes
+
+    def status_for(self, *issues, events=(), now=None):
+        """status over these issues, at `now` (the real clock when None)."""
+        routes = self.routes(*issues, events=events)
+        return brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO, now=now)
+
+    def ticket_line(self, report, number=12):
+        """The ticket's own line under #### briefed, not its Held one."""
+        tickets = report.split("### Held tickets")[0].split("### Tickets")[1]
+        return next(line for line in tickets.splitlines() if line.startswith("- #%d " % number))
+
+    def test_status_lists_a_ticket_with_what_it_waits_for(self):
+        waiting, events = self.waiting()
+        report = self.status_for(self.dependency(), waiting, events=events)
+        self.assertIn("### Held tickets\n- #12 Add the screen - waits for #5 (pr)", report)
+        # A ticket in another repo, and one this repo no longer has open.
+        waiting, events = self.waiting(after="other-owner/other-repo#5, #404")
+        report = self.status_for(self.dependency(), waiting, events=events)
+        self.assertIn("- #12 Add the screen - waits for other-owner/other-repo#5 "
+                      "(unreadable), #404 (unreadable)", report)
+
+    def test_status_lists_no_held_ticket_when_every_dependency_is_merged(self):
+        report = self.status_for(self.dependency(state="merged"), self.waiting()[0])
+        self.assertIn("### Held tickets\n- none", report)
+        self.assertNotIn("### Held tickets\n- #12", report)
+
+    def test_a_hold_of_more_than_two_days_is_reported_as_stuck(self):
+        waiting, events = self.waiting(briefed=OLD)
+        report = self.status_for(self.dependency(), waiting, events=events)
+        line = self.ticket_line(report)
+        self.assertIn("REPEATEDLY STUCK (held by After: #5 for more than 48h", line)
+        self.assertIn("waiting on #5", line)
+
+    def test_a_short_hold_is_neither_stuck_nor_a_stall(self):
+        waiting, events = self.waiting(briefed="2030-01-01T00:00:00Z")
+        report = self.status_for(self.dependency(), waiting, events=events,
+                                 now=datetime(2030, 1, 1, 1, tzinfo=timezone.utc))
+        self.assertNotIn("REPEATEDLY STUCK", self.ticket_line(report))
+        self.assertIn("### Held tickets\n- #12 Add the screen - waits for #5 (pr)", report)
+
+    def test_escalate_refuses_a_ticket_that_is_waiting_on_another(self):
+        routes = ticket_routes(stuck_ticket("failed", body="After: #5\n" + BODY), TWICE, [])
+        routes[("GET", "/repos/%s/issues/5" % REPO)] = reply(200, self.dependency())
+        fake = Routed(routes)
+        with self.assertRaisesRegex(ValueError, "held by After: #5"):
+            brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [])
+        self.assertEqual(fake.sent("PUT", "/issues/9/labels"), [])
+
+
 class AnsweredStatusTests(unittest.TestCase):
     def test_answered_tickets_have_a_brain_status_section(self):
         issue = {"number": 17, "title": "Diagnosis", "created_at": "2026-10-14T00:00:00Z",
@@ -2111,6 +2347,39 @@ class AnsweredStatusTests(unittest.TestCase):
         lines = brain._ticket_lines([issue], datetime(2026, 10, 14, tzinfo=timezone.utc))
         index = lines.index("#### answered")
         self.assertEqual(lines[index + 1], "- #17 Diagnosis - lane:codex - 0h")
+
+
+class LogExcerptTests(unittest.TestCase):
+    """The fix brief quotes the lines of a failed job that say why it failed."""
+
+    TEARDOWN = ["Post job cleanup.", "Stop and remove container: postgres"] + [
+        "LOG:  checkpoint %d" % i for i in range(60)] + ["Cleaning up orphan processes"]
+
+    def test_the_failing_test_is_quoted_and_post_job_cleanup_is_not(self):
+        lines = (["collecting ..."] + ["." * 72 + " [%d%%]" % i for i in range(80)]
+                 + ["E       AssertionError: baseline.json was not re-recorded",
+                    "FAILED tests/test_elder_eval.py::test_baseline_exists_and_prompt_sha_matches",
+                    "1 failed, 2816 passed in 67.48s",
+                    "make: *** [Makefile:40: webhook-test] Error 1",
+                    "##[error]Process completed with exit code 2."] + self.TEARDOWN)
+        excerpt = brain.log_excerpt(lines)
+        self.assertIn("FAILED tests/test_elder_eval.py::test_baseline_exists_and_prompt_sha_matches", excerpt)
+        self.assertIn("AssertionError: baseline.json was not re-recorded", excerpt)
+        self.assertNotIn("Cleaning up orphan processes", excerpt)
+        self.assertNotIn("checkpoint", excerpt)
+
+    def test_a_failure_far_above_the_error_line_is_still_quoted(self):
+        lines = (["Traceback (most recent call last):", "ValueError: bad row"]
+                 + ["step output %d" % i for i in range(100)]
+                 + ["##[error]Process completed with exit code 1."] + self.TEARDOWN)
+        excerpt = brain.log_excerpt(lines).split("\n")
+        self.assertEqual(excerpt[:3], ["Traceback (most recent call last):", "ValueError: bad row", "..."])
+        self.assertEqual(excerpt[-1], "##[error]Process completed with exit code 1.")
+        self.assertLessEqual(len(excerpt), brain.LOG_LINES + brain.FAILURE_LINES + 1)
+
+    def test_a_log_with_no_error_marker_keeps_its_last_lines(self):
+        lines = ["line %d" % i for i in range(100)]
+        self.assertEqual(brain.log_excerpt(lines), "\n".join(lines[-brain.LOG_LINES:]))
 
 
 if __name__ == "__main__":

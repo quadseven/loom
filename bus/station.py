@@ -51,6 +51,9 @@ BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
+# The comment a ticket carries once a ticket it waited on was closed as not
+# planned and stopped holding it.
+AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
@@ -707,6 +710,8 @@ class Station:
         self._seen: Dict[str, set] = {}
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
+        # The tickets named by After: lines, read once a pass.
+        self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
         self._remote_beats: Dict[str, Optional[float]] = {}
         # Whether each repo is public, and the repo invariant breaches are
         # filed in: what a public issue may name (_invariant_ref).
@@ -1168,6 +1173,36 @@ class Station:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"at": self.now, "idle": idle}) + "\n")
 
+    def _dependency(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
+        """The ticket an After: line names, read once a pass and kept for the
+        next lane's pass; None when it cannot be read, which holds."""
+        key = "%s#%d" % (repo, number)
+        if key not in self._depends:
+            try:
+                self._depends[key] = self._issue(repo, number)
+            except GitHubError as err:
+                _say("could not read %s: %s" % (key, err))
+                self._depends[key] = None
+        return self._depends[key]
+
+    def _release_hold(self, repo: str, issue: Dict[str, Any],
+                      released: List[tickets.After]) -> None:
+        """Say on the ticket that an After: line no longer holds it, once per
+        ticket that was closed as not planned."""
+        number = int(issue["number"])
+        said = {m.group(1) for c in self.gh.paginate(
+            "/repos/%s/issues/%d/comments" % (repo, number)) if isinstance(c, dict)
+            for m in [AFTER_RELEASE_RE.match(str(c.get("body") or ""))] if m}
+        for dep in released:
+            if str(dep.number) in said:
+                continue
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+                "body": "<!-- loom:after-release %d -->\nNot held by After: any more: "
+                        "%s was closed as not planned, so this ticket no longer waits "
+                        "for it." % (dep.number, dep.short)})
+            _say("%s#%d is no longer held by %s, closed as not planned"
+                 % (repo, number, dep.short))
+
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
                     free: List[str]) -> bool:
         if self._skip_known(repo, issue):
@@ -1184,6 +1219,13 @@ class Station:
         ok, reason = self._check_trust(repo, issue)
         if not ok:
             self._refuse(repo, issue, reason)
+            return False
+        waiting, released = tickets.after_holds(repo, headers, self._dependency)
+        if released and not waiting:
+            self._release_hold(repo, issue, released)
+        if waiting:
+            _say("%s#%s waits for %s" % (repo, issue["number"], ", ".join(
+                "%s (%s)" % (a.short, a.why) for a in waiting)))
             return False
         fresh = self._issue(repo, int(issue["number"]))
         labelled_lane = _lane_of(issue)
@@ -1633,11 +1675,17 @@ class Station:
             return True
         if fix_pr:
             # A fresh attempt would open a second pull request for the ticket.
-            self._relabel(repo, number, "loom:pr")
+            # A work failure goes to loom:failed, where the factory climbs the
+            # ladder and sends the fix to the next rung on the same pull request
+            # (factory.failed). Back at loom:pr the head is unchanged, so
+            # hand-back sent the same fix to the same lane every pass: 16
+            # rounds in 77 minutes on 2026-10-14. A transient failure retries.
+            state = "loom:failed" if klass == "work" else "loom:pr"
+            self._relabel(repo, number, state)
             self._comment(repo, number, "Lane %s failed: %s. This was a fix round on pull "
-                          "request #%s; the ticket is back at loom:pr and the pull request "
-                          "is unchanged." % (lane, reason, fix_pr))
-            _say("reported %s#%d fix failed, back to loom:pr: %s" % (repo, number, reason))
+                          "request #%s; the ticket is back at %s and the pull request "
+                          "is unchanged." % (lane, reason, fix_pr, state))
+            _say("reported %s#%d fix failed, back to %s: %s" % (repo, number, state, reason))
             return True
         note = ""
         if klass in RETRY_CLASSES:

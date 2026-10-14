@@ -22,6 +22,16 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
 
+## How a lane is told to work
+
+After its brief, every agent gets a "How to work" note (lanes/run_lane.sh
+`work_note`): work test-first (write the failing test, see it fail, fix,
+see it pass), run the full suite or the validation check before finishing,
+follow the review bot's checklist (new functions under cyclomatic
+complexity 15, no swallowed errors, no dead code, docs in step, ASCII
+only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
+rounds, and no lane ran a test before opening its pull request.
+
 ## Validation contract
 
 A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
@@ -117,8 +127,9 @@ The station turns trusted
 ticket, with local paths removed from failure reasons; the runner adds
 `Refs <owner/name>#<number>` to the pull request. A limit or transient
 failure moves the ticket to another available lane as a new attempt, at most
-`LOOM_RETRY_MAX` times (default 2); a failed fix round goes back to
-`loom:pr`; a lane that hit its provider limit stays unavailable until the
+`LOOM_RETRY_MAX` times (default 2); a fix round that fails transiently goes
+back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
+factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
 `state/usage/` to clear it sooner). It reads `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
@@ -141,7 +152,15 @@ spend" below).
 
 Hold: a ticket whose header has `Not before: 2026-10-13T17:00:00Z` (UTC) is
 not claimed before that time, and the factory does not count it as stalled
-until then; the line is left out of the brief the lane reads.
+until then; the line is left out of the brief the lane reads. A ticket whose
+header has `After: #5, owner/name#7` waits for the tickets it builds on: it
+is not claimed while any of them is still open without `loom:merged`,
+`loom:shipped` or `loom:verified`, and the factory counts it as neither
+stalled nor late (one holding it for more than 48 hours is reported to the
+brain, like a stuck ticket). A named ticket closed as not planned never
+merges, so it stops holding and the station says so in one comment. That line
+is left out of the brief too: by the time a lane reads it, it is settled
+(docs/BRAIN.md, "When a ticket may run").
 
 Factory: at most every 5 minutes the station runs `bus/factory.py` over
 `LOOM_REPOS`, with no model. A lane pull request (a `loom/` branch whose
