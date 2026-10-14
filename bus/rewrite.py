@@ -1,9 +1,9 @@
-"""Rewrite a loom:triage issue into a ticket with a configured agent command.
+"""Use a configured agent to rewrite a loom:triage issue into a ticket.
 
-The command reads a prompt on stdin and prints one JSON object. Code validates
-the draft, then files a queued ticket or a human ask. The agent can be a free
-or subscription model because it only drafts. The original issue is never
-closed, retitled or edited; brain.brief and brain.human add a comment and labels.
+The agent command reads the issue prompt on stdin and writes a JSON draft to
+stdout. Code validates that draft, then files a queued ticket or a human ask.
+The original issue is never closed, retitled or edited; brain.brief and
+brain.human add a comment and labels.
 """
 from __future__ import annotations
 
