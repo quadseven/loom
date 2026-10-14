@@ -606,6 +606,15 @@ and item the newest line wins; `python3 -m bus.brain resume OWNER/NAME...
 --holder NAME` lists the defers still standing whose item is open and
 unchanged, and refuses unless that holder holds the tick lock.
 
+`resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
+tickets across the repos, oldest ship first, each with how long ago it
+shipped and its Live criterion (the acceptance line that starts with
+"Live"). `python3 -m bus.brain status` prints the same list in full under
+"### Verify due" for each repo. The hourly lane-machine brain (scope live)
+spends up to a third of its tick on these items: it writes a proof only from
+evidence it saw in the tick, and otherwise leaves a one-line note on the
+ticket naming what evidence is missing.
+
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
