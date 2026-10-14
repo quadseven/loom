@@ -282,7 +282,7 @@ class LanesAndImprovingTest(unittest.TestCase):
         self.assertEqual(board["medium"]["gpt-6-luna"]["merged"], 1)
         self.assertEqual(board["medium"]["gpt-6-luna"]["open"], 1)
 
-        ticket = {"repo": "quadseven/loom", "number": 282, "difficulty": "medium", "state": "closed"}
+        ticket = {"repo": "quadseven.loom", "number": 282, "difficulty": "medium", "state": "closed"}
         payload = {
             "pull_requests": [{"body": pr_body, "state": "closed", "merged_at": "2026-10-14T12:00:00Z"}],
             "lanes": [],

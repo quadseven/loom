@@ -492,11 +492,10 @@ def _lane_view_data(payload, tickets):
                      "reason": None if item["available"] else "held reason missing from lane status comment"})
         lanes.append(item)
     prs = payload.get("pull_requests", [])
-    tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
-    for row in tickets:
-        r = row.get("repo")
-        if r and "/" in r:
-            tickets_by_ref[(r.replace("/", "."), str(row.get("number")))] = row
+    tickets_by_ref = {
+        (views.map_repo(str(row.get("repo") or "")), str(row.get("number"))): row
+        for row in tickets
+    }
     prepared = []
     footer = views.FOOTER
     anthropic = total = 0
