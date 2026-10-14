@@ -359,41 +359,65 @@ def _ticket_detail(state, path):
     return body, 200 if row else 404
 
 
+def _serve_backlog_routes(handler, state, parsed):
+    path = parsed.path
+    raw = _backlog_bytes()
+    if path == "/backlog.json":
+        if raw is None:
+            return handler.send_text(503, "backlog source unavailable")
+        return handler.send_bytes(200, raw, "application/json")
+    if path == "/backlog":
+        if raw is None:
+            return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
+        return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
+    return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
+
+
+def _serve_static(handler, path):
+    asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
+    content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
+    return handler.send_bytes(200, asset.read_bytes(), content_type)
+
+
+def _serve_basic(handler, state, path):
+    """Health and JSON routes; returns False when the path is not one of them."""
+    if path == "/livez":
+        handler.send_text(200, "live")
+    elif path == "/readyz":
+        handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
+    elif path == "/api/tickets":
+        handler.send_json(200, state.response())
+    else:
+        return False
+    return True
+
+
+def _serve_view(handler, state, parsed):
+    """Server-rendered views; returns False when the path is not one of them."""
+    path = parsed.path
+    views_by_path = {"/": _floor, "/goals": _goals}
+    if path in views_by_path:
+        handler.send_page(views_by_path[path](state))
+    elif path == "/tickets":
+        handler.send_page(_tickets(state, parsed))
+    elif path in ("/backlog", "/backlog.json", "/needs-you"):
+        _serve_backlog_routes(handler, state, parsed)
+    elif path in ("/static/loom.css", "/static/loom.js"):
+        _serve_static(handler, path)
+    elif path in ("/improving", "/lanes"):
+        _send_dashboard_view(handler, state, path)
+    else:
+        return False
+    return True
+
+
 def _handler_for(state):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlsplit(self.path)
-            path = parsed.path
-            if path == "/livez":
-                return self.send_text(200, "live")
-            if path == "/readyz":
-                return self.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
-            if path == "/api/tickets":
-                return self.send_json(200, state.response())
-            if path == "/":
-                return self.send_page(_floor(state))
-            if path == "/goals":
-                return self.send_page(_goals(state))
-            if path == "/tickets":
-                return self.send_page(_tickets(state, parsed))
-            if path in ("/backlog", "/backlog.json", "/needs-you"):
-                raw = _backlog_bytes()
-                if path == "/backlog.json":
-                    if raw is None:
-                        return self.send_text(503, "backlog source unavailable")
-                    return self.send_bytes(200, raw, "application/json")
-                if path == "/backlog":
-                    if raw is None:
-                        return self.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
-                    return self.send_page(_backlog_page(_backlog_document(raw), parsed, state))
-                return self.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
-            if path in ("/static/loom.css", "/static/loom.js"):
-                asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
-                content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
-                return self.send_bytes(200, asset.read_bytes(), content_type)
-            if path in ("/improving", "/lanes"):
-                return _send_dashboard_view(self, state, path)
-            detail = _ticket_detail(state, path)
+            if _serve_basic(self, state, parsed.path) or _serve_view(self, state, parsed):
+                return
+            detail = _ticket_detail(state, parsed.path)
             if detail is not None:
                 return self.send_page(*detail)
             return self.send_text(404, "not found")

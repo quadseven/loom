@@ -120,7 +120,7 @@ button { color: inherit; font: inherit; }
 .ticket-bottom .progress { flex: 1; }
 .empty-state { padding: 22px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--muted); text-align: center; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }
-.chips .chip { min-height: 36px; font-size: 11px; }
+.chips .chip { font-size: 11px; }
 .goal-card h2 { margin: 6px 0 12px; font-size: 17px; }
 .goal-card > a:last-child { color: var(--accent); }
 .metric { font: 600 30px/1.1 var(--font-mono); font-variant-numeric: tabular-nums; }
