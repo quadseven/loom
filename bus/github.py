@@ -9,6 +9,7 @@ returns that answer: GitHub does not count a 304 against the hourly budget.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -20,6 +21,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
+# A read that failed on the wire is tried again after these pauses (seconds).
+RETRY_DELAYS = (2.0, 6.0)
+RETRY_STATUSES = (502, 503, 504)
 
 Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
                      Tuple[int, Dict[str, str], bytes]]
@@ -97,8 +101,11 @@ def urllib_transport(method: str, url: str, headers: Dict[str, str],
             return err.code, dict(err.headers.items()), err.read()
         finally:
             err.close()
-    except (urllib.error.URLError, OSError) as err:
-        raise GitHubError("request failed: %s" % err, 0, "") from None
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+        # HTTPException covers IncompleteRead: a connection GitHub closed in
+        # the middle of a body, which is not an OSError and used to escape
+        # every caller's GitHubError handling.
+        raise GitHubError("request failed: %r" % err, 0, "") from None
 
 
 def _json_or_none(text: str) -> Any:
@@ -114,8 +121,10 @@ def _json_or_none(text: str) -> Any:
 class GitHub:
     def __init__(self, token: str, api: str = DEFAULT_API,
                  transport: Optional[Transport] = None,
-                 cache_dir: Optional[str] = None) -> None:
+                 cache_dir: Optional[str] = None,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
         self._token = token
+        self._sleep = sleep
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
         # Where GET answers are kept for conditional requests; None sends none.
@@ -177,14 +186,39 @@ class GitHub:
     def _send(self, method: str, url: str, headers: Dict[str, str],
               payload: Optional[bytes]) -> Tuple[int, Dict[str, str], str]:
         """One request on the wire, counted: status, lower-cased headers, text."""
-        self.requests += 1
-        status, raw_headers, raw = self.transport(method, url,
-                                                  headers, payload)
+        status, raw_headers, raw = self._transport_with_retry(method, url, headers, payload)
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
         # Read before any error is raised: a 403 at the limit carries them.
         self._note_rate(resp_headers)
         self._count(method, url, status)
         return status, resp_headers, (raw or b"").decode("utf-8", "replace")
+
+    def _transport_with_retry(self, method: str, url: str, headers: Dict[str, str],
+                              payload: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
+        """The transport's answer, a read retried after a dropped connection.
+
+        GitHub closes connections in the middle of a burst of reads (2026-10-14:
+        a status call of 60 to 136 requests from a remote brain died on one
+        IncompleteRead, so the brain could not merge for four ticks). A read
+        changes nothing, so a GET is tried again after RETRY_DELAYS when the
+        connection failed (status 0) or GitHub answered 502, 503 or 504. A
+        write is never repeated: it may have landed before the connection
+        dropped. Every attempt is counted."""
+        delays = RETRY_DELAYS if method in ("GET", "HEAD") else ()
+        for attempt in range(len(delays) + 1):
+            self.requests += 1
+            try:
+                status, raw_headers, raw = self.transport(method, url, headers, payload)
+            except GitHubError as err:
+                if err.status != 0 or attempt == len(delays):
+                    raise
+                self._sleep(delays[attempt])
+                continue
+            if status in RETRY_STATUSES and attempt < len(delays):
+                self._sleep(delays[attempt])
+                continue
+            return status, raw_headers, raw
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _keep_answer(self, url: str, status: int, data: Any,
                      resp_headers: Dict[str, str]) -> None:
