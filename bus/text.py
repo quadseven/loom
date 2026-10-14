@@ -19,6 +19,13 @@ _CLOSING = re.compile(
 # An absolute path: a run of non-space characters starting with a slash (not
 # the slash inside a word such as owner/name).
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
+# Credential shapes that must not reach a public comment: provider key
+# prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
+SECRET_RE = re.compile(
+    r"(?i)\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat|xox[a-z]|glpat|AKIA|ASIA)[-_A-Za-z0-9]{12,}"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+"
+    r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
 
 
 def scrub_paths(text: str) -> str:

@@ -132,7 +132,9 @@ done
 # lands code changes in without a test, docs/LANES.md), and LOOM_TRANSCRIPT_URL
 # and LOOM_TRANSCRIPT_TOKEN_SSM (where finished transcripts are uploaded and
 # the SSM parameter holding its bearer token, docs/LANES.md; both come from
-# the installing environment, never this repo). Runs from this checkout, like the lanes, through
+# the installing environment, never this repo), and LOOM_WATCH (the logs the
+# station watches for new repeated errors, lines of name=path; empty watches
+# the station, brain and lane service logs, docs/LANES.md). Runs from this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
 LABEL="com.loom.station"
@@ -179,6 +181,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_NO_TEST_REPOS</key><string>$(xml "${LOOM_NO_TEST_REPOS:-}")</string>
     <key>LOOM_TRANSCRIPT_URL</key><string>$(xml "${LOOM_TRANSCRIPT_URL:-}")</string>
     <key>LOOM_TRANSCRIPT_TOKEN_SSM</key><string>$(xml "${LOOM_TRANSCRIPT_TOKEN_SSM:-}")</string>
+    <key>LOOM_WATCH</key><string>$(xml "${LOOM_WATCH:-}")</string>
   </dict>
 </dict>
 </plist>
