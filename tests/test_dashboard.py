@@ -286,7 +286,11 @@ class DashboardViewTest(unittest.TestCase):
         ]}
 
         def response(self):
-            return {"tickets": self.data}
+            return {"tickets": self.data, "wait_rows": [
+                {"state": "queued", "median_h": 1.5, "worst_h": 4, "n": 3},
+                {"state": "pr", "median_h": 5.5, "worst_h": 9, "n": 4},
+                {"state": "verified", "median_h": 20, "worst_h": 30, "n": 8}],
+                "pull_requests": [{"updated_at": "2026-10-14", "body": "Loom ticket example-owner/sample#32, lane codex, model model-y."}]}
 
     def test_floor_bottleneck_and_links(self):
         from dashboard.server import _floor
@@ -307,6 +311,38 @@ class DashboardViewTest(unittest.TestCase):
         self.assertIn("bottleneck", body)
         self.assertIn('href="/t/example-owner/sample/31"', body)
         self.assertIn('href="/t/example-owner/sample/32"', body)
+        self.assertIn("median 1.5h", body)
+        self.assertIn("worst 9.0h", body)
+        self.assertIn("state-pr bottleneck", body)
+        self.assertNotIn("state-verified bottleneck", body)
+        self.assertIn("model-y", body)
+
+    def test_goal_home_report_journal_and_needs_you_render(self):
+        from dashboard.github import _floor_context
+        from dashboard.server import _floor
+        state = self.State()
+        state.context = _floor_context(
+            [{"body": "<!-- loom:report v1 -->\nProgress improved: 4 tickets verified.\n"
+                      "Going well: Four tickets shipped\nNot going well: One check failed\n"
+                      "Still stuck since last report: One item for two days\nNext: Review the next ticket",
+              "created_at": "2026-10-14T12:00:00Z"}],
+            [{"body": "<!-- loom:journal v1 -->\nTick 2026-10-14T12:10:00Z, brain\n"
+                      "- Next: Review the next ticket", "created_at": "2026-10-14T12:10:00Z"}],
+            [{}, {}], [])
+        body = _floor(state)
+        for item in ("Progress improved: 4 tickets verified.", "Going well", "Four tickets shipped",
+                     "Not going well", "One check failed", "Still stuck", "One item for two days",
+                     "Next", "Review the next ticket", "brain", "2026-10-14T12:10:00Z", "<strong>2</strong>"):
+            self.assertIn(item, body)
+
+    def test_missing_goal_sources_keep_not_looked_reason(self):
+        from dashboard.server import _floor
+        state = self.State()
+        state.context = {"report_reason": "goal home unavailable", "journal_reason": "goal home unavailable",
+                         "needs_you_reason": "needs-operator source unavailable"}
+        body = _floor(state)
+        self.assertIn("not looked: goal home unavailable", body)
+        self.assertIn("not looked: needs-operator source unavailable", body)
 
     def test_ticket_filters_and_empty_state(self):
         from dashboard.server import _tickets
