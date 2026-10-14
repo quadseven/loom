@@ -137,9 +137,13 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
 TIERS: Dict[str, Tuple[str, ...]] = {
-    "easy": ("spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai",
-             "zen", "zai", "agy", "muse"),
-    "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC + ("muse",),
+    # The operator's priority (2026-10-14): Muse and agy first on public
+    # repos, so their allowances are spent before the rest. Both are public
+    # only, so a private repo's ticket still starts at spark or codex.
+    "easy": ("muse", "agy", "spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+             "openrouter", "workersai", "zen", "zai"),
+    "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
+               "opencode-go-4") + ANTHROPIC,
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
