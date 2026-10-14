@@ -14,7 +14,7 @@ from bus.github import GitHub
 from dashboard.github import TicketStore
 from dashboard.server import make_server
 
-import sandbox_caps
+from tests import sandbox_caps
 
 
 @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
