@@ -94,6 +94,10 @@ Briefs, logs and keys never go to GitHub: this repo is public.
    Loom's goal home once a day after `LOOM_DIGEST_HOUR`. The station uses
    `LOOM_REPOS` and its existing Discord bot or webhook configuration.
 3. Point a brain at it: the installed brain tick, or Muse with docs/MUSE.md.
+   Set `LOOM_REWRITE_CMD` for public backlog issues. Set
+   `LOOM_REWRITE_PRIVATE_CMD` separately to use a provider that does not train
+   on private prompts. Leave it empty to skip private repos. Each command
+   reads the issue prompt on stdin and prints one JSON object on stdout.
 4. Test: `python -B -m unittest discover -s tests -v`.
 
 ## Rules

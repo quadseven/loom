@@ -52,8 +52,8 @@ that talks to GitHub about tickets.
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed, by whoever owns shipping for the project under its own rules (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
-| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
-| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Refs #<number>`. The issue stays open. |
+| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The station rewrites it with a configured agent, or marks it `loom:human`. |
+| `loom:rewritten` | A ticket was written from this issue; the ticket says `Refs #<number>`. The issue stays open. |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed (money, hardware, an account, a credential, a decision reserved for the operator). |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -160,6 +160,17 @@ for a later run. Any other issue gets `loom:triage` and one comment naming
 what is missing. Triage writes labels, sub-issue links and that comment
 only: it never closes, retitles or edits an issue, because an automated
 pass over old issues over-calls work as done.
+
+The station then takes at most five `loom:triage` issues per backlog goal home
+each hour, oldest first. It sends the issue and its last ten comments to
+`LOOM_REWRITE_CMD` for public repos, or `LOOM_REWRITE_PRIVATE_CMD` for private
+repos. Each command reads a prompt on stdin and returns one JSON object on
+stdout: `{"action":"brief","title":"...","difficulty":"easy","body":"..."}`,
+`{"action":"human","ask":"..."}`, or `{"action":"skip","reason":"..."}`.
+The station validates the brief before filing a queued ticket with a reference
+to the source. Invalid answers write nothing. It records each outcome and
+waits a day before retrying an issue. An empty private command skips private
+repos. This work waits when the GitHub budget is below its floor.
 
 ## Proof
 

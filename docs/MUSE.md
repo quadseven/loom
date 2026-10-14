@@ -200,14 +200,11 @@ live regression).
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
    ticket under the goal, the rest get `loom:triage` and one comment naming
-   what is missing. The brain only rewrites `loom:triage` issues: take up to
-   5 per tick and, for each, either write the ticket with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
-   (M is the original; the ticket refs it, the original gets
-   `loom:rewritten` and stays open) or, when only a person can do it, run
-   `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
-   the exact thing needed: money, hardware, an account, a credential, or a
-   decision the goal home reserves for the operator. When an open
+   what is missing. The station rewrites up to 5 `loom:triage` issues per
+   backlog goal home per hour with the configured agent command. It files a
+   queued ticket that refs the original, or marks it `loom:human` when only a
+   person can provide money, hardware, an account, a credential, or a decision
+   reserved for the operator. When an open
    `loom:human` issue turns out to be work the brain can do after all,
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays

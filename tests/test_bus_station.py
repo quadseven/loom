@@ -7,13 +7,14 @@ import io
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -157,6 +158,12 @@ class FakeGitHub:
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
+        m = re.match(r"issues/(\d+)/labels/([^/]+)$", rest)
+        if m and method == "DELETE":
+            number, label = int(m.group(1)), unquote(m.group(2))
+            self.issues[number]["labels"] = [item for item in self.issues[number]["labels"]
+                                               if item["name"] != label]
+            return reply(200, [])
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         raise AssertionError("unexpected call %s %s" % (method, path))
@@ -177,6 +184,16 @@ class FakeGitHub:
             self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
+            if "loom:ticket" in data["labels"]:
+                number = max(self.issues) + 1
+                issue = {"number": number, "id": 1000 + number, "state": "open",
+                         "title": data["title"], "body": data["body"],
+                         "labels": [{"name": x} for x in data["labels"]]}
+                self.issues[number] = issue
+                self.comments[number] = []
+                self.created.append(data)
+                return reply(201, dict(issue, html_url="https://github.com/%s/issues/%d"
+                                                   % (REPO, number)))
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
             return reply(201, {"number": 1})
@@ -199,6 +216,11 @@ class FakeGitHub:
             return reply(200, self.humans)
         if "loom:goal" in query:
             return self._get_goals()
+        if "loom:triage" in query:
+            return reply(200, sorted((i for i in self.issues.values()
+                                      if i.get("state") == "open"
+                                      and "loom:triage" in self.names(i["number"])),
+                                     key=lambda i: i.get("created_at", "")))
         if "loom:lanes" in query:
             return reply(200, self.lanes_issues)
         if "loom:digest" in query:
@@ -579,6 +601,107 @@ class TriageTest(Base):
             json.dump({"rates": {"core": [500, 5000, reset]}}, fh)
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
+
+
+class RewriteTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake.add_goal(30, title="Backlog: example work")
+        self.fake.private = False
+        self.start = time.time()
+
+    def command(self, answer):
+        path = os.path.join(self.home, "agent.py")
+        prompt_path = os.path.join(self.home, "prompt.json.txt")
+        self.write(path, "import sys\nfrom pathlib import Path\n"
+                         "Path(%r).write_text(sys.stdin.read())\nprint(%r)\n"
+                         % (prompt_path, answer))
+        self.settings.rewrite_cmd = "%s %s" % (shlex.quote(sys.executable), shlex.quote(path))
+
+    def issue(self, number, created="2030-01-01T00:00:00Z"):
+        self.fake.add_open_issue(number, created=created)
+        self.fake.issues[number]["labels"] = [{"name": "loom:triage"}]
+
+    def run_rewrite(self, offset=0):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings,
+                                 now=self.start + offset)
+        runner.rewrite_backlogs()
+
+    def test_valid_brief_files_queued_ticket_and_only_labels_and_comments_source(self):
+        self.issue(100)
+        self.fake.comments[100] = [{"body": "Comment %d" % n} for n in range(12)]
+        self.command(json.dumps({"action": "brief", "title": "Improve the example",
+                                 "difficulty": "easy", "body": READY_BODY}))
+        self.run_rewrite()
+        ticket = self.fake.created[-1]
+        self.assertEqual(ticket["labels"], ["loom:ticket", "loom:queued"])
+        self.assertIn("Refs #100", ticket["body"])
+        self.assertIn("loom:rewritten", self.fake.names(100))
+        self.assertNotIn("loom:triage", self.fake.names(100))
+        self.assertEqual(self.fake.issues[100]["title"], "Open issue")
+        self.assertEqual(self.fake.issues[100]["body"], "It is slow.")
+        with open(os.path.join(self.home, "prompt.json.txt")) as fh:
+            prompt = fh.read()
+        self.assertIn("Open issue", prompt)
+        self.assertIn("It is slow.", prompt)
+        self.assertIn("loom:triage", prompt)
+        self.assertIn("Comment 11", prompt)
+        self.assertNotIn("Comment 0", prompt)
+        self.assertFalse(any(method == "PATCH" or path.endswith("/issues/100")
+                             and method == "DELETE" for method, path in self.fake.calls))
+
+    def test_human_answer_marks_source_with_ask(self):
+        self.issue(100)
+        self.command(json.dumps({"action": "human", "ask": "Operator: approve the purchase."}))
+        self.run_rewrite()
+        self.assertIn("loom:human", self.fake.names(100))
+        self.assertIn("approve the purchase", self.fake.comments[100][-1]["body"])
+        self.assertFalse(self.fake.created)
+
+    def test_human_answer_without_operator_need_writes_nothing(self):
+        self.issue(100)
+        self.command(json.dumps({"action": "human", "ask": "Run the unit tests."}))
+        self.run_rewrite()
+        self.assertEqual(self.fake.names(100), ["loom:triage"])
+        self.assertFalse(any(method != "GET" for method, _ in self.fake.calls))
+
+    def test_invalid_answers_write_nothing_and_retry_after_a_day(self):
+        for answer in ("not json", json.dumps({"action": "brief", "title": "Incomplete",
+                                               "difficulty": "easy", "body": "## Why\nwhy"})):
+            with self.subTest(answer=answer):
+                self.issue(100)
+                self.command(answer)
+                self.run_rewrite()
+                writes = [call for call in self.fake.calls if call[0] != "GET"]
+                self.assertEqual(writes, [])
+                self.run_rewrite(3601)
+                self.assertEqual([call for call in self.fake.calls if call[0] != "GET"], [])
+                self.assertIn("loom:triage", self.fake.names(100))
+                os.remove(os.path.join(self.home, "state", "station", "rewrite.json"))
+
+    def test_private_repo_without_private_command_is_skipped(self):
+        self.issue(100)
+        self.fake.private = True
+        self.command(json.dumps({"action": "human", "ask": "Buy hardware."}))
+        self.run_rewrite()
+        self.assertEqual(self.fake.names(100), ["loom:triage"])
+        self.assertFalse(any("labels=loom:triage" in path for path in self.fake.paths()))
+
+    def test_at_most_five_oldest_issues_per_hour(self):
+        for number in range(100, 107):
+            self.issue(number, created="2030-01-01T00:%02d:00Z" % (number - 100))
+        self.command(json.dumps({"action": "skip", "reason": "Already handled."}))
+        self.run_rewrite()
+        state_path = os.path.join(self.home, "state", "station", "rewrite.json")
+        with open(state_path) as fh:
+            state = json.load(fh)
+        self.assertEqual(list(state["issues"]), ["%s#%d" % (REPO, n) for n in range(100, 105)])
+        self.run_rewrite(60)
+        with open(state_path) as fh:
+            self.assertEqual(len(json.load(fh)["issues"]), 5)
+        self.run_rewrite(3601)
+        with open(state_path) as fh:
+            self.assertEqual(len(json.load(fh)["issues"]), 7)
 
 
 class ReviewFake:

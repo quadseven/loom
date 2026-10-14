@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import metrics
+from . import rewrite
 from . import spend
 from . import text as _text
 from . import tickets
@@ -119,6 +120,8 @@ REPORT_OVERLAP = 3600
 REPORT_FIRST_LOOKBACK = 24 * 3600
 # A backlog goal home is triaged at most this often.
 TRIAGE_INTERVAL = 3600
+REWRITE_RETRY = 24 * 3600
+REWRITE_LIMIT = 5
 # Through the bot, a report is one short line (the goal's short name and the
 # report's first line) with a thread on it holding the full report.
 SHORT_NAME_RE = re.compile(r"^[ \t]*Short name:[ \t]*(\S.*?)[ \t]*$", re.M | re.I)
@@ -224,7 +227,8 @@ class Settings:
                  no_test_repos: Sequence[str] = (),
                  metrics_goal: str = "",
                  transcript_url: str = "",
-                 transcript_token_ssm: str = "") -> None:
+                 transcript_token_ssm: str = "",
+                 rewrite_cmd: str = "", rewrite_private_cmd: str = "") -> None:
         self.home = home
         self.repos = repos
         self.authors = authors
@@ -248,6 +252,8 @@ class Settings:
         self.metrics_goal = metrics_goal
         self.transcript_url = transcript_url
         self.transcript_token_ssm = transcript_token_ssm
+        self.rewrite_cmd = rewrite_cmd
+        self.rewrite_private_cmd = rewrite_private_cmd
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -292,7 +298,9 @@ class Settings:
                    no_test_repos=words("LOOM_NO_TEST_REPOS"),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
-                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip())
+                   transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
+                   rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
+                   rewrite_private_cmd=env.get("LOOM_REWRITE_PRIVATE_CMD", "").strip())
 
 
 def _origin_repo() -> str:
@@ -2346,6 +2354,70 @@ class Station:
             state[key] = self.now
         _write_json(path, state)
 
+    def rewrite_backlogs(self) -> None:
+        """Rewrite up to five old triaged issues per backlog goal each hour."""
+        if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd):
+            return
+        path = os.path.join(self.state, "rewrite.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        hours = state.setdefault("hours", {})
+        outcomes = state.setdefault("issues", {})
+        try:
+            homes = self._goal_homes()
+        except (GitHubError, OSError) as err:
+            _say("could not list goal homes for rewrite: %s" % err)
+            return
+        privacy: Dict[str, bool] = {}
+        for repo, goal in homes:
+            if not str(goal.get("title") or "").startswith("Backlog:"):
+                continue
+            key = "%s#%d" % (repo, int(goal["number"]))
+            last = hours.get(key)
+            if self._triage_recent(last):
+                continue
+            try:
+                if repo not in privacy:
+                    info = self.gh.rest("GET", "/repos/%s" % repo).data or {}
+                    if not isinstance(info.get("private"), bool):
+                        raise ValueError("repository visibility is unknown")
+                    privacy[repo] = info["private"]
+                command = self.s.rewrite_private_cmd if privacy[repo] else self.s.rewrite_cmd
+                if not command:
+                    continue
+                issues = self.gh.paginate(
+                    "/repos/%s/issues?labels=loom:triage&state=open&sort=created&direction=asc&per_page=100"
+                    % repo)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("rewrite %s could not read issues: %s" % (key, err))
+                continue
+            hours[key] = self.now
+            _write_json(path, state)
+            attempted = 0
+            for issue in issues:
+                if attempted >= REWRITE_LIMIT:
+                    break
+                if self.budget_low() is not None:
+                    break
+                if "pull_request" in issue:
+                    continue
+                number = int(issue["number"])
+                issue_key = "%s#%d" % (repo, number)
+                previous = outcomes.get(issue_key)
+                if (isinstance(previous, dict) and isinstance(previous.get("at"), (int, float))
+                        and 0 <= self.now - previous["at"] < REWRITE_RETRY):
+                    continue
+                attempted += 1
+                try:
+                    result = rewrite.one(self.gh, repo, int(goal["number"]), issue, command)
+                except (GitHubError, OSError, ValueError, subprocess.SubprocessError) as err:
+                    result = "failed"
+                    _say("rewrite %s failed: %s" % (issue_key, _text.scrub_paths(str(err))))
+                outcomes[issue_key] = {"at": self.now, "result": result}
+                _write_json(path, state)
+            _say("rewrite %s: %d attempted" % (key, attempted))
+
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
         """(ledger key, brain tick start or None, body builder) for every
@@ -3118,7 +3190,8 @@ class Station:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.publish_lanes, self.forward_asks, self.post_overdue_standups,
-                     self.forward_reports, self.triage_backlogs, self.post_metrics,
+                     self.forward_reports, self.triage_backlogs, self.rewrite_backlogs,
+                     self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
                      self.run_factory):
             if self._deferred():
