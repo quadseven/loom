@@ -551,8 +551,8 @@ branch after the merge instead (bus/revert.py, every pass, off with
   Its acceptance criteria are the failing checks passing. Its body says
   `Tests: none needed (...)` and `Reverted ticket: #N`.
 - The station claims it first. The factory lands it first, on green and
-  reviewed, deferring its medium and low findings at once instead of after
-  a fix round. A high or critical finding still sends it back.
+  reviewed, deferring its medium and low findings at once like any lane
+  pull request. A high or critical finding still sends it back.
 - The reverted ticket gets a comment naming the red check and the revert
   ticket. Once the revert reaches `loom:merged`, the ticket goes back to
   `loom:briefed` on its own lane, to redo the change on the new default

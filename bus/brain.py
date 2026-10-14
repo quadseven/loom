@@ -488,6 +488,34 @@ def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optiona
     return Counter(undeclared).most_common(1)[0][0]
 
 
+def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
+                        data: Dict[str, Any], bot: str,
+                        authors: Sequence[str] = ()) -> List[str]:
+    """The pull request lines for status: heading, merge readiness for each
+    loom pull request, and the pending brain fix mark when one waits."""
+    lines = ["### Pull requests"]
+    for pr in prs:
+        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
+        try:
+            ticket = _ticket_association(repo, pr)
+        except ValueError:
+            ticket = None
+        if ticket is not None and authors:
+            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+            if _pending_brain_fix(comments, authors):
+                line += " - pending brain fix"
+        lines.append(line)
+    return lines
+
+
+def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
+    """The sensitive pull requests section for status."""
+    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
+    lines = ["### Sensitive pull requests"]
+    lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
+    return lines
+
+
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None) -> List[str]:
     issues = _issues(gh, repo)
@@ -511,21 +539,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
-    lines += held_lines(held, tickets) + ["", "### Pull requests"]
-    for pr in prs:
-        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
-        try:
-            ticket = _ticket_association(repo, pr)
-        except ValueError:
-            ticket = None
-        if ticket is not None and authors:
-            comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-            if _pending_brain_fix(comments, authors or ()):
-                line += " - pending brain fix"
-        lines.append(line)
-    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
-    lines += ["", "### Sensitive pull requests"]
-    lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
+    lines += held_lines(held, tickets)
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or ())
+    lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
@@ -541,6 +557,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
 
 VERIFY_DUE_HEADING = "### Verify due"
 VERIFY_RESUME_MAX = 5
+SENSITIVE_RESUME_MAX = 5
 _LIVE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]*)?(?:\[[ xX]\][ \t]*)?(Live\b.*?)[ \t]*$", re.M)
 
 
@@ -2041,6 +2058,53 @@ def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime) -> Lis
     return out if due else out + ["- none"]
 
 
+def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
+                     check: str) -> Optional[Dict[str, Any]]:
+    """A needs-brain sensitive pull request older than 2 hours whose checks
+    are green and whose review check passed on its head, with its ticket;
+    None otherwise."""
+    if "needs-brain" not in _labels(pr) or "class:sensitive" not in _labels(pr):
+        return None
+    created = _stamp(str(pr.get("created_at") or ""))
+    if created is None or (now - created).total_seconds() <= 2 * 3600:
+        return None
+    try:
+        ticket = _ticket_association(repo, pr)
+    except ValueError:
+        return None
+    if ticket is None:
+        return None
+    owner, name = repo.split("/", 1)
+    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
+                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
+    details = (data.get("repository") or {}).get("p") or {}
+    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    if not _checks_green(details) or not sha or not _review_check_passed(gh, repo, sha, check):
+        return None
+    return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details}
+
+
+def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
+                            env: Optional[Dict[str, str]]) -> List[str]:
+    """Ready sensitive PRs needing brain attention, oldest first."""
+    check = review_check_name(env)
+    ready = [item for repo in repos
+             for item in (_ready_sensitive(gh, repo, pr, now, check)
+                          for pr in gh.paginate("/repos/%s/pulls?state=open" % repo))
+             if item is not None]
+    ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
+    out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
+    for item in ready[:SENSITIVE_RESUME_MAX]:
+        pr, ticket = item["pr"], item["ticket"]
+        title = str((gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}).get("title") or "")
+        threads = (item["details"].get("reviewThreads") or {}).get("nodes") or []
+        open_threads = sum(1 for thread in threads if not thread.get("isResolved"))
+        out.append("- resume sensitive %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
+            item["repo"], pr["number"], ticket[0], ticket[1], title,
+            pr.get("title", ""), _age(pr, now), open_threads))
+    return out if ready else out + ["- none"]
+
+
 def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
            now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None) -> str:
     """What the lock holder may finish for other brains: the live resume items
@@ -2055,7 +2119,8 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
                [j for _, _, found in goals for j in found], holder, now))]
     for repo, issue, found in goals:
         out += _goal_resume_lines(gh, repo, issue, found)
-    return "\n".join(out + _verify_resume_lines(gh, repos, now))
+    return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
+                      + _verify_resume_lines(gh, repos, now))
 
 
 STUCK_STATES = ("failed", "briefed", "pr")

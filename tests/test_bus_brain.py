@@ -100,6 +100,61 @@ class BrainTests(unittest.TestCase):
                 lock_repo=REPO, name="merge", note=None, holder="muse", show=False))
         self.assertIn("brain step write failed", err.getvalue())
 
+
+class SensitiveResumeTests(unittest.TestCase):
+    NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
+
+    def make_gh(self, entries):
+        prs = []
+        details = {}
+        for n, age, checks, _ in entries:
+            prs.append({"number": n, "title": "PR%d" % n,
+                        "created_at": (self.NOW - brain.timedelta(hours=age)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "labels": [{"name": "needs-brain"}, {"name": "class:sensitive"}],
+                        "head": {"ref": "loom/%d-fix" % n, "sha": "sha%d" % n}})
+            details[n] = {"headRefOid": "sha%d" % n,
+                          "commits": {"nodes": [{"commit": {
+                              "statusCheckRollup": {"state": checks}}}]},
+                          "reviewThreads": {"nodes": [
+                              {"isResolved": False}, {"isResolved": True}]}}
+
+        def transport(method, url, headers, body):
+            path = url.split("api.github.com")[1].split("?")[0]
+            if path == "/repos/%s/pulls" % REPO:
+                return reply(200, prs)
+            if path.startswith("/repos/%s/commits/" % REPO) and path.endswith("/check-runs"):
+                sha = path.split("/")[-2]
+                n = int(sha[3:])
+                passed = next(row[3] for row in entries if row[0] == n)
+                runs = [{"name": brain.review_check_name({}), "status": "completed",
+                         "conclusion": "success" if passed else "failure"}] if passed else []
+                return reply(200, {"check_runs": runs})
+            if path.startswith("/repos/%s/issues/" % REPO):
+                n = int(path.rsplit("/", 1)[1])
+                return reply(200, {"title": "Ticket%d" % n})
+            if path == "/graphql":
+                query = json.loads(body)["query"]
+                n = int(query.split("pullRequest(number:")[1].split(")")[0])
+                return reply(200, {"data": {"repository": {"p": details[n]}}})
+            raise AssertionError("unexpected %s %s" % (method, path))
+        return GitHub("t", transport=transport)
+
+    def test_only_old_green_reviewed_sensitive_prs_are_listed_with_ticket_and_threads(self):
+        entries = [(1, 3, "SUCCESS", True), (2, 1, "SUCCESS", True),
+                   (3, 4, "FAILURE", True), (4, 5, "SUCCESS", False)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries), [REPO], self.NOW, {})
+        items = [line for line in lines if line.startswith("- resume sensitive")]
+        self.assertEqual(1, len(items))
+        self.assertIn("%s#1 ticket %s#1 Ticket1 - PR1 - 3h old - 1 open review threads" %
+                      (REPO, REPO), items[0])
+
+    def test_sensitive_resume_is_capped_at_five_oldest_first(self):
+        entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries), [REPO], self.NOW, {})
+        numbers = [int(line.split("#")[1].split()[0]) for line in lines
+                   if line.startswith("- resume sensitive")]
+        self.assertEqual([7, 6, 5, 4, 3], numbers)
+
     def test_goal_trunk_reads_the_trunk_line_from_a_goal_body(self):
         self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
@@ -143,6 +198,71 @@ class BrainTests(unittest.TestCase):
         lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
+
+    def test_status_pull_request_lines_with_and_without_pending_brain_fix(self):
+        pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
+        authors = ["alice-example"]
+        comments_with = [{"user": {"login": "alice-example"},
+                          "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        fake_with = Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [pr]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, comments_with),
+            reply(200, []))
+        report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
+                                   env={}, authors=authors)
+        lines = report_with.splitlines()
+        at = lines.index("### Pull requests")
+        self.assertEqual(lines[at + 1], "- #4 PR - READY - pending brain fix")
+
+        comments_without = [{"user": {"login": "alice-example"},
+                             "body": "%s normal fix" % tickets.FIX_MARKER}]
+        fake_without = Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [pr]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, comments_without),
+            reply(200, []))
+        report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
+                                      env={}, authors=authors)
+        lines = report_without.splitlines()
+        at = lines.index("### Pull requests")
+        self.assertEqual(lines[at + 1], "- #4 PR - READY")
+
+    def test_pull_request_lines_helper_with_and_without_pending_brain_fix(self):
+        pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
+        data = {"prs": {4: ready_node()}}
+        bot = "grug-tribe"
+        authors = ["alice-example"]
+
+        with_fix = [{"user": {"login": "alice-example"},
+                     "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        gh_fix = GitHub("t", transport=Fake(reply(200, with_fix)))
+        lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
+        self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - READY - pending brain fix"])
+
+        without_fix = [{"user": {"login": "alice-example"},
+                        "body": "%s normal fix" % tickets.FIX_MARKER}]
+        gh_without = GitHub("t", transport=Fake(reply(200, without_fix)))
+        lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
+        self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
+
+        no_authors = GitHub("t", transport=Fake())
+        lines_pure = brain._pull_request_lines(no_authors, REPO, [pr], data, bot)
+        self.assertEqual(lines_pure, ["### Pull requests", "- #4 PR - READY"])
+
+    def test_sensitive_pr_lines_helper(self):
+        sensitive_pr = {"number": 4, "title": "Sensitive", "labels": [{"name": "class:sensitive"}]}
+        ordinary_pr = {"number": 5, "title": "Ordinary", "labels": []}
+        lines = brain._sensitive_pr_lines([sensitive_pr, ordinary_pr])
+        self.assertEqual(lines, ["### Sensitive pull requests", "- #4 Sensitive"])
+        empty = brain._sensitive_pr_lines([ordinary_pr])
+        self.assertEqual(empty, ["### Sensitive pull requests", "- none"])
 
     def test_status_lists_open_invariant_issues_for_the_report(self):
         gh = GitHub("t", transport=Fake(
