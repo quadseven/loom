@@ -1792,7 +1792,10 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
         return {"holder": None, "started_at": None, "step": None,
                 "step_index": None, "steps": list(TICK_STEPS), "notes": []}
     sha = ref.data["object"]["sha"]
-    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha))
+    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha), ok=(404,))
+    if commit.status == 404:
+        return {"holder": None, "started_at": None, "step": None,
+                "step_index": None, "steps": list(TICK_STEPS), "notes": []}
     message = str(commit.data.get("message") or "")
     current_holder = re.search(r"holder=(\S+)", message)
     record = {"holder": current_holder.group(1) if current_holder else None,
