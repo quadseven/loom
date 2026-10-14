@@ -1120,7 +1120,7 @@ class ModelFlagTests(unittest.TestCase):
         self.assertEqual(order, ["PATCH", "PUT"])
 
     def test_fix_refuses_an_unknown_lane_or_bad_model(self):
-        for kw in (dict(lane="bogus"), dict(model="bad model")):
+        for kw in (dict(lane="bogus"), dict(lane="muse"), dict(model="bad model")):
             fake = Fake()
             with self.assertRaises(ValueError):
                 brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "n", **kw)

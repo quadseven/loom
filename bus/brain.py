@@ -1745,6 +1745,8 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     another lane and model when given (the body's Model: line is rewritten)."""
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
+    if lane is not None and lane in REMOTE_LANES:
+        raise ValueError("remote lane %s only works with --to queued" % lane)
     _check_model(model)
     _check_written_text(notes)
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}

@@ -311,23 +311,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--title")
     args = parser.parse_args(argv)
     try:
-        gh = GitHub(token_from_env())
         if args.command == "claim":
             repos = [r for r in args.repos.replace(",", " ").split() if r]
             if not repos:
                 raise ValueError("claim requires --repos or LOOM_REPOS")
+            gh = GitHub(token_from_env())
             result = claim(gh, repos, args.lane)
             return 0 if result else 1
-        repo, _, raw = args.ticket.partition("#")
+        repo, _, raw = args.ticket.partition("#") if args.ticket else ("", "", "")
         if args.command == "heartbeat" and not args.ticket:
             status_repo = args.repo or (args.repos.replace(",", " ").split() or [""])[0]
             if not tickets.REPO_RE.fullmatch(status_repo):
                 raise ValueError("heartbeat without a ticket requires --repo or LOOM_STATUS_REPO")
+            gh = GitHub(token_from_env())
             lane_heartbeat(gh, status_repo, args.lane)
             return 0
         if not tickets.REPO_RE.fullmatch(repo) or not raw.isdigit():
             raise ValueError("expected OWNER/NAME#N")
         number = int(raw)
+        gh = GitHub(token_from_env())
         if args.command == "heartbeat":
             heartbeat(gh, repo, number, args.lane)
         else:

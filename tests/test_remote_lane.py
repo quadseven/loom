@@ -158,7 +158,8 @@ class RemoteLaneTests(unittest.TestCase):
         with mock.patch("sys.stderr", buf):
             got = lane.claim(gh, ["example/project"], now=1000)
         self.assertIsNone(got)
-        self.assertEqual(labels(gh)[-1], "loom:queued")
+        self.assertIn("loom:queued", labels(gh))
+        self.assertNotIn("loom:running", labels(gh))
         self.assertIn("scanned 1 repos, found 1 candidates", buf.getvalue())
         self.assertIn("#4 skipped: branch loom/4-add-a-feature already has pull request #99", buf.getvalue())
 

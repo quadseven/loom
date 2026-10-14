@@ -1023,6 +1023,12 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "spark")
         self.assertEqual([c for c in self.gh.comments[7]], [])
 
+    def test_a_limit_hand_off_of_a_briefed_ticket_never_picks_a_remote_lane(self):
+        self.gh.private = False
+        self.limited_easy()
+        self.assertNotEqual(self.lane(7), "muse")
+        self.assertEqual(self.lane(7), "agy")
+
     def test_a_lane_without_an_available_heartbeat_is_not_free(self):
         self.limited_easy(available=["openrouter"])
         self.assertEqual(self.lane(7), "openrouter")
