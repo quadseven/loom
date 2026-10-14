@@ -173,6 +173,7 @@ def _backlog_bytes():
             addresses = {ipaddress.ip_address(row[4][0]) for row in socket.getaddrinfo(parsed.hostname, parsed.port or 443)}
             if not addresses or any(not address.is_global for address in addresses):
                 return None
+            # Verify the public source with system CAs and never follow redirects.
             opener = build_opener(_RejectRedirects, HTTPSHandler(context=ssl.create_default_context()))
             with opener.open(source, timeout=5) as response:
                 return response.read()
@@ -412,6 +413,7 @@ def _serve_view(handler, state, parsed):
 
 
 def _handler_for(state):
+    """Keep GET dispatch small; route groups are handled by module helpers."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlsplit(self.path)
