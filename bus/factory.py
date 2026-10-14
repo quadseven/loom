@@ -73,6 +73,10 @@ Neither needs a model:
   difficulty tier (TIERS), or a ladder ticket to a free lane of its own rung.
   A limit is not a failure, so it never climbs; with no free lane the ticket
   waits where it is for its lane to come back.
+- When no lane of a ticket's tier is up, a limit move or a queued assignment
+  falls back to a free lane of the tiers FALLBACK lists (medium: hard, then
+  easy), and says so in its note. The ticket's Difficulty: line is kept, so
+  its next move takes its own tier again once a lane of it is up.
 - Past the last rung the ticket is left failed for the brain, with a note.
 - A revert ticket (bus/revert.py, REVERT_LABEL) lands first when its own
   pull request is green, even while the default branch is red. Its medium
@@ -137,6 +141,13 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     "medium": ("codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + ANTHROPIC,
     "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
 }
+# When no lane of a ticket's tier is up (each at a limit or down), a tier move
+# takes a free lane of these tiers instead, in order: the next harder tier,
+# then the easier one (docs/MUSE.md, Lane choice). On 2026-10-14 every medium
+# lane was at a limit for hours while claude and the free lanes sat idle.
+# Easy has none (never anthropic or claude) and hard has none (never a free
+# lane or spark).
+FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
 PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4")
@@ -527,15 +538,24 @@ def without_model(body: str) -> str:
     return MODEL_LINE.sub("", head + "\n", count=1).rstrip("\n") + sep + rest
 
 
+def difficulty_of(issue: Dict[str, Any]) -> str:
+    """The ticket's Difficulty: line, "" when it has none readable."""
+    try:
+        return str(tickets.parse(issue.get("body"))[0].get("Difficulty", ""))
+    except ValueError:
+        return ""
+
+
+def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:
+    """The lanes of a difficulty tier a repo may run on, best first."""
+    return tuple(x for x in TIERS.get(difficulty, ())
+                 if not (private and x in PUBLIC_ONLY))
+
+
 def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
     """The lanes of the ticket's difficulty tier it may run on, best first;
     none when it has no readable Difficulty: line."""
-    try:
-        difficulty = tickets.parse(issue.get("body"))[0].get("Difficulty", "")
-    except ValueError:
-        return ()
-    return tuple(x for x in TIERS.get(difficulty, ())
-                 if not (private and x in PUBLIC_ONLY))
+    return lanes_of(difficulty_of(issue), private)
 
 
 class Factory:
@@ -591,11 +611,32 @@ class Factory:
             self._private[repo] = not isinstance(data, dict) or data.get("private") is not False
         return self._private[repo]
 
+    def _up(self, lane: str) -> bool:
+        """A lane that is up and not at a limit."""
+        return lane not in self.limited and (self.available is None or lane in self.available)
+
     def _free(self, lane: str) -> bool:
         """A lane that is up, not at a limit, and holds no briefed or
         running ticket."""
-        return (lane not in self.limited and self.load.get(lane, 0) == 0
-                and (self.available is None or lane in self.available))
+        return self._up(lane) and self.load.get(lane, 0) == 0
+
+    def _tier_move(self, repo: str, issue: Dict[str, Any],
+                   old: str = "") -> Tuple[Optional[str], str]:
+        """(lane, fallback) for a tier move off lane `old`: the first free lane
+        of the ticket's tier, with fallback ""; else, when no lane of its tier
+        is up, the first free lane of its FALLBACK tiers in order, with
+        fallback saying so. (None, "") when it should wait."""
+        private = self._is_private(repo)
+        difficulty = difficulty_of(issue)
+        own = [x for x in lanes_of(difficulty, private) if x != old]
+        lane = next((x for x in own if self._free(x)), None)
+        if lane is not None or any(self._up(x) for x in own):
+            return lane, ""
+        for tier in FALLBACK.get(difficulty, ()):
+            lane = next((x for x in lanes_of(tier, private) if x != old and self._free(x)), None)
+            if lane is not None:
+                return lane, "fallback: no %s lane is up" % difficulty
+        return None, ""
 
     def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
         """Every check run on the commit, all pages."""
@@ -1042,14 +1083,18 @@ class Factory:
 
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
         """Move a ticket off a lane at a limit to the first free lane of its
-        difficulty tier, or a ladder ticket to a free lane of its rung, with
-        no rung marker. With none free it stays where it is, for the lane to
-        take once it is back."""
+        difficulty tier (or of a FALLBACK tier when none of its tier is up),
+        or a ladder ticket to a free lane of its rung, with no rung marker.
+        With none free it stays where it is, for the lane to take once it is
+        back."""
         number = int(issue["number"])
         old = _lane(issue)
         rung = current_rung(issue)
-        lanes = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
-        lane = next((x for x in lanes if x != old and self._free(x)), None)
+        fallback = ""
+        if rung:
+            lane = next((x for x in LADDER[rung - 1][0] if x != old and self._free(x)), None)
+        else:
+            lane, fallback = self._tier_move(repo, issue, old)
         if lane is None:
             _say("%s#%d waits on lane %s, at a limit: no free lane in its %s"
                  % (repo, number, old, "rung" if rung else "tier"))
@@ -1065,11 +1110,13 @@ class Factory:
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
             "body": "Not a failure (lane %s is at a limit): the factory moved this "
                     "ticket to lane %s, %s." % (
-                        old, lane, "on the same rung" if rung else "in its difficulty tier")})
+                        old, lane, "on the same rung" if rung else
+                        fallback or "in its difficulty tier")})
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
-        _say("moved %s#%d off lane %s, at a limit, to %s" % (repo, number, old, lane))
+        _say("moved %s#%d off lane %s, at a limit, to %s%s" % (
+            repo, number, old, lane, " (%s)" % fallback if fallback else ""))
 
     # -- lane load -------------------------------------------------------
     def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
@@ -1082,7 +1129,8 @@ class Factory:
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
 
     def assign_queued(self) -> None:
-        """Give queued tickets free tier lanes, oldest first across repos."""
+        """Give queued tickets free tier lanes (or FALLBACK lanes when none of
+        the tier is up), oldest first across repos."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
         queued = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
@@ -1091,36 +1139,32 @@ class Factory:
                 str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
             if self.now < held_until(issue):
                 continue
-            lanes = [lane for lane in tier_lanes(issue, self._is_private(repo))
-                     if self._free(lane)]
-            if not lanes:
+            lane, fallback = self._tier_move(repo, issue)
+            if lane is None:
                 continue
-            lane = pick_lane(lanes, self.load)
-            difficulty = tickets.parse(issue.get("body"))[0]["Difficulty"]
-            self._guarded(self._assign_queued_one, repo, issue, lane, difficulty)
+            tier = difficulty_of(issue) + (", " + fallback if fallback else "")
+            self._guarded(self._assign_queued_one, repo, issue, lane, tier)
 
     def _assign_queued_one(self, repo: str, issue: Dict[str, Any], lane: str,
-                           difficulty: str) -> None:
+                           tier: str) -> None:
         number = int(issue["number"])
         self.move(self.gh, repo, number, "briefed", lane=lane,
                   note="The station gave this queued ticket lane %s (tier %s)." %
-                       (lane, difficulty))
+                       (lane, tier))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         self.load[lane] = self.load.get(lane, 0) + 1
-        _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, difficulty))
+        _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
 
     def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
         """The first free lane of the difficulty tier the repo may use, else
         its least-loaded lane that is up and not at a limit; None when the
         tier has none. count_load first."""
-        private = self._is_private(repo)
-        lanes = [x for x in TIERS.get(difficulty, ()) if not (private and x in PUBLIC_ONLY)]
+        lanes = lanes_of(difficulty, self._is_private(repo))
         free = next((x for x in lanes if self._free(x)), None)
         if free is not None:
             return free
-        up = [x for x in lanes if x not in self.limited
-              and (self.available is None or x in self.available)]
+        up = [x for x in lanes if self._up(x)]
         return pick_lane(up, self.load) if up else None
 
     # -- the pass --------------------------------------------------------

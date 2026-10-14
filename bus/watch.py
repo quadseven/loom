@@ -122,7 +122,8 @@ def _norm(piece: str) -> str:
 def signature(line: str) -> str:
     """The line with its varying parts replaced by placeholders; HTTP status
     codes are kept, so a 403 and a 502 differ."""
-    line = _LEAD_RE.sub("", line)
+    # The signature becomes a public issue title: strip credentials first.
+    line = _text.SECRET_RE.sub("[redacted]", transcripts.scrub(_LEAD_RE.sub("", line)))
     out, last = [], 0
     for m in HTTP_RE.finditer(line):
         group = "a" if m.group("a") else "b"

@@ -40,7 +40,7 @@
 # LOOM_CHECK_TIMEOUT (seconds per validation step, default 1800; see
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
-# from PATH; a 2.x binary runs --standalone --auto),
+# from PATH; a 2.x binary uses a private server inside its sandbox),
 # LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
 # endpoint, asked for a usage limit before each run and after a timeout; see
 # provider_at_limit),
@@ -1504,7 +1504,7 @@ for BRIEF in "$INBOX"/*.md; do
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$(pr_body "$BRIEF" "$TICKET")" 2>> "$LOG")"; then
-    park "$BRIEF" "pr create failed; branch $BRANCH is pushed"; continue
+    park "$BRIEF" "pr create failed; branch $BRANCH is pushed" transient; continue
   fi
   echo "$PR_URL" >> "$LOG"
   if [ -n "$INTENT_CLASS" ] && ! timeout "$NET_TIMEOUT" gh pr edit "$PR_URL" -R "$REPO" --add-label "class:$INTENT_CLASS" >> "$LOG" 2>&1; then

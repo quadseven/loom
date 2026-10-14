@@ -145,7 +145,9 @@ done
 # rewrite loom:triage issues into tickets, docs/BRAIN.md Triage; for example
 # "lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash", and for
 # private repos the same with a model whose provider does not train on
-# prompts, such as opencode-go/kimi-k2.7-code, never a public-only one). Runs from
+# prompts, such as opencode-go/kimi-k2.7-code, never a public-only one), and
+# LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
+# its merged tickets move to loom:shipped once a deploy carries them). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -177,6 +179,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
+    <key>LOOM_SELF_REPO</key><string>$(xml "${LOOM_SELF_REPO:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
