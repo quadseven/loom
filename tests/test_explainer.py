@@ -116,15 +116,20 @@ class ExplainerPage(unittest.TestCase):
                 self.assertGreaterEqual(contrast(variables[foreground], variables[background]), 4.5)
 
     def test_every_link_and_button_has_a_44px_css_tap_target(self):
-        rules = {selector.strip(): body for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", self.css)}
-        declarations = dict(re.findall(r"([\w-]+)\s*:\s*([^;]+)", rules["a"]))
-        self.assertGreaterEqual(float(declarations["min-height"].removesuffix("px")), 44)
-        button_styles = dict(re.findall(r"([\w-]+)\s*:\s*([^;]+)", rules[".button"]))
-        self.assertNotIn("min-height", button_styles)
-        self.assertNotIn("height", button_styles)
+        rules = {}
+        for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", self.css):
+            declarations = dict(re.findall(r"([\w-]+)\s*:\s*([^;]+)", body))
+            for selector in selectors.split(","):
+                rules[selector.strip()] = declarations
+
         for tag, attrs in self.parser.tags:
             if tag in {"a", "button"}:
-                self.assertTrue(tag == "a" or "button" in attrs.get("class", ""))
+                declarations = dict(rules.get(tag, {}))
+                for class_name in attrs.get("class", "").split():
+                    declarations.update(rules.get("." + class_name, {}))
+                height = declarations.get("min-height", declarations.get("height"))
+                self.assertIsNotNone(height, f"{tag} has no declared tap target height")
+                self.assertGreaterEqual(float(height.removesuffix("px")), 44, f"{tag} tap target too small")
 
 
 if __name__ == "__main__":
