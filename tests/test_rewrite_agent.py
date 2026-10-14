@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import sandbox_caps
+
 LANES = Path(__file__).resolve().parent.parent / "lanes"
 WRAPPER = LANES / "rewrite_agent.sh"
 KEY = "sk-test-rewrite-key-0123456789"
@@ -111,6 +113,7 @@ class RewriteAgentTest(unittest.TestCase):
         lines = self.agent_log.read_text().splitlines() if self.agent_log.exists() else []
         return dict(line.split("=", 1) for line in lines if "=" in line)
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_prompt_reaches_the_agent_on_stdin_and_only_the_final_text_is_printed(self):
         prompt = 'Rewrite this.\nAnswer {"action": "brief"} with "quotes" kept.\n'
         result = self.run_wrapper(prompt)
@@ -121,6 +124,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(argv, f"run -m {MODEL} --format json")
         self.assertNotIn("Rewrite this", argv)
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_the_key_reaches_only_the_agent_environment(self):
         result = self.run_wrapper()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -142,6 +146,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertTrue(seen["home"].startswith(str(self.loom / "run" / "rewrite.")))
         self.assertEqual(list((self.loom / "run").iterdir()), [])
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_the_opencode_permission_config_denies_every_tool(self):
         result = self.run_wrapper()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -150,6 +155,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(config["model"], MODEL)
         self.assertEqual(config["small_model"], MODEL)
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_failing_agent_exits_non_zero_and_prints_nothing(self):
         for mode in ("fail", "error", "notext"):
             with self.subTest(mode=mode):
@@ -165,6 +171,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertNotIn(KEY, result.stderr)
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_module_the_agent_leaves_is_never_imported(self):
         result = self.run_wrapper("MODE=plant")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -186,6 +193,7 @@ class RewriteAgentTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.agent_log.exists())
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_opencode_2_runs_against_its_own_server(self):
         self.write_fake_opencode("opencode v2.0.28")
         result = self.run_wrapper()
