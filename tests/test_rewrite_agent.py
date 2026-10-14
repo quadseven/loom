@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import sandbox_caps
+from tests import sandbox_caps
 
 LANES = Path(__file__).resolve().parent.parent / "lanes"
 WRAPPER = LANES / "rewrite_agent.sh"
