@@ -56,10 +56,9 @@ def interleave_activity(events, review_threads):
     return sorted(rows, key=lambda row: str(row.get("ts") or ""))
 
 
-def render(record, runs, selected, events, pull_requests=(), review_threads=()):
+def _header(record, runs):
     esc = _esc
     repo, number = record.get("repo", ""), record.get("number", "")
-    body = str(record.get("body") or "")
     parts = ['<div class="ticket-header"><div class="label">%s#%s / %s</div><h2>%s</h2><p class="machine-fact">%s / %s / %s / %d attempts / rung %s</p><div class="progress" aria-label="Ticket states">' % (
         esc(repo), esc(number), esc(record.get("goal") or "goal missing"), esc(record.get("title")), esc(record.get("lane") or "lane missing"), esc(record.get("model") or "model missing"), esc(record.get("difficulty") or "difficulty missing"), len(runs), esc(record.get("rung") if record.get("rung") is not None else "missing"))]
     current = record.get("state") or "queued"
@@ -68,23 +67,50 @@ def render(record, runs, selected, events, pull_requests=(), review_threads=()):
         cls = "done" if i < current_index else "current" if i == current_index else ""
         parts.append('<span class="%s" title="%s"></span>' % (cls, esc(state)))
     parts.append('</div><div class="state-words">%s</div></div>' % " / ".join(esc(s) for s in STATES))
-    parts.append('<nav class="ticket-segments" aria-label="Ticket panes">' + ''.join('<a href="?tab=%s" data-ticket-tab="%s">%s</a>' % (tab, tab, label) for tab, label in (("transcript", "Transcript"), ("path", "Path"), ("pr", "PR"))) + '</nav>')
-    parts.append('<div class="ticket-columns"><section class="ticket-pane path-pane" data-pane="path"><h3>Path</h3><ul class="acceptance">')
+    return ''.join(parts)
+
+
+def _path_pane(body):
+    esc = _esc
+    parts = ['<section class="ticket-pane path-pane" data-pane="path"><h3>Path</h3><ul class="acceptance">']
     for item in checks(body):
         parts.append('<li class="%s">%s %s</li>' % ("checked" if item["checked"] else "unchecked", "&#10003;" if item["checked"] else "&#9633;", esc(item["text"])))
     if not checks(body): parts.append('<li class="missing">Acceptance checks missing: ticket body has no checklist.</li>')
     parts.append('</ul><p class="empty-state">Path timeline missing: the dashboard snapshot has no label events, ticket comments, or handoff markers.</p><ol class="ticket-timeline"><li>Next step <span>missing: no next-step source is available</span></li></ol></section>')
-    parts.append('<section class="ticket-pane transcript-pane" data-pane="transcript"><h3>Transcript</h3><div class="attempts">')
+    return ''.join(parts)
+
+
+def _transcript_pane(runs, selected, events, review_threads, running):
+    esc = _esc
+    parts = ['<section class="ticket-pane transcript-pane" data-pane="transcript"><h3>Transcript</h3><div class="attempts">']
     for run in runs:
         parts.append('<a class="attempt-chip" href="?run=%s&tab=transcript">Attempt %s</a>' % (esc(run.get("id")), esc(run.get("attempt"))))
     parts.append('</div><label><input type="checkbox" data-thought-toggle> Show thoughts</label>')
-    parts.append('<div class="run-events" data-run="%s" data-running="%s">' % (esc(selected or ""), "true" if current == "running" else "false"))
+    parts.append('<div class="run-events" data-run="%s" data-running="%s">' % (esc(selected or ""), "true" if running else "false"))
     if not events: parts.append('<p class="empty-state">Transcript missing: no events were stored for this attempt.</p>')
     for event in interleave_activity(events, review_threads): parts.append(_event_html(event))
-    parts.append('</div></section><section class="ticket-pane pr-pane" data-pane="pr"><h3>Pull request</h3>')
+    parts.append('</div></section>')
+    return ''.join(parts)
+
+
+def _pr_pane(pull_requests, review_threads):
+    esc = _esc
+    parts = ['<section class="ticket-pane pr-pane" data-pane="pr"><h3>Pull request</h3>']
     if not pull_requests: parts.append('<p class="empty-state">Pull request data missing: no linked pull request was found.</p>')
     else:
         for pr in pull_requests: parts.append('<article class="card"><a href="%s">%s</a><p>%s</p></article>' % (esc(pr.get("html_url")), esc(pr.get("title")), esc(pr.get("state"))))
     if not review_threads: parts.append('<p class="empty-state">Review threads missing: the GitHub snapshot does not include review comments.</p>')
-    parts.append('<h3>Across all attempts</h3><p>Missing: attempt outcome summary is unavailable.</p><article class="card">Proof<br>Missing: no live check was found.</article></section></div>')
+    parts.append('<h3>Across all attempts</h3><p>Missing: attempt outcome summary is unavailable.</p><article class="card">Proof<br>Missing: no live check was found.</article></section>')
+    return ''.join(parts)
+
+
+def render(record, runs, selected, events, pull_requests=(), review_threads=()):
+    body = str(record.get("body") or "")
+    parts = [_header(record, runs)]
+    parts.append('<nav class="ticket-segments" aria-label="Ticket panes">' + ''.join('<a href="?tab=%s" data-ticket-tab="%s">%s</a>' % (tab, tab, label) for tab, label in (("transcript", "Transcript"), ("path", "Path"), ("pr", "PR"))) + '</nav>')
+    parts.append('<div class="ticket-columns">')
+    parts.append(_path_pane(body))
+    parts.append(_transcript_pane(runs, selected, events, review_threads, record.get("state") == "running"))
+    parts.append(_pr_pane(pull_requests, review_threads))
+    parts.append('</div>')
     return ''.join(parts)

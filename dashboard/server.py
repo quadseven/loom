@@ -214,6 +214,29 @@ def _ticket_detail(state, path):
     return body, 200 if row else 404
 
 
+def _handle_transcript_post(handler, state):
+    token = os.environ.get("LOOM_UPLOAD_TOKEN", "")
+    supplied = handler.headers.get("Authorization", "")
+    if not token or not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+        if length < 1 or length > 2_000_000:
+            raise ValueError("invalid request size")
+        body = json.loads(handler.rfile.read(length))
+        store = getattr(state, "transcripts", None)
+        if store is None:
+            store = transcript_store.Store()
+            state.transcripts = store
+        return handler.send_json(201, store.upload(body))
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    except RuntimeError as exc:
+        return handler.send_json(503, {"error": str(exc)})
+    except transcript_store.storage_errors():
+        return handler.send_json(503, {"error": "transcript storage unavailable"})
+
+
 def _handler_for(state):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -222,26 +245,7 @@ def _handler_for(state):
         def do_POST(self):
             if self.path.split("?", 1)[0] != "/api/transcripts":
                 return self.send_text(404, "not found")
-            token = os.environ.get("LOOM_UPLOAD_TOKEN", "")
-            supplied = self.headers.get("Authorization", "")
-            if not token or not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
-                return self.send_json(401, {"error": "unauthorized"})
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if length < 1 or length > 2_000_000:
-                    raise ValueError("invalid request size")
-                body = json.loads(self.rfile.read(length))
-                store = getattr(state, "transcripts", None)
-                if store is None:
-                    store = transcript_store.Store()
-                    state.transcripts = store
-                return self.send_json(201, store.upload(body))
-            except (ValueError, json.JSONDecodeError) as exc:
-                return self.send_json(400, {"error": str(exc)})
-            except RuntimeError as exc:
-                return self.send_json(503, {"error": str(exc)})
-            except transcript_store.storage_errors():
-                return self.send_json(503, {"error": "transcript storage unavailable"})
+            return _handle_transcript_post(self, state)
 
         def ticket_list(self, repos):
             rows = repos.get("filtered") if "filtered" in repos else [row for items in repos.values() if items for row in items]
@@ -287,84 +291,112 @@ def _handler_for(state):
 def _dispatch_get(handler, state):
     parsed = urlsplit(handler.path)
     path = parsed.path
+    if re.fullmatch(r"/api/tickets/[^/]+/[^/]+/[0-9]+(?:/runs(?:/[0-9]+)?)?", path):
+        return _dispatch_ticket_api(handler, state, parsed)
+    if path in ("/backlog", "/backlog.json", "/needs-you"):
+        return _dispatch_backlog(handler, state, path, parsed)
+    if path in ("/static/loom.css", "/static/loom.js"):
+        return _dispatch_static(handler, path)
+    if path in ("/improving", "/lanes"):
+        return _send_dashboard_view(handler, state, path)
+    if path in ("/", "/tickets"):
+        return _dispatch_ticket_list(handler, state, path, parsed)
+    if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
+        return _dispatch_ticket_page(handler, state, path, parsed)
+    return _dispatch_basic(handler, state, path)
+
+
+def _dispatch_ticket_api(handler, state, parsed):
+    path = parsed.path
     api_match = re.fullmatch(r"/api/tickets/([^/]+)/([^/]+)/([0-9]+)(?:/runs(?:/([0-9]+))?)?", path)
-    if api_match:
-        owner, name, number, run_number = api_match.groups()
-        repo = unquote(owner) + "/" + unquote(name)
-        record = next((row for row in (state.data.get(repo) or []) if int(row.get("number", -1)) == int(number)), None)
-        if record is None:
-            return handler.send_json(404, {"error": "ticket missing from current snapshot"})
-        store = getattr(state, "transcripts", None)
-        if store is None:
-            try:
-                store = transcript_store.Store()
-                state.transcripts = store
-            except RuntimeError:
-                store = None
-        runs = store.attempts(repo + "#" + number) if store else []
-        if run_number is not None:
-            if not 1 <= int(run_number) <= len(runs):
-                return handler.send_json(404, {"error": "attempt missing"})
-            run = runs[int(run_number) - 1]
-            full = store.get(run["id"])
-            after = parse_qs(parsed.query).get("after", [""])[0]
-            events = [event for event in (full or {}).get("events", []) if not after or event.get("ts", "") > after]
-            return handler.send_json(200, {"run": run, "events": events})
-        if path.endswith("/runs"):
-            reason = None if store else "transcript store unavailable: configure dashboard database or explicit memory mode"
-            return handler.send_json(200, {"runs": runs, "missing_reason": reason})
-        payload = state.response()
-        prs = [pr for pr in payload.get("pull_requests", []) if re.search(r"(?:/issues/|/pull/)" + re.escape(number) + r"(?:\b|$)", str(pr.get("body") or ""))]
-        return handler.send_json(200, {"ticket": record, "checks": ticket_view.checks(record.get("body")),
-                                       "pull_request": prs, "timeline": [],
-                                       "timeline_missing": "ticket comments and label events are not in the current snapshot"})
+    owner, name, number, run_number = api_match.groups()
+    repo = unquote(owner) + "/" + unquote(name)
+    record = next((row for row in (state.data.get(repo) or []) if int(row.get("number", -1)) == int(number)), None)
+    if record is None:
+        return handler.send_json(404, {"error": "ticket missing from current snapshot"})
+    store = _transcript_store(state)
+    runs = store.attempts(repo + "#" + number) if store else []
+    if run_number is not None:
+        return _dispatch_run(handler, parsed, store, runs, run_number)
+    if path.endswith("/runs"):
+        reason = None if store else "transcript store unavailable: configure dashboard database or explicit memory mode"
+        return handler.send_json(200, {"runs": runs, "missing_reason": reason})
+    payload = state.response()
+    prs = [pr for pr in payload.get("pull_requests", []) if re.search(r"(?:/issues/|/pull/)" + re.escape(number) + r"(?:\b|$)", str(pr.get("body") or ""))]
+    return handler.send_json(200, {"ticket": record, "checks": ticket_view.checks(record.get("body")),
+                                   "pull_request": prs, "timeline": [],
+                                   "timeline_missing": "ticket comments and label events are not in the current snapshot"})
+
+
+def _transcript_store(state):
+    store = getattr(state, "transcripts", None)
+    if store is None:
+        try:
+            store = transcript_store.Store()
+            state.transcripts = store
+        except RuntimeError:
+            return None
+    return store
+
+
+def _dispatch_run(handler, parsed, store, runs, run_number):
+    if not 1 <= int(run_number) <= len(runs):
+        return handler.send_json(404, {"error": "attempt missing"})
+    run = runs[int(run_number) - 1]
+    full = store.get(run["id"])
+    after = parse_qs(parsed.query).get("after", [""])[0]
+    events = [event for event in (full or {}).get("events", []) if not after or event.get("ts", "") > after]
+    return handler.send_json(200, {"run": run, "events": events})
+
+
+def _dispatch_backlog(handler, state, path, parsed):
+    raw = _backlog_bytes()
+    if path == "/backlog.json":
+        return handler.send_bytes(503, b"backlog source unavailable", "text/plain; charset=utf-8") if raw is None else handler.send_bytes(200, raw, "application/json")
+    if path == "/backlog":
+        if raw is None:
+            return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
+        return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
+    return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
+
+
+def _dispatch_static(handler, path):
+    asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
+    content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
+    return handler.send_bytes(200, asset.read_bytes(), content_type)
+
+
+def _dispatch_ticket_list(handler, state, path, parsed):
+    tickets = state.response()["tickets"]
+    data = tickets if path == "/" else _ticket_page(state, parsed)
+    return handler.send_page(handler.ticket_list(data))
+
+
+def _dispatch_ticket_page(handler, state, path, parsed):
+    detail = _ticket_detail(state, path)
+    if detail[1] != 200:
+        return handler.send_page(detail[0], detail[1])
+    match = re.fullmatch(r"/t/([^/]+)/([^/]+)/([0-9]+)", path)
+    repo = unquote(match.group(1)) + "/" + unquote(match.group(2))
+    number = int(match.group(3))
+    record = next(row for row in (state.data.get(repo) or []) if int(row.get("number", -1)) == number)
+    store = _transcript_store(state)
+    runs = store.attempts(repo + "#" + str(number)) if store else []
+    params = parse_qs(parsed.query)
+    selected = params.get("run", [""])[0]
+    run = next((item for item in runs if str(item["id"]) == selected or str(item["attempt"]) == selected), runs[-1] if runs else None)
+    full = store.get(run["id"]) if store and run else None
+    body = ticket_view.render(record, runs, run.get("id") if run else None, (full or {}).get("events", []), [])
+    return handler.send_page(page("Ticket %s#%d" % (repo, number), "tickets", body, status="Live"))
+
+
+def _dispatch_basic(handler, state, path):
     if path == "/livez":
         return handler.send_text(200, "live")
     if path == "/readyz":
         return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
     if path == "/api/tickets":
         return handler.send_json(200, state.response())
-    if path in ("/backlog", "/backlog.json", "/needs-you"):
-        raw = _backlog_bytes()
-        if path == "/backlog.json":
-            return handler.send_bytes(503, b"backlog source unavailable", "text/plain; charset=utf-8") if raw is None else handler.send_bytes(200, raw, "application/json")
-        if path == "/backlog":
-            if raw is None:
-                return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
-            return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
-        return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
-    if path in ("/static/loom.css", "/static/loom.js"):
-        asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
-        content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
-        return handler.send_bytes(200, asset.read_bytes(), content_type)
-    if path in ("/improving", "/lanes"):
-        return _send_dashboard_view(handler, state, path)
-    if path in ("/", "/tickets"):
-        tickets = state.response()["tickets"]
-        data = tickets if path == "/" else _ticket_page(state, parsed)
-        return handler.send_page(handler.ticket_list(data))
-    detail = _ticket_detail(state, path)
-    if detail is not None:
-        if detail[1] != 200:
-            return handler.send_page(detail[0], detail[1])
-        match = re.fullmatch(r"/t/([^/]+)/([^/]+)/([0-9]+)", path)
-        repo = unquote(match.group(1)) + "/" + unquote(match.group(2))
-        number = int(match.group(3))
-        record = next(row for row in (state.data.get(repo) or []) if int(row.get("number", -1)) == number)
-        store = getattr(state, "transcripts", None)
-        if store is None:
-            try:
-                store = transcript_store.Store()
-                state.transcripts = store
-            except RuntimeError:
-                store = None
-        runs = store.attempts(repo + "#" + str(number)) if store else []
-        params = parse_qs(parsed.query)
-        selected = params.get("run", [""])[0]
-        run = next((item for item in runs if str(item["id"]) == selected or str(item["attempt"]) == selected), runs[-1] if runs else None)
-        full = store.get(run["id"]) if store and run else None
-        body = ticket_view.render(record, runs, run.get("id") if run else None, (full or {}).get("events", []), [])
-        return handler.send_page(page("Ticket %s#%d" % (repo, number), "tickets", body, status="Live"))
     return handler.send_text(404, "not found")
 
 
