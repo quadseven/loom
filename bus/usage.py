@@ -41,10 +41,14 @@ def _utc_epoch(value: Any, now: float, relative: bool = True) -> Optional[str]:
 
 
 def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
-    info = item.get("payload", item) if isinstance(item, dict) else {}
-    if isinstance(info, dict) and isinstance(info.get("info"), dict):
-        info = info["info"]
-    limits = info.get("rate_limits") if isinstance(info, dict) else None
+    payload = item.get("payload", item) if isinstance(item, dict) else {}
+    # The current codex CLI puts rate_limits beside payload.info (token
+    # counts); older ones put it inside info. Look in both.
+    limits = None
+    for holder in (payload, payload.get("info") if isinstance(payload, dict) else None):
+        if isinstance(holder, dict) and isinstance(holder.get("rate_limits"), dict):
+            limits = holder["rate_limits"]
+            break
     if not isinstance(limits, dict):
         return {}
     found = {}
@@ -64,19 +68,50 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
     return found
 
 
-def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]]:
-    found: Dict[str, Dict[str, Any]] = {}
-    for path in sorted(sessions.glob("**/*.jsonl")):
+# The newest reading is at the end of the newest session file. Reading every
+# session on every station pass parsed 4.4 GB (770 files) on the lane machine
+# on 2026-10-14, so only the newest files are opened, and only their tails.
+SESSION_FILES = 8
+SESSION_TAIL = 512 * 1024
+
+
+def _newest_sessions(sessions: Path) -> List[Path]:
+    dated = []
+    for path in sessions.glob("**/*.jsonl"):
         try:
-            with path.open(encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    try:
-                        found.update(_codex_limits(json.loads(line), now))
-                    except ValueError:
-                        continue
+            dated.append((path.stat().st_mtime, str(path), path))
         except OSError:
             continue
-    return found
+    dated.sort(reverse=True)
+    return [path for _, _, path in dated[:SESSION_FILES]]
+
+
+def _tail_lines(path: Path) -> List[str]:
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size - SESSION_TAIL))
+        lines = stream.read().decode("utf-8", "replace").splitlines()
+    # A tail that starts mid-file starts mid-line.
+    return lines[1:] if size > SESSION_TAIL else lines
+
+
+def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]]:
+    """The rate-limit windows of the newest line that carries any, looking at
+    the newest SESSION_FILES files, newest first, and only their tails."""
+    for path in _newest_sessions(sessions):
+        try:
+            lines = _tail_lines(path)
+        except OSError:
+            continue
+        for line in reversed(lines):
+            try:
+                found = _codex_limits(json.loads(line), now)
+            except ValueError:
+                continue
+            if found:
+                return found
+    return {}
 
 
 def codex_records(lanes: List[str], sessions: Path, now: float) -> List[Dict[str, Any]]:
@@ -144,8 +179,9 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
     records = []
     registry = {
         "anthropic": lambda _home, slots, settings, stamp: anthropic_records(_home, slots, settings, stamp),
-        "codex": lambda _home, slots, _settings, stamp: codex_records(
-            slots, sessions or Path.home() / ".codex" / "sessions", stamp),
+        "codex": lambda _home, slots, settings, stamp: codex_records(
+            slots, sessions or Path(settings.get("LOOM_CODEX_SESSIONS")
+                                    or Path.home() / ".codex" / "sessions"), stamp),
         "opencode-go": _opencode_records,
         "spark": _spark_records,
     }
