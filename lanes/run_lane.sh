@@ -269,7 +269,11 @@ pr_body() {
   local size issue refs=""
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
-  size="$(section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
+  # The size as the review bot's letter (Medium -> M), so its plan check
+  # passes whatever word the brief used; an unknown size is kept as written.
+  size="$(section Size "$1" | head -1)"
+  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan size "$size" 2>/dev/null ||
+    printf '%s' "$size" | awk '{print $1}' | tr -d ':')"
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
@@ -1502,8 +1506,15 @@ for BRIEF in "$INBOX"/*.md; do
   prepare_intent "$BRIEF" >> "$LOG" 2>&1
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
+  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  # Briefs are checked when filed, so this only fires on a brief filed
+  # before that check or edited by hand: the PR still opens (the work is
+  # done), and the log names what the review bot will hold it for.
+  if ! PLAN_PROBLEMS="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)"; then
+    echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$PLAN_PROBLEMS" | tr '\n' ';')" >> "$LOG"
+  fi
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
-       --body "$(pr_body "$BRIEF" "$TICKET")" 2>> "$LOG")"; then
+       --body "$PR_BODY" 2>> "$LOG")"; then
     park "$BRIEF" "pr create failed; branch $BRANCH is pushed" transient; continue
   fi
   echo "$PR_URL" >> "$LOG"

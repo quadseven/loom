@@ -110,6 +110,14 @@ XS | S | M | L
 - ...
 ```
 
+`brief` refuses a body whose pull request would fail the review bot's plan
+checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
+non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
+Out of scope), and files a Size written as a word (Small, Medium, Large) as
+its letter. Triage counts the same checks as missing sections. The runner
+writes the Size as the letter whatever the brief says, and logs any plan
+check its body still fails before it opens the pull request.
+
 The station renders the local brief from the issue: `Repo` is the issue's
 repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 <owner/name>#<number>`, then the header lines and the body. The runner adds
