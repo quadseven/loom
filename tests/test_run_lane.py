@@ -198,8 +198,34 @@ ln -s "$real_home/loom/run/elsewhere" "$HOME/.claude" 2>/dev/null
 echo fixed > fix.txt
 """
 
-# opencode 2.0 says which major version it is on --version.
-FAKE_OPENCODE_2 = FAKE_OPENCODE.replace('echo "1.18.4"', 'echo "opencode v2.0.28"')
+# opencode 2.0 starts a real TCP listener so the run checks the sandbox rule.
+FAKE_OPENCODE_2 = FAKE_OPENCODE.replace('echo "1.18.4"', 'echo "opencode v2.0.28"').replace(
+    'args="$*"; args=', '''if [ "${1:-}" = serve ]; then
+  [ "${OPENCODE_PASSWORD:-}" ] || exit 7
+  shift
+  [ "$1 $3" = "--hostname --port" ] || exit 8
+  port="$4"
+  echo "serve --hostname $2 --port $port password=set" >> "$TMPDIR/agent.log"
+  exec python3 -c 'import socket, sys
+s = socket.socket()
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen()
+while True:
+    client, _ = s.accept()
+    client.close()' "$port"
+fi
+if [ "${1:-}" = run ]; then
+  [ "${OPENCODE_PASSWORD:-}" ] || exit 9
+  [ "$2" = --server ] || exit 10
+  port="${3##*:}"
+  if /usr/bin/nc -z -w 1 127.0.0.1 "$port" > /dev/null 2>&1; then
+    echo "server=reachable password=set" >> "$TMPDIR/agent.log"
+  else
+    echo "server=denied" >> "$TMPDIR/agent.log"
+    exit 11
+  fi
+fi
+args="$*"; args=''', 1)
 
 # Fake aws: `ssm get-parameter --name N` prints $FAKE_SECRET_<N with / as _>
 # or fails like a missing parameter.
@@ -1068,6 +1094,8 @@ cat > /dev/null
         config = next(line.removeprefix("config=") for line in calls if line.startswith("config="))
         self.assertEqual(json.loads(config)["permission"]["external_directory"], "deny")
         profile = Path(profile_file).read_text()
+        self.assertIn('(deny network-outbound (remote ip "localhost:*"))', profile)
+        self.assertNotRegex(profile, r'\(allow network-outbound \(remote ip "localhost:\d+"\)\)')
         writes = [line for line in profile.splitlines() if "file-write*" in line]
         scratch = home.resolve()
         self.assertEqual(len(writes), 3)
@@ -1549,10 +1577,57 @@ cat > /dev/null
         return str(path)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
-    def test_a_slot_on_opencode_2_runs_it_standalone(self):
+    def test_a_slot_on_opencode_2_uses_one_sandboxed_server(self):
+        profile_file = Path(self._tmp.name) / "opencode2.profile"
+        self.write_tool(self.bin / "sandbox-exec", "#!/bin/sh\nprintf '%s' \"$2\" > "
+                        + shlex.quote(str(profile_file)) + "\nexec /usr/bin/sandbox-exec \"$@\"\n")
         run = self.slot_run("opencode-go-3", LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
-        self.assertIn("run --standalone --auto -m opencode-go/deepseek-v4.1-flash", run)
+        port = int(re.search(r"run --server http://127\.0\.0\.1:(\d+)", run).group(1))
+        self.assertGreaterEqual(port, 49152)
+        self.assertLessEqual(port, 65535)
+        self.assertIn(f"serve --hostname 127.0.0.1 --port {port} password=set", self.calls())
+        self.assertIn(f"run --server http://127.0.0.1:{port} --auto -m opencode-go/deepseek-v4.1-flash", run)
+        self.assertNotIn("--standalone", run)
+        self.assertNotIn("run --port", run)
+        self.assertIn("server=reachable password=set", self.calls())
+        profile = profile_file.read_text()
+        self.assertIn('(deny network-outbound (remote ip "localhost:*"))', profile)
+        self.assertEqual(re.findall(r'\(allow network-outbound \(remote ip "localhost:(\d+)"\)\)', profile),
+                         [str(port)])
+        with socket.socket() as probe:
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
         self.assertIn("secret=denied", run)
+        self.assertIn("lo=denied", run)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_opencode_2_stops_its_server_after_agent_failure(self):
+        inbox, result = self.api_lane(
+            "opencode-go-3", extra="AGENT_FAIL=1\n",
+            LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+            LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash",
+            LOOM_OPENCODE_GO_3_OPENCODE=self.opencode_2())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = next(c for c in self.calls() if c.startswith("opencode run --server"))
+        port = int(re.search(r"http://127\.0\.0\.1:(\d+)", run).group(1))
+        with socket.socket() as probe:
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(os.environ.get("LOOM_TEST_OPENCODE2") and shutil.which("sandbox-exec"),
+                         "set LOOM_TEST_OPENCODE2 to a real opencode 2 binary on macOS")
+    def test_real_opencode_2_reaches_model_step_inside_sandbox(self):
+        binary = os.environ["LOOM_TEST_OPENCODE2"]
+        self.assertTrue(subprocess.check_output([binary, "--version"], text=True).startswith("opencode v2."))
+        inbox, result = self.api_lane(
+            "opencode-go-3", LOOM_OPENCODE_GO_KEY_SSM="/k/go",
+            FAKE_SECRET__k_go="fake-go-key",
+            LOOM_OPENCODE_GO_3_MODEL="opencode-go/nonexistent-model-for-test",
+            LOOM_OPENCODE_GO_3_OPENCODE=binary, LOOM_AGENT_TIMEOUT="30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs/opencode-go-3/T042-fix-the-thing.log").read_text()
+        self.assertRegex(log.lower(), r"model.*(not found|unknown|invalid)|(?:not found|unknown|invalid).*model")
+        self.assertNotIn("Transport: Was there a typo in the url or port?", log)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_sibling_slot_keeps_the_default_opencode(self):

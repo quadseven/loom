@@ -40,7 +40,7 @@
 # LOOM_CHECK_TIMEOUT (seconds per validation step, default 1800; see
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
-# from PATH; a 2.x binary runs --standalone --auto),
+# from PATH; a 2.x binary uses a private server inside its sandbox),
 # LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
@@ -383,7 +383,11 @@ sandbox_profile() {
   # validation run ($3 = check), whichever lane it serves.
   local keychain_deny='(global-name "com.apple.SecurityServer") ' agy_lane=""
   [ "$LANE" = agy ] && [ "${3:-}" != check ] && { keychain_deny=""; agy_lane=1; }
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules=""
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule=""
+  if [ -n "${4:-}" ]; then
+    [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] || return 1
+    loopback_rule="(allow network-outbound (remote ip \"localhost:$4\"))"
+  fi
   home="$(cd "$HOME" && pwd -P)"
   tree="$(cd "$1" && pwd -P)"
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
@@ -412,8 +416,8 @@ sandbox_profile() {
     done
   done
   [ -n "$agy_lane" ] && agy_rules="$(agy_write_rules "$allow_rw")"
-  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n' \
-    "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny"
+  printf '(version 1)\n(allow default)\n(deny file-read* file-write* (subpath "%s"))\n(allow file-read* file-write* %s)\n%s(deny file-write* (subpath "%s/.git"))\n(allow file-read* %s)\n%s(allow file-read-metadata%s)\n(deny mach-lookup %s(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents"))\n(deny appleevent-send)\n(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl") (literal "/usr/bin/sudo") (literal "/usr/bin/su"))\n(deny network-outbound (remote unix-socket))\n(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))\n(deny network-outbound (remote ip "localhost:*"))\n%s\n' \
+    "$home" "$allow_rw" "$agy_rules" "$tree" "$allow_ro" "$skills_rules" "$meta" "$keychain_deny" "$loopback_rule"
 }
 
 # API lanes run the agent with an emptied environment (its provider key, a
@@ -424,9 +428,9 @@ sandbox_profile() {
 api_agent() {
   local key_var="$1" cli="$2" profile
   mkdir -p "$AGENT_HOME/tmp"
-  profile="$(sandbox_profile "$PWD" "$cli")" || return 3
+  profile="$(sandbox_profile "$PWD" "$cli" "" "${OPENCODE_SERVER_PORT:-}")" || return 3
   (
-    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV"
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" key="$API_KEY" extra="$AGENT_EXTRA_ENV" server_port="${OPENCODE_SERVER_PORT:-}"
     for v in $(compgen -e); do unset "$v"; done
     [ -z "$(compgen -e)" ] || { echo "could not clear the agent environment: $(compgen -e | tr '\n' ' ')" >&2; exit 3; }
     # shellcheck disable=SC2030 # deliberately local to the agent's subshell
@@ -435,7 +439,29 @@ api_agent() {
     [ "$key_var" = - ] || export "$key_var=$key"
     # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
     while IFS= read -r kv; do [ -z "$kv" ] || export "${kv?}"; done <<< "$extra"
-    exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
+    if [ -n "$server_port" ]; then
+      OPENCODE_PASSWORD="$(openssl rand -hex 32)" || exit 3
+      export OPENCODE_PASSWORD
+      sandbox-exec -p "$profile" "$cli" serve --hostname 127.0.0.1 \
+        --port "$server_port" > /dev/null 2>&1 < /dev/null &
+      server_pid=$!
+      trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+      trap 'exit 143' TERM
+      trap 'exit 130' INT
+      trap 'exit 129' HUP
+      ready=""
+      deadline=$((SECONDS + 15))
+      while [ "$SECONDS" -lt "$deadline" ]; do
+        kill -0 "$server_pid" 2>/dev/null || { echo "opencode server stopped before it was ready" >&2; exit 3; }
+        if sandbox-exec -p "$profile" /usr/bin/nc -z -w 1 127.0.0.1 "$server_port" \
+          > /dev/null 2>&1; then ready=1; break; fi
+        sleep 0.1
+      done
+      [ -n "$ready" ] || { echo "opencode server was not ready within 15 seconds" >&2; exit 3; }
+      timeout -k 5 "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
+    else
+      exec timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" "${@:2}" < /dev/null
+    fi
   ) 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
   # The agent writes into a pipe, not the log file: the log lives under HOME,
   # where the sandbox denies even fstat, and CLIs fstat their output at start.
@@ -637,17 +663,20 @@ opencode_bin() {
   printf '%s' "${b:-opencode}"
 }
 
-# opencode 2.x `run` talks to a shared background service unless told
-# --standalone; the sandbox denies localhost, and a shared service would mix
-# lanes' sessions. --auto lets it act without prompting, as 1.x run does.
+# opencode 2.x needs its own server on one allowed loopback port. --auto lets
+# it act without prompting, as 1.x run does.
 # Usage: opencode_agent <key_var> <brief text>
 opencode_agent() {
-  local bin flags=()
+  local bin port
   bin="$(opencode_bin)"
+  opencode_config || return 1
   case "$(timeout "$NET_TIMEOUT" "$bin" --version < /dev/null 2> /dev/null | head -n 1)" in
-    "opencode v2."*) flags=(--standalone --auto) ;;
+    "opencode v2."*)
+      port="$(python3 -c 'import secrets; print(49152 + secrets.randbelow(16384))')" || return 3
+      OPENCODE_SERVER_PORT="$port" api_agent "$1" "$bin" run --server "http://127.0.0.1:$port" --auto -m "$MODEL" "$2"
+      return $? ;;
   esac
-  opencode_config && api_agent "$1" "$bin" run ${flags[@]+"${flags[@]}"} -m "$MODEL" "$2"
+  api_agent "$1" "$bin" run -m "$MODEL" "$2"
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
