@@ -61,6 +61,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "loom:digest": {"color": "ededed", "description": "The issue holding the daily asks digest"},
+    "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},

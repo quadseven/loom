@@ -133,6 +133,8 @@ RULING_FIELDS = (
     " mergeable rulingThreads: reviewThreads(first:100) { nodes { isResolved"
     " comments(first:50) { nodes { databaseId author { __typename login } body } } } }")
 PAST_RUNG_HEADING = "### Past the last rung"
+# Open issues the station filed for a broken factory invariant (bus/invariants.py).
+INVARIANTS_HEADING = "### Invariants broken"
 # Ticketless pull requests a trusted login opened, listed for the brain.
 ADOPT_HEADING = "### Pull requests without a ticket"
 ADOPT_MARKER = "<!-- loom:adopt v1 -->"
@@ -459,6 +461,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += ["", ADOPT_HEADING]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
+    lines += ["", INVARIANTS_HEADING]
+    lines += ["- #%s %s" % (i["number"], i.get("title", ""))
+              for i in issues if "loom:invariant" in _labels(i)] or ["- none"]
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "needs-operator" in _labels(i)]

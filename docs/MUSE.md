@@ -258,6 +258,11 @@ live regression).
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
+   A step of this tick that failed or ran degraded gets its own line,
+   `- Step <name>: failed <why>` or `- Step <name>: degraded <why>`, with
+   the step's name from the list above (lock, status, merge, verify, failed,
+   asks, brief, triage, journal, unlock): the station files a ticket when one
+   brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
    Every 2 hours per goal (when status lists the goal as due or overdue),
    also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
@@ -266,7 +271,9 @@ live regression).
    - First line: one sentence on how the goal is doing since the last report
      (better, the same, or worse, and the one number that shows it).
    - Going well: one to three things that moved, in plain words.
-   - Not going well: one to three things that got worse or failed.
+   - Not going well: one to three things that got worse or failed, and
+     on the goal home the station files invariant breaches on, every issue
+     `status` lists under "Invariants broken".
    - Still stuck since last report: anything the previous report already
      named as stuck or blocked and still is, with how long; say "nothing"
      when the list is empty. Read the previous report to fill this in.
