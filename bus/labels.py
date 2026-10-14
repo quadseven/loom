@@ -58,12 +58,16 @@ LABELS: Dict[str, Dict[str, str]] = {
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
+    "class:sensitive": {"color": "b60205", "description": "Touches a sensitive path; needs extra scrutiny"},
+    "class:logic": {"color": "0075ca", "description": "Changes behavior-carrying code"},
+    "class:tests": {"color": "0e8a16", "description": "Changes test files only"},
+    "class:docs": {"color": "ededed", "description": "Changes docs only"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",
                                "description": "Work for the %s lane" % _lane}
 
-MANAGED_PREFIXES = ("loom:", "lane:")
+MANAGED_PREFIXES = ("loom:", "lane:", "class:")
 
 
 def ensure_labels(gh: GitHub, repo: str) -> List[str]:
