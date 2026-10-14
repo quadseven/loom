@@ -407,6 +407,36 @@ verdict. A tick takes that line as given instead of re-reading the review
 list. `bus.brain merge` keeps its own checks; this signal does not change
 what it accepts.
 
+## Pull requests without a ticket
+
+A pull request with no ticket (no `Refs` line and no `loom/` branch) that a
+`LOOM_BRIEF_AUTHORS` login opened is not a lane pull request: no ticket
+moves and nothing briefs it. A brain is allowed to write one while
+shipping, and it must not be left for the operator. Such a fix either goes
+through `brief` like any other work, or is merged with `--adopt`.
+
+`python3 -m bus.brain merge OWNER/NAME#PR --adopt` squash-merges a
+ticketless pull request when all of these hold:
+
+- its author is in `LOOM_BRIEF_AUTHORS`;
+- its head and base are both in the same repo, so a fork is refused;
+- it is not a draft, and it has no ticket (a linked ticket is refused:
+  merge that without `--adopt`);
+- its head commit's check rollup is `SUCCESS`;
+- the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) ran and
+  passed on the head commit, because every change is reviewed before it
+  lands;
+- every review thread is resolved.
+
+It pins the head SHA in the squash merge, deletes the branch only after
+GitHub confirms the merge, and comments on the pull request that it was
+adopted.
+
+`python3 -m bus.brain status` lists these under "Pull requests without a
+ticket", one line per open pull request from a trusted author with no
+ticket, ending in `READY` or `blocked:` and every blocker exactly as a lane
+pull request's line, so a brain sees them and adopts them.
+
 ## Journal
 
 One comment per tick that changed something, on the goal's home issue:

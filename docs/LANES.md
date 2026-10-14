@@ -646,3 +646,37 @@ Adding one takes:
 - A section here: what the lane is for and what it runs.
 
 No lane may merge, ship, or hold another lane's credentials.
+
+## Change classes and the Intent section
+
+Every lane pull request opens with an `## Intent` section at the top of
+its body, followed by the ticket sections. The section names the change
+class, one line per behavior change, and the counts of files by class:
+
+```
+## Intent
+Class: logic
+- Fix the thing for every user
+Files: 1 logic, 1 tests
+```
+
+The behavior lines come from the lane's final summary: the agent writes
+one line per behavior change to `.loom/summary.md` at the top of its
+tree (the runner tells it to, reads it, and never commits it). When the
+lane left no summary, the runner falls back to the ticket's `What`
+section, one line per non-empty line.
+
+One class covers the whole pull request, highest wins:
+
+- `sensitive`: any changed file matches `.loom/sensitive-paths` in the
+  repo (one glob per line, `#` comments, a trailing `/` is a directory
+  prefix), read from the default branch. A missing file means no
+  sensitive class. Sensitive changes deserve extra scrutiny.
+- `logic`: anything else behavior-carrying (code, config, scripts).
+- `tests`: only test files (a `test` or `tests` folder in the path, or
+  `test_`, `_test.`, `.test.` or `.spec.` in the name).
+- `docs`: only `*.md`, `docs/`, `LICENSE`, `*.txt`.
+
+The pull request carries exactly one `class:<name>` label, created like
+the other labels by `bus/labels.py`. Classification never changes merge
+rules; it only tells the reader how risky the change is.
