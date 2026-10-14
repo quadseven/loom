@@ -203,6 +203,18 @@ class DashboardTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_brain_and_hot_spots_routes_render_with_missing_sources(self):
+        for path, expected in (("/brain", "not recorded"), ("/hot-spots", "Wait times: missing")):
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+            try:
+                connection.request("GET", path)
+                response = connection.getresponse()
+                body = response.read().decode()
+            finally:
+                connection.close()
+            self.assertEqual(response.status, 200)
+            self.assertIn(expected, body)
+
     def test_floor_backlog_bottleneck_and_ticket_links(self):
         import os
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as fixture:

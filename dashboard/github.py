@@ -10,8 +10,12 @@ import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlsplit
 
-from bus import labels, tickets
+from datetime import datetime, timedelta, timezone
+
+from bus import brain, factory, labels, tickets
 from bus.github import DEFAULT_API, GitHub, GitHubError
+
+from . import hot_spots
 
 
 def repos_from_env() -> List[str]:
@@ -84,7 +88,9 @@ class TicketStore:
         self._snapshot = {"tickets": {repo: None for repo in self.repos}, "errors": {},
                           "stale": False, "ready": False,
                           "improving": {"journals": [], "metrics_comments": []},
-                          "lanes": [], "pull_requests": [], "dashboard_errors": []}
+                          "lanes": [], "pull_requests": [], "dashboard_errors": [],
+                          "reports": [], "brain": {"record": None, "error": "not read yet"},
+                          "hot_spots": {}}
         self.operator_items = []
         self.human_counts = {}
         self.auth = "token" if token else "none"
@@ -174,13 +180,15 @@ class TicketStore:
             data.update({"improving": {"journals": [], "metrics_comments": []},
                          "lanes": [], "pull_requests": [],
                          "dashboard_errors": ["optional view sources were not refreshed because the GitHub request budget is below its floor"]})
+            reason = "not refreshed: the GitHub request budget is below its floor"
+            data.update({"reports": [], "brain": {"record": None, "error": reason}, "hot_spots": {}})
             return
 
-        journals, metric_comments, prs, lanes = [], [], [], []
+        journals, metric_comments, prs, lanes, reports = [], [], [], [], []
         errors = []
         homes, status_home = _dashboard_homes()
         for repo, issue_number in homes:
-            self._read_dashboard_home(repo, issue_number, journals, metric_comments, lanes, errors)
+            self._read_dashboard_home(repo, issue_number, journals, metric_comments, lanes, errors, reports)
         if status_home and tickets.REPO_RE.fullmatch(status_home):
             self._read_lane_status(status_home, lanes, errors)
         for repo in self.repos:
@@ -189,8 +197,11 @@ class TicketStore:
         data["lanes"] = lanes
         data["pull_requests"] = prs
         data["dashboard_errors"] = errors
+        data["reports"] = reports
+        data["brain"] = self._read_brain_step(status_home)
+        data["hot_spots"] = self._read_hot_spot_sources()
 
-    def _read_dashboard_home(self, repo, issue_number, journals, metric_comments, lanes, errors):
+    def _read_dashboard_home(self, repo, issue_number, journals, metric_comments, lanes, errors, reports=None):
         try:
             if issue_number:
                 issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), issue_number)).data
@@ -213,6 +224,8 @@ class TicketStore:
                         metric_comments.append(comment)
                     if body.startswith("<!-- loom:lanes v1 -->"):
                         lanes.append(comment)
+                    if reports is not None and body.startswith("<!-- loom:report v1 -->"):
+                        reports.append(comment)
         except (GitHubError, OSError, ValueError, KeyError) as exc:
             errors.append("%s: %s" % (repo, self._error_reason(exc)))
 
@@ -230,6 +243,37 @@ class TicketStore:
                              and str(comment.get("body") or "").startswith("<!-- loom:lanes v1 -->"))
         except (GitHubError, OSError, ValueError, KeyError) as exc:
             errors.append("%s lane status: %s" % (status_home, self._error_reason(exc)))
+
+    def _read_brain_step(self, lock_repo):
+        """The tick step record (bus.brain step --show), read-only."""
+        if not lock_repo or not tickets.REPO_RE.fullmatch(lock_repo):
+            return {"record": None, "error": "LOOM_STATUS_REPO is not set, so the lock repo is unknown"}
+        try:
+            return {"record": brain.tick_step(self.gh, lock_repo), "error": None}
+        except (GitHubError, OSError, ValueError, KeyError) as exc:
+            return {"record": None, "error": "step record unreadable: %s" % self._error_reason(exc)}
+
+    def _read_hot_spot_sources(self):
+        """Station outcome and rung comments, and review bot comments, of the last 14 days."""
+        since = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT).lower()
+        issue_comments, review_comments, errors = [], [], []
+        for repo in self.repos:
+            base = "/repos/%s" % quote(repo, safe="/")
+            try:
+                issue_comments.extend(
+                    {"body": c["body"], "created_at": c.get("created_at"), "issue_url": c.get("issue_url")}
+                    for c in self.gh.paginate("%s/issues/comments?since=%s&per_page=100" % (base, since))
+                    if isinstance(c, dict) and hot_spots.relevant(str(c.get("body") or "")))
+                review_comments.extend(
+                    {"body": c["body"], "created_at": c.get("created_at")}
+                    for c in self.gh.paginate("%s/pulls/comments?since=%s&per_page=100" % (base, since))
+                    if isinstance(c, dict) and c.get("body")
+                    and str((c.get("user") or {}).get("login") or "").lower() in (bot, bot + "[bot]"))
+            except (GitHubError, OSError, ValueError) as exc:
+                errors.append("%s comments: %s" % (repo, self._error_reason(exc)))
+                return {"errors": errors}
+        return {"issue_comments": issue_comments, "review_comments": review_comments, "errors": errors}
 
     def _read_pull_requests(self, repo, prs, errors):
         try:
@@ -279,7 +323,10 @@ class TicketStore:
                 "improving": snapshot.get("improving", {}),
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
-                "dashboard_errors": snapshot.get("dashboard_errors", [])}
+                "dashboard_errors": snapshot.get("dashboard_errors", []),
+                "reports": snapshot.get("reports", []),
+                "brain": snapshot.get("brain", {"record": None, "error": "not read yet"}),
+                "hot_spots": snapshot.get("hot_spots", {})}
 
 
 def _dashboard_homes():

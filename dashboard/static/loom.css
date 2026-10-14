@@ -226,3 +226,23 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .ticket-columns { display: block; }
   .ticket-columns > [hidden] { display: none; }
 }
+
+/* Brain and Hot spots views */
+.progress.ten { grid-template-columns: repeat(10, 1fr); max-width: none; }
+.step-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 4px 12px; color: var(--muted); }
+.step-list .step-current { color: var(--accent); font-weight: 600; }
+.step-list .step-done { color: var(--good); }
+.thought, .tick-row, .hot-row { margin: 0 0 8px; }
+.tag { font: 11px var(--font-mono); text-transform: uppercase; letter-spacing: .08em; padding: 1px 6px; border: 1px solid var(--line-strong); border-radius: 4px; }
+.tag-regression { color: var(--bad); }
+.tag-operator, .tag-verifying { color: var(--accent); }
+.tag-merged { color: var(--good); }
+.tag-deferred { color: var(--muted); }
+.marker { margin: 0 0 6px; padding: 8px 10px; background: var(--code); border-radius: 6px; overflow-x: auto; font: 12px var(--font-mono); }
+.hot-row.bottleneck { color: var(--accent); }
+.lane-bars { display: flex; flex-wrap: wrap; gap: 14px; }
+.lane-bar { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 96px; }
+.lane-bar .bar-track { width: 28px; height: 96px; display: flex; align-items: flex-end; background: var(--future); border-radius: 4px; }
+.lane-bar .bar-track span { width: 100%; background: var(--good); border-radius: 4px; }
+.lane-bar.over .bar-track span { background: var(--bad); }
+.lane-bar.over strong { color: var(--bad); }

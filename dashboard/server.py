@@ -23,8 +23,8 @@ from . import usage as usage_store
 from . import ticket as ticket_view
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
-WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
-from . import views
+from . import brain_view, hot_spots, views
+WAIT_STATES = hot_spots.WAIT_STATES
 
 def _all_tickets(state):
     return [row for rows in state.response()["tickets"].values() if rows for row in rows]
@@ -83,10 +83,7 @@ def _backlog(state):
 def _conveyor(state, rows):
     by_state = {name: [row for row in rows if row.get("state") == name] for name in STATES}
     waits = getattr(state, "waits", None)
-    waiting = [(name, waits.get(name)) for name in WAIT_STATES
-               if isinstance(waits, dict) and isinstance(waits.get(name), list)
-               and len(waits[name]) >= 3]
-    bottleneck = max(waiting, key=lambda pair: statistics.median(pair[1]))[0] if waiting else None
+    bottleneck = hot_spots.bottleneck(waits)
     backlog_count, backlog_error = _backlog(state)
     cards = ['<a class="step-card" href="/backlog"><strong>%s</strong><span>backlog</span><small>%s</small></a>' % (
         str(backlog_count) if backlog_count is not None else "not looked",
@@ -456,7 +453,7 @@ def _dispatch_get(handler, state):
         return _dispatch_backlog(handler, state, path, parsed)
     if path in ("/static/loom.css", "/static/loom.js"):
         return _dispatch_static(handler, path)
-    if path in ("/improving", "/lanes"):
+    if path in ("/improving", "/lanes", "/brain", "/hot-spots"):
         return _send_dashboard_view(handler, state, path)
     if path == "/usage":
         return _dispatch_usage(handler, state)
@@ -577,7 +574,17 @@ def _send_dashboard_view(handler, state, path):
     payload = state.response()
     tickets = [row for rows in payload["tickets"].values() if rows for row in rows]
     status = "stale" if payload["stale"] else "live"
-    if path == "/improving":
+    if path == "/brain":
+        step = payload.get("brain") or {}
+        data = brain_view.build_brain(step.get("record"), step.get("error"),
+                                      payload.get("improving", {}).get("journals", []),
+                                      payload.get("reports", []))
+        body, title, active = brain_view.render_brain(data), "Brain", "brain"
+    elif path == "/hot-spots":
+        data = hot_spots.build_hot_spots(tickets, getattr(state, "waits", None),
+                                         payload.get("hot_spots"))
+        body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
+    elif path == "/improving":
         source = payload.get("improving", {})
         data = views.build_improvements(source.get("journals", []), tickets,
                                         source.get("metrics_comments", []))
