@@ -1,0 +1,479 @@
+/* loom.css: the tokens and shared components of every dashboard screen.
+
+   Design reference: docs/design/floor/README.md (Shell, Ticket row, Design
+   tokens). Each colour token is light-dark(LIGHT, DARK): the theme follows
+   prefers-color-scheme unless <html data-theme="light|dark"> pins it (the
+   toggle in loom.js stores that choice in the loom_theme cookie).
+
+   Rules the tests hold this file to:
+   - every --fg-* token and every accent clears 4.5:1 on every --bg-* token,
+     in both themes (tests/test_dashboard_shell.py);
+   - every interactive element is at least 44px in both directions;
+   - no shadows, no transitions or animations: hover is the only change.
+   dim (labels) and faint (timestamps) are a little brighter than the README's
+   #7a8596 and #5f6a7b, which fall under 4.5:1 on the raised surface. */
+
+:root {
+  color-scheme: dark light;
+
+  --bg: light-dark(#f5f6f8, #0e1117);
+  --bg-surface: light-dark(#ffffff, #151a22);
+  --bg-row: light-dark(#fbfbfc, #121720);
+  --bg-raised: light-dark(#eceef2, #1b212b);
+  --bg-hover: light-dark(#e9ecf0, #171d27);
+  --bg-code: light-dark(#f0f2f5, #090c10);
+
+  --line-hair: light-dark(#e6e8ec, #1a1f28);
+  --line: light-dark(#dfe2e7, #1e242e);
+  --line-2: light-dark(#d8dce2, #222935);
+  --line-3: light-dark(#d0d5dc, #262d39);
+  --line-hover: light-dark(#bfc5ce, #2c3442);
+  --line-strong: light-dark(#9aa2ae, #3a4352);
+
+  --fg: light-dark(#0e1117, #e2e6ee);
+  --fg-body: light-dark(#232a35, #d3d9e3);
+  --fg-body-2: light-dark(#2c3442, #c9d0db);
+  --fg-muted: light-dark(#4a5260, #9aa4b4);
+  --fg-dim: light-dark(#555e6c, #8a95a6);
+  --fg-faint: light-dark(#5c6573, #818c9d);
+
+  /* Accents: amber act on this, green done or good, red failing, blue brain
+     or shipped. Each is also a text colour, so each clears 4.5:1. */
+  --amber: light-dark(oklch(0.53 0.11 70), oklch(0.82 0.14 75));
+  --green: light-dark(oklch(0.5 0.12 155), oklch(0.78 0.13 155));
+  --red: light-dark(oklch(0.52 0.18 25), oklch(0.72 0.15 25));
+  --blue: light-dark(oklch(0.5 0.13 250), oklch(0.76 0.1 245));
+  --on-amber: light-dark(#ffffff, #0e1117);
+
+  --step-future: light-dark(#dde1e7, #232a35);
+  --scrim: light-dark(rgba(20, 24, 30, 0.35), rgba(5, 7, 10, 0.6));
+
+  --sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --tap: 44px;
+  --nav-width: 232px;
+  --topbar: 52px;
+  --tabbar: 76px;
+}
+
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+
+/* Base */
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html { background: var(--bg); }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--amber); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+button { font: inherit; color: inherit; }
+
+/* Mono is for machine facts: ids, numbers, labels, code. Sans is for
+   sentences. */
+.mono { font-family: var(--mono); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.muted { color: var(--fg-muted); }
+.faint { color: var(--fg-faint); }
+code, pre { font-family: var(--mono); }
+pre {
+  background: var(--bg-code);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+
+/* States. A state is never shown by colour alone: whatever carries --st
+   also prints the state's word. */
+.st-queued { --st: var(--fg-dim); }
+.st-briefed { --st: var(--fg-body-2); }
+.st-running, .st-pr { --st: var(--amber); }
+.st-merged, .st-verified { --st: var(--green); }
+.st-shipped { --st: var(--blue); }
+.st-failed { --st: var(--red); }
+.st-word { color: var(--st, var(--fg-muted)); }
+
+/* Shell */
+
+.skip {
+  position: absolute;
+  left: 8px;
+  top: -100px;
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 14px;
+  border-radius: 8px;
+  background: var(--amber);
+  color: var(--on-amber);
+}
+.skip:focus { top: 8px; }
+
+.shell { display: flex; min-height: 100vh; }
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.main {
+  width: 100%;
+  max-width: 1320px;
+  padding: 24px clamp(16px, 3.5vw, 40px) 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+.main:focus { outline: none; }
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+}
+.brand:hover { text-decoration: none; }
+
+/* The last tick: a dot plus its word. ok green, failed red, missing dim. */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.status .dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--st);
+}
+.status-ok { --st: var(--green); }
+.status-failed { --st: var(--red); }
+.status-missing { --st: var(--fg-dim); }
+.status-failed .status-word { color: var(--red); }
+
+/* Desktop nav, >= 960px */
+.nav {
+  display: none;
+  width: var(--nav-width);
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+  padding: 22px 14px;
+  flex-direction: column;
+  gap: 4px;
+}
+.nav-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 10px;
+  padding: 0 10px 14px;
+}
+.nav-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.nav-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--fg-muted);
+}
+.nav-link:hover { background: var(--bg-hover); text-decoration: none; }
+.nav-link[aria-current="page"] { background: var(--bg-raised); color: var(--fg); }
+.nav-n { font-size: 11px; color: var(--amber); }
+.nav-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 0 0;
+  border-top: 1px solid var(--line);
+}
+
+/* Mobile, < 960px: top bar, tab bar, more sheet */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  height: var(--topbar);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 18px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line-hair);
+}
+.topbar .brand { font-size: 18px; }
+
+.tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  height: var(--tabbar);
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  padding-bottom: 14px;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+.tabbar-link {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.tabbar-link::before {
+  content: "";
+  width: 18px;
+  height: 3px;
+  border-radius: 2px;
+  background: transparent;
+}
+.tabbar-link:hover { text-decoration: none; color: var(--fg-body-2); }
+.tabbar-link[aria-current="page"], .tabbar-link.on, .tabbar-link[aria-expanded="true"] { color: var(--amber); }
+.tabbar-link[aria-current="page"]::before, .tabbar-link.on::before,
+.tabbar-link[aria-expanded="true"]::before { background: var(--amber); }
+
+/* The sheet is shown by :target without the script, by .open with it (the
+   script marks <html class="js">, so a page loaded at #more still closes). It
+   is not positioned itself, so its backdrop sits under the tab bar and its
+   panel over it, and "more" still closes it. */
+.sheet { display: none; }
+html:not(.js) .sheet:target, .sheet.open { display: block; }
+.sheet-backdrop { position: fixed; inset: 0; z-index: 9; background: var(--scrim); }
+.sheet-panel {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: var(--tabbar);
+  z-index: 11;
+  max-height: calc(100vh - var(--tabbar) - var(--topbar));
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px 12px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--line-3);
+  border-radius: 18px 18px 0 0;
+}
+.sheet-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 52px;
+  min-width: var(--tap);
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  font: 15px var(--sans);
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.sheet-link:hover { background: var(--bg-raised); text-decoration: none; }
+.sheet-link[aria-current="page"] { background: var(--bg-raised); color: var(--amber); }
+.sheet-link .nav-n { font-size: 12px; }
+
+@media (min-width: 960px) {
+  .nav { display: flex; }
+  .topbar, .tabbar, html .sheet { display: none; }
+  .main { padding-bottom: 48px; }
+}
+
+/* Components */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--line-2);
+}
+.card-act { border-color: color-mix(in oklch, var(--amber) 38%, transparent); }
+.card-fail { border-color: color-mix(in oklch, var(--red) 45%, transparent); }
+a.card { color: inherit; }
+a.card:hover { text-decoration: none; border-color: var(--line-hover); }
+
+/* Ticket row:
+   <a class="row st-pr" href="/t/owner/name/94">
+     <span class="row-head"><span class="row-id">name#94</span><span class="row-flag st-word">pr</span></span>
+     <span class="row-title">...</span>
+     <span class="row-foot"><span class="steps">7 x <span class="step done|now|fail"></span></span><span class="row-lane">lane / model</span></span>
+   </a> */
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--bg-row);
+  border: 1px solid var(--line);
+  color: inherit;
+}
+.row:hover { background: var(--bg-hover); border-color: var(--line-hover); text-decoration: none; }
+.row-head { display: flex; justify-content: space-between; gap: 10px; font-family: var(--mono); font-size: 11.5px; }
+.row-id { color: var(--fg); }
+.row-flag { text-align: right; }
+.row-title { font-size: 14px; line-height: 1.38; color: var(--fg-body); text-wrap: pretty; }
+.row-foot { display: flex; align-items: center; gap: 12px; }
+.row-lane {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Seven progress segments: done green, current amber (red when it failed),
+   future grey. The row's flag carries the state's word. */
+.steps { display: flex; gap: 3px; flex: 1; max-width: 240px; }
+.step { flex: 1; height: 4px; border-radius: 2px; background: var(--step-future); }
+.step.done { background: var(--green); }
+.step.now { background: var(--amber); }
+.step.fail { background: var(--red); }
+
+/* Filter chips: <a class="chip" href="?state=pr" data-param="state" data-value="pr">pr <span class="chip-n">3</span></a> */
+.chips { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-shrink: 0;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--bg-surface);
+  border: 1px solid var(--line-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-body-2);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.chip:hover { background: var(--bg-hover); border-color: var(--line-hover); text-decoration: none; }
+.chip[aria-current="true"], .chip[aria-pressed="true"] { background: var(--bg-raised); border-color: var(--amber); color: var(--fg); }
+.chip-n { color: var(--fg-dim); }
+
+/* A count tag that is not interactive, e.g. "3 pr" on a goal card. */
+.tag {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg-raised);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-body-2);
+  white-space: nowrap;
+}
+
+/* Segmented control (tabs):
+   <div class="segmented" role="tablist" data-tabs="tab">
+     <a class="segment" role="tab" href="?tab=path" data-value="path" aria-controls="pane-path">path</a>
+   </div>
+   <section id="pane-path" role="tabpanel">...</section>
+   Inside .panes-wide, every pane shows side by side from 960px and the
+   control hides. */
+.segmented {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--line);
+}
+.segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.segment:hover { background: var(--bg-hover); text-decoration: none; }
+.segment[aria-selected="true"] { background: var(--bg-raised); color: var(--fg); }
+
+@media (min-width: 960px) {
+  .panes-wide > .segmented { display: none; }
+  .panes-wide > [role="tabpanel"][hidden] { display: block !important; }
+}
+
+/* Buttons. Primary is the one thing to act on. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  padding: 0 16px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  font: 500 14px var(--sans);
+  color: var(--fg);
+  cursor: pointer;
+}
+.btn:hover { background: var(--bg-hover); text-decoration: none; }
+.btn-primary { background: var(--amber); border-color: var(--amber); color: var(--on-amber); }
+.btn-primary:hover { background: var(--amber); border-color: var(--fg); }
+.btn-quiet { border-color: var(--line-2); color: var(--fg-muted); font: 12px var(--mono); }
