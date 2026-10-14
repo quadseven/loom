@@ -2349,5 +2349,38 @@ class AnsweredStatusTests(unittest.TestCase):
         self.assertEqual(lines[index + 1], "- #17 Diagnosis - lane:codex - 0h")
 
 
+class LogExcerptTests(unittest.TestCase):
+    """The fix brief quotes the lines of a failed job that say why it failed."""
+
+    TEARDOWN = ["Post job cleanup.", "Stop and remove container: postgres"] + [
+        "LOG:  checkpoint %d" % i for i in range(60)] + ["Cleaning up orphan processes"]
+
+    def test_the_failing_test_is_quoted_and_post_job_cleanup_is_not(self):
+        lines = (["collecting ..."] + ["." * 72 + " [%d%%]" % i for i in range(80)]
+                 + ["E       AssertionError: baseline.json was not re-recorded",
+                    "FAILED tests/test_elder_eval.py::test_baseline_exists_and_prompt_sha_matches",
+                    "1 failed, 2816 passed in 67.48s",
+                    "make: *** [Makefile:40: webhook-test] Error 1",
+                    "##[error]Process completed with exit code 2."] + self.TEARDOWN)
+        excerpt = brain.log_excerpt(lines)
+        self.assertIn("FAILED tests/test_elder_eval.py::test_baseline_exists_and_prompt_sha_matches", excerpt)
+        self.assertIn("AssertionError: baseline.json was not re-recorded", excerpt)
+        self.assertNotIn("Cleaning up orphan processes", excerpt)
+        self.assertNotIn("checkpoint", excerpt)
+
+    def test_a_failure_far_above_the_error_line_is_still_quoted(self):
+        lines = (["Traceback (most recent call last):", "ValueError: bad row"]
+                 + ["step output %d" % i for i in range(100)]
+                 + ["##[error]Process completed with exit code 1."] + self.TEARDOWN)
+        excerpt = brain.log_excerpt(lines).split("\n")
+        self.assertEqual(excerpt[:3], ["Traceback (most recent call last):", "ValueError: bad row", "..."])
+        self.assertEqual(excerpt[-1], "##[error]Process completed with exit code 1.")
+        self.assertLessEqual(len(excerpt), brain.LOG_LINES + brain.FAILURE_LINES + 1)
+
+    def test_a_log_with_no_error_marker_keeps_its_last_lines(self):
+        lines = ["line %d" % i for i in range(100)]
+        self.assertEqual(brain.log_excerpt(lines), "\n".join(lines[-brain.LOG_LINES:]))
+
+
 if __name__ == "__main__":
     unittest.main()
