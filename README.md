@@ -106,3 +106,13 @@ Briefs, logs and keys never go to GitHub: this repo is public.
 - Subscription CLIs run with the owner's own login; no credential sharing.
 - GitHub text is ASCII with no em dashes, never names the review bot with an
   at-sign, and never puts a closing keyword next to an issue number.
+
+# Dashboard
+
+Run the stdlib dashboard with `python3 -m dashboard`. It serves on port 8080
+by default. Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
+space-separated list of `OWNER/NAME` repositories. Set
+`LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
+the dashboard also checks the standard GitHub CLI authentication. Set
+`LOOM_DASHBOARD_BUDGET_FLOOR` to change the remaining-request threshold below
+which the last ticket snapshot is served as stale. The default is 500.
