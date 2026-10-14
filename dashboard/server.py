@@ -265,14 +265,7 @@ def _dispatch_get(handler, state):
     if path == "/api/tickets":
         return handler.send_json(200, state.response())
     if path in ("/backlog", "/backlog.json", "/needs-you"):
-        raw = _backlog_bytes()
-        if path == "/backlog.json":
-            return handler.send_bytes(503, b"backlog source unavailable", "text/plain; charset=utf-8") if raw is None else handler.send_bytes(200, raw, "application/json")
-        if path == "/backlog":
-            if raw is None:
-                return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
-            return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
-        return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
+        return _send_backlog_view(handler, state, parsed)
     if path in ("/static/loom.css", "/static/loom.js"):
         asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
         content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
@@ -289,6 +282,18 @@ def _dispatch_get(handler, state):
     if detail is not None:
         return handler.send_page(detail[0], detail[1])
     return handler.send_text(404, "not found")
+
+
+def _send_backlog_view(handler, state, parsed):
+    path = parsed.path
+    raw = _backlog_bytes()
+    if path == "/backlog.json":
+        return handler.send_bytes(503, b"backlog source unavailable", "text/plain; charset=utf-8") if raw is None else handler.send_bytes(200, raw, "application/json")
+    if path == "/backlog":
+        if raw is None:
+            return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
+        return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
+    return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
 
 
 def _send_insights_view(handler, state, path):
