@@ -22,8 +22,9 @@ from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
 GOAL = 30
-BODY = ("## Why\nThe page is slow.\n\n## What\nCache the query.\n\n"
-        "## Acceptance criteria\n- [ ] The page loads in under a second.\n\n"
+BODY = ("## Why\nThe page is slow for every visitor.\n\n## What\nCache the query.\n\n"
+        "## Acceptance criteria\n- [ ] The page loads in under a second.\n"
+        "- [ ] A test fails without the cache.\n- [ ] The query runs once a minute.\n\n"
         "## Size\nS\n\n## Out of scope\n- Other pages.\n")
 BRIEF = {"action": "brief", "title": "Cache the page query", "difficulty": "easy",
          "body": BODY}

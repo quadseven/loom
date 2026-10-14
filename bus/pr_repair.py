@@ -15,7 +15,7 @@ import sys
 import tempfile
 from typing import Dict, Optional, Tuple
 
-from . import text
+from . import hunt_plan, text
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
@@ -61,10 +61,14 @@ def _brief_section(brief: str, name: str) -> str:
 
 
 def _brief_size(brief: str) -> str:
-    """The first word of the Size section, with any trailing colon dropped."""
+    """The Size section's first line as the review bot's letter (Medium ->
+    M); a size it cannot read stays as its first word, colon dropped."""
     section = _brief_section(brief, "Size")
     first = section.split("\n", 1)[0].strip()
-    return first.split()[0].rstrip(":") if first else ""
+    try:
+        return hunt_plan.size_letter(first)
+    except ValueError:
+        return first.split()[0].rstrip(":") if first else ""
 
 
 def _brief_title(brief: str) -> Optional[str]:
