@@ -1714,10 +1714,32 @@ def _job_log(gh: GitHub, repo: str, job_id: int) -> Optional[List[str]]:
             for l in (raw or b"").decode("utf-8", "replace").splitlines()]
 
 
+# A line that says what failed: a test runner's failure summary, an
+# assertion, a traceback or a compiler error.
+_FAILURE_LINE = re.compile(r"FAILED|FAIL:|ERROR:|Error:|Error\b|Traceback|assert|error[: ]|\bfailed\b")
+FAILURE_LINES = 20
+
+
+def log_excerpt(lines: Sequence[str]) -> str:
+    """The part of a job log that says why it failed. The log is cut at the
+    last `##[error]` line, the failing step's end, so post-job cleanup (a
+    service container's shutdown, orphan process cleanup) never crowds out
+    the failure. The last LOG_LINES lines before the cut follow up to
+    FAILURE_LINES earlier lines that name a failure. On 2026-10-14 a fix brief
+    quoted 40 lines of Postgres teardown and no lane saw the failing test
+    across 16 rounds."""
+    end = max((i for i, line in enumerate(lines) if "##[error]" in line), default=len(lines) - 1)
+    window = list(lines[:end + 1])
+    head, tail = window[:-LOG_LINES], window[-LOG_LINES:]
+    failures = [line for line in head if _FAILURE_LINE.search(line)][-FAILURE_LINES:]
+    return "\n".join(failures + (["..."] if failures else []) + tail)
+
+
 def _job_log_tail(gh: GitHub, repo: str, job_id: int) -> Optional[str]:
-    """The last lines of a GitHub Actions job's log, or None."""
+    """The lines of a GitHub Actions job's log that say why it failed
+    (log_excerpt), or None."""
     lines = _job_log(gh, repo, job_id)
-    return None if lines is None else "\n".join(lines[-LOG_LINES:])
+    return None if lines is None else log_excerpt(lines)
 
 
 def _failing_checks(gh: GitHub, repo: str, sha: str) -> List[Tuple[str, str]]:
