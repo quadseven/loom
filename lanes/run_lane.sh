@@ -572,7 +572,7 @@ PROBE_HOLD=43200
 # 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
 # MODEL; 1 for any other answer, no answer, or no probe configured.
 provider_at_limit() {
-  local url header session model body out code limit_name
+  local url header session model body out code limit_name headers retry_after stamp
   url="$(lane_setting PROBE_URL)" header="$(lane_setting PROBE_HEADER)"
   [ -n "$url" ] && [ -n "$API_KEY" ] || return 1
   [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 1
@@ -585,13 +585,29 @@ provider_at_limit() {
   model="${MODEL#*/}"
   [[ "$model" =~ ^[A-Za-z0-9._:/@-]+$ ]] || return 1
   body="$(printf '{"model": "%s", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}' "$model")"
-  out="$(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" |
-    curl -s -K - -X POST --max-time "$PROBE_TIMEOUT" -w '\n%{http_code}' \
+  headers="$LOOM_HOME/state/usage/$SLOT.probe-headers"
+  mkdir -p "$LOOM_HOME/state/usage"
+  if ! out="$(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" |
+    curl -s -K - -D "$headers" -X POST --max-time "$PROBE_TIMEOUT" -w '\n%{http_code}' \
       -H 'Content-Type: application/json' ${header:+-H "$header: $session"} \
-      --data-binary "$body" "$url" 2>/dev/null)" || return 1
+      --data-binary "$body" "$url" 2>/dev/null)"; then
+    rm -f "$headers"
+    return 1
+  fi
   code="${out##*$'\n'}" body="${out%$'\n'*}"
-  [ "$code" = 429 ] && [[ "$body" == *GoUsageLimitError* ]] || return 1
+  if [ "$code" != 429 ] || [[ "$body" != *GoUsageLimitError* ]]; then
+    rm -f "$headers"
+    return 1
+  fi
   limit_name="$(printf '%s' "$body" | sed -nE 's/.*"limitName" *: *"([A-Za-z0-9_-]+)".*/\1/p' | head -1)"
+  retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
+  rm -f "$headers"
+  retry_after="$(printf '%s' "$retry_after" | tr -cd '[:alnum:], :-')"
+  stamp="$(date +%s)"
+  [[ "$retry_after" =~ ^[0-9]+$ ]] && retry_after=$((stamp + retry_after))
+  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s"}\n' \
+    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
+    mv -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 GoUsageLimitError)"
   return 0
 }
