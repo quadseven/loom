@@ -49,11 +49,12 @@ class FakeGitHub:
 
     def pull(self, number, ticket, created=3600, mergeable=True, green=True,
              resolved=True, runs=(("unittest", "completed"), (factory.DEFAULT_REVIEW_CHECK, "completed")),
-             updated=3600, files=("bus/a.py", "tests/test_a.py")):
+             updated=3600, files=("bus/a.py", "tests/test_a.py"), labels=()):
         sha = "sha%d" % number
         self.files[number] = list(files)
         self.pulls[number] = {
             "number": number, "state": "open", "draft": False, "body": "", "user": ME,
+            "labels": [{"name": x} for x in labels],
             "head": {"ref": "loom/%d-some-title" % ticket, "sha": sha,
                      "repo": {"full_name": REPO}},
             "base": {"ref": "main", "repo": {"full_name": REPO}},
@@ -123,7 +124,12 @@ class FakeGitHub:
         if m:
             number = int(m.group(1))
             if m.group(2) == "/labels":
-                self.issues[number]["labels"] = [{"name": x} for x in body["labels"]]
+                if number in self.issues:
+                    self.issues[number]["labels"] = [{"name": x} for x in body["labels"]]
+                else:
+                    have = [x["name"] for x in self.pulls[number].get("labels", [])]
+                    self.pulls[number]["labels"] = [
+                        {"name": x} for x in dict.fromkeys(have + list(body["labels"]))]
             elif m.group(2) == "/comments":
                 self.comments[number].append({"body": body["body"], "created_at": iso(0), "user": ME})
             elif method == "PATCH":
@@ -618,6 +624,45 @@ class DeferredFindings(Base):
         self.assertEqual(len(self.gh.filed), 1)
         self.assertTrue([w for w in self.gh.writes if w[0] == "REPLY"][0][2].startswith("Deferred to #777: "))
         self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_docs_pull_request_defers_a_medium_finding_at_once(self):
+        self.gh.pulls[50]["labels"] = [{"name": "class:docs"}]
+        self.finding(MEDIUM, asked=())
+        self.go()
+        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+        self.assertEqual(self.fixed, [])
+
+    def test_a_tests_pull_request_defers_a_low_finding_at_once(self):
+        self.gh.pulls[50]["labels"] = [{"name": "class:tests"}]
+        self.finding("low | _style_ | `nit`", asked=())
+        self.go()
+        self.assertEqual((len(self.gh.filed), self.merged), (1, [(50, (REPO, 5))]))
+
+    def test_a_logic_pull_request_keeps_todays_rule_for_a_minor_finding(self):
+        self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
+        self.finding(MEDIUM, asked=())
+        self.go()
+        self.assertEqual((self.gh.filed, self.merged, len(self.fixed)), ([], [], 1))
+
+
+class ChangeClasses(Base):
+    def test_a_sensitive_pull_request_is_left_for_the_brain_and_marked(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive",))
+        self.go()
+        self.assertEqual((self.merged, self.fixed), ([], []))
+        self.assertIn(("POST", "/repos/%s/issues/50/labels" % REPO, {"labels": ["needs-brain"]}),
+                      self.gh.writes)
+        names = [x["name"] for x in self.gh.pulls[50]["labels"]]
+        self.assertIn("class:sensitive", names)
+        self.assertIn("needs-brain", names)
+
+    def test_a_sensitive_pull_request_already_marked_is_left_alone(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, labels=("class:sensitive", "needs-brain"))
+        self.go()
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/labels")], [])
+        self.assertEqual(self.merged, [])
 
 
 class Trust(Base):

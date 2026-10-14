@@ -407,6 +407,23 @@ verdict. A tick takes that line as given instead of re-reading the review
 list. `bus.brain merge` keeps its own checks; this signal does not change
 what it accepts.
 
+## Merge by change class
+
+Every lane pull request carries one change class (`class:<name>`, set by the
+runner from its changed files; docs/LANES.md). The factory reads it when it
+decides merge-ready, so consequence decides the rule:
+
+- `docs` and `tests`: merged on green checks and a review pass on the head
+  commit alone. A medium or low finding the review bot opened is deferred to
+  the follow-up issue at once, with no fix round.
+- `logic`: the rule above is unchanged.
+- `sensitive`: never merged by the factory. The factory marks the pull
+  request `needs-brain`, and `bus.brain status` lists it under "Sensitive
+  pull requests". Only a brain merges it, with `bus.brain merge`, which for
+  this class also requires that the review check passed and that no high or
+  critical finding is open on the head commit.
+- A pull request with no class label keeps the `logic` rule.
+
 ## Journal
 
 One comment per tick that changed something, on the goal's home issue:

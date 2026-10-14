@@ -384,6 +384,10 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines = ["", "## %s" % repo, ""] + _goal_lines(goals, data, now, authors) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + ["", "### Pull requests"]
     lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in prs]
+    from . import factory  # factory imports this module
+    sensitive = [pr for pr in prs if factory.class_of(pr) == "sensitive"]
+    lines += ["", "### Sensitive pull requests"]
+    lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", "### Needs operator"]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
@@ -1007,8 +1011,9 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
-             ' commits(last:1) { nodes { commit { statusCheckRollup { state } } } } '
-             ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes { databaseId } } } }'
+             ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
+             ' reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes {'
+             ' databaseId author { __typename login } body createdAt } } } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     return ((data.get("repository") or {}).get("pullRequest") or {})
@@ -1016,9 +1021,13 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
 
 def merge(gh: GitHub, repo: str, number: int,
           ticket: Optional[Tuple[str, int]] = None) -> Dict[str, Any]:
+    from . import factory  # factory imports this module
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     details = _pr_graphql(gh, repo, number)
     _validate_merge_pr(repo, pr, details)
+    if factory.class_of(pr) == "sensitive":
+        bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+        _validate_sensitive_merge(gh, repo, details, bot, _review_check_name())
     association = _validate_ticket_association(gh, repo, number, pr, ticket, "pr")
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
@@ -1071,6 +1080,58 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -
     for ok, reason in rules:
         if not ok:
             raise ValueError(reason)
+
+
+# A sensitive change (bus/change_class.py) is never merged by the factory; the
+# brain merges it only when the review check passed and no high or critical
+# finding is open on the head commit (docs/MUSE.md, Merge by change class).
+# The bot opens each finding with its severity line, "<symbol> high | ...".
+HIGH_RE = re.compile(r"^\W*(high|critical) \|")
+
+
+def _review_check_name(env: Optional[Dict[str, str]] = None) -> str:
+    from . import factory
+    raw = (os.environ if env is None else env).get("LOOM_REVIEW_CHECK", "").strip()
+    return raw or factory.DEFAULT_REVIEW_CHECK
+
+
+def _review_check_passed(gh: GitHub, repo: str, sha: str, name: str) -> bool:
+    """The review check has a successful run on this commit."""
+    from . import factory
+    runs = (gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)).data
+            or {}).get("check_runs") or []
+    return any(r.get("name") == name and r.get("conclusion") in factory.GREEN for r in runs)
+
+
+def _open_critical_finding(details: Dict[str, Any], bot: str) -> bool:
+    """A high or critical finding the review bot opened that is still open on
+    the head commit: its thread is unresolved, or it has no fix-up commit
+    after it (it was created at or after the head commit)."""
+    committed = str(_head_commit(details).get("committedDate") or "")
+    threads = (details.get("reviewThreads") or {}).get("nodes") or []
+    for thread in threads:
+        comments = (thread.get("comments") or {}).get("nodes") or []
+        root = (comments[0] if comments else None) or {}
+        if not by_bot(root, bot) or not HIGH_RE.match(str(root.get("body") or "")):
+            continue
+        created = str(root.get("createdAt") or "")
+        if not thread.get("isResolved") or (committed and created >= committed):
+            return True
+    return False
+
+
+def _validate_sensitive_merge(gh: GitHub, repo: str, details: Dict[str, Any],
+                              bot: str, check: str) -> None:
+    """What a sensitive-class pull request needs beyond the standard merge
+    checks: the review check passed on its head commit, and no high or
+    critical finding is open there."""
+    sha = str(details.get("headRefOid") or "")
+    if not sha or not _review_check_passed(gh, repo, sha, check):
+        raise ValueError("sensitive pull request: the review check %s has not passed "
+                         "on its head commit" % check)
+    if _open_critical_finding(details, bot):
+        raise ValueError("sensitive pull request: a high or critical finding is open "
+                         "on its head commit")
 
 
 def reply_to_review(gh: GitHub, repo: str, number: int, comment_id: int,

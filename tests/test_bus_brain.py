@@ -67,6 +67,19 @@ class BrainTests(unittest.TestCase):
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
 
+    def test_status_lists_a_sensitive_pull_request(self):
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [{"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work"},
+                         "labels": [{"name": "class:sensitive"}]}]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, [])))
+        lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
+        at = lines.index("### Sensitive pull requests")
+        self.assertEqual(lines[at + 1], "- #4 Sensitive")
+
     def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
         goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"},
@@ -337,6 +350,65 @@ class BrainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             brain.merge(GitHub("t", transport=fake), REPO, 8)
         self.assertFalse(any("/git/refs/" in call[1] for call in fake.calls))
+
+    def _sensitive_replies(self, finding=None):
+        details = {"commits": {"nodes": [{"commit": {
+            "committedDate": "2030-01-01T00:00:00Z",
+            "statusCheckRollup": {"state": "SUCCESS"}}}]},
+            "reviewThreads": {"nodes": [] if finding is None else [finding]}}
+        return self._merge_replies({"pr": {"labels": [{"name": "class:sensitive"}]},
+                                    "details": details})
+
+    def _passing_check(self):
+        return reply(200, {"check_runs": [{"name": brain._review_check_name(),
+                                           "status": "completed", "conclusion": "success"}]})
+
+    def test_merge_refuses_a_sensitive_pr_with_an_open_high_finding(self):
+        # The finding is unresolved on the head commit: the head is committed
+        # at 00:00 and the finding at 00:10, so no fix-up commit came after it.
+        high = {"id": "T1", "isResolved": True, "comments": {"nodes": [
+            {"author": {"__typename": "Bot", "login": "grug-tribe"},
+             "body": "\U0001f525 high | _correctness_ | `null-deref`",
+             "createdAt": "2030-01-01T00:10:00Z"}]}}
+        pr, query = self._sensitive_replies(high)
+        fake = Fake(pr, query, self._passing_check())
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("high or critical finding", str(caught.exception))
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_sensitive_pr_without_a_passed_review_check(self):
+        pr, query = self._sensitive_replies()
+        checks = reply(200, {"check_runs": [{"name": "unittest", "status": "completed",
+                                             "conclusion": "success"}]})
+        fake = Fake(pr, query, checks)
+        with self.assertRaises(ValueError) as caught:
+            brain.merge(GitHub("t", transport=fake), REPO, 8)
+        self.assertIn("review check", str(caught.exception))
+
+    def test_a_sensitive_pr_with_a_passed_review_and_no_high_finding_merges(self):
+        pr, query = self._sensitive_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, self._passing_check(), reply(200, issue),
+                    reply(200, {"merged": True}), reply(204), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        self.assertTrue(result["merged"])
+
+    def test_a_logic_pr_with_a_resolved_high_finding_keeps_todays_rule(self):
+        high = {"id": "T1", "isResolved": True, "comments": {"nodes": [
+            {"author": {"__typename": "Bot", "login": "grug-tribe"},
+             "body": "high | _correctness_ | `null-deref`",
+             "createdAt": "2030-01-01T00:10:00Z"}]}}
+        pr, query = self._merge_replies({"details": {
+            "commits": {"nodes": [{"commit": {
+                "committedDate": "2030-01-01T00:00:00Z",
+                "statusCheckRollup": {"state": "SUCCESS"}}}]},
+            "reviewThreads": {"nodes": [high]}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
+                    reply(204), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        self.assertTrue(result["merged"])
 
     def test_reply_and_resolve_right_thread(self):
         details = {"reviewThreads": {"nodes": [{"id": "THREAD", "comments": {"nodes": [{"databaseId": 42}]}}]}}
