@@ -568,7 +568,7 @@ PROBE_HOLD=43200
 # 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
 # MODEL; 1 for any other answer, no answer, or no probe configured.
 provider_at_limit() {
-  local url header session body out code limit_name
+  local url header session model body out code limit_name
   url="$(lane_setting PROBE_URL)" header="$(lane_setting PROBE_HEADER)"
   [ -n "$url" ] && [ -n "$API_KEY" ] || return 1
   [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 1
@@ -576,8 +576,11 @@ provider_at_limit() {
   # A quote, backslash or newline would end the key's line in curl's config.
   case "$API_KEY" in *'"'*|*\\*|*$'\n'*) return 1 ;; esac
   session="loom-probe-$SLOT-$(date +%s)-$$"
-  # MODEL passed the lane's allowlist: no quote or backslash can reach here.
-  body="$(printf '{"model": "%s", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}' "${MODEL#*/}")"
+  # The model goes into the JSON body as written: checked here, not only by
+  # the brief loop's allowlist, so no quote or backslash can reach the body.
+  model="${MODEL#*/}"
+  [[ "$model" =~ ^[A-Za-z0-9._:/@-]+$ ]] || return 1
+  body="$(printf '{"model": "%s", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}' "$model")"
   out="$(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" |
     curl -s -K - -X POST --max-time "$PROBE_TIMEOUT" -w '\n%{http_code}' \
       -H 'Content-Type: application/json' ${header:+-H "$header: $session"} \

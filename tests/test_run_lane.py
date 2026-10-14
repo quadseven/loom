@@ -1857,6 +1857,21 @@ cat > /dev/null
         self.assertIn("weekly", self.beat("opencode-go")["reason"])
         self.assertTrue(self.beat("opencode-go")["reason"].startswith("limit: "))
 
+    def test_a_model_with_a_quote_never_reaches_the_probe_body(self):
+        # The probe checks the model itself, not only through the brief loop's allowlist.
+        sent = Path(self._tmp.name) / "probe-sent"
+        script = self.source_functions("provider_at_limit") + (
+            'lane_setting() { case "$1" in PROBE_URL) echo http://127.0.0.1:9/v1/chat ;; esac; }\n'
+            'curl() { cat > /dev/null; printf "%s\\n" "$*" >> "$SENT"; printf "\\n200"; }\n'
+            'SLOT=opencode-go API_KEY=k PROBE_TIMEOUT=1 MODEL="$1"\nprovider_at_limit; echo "rc=$?"')
+        for model, reaches in (('opencode-go/kimi", "max_tokens": 99999, "x": "', False),
+                               ("opencode-go/kimi\\", False), ("opencode-go/kimi-k2.7-code", True)):
+            sent.unlink(missing_ok=True)
+            result = subprocess.run(["bash", "-c", script, "bash", model], env={**self.lane_env(), "SENT": str(sent)},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), "rc=1", model)
+            self.assertEqual(sent.exists(), reaches, model)
+
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_provider_that_answers_lets_the_run_go_ahead(self):
         requests, env = self.provider((200, '{"choices": [{"message": {"content": "p"}}]}'))
