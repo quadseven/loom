@@ -238,6 +238,13 @@ summary_note() {
   printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. If there is no behavior change, leave the file out.\n' "$SUMMARY_FILE"
 }
 
+# How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
+# tickets took six or more rounds: no lane ran a test before opening its pull
+# request, and most fix rounds answered review findings a checklist covers.
+work_note() {
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Commit your work. A run that ends with no commit fails the ticket.\n'
+}
+
 # The ## Intent section for the top of a new lane PR body: the change
 # class, one line per behavior change, and the counts of files by class.
 # Sensitive globs come from SENSITIVE_FILE on the base revision; a missing
@@ -1107,7 +1114,7 @@ markers_left() {
 
 run_agent() {
   local brief_text
-  brief_text="$(cat "$1")$(validation_note)$(summary_note)"
+  brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
   AGENT_EXTRA_ENV=""
   is_api_lane && fresh_agent_home
   case "$LANE" in

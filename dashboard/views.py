@@ -9,7 +9,21 @@ from urllib.parse import quote
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 LANES_MARKER = "<!-- loom:lanes v1 -->"
-FOOTER = re.compile(r"Loom ticket ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#?(\d+), lane ([A-Za-z0-9_.-]+), model (.+?)\.(?:\s|$)")
+# A lane pull request's footer names its ticket in the runner's form,
+# owner.name-N or owner.name-N-rK (bus/tickets.ticket_name), or as
+# owner/name#N, at the start of a line. An owner never has a dot, so the
+# first dot splits it; a model id is one token.
+FOOTER = re.compile(r"^Loom ticket ([A-Za-z0-9-]+)[./]([A-Za-z0-9_.-]+?)(?:#|-)(\d+)(?:-r\d+)?, "
+                    r"lane ([A-Za-z0-9_.-]+), model (\S+?)\.(?:\s|$)", re.M)
+
+
+def footer(text):
+    """(repo, number, lane, model) from a lane pull request footer, or None."""
+    match = FOOTER.search(str(text or ""))
+    if not match:
+        return None
+    owner, name, number, lane, model = match.groups()
+    return "%s/%s" % (owner, name), number, lane, model.strip()
 NUMBER = re.compile(r"^\d+\. (PASS|FAIL) (.+?): (.*?) \(target (.*?)\)$", re.M)
 REF = re.compile(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
@@ -92,10 +106,10 @@ def build_scoreboard(pull_requests):
     tiers = {}
     for pr in pull_requests:
         body = str(pr.get("body") or "")
-        match = FOOTER.search(body)
-        if not match:
+        parsed = footer(body)
+        if not parsed:
             continue
-        repo, number, lane, model = match.groups()
+        repo, number, lane, model = parsed
         tier = str(pr.get("tier") or pr.get("difficulty") or "unknown").lower()
         if tier not in ("easy", "medium", "hard", "frontier"):
             tier = "unknown"
@@ -141,6 +155,46 @@ def render_improving(data):
     return "".join(parts)
 
 
+def format_heartbeat(raw):
+    raw = str(raw or "").strip()
+    if not raw or raw == "-":
+        return "heartbeat missing"
+    match = re.search(r"(\d{1,2}:\d{2})(?::\d{2})?Z?", raw)
+    if match:
+        return "heartbeat %sZ" % match.group(1)
+    if raw.startswith("heartbeat "):
+        return raw
+    return "heartbeat " + raw
+
+
+def format_age(dt, now=None):
+    if not dt:
+        return None
+    now = now or datetime.now(timezone.utc)
+    if isinstance(dt, (int, float)) and not isinstance(dt, bool):
+        dt = datetime.fromtimestamp(dt, timezone.utc)
+    elif isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    seconds = max(0, int((now - dt).total_seconds()))
+    if seconds < 60:
+        return "less than a minute ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return "%d minute%s ago" % (minutes, "" if minutes == 1 else "s")
+    hours = minutes // 60
+    if hours < 24:
+        return "%d hour%s ago" % (hours, "" if hours == 1 else "s")
+    days = hours // 24
+    return "%d day%s ago" % (days, "" if days == 1 else "s")
+
+
 def parse_lane_rows(body):
     rows = []
     for line in str(body or "").splitlines():
@@ -164,14 +218,16 @@ def render_lanes(data):
         parts.append('<p class="empty-state">Lane status is missing: no loom:lanes comment was found.</p>')
     for lane in data.get("lanes", []):
         availability = "busy" if lane["ticket"] else ("free" if lane["available"] else "held")
-        reason = lane.get("reason") or ("heartbeat available" if lane["available"] else lane.get("heartbeat") or "unavailable reason missing")
+        heartbeat = format_heartbeat(lane.get("heartbeat"))
         ticket = lane.get("ticket")
         ticket_html = ('<a href="%s">%s</a>' % (_ticket_href(ticket["repo"], ticket["number"]), esc(str(ticket["title"] or "ticket"))) if ticket else "")
+        line = "%s - %s" % (ticket_html, esc(heartbeat)) if ticket_html else esc(heartbeat)
         quota = lane.get("quota")
         quota_html = '<div class="quota"><span style="width:%d%%"></span></div>' % max(0, min(100, int(quota))) if quota is not None else '<small>quota missing</small>'
-        parts.append('<article class="card lane-card"><strong>%s</strong><span>%s / %s</span><p>%s %s</p>%s</article>' % (
+        reason = ('<p>%s</p>' % esc(lane["reason"])) if lane.get("reason") else ""
+        parts.append('<article class="card lane-card"><strong>%s</strong><span>%s / %s</span><p>%s</p>%s%s</article>' % (
             esc(lane["lane"]), esc(availability), esc(lane.get("model") or "model missing"),
-            ticket_html, esc(reason), quota_html))
+            line, reason, quota_html))
     parts.append('</div></section><section><h2>Models by tier</h2>')
     if not data.get("scoreboard"):
         parts.append('<p class="empty-state">Scoreboard is missing: no lane pull requests matched the runner footer.</p>')

@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bus import hunt_plan, pr_repair, text, tickets  # noqa: E402
-import sandbox_caps  # noqa: E402
+from tests import sandbox_caps  # noqa: E402
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 INSTALL_LOCK = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "lock.sh"
@@ -590,6 +590,15 @@ class LaneRunnerTest(unittest.TestCase):
         agent = [c for c in self.calls() if c.startswith("codex ")]
         self.assertIn("--model gpt-test-default", agent[0])
         self.assertIn("lane codex, model gpt-test-default", self.body.read_text())
+
+    def test_the_agent_is_told_to_work_test_first_and_run_the_suite(self):
+        self.drop_brief()
+        self.run_lane()
+        prompt = self.log.read_text()
+        self.assertIn("## How to work", prompt)
+        self.assertIn("Work test-first", prompt)
+        self.assertIn("run the repo's full test suite", prompt)
+        self.assertIn("cyclomatic complexity under 15", prompt)
 
     def test_pr_body_ends_with_refs_for_a_station_brief(self):
         self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo#42\n"))
