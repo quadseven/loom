@@ -1,10 +1,12 @@
 """lanes/mac/station.sh run as a process: a local bare repo as the remote, a
 checkout made from it, and fake gh and python3 on PATH."""
 
+import json
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -69,9 +71,14 @@ class StationScriptTest(unittest.TestCase):
 
     def run_script(self, **env):
         full = dict(os.environ, PATH="%s:%s" % (self.bin, os.environ["PATH"]),
-                    FAKE_LOG=str(self.log), **env)
+                    FAKE_LOG=str(self.log), LOOM_HOME=str(self.tmp / "home"), **env)
         return subprocess.run(["bash", str(self.checkout / "lanes" / "mac" / "station.sh")],
                               env=full, capture_output=True, text=True, timeout=60)
+
+    def deployed(self):
+        """The deploy record the station's pass ships tickets from, or None."""
+        path = self.tmp / "home" / "state" / "station" / "deployed.json"
+        return json.loads(path.read_text()) if path.exists() else None
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
@@ -83,6 +90,9 @@ class StationScriptTest(unittest.TestCase):
         self.assertEqual(self.head(), target)
         self.assertIn("station: deployed %s: Change a.txt" % target[:7], result.stdout)
         self.assertEqual(self.calls()[-1], "python3 -m bus station in %s" % self.checkout)
+        record = self.deployed()
+        self.assertEqual(record["revision"], target)
+        self.assertLessEqual(abs(record["at"] - time.time()), 60)
 
     def test_a_head_whose_ci_has_not_passed_waits(self):
         before = self.head()
@@ -91,6 +101,8 @@ class StationScriptTest(unittest.TestCase):
             result = self.run_script(FAKE_CHECK=verdict)
             self.assertEqual(self.head(), before)
             self.assertNotIn("deployed", result.stdout)
+        # A deploy that did not happen records nothing, so nothing ships.
+        self.assertIsNone(self.deployed())
         self.assertTrue(self.calls()[-1].startswith("python3 -m bus station"))
 
     def test_a_head_that_brings_in_a_commit_a_revert_names_waits(self):
@@ -101,6 +113,7 @@ class StationScriptTest(unittest.TestCase):
         result = self.run_script(FAKE_REVERTS=reverts)
         self.assertEqual(self.head(), before)
         self.assertIn("not deploying: %s is named by a revert ticket" % bad[:12], result.stdout)
+        self.assertIsNone(self.deployed())
         self.assertTrue(self.calls()[-1].startswith("python3 -m bus station"))
 
     def test_a_named_commit_already_deployed_does_not_hold_the_next_one(self):

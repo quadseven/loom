@@ -9,13 +9,24 @@
 # does one that would bring in a commit an in-flight revert ticket names
 # (bus/revert.py: a merge that turned the branch red). The update
 # runs here, before Python, so a station a bad merge broke still receives the
-# fix merged after it. LOOM_DEPLOY=0 turns it off.
+# fix merged after it. LOOM_DEPLOY=0 turns it off. A deploy that succeeded is
+# recorded in the station's state (deployed.json: the revision and when), and
+# only then: the pass ships the merged tickets that revision carries
+# (bus/station.py ship_deployed).
 set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BRANCH="${LOOM_DEPLOY_BRANCH:-main}"
 CHECK="${LOOM_DEPLOY_CHECK:-unittest}"
+STATE_DIR="${LOOM_HOME:-$HOME/loom}/state/station"
 say() { printf 'station: %s\n' "$*"; }
 g() { git -C "$REPO_ROOT" -c core.hooksPath=/dev/null "$@"; }
+
+record_deploy() {
+  mkdir -p "$STATE_DIR" &&
+    printf '{"revision": "%s", "at": %s}\n' "$1" "$(date +%s)" > "$STATE_DIR/deployed.json.tmp" &&
+    mv -f "$STATE_DIR/deployed.json.tmp" "$STATE_DIR/deployed.json" ||
+    say "could not record the deploy of ${1:0:12}"
+}
 
 deploy() {
   [ "${LOOM_DEPLOY:-1}" != 0 ] || return 0
@@ -47,6 +58,7 @@ deploy() {
   done
   if g merge -q --ff-only "$target"; then
     say "deployed $(g rev-parse --short HEAD): $(g log -1 --format=%s HEAD | cut -c1-100)"
+    record_deploy "$(g rev-parse HEAD)"
   fi
 }
 
