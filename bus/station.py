@@ -31,6 +31,7 @@ from . import metrics
 from . import rewrite
 from . import revert
 from . import spend
+from . import usage
 from . import text as _text
 from . import tickets
 from . import transcripts
@@ -3489,6 +3490,10 @@ class Station:
             self.prune_trees()
         except OSError as err:
             _say("prune_trees failed: %s" % err)
+        try:
+            usage.write(self.s.home, usage.collect(self.s.home, now=self.now))
+        except OSError as err:
+            _say("could not write usage limits: %s" % err)
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
