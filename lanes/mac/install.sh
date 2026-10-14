@@ -61,7 +61,8 @@ LANES=("$@")
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
-# behind and break (a Homebrew opencode crashed on start, 2026-10-11).
+# behind and break (a Homebrew opencode crashed on start, 2026-10-11). The
+# station's PATH holds ~/.opencode/bin too, for lanes/rewrite_agent.sh.
 
 # XML-escape a value for a plist <string>.
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
@@ -136,7 +137,10 @@ done
 # station watches for new repeated errors, lines of name=path; empty watches
 # the station, brain and lane service logs, docs/LANES.md), and
 # LOOM_REWRITE_CMD and LOOM_REWRITE_PRIVATE_CMD (the agent commands that
-# rewrite loom:triage issues into tickets, docs/BRAIN.md Triage). Runs from
+# rewrite loom:triage issues into tickets, docs/BRAIN.md Triage; for example
+# "lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash", and for
+# private repos the same with a model whose provider does not train on
+# prompts, such as opencode-go/kimi-k2.7-code, never a public-only one). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -160,7 +164,7 @@ cat > "$PLIST" <<EOF
   <key>StandardErrorPath</key><string>$X_LOOM/logs/station.log</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$X_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>$X_HOME/.local/bin:$X_HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
     <key>LOOM_REPOS</key><string>$(xml "${LOOM_REPOS:-}")</string>
