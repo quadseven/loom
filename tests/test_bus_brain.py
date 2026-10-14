@@ -45,6 +45,48 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
 
 
 class BrainTests(unittest.TestCase):
+    def test_tick_step_records_and_reads_step_and_refuses_a_non_holder(self):
+        now = brain.datetime(2030, 1, 1, 12, 0, tzinfo=brain.timezone.utc)
+        original = {"object": {"sha": "old"}}
+        commit = {"message": "holder=muse expires=2030-01-01T13:00:00Z",
+                  "tree": {"sha": "tree"}}
+        fake = Fake(reply(200, original), reply(200, commit),
+                    reply(200, original), reply(200, commit),
+                    reply(200, {"sha": "new"}), reply(200, {}),
+                    reply(200, original), reply(200, commit),
+                    reply(200, original), reply(200, commit))
+        gh = GitHub("t", transport=fake)
+        saved = brain.tick_step(gh, REPO, "merge", "reviewing changes", "muse", now)
+        self.assertEqual((saved["step"], saved["step_index"]), ("merge", 3))
+        self.assertEqual(saved["notes"], [{"ts": "2030-01-01T12:00:00Z", "step": "merge", "text": "reviewing changes"}])
+        self.assertIn('"step_index":3', fake.calls[4][2]["message"])
+        with self.assertRaisesRegex(ValueError, "does not hold the lock"):
+            brain.tick_step(gh, REPO, "verify", holder="intruder", now=now)
+
+    def test_tick_step_show_reads_the_recorded_json_payload(self):
+        saved = {"started_at": "2030-01-01T12:00:00Z", "step": "merge",
+                 "step_index": 3, "notes": [{"ts": "2030-01-01T12:01:00Z",
+                 "step": "merge", "text": "checking"}]}
+        message = "holder=muse expires=2030-01-01T13:00:00Z\nloom:tick=" + json.dumps(saved)
+        gh = GitHub("t", transport=Fake(reply(200, {"object": {"sha": "c"}}),
+                                         reply(200, {"message": message})))
+        record = brain.tick_step(gh, REPO)
+        self.assertEqual(record["holder"], "muse")
+        self.assertEqual(record["step_index"], 3)
+        self.assertEqual(record["notes"][0]["text"], "checking")
+
+    def test_step_github_failure_is_logged_and_command_succeeds(self):
+        class Broken:
+            requests = 0
+            def rest(self, *args, **kwargs):
+                self.requests += 1
+                raise GitHubError("offline")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            brain._cmd_step(Broken(), brain.argparse.Namespace(
+                lock_repo=REPO, name="merge", note=None, holder="muse", show=False))
+        self.assertIn("brain step write failed", err.getvalue())
+
     def test_goal_trunk_reads_the_trunk_line_from_a_goal_body(self):
         self.assertEqual(brain.goal_trunk({"body": "Trunk: side\n\n## Why\n"}), "side")
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))

@@ -100,7 +100,8 @@ live regression).
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
    is held.
-2. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+   Then run `python3 -m bus.brain step lock --holder muse`.
+2. First run `python3 -m bus.brain step status --holder muse`. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
@@ -136,7 +137,7 @@ live regression).
    work and before any new brief. Verify them as step 4 says; write a proof
    only from evidence you saw in this tick, and otherwise leave a one-line
    note on the ticket naming what evidence is missing.
-3. The station hands failed checks and unresolved review-bot threads back to
+3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
    the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
    model ladder every 5 minutes. Review in full only tickets labeled
@@ -155,14 +156,14 @@ live regression).
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. Verify shipped tickets against the live system named in the ticket. Tick
+4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. Tick
    each acceptance criterion in the ticket body only once you have seen it
    hold, write the proof record (docs/BRAIN.md, Proof), then run
    `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
    and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
    refuse a missing proof or an unchecked criterion: never invent evidence to
    get past them; leave the ticket open and say what is missing.
-5. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
+5. First run `python3 -m bus.brain step failed --holder muse`. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each
    unresolved thread's severity, comment ID, first line and the newest lane
@@ -189,14 +190,14 @@ live regression).
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
    `python3 -m bus.brain close OWNER/NAME#N --reason not_planned --note TEXT`.
-6. Read every open `needs-operator` issue in `LOOM_REPOS`. Do yourself
+6. First run `python3 -m bus.brain step asks --holder muse`. Read every open `needs-operator` issue in `LOOM_REPOS`. Do yourself
    whatever does not need the operator's own hands, money, accounts or a
    decision the goal home reserves for the operator: fix it, ticket it, or
    record the decision the evidence supports. Then comment what was done and
    remove the label. Keep an ask only when only the operator can do it, with
    one exact ask in its body. The station forwards every open ask to the
    operator, so an ask left open is a message to the operator's phone.
-7. Fill every free lane slot with the highest-ranked work (The brain's job),
+7. First run `python3 -m bus.brain step brief --holder muse`. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,
    and `brief --not-before` writes the line),
@@ -207,7 +208,7 @@ live regression).
    when the brain needs to choose the lane itself. A queued ticket without a
    readable Difficulty line stays queued and appears in the goal's next
    station standup as needing a difficulty.
-8. Triage the backlog. The station runs `python3 -m bus.brain triage
+8. First run `python3 -m bus.brain step triage --holder muse`. Triage the backlog. The station runs `python3 -m bus.brain triage
    OWNER/NAME --goal N` once an hour on every backlog goal home (the goal
    home onboard opens for a repo has a title starting `Backlog:`), with the
    default limit of 25 issues a run, oldest first. It skips pull requests,
@@ -228,7 +229,7 @@ live regression).
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close.
-9. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
+9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
@@ -256,7 +257,7 @@ live regression).
    must stand on its own. Each goal needs its own report on its own home:
    a report on a parent goal does not cover its child goals, and a journal
    or a report quoted inside another comment does not count.
-10. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
+10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports
     (one sentence on how things are going, then going well, not going
