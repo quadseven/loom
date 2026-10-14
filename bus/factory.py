@@ -140,7 +140,7 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # The operator's priority (2026-10-14): Muse and agy first on public
     # repos, so their allowances are spent before the rest. Both are public
     # only, so a private repo's ticket still starts at spark or codex.
-    "easy": ("muse", "agy", "spark", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+    "easy": ("muse", "agy", "spark", "spark-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
              "openrouter", "workersai", "zen", "zai"),
     "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
                "opencode-go-4") + ANTHROPIC,

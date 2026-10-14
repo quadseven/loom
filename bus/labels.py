@@ -17,7 +17,9 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
 # takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
          "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
-         "opencode-go-4"]
+         "opencode-go-4",
+         # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
+         "spark-2"]
 LANES = LANES + SLOTS
 # Remote lanes pull ticket work from GitHub and have no local station inbox.
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs

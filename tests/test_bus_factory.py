@@ -982,15 +982,15 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.model(7), self.model(8)), (None, None))
 
-    def limited_easy(self, busy=(), available=None):
-        """An easy ticket briefed on spark at a limit, with a ticket waiting
-        on each lane in `busy`."""
+    def limited_easy(self, busy=(), available=None, limited=("spark", "spark-2")):
+        """An easy ticket briefed on spark at a limit (both local coder slots
+        by default), with a ticket waiting on each lane in `busy`."""
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
                               "created_at": iso(60)}]
         for n, lane in enumerate(busy, 20):
             self.gh.ticket(n, "briefed", lane=lane)
-        self.go(limited=["spark"], available=available)
+        self.go(limited=list(limited), available=available)
 
     def test_a_private_easy_ticket_at_a_limit_moves_within_its_tier(self):
         self.limited_easy()
@@ -1014,6 +1014,12 @@ class Tickets(Base):
         self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3"))
         self.assertEqual(self.lane(7), "opencode-go-4")
         self.assertIn("opencode-go-4", factory.PUBLIC_ONLY)
+
+    def test_a_private_easy_ticket_goes_to_spark_2_when_spark_is_busy(self):
+        self.assertEqual(factory.lanes_of("easy", True)[:2], ("spark", "spark-2"))
+        self.gh.private = True
+        self.limited_easy(limited=("spark",))
+        self.assertEqual(self.lane(7), "spark-2")
 
     def test_muse_then_agy_take_public_easy_and_medium_tickets_first(self):
         # The operator's priority (2026-10-14): Muse's and agy's allowances
@@ -1083,7 +1089,7 @@ class Tickets(Base):
         self.assertIn("fallback: no medium lane is up", self.gh.comments[7][-1]["body"])
 
     def test_a_private_ticket_never_falls_back_to_a_public_only_lane(self):
-        busy = ("claude", "spark", "openrouter", "workersai")
+        busy = ("claude", "spark", "spark-2", "openrouter", "workersai")
         self.limited_medium(busy=busy)
         self.assertEqual(self.lane(7), "codex")  # waits; zen, zai and agy are public only
         self.setUp()
