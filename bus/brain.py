@@ -1392,6 +1392,16 @@ def _with_priority(body: str, priority: str) -> str:
     return "".join(lines)
 
 
+def _prioritize_write(gh: GitHub, repo: str, number: int, method: str,
+                      path: str, payload: Dict[str, str], operation: str) -> None:
+    """Keep failed priority writes visible with the operation that failed."""
+    try:
+        gh.rest(method, path, payload)
+    except GitHubError as exc:
+        raise GitHubError("prioritize %s failed: %s" % (operation, exc),
+                          exc.status, exc.body) from exc
+
+
 def prioritize(gh: GitHub, repo: str, number: int, priority: str,
                note: Optional[str] = None,
                env: Optional[Dict[str, str]] = None) -> None:
@@ -1415,9 +1425,13 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: str,
     updated = _with_priority(body, priority)
     _check_written_text(updated)
     if updated != body:
-        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": updated})
+        _prioritize_write(gh, repo, number, "PATCH",
+                          "/repos/%s/issues/%d" % (repo, number),
+                          {"body": updated}, "ticket body update")
     if note is not None:
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+        _prioritize_write(gh, repo, number, "POST",
+                          "/repos/%s/issues/%d/comments" % (repo, number),
+                          {"body": note}, "note comment")
 
 
 def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],

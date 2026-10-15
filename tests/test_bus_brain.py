@@ -68,6 +68,16 @@ class BrainTests(unittest.TestCase):
         brain.prioritize(gh, REPO, 8, "P3", env=env)
         self.assertEqual(fake.calls[3][2], {"body": changed.replace("P1", "P3")})
 
+    def test_prioritize_inserts_priority_before_body_without_trailing_newline(self):
+        original = "A body with exact spacing.  "
+        expected = "Priority: P1\n\n" + original
+        fake = Fake(reply(200, {"state": "open", "body": original,
+                                "labels": [{"name": "loom:ticket"}],
+                                "user": {"login": "trusted"}}), reply(200, {}))
+        brain.prioritize(GitHub("t", transport=fake), REPO, 8, "P1",
+                         env={"LOOM_BRIEF_AUTHORS": "trusted"})
+        self.assertEqual(fake.calls[1][2], {"body": expected})
+
     def test_prioritize_refusals_make_no_writes(self):
         for issue, priority in (
             ({"state": "closed", "body": "", "labels": [{"name": "loom:ticket"}],
@@ -90,6 +100,16 @@ class BrainTests(unittest.TestCase):
         brain.prioritize(GitHub("t", transport=fake), REPO, 8, "P0", "urgent work",
                          env={"LOOM_BRIEF_AUTHORS": "trusted"})
         self.assertEqual(fake.calls[2][2], {"body": "urgent work"})
+
+    def test_prioritize_note_failure_reports_that_comment_posting_failed(self):
+        fake = Fake(reply(200, {"state": "open", "body": "## Why\nx",
+                                "labels": [{"name": "loom:ticket"}],
+                                "user": {"login": "trusted"}}),
+                    reply(200, {}), reply(500, {"message": "server error"}))
+        with self.assertRaisesRegex(GitHubError, "prioritize note comment failed"):
+            brain.prioritize(GitHub("t", transport=fake), REPO, 8, "P0", "urgent work",
+                               env={"LOOM_BRIEF_AUTHORS": "trusted"})
+        self.assertEqual([call[0] for call in fake.calls], ["GET", "PATCH", "POST"])
 
     def test_tick_step_records_and_reads_step_and_refuses_a_non_holder(self):
         now = brain.datetime(2030, 1, 1, 12, 0, tzinfo=brain.timezone.utc)
