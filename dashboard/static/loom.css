@@ -427,7 +427,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .hot-stuck { display: flex; flex-direction: column; gap: 8px; }
 .stuck-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 8px; }
 .stuck-meta { color: var(--dim); font-size: 10.5px; }
-.brain-layout h2.label, .hot-spot h2.label, .hot-stuck h2.label { margin: 0 0 6px; }
+.brain-layout h2.label, .hot-spot h2.label, .hot-stuck h2.label { margin: 0 0 6px; font: 11px/1.4 var(--font-mono); letter-spacing: .08em; }
 .lane-bar.bad small { color: var(--bad); }
 
 /* Floor and Goals, after the design (docs/design/floor/README.md, Floor and Goals) */

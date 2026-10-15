@@ -133,3 +133,13 @@ class ShellTests(unittest.TestCase):
 
     def test_shared_interactive_components_have_44px_minimum_targets(self):
         test_shared_interactive_components_have_44px_minimum_targets()
+
+
+class LabelSize(unittest.TestCase):
+    def test_section_labels_inside_cards_stay_at_the_label_size(self):
+        # A card's h2 rule (16px) used to outweigh .label (11px), so the Brain
+        # and Hot spots section labels rendered as large uppercase headings.
+        css = re.sub(r"/\*.*?\*/", "", (ROOT / "dashboard/static/loom.css").read_text(), flags=re.S)
+        rules = [body for selectors, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css)
+                 if ".brain-layout h2.label" in selectors]
+        self.assertTrue(any("11px" in body for body in rules))
