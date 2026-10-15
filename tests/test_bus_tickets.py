@@ -1,6 +1,7 @@
 """Test the Finding class and related functions in bus.tickets."""
 import unittest
 
+from bus import tickets
 from bus.tickets import (Finding, after_holds, after_refs, dependency_state, parse,
                          parse_findings, Fix, render_findings, render_brief)
 
@@ -349,3 +350,25 @@ class PriorityTest(unittest.TestCase):
         text = render_brief(REPO, issue, "codex")
         self.assertIn("Difficulty: easy\n", text)
         self.assertNotIn("Priority", text)
+
+
+class LandedStateWins(unittest.TestCase):
+    """A merged, shipped or verified label wins over an earlier state's
+    label left beside it (2026-10-15: shipped tickets with a stale
+    loom:ready read as ready)."""
+
+    def _issue(self, *names):
+        return {"labels": [{"name": n} for n in names]}
+
+    def test_a_stale_ready_beside_shipped_reads_shipped(self):
+        self.assertEqual(tickets.ticket_state(self._issue("loom:ready", "loom:shipped")), "shipped")
+
+    def test_the_furthest_landed_state_wins(self):
+        self.assertEqual(
+            tickets.ticket_state(self._issue("loom:merged", "loom:verified", "loom:shipped")), "verified")
+
+    def test_states_before_merge_are_unchanged(self):
+        self.assertEqual(tickets.ticket_state(self._issue("loom:pr", "loom:ready")), "pr")
+        self.assertEqual(tickets.ticket_state(self._issue("loom:ready")), "ready")
+        self.assertEqual(tickets.ticket_state(self._issue("custom")), "")
+

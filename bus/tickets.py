@@ -495,8 +495,14 @@ class After(NamedTuple):
 
 
 def ticket_state(issue: Dict[str, Any]) -> str:
-    """The ticket's own state label ("queued", "pr", "merged", ...), or ""."""
+    """The ticket's own state label ("queued", "pr", "merged", ...), or "".
+    A merged, shipped or verified label wins over an earlier state's label
+    left beside it (a stale loom:ready on a shipped ticket): the pull request
+    has landed, so the earlier stage is over. The furthest of them wins."""
     names = _names(issue)
+    landed = [s for s in MERGED_STATES if "loom:" + s in names]
+    if landed:
+        return landed[-1]
     return next((s for s in TICKET_STATES if "loom:" + s in names), "")
 
 
