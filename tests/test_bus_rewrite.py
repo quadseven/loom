@@ -155,7 +155,7 @@ class RewriteIssueTest(Base):
         self.assertEqual(ticket["title"], "Cache the page query")
         self.assertEqual(ticket["labels"], ["loom:ticket", "loom:queued"])
         self.assertTrue(ticket["body"].startswith("Difficulty: easy\n"))
-        self.assertIn("Refs #7", ticket["body"])
+        self.assertIn("Rewritten from issue 7.", ticket["body"])
         self.assertEqual(self.fake.labels, [(7, ["loom:rewritten"])])
         self.assertEqual(self.fake.removed, [(7, "loom%3Atriage")])
 

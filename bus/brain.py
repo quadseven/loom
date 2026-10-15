@@ -1022,9 +1022,13 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           regresses: Optional[int] = None, after: Optional[str] = None,
           priority: Optional[str] = None) -> str:
     """File a ticket under the goal. With refs, the ticket is a rewrite of that
-    open issue: its body ends with "Refs #M", and the original gets a comment
-    naming the ticket and loom:rewritten in place of loom:triage. The original
-    is never closed, retitled or edited.
+    open issue: its body ends with "Rewritten from issue M." in words, and the
+    original gets a comment naming the ticket and loom:rewritten in place of
+    loom:triage. The original is never closed, retitled or edited. The line is
+    words, not "Refs #M": lanes copy the brief's sections into their pull
+    request, and the review bot's plan check then demands that the original,
+    which is in no epic, belong to one (2026-10-15: muster and zippie lane
+    pull requests held on "which epic").
 
     With regresses, the brief fixes a measured regression of shipped ticket M:
     its body has the line "Regresses #M" and the evidence on the lines after
@@ -1054,7 +1058,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if refs is not None and regresses is not None:
         raise ValueError("a brief is a rewrite or a regression, not both")
     if refs is not None:
-        body = body.rstrip("\n") + "\n\nRefs #%d\n" % refs
+        body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
     _check_written_text(title + "\n" + body)
     _check_no_foreign_refs(gh, repo, title + "\n" + body)
     if refs is not None:
