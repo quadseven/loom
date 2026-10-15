@@ -63,8 +63,8 @@ class EvidenceEndpointTest(unittest.TestCase):
         self.temp.cleanup()
 
     def get_json(self, path, token="test-bearer"):
-        request = Request(self.base + path, headers={"Authorization": "Bearer " + token})
-        with urlopen(request) as response:
+        request = Request(self.base + path, headers={"Authorization": "Bearer " + token})  # noqa: S310 - URL uses this test's local server.
+        with urlopen(request) as response:  # noqa: S310 - URL uses this test's local server.
             return response.status, json.loads(response.read())
 
     def test_named_log_source_and_query_return_capped_evidence(self):
@@ -111,13 +111,19 @@ class EvidenceEndpointTest(unittest.TestCase):
         try:
             url = "http://127.0.0.1:%d/evidence/query?name=runs&state=stalled" % server.server_port
             with self.assertRaises(HTTPError) as caught:
-                urlopen(url)
+                urlopen(url)  # noqa: S310 - URL uses this test's local server.
             self.assertEqual(caught.exception.code, 401)
-            request = Request(url, headers={"Authorization": "Bearer test-bearer"})
-            with urlopen(request) as response:
+            request = Request(url, headers={"Authorization": "Bearer test-bearer"})  # noqa: S310 - URL uses this test's local server.
+            with urlopen(request) as response:  # noqa: S310 - URL uses this test's local server.
                 response.read()
             self.assertEqual(len(calls), 2)
             self.assertEqual([call[0] for call in calls], ["unknown", "query"])
+            self.assertEqual(calls[0][1], "<invalid>")
+            self.assertEqual(calls[0][2], {})
+            self.assertEqual(calls[1][1], "runs")
+            self.assertEqual(calls[1][2], {"state": "stalled"})
+            self.assertGreater(calls[0][3], 0)
+            self.assertGreater(calls[1][3], 0)
         finally:
             server.shutdown()
             server.server_close()

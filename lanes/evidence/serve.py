@@ -2,6 +2,7 @@
 """Read-only HTTP access to explicitly configured log sources and SQL queries."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -241,7 +242,11 @@ def main() -> None:
     if not config_path or not token_ssm or not bind_host or not region or not raw_port.isdigit():
         sys.exit("LOOM_EVIDENCE_CONFIG, LOOM_EVIDENCE_TOKEN_SSM, LOOM_AWS_REGION, "
                  "LOOM_EVIDENCE_BIND_HOST and LOOM_EVIDENCE_PORT are required")
-    if bind_host in ("0.0.0.0", "::", "127.0.0.1", "localhost") or not 0 < int(raw_port) < 65536:
+    try:
+        unspecified = ipaddress.ip_address(bind_host).is_unspecified
+    except ValueError:
+        unspecified = False
+    if unspecified or bind_host in ("::", "127.0.0.1", "localhost") or not 0 < int(raw_port) < 65536:
         sys.exit("evidence service requires a non-loopback interface address and valid port")
     _require_tailnet_address(bind_host, tailscale_bin)
     config = _read_config(config_path)
