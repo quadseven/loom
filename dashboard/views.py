@@ -255,44 +255,61 @@ def _improvement_card(row):
 
 # Each daily number reduced to the value a person reads first, and what it
 # counts. The metrics comment line carries every detail; a card shows one.
-_SUMMARY = (
-    ("Flow", r"median ([\d.]+h)", r"(\d+) PRs? >6h", "{} PR over 6h"),
-    ("Throughput", r"verified (\d+/\d+)", None, "tickets verified"),
-    ("Spread", r"Anthropic (\d+/\d+)", r"idle (\d+/\d+)", "idle {} passes"),
-    ("Escalation", r"(\d+) tickets? failed twice", None, "failed twice on one model"),
-    ("Quality", None, None, None),
-    ("Autonomy", r"(\d+) asks? opened", None, "asks opened"),
-    ("Visibility", None, None, None),
-    ("Self-repair", r"(\d+) un-ticketed", None, "un-ticketed factory faults"),
-    ("Generic", r"(\d+) files?", None, "files naming one product"),
-)
+def _first(pattern, value):
+    found = re.search(pattern, value)
+    return found.group(1) if found else None
+
+
+def _flow(value):
+    median, over = _first(r"median ([\d.]+h)", value), _first(r"(\d+) PRs? >6h", value)
+    return median and (median, "%s PR over 6h" % over if over else "median briefed to merged")
+
+
+def _spread(value):
+    ratio, idle = _first(r"Anthropic (\d+/\d+)", value), _first(r"idle (\d+/\d+)", value)
+    if not ratio:
+        return None
+    used, total = (int(x) for x in ratio.split("/"))
+    share = "%d%%" % round(100 * used / total) if total else ratio
+    return share, "Anthropic share; idle %s passes" % idle if idle else "Anthropic share"
+
+
+def _quality(value):
+    parts = [p.strip() for p in value.split(";") if p.strip()]
+    worst = next((p for p in parts if not p.startswith("0 ")), parts[0] if parts else "")
+    number = re.match(r"(\d+)\s+(.*)", worst)
+    return (number.group(1), number.group(2)) if number else None
+
+
+def _visibility(value):
+    ages = [float(age) for age in re.findall(r"(-?[\d.]+)h", value)]
+    return ("%.1fh" % max(ages), "oldest goal report") if ages else ("missing", "no goal report")
+
+
+def _counted(pattern, label):
+    return lambda value: (lambda n: n and (n, label))(_first(pattern, value))
+
+
+_SUMMARIES = {
+    "Flow": _flow,
+    "Throughput": _counted(r"verified (\d+/\d+)", "tickets verified"),
+    "Spread": _spread,
+    "Escalation": _counted(r"(\d+) tickets? failed twice", "failed twice on one model"),
+    "Quality": _quality,
+    "Autonomy": _counted(r"(\d+) asks? opened", "asks opened"),
+    "Visibility": _visibility,
+    "Self-repair": _counted(r"(\d+) un-ticketed", "un-ticketed factory faults"),
+    "Generic": _counted(r"(\d+) files?", "files naming one product"),
+}
 
 
 def metric_summary(name, value):
     """(value, what it counts) for one daily number, never the raw line."""
     value = str(value or "")
-    if name == "Quality":
-        parts = [p.strip() for p in value.split(";") if p.strip()]
-        worst = next((p for p in parts if not p.startswith("0 ")), parts[0] if parts else "")
-        number = re.match(r"(\d+)\s+(.*)", worst)
-        return (number.group(1), number.group(2)) if number else (worst[:24], "")
-    if name == "Visibility":
-        ages = [float(age) for age in re.findall(r"(-?[\d.]+)h", value)]
-        return ("%.1fh" % max(ages), "oldest goal report") if ages else ("missing", "no goal report")
-    for key, main, extra, label in _SUMMARY:
-        if key != name or not main:
-            continue
-        found = re.search(main, value)
-        if not found:
-            break
-        more = re.search(extra, value) if extra else None
-        if name == "Flow":
-            return found.group(1), label.format(more.group(1)) if more else "median briefed to merged"
-        if name == "Spread":
-            used, total = (int(x) for x in found.group(1).split("/"))
-            share = "%d%%" % round(100 * used / total) if total else found.group(1)
-            return share, "Anthropic share; " + label.format(more.group(1)) if more else "Anthropic share"
-        return found.group(1), label
+    summary = _SUMMARIES.get(name)
+    found = summary(value) if summary else None
+    if found:
+        return found
     first = re.match(r"\s*(\S+)", value)
     return (first.group(1)[:24] if first else "missing"), ""
 

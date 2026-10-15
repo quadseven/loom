@@ -128,8 +128,12 @@ class HeldLaneTest(unittest.TestCase):
                   "holds": {"anthropic-3": "limit: out of credit; unavailable until 2030-01-02T00:01:27Z"}}]
         html = render_lanes(_lane_view_data({"lanes": [{"body": comment}], "pull_requests": [],
                                              "tickets": {}, "usage": usage}, []))
-        self.assertIn("out of credit until 2030-01-02 00:01 UTC", html)
-        self.assertIn("held: the lane machine sent no reason", html)
+        cards = dict(__import__("re").findall(r"<strong>([\w-]+)</strong>(.*?)</article>", html))
+        # The lane whose heartbeat gave a reason shows it, and only it.
+        self.assertIn("out of credit until 2030-01-02 00:01 UTC", cards["anthropic-3"])
+        self.assertNotIn("sent no reason", cards["anthropic-3"])
+        # A held lane with no reason uploaded says that, never a stand-in.
+        self.assertIn("held: the lane machine sent no reason", cards["zen"])
         self.assertNotIn("held reason missing from lane status comment", html)
 
     def test_the_upload_keeps_holds_and_refuses_bad_ones(self):
