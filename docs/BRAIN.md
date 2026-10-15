@@ -543,8 +543,8 @@ fixes a measured regression of ticket M:
 ## Red default branch
 
 Lanes merge as soon as their own pull request is green and reviewed: there
-is no merge queue and no global lock. Two changes that are each green can
-still break the default branch together, so the station watches the
+is no merge queue and no global lock. A check can fail on the default branch
+even when it passed on the pull request, so the station watches the
 branch after the merge instead (bus/revert.py, every pass, off with
 `LOOM_FACTORY=0`):
 
@@ -557,12 +557,16 @@ branch after the merge instead (bus/revert.py, every pass, off with
 - When the newest tested commit is red, the first red commit after the
   last green one is the culprit. A commit before it that is still running
   is waited on, since it may be the culprit.
-- The culprit is reverted only when all of these hold: it is the merge of
-  a trusted lane pull request whose head was green; it has been red for
-  30 minutes, so a newer commit had time to turn the branch green; no other
-  `loom:revert` ticket is in flight in the repo; and no revert ticket names
-  it yet. A red commit no lane merged is reported once and left for a
-  person or the brain.
+- When a trusted lane pull request's merge is red and its head was green,
+  the station files a fix-forward ticket on the original ticket's lane.
+  The new ticket asks for a follow-up pull request without undoing the
+  merged change. It quotes failing annotations and job log lines, and the
+  original ticket gets a link to it. If main remains red 45 minutes after
+  that brief, the station files a revert ticket. An open revert in the repo
+  or an existing revert for the merge prevents another revert.
+- If a check was already red on the commit immediately before a lane merge,
+  the station files one factory ticket naming the check and does not revert
+  that merge. A red commit no lane merged is reported once.
 - The revert is a ticket titled `Revert <sha>: <title>`, labelled
   `loom:revert` and `class:logic`, with no `Model:` line (rung 0). It goes
   to the first free lane of the easy tier the repo may use, or of the next
