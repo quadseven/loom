@@ -449,7 +449,7 @@ def verify_name(repo: str, number: int, stamp: int) -> str:
 
 
 def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
-                        live: str) -> str:
+                        live: str, model: Optional[str] = None) -> str:
     """The brief that hands a lane slot one shipped ticket to verify: no
     branch is pushed (the Branch: line only names the work directory) and the
     result is verify.json, not a pull request."""
@@ -458,9 +458,11 @@ def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
     wanted = "\n".join("- %s" % " ".join(text.split())
                        for _, text in proof.criteria(str(issue.get("body") or "")))
     head = ["# Brief: %s" % verify_name(repo, number, stamp), "", "Repo: %s" % repo,
-            "Branch: loom/verify-%d-%d" % (number, stamp), "Lane: %s" % lane,
-            "Issue: %s#%d" % (repo, number), "Deliverable: verify", "",
-            "# T%d: Verify %s" % (number, title), ""]
+            "Branch: loom/verify-%d-%d" % (number, stamp), "Lane: %s" % lane]
+    if model:
+        head.append("Model: %s" % model)
+    head += ["Issue: %s#%d" % (repo, number), "Deliverable: verify", "",
+             "# T%d: Verify %s" % (number, title), ""]
     return "\n".join(head) + "\n" + VERIFY_BRIEF % (live, wanted)
 
 

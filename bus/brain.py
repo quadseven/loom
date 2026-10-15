@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
@@ -42,6 +42,7 @@ STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
+AUDIT_MARKER = "<!-- loom:audit v1 -->"
 TRIAGE_LIMIT = 25
 # A goal home may name the branch work merges into, when that branch is not the
 # repository's default branch. The line lives in the goal body's header area.
@@ -1480,6 +1481,7 @@ def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
                    record: Dict[str, Any]) -> str:
     """Check a proof record against the ticket and return the comment for it.
     Runtime work is verified once shipped; documentation once merged."""
+    record.setdefault("verified_by", "brain")
     names = _labels(issue)
     if "loom:ticket" not in names:
         raise ValueError("only a loom:ticket is verified")
@@ -2258,6 +2260,138 @@ def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime) -> Lis
     return out if due else out + ["- none"]
 
 
+def _check_url(url: str) -> Tuple[bool, str]:
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "loom-brain"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status >= 400:
+                return False, "endpoint returned HTTP %d" % resp.status
+    except Exception as err:
+        return False, "endpoint not reached: %s" % err
+    return True, ""
+
+
+def _check_evidence_text(evidence: str) -> Tuple[bool, str]:
+    urls = re.findall(r"https?://[^\s)\]]+", evidence)
+    for url in urls:
+        ok, why = _check_url(url)
+        if not ok:
+            return False, why
+    file_matches = re.findall(r"(?:/[^\s)\]]+|(?:logs|[A-Za-z0-9_.-]+)/[^\s)\]]+\.[a-z0-9]+)", evidence)
+    for path in file_matches:
+        if not os.path.exists(path):
+            return False, "file or log not found: %s" % path
+    if not evidence or "missing" in evidence.lower() or "not found" in evidence.lower():
+        return False, "evidence missing or incomplete"
+    return True, ""
+
+
+def verify_evidence(criterion: Dict[str, Any],
+                    check_fn: Optional[Callable[[str], Any]] = None) -> Tuple[bool, str]:
+    """Check whether a single proof criterion's evidence holds."""
+    evidence = str(criterion.get("evidence") or "").strip()
+    if check_fn is not None:
+        res = check_fn(evidence)
+        if isinstance(res, tuple):
+            return res
+        return (bool(res), "" if res else "evidence check failed: %s" % evidence)
+    return _check_evidence_text(evidence)
+
+
+def _audit_ticket_proofs(gh: GitHub, repo: str, issue: Dict[str, Any],
+                         cutoff: datetime) -> List[Tuple[datetime, str, Dict[str, Any], Dict[str, Any]]]:
+    number = int(issue["number"])
+    comments = gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+    if any(isinstance(c, dict) and str(c.get("body") or "").startswith(AUDIT_MARKER) for c in comments):
+        return []
+    candidates = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        rec = proof.read(str(c.get("body") or ""))
+        if not rec:
+            continue
+        v_by = rec.get("verified_by")
+        if not v_by or v_by == "brain":
+            continue
+        c_at = _when(c.get("created_at"))
+        if c_at is None or c_at < cutoff:
+            continue
+        candidates.append((c_at, repo, issue, rec))
+    return candidates
+
+
+def find_lane_proofs_to_audit(gh: GitHub, repos: Sequence[str],
+                              now: Optional[datetime] = None
+                              ) -> List[Tuple[datetime, str, Dict[str, Any], Dict[str, Any]]]:
+    """Lane-made proofs from the last 24h needing audit, oldest first."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    candidates = []
+    for repo in repos:
+        issues = gh.paginate("/repos/%s/issues?labels=loom:verified&state=all&per_page=100" % repo)
+        for issue in issues:
+            if isinstance(issue, dict) and "pull_request" not in issue:
+                candidates += _audit_ticket_proofs(gh, repo, issue, cutoff)
+    candidates.sort(key=lambda x: (x[0], x[1], int(x[2]["number"])))
+    return candidates
+
+
+def audit_proof(gh: GitHub, repo: str, issue: Dict[str, Any],
+                record: Dict[str, Any],
+                check_fn: Optional[Callable[[str], Any]] = None,
+                now: Optional[datetime] = None,
+                home: Optional[str] = None) -> Dict[str, Any]:
+    """Re-check one lane-made proof; move back to shipped if evidence fails."""
+    now = now or datetime.now(timezone.utc)
+    number = int(issue["number"])
+    verified_by = str(record.get("verified_by") or "")
+    lane = verified_by.split("/")[0] if "/" in verified_by else verified_by
+    failed = []
+    for c in record.get("criteria", []):
+        ok, why = verify_evidence(c, check_fn=check_fn)
+        if not ok:
+            failed.append("%s (%s)" % (c.get("criterion", ""), why))
+    if failed:
+        from . import station
+        home = home or os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+        station.hold_verify_lane(home, lane, now.timestamp(), duration=station.VERIFY_HOLD_DURATION)
+        note = "Audit failed: evidence did not hold: %s. Moved back to shipped." % "; ".join(failed)
+        if issue.get("state") == "closed":
+            gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
+        move(gh, repo, number, "shipped", note=note)
+        return {"repo": repo, "number": number, "lane": lane, "verified_by": verified_by,
+                "result": "failed", "failed": failed, "note": note}
+    audit_note = "%s\nAudit passed for proof by %s at revision %s." % (
+        AUDIT_MARKER, verified_by, record.get("revision", ""))
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": audit_note})
+    return {"repo": repo, "number": number, "lane": lane, "verified_by": verified_by,
+            "result": "pass"}
+
+
+def audit_one_proof(gh: GitHub, repos: Sequence[str],
+                    check_fn: Optional[Callable[[str], Any]] = None,
+                    now: Optional[datetime] = None,
+                    home: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Audit the oldest unaudited lane-made proof from the last 24h."""
+    candidates = find_lane_proofs_to_audit(gh, repos, now=now)
+    if not candidates:
+        return None
+    _, repo, issue, rec = candidates[0]
+    return audit_proof(gh, repo, issue, rec, check_fn=check_fn, now=now, home=home)
+
+
+def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime) -> List[str]:
+    candidates = find_lane_proofs_to_audit(gh, repos, now=now)
+    if not candidates:
+        return []
+    at, repo, issue, rec = candidates[0]
+    return ["", "## Audit due (one lane proof, oldest first)",
+            "- resume audit %s#%s (%s) proof at %s" % (
+                repo, issue["number"], rec.get("verified_by"), _iso(at))]
+
+
 def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
                      check: str) -> Optional[Dict[str, Any]]:
     """A needs-brain sensitive pull request older than 2 hours whose checks
@@ -2320,7 +2454,8 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     for repo, issue, found in goals:
         out += _goal_resume_lines(gh, repo, issue, found)
     return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
-                      + _verify_resume_lines(gh, repos, now))
+                      + _verify_resume_lines(gh, repos, now)
+                      + _audit_resume_lines(gh, repos, now))
 
 
 STUCK_STATES = ("failed", "briefed", "pr")
@@ -2638,6 +2773,7 @@ def parser() -> argparse.ArgumentParser:
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
+    au = sub.add_parser("audit"); au.add_argument("repos", nargs="+"); au.add_argument("--home")
     return p
 
 
@@ -2730,12 +2866,35 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
     print(resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo)))
 
 
+def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
+    if len(args.repos) == 1 and "#" in args.repos[0]:
+        repo, number = _ref(args.repos[0], "ticket")
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+        comments = gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        proof_rec = None
+        for c in reversed(comments):
+            rec = proof.read(str(c.get("body") or ""))
+            if rec and rec.get("verified_by") and rec.get("verified_by") != "brain":
+                proof_rec = rec
+                break
+        if not proof_rec:
+            raise ValueError("no lane-made proof found on %s#%d" % (repo, number))
+        res = audit_proof(gh, repo, issue, proof_rec, home=args.home)
+    else:
+        res = audit_one_proof(gh, [_repo(x) for x in args.repos], home=args.home)
+    if res:
+        print("audited %s#%d (%s): %s" % (res["repo"], res["number"], res["verified_by"], res["result"]))
+    else:
+        print("no lane-made proof to audit")
+
+
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "prioritize": _cmd_prioritize,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
-            "onboard": _cmd_onboard, "escalate": _cmd_escalate}
+            "onboard": _cmd_onboard, "escalate": _cmd_escalate,
+            "audit": _cmd_audit}
 COMMANDS["step"] = _cmd_step
 
 

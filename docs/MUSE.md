@@ -206,6 +206,10 @@ this tick"; a step with no note shows nothing there.
    and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
    refuse a missing proof or an unchecked criterion: never invent evidence to
    get past them; leave the ticket open and say what is missing.
+   Then re-check one lane-made proof from the last 24 hours with
+   `python3 -m bus.brain audit $LOOM_REPOS`, oldest first. When its evidence
+   does not hold, it moves the ticket back to shipped and holds the lane for 24
+   hours. Keep the audited proof result for the journal.
 5. First run `python3 -m bus.brain step failed --holder muse`. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each
@@ -284,6 +288,7 @@ this tick"; a step with no note shows nothing there.
    before unlocking. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
+   Add `- Audited: OWNER/NAME#N pass` (or fail) when step 4 audited a lane proof.
    A step of this tick that failed or ran degraded gets its own line,
    `- Step <name>: failed <why>` or `- Step <name>: degraded <why>`, with
    the step's name from the list above (lock, status, merge, verify, failed,

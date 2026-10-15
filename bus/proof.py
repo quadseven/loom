@@ -136,6 +136,8 @@ def check(record: Any, body: str) -> Dict[str, Any]:
         raise ValueError("proof sources must list at least one reference")
     check_criteria(body)
     _check_record_criteria(record, body)
+    if "verified_by" in record:
+        _text(record, "verified_by")
     return record
 
 
@@ -147,6 +149,8 @@ def render(record: Dict[str, Any], body: str) -> str:
     """The proof comment: a readable summary, then the record with the
     acceptance contract it was checked against."""
     lines = [PROOF_MARKER, "Proof (%s) at revision %s" % (record["kind"], record["revision"])]
+    if record.get("verified_by"):
+        lines.append("Verified by: %s" % _line(record["verified_by"]))
     if record["kind"] == "runtime":
         lines.append("Environment: %s, artifact: %s" % (
             _line(record["environment"]), _line(record["artifact"])))

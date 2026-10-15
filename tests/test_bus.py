@@ -423,6 +423,11 @@ class JournalTests(unittest.TestCase):
                                        measure="p95 2s").splitlines()
         self.assertEqual(lines[2], "- Measure: p95 2s")
 
+    def test_render_journal_with_audited(self):
+        lines = journal.render_journal(NOW, "tick-1", [], [], [], [], 1, 1,
+                                       audited="repo#1 pass").splitlines()
+        self.assertIn("- Audited: repo#1 pass", lines)
+
     def test_render_report(self):
         lines = journal.render_report(NOW, "tick-1", "m", [], "f", "none", "n").splitlines()
         self.assertEqual(lines[0], journal.REPORT_MARKER)

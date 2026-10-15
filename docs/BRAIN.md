@@ -305,9 +305,18 @@ The record is JSON, passed with `move --to verified --proof PROOF.json`:
   "observed": {"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T01:00:00Z"},
   "measure": {"name": "<metric>", "baseline": "<before>", "target": "<goal>", "after": "<observed>"},
   "sources": ["<log line, dashboard or check run that shows it>"],
-  "criteria": [{"criterion": "<acceptance criterion, verbatim>", "result": "pass", "evidence": "<what showed it>"}]
+  "criteria": [{"criterion": "<acceptance criterion, verbatim>", "result": "pass", "evidence": "<what showed it>"}],
+  "verified_by": "<lane>/<model> or brain"
 }
 ```
+
+A proof carries `"verified_by": "<lane>/<model>"` when applied from a verify run,
+or `"verified_by": "brain"` when made by the brain. Each brain tick re-checks
+one lane-made proof from the last 24 hours, oldest first (`python3 -m bus.brain audit`);
+when its evidence does not hold, the ticket returns to shipped with a note naming
+what failed, and the station holds that lane's verify runs for 24 hours. The daily
+Throughput line counts lane-made and brain-made verified tickets separately
+(`verified X/Y (A lane, B brain)`).
 
 `kind` is `runtime` or `docs`. Documentation-only work uses `docs`, which
 needs only `revision` (the default-branch commit that carries it),
@@ -675,6 +684,7 @@ Tick <UTC time>, <holder>
 - Briefed: <links with lanes or none>
 - Waiting: <what is in flight and on whom>
 - Asks: <links or none>
+- Audited: <links with pass/fail or none>
 - Cost: <GitHub requests>, <minutes>
 ```
 

@@ -244,10 +244,37 @@ IDLE_SCAN = 600
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
 VERIFY_FILE = "verify-runs.json"
+VERIFY_HOLD_FILE = "verify-holds.json"
+VERIFY_HOLD_DURATION = 24 * 3600
 # Lanes that spend Anthropic models never take a verify run; the free and
 # subscription lanes do (the claude lane spends the operator's subscription).
 VERIFY_SKIP = ("anthropic", "claude")
 NOTE_MAX = 1500
+
+
+def hold_verify_lane(home: str, lane: str, now: float,
+                     duration: float = VERIFY_HOLD_DURATION) -> None:
+    """Hold a lane from verify runs for duration seconds."""
+    state_dir = os.path.join(home, "state")
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, VERIFY_HOLD_FILE)
+    holds = _read_json(path, {}, strict=False)
+    holds = holds if isinstance(holds, dict) else {}
+    holds[lane] = now + duration
+    _write_json(path, holds)
+
+
+def verify_lane_held(home: str, lane: str, now: float) -> bool:
+    """Whether a lane is held from verify runs."""
+    path = os.path.join(home, "state", VERIFY_HOLD_FILE)
+    holds = _read_json(path, {}, strict=False)
+    if not isinstance(holds, dict):
+        return False
+    for key in (lane, provider(lane)):
+        until = holds.get(key)
+        if isinstance(until, (int, float)) and now < float(until):
+            return True
+    return False
 
 
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
@@ -650,6 +677,29 @@ def provider(lane: str) -> str:
     """The provider lane of a slot (anthropic-2 -> anthropic), as the runner
     maps it."""
     return re.sub(r"-[0-9]+$", "", lane)
+
+
+def hold_verify_lane(home: str, lane: str, now: float, duration: float = VERIFY_HOLD_DURATION) -> None:
+    state_dir = os.path.join(home, "state", "station")
+    path = os.path.join(state_dir, VERIFY_HOLD_FILE)
+    holds = _read_json(path, {}, strict=False)
+    holds = holds if isinstance(holds, dict) else {}
+    holds[lane] = now + duration
+    _write_json(path, holds)
+
+
+def verify_lane_held(home: str, lane: str, now: float) -> bool:
+    state_dir = os.path.join(home, "state", "station")
+    path = os.path.join(state_dir, VERIFY_HOLD_FILE)
+    holds = _read_json(path, {}, strict=False)
+    if not isinstance(holds, dict):
+        return False
+    prov = provider(lane)
+    for key in (lane, prov):
+        until = holds.get(key)
+        if isinstance(until, (int, float)) and now < float(until):
+            return True
+    return False
 
 
 def failure_class(reason: str) -> str:
@@ -1272,11 +1322,35 @@ class Station:
             found.append((repo, issue))
         return verify_due(found, attempts, self.now), held
 
+    def _verify_held(self, lane: str) -> bool:
+        return verify_lane_held(self.s.home, lane, self.now)
+
+    def _lane_model(self, lane: str) -> str:
+        var = "LOOM_%s_MODEL" % lane.upper().replace("-", "_")
+        prov_var = "LOOM_%s_MODEL" % provider(lane).upper().replace("-", "_")
+        env_model = os.environ.get(var) or os.environ.get(prov_var)
+        if env_model:
+            return env_model
+        for lanes, model in factory.LADDER:
+            if lane in lanes or provider(lane) in lanes:
+                return model
+        defaults = {
+            "agy": "gemini-2.5-pro",
+            "opencode-go": "opencode-go/deepseek-v4.1-flash",
+            "zen": "opencode/glm-4.7-free",
+            "zai": "zai/glm-4.7-flash",
+            "workersai": "cloudflare-workers-ai/@cf/meta/llama-3-8b-instruct",
+            "spark": "spark/qwen-2.5-coder",
+            "openrouter": "openrouter/free",
+        }
+        return defaults.get(provider(lane), "default")
+
     def _hand_verifies(self, idle: List[str]) -> None:
         """Give each idle slot that may verify, has no build work and is
         empty one shipped ticket to verify. The ticket keeps its labels: the
         station moves it when the result comes back (_report_verify)."""
-        lanes = [x for x in idle if provider(x) not in VERIFY_SKIP and self._inbox_empty(x)]
+        lanes = [x for x in idle if provider(x) not in VERIFY_SKIP
+                 and not self._verify_held(x) and self._inbox_empty(x)]
         if not lanes:
             return
         path = os.path.join(self.state, VERIFY_FILE)
@@ -1299,11 +1373,14 @@ class Station:
                 self._write_verify_brief(repo, lane, issue)
                 break
 
-    def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
+    def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any],
+                            model: Optional[str] = None) -> None:
         number = int(issue["number"])
         stamp = int(self.now)
+        model = model or self._lane_model(lane)
         text = tickets.render_verify_brief(
-            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")),
+            model=model)
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
@@ -1340,7 +1417,8 @@ class Station:
             return None, "Its verify.json is not a JSON object."
         return data, ""
 
-    def _report_verify(self, lane: str, kind: str, repo: str, number: int, name: str) -> bool:
+    def _report_verify(self, lane: str, kind: str, repo: str, number: int, name: str,
+                       model: Optional[str] = None) -> bool:
         """Apply a finished verify run. A failed run changes nothing: the
         ticket is due again once its cooldown is over."""
         if kind == "failed":
@@ -1353,10 +1431,11 @@ class Station:
             self._verify_note(repo, number, lane, "Missing evidence: %s" % self._note_text(
                 result["missing"]))
         else:
-            self._apply_proof(lane, repo, number, result)
+            self._apply_proof(lane, repo, number, result, model=model)
         return True
 
-    def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any]) -> None:
+    def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any],
+                     model: Optional[str] = None) -> None:
         """Check the record with bus/proof.py, tick the criteria and move the
         ticket to verified with it; a refused record leaves the ticket shipped
         with one note."""
@@ -1365,6 +1444,8 @@ class Station:
         if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
             _say("%s#%d is no longer shipped; its verify result is dropped" % (repo, number))
             return
+        model = model or self._lane_model(lane)
+        record["verified_by"] = "%s/%s" % (lane, model)
         body = str(issue.get("body") or "")
         ticked = proof.tick(body)
         try:
@@ -1855,7 +1936,8 @@ class Station:
         if not self._repo_ok(repo):
             return True
         if self._field(text, "Deliverable") == "verify":
-            return self._report_verify(lane, kind, repo, number, name)
+            model = self._field(text, "Model") or self._lane_model(lane)
+            return self._report_verify(lane, kind, repo, number, name, model=model)
         if kind == "done":
             if self._field(text, "Deliverable") == "answer":
                 _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))

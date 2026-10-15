@@ -33,17 +33,20 @@ def _items(value: Union[str, Iterable[str], None]) -> str:
 
 
 def render_journal(when, holder, shipped, briefed, waiting, asks,
-                   requests, minutes, measure=None) -> str:
+                   requests, minutes, measure=None, audited=None) -> str:
     head = [JOURNAL_MARKER, "Tick %s, %s" % (_when(when), holder)]
     if measure is not None:
         head.append("- Measure: %s" % _items(measure))
-    return "\n".join(head + [
+    lines = head + [
         "- Shipped: %s" % _items(shipped),
         "- Briefed: %s" % _items(briefed),
         "- Waiting: %s" % _items(waiting),
         "- Asks: %s" % _items(asks),
-        "- Cost: %s requests, %s minutes" % (requests, minutes),
-    ])
+    ]
+    if audited is not None:
+        lines.append("- Audited: %s" % _items(audited))
+    lines.append("- Cost: %s requests, %s minutes" % (requests, minutes))
+    return "\n".join(lines)
 
 
 def render_report(when, holder, measure, shipped, in_flight, blocked,
