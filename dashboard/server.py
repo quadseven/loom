@@ -22,6 +22,7 @@ from . import transcripts as transcript_store
 from . import usage as usage_store
 from . import ticket as ticket_view
 from . import goals as goals_view
+from . import ticket_data
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
@@ -588,11 +589,13 @@ def _dispatch_ticket_api(handler, state, parsed):
     if path.endswith("/runs"):
         reason = None if store else "transcript store unavailable: configure dashboard database or explicit memory mode"
         return handler.send_json(200, {"runs": runs, "missing_reason": reason})
-    payload = state.response()
-    prs = [pr for pr in payload.get("pull_requests", []) if re.search(r"(?:/issues/|/pull/)" + re.escape(number) + r"(?:\b|$)", str(pr.get("body") or ""))]
-    return handler.send_json(200, {"ticket": record, "checks": ticket_view.checks(record.get("body")),
-                                   "pull_request": prs, "timeline": [],
-                                   "timeline_missing": "ticket comments and label events are not in the current snapshot"})
+    detail = _ticket_detail_data(state, repo, int(number))
+    return handler.send_json(200, {
+        "ticket": record, "checks": ticket_view.checks(record.get("body")),
+        "pull_request": (detail or {}).get("pull_request"),
+        "timeline": ticket_view.path_steps(record, (detail or {}).get("comments") or [],
+                                           (detail or {}).get("events") or []) if detail else [],
+        "missing": (detail or {}).get("errors") if detail else {"github": "no GitHub client"}})
 
 
 def _transcript_store(state):
@@ -653,8 +656,23 @@ def _dispatch_ticket_page(handler, state, path, parsed):
     selected = params.get("run", [""])[0]
     run = next((item for item in runs if str(item["id"]) == selected or str(item["attempt"]) == selected), runs[-1] if runs else None)
     full = store.get(run["id"]) if store and run else None
-    body = ticket_view.render(record, runs, run.get("id") if run else None, (full or {}).get("events", []), [])
+    body = ticket_view.render(record, runs, run, (full or {}).get("events", []),
+                              detail=_ticket_detail_data(state, repo, number))
     return handler.send_page(page("Ticket %s#%d" % (repo, number), "tickets", body, status="Live"))
+
+
+def _ticket_detail_data(state, repo, number):
+    """What GitHub says about one ticket (dashboard/ticket_data.py), or None
+    when the dashboard has no GitHub client to ask."""
+    details = getattr(state, "ticket_details", None)
+    if details is None:
+        gh = getattr(state, "gh", None)
+        if gh is None:
+            return None
+        details = ticket_data.TicketDetails(gh)
+        state.ticket_details = details
+    prs = state.response().get("pull_requests", []) if hasattr(state, "response") else []
+    return details.get(repo, number, prs, views.footer)
 
 
 def _dispatch_basic(handler, state, path):
