@@ -233,6 +233,13 @@ class RewriteIssueTest(Base):
                                   "%s -c 'raise SystemExit(3)'" % shlex.quote(sys.executable))
         self.assertEqual(self.fake.writes_to(7), [])
 
+    def test_a_failing_command_includes_its_last_stderr_line(self):
+        self.fake.add_triage(7)
+        cmd = "%s -c 'import sys; print(\"diagnostic reason\", file=sys.stderr); raise SystemExit(3)'" % shlex.quote(sys.executable)
+        with self.assertRaises(rewrite.Invalid) as caught:
+            rewrite.rewrite_issue(self.gh(), REPO, GOAL, self.fake.triage[7], cmd)
+        self.assertIn("diagnostic reason", str(caught.exception))
+
     def test_no_request_closes_retitles_or_edits_the_original(self):
         self.rewrite(BRIEF)
         self.rewrite({"action": "human", "ask": "Buy the domain name."}, number=8)
@@ -320,6 +327,17 @@ class StationRewriteTest(Base):
         self.assertEqual(self.fake.read_comments(), [])
         self.run_station(self.station(cmd=cmd, now=station.REWRITE_RETRY + 10))
         self.assertEqual(self.fake.read_comments(), [7])
+
+    def test_a_command_failure_logs_stderr_and_does_not_mark_issue_tried(self):
+        self.fake.add_triage(7)
+        cmd = "%s -c 'import sys; print(\"agent unavailable\", file=sys.stderr); raise SystemExit(1)'" % shlex.quote(sys.executable)
+        st = self.station(cmd=cmd)
+        err = self.run_station(st)
+        self.assertIn("agent unavailable", err)
+        with open(os.path.join(st.state, "rewrite.json")) as fh:
+            ledger = json.load(fh)
+        key = "%s#%d" % (REPO, GOAL)
+        self.assertNotIn("7", ledger[key]["tried"])
 
     def test_a_backlog_nobody_triaged_is_left_alone(self):
         self.fake.add_triage(7)

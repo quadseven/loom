@@ -184,6 +184,7 @@ cat > "$PLIST" <<EOF
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
     <key>LOOM_REPOS</key><string>$(xml "${LOOM_REPOS:-}")</string>
+    <key>LOOM_REWRITE_OPENCODE</key><string>$(xml "${LOOM_REWRITE_OPENCODE:-$HOME/.opencode/bin/opencode}")</string>
     <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>

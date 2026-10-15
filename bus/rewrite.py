@@ -15,6 +15,7 @@ import subprocess
 from typing import Any, Dict, List, Tuple
 
 from . import brain, tickets
+from .text import SECRET_RE, scrub_paths
 from .github import GitHub
 
 COMMENTS_SHOWN = 10
@@ -29,6 +30,10 @@ DOCS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 class Invalid(Exception):
     """The agent's answer, or the agent itself, is unusable; nothing was written."""
+
+
+class CommandFailure(Invalid):
+    """The agent command failed before producing an answer."""
 
 
 def command_for(public_cmd: str, private_cmd: str, private: bool) -> str:
@@ -116,7 +121,10 @@ def run_agent(cmd: str, prompt: str, timeout: float) -> str:
     except (OSError, subprocess.SubprocessError, UnicodeError) as err:
         raise Invalid("the agent command could not run: %s" % type(err).__name__) from None
     if out.returncode != 0:
-        raise Invalid("the agent command exited %d" % out.returncode)
+        lines = [line.strip() for line in out.stderr.splitlines() if line.strip()]
+        reason = SECRET_RE.sub("[redacted]", lines[-1]) if lines else "the agent command exited %d" % out.returncode
+        reason = scrub_paths(reason)[:300]
+        raise CommandFailure("the agent command exited %d: %s" % (out.returncode, reason))
     return out.stdout[:OUTPUT_MAX]
 
 
