@@ -20,3 +20,7 @@ outcomes, and `LOOM_REVIEW_BOT` names the review bot whose findings are
 counted (default `grug-tribe`). `.env.example` lists the dashboard variables with placeholder
 values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
 and station so completed runs can upload to `POST /api/transcripts`.
+
+The dashboard reads repository sources with up to eight concurrent workers.
+`/readyz` stays unavailable until the first snapshot has fetched at least one
+repository, and startup logs the time taken for that snapshot.
