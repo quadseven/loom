@@ -83,6 +83,11 @@ Neither needs a model:
   pull request is green, even while the default branch is red. Its medium
   and low findings are deferred at once instead of after a fix round, and
   it needs no test of its own (the failing check it fixes is its test).
+- A lane pull request whose ticket has a newer open lane pull request, or whose
+  ticket is at merged, shipped or verified through a different pull request, is
+  closed with a comment naming the pull request that superseded it. A pull
+  request a person opened, or one not on a loom/ branch, is never closed this
+  way.
 
 Each climb is recorded on the ticket as a RUNG_MARKER comment, so the ladder
 survives restarts and any brain can read where a ticket stands.
@@ -251,6 +256,12 @@ ticket body; the lane does not."""
 
 def _say(message: str) -> None:
     print("factory: %s" % message, flush=True)
+
+
+def _default_close(gh: GitHub, repo: str, number: int, comment: str) -> None:
+    brain._check_written_text(comment)
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+    gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number), {"state": "closed"})
 
 
 def _ts(value: Any) -> float:
@@ -584,6 +595,7 @@ class Factory:
                  merge: Callable[..., Any] = brain.merge,
                  fix: Callable[..., Any] = brain.fix,
                  move: Callable[..., Any] = brain.move,
+                 close: Optional[Callable[..., Any]] = None,
                  limited: Sequence[str] = (),
                  no_test_repos: Sequence[str] = (),
                  available: Optional[Sequence[str]] = None) -> None:
@@ -594,6 +606,7 @@ class Factory:
         self.review_check = review_check
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
+        self.close = close if close is not None else _default_close
         self.limited = set(limited)
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
@@ -607,6 +620,8 @@ class Factory:
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
         # The tickets named by After: lines, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._ticket_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._merged_prs: Dict[str, Dict[int, int]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -625,6 +640,17 @@ class Factory:
                 _say("could not read %s: %s" % (key, err))
                 self._depends[key] = None
         return self._depends[key]
+
+    def _ticket(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
+        """Read a ticket issue once; None when unreadable."""
+        key = "%s#%d" % (repo, number)
+        if key not in self._ticket_cache:
+            try:
+                data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                self._ticket_cache[key] = data if isinstance(data, dict) and self._trusted(data) else None
+            except GitHubError:
+                self._ticket_cache[key] = None
+        return self._ticket_cache[key]
 
     def _tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         data = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
@@ -867,12 +893,94 @@ class Factory:
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
     # -- the three kinds of stuck ----------------------------------------
+    def _is_lane_pr(self, pr: Dict[str, Any]) -> bool:
+        """A trusted, non-draft pull request on a loom/ branch."""
+        if pr.get("draft") or not self._trusted(pr):
+            return False
+        return str((pr.get("head") or {}).get("ref") or "").startswith("loom/")
+
+    def _merged_pull(self, repo: str, ticket_number: int) -> Optional[int]:
+        """The newest pull request number that merged this ticket, or None."""
+        if repo not in self._merged_prs:
+            merged: Dict[int, int] = {}
+            for pr in self.gh.paginate("/repos/%s/pulls?state=closed" % repo):
+                if not isinstance(pr, dict):
+                    continue
+                if pr.get("merged_at") is None and not pr.get("merged"):
+                    continue
+                assoc = self._association(repo, pr)
+                if assoc and assoc[0] == repo:
+                    t_num = assoc[1]
+                    if t_num not in merged or int(pr["number"]) > merged[t_num]:
+                        merged[t_num] = int(pr["number"])
+            self._merged_prs[repo] = merged
+        return self._merged_prs[repo].get(ticket_number)
+
+    def _close_pr(self, repo: str, pr: Dict[str, Any], superseded_by: int) -> None:
+        """Close an open lane pull request and comment with the PR that superseded it."""
+        number = int(pr["number"])
+        comment = "Superseded by #%d." % superseded_by
+        self.close(self.gh, repo, number, comment)
+        self.actions += 1
+        _say("closed %s#%d (superseded by #%d)" % (repo, number, superseded_by))
+
+    def _close_if_ticket_merged(self, repo: str, ticket_number: int,
+                                ticket: Optional[Dict[str, Any]],
+                                prs: Sequence[Dict[str, Any]], closed: set) -> None:
+        state = _state(ticket) if ticket else ""
+        if state not in ("merged", "shipped", "verified"):
+            return
+        merged = self._merged_pull(repo, ticket_number)
+        if merged is None:
+            return
+        for pr in prs:
+            num = int(pr["number"])
+            if num != merged and num not in closed:
+                if self.actions >= MAX_ACTIONS:
+                    return
+                self._close_pr(repo, pr, merged)
+                closed.add(num)
+
+    def _close_if_newer_lane_pr(self, repo: str, prs: Sequence[Dict[str, Any]],
+                                closed: set) -> None:
+        if len(prs) <= 1:
+            return
+        newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
+        newest_num = int(newest["number"])
+        for pr in prs:
+            num = int(pr["number"])
+            if num != newest_num and num not in closed:
+                if self.actions >= MAX_ACTIONS:
+                    return
+                self._close_pr(repo, pr, newest_num)
+                closed.add(num)
+
+    def _close_superseded_prs(self, repo: str, open_prs: Sequence[Dict[str, Any]],
+                              tickets: Dict[int, Dict[str, Any]]) -> set:
+        """Close lane pull requests superseded by a newer one or a ticket merge."""
+        lane_prs: Dict[int, List[Dict[str, Any]]] = {}
+        for pr in open_prs:
+            if not self._is_lane_pr(pr):
+                continue
+            assoc = self._association(repo, pr)
+            if assoc and assoc[0] == repo:
+                lane_prs.setdefault(assoc[1], []).append(pr)
+        closed: set = set()
+        for ticket_number, prs in lane_prs.items():
+            if self.actions >= MAX_ACTIONS:
+                break
+            ticket = tickets.get(ticket_number) or self._ticket(repo, ticket_number)
+            state = _state(ticket) if ticket else ""
+            if state in ("merged", "shipped", "verified"):
+                self._close_if_ticket_merged(repo, ticket_number, ticket, prs, closed)
+            else:
+                self._close_if_newer_lane_pr(repo, prs, closed)
+        return closed
+
     def _lane_pr_ticket(self, repo: str, pr: Dict[str, Any],
                         tickets: Dict[int, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """The loom:pr ticket of a trusted, non-draft lane pull request."""
-        if pr.get("draft") or not self._trusted(pr):
-            return None
-        if not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
+        if not self._is_lane_pr(pr):
             return None
         association = self._association(repo, pr)
         issue = tickets.get(association[1]) if association else None
@@ -1337,8 +1445,10 @@ class Factory:
 
     def _repo_pass(self, repo: str, tickets: Dict[int, Dict[str, Any]]) -> None:
         # GitHub.paginate asks for 100 a page and follows every page.
-        prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
-               if isinstance(p, dict) and self._trusted(p)]
+        all_prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+                   if isinstance(p, dict)]
+        closed_numbers = self._close_superseded_prs(repo, all_prs, tickets)
+        prs = [p for p in all_prs if self._trusted(p) and int(p.get("number") or 0) not in closed_numbers]
         linked = {a[1]: pr for pr in prs for a in [self._association(repo, pr)] if a}
         for pr in landing_order(prs, tickets, linked):
             if self.actions >= MAX_ACTIONS:
