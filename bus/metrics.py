@@ -244,6 +244,17 @@ class Collector:
                             left_out += 1
         return counts, failures, unlinked, left_out
 
+    def verify_runs(self) -> int:
+        """Lane runs in the window that were verify runs (Deliverable: verify),
+        a kind of their own inside the Spread count."""
+        found = 0
+        for lane in LANES:
+            for kind in ("done", "failed"):
+                for path in self._finished(lane, kind):
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        found += bool(re.search(r"^Deliverable: verify[ \t]*$", fh.read(), re.M))
+        return found
+
     def _failure_kind(self, lane: str, path: str) -> str:
         """The kind the runner tagged the ticket's last failure with; work if untagged."""
         log = os.path.join(self.home, "logs", lane, os.path.basename(path)[:-len(".md")] + ".log")
@@ -429,7 +440,7 @@ class Collector:
         return [
             flow_number(total),
             throughput_number(total),
-            spread_number(runs, *self.slot_samples()),
+            spread_number(runs, *self.slot_samples(), verify=self.verify_runs()),
             escalation_number(failures, left_out),
             quality_number(total),
             autonomy_number(total),
@@ -456,13 +467,13 @@ def throughput_number(total: Totals) -> Number:
                   "each goal repo >=1 merge; >=50% verified", ok)
 
 
-def spread_number(runs: Dict[str, int], idle: int, samples: int) -> Number:
+def spread_number(runs: Dict[str, int], idle: int, samples: int, verify: int = 0) -> Number:
     total_runs = sum(runs.values())
     anthropic = sum(v for lane, v in runs.items() if lane.startswith("anthropic"))
     ok = total_runs > 0 and anthropic * 2 <= total_runs and samples > 0 and idle == 0
-    return Number("Spread", "%s; Anthropic %d/%d; idle %d/%d passes" %
+    return Number("Spread", "%s; Anthropic %d/%d; verify %d; idle %d/%d passes" %
                   (", ".join("%s %d" % pair for pair in runs.items()),
-                   anthropic, total_runs, idle, samples),
+                   anthropic, total_runs, verify, idle, samples),
                   "Anthropic <=50%; idle 0", ok)
 
 

@@ -32,6 +32,7 @@ from . import handoff
 from . import health
 from . import invariants
 from . import metrics
+from . import proof
 from . import rewrite
 from . import revert
 from . import spend
@@ -242,6 +243,11 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
+VERIFY_FILE = "verify-runs.json"
+# Lanes that spend Anthropic models never take a verify run; the free and
+# subscription lanes do (the claude lane spends the operator's subscription).
+VERIFY_SKIP = ("anthropic", "claude")
+NOTE_MAX = 1500
 
 
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
@@ -1155,6 +1161,7 @@ class Station:
             self._claim_for_lane(lane, by_lane[lane], free)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in free))
+        self._hand_verifies([lane for lane in free if not by_lane[lane]])
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:
@@ -1206,6 +1213,173 @@ class Station:
             self._try_ticket(repo, lane, issue, free)
         except (GitHubError, OSError) as err:
             _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
+
+    # -- verify runs ------------------------------------------------------
+    def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open tickets filed by a trusted author."""
+        allowed = {a.lower() for a in self.s.authors}
+        found = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        return [i for i in found if isinstance(i, dict) and "pull_request" not in i
+                and tickets._login(i.get("user")) in allowed]
+
+    def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]]) -> set:
+        """The lanes a queued ticket of the repo may be given: its model's
+        lanes, else its difficulty tier's."""
+        lanes: set = set()
+        for issue in issues:
+            if "loom:queued" not in _label_names(issue):
+                continue
+            model = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+            if model:
+                lanes.update(model_lanes(model.group(1)))
+            else:
+                lanes.update(factory.lanes_of(factory.difficulty_of(issue), not self._public(repo)))
+        return lanes
+
+    def _proven(self, repo: str, number: int) -> bool:
+        allowed = {a.lower() for a in self.s.authors}
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        return any(isinstance(c, dict) and tickets._login(c.get("user")) in allowed
+                   and proof.read(str(c.get("body") or "")) is not None for c in comments)
+
+    def _shipped_stamp(self, repo: str, issue: Dict[str, Any]) -> float:
+        """When loom:shipped was last applied; the issue's update time if the
+        events do not say."""
+        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+        stamps = [metrics.stamp(e.get("created_at")) for e in events
+                  if isinstance(e, dict) and e.get("event") == "labeled"
+                  and (e.get("label") or {}).get("name") == "loom:shipped"]
+        return max(stamps) if stamps else metrics.stamp(issue.get("updated_at"))
+
+    def _verify_pool(self, attempts: Dict[str, Any]
+                     ) -> Tuple[List[Tuple[str, Dict[str, Any]]], set]:
+        """(the tickets due a verify run, oldest ship first; the lanes queued
+        build work could take)."""
+        held: set = set()
+        shipped: List[Tuple[str, Dict[str, Any]]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = self._tickets_open(repo)
+            held |= self._queued_lanes(repo, issues)
+            shipped += [(repo, i) for i in issues]
+        # The cheap filters first: the events and comments of a ticket are
+        # read only when its cooldown is over.
+        found = []
+        for repo, issue in verify_due(shipped, attempts, self.now):
+            issue["shipped_at"] = self._shipped_stamp(repo, issue)
+            issue["has_proof"] = self._proven(repo, int(issue["number"]))
+            found.append((repo, issue))
+        return verify_due(found, attempts, self.now), held
+
+    def _hand_verifies(self, idle: List[str]) -> None:
+        """Give each idle slot that may verify, has no build work and is
+        empty one shipped ticket to verify. The ticket keeps its labels: the
+        station moves it when the result comes back (_report_verify)."""
+        lanes = [x for x in idle if provider(x) not in VERIFY_SKIP and self._inbox_empty(x)]
+        if not lanes:
+            return
+        path = os.path.join(self.state, VERIFY_FILE)
+        attempts = _read_json(path, {}, strict=False)
+        attempts = attempts if isinstance(attempts, dict) else {}
+        try:
+            pool, held = self._verify_pool(attempts)
+        except GitHubError as err:
+            _say("could not list tickets to verify: %s" % err)
+            return
+        for lane in lanes:
+            if lane in held:
+                continue
+            for repo, issue in list(pool):
+                if needs_public_repo(lane, "") and not self._public(repo):
+                    continue
+                pool.remove((repo, issue))
+                attempts["%s#%s" % (repo, issue["number"])] = self.now
+                _write_json(path, attempts)
+                self._write_verify_brief(repo, lane, issue)
+                break
+
+    def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
+        number = int(issue["number"])
+        stamp = int(self.now)
+        text = tickets.render_verify_brief(
+            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+        claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
+        os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
+
+    @staticmethod
+    def _note_text(raw: Any) -> str:
+        """Lane-written text made safe to post: no credentials, paths, mentions
+        or non-ASCII, and nothing the text checks refuse."""
+        clean = SECRET_RE.sub("<redacted>", scrub(str(raw)))
+        clean = _clip(clean.replace("@", "(at)").encode("ascii", "replace").decode(), NOTE_MAX)
+        try:
+            _text.check(clean)
+        except ValueError:
+            return "(withheld: the text failed the text checks)"
+        return clean
+
+    def _verify_note(self, repo: str, number: int, lane: str, why: str) -> None:
+        self._comment(repo, number, "Lane %s checked this shipped ticket for proof and could "
+                      "not verify it. %s The ticket stays shipped; it is tried again after "
+                      "%d hours." % (lane, why, VERIFY_INTERVAL // 3600))
+        _say("verify of %s#%d left it shipped: %s" % (repo, number, why))
+
+    def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """(the lane's verify.json, "") or (None, why it cannot be used)."""
+        path = os.path.join(self.s.home, "logs", lane, name + ".verify.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return None, "The run wrote no verify.json."
+        except ValueError:
+            return None, "Its verify.json is not valid JSON."
+        if not isinstance(data, dict):
+            return None, "Its verify.json is not a JSON object."
+        return data, ""
+
+    def _report_verify(self, lane: str, kind: str, repo: str, number: int, name: str) -> bool:
+        """Apply a finished verify run. A failed run changes nothing: the
+        ticket is due again once its cooldown is over."""
+        if kind == "failed":
+            _say("verify run %s failed; %s#%d stays shipped" % (name, repo, number))
+            return True
+        result, why = self._read_verify(lane, name)
+        if result is None:
+            self._verify_note(repo, number, lane, why)
+        elif set(result) == {"missing"}:
+            self._verify_note(repo, number, lane, "Missing evidence: %s" % self._note_text(
+                result["missing"]))
+        else:
+            self._apply_proof(lane, repo, number, result)
+        return True
+
+    def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any]) -> None:
+        """Check the record with bus/proof.py, tick the criteria and move the
+        ticket to verified with it; a refused record leaves the ticket shipped
+        with one note."""
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
+            _say("%s#%d is no longer shipped; its verify result is dropped" % (repo, number))
+            return
+        body = str(issue.get("body") or "")
+        ticked = proof.tick(body)
+        try:
+            proof.check(record, ticked)
+        except ValueError as err:
+            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
+            return
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
+        try:
+            brain.move(self.gh, repo, number, "verified", record=record)
+        except ValueError as err:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
+            return
+        _say("verified %s#%d from the proof lane %s gathered" % (repo, number, lane))
 
     def _record_slot_sample(self, idle: bool) -> None:
         if not self.s.metrics_goal:
@@ -1677,6 +1851,8 @@ class Station:
         repo, number = m.group(1), int(m.group(2))
         if not self._repo_ok(repo):
             return True
+        if self._field(text, "Deliverable") == "verify":
+            return self._report_verify(lane, kind, repo, number, name)
         if kind == "done":
             if self._field(text, "Deliverable") == "answer":
                 _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))

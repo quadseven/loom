@@ -15,6 +15,8 @@ import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
+from . import proof
+
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
 BASE_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
@@ -410,6 +412,56 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                  "true.\n\n%s\n"
                  % (fix.pr, fix.branch, ANSWER_NOTE, fix.findings))
     return text
+
+
+VERIFY_BRIEF = """\
+## Verify
+
+This is a verify run, not a build. Change no code, run no git command, and open
+no pull request. A lane never moves a label: the station checks what you write
+and moves the ticket itself.
+
+Read the ticket's Live criterion below and gather evidence for each acceptance
+criterion with read-only reads only: the GitHub API (GET requests), the goal's
+REST endpoints, and the station and lane logs. Then write verify.json in the
+top of your work directory. It holds exactly one of:
+
+1. A proof record, a JSON object of kind "runtime" or "docs" (bus/proof.py):
+   kind, revision (a commit SHA on the default branch), observed {start, end}
+   as UTC times like 2030-01-01T00:00:00Z, sources (a list of references),
+   and criteria: one {criterion, result, evidence} per acceptance criterion
+   below, in order, with the criterion text copied exactly and result "pass".
+   A runtime record also needs environment, artifact, and measure {name,
+   baseline, target, after}.
+2. {"missing": "<the evidence that does not exist yet>"} when you cannot
+   prove every criterion. Name the evidence precisely; do not guess.
+
+Live criterion: %s
+
+Acceptance criteria:
+%s
+"""
+
+
+def verify_name(repo: str, number: int, stamp: int) -> str:
+    """The name of a verify brief; the stamp keeps each run's name its own."""
+    return "%s-verify-%d" % (ticket_name(repo, number), stamp)
+
+
+def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
+                        live: str) -> str:
+    """The brief that hands a lane slot one shipped ticket to verify: no
+    branch is pushed (the Branch: line only names the work directory) and the
+    result is verify.json, not a pull request."""
+    number = int(issue["number"])
+    title = " ".join(str(issue.get("title") or "").split())
+    wanted = "\n".join("- %s" % " ".join(text.split())
+                       for _, text in proof.criteria(str(issue.get("body") or "")))
+    head = ["# Brief: %s" % verify_name(repo, number, stamp), "", "Repo: %s" % repo,
+            "Branch: loom/verify-%d-%d" % (number, stamp), "Lane: %s" % lane,
+            "Issue: %s#%d" % (repo, number), "Deliverable: verify", "",
+            "# T%d: Verify %s" % (number, title), ""]
+    return "\n".join(head) + "\n" + VERIFY_BRIEF % (live, wanted)
 
 
 def _login(value: Any) -> str:

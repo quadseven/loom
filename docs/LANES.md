@@ -283,6 +283,24 @@ home title. A failed line is retried on the next pass; once the line is out,
 a failed thread is only logged, so the line is never posted twice. Every
 station post, through the webhook or the bot, suppresses link previews.
 
+### Verify runs
+
+A slot of a lane that is not Anthropic (`anthropic*` and `claude` never take
+one), is free, and has no build work (no briefed ticket claimed for it and no
+queued ticket of its tier or model) is handed one verify run instead of
+idling: the oldest shipped ticket without a proof, at most once per 6 hours
+per ticket, on a public repo only. The brief carries `Deliverable: verify`.
+The agent changes no code, opens no pull request and moves no label; it reads
+the ticket's Live criterion and gathers evidence with read-only reads, then
+writes `verify.json`: a proof record (`bus/proof.py`) or
+`{"missing": "<the evidence that does not exist yet>"}`. The runner copies it
+to the lane's log folder as `<brief>.verify.json`. The station checks a
+record with `bus/proof.py`, ticks the criteria and moves the ticket to
+verified with the proof. A refused record, a missing result or no
+`verify.json` leaves the ticket shipped with one note on it. The run is
+counted like any lane run, and the Spread line also shows how many were
+verify runs.
+
 ### Talking to the brain from Discord
 
 The webhook only posts. To let the operator answer a report, ask a question

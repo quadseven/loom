@@ -25,6 +25,9 @@
 # A fix brief (a Fix-PR: <number> line, from the station) instead works on
 # that open PR's existing branch: it pushes fast-forward only and comments on
 # the PR, and never opens a second one.
+# A verify brief (Deliverable: verify, from the station) changes no code: the
+# agent leaves verify.json in its tree, the runner copies it to the lane's log
+# folder, and the station checks it and moves the ticket. No pull request.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
@@ -1334,8 +1337,8 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$BASE_BRANCH" ] && ! [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     park "$BRIEF" "brief Base: is not a branch name"; continue
   fi
-  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ]; then
-    park "$BRIEF" "brief Deliverable: must be answer"; continue
+  if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ]; then
+    park "$BRIEF" "brief Deliverable: must be answer or verify"; continue
   fi
   if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
@@ -1456,7 +1459,8 @@ for BRIEF in "$INBOX"/*.md; do
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED=""
-  if ! prepare_validation >> "$LOG" 2>&1; then
+  # A verify run changes no code, so there is nothing to validate.
+  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run"; continue
   fi
   RUN_BRIEF="$BRIEF"
@@ -1535,6 +1539,18 @@ for BRIEF in "$INBOX"/*.md; do
     break
   fi
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
+  if [ "$DELIVERABLE" = verify ]; then
+    # The station reads the result from the log folder and applies it; the
+    # runner moves no label and opens no pull request.
+    RESULT="$TREE/verify.json"
+    if [ ! -f "$RESULT" ] || [ -L "$RESULT" ] || [ "$(wc -c < "$RESULT")" -gt 65536 ]; then
+      park "$BRIEF" "no verify.json written"; continue
+    fi
+    cp "$RESULT" "$LOGDIR/$TICKET.verify.json"
+    echo "[$(date -u +%FT%TZ)] $TICKET done, verify result recorded" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
+  fi
   if [ "$DELIVERABLE" = answer ]; then
     ANSWER="$TREE/.loom/answer.md"
     if [ ! -d "$TREE/.loom" ] || [ -L "$TREE/.loom" ] || [ ! -f "$ANSWER" ] || [ -L "$ANSWER" ]; then

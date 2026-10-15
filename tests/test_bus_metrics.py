@@ -100,6 +100,15 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(result), 9)
         self.assertTrue(all(n.passed for n in result), [n.line() for n in result])
 
+    def test_verify_runs_are_counted_as_their_own_kind_inside_spread(self):
+        run = os.path.join(self.home, "briefs", "codex", "done", "check.md")
+        with open(run, "w") as fh:
+            fh.write("Issue: %s#3\nDeliverable: verify\n" % REPO)
+        os.utime(run, (NOW - 1000, NOW - 1000))
+        spread = next(n for n in self.numbers() if n.name == "Spread")
+        self.assertIn("codex 2", spread.line())
+        self.assertIn("verify 1;", spread.line())
+
     def test_ticket_waits_include_reentered_state_and_current_state(self):
         events = []
         for kind, state, hours in (("labeled", "queued", 0), ("labeled", "briefed", 2),
