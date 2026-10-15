@@ -100,7 +100,8 @@ def test_text_background_token_pairs_meet_wcag_aa_in_both_themes():
 def test_shared_interactive_components_have_44px_minimum_targets():
     css = re.sub(r"/\*.*?\*/", "", (ROOT / "dashboard/static/loom.css").read_text(), flags=re.S)
     for selector in (".nav-row", ".chip", ".filter-chip", ".segment-tab", ".theme-toggle", ".icon-button", ".tab-link",
-                     ".attempt-chip", ".page-content h2 > a", ".page-content li > a", ".page-content p > a"):
+                     ".attempt-chip", ".page-content h2 > a", ".page-content li > a", ".page-content p > a",
+                     ".section-head a", ".ticket-topline a", ".improvement-meta a", ".page-content details > summary"):
         declarations = [
             body for selectors, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css)
             if selector in [part.strip() for part in selectors.split(",")]
