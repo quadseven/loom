@@ -42,6 +42,10 @@ not looked hard enough yet. Each tick the brain:
 - Finishes before it starts: each tick merges every lane pull request that
   `bus.brain status` marks `READY` (the merge-ready signal in
   docs/BRAIN.md) before it briefs anything new.
+- In the brief step, rank up to 5 open tickets that have no `Priority:` line
+  with `python3 -m bus.brain prioritize OWNER/NAME#N --priority P0|P1|P2|P3
+  --note "REASON"`. Choose highest goal cost first, and make each note one
+  line explaining the reason for that rank.
 - When a goal is at its cap, a brief that fixes a measured regression of a
   ticket already shipped still goes in, through the goal's one regression
   slot: `brief --regresses M`, with `Regresses #M` and the evidence in the

@@ -1370,6 +1370,52 @@ def _with_model(body: str, model: str) -> str:
     return "\n".join(lines[:header] + [line] + lines[header:])
 
 
+def _with_priority(body: str, priority: str) -> str:
+    """Set Priority in the leading headers without changing the remaining text."""
+    lines = body.splitlines(keepends=True)
+    header = 0
+    while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip("\r\n").rstrip()):
+        header += 1
+    for index in range(header):
+        if lines[index].startswith("Priority:"):
+            ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
+            lines[index] = "Priority: " + priority + ending
+            return "".join(lines)
+    newline = "\r\n" if "\r\n" in body else "\n"
+    lines.insert(header, "Priority: " + priority + newline)
+    if header == 0 and body and not body.startswith(("\n", "\r")):
+        lines.insert(1, newline)
+    return "".join(lines)
+
+
+def prioritize(gh: GitHub, repo: str, number: int, priority: str,
+               note: Optional[str] = None,
+               env: Optional[Dict[str, str]] = None) -> None:
+    """Rank an open ticket, requiring its author to be trusted."""
+    if priority not in tickets.PRIORITIES:
+        raise ValueError("priority must be one of %s" % ", ".join(tickets.PRIORITIES))
+    if note is not None:
+        _check_written_text(note)
+        if "\n" in note or "\r" in note:
+            raise ValueError("priority note must be one line")
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    if issue.get("state") != "open":
+        raise ValueError("cannot prioritize a closed issue")
+    if "loom:ticket" not in _labels(issue):
+        raise ValueError("only a loom:ticket can be prioritized")
+    authors = {author.lower() for author in trusted_authors(env)}
+    login = str((issue.get("user") or {}).get("login") or "").lower()
+    if not login or login not in authors:
+        raise ValueError("ticket author is not a trusted login")
+    body = str(issue.get("body") or "")
+    updated = _with_priority(body, priority)
+    _check_written_text(updated)
+    if updated != body:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": updated})
+    if note is not None:
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+
+
 def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
                model: str) -> None:
     """Rewrite the ticket body's Model: line; done before the labels change so
@@ -2532,6 +2578,7 @@ def parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
+    pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES, required=True); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
@@ -2586,6 +2633,11 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
     move(gh, repo, number, args.to, args.lane, args.note, record, args.model)
 
 
+def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    prioritize(gh, repo, number, args.priority, args.note)
+
+
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     close(gh, repo, number, args.reason, args.note)
@@ -2630,6 +2682,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
+            "prioritize": _cmd_prioritize,
             "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,

@@ -131,6 +131,12 @@ its letter. Triage counts the same checks as missing sections. The runner
 writes the Size as the letter whatever the brief says, and logs any plan
 check its body still fails before it opens the pull request.
 
+`python3 -m bus.brain prioritize OWNER/NAME#N --priority P0|P1|P2|P3
+[--note TEXT]` changes the `Priority:` header on an existing open
+`loom:ticket`. The issue author must be in `LOOM_BRIEF_AUTHORS`. It preserves
+the rest of the body, and an optional one-line note is posted as a comment.
+It refuses closed issues and issues without `loom:ticket`.
+
 The station renders the local brief from the issue: `Repo` is the issue's
 repo, `Branch` as above, `Lane` from the `lane:` label, `Issue:
 <owner/name>#<number>`, then the header lines and the body. The runner adds

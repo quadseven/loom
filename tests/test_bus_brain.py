@@ -50,6 +50,47 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
 
 
 class BrainTests(unittest.TestCase):
+    def test_prioritize_sets_and_replaces_priority_without_changing_body_content(self):
+        original = "Difficulty: medium\n\n## Why\nExact text.  \n\n## What\nKeep this.\n"
+        changed = "Difficulty: medium\nPriority: P1\n\n## Why\nExact text.  \n\n## What\nKeep this.\n"
+        fake = Fake(reply(200, {"state": "open", "body": original,
+                                "labels": [{"name": "loom:ticket"}],
+                                "user": {"login": "trusted"}}),
+                    reply(200, {}),
+                    reply(200, {"state": "open", "body": changed,
+                                "labels": [{"name": "loom:ticket"}],
+                                "user": {"login": "trusted"}}),
+                    reply(200, {}))
+        gh = GitHub("t", transport=fake)
+        env = {"LOOM_BRIEF_AUTHORS": "trusted"}
+        brain.prioritize(gh, REPO, 8, "P1", env=env)
+        self.assertEqual(fake.calls[1][2], {"body": changed})
+        brain.prioritize(gh, REPO, 8, "P3", env=env)
+        self.assertEqual(fake.calls[3][2], {"body": changed.replace("P1", "P3")})
+
+    def test_prioritize_refusals_make_no_writes(self):
+        for issue, priority in (
+            ({"state": "closed", "body": "", "labels": [{"name": "loom:ticket"}],
+              "user": {"login": "trusted"}}, "P1"),
+            ({"state": "open", "body": "", "labels": [], "user": {"login": "trusted"}}, "P1"),
+            ({"state": "open", "body": "", "labels": [{"name": "loom:ticket"}],
+              "user": {"login": "trusted"}}, "P4"),
+        ):
+            fake = Fake(reply(200, issue))
+            with self.assertRaises(ValueError):
+                brain.prioritize(GitHub("t", transport=fake), REPO, 8, priority,
+                                 env={"LOOM_BRIEF_AUTHORS": "trusted"})
+            self.assertFalse(any(method in ("PATCH", "POST", "PUT", "DELETE")
+                                 for method, _, _ in fake.calls))
+
+    def test_prioritize_note_is_posted_after_body_update(self):
+        fake = Fake(reply(200, {"state": "open", "body": "## Why\nx",
+                                "labels": [{"name": "loom:ticket"}],
+                                "user": {"login": "trusted"}}), reply(200, {}), reply(201, {}))
+        brain.prioritize(GitHub("t", transport=fake), REPO, 8, "P0", "urgent work",
+                         env={"LOOM_BRIEF_AUTHORS": "trusted"})
+        self.assertEqual(fake.calls[2][2], {"body": "urgent work"})
+
     def test_tick_step_records_and_reads_step_and_refuses_a_non_holder(self):
         now = brain.datetime(2030, 1, 1, 12, 0, tzinfo=brain.timezone.utc)
         original = {"object": {"sha": "old"}}
