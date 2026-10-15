@@ -75,6 +75,48 @@ not looked hard enough yet. Each tick the brain:
   live system and the metric it targets moved. A change that moved nothing is
   not done; say so on the ticket and plan the next attempt.
 
+## Operate, do not report
+
+The brain is the factory's operator. A tick that only restates numbers
+failed, however tidy its journal. These rules come before the step list
+below; where the steps leave room, this is how to spend it.
+
+1. Every tick moves something. Before the journal, at least one of: a lane
+   pull request merged or sent back with `bus.brain fix`, a ticket briefed,
+   re-briefed with `--regresses`, escalated or closed, a shipped ticket
+   verified, or a factory ticket filed. Start from the Priorities list in
+   `status`, top first, and finish one item before starting the next.
+2. The same stuck line twice is an order to act. If a problem (a stuck
+   member, a failing run, a held pull request) appears in two journals in a
+   row with no change, this tick acts on it: a shipped ticket that did not
+   fix it gets `brief --regresses N` with the measured numbers; a ticket
+   that failed twice climbs with `bus.brain escalate`; a problem with no
+   ticket gets one. Never write the same stuck line a third time.
+3. Review every lane pull request against its ticket before it merges.
+   Map each acceptance criterion to the hunk that meets it. Send it back
+   with `bus.brain fix`, naming the unmet criterion, when the diff only adds
+   logging or diagnostics for a criterion about behavior, adds functions
+   nothing calls, only adds tests, or makes a problem stop being measured
+   instead of making it better (a threshold moved, a resource held back, the
+   affected left out of the count). Green checks and a clean review say the
+   code is safe; they do not say the ticket is done.
+4. Diagnose before briefing. Read the lane's run and transcript, the
+   endpoint numbers and the goal's health findings; compare before and
+   after the last ship. A brief quotes the numbers and names the step that
+   fails, so the lane fixes the cause on its first attempt.
+5. Verify only from something seen, with the time it was seen: a log line,
+   an endpoint answer, a page. "Would show", "should" and code reading are
+   not live evidence. A criterion that waits for a future event gets a note
+   naming the event and the date it is due, not a pass.
+6. Do not defer for states that clear in minutes. `bus.brain merge` waits
+   for mergeability and running checks; a red check gets `bus.brain fix`
+   now, not a retry next tick.
+7. Spend the tick on work, not on re-reading. A goal body or rules comment
+   whose `updated_at` has not changed since the last journal is not read
+   again; say "unchanged" and move on.
+8. Every failure the brain finds by hand becomes a factory ticket (Improving
+   Loom itself), so the factory catches it next time without the brain.
+
 ## Improving Loom itself
 
 Loom is a goal too (loom#30), and every brain works on it, not only on the
