@@ -76,8 +76,12 @@ class FakeGit:
         if method == "DELETE" and path.startswith("git/refs/"):
             self.refs.pop(path[len("git/refs/"):], None)
             return reply(204)
+        # Like GitHub: a ref is read at git/ref/<ref> but updated at
+        # git/refs/<ref>; a PATCH to the read path answers 404.
         if method == "PATCH" and path.startswith("git/ref/"):
-            ref = path[len("git/ref/"):]
+            return reply(404, {"message": "Not Found"})
+        if method == "PATCH" and path.startswith("git/refs/"):
+            ref = path[len("git/refs/"):]
             self.refs[ref] = data["sha"]
             return reply(200, {})
         raise AssertionError("unexpected call %s %s" % (method, path))

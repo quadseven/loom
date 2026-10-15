@@ -124,6 +124,10 @@ live regression).
 
 ## Tick
 
+Each `bus.brain step NAME` below may carry `--note "<one line>"`: what that
+step found or decided. The notes are the dashboard Brain view's "Thinking,
+this tick"; a step with no note shows nothing there.
+
 1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
    is held.
    Then run `python3 -m bus.brain step lock --holder muse`.

@@ -99,5 +99,7 @@ def release(gh: GitHub, repo: str, holder: str) -> bool:
                      previous.get("message", ""))
     commit = gh.rest("POST", "/repos/%s/git/commits" % repo, {
         "message": message, "tree": previous["tree"]["sha"], "parents": [sha]})
-    gh.rest("PATCH", ref_path, {"sha": commit.data["sha"], "force": True})
+    # Updated at git/refs/<ref>: the git/ref/<ref> read path answers 404 to a PATCH.
+    gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
+            {"sha": commit.data["sha"], "force": True})
     return True

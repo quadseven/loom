@@ -65,6 +65,9 @@ class BrainTests(unittest.TestCase):
         self.assertEqual((saved["step"], saved["step_index"]), ("merge", 3))
         self.assertEqual(saved["notes"], [{"ts": "2030-01-01T12:00:00Z", "step": "merge", "text": "reviewing changes"}])
         self.assertIn('"step_index":3', fake.calls[4][2]["message"])
+        # Updated at git/refs/: GitHub answers a PATCH to the git/ref/ read path with 404.
+        self.assertEqual(fake.calls[5][0], "PATCH")
+        self.assertTrue(fake.calls[5][1].endswith("/git/refs/heads/loom-lock/brain"), fake.calls[5][1])
         with self.assertRaisesRegex(ValueError, "does not hold the lock"):
             brain.tick_step(gh, REPO, "verify", holder="intruder", now=now)
 
