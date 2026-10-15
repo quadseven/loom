@@ -63,4 +63,9 @@ deploy() {
 }
 
 deploy
+if [ -n "${LOOM_PIN_TARGETS:-}" ] && [ "${LOOM_DEPLOY:-1}" != 0 ] &&
+   [ "$(g symbolic-ref --short -q HEAD)" = "$BRANCH" ]; then
+  LOOM_SELF_REPO="${LOOM_SELF_REPO:-$(g remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')}" \
+    python3 -m bus.pin || say "pin pass failed; will retry on the next station pass"
+fi
 cd "$REPO_ROOT" && exec python3 -m bus station
