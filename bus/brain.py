@@ -1402,6 +1402,33 @@ def _prioritize_write(gh: GitHub, repo: str, number: int, method: str,
                           exc.status, exc.body) from exc
 
 
+def _prioritize_body(issue: Dict[str, Any], priority: str,
+                     env: Optional[Dict[str, str]]) -> str:
+    """Validate that the issue is an open ticket by a trusted author."""
+    if issue.get("state") != "open":
+        raise ValueError("cannot prioritize a closed issue")
+    if "loom:ticket" not in _labels(issue):
+        raise ValueError("only a loom:ticket can be prioritized")
+    authors = {author.lower() for author in trusted_authors(env)}
+    login = str((issue.get("user") or {}).get("login") or "").lower()
+    if not login or login not in authors:
+        raise ValueError("ticket author is not a trusted login")
+    updated = _with_priority(str(issue.get("body") or ""), priority)
+    _check_written_text(updated)
+    return updated
+
+
+def _write_priority(gh: GitHub, repo: str, number: int, body: str,
+                    note: Optional[str]) -> None:
+    """Write the changed body and optional note, reporting each failure."""
+    path = "/repos/%s/issues/%d" % (repo, number)
+    _prioritize_write(gh, repo, number, "PATCH", path, {"body": body},
+                      "ticket body update")
+    if note is not None:
+        _prioritize_write(gh, repo, number, "POST", path + "/comments",
+                          {"body": note}, "note comment")
+
+
 def prioritize(gh: GitHub, repo: str, number: int, priority: str,
                note: Optional[str] = None,
                env: Optional[Dict[str, str]] = None) -> None:
@@ -1413,25 +1440,14 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: str,
         if "\n" in note or "\r" in note:
             raise ValueError("priority note must be one line")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
-    if issue.get("state") != "open":
-        raise ValueError("cannot prioritize a closed issue")
-    if "loom:ticket" not in _labels(issue):
-        raise ValueError("only a loom:ticket can be prioritized")
-    authors = {author.lower() for author in trusted_authors(env)}
-    login = str((issue.get("user") or {}).get("login") or "").lower()
-    if not login or login not in authors:
-        raise ValueError("ticket author is not a trusted login")
     body = str(issue.get("body") or "")
-    updated = _with_priority(body, priority)
-    _check_written_text(updated)
+    updated = _prioritize_body(issue, priority, env)
     if updated != body:
-        _prioritize_write(gh, repo, number, "PATCH",
-                          "/repos/%s/issues/%d" % (repo, number),
-                          {"body": updated}, "ticket body update")
-    if note is not None:
-        _prioritize_write(gh, repo, number, "POST",
-                          "/repos/%s/issues/%d/comments" % (repo, number),
-                          {"body": note}, "note comment")
+        _write_priority(gh, repo, number, updated, note)
+    elif note is not None:
+        path = "/repos/%s/issues/%d/comments" % (repo, number)
+        _prioritize_write(gh, repo, number, "POST", path, {"body": note},
+                          "note comment")
 
 
 def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
