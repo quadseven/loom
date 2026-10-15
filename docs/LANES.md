@@ -290,6 +290,16 @@ one), is free, and has no build work (no briefed ticket claimed for it and no
 queued ticket of its tier or model) is handed one verify run instead of
 idling: the oldest shipped ticket without a proof, at most once per 6 hours
 per ticket, on a public repo only. The brief carries `Deliverable: verify`.
+When `LOOM_EVIDENCE_CMDS` is set in the station plist, it is a JSON map from
+`owner/repo` to a read-only shell command. The command receives each eligible
+backticked string from the ticket's Live criterion in
+`LOOM_EVIDENCE_NEEDLE`; it should search logs from the last 24 hours with a
+fixed-string match (see `.env.example`). The station runs it once per string,
+with a 60-second timeout, then quotes up to 20 matching lines per string in
+the verify brief. It accepts at most five ASCII strings of at most 120
+characters. Lines containing credentials, private hosts, IP addresses or
+local paths are dropped and counted. A timeout or command error is stated in
+the brief without quoting its output. Repos without a command run none.
 The agent changes no code, opens no pull request and moves no label; it reads
 the ticket's Live criterion and gathers evidence with read-only reads, then
 writes `verify.json`: a proof record (`bus/proof.py`) or
