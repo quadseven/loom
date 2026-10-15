@@ -2114,7 +2114,10 @@ class HumanAndRefsTests(unittest.TestCase):
                     reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t"}),
                     reply(201, {}), reply(201, {}), reply(200, []), reply(200, []))
         brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
-        self.assertTrue(fake.calls[3][2]["body"].endswith("\n\nRefs #6\n"))
+        # Words, not "Refs #6": lanes copy the brief into their pull request,
+        # and a linked original in no epic fails the plan check.
+        self.assertTrue(fake.calls[3][2]["body"].endswith("\n\nRewritten from issue 6.\n"))
+        self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
         self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
         self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
