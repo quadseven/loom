@@ -83,7 +83,8 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
         "Out of scope, as in the format below, and no Difficulty, Model or Base lines. "
         "Say in Why what the issue asks for, in your own words, in at least one full "
         "sentence. Acceptance criteria has at least three checkboxes. Size is one of XS, "
-        "S, M or L. Out of scope names at least one thing.",
+        "S, M or L. Out of scope names at least one thing. Do not write header lines "
+        "such as Priority, Difficulty, After or Not before; the station adds those.",
         "Use human only when the work needs money, hardware, an account, a credential or "
         "an operator decision.",
         "Use skip when the issue is unclear, already done, or not a task.",
