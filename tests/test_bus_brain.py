@@ -713,6 +713,13 @@ class SensitiveResumeTests(unittest.TestCase):
         brain.move(gh, REPO, 8, "briefed", "codex")
         self.assertEqual(fake.calls[1][2], {"labels": ["loom:ticket", "custom", "loom:briefed", "lane:codex"]})
 
+    def test_a_move_clears_every_state_label_including_ready(self):
+        # A shipped move that kept loom:ready read as "ready" everywhere
+        # (2026-10-15: five WoW tickets listed as lane work in Priorities).
+        have = ["loom:ticket", "loom:merged", "loom:ready", "loom:closed-unmerged", "lane:claude"]
+        self.assertEqual(brain._moved_labels(have, "shipped", None),
+                         ["loom:ticket", "lane:claude", "loom:shipped"])
+
     def test_move_refuses_a_lane_that_cannot_run_the_model(self):
         issue = {"state": "open", "body": "Model: claude-sonnet-5-5\n\nWork.",
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:briefed"},
