@@ -26,6 +26,11 @@ STATES = ("queued", "briefed", "running", "pr", "answered", "failed", "merged", 
 # so they never count against a goal's cap.
 IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 DEFAULT_GOAL_CAP = 16
+# Merged and shipped tickets that still wait on a live check. A verified
+# ticket carries loom:verified instead of loom:shipped (or loom:merged for a
+# docs proof), so it never counts here.
+UNPROVEN = ("loom:merged", "loom:shipped")
+DEFAULT_UNVERIFIED_LIMIT = 15
 # A ticket admitted for a measured regression of a shipped one. Past the cap,
 # a goal admits one such ticket at a time (its regression slot).
 REGRESSION = "loom:regression"
@@ -736,6 +741,13 @@ def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
 
 
+def unverified_limit(env: Optional[Dict[str, str]] = None) -> int:
+    """Unproven tickets per goal before new build work waits: LOOM_UNVERIFIED_LIMIT,
+    a whole number of at least 1, else DEFAULT_UNVERIFIED_LIMIT."""
+    raw = (os.environ if env is None else env).get("LOOM_UNVERIFIED_LIMIT", "")
+    return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_UNVERIFIED_LIMIT
+
+
 def _goal_issue(gh: GitHub, repo: str, goal: int) -> Dict[str, Any]:
     """An open loom:goal issue; ValueError for anything else."""
     try:
@@ -846,13 +858,38 @@ def _goal_in_flight(gh: GitHub, repo: str, goal: int,
     return sum(1 for i in _goal_children(gh, repo, goal, issue) if _in_flight(i))
 
 
-def _check_goal_capacity(gh: GitHub, repo: str, goal: int,
-                         issue: Optional[Dict[str, Any]] = None) -> None:
-    count = _goal_in_flight(gh, repo, goal, issue)
+def _check_goal_capacity(children: List[Dict[str, Any]], goal: int) -> None:
+    count = sum(1 for i in children if _in_flight(i))
     cap = goal_cap()
     if count >= cap:
         raise ValueError("goal already has %d tickets in flight (cap %d); only a measured "
                          "regression of a shipped ticket passes it (--regresses)" % (count, cap))
+
+
+def _unproven(issue: Dict[str, Any]) -> bool:
+    """An open loom:ticket at merged or shipped: unproven work still waiting on
+    a live check. A verified ticket carries loom:verified instead, so it never
+    counts."""
+    names = _labels(issue)
+    return (issue.get("state") == "open" and "loom:ticket" in names
+            and any(state in names for state in UNPROVEN))
+
+
+def _goal_unproven(gh: GitHub, repo: str, goal: int,
+                   issue: Optional[Dict[str, Any]] = None) -> int:
+    """The goal's unproven tickets; ValueError for anything that is not an
+    open loom:goal issue."""
+    return sum(1 for i in _goal_children(gh, repo, goal, issue) if _unproven(i))
+
+
+def _check_goal_unproven(children: List[Dict[str, Any]], goal: int) -> None:
+    count = sum(1 for i in children if _unproven(i))
+    limit = unverified_limit()
+    if count > limit:
+        raise ValueError("goal #%d has %d tickets at merged or shipped without a proof "
+                         "(limit %d); verify them before briefing more build work; only a "
+                         "measured regression of a shipped ticket passes it (--regresses)"
+                         % (goal, count, limit))
 
 
 def _lines(text: str) -> List[str]:
@@ -1075,7 +1112,9 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue)
-    _check_goal_capacity(gh, repo, goal, goal_issue)
+    children = _goal_children(gh, repo, goal, goal_issue)
+    _check_goal_capacity(children, goal)
+    _check_goal_unproven(children, goal)
     issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
