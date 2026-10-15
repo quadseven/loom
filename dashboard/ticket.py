@@ -206,45 +206,78 @@ def _row(label: str, ts: Any, inner: str, cls: str = "", extra: str = "") -> str
             '<span class="tx-at">%s</span></div>%s</div>') % (cls, extra, _esc(label), _esc(_hm(ts)), inner)
 
 
+def _event_type(event: Dict[str, Any]) -> str:
+    """Which renderer an event takes."""
+    if event.get("activity_type") in ("review", "answer"):
+        return event["activity_type"]
+    role, kind = event.get("role", ""), event.get("kind", "")
+    if role == "user":
+        return "brief"
+    if role == "thinking" or kind == "thinking":
+        return "thought"
+    if kind in ("tool_use", "tool_result"):
+        return kind
+    if role == "runner" or kind == "log":
+        return "runner"
+    return "said"
+
+
+def _review_html(event: Dict[str, Any]) -> str:
+    return _row("grug", event.get("ts"), '<blockquote class="review-thread">%s / %s<br>%s</blockquote>' % (
+        _esc(event.get("severity") or "severity missing"),
+        _esc("resolved" if event.get("resolved") else "open"), _esc(event.get("text"))), "grug")
+
+
+def _brief_html(event: Dict[str, Any]) -> str:
+    text = str(event.get("text", ""))
+    first = next((line for line in text.split("\n") if line.strip()), "Brief")
+    return _row("brief", event.get("ts"), '<details class="transcript-brief"><summary>%s <span>show the full brief</span>'
+                                          '</summary><pre>%s</pre></details>' % (_esc(first), _esc(text)), "brief")
+
+
+def _tool_html(event: Dict[str, Any], result: Optional[Dict[str, Any]]) -> str:
+    tool = _tool_head(str(event.get("text", "")))
+    body = '<pre class="tool-head">%s</pre>' % _esc(tool["head"])
+    body += "".join('<span class="ln %s">%s</span>' % (tone, _esc(line)) for line, tone in tool["lines"])
+    if result is not None:
+        body += _result_lines(result.get("text", ""))
+    return _row(tool["label"], event.get("ts"), '<div class="tool-block">%s</div>' % body, tool["label"])
+
+
+def _runner_html(event: Dict[str, Any]) -> str:
+    lines = [line for line in str(event.get("text", "")).split("\n") if line.strip()]
+    inner = '<pre class="runner">%s</pre>' % _esc("\n".join(lines[-RUNNER_LINES:]))
+    if len(lines) > RUNNER_LINES:
+        inner += ('<details class="more"><summary>show the full runner log (%d lines)</summary>'
+                  '<pre class="runner">%s</pre></details>') % (len(lines), _esc("\n".join(lines)))
+    return _row("runner", event.get("ts"), inner, "runner")
+
+
+SIMPLE = {
+    "review": _review_html,
+    "answer": lambda e: _row("answered", e.get("ts"), '<blockquote class="review-answer">%s</blockquote>'
+                             % _esc(e.get("text")), "answered"),
+    "brief": _brief_html,
+    "thought": lambda e: _row("thought", e.get("ts"), "<em>%s</em>" % _esc(e.get("text")), "thought", " data-thought"),
+    "tool_result": lambda e: _row("output", e.get("ts"), '<div class="tool-block">%s</div>'
+                                  % _result_lines(e.get("text", "")), "output"),
+    "runner": _runner_html,
+    "said": lambda e: _row("said", e.get("ts"), "<p>%s</p>" % _esc(e.get("text")), "said"),
+}
+
+
 def _event_rows(rows: List[Dict[str, Any]]) -> List[str]:
+    """Each event as its block; a tool call takes the output that follows it."""
     out = []
     i = 0
     while i < len(rows):
-        event = rows[i]
-        role, kind, text = event.get("role", ""), event.get("kind", ""), str(event.get("text", ""))
-        ts = event.get("ts")
-        if event.get("activity_type") == "review":
-            out.append(_row("grug", ts, '<blockquote class="review-thread">%s / %s<br>%s</blockquote>' % (
-                _esc(event.get("severity") or "severity missing"),
-                _esc("resolved" if event.get("resolved") else "open"), _esc(text)), "grug"))
-        elif event.get("activity_type") == "answer":
-            out.append(_row("answered", ts, '<blockquote class="review-answer">%s</blockquote>' % _esc(text), "answered"))
-        elif role == "user":
-            first = next((line for line in text.split("\n") if line.strip()), "Brief")
-            out.append(_row("brief", ts, '<details class="transcript-brief"><summary>%s <span>show the full brief</span>'
-                                         '</summary><pre>%s</pre></details>' % (_esc(first), _esc(text)), "brief"))
-        elif role == "thinking" or kind == "thinking":
-            out.append(_row("thought", ts, "<em>%s</em>" % _esc(text), "thought", " data-thought"))
-        elif kind == "tool_use":
-            tool = _tool_head(text)
-            body = '<pre class="tool-head">%s</pre>' % _esc(tool["head"])
-            body += "".join('<span class="ln %s">%s</span>' % (tone, _esc(line)) for line, tone in tool["lines"])
-            if i + 1 < len(rows) and rows[i + 1].get("kind") == "tool_result":
-                body += _result_lines(rows[i + 1].get("text", ""))
-                i += 1
-            out.append(_row(tool["label"], ts, '<div class="tool-block">%s</div>' % body, tool["label"]))
-        elif kind == "tool_result":
-            out.append(_row("output", ts, '<div class="tool-block">%s</div>' % _result_lines(text), "output"))
-        elif role == "runner" or kind == "log":
-            lines = [line for line in text.split("\n") if line.strip()]
-            tail = "\n".join(lines[-RUNNER_LINES:])
-            inner = '<pre class="runner">%s</pre>' % _esc(tail)
-            if len(lines) > RUNNER_LINES:
-                inner += '<details class="more"><summary>show the full runner log (%d lines)</summary><pre class="runner">%s</pre></details>' % (
-                    len(lines), _esc("\n".join(lines)))
-            out.append(_row("runner", ts, inner, "runner"))
-        else:
-            out.append(_row("said", ts, "<p>%s</p>" % _esc(text), "said"))
+        kind = _event_type(rows[i])
+        if kind == "tool_use":
+            result = rows[i + 1] if i + 1 < len(rows) and _event_type(rows[i + 1]) == "tool_result" else None
+            out.append(_tool_html(rows[i], result))
+            i += 2 if result is not None else 1
+            continue
+        out.append(SIMPLE[kind](rows[i]))
         i += 1
     return out
 
