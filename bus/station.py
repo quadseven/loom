@@ -247,6 +247,31 @@ VERIFY_FILE = "verify-runs.json"
 # Lanes that spend Anthropic models never take a verify run; the free and
 # subscription lanes do (the claude lane spends the operator's subscription).
 VERIFY_SKIP = ("anthropic", "claude")
+
+# A live criterion passes only on something seen: a log line, a response, a
+# page, with the time it was seen. A lane that read the code and wrote what
+# the logs "would show" proved nothing (2026-10-15: a lane proof passed a
+# live criterion that way and was moved back by hand).
+_LIVE_CRITERION = re.compile(r"^\s*live\b", re.I)
+_SEEN_AT = re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d|\b\d\d:\d\d(?::\d\d)?Z\b")
+_HYPOTHETICAL = re.compile(
+    r"\b(would|should|will|expected|expects?|could|might|once deployed|when deployed)\b", re.I)
+
+
+def unseen_live_evidence(record: Dict[str, Any]) -> str:
+    """Why a lane's proof does not show its live criteria were observed, or
+    "" when every live criterion's evidence names a time it was seen and
+    does not speak in the conditional."""
+    for item in record.get("criteria") or []:
+        if not isinstance(item, dict) or not _LIVE_CRITERION.match(str(item.get("criterion") or "")):
+            continue
+        evidence = str(item.get("evidence") or "")
+        if _HYPOTHETICAL.search(evidence):
+            return ("the evidence for a live criterion says what would happen (%r), "
+                    "not what was seen" % _HYPOTHETICAL.search(evidence).group(0))
+        if not _SEEN_AT.search(evidence):
+            return "the evidence for a live criterion names no time it was seen"
+    return ""
 NOTE_MAX = 1500
 
 
@@ -1374,6 +1399,10 @@ class Station:
             return
         if _text.CREDENTIAL_RE.search(proof.render(record, ticked)):
             self._verify_note(repo, number, lane, "Its proof holds text shaped like a credential.")
+            return
+        unseen = unseen_live_evidence(record)
+        if unseen:
+            self._verify_note(repo, number, lane, "Its proof was refused: %s." % unseen)
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
