@@ -7,6 +7,7 @@ for each lane that can take one. docs/BRAIN.md ("Claim and outcome", "Polling bu
 """
 from __future__ import annotations
 
+import base64
 import calendar
 from datetime import date, timedelta
 import errno
@@ -306,6 +307,151 @@ def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:
     return tuple(sorted(times))
 
 
+class PinTarget:
+    """A target repo and file where Loom revision and tarball sha256 are pinned."""
+
+    def __init__(self, repo: str, path: str, rev_var: str, sha_var: str) -> None:
+        self.repo = repo
+        self.path = path
+        self.rev_var = rev_var
+        self.sha_var = sha_var
+
+    def __eq__(self, other: Any) -> bool:
+        return (isinstance(other, PinTarget)
+                and (self.repo, self.path, self.rev_var, self.sha_var)
+                == (other.repo, other.path, other.rev_var, other.sha_var))
+
+    def __repr__(self) -> str:
+        return "PinTarget(%r, %r, %r, %r)" % (self.repo, self.path, self.rev_var, self.sha_var)
+
+
+def parse_pin_targets(raw: str) -> List[PinTarget]:
+    """Parse LOOM_PIN_TARGETS into a list of PinTarget.
+
+    Accepts:
+    - JSON array of objects with repo, path, rev_var, sha_var or 4-tuples.
+    - Semicolon, newline, or whitespace separated entries of repo:path:rev_var:sha_var.
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            data = json.loads(raw)
+            out = []
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        repo = str(item.get("repo") or "").strip()
+                        path = str(item.get("path") or "").strip()
+                        rev_var = str(item.get("rev_var") or "").strip()
+                        sha_var = str(item.get("sha_var") or "").strip()
+                        if repo and path and rev_var and sha_var:
+                            out.append(PinTarget(repo, path, rev_var, sha_var))
+                    elif isinstance(item, (list, tuple)) and len(item) == 4:
+                        out.append(PinTarget(str(item[0]).strip(), str(item[1]).strip(),
+                                             str(item[2]).strip(), str(item[3]).strip()))
+            return out
+        except ValueError:
+            pass
+
+    if ";" in raw or "\n" in raw:
+        parts = re.split(r"[;\n]+", raw)
+    elif " " in raw:
+        parts = raw.split()
+    elif "," in raw and raw.count(":") > 0:
+        parts = raw.split(",")
+    else:
+        parts = [raw]
+
+    out = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            pieces = [p.strip() for p in part.split(":")]
+            if len(pieces) == 4 and all(pieces):
+                out.append(PinTarget(pieces[0], pieces[1], pieces[2], pieces[3]))
+        elif "," in part:
+            pieces = [p.strip() for p in part.split(",")]
+            if len(pieces) == 4 and all(pieces):
+                out.append(PinTarget(pieces[0], pieces[1], pieces[2], pieces[3]))
+    return out
+
+
+def _find_pinned_rev(content: str, rev_var: str) -> Optional[str]:
+    """Extract the current pinned revision from content."""
+    pattern = re.compile(
+        r'(?:^|[\r\n])[ \t]*(?:export[ \t]+)?["\']?' + re.escape(rev_var) +
+        r'["\']?[ \t]*[:=][ \t]*["\']?([^"\'\r\n\s#]+)["\']?',
+        re.MULTILINE
+    )
+    m = pattern.search(content)
+    return m.group(1).strip() if m else None
+
+
+def _replace_var(content: str, var_name: str, new_val: str) -> Tuple[str, bool]:
+    pattern = re.compile(
+        r'((?:^|[\r\n])[ \t]*(?:export[ \t]+)?["\']?' + re.escape(var_name) +
+        r'["\']?[ \t]*[:=][ \t]*)(["\']?)([^"\'\r\n\s#]+)(["\']?)',
+        re.MULTILINE
+    )
+    m = pattern.search(content)
+    if not m:
+        return content, False
+    prefix = m.group(1)
+    q1 = m.group(2)
+    q2 = m.group(4)
+    replacement = prefix + q1 + new_val + q2
+    return pattern.sub(replacement, content, count=1), True
+
+
+def _update_pin_file(content: str, rev_var: str, new_rev: str,
+                     sha_var: str, new_sha: str) -> str:
+    """Return content with rev_var and sha_var replaced by new values."""
+    content, rev_ok = _replace_var(content, rev_var, new_rev)
+    if not rev_ok:
+        raise ValueError("could not find %s in pin file" % rev_var)
+    content, sha_ok = _replace_var(content, sha_var, new_sha)
+    if not sha_ok:
+        raise ValueError("could not find %s in pin file" % sha_var)
+    return content
+
+
+def _pin_slug(target: PinTarget) -> str:
+    cleaned = "%s-%s" % (target.path, target.rev_var)
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", cleaned).strip("-").lower()
+
+
+def _pin_pr_body(self_repo: str, target: PinTarget, old_rev: str,
+                 new_rev: str, sha256: str, pr_titles: Sequence[str]) -> str:
+    short_old = old_rev[:12] if len(old_rev) >= 12 else old_rev
+    short_new = new_rev[:12] if len(new_rev) >= 12 else new_rev
+    why_lines = [
+        "Bump Loom pin in %s from %s to %s." % (target.path, short_old, short_new),
+        "This update brings recent merged changes from %s:" % self_repo,
+    ]
+    if pr_titles:
+        for title in pr_titles:
+            why_lines.append("- %s" % title.strip())
+    else:
+        why_lines.append("- Upstream changes through %s" % short_new)
+
+    why_text = "\n".join(why_lines)
+    criteria_lines = [
+        "- [ ] Pinned revision is updated to %s (%s)" % (new_rev, short_new),
+        "- [ ] Pinned tarball sha256 is updated to %s" % sha256,
+        "- [ ] Target service builds and passes checks with the new pin",
+    ]
+    return "\n\n".join([
+        "## Why\n\n%s" % why_text,
+        "## Acceptance criteria\n\n%s" % "\n".join(criteria_lines),
+        "Size: S",
+        "## Out of scope\n\n- Changes outside %s pin variables." % target.path,
+    ])
+
+
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
@@ -327,9 +473,11 @@ class Settings:
                  self_repo: str = "",
                  invariant_goal: str = "",
                  plan_check: str = invariants.DEFAULT_PLAN_CHECK,
-                 report_digest: Sequence[Tuple[int, int]] = (),
-                 health_urls: str = "",
-                 health_every: int = health.EVERY) -> None:
+                  report_digest: Sequence[Tuple[int, int]] = (),
+                  health_urls: str = "",
+                  health_every: int = health.EVERY,
+                  pin_targets: Sequence[PinTarget] = (),
+                  deploy_check: str = "unittest") -> None:
         self.home = home
         # "owner/name#goal=https://..." entries: each goal home's health
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
@@ -374,6 +522,8 @@ class Settings:
         self.invariant_goal = invariant_goal
         # The review bot's check that reads a pull request's plan (its body).
         self.plan_check = plan_check
+        self.pin_targets = tuple(pin_targets)
+        self.deploy_check = deploy_check
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Settings":
@@ -434,7 +584,9 @@ class Settings:
                    plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
                                or invariants.DEFAULT_PLAN_CHECK),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
-                   health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY))
+                   health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
+                   pin_targets=parse_pin_targets(env.get("LOOM_PIN_TARGETS", "")),
+                   deploy_check=env.get("LOOM_DEPLOY_CHECK", "").strip() or "unittest")
 
 
 def _seconds(raw: str, default: int) -> int:
@@ -1683,6 +1835,158 @@ class Station:
                 continue
             _say("shipped %s#%d: deployed %s carries #%d" % (
                 repo, number, revision[:12], int(pr["number"])))
+
+    def _ci_passed(self, repo: str, sha: str) -> bool:
+        """Whether the revision's deploy CI check passed."""
+        check = self.s.deploy_check
+        try:
+            data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?check_name=%s"
+                                % (repo, sha, quote(check, safe=""))).data
+        except GitHubError as err:
+            _say("could not check CI on %s for %s: %s" % (repo, sha[:12], err))
+            return False
+        runs = (data or {}).get("check_runs") if isinstance(data, dict) else []
+        if not runs:
+            _say("no CI check run %r found on %s for %s" % (check, repo, sha[:12]))
+            return False
+        success = all(isinstance(r, dict) and r.get("status") == "completed"
+                      and r.get("conclusion") == "success" for r in runs)
+        if not success:
+            conclusions = ", ".join(str(r.get("conclusion") or r.get("status"))
+                                    for r in runs if isinstance(r, dict))
+            _say("CI check %r on %s for %s did not pass (%s)" % (check, repo, sha[:12], conclusions))
+            return False
+        return True
+
+    def _download_tarball_twice(self, repo: str, revision: str) -> Optional[str]:
+        """Download tarball twice, verify sha256 matches. Returns sha256 or None."""
+        try:
+            raw1 = self.gh.raw("GET", "/repos/%s/tarball/%s" % (repo, revision))
+            raw2 = self.gh.raw("GET", "/repos/%s/tarball/%s" % (repo, revision))
+        except GitHubError as err:
+            _say("tarball download failed for %s on %s: %s" % (revision[:12], repo, err))
+            return None
+        sha1 = hashlib.sha256(raw1).hexdigest()
+        sha2 = hashlib.sha256(raw2).hexdigest()
+        if sha1 != sha2:
+            _say("tarball downloads for %s differ (%s vs %s); not opening pin PR"
+                 % (revision[:12], sha1[:12], sha2[:12]))
+            return None
+        return sha1
+
+    def _merged_prs_since(self, repo: str, revision: str,
+                          pinned_rev: Optional[str]) -> List[str]:
+        """Titles of merged pull requests in repo carried by revision but not pinned_rev."""
+        titles: List[str] = []
+        try:
+            resp = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100" % repo)
+            prs = resp.data if isinstance(resp.data, list) else []
+            for pr in prs:
+                if not isinstance(pr, dict) or not pr.get("merged_at"):
+                    continue
+                sha = str(pr.get("merge_commit_sha") or "")
+                if not sha:
+                    continue
+                if self.ancestor(sha, revision):
+                    if pinned_rev and self.ancestor(sha, pinned_rev):
+                        continue
+                    title = " ".join(str(pr.get("title") or "").split())
+                    if title:
+                        titles.append(title)
+        except GitHubError as err:
+            _say("could not read merged pull requests for %s: %s" % (repo, err))
+        return titles
+
+    def _ensure_branch(self, repo: str, branch: str, base_sha: str) -> None:
+        try:
+            self.gh.rest("POST", "/repos/%s/git/refs" % repo,
+                         {"ref": "refs/heads/" + branch, "sha": base_sha})
+        except GitHubError as err:
+            if err.status in (422, 400):
+                self.gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, branch),
+                             {"sha": base_sha, "force": True})
+            else:
+                raise
+
+    def _bump_pin_target(self, target: PinTarget, revision: str) -> None:
+        """Check and update one pin target for deployed revision."""
+        if not self._ci_passed(self.s.self_repo, revision):
+            return
+        repo_data = self.gh.rest("GET", "/repos/%s" % target.repo).data or {}
+        default_branch = str((repo_data if isinstance(repo_data, dict) else {}).get("default_branch") or "main")
+        file_resp = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                                 % (target.repo, target.path, default_branch), ok=(404,))
+        if file_resp.status != 200 or not isinstance(file_resp.data, dict) or "content" not in file_resp.data:
+            _say("could not read %s from %s on %s" % (target.path, target.repo, default_branch))
+            return
+        file_data = file_resp.data
+        try:
+            raw_content = base64.b64decode(file_data["content"].encode("ascii")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as err:
+            _say("could not decode %s from %s: %s" % (target.path, target.repo, err))
+            return
+        pinned_rev = _find_pinned_rev(raw_content, target.rev_var)
+        if pinned_rev == revision or (pinned_rev and len(pinned_rev) >= 12 and revision.startswith(pinned_rev)):
+            _say("%s in %s is already pinned to %s" % (target.path, target.repo, revision[:12]))
+            return
+
+        sha256 = self._download_tarball_twice(self.s.self_repo, revision)
+        if sha256 is None:
+            return
+
+        pr_titles = self._merged_prs_since(self.s.self_repo, revision, pinned_rev)
+        branch = "loom/pin-%s" % _pin_slug(target)
+        open_prs = [p for p in self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100"
+                                            % target.repo).data or [] if isinstance(p, dict)]
+        existing_pr = next((p for p in open_prs if (p.get("head") or {}).get("ref") == branch), None)
+
+        try:
+            updated_content = _update_pin_file(raw_content, target.rev_var, revision,
+                                               target.sha_var, sha256)
+        except ValueError as err:
+            _say("could not update pin variables in %s: %s" % (target.path, err))
+            return
+        updated_b64 = base64.b64encode(updated_content.encode("utf-8")).decode("ascii")
+        pr_title = "Bump Loom pin in %s to %s" % (target.path, revision[:12])
+        pr_body = _pin_pr_body(self.s.self_repo, target, pinned_rev or "previous",
+                               revision, sha256, pr_titles)
+
+        if existing_pr is None:
+            ref_resp = self.gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (target.repo, default_branch)).data or {}
+            base_sha = str((ref_resp.get("object") or {}).get("sha") or ref_resp.get("sha") or "")
+            self._ensure_branch(target.repo, branch, base_sha)
+            self.gh.rest("PUT", "/repos/%s/contents/%s" % (target.repo, target.path),
+                         {"message": pr_title, "content": updated_b64,
+                          "sha": file_data["sha"], "branch": branch})
+            new_pr = self.gh.rest("POST", "/repos/%s/pulls" % target.repo,
+                                  {"title": pr_title, "head": branch,
+                                   "base": default_branch, "body": pr_body}).data
+            url = (new_pr or {}).get("html_url") if isinstance(new_pr, dict) else branch
+            _say("opened pin pull request in %s: %s" % (target.repo, url))
+        else:
+            branch_file = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                                       % (target.repo, target.path, branch)).data or {}
+            branch_sha = (branch_file if isinstance(branch_file, dict) else {}).get("sha") or file_data["sha"]
+            self.gh.rest("PUT", "/repos/%s/contents/%s" % (target.repo, target.path),
+                         {"message": pr_title, "content": updated_b64,
+                          "sha": branch_sha, "branch": branch})
+            self.gh.rest("PATCH", "/repos/%s/pulls/%d" % (target.repo, int(existing_pr["number"])),
+                         {"title": pr_title, "body": pr_body})
+            _say("updated pin pull request #%d in %s" % (int(existing_pr["number"]), target.repo))
+
+    def bump_pins(self) -> None:
+        """Open or update pin pull requests for deployed Loom revision."""
+        if not self.s.pin_targets:
+            return
+        deployed = self._deployed()
+        if deployed is None or not self.s.self_repo:
+            return
+        revision, _ = deployed
+        for target in self.s.pin_targets:
+            try:
+                self._bump_pin_target(target, revision)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("could not bump pin target %s in %s: %s" % (target.path, target.repo, err))
 
     def hand_back(self) -> None:
         """Return completed lane PRs with failed checks or bot findings."""
@@ -4255,7 +4559,7 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.ship_deployed, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.ship_deployed, self.bump_pins, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,

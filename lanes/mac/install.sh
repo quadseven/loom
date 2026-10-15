@@ -212,6 +212,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REWRITE_PRIVATE_CMD</key><string>$(xml "${LOOM_REWRITE_PRIVATE_CMD:-}")</string>
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
+    <key>LOOM_PIN_TARGETS</key><string>$(xml "${LOOM_PIN_TARGETS:-}")</string>
+    <key>LOOM_DEPLOY_CHECK</key><string>$(xml "${LOOM_DEPLOY_CHECK:-}")</string>
   </dict>
 </dict>
 </plist>

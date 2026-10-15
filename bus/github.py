@@ -170,6 +170,17 @@ class GitHub:
             self._keep_answer(url, status, data, resp_headers)
         return Response(status, data, resp_headers.get("etag"), resp_headers)
 
+    def raw(self, method: str, path: str, ok: Tuple[int, ...] = ()) -> bytes:
+        url = self._url(path)
+        headers, payload = self._request(None, None)
+        status, raw_headers, raw = self._transport_with_retry(method, url, headers, payload)
+        resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
+        self._note_rate(resp_headers)
+        self._count(method, url, status)
+        if not (200 <= status < 300 or status in ok):
+            raise GitHubError("%s %s -> %d" % (method, path, status), status, "")
+        return raw or b""
+
     def _request(self, body: Any,
                  if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
         """The headers and encoded body for one request."""

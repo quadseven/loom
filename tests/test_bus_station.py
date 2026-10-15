@@ -1,8 +1,8 @@
-from __future__ import annotations
-
+import base64
 import calendar
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -14,12 +14,12 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import brain, proof, spend, station, tickets  # noqa: E402
+from bus import brain, hunt_plan, proof, spend, station, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -71,6 +71,12 @@ class FakeGitHub:
         self.open_issues = []
         # Issues of other repos, read by an After: line: (repo, number) -> issue.
         self.foreign = {}
+        self.repo_contents = {}
+        self.repo_pulls = {}
+        self.repo_refs = {}
+        self.tarball_bytes = b"fake-tarball-content"
+        self.tarball_bytes_sequence = []
+        self.check_runs = {}
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -156,9 +162,83 @@ class FakeGitHub:
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
-        if method == "GET" and parts.path == "/repos/%s" % REPO:
-            return reply(200, {"full_name": REPO, "private": self.private,
+        m_repo = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$", parts.path)
+        if method == "GET" and m_repo:
+            r = m_repo.group(1)
+            return reply(200, {"full_name": r, "private": self.private if r == REPO else False,
                                "default_branch": "main"})
+        m_tarball = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/tarball/([^/]+)$", parts.path)
+        if method == "GET" and m_tarball:
+            payload = self.tarball_bytes_sequence.pop(0) if self.tarball_bytes_sequence else self.tarball_bytes
+            return 200, {"content-type": "application/x-gzip"}, payload
+        m_checks = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/commits/([^/]+)/check-runs$", parts.path)
+        if method == "GET" and m_checks:
+            r, sha = m_checks.group(1), m_checks.group(2)
+            q = parse_qs(parts.query)
+            c_name = q.get("check_name", [""])[0]
+            runs = self.check_runs.get((r, sha, c_name))
+            if runs is None:
+                runs = self.check_runs.get((r, sha, ""))
+            if runs is None:
+                runs = [{"name": c_name or "unittest", "status": "completed", "conclusion": "success"}]
+            return reply(200, {"check_runs": runs})
+        m_ref = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/git/ref/heads/(.+)$", parts.path)
+        if method == "GET" and m_ref:
+            r, b = m_ref.group(1), m_ref.group(2)
+            sha = self.repo_refs.get((r, b), "0" * 40)
+            return reply(200, {"ref": "refs/heads/" + b, "object": {"sha": sha}, "sha": sha})
+        m_refs_post = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/git/refs$", parts.path)
+        if method == "POST" and m_refs_post:
+            r = m_refs_post.group(1)
+            ref_name = data.get("ref", "").replace("refs/heads/", "")
+            self.repo_refs[(r, ref_name)] = data.get("sha", "")
+            return reply(201, {"ref": data.get("ref"), "object": {"sha": data.get("sha")}})
+        if method == "PATCH" and m_ref:
+            r, b = m_ref.group(1), m_ref.group(2)
+            self.repo_refs[(r, b)] = data.get("sha", "")
+            return reply(200, {"ref": "refs/heads/" + b, "object": {"sha": data.get("sha")}})
+        m_contents = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/contents/(.+)$", parts.path)
+        if method == "GET" and m_contents:
+            r, fpath = m_contents.group(1), m_contents.group(2)
+            content = self.repo_contents.get((r, fpath))
+            if content is None:
+                return reply(404, {"message": "Not Found"})
+            b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+            blob_sha = hashlib.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content.encode("utf-8")).hexdigest()
+            return reply(200, {"content": b64, "sha": blob_sha, "encoding": "base64", "name": os.path.basename(fpath)})
+        if method == "PUT" and m_contents:
+            r, fpath = m_contents.group(1), m_contents.group(2)
+            raw_bytes = base64.b64decode(data["content"].encode("ascii"))
+            self.repo_contents[(r, fpath)] = raw_bytes.decode("utf-8")
+            new_sha = hashlib.sha1(b"blob " + str(len(raw_bytes)).encode("ascii") + b"\0" + raw_bytes).hexdigest()
+            return reply(200, {"content": {"sha": new_sha}})
+        m_pulls = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pulls$", parts.path)
+        if method == "GET" and m_pulls:
+            r = m_pulls.group(1)
+            if r == REPO:
+                return reply(200, self.pulls)
+            return reply(200, self.repo_pulls.get(r, []))
+        if method == "POST" and m_pulls:
+            r = m_pulls.group(1)
+            prs = self.repo_pulls.setdefault(r, [])
+            num = len(prs) + 1
+            pr = {"number": num, "title": data.get("title"), "body": data.get("body"),
+                  "head": {"ref": data.get("head")}, "base": {"ref": data.get("base")},
+                  "state": "open", "html_url": "https://github.com/%s/pull/%d" % (r, num)}
+            prs.append(pr)
+            return reply(201, pr)
+        m_pull_patch = re.match(r"^/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pulls/(\d+)$", parts.path)
+        if method == "PATCH" and m_pull_patch:
+            r, num = m_pull_patch.group(1), int(m_pull_patch.group(2))
+            prs = self.repo_pulls.get(r, [])
+            pr = next((p for p in prs if p["number"] == num), None)
+            if pr:
+                if "title" in data:
+                    pr["title"] = data["title"]
+                if "body" in data:
+                    pr["body"] = data["body"]
+                return reply(200, pr)
+            return reply(404, {"message": "Not Found"})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -3887,3 +3967,137 @@ class UnseenLiveEvidenceTest(unittest.TestCase):
     def test_non_live_criteria_are_not_judged(self):
         self.assertEqual(station.unseen_live_evidence(
             {"criteria": [{"criterion": "A test fails without it", "evidence": "it would fail"}]}), "")
+
+
+class PinPullRequestTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.target_repo = "example-owner/deploy-repo"
+        self.target_path = "config/pin.yaml"
+        self.initial_content = (
+            "# Service deployment pin\n"
+            "LOOM_REV: 0000000000000000000000000000000000000000\n"
+            "LOOM_SHA: 1111111111111111111111111111111111111111111111111111111111111111\n"
+        )
+        self.fake.repo_contents[(self.target_repo, self.target_path)] = self.initial_content
+        self.pin_target = station.PinTarget(self.target_repo, self.target_path, "LOOM_REV", "LOOM_SHA")
+        self.settings.pin_targets = (self.pin_target,)
+        self.settings.self_repo = REPO
+        self.deployed_r1 = "aaaa000000000000000000000000000000000000"
+        self.deployed_r2 = "bbbb000000000000000000000000000000000000"
+        self.tarball_r1 = b"tarball-content-r1"
+        self.tarball_r2 = b"tarball-content-r2"
+        self.fake.tarball_bytes = self.tarball_r1
+
+    def record_deploy(self, revision, at=None):
+        at = int(time.time()) if at is None else at
+        d = os.path.join(self.home, "state", "station")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "deployed.json"), "w") as fh:
+            json.dump({"revision": revision, "at": at}, fh)
+
+    def test_parse_pin_targets(self):
+        # Colon-separated format
+        parsed = station.parse_pin_targets("owner/repo:path/to/file:REV_VAR:SHA_VAR")
+        self.assertEqual(parsed, [station.PinTarget("owner/repo", "path/to/file", "REV_VAR", "SHA_VAR")])
+
+        # Multiple entries separated by whitespace or newline
+        multi = station.parse_pin_targets("r1:p1:v1:s1\nr2:p2:v2:s2 r3:p3:v3:s3")
+        self.assertEqual(len(multi), 3)
+
+        # JSON array format
+        json_raw = json.dumps([
+            {"repo": "r1", "path": "p1", "rev_var": "v1", "sha_var": "s1"},
+            ["r2", "p2", "v2", "s2"]
+        ])
+        parsed_json = station.parse_pin_targets(json_raw)
+        self.assertEqual(len(parsed_json), 2)
+        self.assertEqual(parsed_json[0].repo, "r1")
+        self.assertEqual(parsed_json[1].rev_var, "v2")
+
+        # Empty / whitespace
+        self.assertEqual(station.parse_pin_targets(""), [])
+        self.assertEqual(station.parse_pin_targets("   "), [])
+
+    def test_moved_green_revision_opens_pin_pr_and_second_pass_updates_it(self):
+        self.record_deploy(self.deployed_r1)
+        self.fake.tarball_bytes = self.tarball_r1
+        sha1 = hashlib.sha256(self.tarball_r1).hexdigest()
+
+        # Add closed merged PR to REPO that revision carries
+        self.fake.pulls.append({
+            "number": 101, "title": "Add priorities card (#101)",
+            "merged_at": "2026-10-15T12:00:00Z",
+            "merge_commit_sha": self.deployed_r1,
+        })
+
+        with mock.patch.object(station.Station, "_is_ancestor", return_value=True):
+            self.run_pass()
+
+        # Verify PR was opened in target_repo
+        prs = self.fake.repo_pulls.get(self.target_repo, [])
+        self.assertEqual(len(prs), 1)
+        pr1 = prs[0]
+        self.assertEqual(pr1["number"], 1)
+        self.assertEqual(pr1["title"], "Bump Loom pin in %s to %s" % (self.target_path, self.deployed_r1[:12]))
+        self.assertIn("Add priorities card (#101)", pr1["body"])
+        self.assertIn(sha1, pr1["body"])
+        self.assertEqual(hunt_plan.problems(pr1["body"]), [])
+
+        # Check file in target repo was updated
+        updated_content = self.fake.repo_contents[(self.target_repo, self.target_path)]
+        self.assertIn(self.deployed_r1, updated_content)
+        self.assertIn(sha1, updated_content)
+
+        # Pass 2: Main moves to deployed_r2
+        self.record_deploy(self.deployed_r2)
+        self.fake.tarball_bytes = self.tarball_r2
+        sha2 = hashlib.sha256(self.tarball_r2).hexdigest()
+        self.fake.pulls.append({
+            "number": 102, "title": "Fix dashboard labels (#102)",
+            "merged_at": "2026-10-15T14:00:00Z",
+            "merge_commit_sha": self.deployed_r2,
+        })
+
+        with mock.patch.object(station.Station, "_is_ancestor", return_value=True):
+            self.run_pass()
+
+        # Verify second pass updated the existing PR rather than opening another
+        prs_after = self.fake.repo_pulls.get(self.target_repo, [])
+        self.assertEqual(len(prs_after), 1)
+        pr_updated = prs_after[0]
+        self.assertEqual(pr_updated["number"], 1)
+        self.assertEqual(pr_updated["title"], "Bump Loom pin in %s to %s" % (self.target_path, self.deployed_r2[:12]))
+        self.assertIn("Fix dashboard labels (#102)", pr_updated["body"])
+        self.assertIn(sha2, pr_updated["body"])
+        self.assertEqual(hunt_plan.problems(pr_updated["body"]), [])
+
+        # Verify file has revision 2 and sha2
+        content_after = self.fake.repo_contents[(self.target_repo, self.target_path)]
+        self.assertIn(self.deployed_r2, content_after)
+        self.assertIn(sha2, content_after)
+
+    def test_tarball_differing_downloads_opens_nothing_and_logs_why(self):
+        self.record_deploy(self.deployed_r1)
+        self.fake.tarball_bytes_sequence = [b"download-first", b"download-second"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+
+        prs = self.fake.repo_pulls.get(self.target_repo, [])
+        self.assertEqual(prs, [])
+        self.assertIn("tarball downloads for aaaa00000000 differ", err.getvalue())
+
+    def test_unpassed_ci_opens_nothing_and_logs_why(self):
+        self.record_deploy(self.deployed_r1)
+        self.fake.check_runs[(REPO, self.deployed_r1, "unittest")] = [
+            {"name": "unittest", "status": "completed", "conclusion": "failure"}
+        ]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+
+        prs = self.fake.repo_pulls.get(self.target_repo, [])
+        self.assertEqual(prs, [])
+        self.assertIn("CI check 'unittest' on %s for aaaa00000000 did not pass" % REPO, err.getvalue())
+

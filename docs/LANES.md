@@ -120,6 +120,13 @@ merged Loom pull request is running a minute after its CI passes on main,
 and the pass after the deploy moves its ticket to `loom:shipped`
 (`LOOM_SELF_REPO`, default `LOOM_STATUS_REPO`; docs/BRAIN.md, Shipping Loom
 itself).
+When `LOOM_PIN_TARGETS` is set (naming one or more targets as
+`repo:path:rev_var:sha_var`), after deploying a new Loom revision whose CI check
+(`LOOM_DEPLOY_CHECK`, default `unittest`) passed, the station compares each
+target's pinned revision. When main has moved, it opens or updates one pin
+pull request in the target repo setting the new revision and the verified
+tarball sha256 (downloaded twice and confirmed identical), using the Hunt
+Plan body shape with merged Loom pull requests listed by title.
 The station turns trusted
 `loom:briefed` ticket issues into briefs in the lane inboxes
 (`<owner>.<name>-<number>.md`, with an `Issue:` line), marks the ticket
