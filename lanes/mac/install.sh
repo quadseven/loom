@@ -155,6 +155,7 @@ done
 # prompts, such as opencode-go/kimi-k2.7-code, never a public-only one), and
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
+# LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
 # are filed on, and the review bot's plan check, docs/LANES.md Invariants). Runs from
 # this checkout, like the lanes, through
@@ -190,6 +191,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
     <key>LOOM_SELF_REPO</key><string>$(xml "${LOOM_SELF_REPO:-}")</string>
+    <key>LOOM_PIN_TARGETS</key><string>$(xml "${LOOM_PIN_TARGETS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>

@@ -85,6 +85,16 @@ pass, oldest merge first. A deploy that did not happen records nothing, so it
 ships nothing. Tickets of every other repo are never moved here; their goal
 home's ship rules decide.
 
+Set `LOOM_PIN_TARGETS` in the install environment to a private JSON array of
+`repo`, `path`, `revision_var`, and `sha256_var` objects (see `.env.example`).
+The station copies it into its plist. After deploying a green Loom revision,
+each station pass checks the target's pin file, downloads the Loom tarball
+twice, and opens or updates one pull request per target with the new revision
+and matching SHA-256. It lists merged Loom pull request titles in a Hunt Plan
+body. A person or normal review automation must review and merge that pull
+request; the station never merges it. The station needs GitHub write access to
+the target repository. If pinning fails, the next station pass retries.
+
 ## Ticket issues
 
 Title: `<short title>`. The ticket id is the issue number; the branch is
