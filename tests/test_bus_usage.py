@@ -88,6 +88,17 @@ class UsageTests(unittest.TestCase):
         self.assertEqual([(row["window"], row["used_pct"]) for row in rows],
                          [("5-hour", 63.0), ("weekly", 86.0)])
 
+    def test_each_record_carries_why_its_held_lanes_are_held(self):
+        state = Path(self.home) / "state" / "usage"
+        state.mkdir(parents=True)
+        (state / "zen.json").write_text(json.dumps(
+            {"lane": "zen", "available": False, "reason": "limit: out of credit; unavailable until 2030-01-02T00:00:00Z"}))
+        (state / "zai.json").write_text(json.dumps({"lane": "zai", "available": True, "reason": "ready"}))
+        (state / "workersai.json").write_text("not json")
+        rows = usage.collect(self.home, now=1000, lane_names=["zen", "zai", "workersai"])
+        holds = {lane: reason for row in rows for lane, reason in row["holds"].items()}
+        self.assertEqual(holds, {"zen": "limit: out of credit; unavailable until 2030-01-02T00:00:00Z"})
+
     def test_unexposed_provider_and_raising_adapter_are_reported(self):
         def broken(_home, _lanes, _env, _now):
             raise RuntimeError("details are not included")

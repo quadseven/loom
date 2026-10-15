@@ -67,8 +67,16 @@ def build_improvements(journals, tickets, metrics_comments):
     metrics = parse_metrics(metrics_comments)
     latest = metrics[0][1] if metrics else {}
     previous = metrics[1][1] if len(metrics) > 1 else {}
-    records = [record for journal in journals
-               for record in _journal_records(journal, tickets, latest, previous)]
+    newest_first = sorted(journals, key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    records, seen = [], set()
+    for journal in newest_first:
+        for record in _journal_records(journal, tickets, latest, previous):
+            # The same friction is often carried from tick to tick: one card
+            # per friction, from the newest journal that names it.
+            key = _clean_text(record["friction"])
+            if key not in seen:
+                seen.add(key)
+                records.append(record)
     return {"records": records, "latest": latest, "previous": previous,
             "metrics_available": bool(metrics)}
 
@@ -127,6 +135,8 @@ def _ticket_refs_journal(tickets, journal):
 
 
 def _why_quotes_friction(why_clean, friction_clean):
+    if not why_clean:
+        return False  # an empty Why is in every string, so it quotes nothing
     if friction_clean in why_clean or why_clean in friction_clean:
         return True
     words = [w for w in friction_clean.split() if len(w) > 3]
@@ -168,9 +178,15 @@ def _moved_metric(ticket, state, latest, previous):
                  if name in previous and value["value"] != previous[name]["value"]), None)
 
 
+# The loop's four stages, by index: noticed in a journal, ticketed, shipped,
+# and moved a factory number.
+LOOP_STAGES = (("noticed", "in a tick journal"), ("ticketed", "on loom#30 or grug#1143"),
+               ("shipped", "live on the factory"), ("moved", "a factory number changed"))
+
+
 def _improvement_stage(ticket, state, moved):
     if moved:
-        return 4
+        return 3
     if ticket and state in ("shipped", "merged", "verified"):
         return 2
     return 1 if ticket else 0
@@ -213,43 +229,107 @@ def build_scoreboard(pull_requests):
     return tiers
 
 
+def _short_ref(repo, number):
+    return "%s#%s" % (str(repo).split("/")[-1], number)
+
+
 def _improvement_card(row):
     esc = html.escape
     ticket = row["ticket"]
     ref = row["journal"].get("html_url") or ""
     journal = '<a href="%s">journal</a>' % esc(ref, True) if ref else "journal"
-    ticket_html = ('<a href="%s">#%s %s</a>' % (_ticket_href(ticket["repo"], ticket["number"]),
-                   esc(str(ticket["number"])), esc(str(ticket.get("title") or "ticket")))
-                   if ticket else "ticket not found")
-    moved = '<strong class="good">moved: %s</strong>' % esc(row["moved"]) if row["moved"] else ""
+    ticket_html = ('<a href="%s">%s %s</a>' % (_ticket_href(ticket["repo"], ticket["number"]),
+                   esc(_short_ref(ticket["repo"], ticket["number"])), esc(str(ticket.get("title") or "ticket")))
+                   if ticket else "not ticketed yet")
+    moved = ('<p class="moved good">moved: %s</p>' % esc(row["moved"])) if row["moved"] else ""
     segments = "".join('<span class="%s"></span>' % (
-        "done" if index < row["stage"] else "current" if index == row["stage"] else "")
+        ("moved" if index == 3 else "done") if index <= row["stage"] else "")
         for index in range(4))
-    return '<article class="improvement"><div class="progress four">%s</div><p>"%s"</p><p>%s / %s / %s %s</p></article>' % (
-        segments, esc(row["friction"]), journal, ticket_html, esc(str(row["state"])), moved)
+    state = str(row["state"])
+    return ('<article class="improvement"><div class="loop-steps">%s</div>'
+            '<p class="friction">"%s"</p>'
+            '<div class="improvement-meta"><span>%s -&gt; %s</span><span class="state-%s">%s</span></div>%s</article>') % (
+        segments, esc(row["friction"]), journal, ticket_html,
+        esc(state.replace(" ", "-")), esc(state), moved)
+
+
+# Each daily number reduced to the value a person reads first, and what it
+# counts. The metrics comment line carries every detail; a card shows one.
+_SUMMARY = (
+    ("Flow", r"median ([\d.]+h)", r"(\d+) PRs? >6h", "{} PR over 6h"),
+    ("Throughput", r"verified (\d+/\d+)", None, "tickets verified"),
+    ("Spread", r"Anthropic (\d+/\d+)", r"idle (\d+/\d+)", "idle {} passes"),
+    ("Escalation", r"(\d+) tickets? failed twice", None, "failed twice on one model"),
+    ("Quality", None, None, None),
+    ("Autonomy", r"(\d+) asks? opened", None, "asks opened"),
+    ("Visibility", None, None, None),
+    ("Self-repair", r"(\d+) un-ticketed", None, "un-ticketed factory faults"),
+    ("Generic", r"(\d+) files?", None, "files naming one product"),
+)
+
+
+def metric_summary(name, value):
+    """(value, what it counts) for one daily number, never the raw line."""
+    value = str(value or "")
+    if name == "Quality":
+        parts = [p.strip() for p in value.split(";") if p.strip()]
+        worst = next((p for p in parts if not p.startswith("0 ")), parts[0] if parts else "")
+        number = re.match(r"(\d+)\s+(.*)", worst)
+        return (number.group(1), number.group(2)) if number else (worst[:24], "")
+    if name == "Visibility":
+        ages = [float(age) for age in re.findall(r"(-?[\d.]+)h", value)]
+        return ("%.1fh" % max(ages), "oldest goal report") if ages else ("missing", "no goal report")
+    for key, main, extra, label in _SUMMARY:
+        if key != name or not main:
+            continue
+        found = re.search(main, value)
+        if not found:
+            break
+        more = re.search(extra, value) if extra else None
+        if name == "Flow":
+            return found.group(1), label.format(more.group(1)) if more else "median briefed to merged"
+        if name == "Spread":
+            used, total = (int(x) for x in found.group(1).split("/"))
+            share = "%d%%" % round(100 * used / total) if total else found.group(1)
+            return share, "Anthropic share; " + label.format(more.group(1)) if more else "Anthropic share"
+        return found.group(1), label
+    first = re.match(r"\s*(\S+)", value)
+    return (first.group(1)[:24] if first else "missing"), ""
 
 
 def _factory_card(name, current, old):
     esc = html.escape
+    value, counts = metric_summary(name, current["value"])
     if old is None:
-        direction, direction_class = "previous value missing", ""
+        was, direction = "previous value missing", "no earlier day"
     else:
-        # Better or worse only when the target flips; a number that
-        # held its side of the target says so, never "better".
+        was = "was %s" % metric_summary(name, old["value"])[0]
+        # Better or worse only when the target flips; a number that held its
+        # side of the target says so, never "better".
         direction = ("better" if current["passed"] and not old["passed"] else
                      "worse" if old["passed"] and not current["passed"] else
                      "still passing" if current["passed"] else "still failing")
-        direction_class = "good" if current["passed"] else "bad"
-    return '<article class="card metric factory-card"><span class="metric-val">%s</span><strong class="metric-name">%s</strong><span class="metric-prev %s">was %s / %s</span></article>' % (
-        esc(current["value"]), esc(name), esc(direction_class), esc(old["value"] if old is not None else "missing"), esc(direction))
+    tone = "good" if current["passed"] else "bad"
+    return ('<article class="card factory-card"><span class="metric-val">%s</span>'
+            '<strong class="metric-name">%s</strong><span class="metric-counts">%s</span>'
+            '<span class="metric-prev %s">%s / %s</span></article>') % (
+        esc(value), esc(name), esc(counts), tone, esc(was), esc(direction))
 
 
 def render_improving(data):
-    parts = ['<section class="card"><h2>Noticed to moved</h2><div class="improvement-list">']
-    if not data["records"]:
+    records = data["records"]
+    parts = ['<p class="page-lede">Loom is a goal too (loom#30). Each tick\'s journal notes what slowed '
+             'the factory down; the biggest becomes a ticket, and it counts only when a factory number moves.</p>',
+             '<div class="loop-stages">']
+    for index, (name, sub) in enumerate(LOOP_STAGES):
+        count = sum(1 for row in records if row["stage"] >= index)
+        parts.append('<div class="loop-stage%s"><span class="loop-count">%d</span><span class="loop-name">%s</span>'
+                     '<small>%s</small></div>' % (" moved" if index == 3 else "", count, name, sub))
+    parts.append('</div><section><h2 class="label">Noticed to moved</h2><div class="improvement-list">')
+    if not records:
         parts.append('<p class="empty-state">No friction lines in the journals yet.</p>')
-    parts.extend(_improvement_card(row) for row in data["records"])
-    parts.append("</div></section><section><h2>Factory numbers</h2>")
+    parts.extend(_improvement_card(row) for row in records)
+    parts.append('</div></section><section><h2 class="label">The nine factory numbers, vs the day before</h2>')
     if not data["metrics_available"]:
         parts.append('<p class="empty-state">Daily metrics are missing: no metrics comment was found.</p>')
     else:
@@ -311,37 +391,66 @@ def parse_lane_rows(body):
     return rows
 
 
-def render_lanes(data):
+def _lane_card(lane):
     esc = html.escape
-    parts = ['<section><h2>Anthropic share</h2>']
+    ticket = lane.get("ticket")
+    state = "busy" if ticket else ("free" if lane["available"] else "held")
+    heartbeat = format_heartbeat(lane.get("heartbeat"))
+    if ticket:
+        line = '<a href="%s">%s %s</a> - %s' % (
+            _ticket_href(ticket["repo"], ticket["number"]), esc(_short_ref(ticket["repo"], ticket["number"])),
+            esc(str(ticket.get("title") or "ticket")), esc(heartbeat))
+    elif lane.get("reason"):
+        line = "%s - %s" % (esc(lane["reason"]), esc(heartbeat))
+    else:
+        line = "waiting for work - %s" % esc(heartbeat)
+    quota = lane.get("quota")
+    if quota is None:
+        quota_html = '<div class="quota-row"><span class="quota-label">quota missing</span></div>'
+    else:
+        pct = max(0, min(100, int(quota)))
+        quota_html = ('<div class="quota-row"><div class="quota%s"><span style="width:%d%%"></span></div>'
+                      '<span class="quota-label">quota %d%% used</span></div>') % (" low" if pct >= 75 else "", pct, pct)
+    return ('<article class="card lane-card lane-%s"><div class="lane-head"><i class="lane-dot"></i>'
+            '<strong>%s</strong><span class="lane-state">%s</span></div>'
+            '<span class="lane-model">%s</span><p>%s</p>%s</article>') % (
+        state, esc(lane["lane"]), state, esc(lane.get("model") or "model missing"), line, quota_html)
+
+
+def _tier_card(tier, models):
+    esc = html.escape
+    most = max((sum(c[k] for k in ("merged", "open", "closed")) for c in models.values()), default=0) or 1
+    rows = []
+    for model, counts in sorted(models.items(), key=lambda item: -sum(item[1][k] for k in ("merged", "open", "closed"))):
+        total = counts["merged"] + counts["open"] + counts["closed"]
+        bars = "".join('<span class="bar-%s" style="width:%.1f%%"></span>' % (key, 100.0 * counts[key] / most)
+                       for key in ("merged", "open", "closed"))
+        rows.append('<div class="model-row"><div><span class="model-name">%s</span> <span class="lane-model">%s</span>'
+                    '<span class="model-label">%d PRs, %d merged / %d open / %d closed</span></div>'
+                    '<div class="stack">%s</div></div>' % (esc(model), esc(counts["lane"]), total,
+                                                          counts["merged"], counts["open"], counts["closed"], bars))
+    return '<section class="card tier-card"><h3 class="label">%s</h3>%s</section>' % (esc(tier.title()), "".join(rows))
+
+
+def render_lanes(data):
+    parts = ['<p class="page-lede">Easy work on free lanes and spark, medium on codex and opencode-go, '
+             'hard on Anthropic credit. At most half of runs on Anthropic.</p><section><h2 class="label">Anthropic share of runs</h2>']
     share = data.get("anthropic_share")
     if share is None:
         parts.append('<p class="empty-state">Share is missing: no lane run totals were available.</p>')
     else:
-        parts.append('<div class="share-track"><span style="width:%d%%"></span><i></i></div><p>%d%% of lane runs / cap 50%%</p>' % (min(100, share), share))
-    parts.append('</section><section><h2>Lanes</h2><div class="lane-grid">')
+        parts.append('<div class="share-track"><span style="width:%d%%"></span><i></i></div><p class="machine-fact">%d%% of lane runs / cap 50%%</p>' % (min(100, share), share))
+    parts.append('</section><section><h2 class="label">Lanes</h2><div class="lane-grid">')
     if not data.get("lanes"):
         parts.append('<p class="empty-state">Lane status is missing: no loom:lanes comment was found.</p>')
-    for lane in data.get("lanes", []):
-        availability = "busy" if lane["ticket"] else ("free" if lane["available"] else "held")
-        heartbeat = format_heartbeat(lane.get("heartbeat"))
-        ticket = lane.get("ticket")
-        ticket_html = ('<a href="%s">%s</a>' % (_ticket_href(ticket["repo"], ticket["number"]), esc(str(ticket["title"] or "ticket"))) if ticket else "")
-        line = "%s - %s" % (ticket_html, esc(heartbeat)) if ticket_html else esc(heartbeat)
-        quota = lane.get("quota")
-        quota_html = '<div class="quota"><span style="width:%d%%"></span></div>' % max(0, min(100, int(quota))) if quota is not None else '<small>quota missing</small>'
-        reason = ('<p>%s</p>' % esc(lane["reason"])) if lane.get("reason") else ""
-        parts.append('<article class="card lane-card"><strong>%s</strong><span>%s / %s</span><p>%s</p>%s%s</article>' % (
-            esc(lane["lane"]), esc(availability), esc(lane.get("model") or "model missing"),
-            line, reason, quota_html))
-    parts.append('</div></section><section><h2>Models by tier</h2>')
+    parts.extend(_lane_card(lane) for lane in data.get("lanes", []))
+    parts.append('</div></section><section><h2 class="label">Which model opened each lane PR</h2>'
+                 '<p class="legend"><span class="bar-merged"></span> merged <span class="bar-open"></span> open '
+                 '<span class="bar-closed"></span> closed</p><div class="tier-grid">')
     if not data.get("scoreboard"):
         parts.append('<p class="empty-state">Scoreboard is missing: no lane pull requests matched the runner footer.</p>')
-    for tier, models in data.get("scoreboard", {}).items():
-        parts.append('<h3>%s</h3>' % esc(tier.title()))
-        for model, counts in models.items():
-            parts.append('<article class="card metric"><strong>%s</strong><span>%s</span><span>%d merged / %d open / %d closed</span></article>' % (
-                esc(model), esc(counts["lane"]), counts["merged"], counts["open"], counts["closed"]))
+    parts.extend(_tier_card(tier, models) for tier, models in data.get("scoreboard", {}).items())
+    parts.append("</div></section>")
     return "".join(parts)
 
 
