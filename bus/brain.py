@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 import json
 import os
@@ -567,6 +568,11 @@ def live_criterion(body: Optional[str]) -> str:
     return _one_line(found.group(1), 300) if found else "(no Live criterion on the ticket)"
 
 
+# Concurrent GitHub reads in status: few enough that GitHub's burst limits
+# and dropped connections stay rare (each GET retries on its own).
+READ_WORKERS = 6
+
+
 def _shipped_at(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[datetime]:
     """When loom:shipped was last applied; the issue's update time if the
     events do not say."""
@@ -581,12 +587,13 @@ def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: dateti
                ) -> List[Tuple[datetime, Dict[str, Any]]]:
     """Open loom:shipped tickets, oldest ship first. A verified ticket carries
     loom:verified instead, so it never appears."""
-    due = []
-    for issue in tickets:
-        names = _labels(issue)
-        if "loom:shipped" not in names or "loom:verified" in names:
-            continue
-        due.append((_shipped_at(gh, repo, issue) or now, issue))
+    shipped = [issue for issue in tickets
+               if "loom:shipped" in _labels(issue) and "loom:verified" not in _labels(issue)]
+    # One events read per ticket, in parallel: 93 in a row took 36 s of a
+    # 68 s status on 2026-10-15.
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+        stamps = list(pool.map(lambda issue: _shipped_at(gh, repo, issue), shipped))
+    due = [(stamp or now, issue) for stamp, issue in zip(stamps, shipped, strict=True)]
     return sorted(due, key=lambda x: (x[0], int(x[1]["number"])))
 
 
@@ -625,8 +632,12 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     if authors is None:
         authors = trusted_authors(env)
     out: List[str] = ["# Loom status"]
-    for repo in repos:
-        out += _repo_section(gh, repo, now, bot, authors)
+    # Each repo's reads are independent, so they run side by side; the
+    # sections keep the order of `repos`. A status took 68 s here and 152 s
+    # from a remote brain, over a 15-minute tick (2026-10-15).
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+        for section in pool.map(lambda repo: _repo_section(gh, repo, now, bot, authors), repos):
+            out += section
     out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
 
