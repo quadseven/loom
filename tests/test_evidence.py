@@ -101,6 +101,16 @@ class EvidenceEndpointTest(unittest.TestCase):
         self.assertEqual(result["lines"], ["ordinary evidence"])
         self.assertEqual(result["dropped"], 1)
 
+    def test_wrong_token_unknown_route_and_bad_parameters_are_refused(self):
+        cases = (("/evidence/logs?source=service&match=x&since=1", "wrong-bearer", 401),
+                 ("/evidence/other", "test-bearer", 404),
+                 ("/evidence/logs?source=service&match=x&since=999", "test-bearer", 400),
+                 ("/evidence/query?name=runs", "test-bearer", 400))
+        for path, token, code in cases:
+            with self.assertRaises(HTTPError) as caught:
+                self.get_json(path, token)
+            self.assertEqual(caught.exception.code, code, path)
+
     def test_bearer_is_required_and_each_call_is_logged(self):
         calls = []
         handler = make_handler(self.config, "test-bearer", logging.getLogger("evidence-audit"),

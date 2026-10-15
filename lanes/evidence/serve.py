@@ -83,7 +83,7 @@ def _log_lines(spec: dict[str, Any], hours: int, match: str) -> list[str]:
     return [line for line in completed.stdout.splitlines() if match in line]
 
 
-def _query_rows(spec: dict[str, Any], supplied: dict[str, str]) -> list[list[Any]]:
+def _check_query_spec(spec: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     sql = spec.get("sql")
     declarations = spec.get("params")
     database = spec.get("database")
@@ -91,25 +91,38 @@ def _query_rows(spec: dict[str, Any], supplied: dict[str, str]) -> list[list[Any
             not SQL_SELECT_RE.match(sql) or SQL_FORBIDDEN_RE.search(sql) or
             not isinstance(declarations, dict)):
         raise ValueError("query must declare a database, parameters, and one SELECT")
+    return database, sql, declarations
+
+
+def _typed_value(kind: Any, raw: str) -> Any:
+    if kind == "str":
+        return raw
+    if kind == "int":
+        return int(raw)
+    if kind == "float":
+        return float(raw)
+    if kind == "bool" and raw in ("true", "false"):
+        return raw == "true"
+    raise ValueError("query parameter has an unsupported type or value")
+
+
+def _typed_params(sql: str, declarations: dict[str, Any],
+                  supplied: dict[str, str]) -> dict[str, Any]:
     if set(supplied) != set(declarations):
         raise ValueError("query parameters do not match the declaration")
     typed: dict[str, Any] = {}
     for key, kind in declarations.items():
         if not PARAM_RE.fullmatch(key) or ":" + key not in sql:
             raise ValueError("query parameter declaration is invalid")
-        raw = supplied[key]
-        if not _safe_parameter(raw):
+        if not _safe_parameter(supplied[key]):
             raise ValueError("query parameter contains a forbidden character")
-        if kind == "str":
-            typed[key] = raw
-        elif kind == "int":
-            typed[key] = int(raw)
-        elif kind == "float":
-            typed[key] = float(raw)
-        elif kind == "bool" and raw in ("true", "false"):
-            typed[key] = raw == "true"
-        else:
-            raise ValueError("query parameter has an unsupported type or value")
+        typed[key] = _typed_value(kind, supplied[key])
+    return typed
+
+
+def _query_rows(spec: dict[str, Any], supplied: dict[str, str]) -> list[list[Any]]:
+    database, sql, declarations = _check_query_spec(spec)
+    typed = _typed_params(sql, declarations, supplied)
     uri = Path(database).resolve().as_uri() + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=5)
     try:
@@ -148,6 +161,45 @@ def _capped_payload(key: str, items: list[Any], dropped: int) -> dict[str, Any]:
         dropped += 1
 
 
+class _Refused(Exception):
+    """A request that names something the allowlist does not hold."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def _logs_payload(config: dict[str, Any], query: dict[str, list[str]],
+                  params: dict[str, str]) -> tuple[str, dict[str, Any]]:
+    name = _single(query, "source")
+    match = _single(query, "match")
+    raw_hours = _single(query, "since")
+    params.update({"match": match, "since": raw_hours})
+    if not _valid_name(name) or name not in config["logs"]:
+        raise _Refused("unknown source")
+    if not _safe_parameter(match) or not raw_hours.isdigit():
+        raise ValueError("invalid log parameters")
+    hours = int(raw_hours)
+    if not 0 <= hours <= MAX_SINCE_HOURS:
+        raise ValueError("since is outside the allowed range")
+    safe, dropped = _safe_items(_log_lines(config["logs"][name], hours, match))
+    return name, _capped_payload("lines", safe, dropped)
+
+
+def _query_payload(config: dict[str, Any], query: dict[str, list[str]],
+                   params: dict[str, str]) -> tuple[str, dict[str, Any]]:
+    name = _single(query, "name")
+    params.update({key: _single(query, key) for key in query if key != "name"})
+    if not _valid_name(name) or name not in config["queries"]:
+        raise _Refused("unknown query")
+    safe, dropped = _safe_items(_query_rows(config["queries"][name], params))
+    return name, _capped_payload("rows", safe, dropped)
+
+
+_ROUTES = {"/evidence/logs": ("logs", _logs_payload),
+           "/evidence/query": ("query", _query_payload)}
+
+
 def make_handler(config: dict[str, Any], token: str, logger: logging.Logger,
                  audit_logger: Callable[..., None] | None = None):
     """Create an HTTP handler for one immutable allowlist and bearer token."""
@@ -166,52 +218,31 @@ def make_handler(config: dict[str, Any], token: str, logger: logging.Logger,
             self.wfile.write(data)
             return len(data)
 
+        def _answer(self, parts: Any, kind: str, name: str,
+                    params: dict[str, str]) -> tuple[str, str, int, int]:
+            """Return kind, name, status and size after sending the reply."""
+            if self.headers.get("Authorization", "") != "Bearer " + token:
+                return kind, name, 401, self._reply(401, {"error": "unauthorized"})
+            route = _ROUTES.get(parts.path)
+            if route is None:
+                return kind, name, 404, self._reply(404, {"error": "not found"})
+            kind = route[0]
+            query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=False)
+            try:
+                name, payload = route[1](config, query, params)
+            except _Refused as refused:
+                return kind, name, 404, self._reply(404, {"error": refused.message})
+            return kind, name, 200, self._reply(200, payload)
+
         def do_GET(self) -> None:  # noqa: N802
             start = time.monotonic()
-            parts = urlsplit(self.path)
-            query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=False)
             kind, name, params = "unknown", "", {}
             status, size = 500, 0
             try:
-                if self.headers.get("Authorization", "") != "Bearer " + token:
-                    status, size = 401, self._reply(401, {"error": "unauthorized"})
-                    return
-                if parts.path == "/evidence/logs":
-                    kind = "logs"
-                    name = _single(query, "source")
-                    match = _single(query, "match")
-                    raw_hours = _single(query, "since")
-                    params = {"match": match, "since": raw_hours}
-                    if not _valid_name(name) or name not in config["logs"]:
-                        status, size = 404, self._reply(404, {"error": "unknown source"})
-                        return
-                    if not _safe_parameter(match) or not raw_hours.isdigit():
-                        raise ValueError("invalid log parameters")
-                    hours = int(raw_hours)
-                    if not 0 <= hours <= MAX_SINCE_HOURS:
-                        raise ValueError("since is outside the allowed range")
-                    lines = _log_lines(config["logs"][name], hours, match)
-                    safe, dropped = _safe_items(lines)
-                    payload = _capped_payload("lines", safe, dropped)
-                elif parts.path == "/evidence/query":
-                    kind = "query"
-                    name = _single(query, "name")
-                    params = {key: _single(query, key) for key in query if key != "name"}
-                    if not _valid_name(name) or name not in config["queries"]:
-                        status, size = 404, self._reply(404, {"error": "unknown query"})
-                        return
-                    rows = _query_rows(config["queries"][name], params)
-                    safe, dropped = _safe_items(rows)
-                    payload = _capped_payload("rows", safe, dropped)
-                else:
-                    status, size = 404, self._reply(404, {"error": "not found"})
-                    return
-                status, size = 200, self._reply(200, payload)
+                kind, name, status, size = self._answer(urlsplit(self.path), kind, name, params)
             except (ValueError, KeyError, TypeError, OverflowError):
                 status, size = 400, self._reply(400, {"error": "invalid evidence request"})
-            except (OSError, subprocess.SubprocessError):
-                status, size = 502, self._reply(502, {"error": "evidence source failed"})
-            except sqlite3.Error:
+            except (OSError, subprocess.SubprocessError, sqlite3.Error):
                 status, size = 502, self._reply(502, {"error": "evidence source failed"})
             finally:
                 safe_name = name if _valid_name(name) else "<invalid>"
