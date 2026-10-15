@@ -94,6 +94,18 @@ class StationScriptTest(unittest.TestCase):
         self.assertEqual(record["revision"], target)
         self.assertLessEqual(abs(record["at"] - time.time()), 60)
 
+    def test_configured_pin_pass_runs_after_deploy_and_retries_next_pass(self):
+        self.push_change()
+        settings = {"LOOM_PIN_TARGETS": '[{"repo":"example-owner/deploy","path":"pin.env",'
+                    '"revision_var":"REV","sha256_var":"SHA"}]',
+                    "LOOM_SELF_REPO": "example-owner/loom"}
+        self.run_script(**settings)
+        calls = self.calls()
+        self.assertTrue(calls[-2].startswith("python3 -m bus.pin"), calls)
+        self.assertTrue(calls[-1].startswith("python3 -m bus station"), calls)
+        self.run_script(**settings)
+        self.assertEqual(sum("python3 -m bus.pin" in call for call in self.calls()), 2)
+
     def test_a_head_whose_ci_has_not_passed_waits(self):
         before = self.head()
         self.push_change()
