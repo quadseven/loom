@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from unittest import mock
 
 from bus import factory, station
-from bus.github import Response
+from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
 REPO = "example-org/example-repo"
@@ -551,6 +551,21 @@ class PullRequests(Base):
         self.assertEqual(self.closed, [])
         self.assertEqual(self.gh.pulls[60]["state"], "open")
         self.assertEqual(self.gh.pulls[70]["state"], "open")
+
+    def test_failed_close_does_not_stop_the_rest_of_the_pass(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200, updated=7200, branch="loom/5-some-title")
+        self.gh.pull(52, 5, created=3600, updated=3600, branch="loom/5-some-title-r2")
+        real_rest = self.gh.rest
+
+        def rest(method, path, *args, **kwargs):
+            if method == "PATCH" and path.endswith("/pulls/50"):
+                raise GitHubError("boom", 500)
+            return real_rest(method, path, *args, **kwargs)
+        with mock.patch.object(self.gh, "rest", side_effect=rest):
+            self.go()
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+        self.assertEqual(len(self.merged), 1)
 
 
 LEAK_JOB = "leak-scan / Scan diff and PR/issue text for private identifiers"

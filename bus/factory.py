@@ -925,36 +925,31 @@ class Factory:
         self.actions += 1
         _say("closed %s#%d (superseded by #%d)" % (repo, number, superseded_by))
 
-    def _close_if_ticket_merged(self, repo: str, ticket_number: int,
-                                ticket: Optional[Dict[str, Any]],
-                                prs: Sequence[Dict[str, Any]], closed: set) -> None:
-        state = _state(ticket) if ticket else ""
-        if state not in ("merged", "shipped", "verified"):
-            return
-        merged = self._merged_pull(repo, ticket_number)
-        if merged is None:
-            return
+    def _close_all_but(self, repo: str, prs: Sequence[Dict[str, Any]], keep: int,
+                       closed: set) -> None:
+        """Close every pull request in prs except keep, naming keep in the comment."""
         for pr in prs:
             num = int(pr["number"])
-            if num != merged and num not in closed:
-                if self.actions >= MAX_ACTIONS:
-                    return
-                self._close_pr(repo, pr, merged)
-                closed.add(num)
+            if num == keep:
+                continue
+            if self.actions >= MAX_ACTIONS:
+                return
+            self._close_pr(repo, pr, keep)
+            closed.add(num)
 
-    def _close_if_newer_lane_pr(self, repo: str, prs: Sequence[Dict[str, Any]],
-                                closed: set) -> None:
-        if len(prs) <= 1:
-            return
-        newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
-        newest_num = int(newest["number"])
-        for pr in prs:
-            num = int(pr["number"])
-            if num != newest_num and num not in closed:
-                if self.actions >= MAX_ACTIONS:
-                    return
-                self._close_pr(repo, pr, newest_num)
-                closed.add(num)
+    def _close_ticket_group(self, repo: str, item: Dict[str, Any],
+                            tickets: Dict[int, Dict[str, Any]],
+                            prs: Sequence[Dict[str, Any]], closed: set) -> None:
+        """Close the superseded lane pull requests of one ticket (item names it)."""
+        ticket_number = int(item["number"])
+        ticket = tickets.get(ticket_number) or self._ticket(repo, ticket_number)
+        if ticket and _state(ticket) in ("merged", "shipped", "verified"):
+            merged = self._merged_pull(repo, ticket_number)
+            if merged is not None:
+                self._close_all_but(repo, prs, merged, closed)
+        elif len(prs) > 1:
+            newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
+            self._close_all_but(repo, prs, int(newest["number"]), closed)
 
     def _close_superseded_prs(self, repo: str, open_prs: Sequence[Dict[str, Any]],
                               tickets: Dict[int, Dict[str, Any]]) -> set:
@@ -970,12 +965,8 @@ class Factory:
         for ticket_number, prs in lane_prs.items():
             if self.actions >= MAX_ACTIONS:
                 break
-            ticket = tickets.get(ticket_number) or self._ticket(repo, ticket_number)
-            state = _state(ticket) if ticket else ""
-            if state in ("merged", "shipped", "verified"):
-                self._close_if_ticket_merged(repo, ticket_number, ticket, prs, closed)
-            else:
-                self._close_if_newer_lane_pr(repo, prs, closed)
+            self._guarded(self._close_ticket_group, repo, {"number": ticket_number},
+                          tickets, prs, closed)
         return closed
 
     def _lane_pr_ticket(self, repo: str, pr: Dict[str, Any],
