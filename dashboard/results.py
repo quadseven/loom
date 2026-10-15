@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 WINDOWS = (("day", "Last day", timedelta(days=1)),
            ("week", "Last week", timedelta(days=7)),
@@ -49,6 +49,52 @@ def _work_failure(body: str) -> bool:
     return body.startswith(LANE_FAILED) and (FAILED_WORD + "work]") in body
 
 
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _count_prs(prs: List[Dict[str, Any]], start: datetime, lane: bool, merged: bool) -> int:
+    """Pull requests merged (or, with merged False, closed unmerged) since start."""
+    n = 0
+    for pr in prs:
+        if lane and not _is_lane_pr(pr):
+            continue
+        if merged:
+            at = _when(pr.get("merged_at"))
+        else:
+            at = None if pr.get("merged_at") else _when(pr.get("closed_at"))
+        n += 1 if at and at >= start else 0
+    return n
+
+
+def _count_closed(tickets: List[Dict[str, Any]], start: datetime, reason: str) -> int:
+    return sum(1 for t in tickets
+               if (_when(t.get("closed_at")) or _EPOCH) >= start
+               and (t.get("state_reason") or "completed") == reason)
+
+
+def _count_comments(comments: List[Dict[str, Any]], start: datetime, test) -> int:
+    return sum(1 for c in comments
+               if (_when(c.get("created_at")) or _EPOCH) >= start and test(str(c.get("body") or "")))
+
+
+def _is_proof(body: str) -> bool:
+    return body.startswith(PROOF_MARKER)
+
+
+def _week_by_repo(prs, comments, week: datetime):
+    by_repo: Dict[str, Dict[str, int]] = {}
+    for pr in prs:
+        at = _when(pr.get("merged_at"))
+        if _repo_of(pr) and _is_lane_pr(pr) and at and at >= week:
+            by_repo.setdefault(_repo_of(pr), {"merged": 0, "failed": 0})["merged"] += 1
+    for c in comments:
+        at = _when(c.get("created_at"))
+        repo = str(c.get("repo") or "")
+        if repo and at and at >= week and _work_failure(str(c.get("body") or "")):
+            by_repo.setdefault(repo, {"merged": 0, "failed": 0})["failed"] += 1
+    return sorted(by_repo.items(), key=lambda kv: (-kv[1]["merged"], kv[0]))
+
+
 def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """Counts per window, and the week's counts per repo."""
     prs = [pr for pr in payload.get("pull_requests") or [] if isinstance(pr, dict)]
@@ -56,67 +102,26 @@ def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     comments = [c for c in payload.get("issue_comments") or [] if isinstance(c, dict)]
     comments_read = "issue_comments" in payload and not payload.get("hot_spots_error")
 
-    def since(delta):
-        return now - delta
-
-    def count_prs(delta, lane, merged):
-        start = since(delta)
-        n = 0
-        for pr in prs:
-            if lane and not _is_lane_pr(pr):
-                continue
-            if merged:
-                at = _when(pr.get("merged_at"))
-            else:
-                at = None if pr.get("merged_at") else _when(pr.get("closed_at"))
-            if at and at >= start:
-                n += 1
-        return n
-
-    def count_closed(delta, reason):
-        start = since(delta)
-        return sum(1 for t in tickets
-                   if (_when(t.get("closed_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= start
-                   and (t.get("state_reason") or "completed") == reason)
-
-    def count_comments(delta, test):
-        if not comments_read:
+    def comment_count(delta, test):
+        # None is "not looked": unread, or older than the comment window.
+        if not comments_read or delta > COMMENT_REACH:
             return None
-        if delta > COMMENT_REACH:
-            return None
-        start = since(delta)
-        return sum(1 for c in comments
-                   if (_when(c.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= start
-                   and test(str(c.get("body") or "")))
+        return _count_comments(comments, now - delta, test)
 
     rows = [
-        ("Lane pull requests merged", lambda d: count_prs(d, True, True)),
-        ("All pull requests merged", lambda d: count_prs(d, False, True)),
-        ("Tickets closed as done", lambda d: count_closed(d, "completed")),
-        ("Tickets closed as not planned", lambda d: count_closed(d, "not_planned")),
-        ("Live proofs posted", lambda d: count_comments(d, lambda b: b.startswith(PROOF_MARKER))),
-        ("Lane runs failed at the work", lambda d: count_comments(d, _work_failure)),
-        ("Lane pull requests closed unmerged", lambda d: count_prs(d, True, False)),
+        ("Lane pull requests merged", lambda d: _count_prs(prs, now - d, True, True)),
+        ("All pull requests merged", lambda d: _count_prs(prs, now - d, False, True)),
+        ("Tickets closed as done", lambda d: _count_closed(tickets, now - d, "completed")),
+        ("Tickets closed as not planned", lambda d: _count_closed(tickets, now - d, "not_planned")),
+        ("Live proofs posted", lambda d: comment_count(d, _is_proof)),
+        ("Lane runs failed at the work", lambda d: comment_count(d, _work_failure)),
+        ("Lane pull requests closed unmerged", lambda d: _count_prs(prs, now - d, True, False)),
     ]
     table = [{"name": name, "values": {key: fn(delta) for key, _, delta in WINDOWS}}
              for name, fn in rows]
-
-    week = since(timedelta(days=7))
-    by_repo: Dict[str, Dict[str, int]] = {}
-    for pr in prs:
-        repo = _repo_of(pr)
-        at = _when(pr.get("merged_at"))
-        if repo and _is_lane_pr(pr) and at and at >= week:
-            by_repo.setdefault(repo, {"merged": 0, "failed": 0})["merged"] += 1
-    for c in comments:
-        at = _when(c.get("created_at"))
-        repo = str(c.get("repo") or "")
-        if repo and at and at >= week and _work_failure(str(c.get("body") or "")):
-            by_repo.setdefault(repo, {"merged": 0, "failed": 0})["failed"] += 1
-    repos = sorted(by_repo.items(), key=lambda kv: (-kv[1]["merged"], kv[0]))
     reason = "" if comments_read else (payload.get("hot_spots_error") or "issue comments were not read")
-    return {"rows": table, "repos": repos, "comments_reason": reason,
-            "comment_reach_days": COMMENT_REACH.days}
+    return {"rows": table, "repos": _week_by_repo(prs, comments, now - timedelta(days=7)),
+            "comments_reason": reason, "comment_reach_days": COMMENT_REACH.days}
 
 
 def _cell(value: Optional[int], reach_days: int, reason: str) -> str:
