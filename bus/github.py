@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -129,6 +130,8 @@ class GitHub:
         self.transport = transport or urllib_transport
         # Where GET answers are kept for conditional requests; None sends none.
         self.cache_dir = cache_dir
+        # Reads may run on several threads (brain.status): counts change under this lock.
+        self._count_lock = threading.Lock()
         self.requests = 0
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
@@ -206,7 +209,8 @@ class GitHub:
         dropped. Every attempt is counted."""
         delays = RETRY_DELAYS if method in ("GET", "HEAD") else ()
         for attempt in range(len(delays) + 1):
-            self.requests += 1
+            with self._count_lock:
+                self.requests += 1
             try:
                 status, raw_headers, raw = self.transport(method, url, headers, payload)
             except GitHubError as err:
@@ -230,10 +234,12 @@ class GitHub:
     def _count(self, method: str, url: str, status: int) -> None:
         """Tally one answer: a 304 apart, anything else by its kind."""
         if status == 304:
-            self.not_modified += 1
+            with self._count_lock:
+                self.not_modified += 1
             return
         kind = request_kind(method, url)
-        self.kinds[kind] = self.kinds.get(kind, 0) + 1
+        with self._count_lock:
+            self.kinds[kind] = self.kinds.get(kind, 0) + 1
 
     def _from_cache(self, url: str, cached: Dict[str, Any],
                     resp_headers: Dict[str, str]) -> Response:
@@ -277,7 +283,7 @@ class GitHub:
         if not self.cache_dir:
             return
         path = self._cache_path(url)
-        tmp = "%s.%d.tmp" % (path, os.getpid())
+        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:

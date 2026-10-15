@@ -1729,6 +1729,25 @@ class VerifyDueTests(unittest.TestCase):
         self.assertEqual(lines[0], "### Verify due")
         self.assertEqual(lines[1], "- #5 T5 - shipped 6h ago - Live: the dashboard shows the new column")
 
+    def test_shipped_tickets_are_read_side_by_side_in_ship_order(self):
+        import threading, time as clock
+        tickets = [self.issue(n) for n in range(1, 7)]
+        lock, state = threading.Lock(), {"now": 0, "peak": 0}
+
+        def transport(method, url, headers, body):
+            number = int(url.split("?")[0].split("/")[-2])
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            clock.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return reply(200, [{"event": "labeled", "label": {"name": "loom:shipped"},
+                                "created_at": "2030-01-02T%02d:00:00Z" % (10 - number)}])
+        due = brain.verify_due(GitHub("t", transport=transport), REPO, tickets, self.NOW)
+        self.assertGreater(state["peak"], 1)
+        self.assertEqual([6, 5, 4, 3, 2, 1], [int(i["number"]) for _, i in due])
+
     def test_a_ticket_without_a_live_line_says_so(self):
         self.assertIn("no Live criterion", brain.live_criterion("## Acceptance criteria\n- [ ] Tests"))
 
