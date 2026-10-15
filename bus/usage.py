@@ -192,7 +192,26 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
         except Exception as err:
             records.append(_record(provider, slots, "all", None, None, None, None,
                                    "adapter", now, "adapter error: %s" % type(err).__name__))
+    for record in records:
+        record["holds"] = lane_holds(home, record.get("lanes") or [])
     return records
+
+
+def lane_holds(home: str, lanes: List[str]) -> Dict[str, str]:
+    """Why each unavailable lane is held, from its own heartbeat file
+    (state/usage/<lane>.json, written by lanes/run_lane.sh), for the
+    dashboard's lane cards. Lanes that are available, or unreadable, are left
+    out."""
+    holds: Dict[str, str] = {}
+    for lane in lanes:
+        try:
+            beat = json.loads((Path(home) / "state" / "usage" / (lane + ".json")).read_text())
+        except (OSError, ValueError):
+            continue
+        reason = beat.get("reason") if isinstance(beat, dict) else None
+        if isinstance(beat, dict) and beat.get("available") is False and isinstance(reason, str) and reason:
+            holds[lane] = reason[:300]
+    return holds
 
 
 def _opencode_records(home: str, slots: List[str], _env: Dict[str, str], now: float) -> List[Dict[str, Any]]:

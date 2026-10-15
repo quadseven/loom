@@ -175,6 +175,7 @@ class TicketStore:
                     continue
                 items.append({"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
                               "html_url": issue.get("html_url"), "ask": issue.get("body") or issue.get("title", ""),
+                              "created_at": issue.get("created_at"),
                               "waiting_since": issue.get("updated_at", "9999"), "waiting_since_source": "updated",
                               "unblocks": 0, "queue": "needs_operator"})
         return items, human_counts, ask_error

@@ -34,6 +34,12 @@ def _validate_row(raw_row: Any) -> dict[str, Any]:
     if reset is not None and not isinstance(reset, str):
         raise ValueError("invalid resets_at")
     row["note"] = str(row.get("note") or "")[:1000]
+    holds = row.get("holds")
+    if holds is not None and (not isinstance(holds, dict) or any(
+            not isinstance(k, str) or not isinstance(v, str) or len(k) > 100 or len(v) > 300
+            for k, v in holds.items())):
+        raise ValueError("invalid holds")
+    row["holds"] = dict(holds or {})
     return row
 
 
