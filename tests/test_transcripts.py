@@ -233,13 +233,13 @@ class TicketRef(Fixture):
     carried the brief's file name."""
 
     def test_the_issue_line_is_the_ticket(self):
-        self.assertEqual(transcripts.ticket_ref("anything", "quadseven/wow-overseer#931"),
-                         "quadseven/wow-overseer#931")
+        self.assertEqual(transcripts.ticket_ref("anything", "example-owner/sample-repo#931"),
+                         "example-owner/sample-repo#931")
 
     def test_the_brief_name_is_the_fallback_also_for_a_retry_and_a_dashed_repo(self):
         self.assertEqual(transcripts.ticket_ref("example.loom-229"), "example/loom#229")
-        self.assertEqual(transcripts.ticket_ref("example.wow-overseer-931-r3"),
-                         "example/wow-overseer#931")
+        self.assertEqual(transcripts.ticket_ref("example.sample-repo-931-r3"),
+                         "example/sample-repo#931")
 
     def test_a_name_with_no_ticket_is_refused(self):
         with self.assertRaises(ValueError):
