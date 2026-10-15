@@ -178,6 +178,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
      24px tall at 390px wide). */
   .page-content h2 > a, .page-content li > a, .page-content p > a, .card > a,
   .goal-card a, .page-content label:has(> input) { display: inline-flex; min-height: 44px; align-items: center; }
+  .section-head a, .ticket-topline a, .improvement-meta a, .page-content details > summary { display: inline-flex; min-height: 44px; align-items: center; }
 }
 @media (max-width: 720px) { .floor-columns { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
