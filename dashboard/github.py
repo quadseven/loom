@@ -4,10 +4,12 @@ from __future__ import annotations
 import os
 import json
 import ipaddress
+import logging
 import re
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlsplit
@@ -17,6 +19,10 @@ from bus.github import DEFAULT_API, GitHub, GitHubError
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
 from . import goals, views
+
+
+READ_WORKERS = 8
+LOG = logging.getLogger(__name__)
 
 
 def repos_from_env() -> List[str]:
@@ -163,24 +169,32 @@ class TicketStore:
 
     def _read_operator_items(self):
         items, human_counts = [], {}
-        ask_error = "LOOM_REPOS is not set" if not self.repos else ""
-        for repo in self.repos:
-            try:
-                asks = self.gh.paginate("/repos/%s/issues?labels=needs-operator&state=open" % quote(repo, safe="/"))
-                humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
-            except (GitHubError, OSError, ValueError) as exc:
-                ask_error = self._error_reason(exc)
-                continue
-            human_counts[repo] = len([row for row in humans if isinstance(row, dict) and "pull_request" not in row])
-            for issue in asks:
-                if not isinstance(issue, dict) or "pull_request" in issue:
-                    continue
-                items.append({"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
-                              "html_url": issue.get("html_url"), "ask": issue.get("body") or issue.get("title", ""),
-                              "created_at": issue.get("created_at"),
-                              "waiting_since": issue.get("updated_at", "9999"), "waiting_since_source": "updated",
-                              "unblocks": 0, "queue": "needs_operator"})
+        ask_errors = []
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(self._read_operator_repo, self.repos))
+        for repo, found, count, error in results:
+            if error:
+                ask_errors.append(error)
+            else:
+                human_counts[repo] = count
+                items.extend(found)
+        ask_error = "; ".join(ask_errors) if self.repos else "LOOM_REPOS is not set"
         return items, human_counts, ask_error
+
+    def _read_operator_repo(self, repo):
+        try:
+            asks = self.gh.paginate("/repos/%s/issues?labels=needs-operator&state=open" % quote(repo, safe="/"))
+            humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
+        except (GitHubError, OSError, ValueError) as exc:
+            return repo, [], 0, "%s operator items: %s" % (repo, self._error_reason(exc))
+        count = len([row for row in humans if isinstance(row, dict) and "pull_request" not in row])
+        found = [{"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
+                  "html_url": issue.get("html_url"), "ask": issue.get("body") or issue.get("title", ""),
+                  "created_at": issue.get("created_at"),
+                  "waiting_since": issue.get("updated_at", "9999"), "waiting_since_source": "updated",
+                  "unblocks": 0, "queue": "needs_operator"}
+                 for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
+        return repo, found, count, ""
 
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
         """Read optional view sources; errors stay visible without failing tickets."""
@@ -196,12 +210,21 @@ class TicketStore:
         journals, reports, metric_comments, prs, lanes = [], [], [], [], []
         errors = []
         homes, status_home = _dashboard_homes()
-        for repo, issue_number in homes:
-            self._read_dashboard_home(repo, issue_number, journals, reports, metric_comments, lanes, errors)
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            home_results = list(pool.map(lambda home: self._dashboard_home_result(*home), homes))
+        for found_journals, found_reports, found_metrics, found_lanes, found_errors in home_results:
+            journals.extend(found_journals)
+            reports.extend(found_reports)
+            metric_comments.extend(found_metrics)
+            lanes.extend(found_lanes)
+            errors.extend(found_errors)
         if status_home and tickets.REPO_RE.fullmatch(status_home):
             self._read_lane_status(status_home, lanes, errors)
-        for repo in self.repos:
-            self._read_pull_requests(repo, prs, errors)
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            pull_results = list(pool.map(self._pull_requests_for_repo, self.repos))
+        for found, repo_errors in pull_results:
+            prs.extend(found)
+            errors.extend(repo_errors)
         data["improving"] = {"journals": journals, "metrics_comments": metric_comments}
         data["floor_context"] = _floor_context(reports, journals, self.operator_items, errors)
         data["lanes"] = lanes
@@ -249,19 +272,29 @@ class TicketStore:
         since = (day - 2 * HOT_SPOT_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
         trusted = {login.lower() for login in brain.trusted_authors()}
         issue_comments, review_comments, errors = [], [], []
-        for repo in self.repos:
-            path = quote(repo, safe="/")
-            try:
-                found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-                issue_comments.extend(dict(c, repo=repo) for c in found if isinstance(c, dict) and (
-                    not trusted or str((c.get("user") or {}).get("login") or "").lower() in trusted))
-                found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
-                review_comments.extend(dict(c, repo=repo) for c in found if isinstance(c, dict))
-            except (GitHubError, OSError, ValueError) as exc:
-                errors.append("%s comments: %s" % (repo, self._error_reason(exc)))
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(lambda repo: self._comments_for_repo(repo, since, trusted), self.repos))
+        for issues, reviews, error in results:
+            issue_comments.extend(issues)
+            review_comments.extend(reviews)
+            if error:
+                errors.append(error)
         data["issue_comments"], data["review_comments"] = issue_comments, review_comments
         data["hot_spots_error"] = "; ".join(errors) if errors else (
             "" if self.repos else "LOOM_REPOS is not set")
+
+    def _comments_for_repo(self, repo, since, trusted):
+        path = quote(repo, safe="/")
+        issues, reviews = [], []
+        try:
+            found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
+            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and (
+                not trusted or str((c.get("user") or {}).get("login") or "").lower() in trusted)]
+            found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
+            reviews = [dict(c, repo=repo) for c in found if isinstance(c, dict)]
+        except (GitHubError, OSError, ValueError) as exc:
+            return issues, reviews, "%s comments: %s" % (repo, self._error_reason(exc))
+        return issues, reviews, ""
 
     def _read_dashboard_home(self, repo, issue_number, journals, reports, metric_comments, lanes, errors):
         try:
@@ -291,6 +324,11 @@ class TicketStore:
         except (GitHubError, OSError, ValueError, KeyError) as exc:
             errors.append("%s: %s" % (repo, self._error_reason(exc)))
 
+    def _dashboard_home_result(self, repo, issue_number):
+        journals, reports, metrics, lanes, errors = [], [], [], [], []
+        self._read_dashboard_home(repo, issue_number, journals, reports, metrics, lanes, errors)
+        return journals, reports, metrics, lanes, errors
+
     def _read_lane_status(self, status_home, lanes, errors):
         try:
             status_issues = self.gh.paginate(
@@ -313,6 +351,12 @@ class TicketStore:
             prs.extend(item for item in items if isinstance(item, dict))
         except (GitHubError, OSError, ValueError) as exc:
             errors.append("%s pull requests: %s" % (repo, self._error_reason(exc)))
+
+    def _pull_requests_for_repo(self, repo):
+        prs, errors = [], []
+        self._read_pull_requests(repo, prs, errors)
+        return prs, errors
+
     def _note_budget(self) -> None:
         remaining = self.gh.rate.get("core", (None, 0, 0))[0]
         if isinstance(remaining, int):
@@ -320,19 +364,26 @@ class TicketStore:
 
     def _read_repos(self, data: Dict[str, Any], errors: Dict[str, str]) -> bool:
         """Read each repo into data/errors; return True if the budget floor stopped the pass."""
-        for repo in self.repos:
-            if self._below_floor():
-                return True
-            try:
-                data[repo] = self._read_repo(repo)
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(self._read_repo_result, self.repos))
+        for repo, found, error in results:
+            if error:
+                errors[repo] = error
+            else:
+                data[repo] = found
                 errors.pop(repo, None)
-            except (GitHubError, OSError, ValueError) as exc:
-                errors[repo] = self._error_reason(exc)
-            self._note_budget()
-        return False
+        self._note_budget()
+        return self._below_floor()
+
+    def _read_repo_result(self, repo):
+        try:
+            return repo, self._read_repo(repo), ""
+        except (GitHubError, OSError, ValueError) as exc:
+            return repo, None, self._error_reason(exc)
 
     def refresh(self) -> None:
         with self._refresh_lock:
+            started = time.monotonic()
             current = self._snapshot
             data = dict(current["tickets"])
             errors = dict(current["errors"])
@@ -341,7 +392,8 @@ class TicketStore:
                 operator_items, human_counts, ask_error = self.operator_items, self.human_counts, self.operator_error
             else:
                 operator_items, human_counts, ask_error = self._read_operator_items()
-            snapshot = {"tickets": data, "errors": errors, "stale": stale, "ready": True}
+            snapshot = {"tickets": data, "errors": errors, "stale": stale,
+                        "ready": any(rows is not None for rows in data.values())}
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
             self._read_dashboard(snapshot)
@@ -369,6 +421,8 @@ class TicketStore:
             snapshot["floor_context"] = floor_context
             with self._snapshot_lock:
                 self._snapshot = snapshot
+            if snapshot["ready"] and not current["ready"]:
+                LOG.info("first dashboard snapshot ready in %.1fs", time.monotonic() - started)
 
     def response(self) -> Dict[str, Any]:
         with self._snapshot_lock:
