@@ -310,3 +310,31 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .stuck-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 8px; }
 .stuck-meta { color: var(--dim); font-size: 10.5px; }
 .brain-layout h2.label, .hot-spot h2.label, .hot-stuck h2.label { margin: 0 0 6px; }
+.lane-bar.bad small { color: var(--bad); }
+
+/* Floor and Goals, after the design (docs/design/floor/README.md, Floor and Goals) */
+.standup-line { margin: 0; font-family: var(--font-sans); font-size: clamp(21px, 2.4vw, 28px); font-weight: 500; line-height: 1.25; letter-spacing: -.015em; color: var(--text); max-width: 60ch; }
+.standup-meta { margin: 8px 0 0; color: var(--dim-on-bg); font-size: 11px; }
+.section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+.section-head .label { font-family: var(--font-mono); }
+.section-head a { font: 12px var(--font-mono); color: var(--accent-on-bg); }
+.ticket-list { display: grid; gap: 7px; }
+.floor-aside .card { margin-bottom: 12px; }
+.floor-aside .label { display: block; margin-bottom: 8px; font-family: var(--font-mono); }
+.next-move-card { border-color: color-mix(in oklch, var(--accent) 38%, transparent); border-radius: 14px; }
+.next-move { margin: 0 0 6px; font-size: 15px; font-weight: 600; line-height: 1.35; color: var(--text); }
+.floor-aside .muted, .goal-card p.muted { color: var(--muted); font-size: 13px; line-height: 1.42; }
+.floor-aside a { font: 12px var(--font-mono); color: var(--accent-on-bg); }
+.since { display: grid; grid-template-columns: 70px 1fr; gap: 6px 10px; margin: 0; font-size: 13px; line-height: 1.42; }
+.since dt { font: 11px var(--font-mono); color: var(--muted); padding-top: 2px; }
+.since dd { margin: 0; color: var(--body); }
+.since dt.since-well { color: var(--good-on-bg); }
+.since dt.since-not-well { color: var(--bad-on-bg); }
+.since dt.since-stuck { color: var(--accent-on-bg); }
+.count { font: 600 22px var(--font-mono); font-variant-numeric: tabular-nums; }
+.page-lede { margin: -12px 0 18px; color: var(--muted); font-size: 14px; }
+.goal-metric { display: flex; justify-content: space-between; align-items: end; gap: 12px; margin-bottom: 10px; }
+.goal-metric .sparkline { margin: 0; width: 120px; flex-shrink: 0; }
+.goal-metric .sparkline i { flex: 1; background: var(--line); }
+.goal-metric .sparkline i.last { background: var(--accent); }
+.goal-card p { color: var(--body); font-size: 13.5px; line-height: 1.45; }
