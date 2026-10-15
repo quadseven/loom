@@ -43,6 +43,18 @@ def criteria(body: str) -> List[Tuple[bool, str]]:
     return found
 
 
+def tick(body: str) -> str:
+    """The body with every checkbox under the acceptance criteria checked."""
+    out: List[str] = []
+    inside = False
+    for line in (body or "").split("\n"):
+        if line.startswith("## "):
+            inside = line.strip() == _CRITERIA_HEADING
+        match = _BOX.match(line.rstrip("\r")) if inside else None
+        out.append(re.sub(r"\[ \]", "[x]", line, count=1) if match and match.group(1) == " " else line)
+    return "\n".join(out)
+
+
 def contract(body: str) -> str:
     """Hash of the criteria texts, not their check marks: ticking a box keeps
     the contract, rewording, adding or removing a criterion changes it."""

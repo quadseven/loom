@@ -157,7 +157,8 @@ class FakeGitHub:
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
         if method == "GET" and parts.path == "/repos/%s" % REPO:
-            return reply(200, {"full_name": REPO, "private": self.private})
+            return reply(200, {"full_name": REPO, "private": self.private,
+                               "default_branch": "main"})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -173,6 +174,8 @@ class FakeGitHub:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
+        if method == "GET" and rest.startswith("compare/"):
+            return reply(200, {"status": "behind"})
         raise AssertionError("unexpected call %s %s" % (method, path))
 
     def _post_page(self, data):
@@ -293,6 +296,9 @@ class FakeGitHub:
         if method == "POST" and sub == "comments":
             self.comments[n].append({"body": data["body"]})
             return reply(201, {})
+        if method == "PATCH" and sub is None:
+            self.issues[n]["body"] = data["body"]
+            return reply(200, {})
         if method == "POST" and sub == "sub_issues":
             self.sub_issues.setdefault(n, []).append(self.issues.get(data["sub_issue_id"] - 1000, {}))
             return reply(201, {})
@@ -3708,3 +3714,148 @@ class VerifyDueTest(unittest.TestCase):
         issue = {"number": 4, "state": "open", "shipped_at": 1,
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]}
         self.assertEqual(station.verify_due([(REPO, issue)], {}, 99999), [])
+
+
+SHIPPED_BODY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
+                "- [ ] A test passes\n- [ ] Live: the daily line shows it\n")
+HOUR = 3600
+
+
+def shipped_at(age_hours):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_hours * HOUR))
+    return [dict(labeled("loom:shipped", "alice-example"), created_at=stamp)]
+
+
+class VerifyDispatchTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(10))
+        self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(30))
+
+    def briefs(self, lane="codex"):
+        try:
+            return sorted(n for n in os.listdir(self.inbox(lane)) if n.endswith(".md"))
+        except OSError:
+            return []
+
+    def text(self, lane="codex"):
+        with open(os.path.join(self.inbox(lane), self.briefs(lane)[0])) as fh:
+            return fh.read()
+
+    def test_free_slot_gets_the_oldest_shipped_ticket_with_a_verify_brief(self):
+        self.run_pass()
+        text = self.text()
+        self.assertIn("Issue: %s#2\n" % REPO, text)
+        self.assertIn("Deliverable: verify\n", text)
+        self.assertIn("Change no code", text)
+        self.assertIn("verify.json", text)
+        self.assertIn("A lane never moves a label", text)
+        self.assertIn("loom:shipped", self.fake.names(2))
+        self.assertEqual(self.fake.paths("PUT"), [])
+
+    def test_a_ticket_is_verified_at_most_once_per_six_hours(self):
+        self.run_pass()
+        os.remove(os.path.join(self.inbox(), self.briefs()[0]))
+        self.run_pass()
+        self.assertIn("Issue: %s#1\n" % REPO, self.text())
+        os.remove(os.path.join(self.inbox(), self.briefs()[0]))
+        self.run_pass()
+        self.assertEqual(self.briefs(), [])
+
+    def test_a_ticket_with_a_proof_is_not_due(self):
+        self.fake.comments[2] = [{"body": proof.PROOF_MARKER + "\n```json\n{}\n```",
+                                  "user": {"login": "alice-example"}}]
+        self.run_pass()
+        self.assertIn("Issue: %s#1\n" % REPO, self.text())
+
+    def test_an_anthropic_slot_is_never_handed_a_verify_brief(self):
+        self.heartbeat("codex", available=False)
+        self.heartbeat("anthropic")
+        self.heartbeat("claude")
+        self.run_pass()
+        self.assertEqual(self.briefs("anthropic"), [])
+        self.assertEqual(self.briefs("claude"), [])
+
+    def test_build_work_for_the_slot_comes_first(self):
+        self.fake.add(3, lane="codex", state="briefed")
+        self.run_pass()
+        self.assertIn("Issue: %s#3\n" % REPO, self.text())
+        self.assertEqual(len(self.briefs()), 1)
+
+    def test_a_queued_ticket_of_the_slots_tier_holds_the_slot(self):
+        self.fake.add(3, lane="codex", state="queued", body="Difficulty: medium\n\nBody\n")
+        self.run_pass()
+        self.assertEqual(self.briefs(), [])
+
+    def test_a_private_repo_is_not_verified_on_a_free_model_lane(self):
+        self.fake.private = True
+        self.heartbeat("codex", available=False)
+        self.heartbeat("zen")
+        self.run_pass()
+        self.assertEqual(self.briefs("zen"), [])
+
+
+class VerifyResultTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake.add(5, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(30))
+        self.name = "example-owner.example-repo-5-verify-1"
+        brief = "# Brief: %s\n\nRepo: %s\nBranch: loom/verify-5\nLane: codex\nIssue: %s#5\n" \
+                "Deliverable: verify\n\n# T5: Fix the thing\n" % (self.name, REPO, REPO)
+        self.write(os.path.join(self.inbox("codex", "done"), self.name + ".md"), brief)
+
+    def result(self, data):
+        text = data if isinstance(data, str) else json.dumps(data)
+        self.write(os.path.join(self.home, "logs", "codex", self.name + ".verify.json"), text)
+
+    def good(self, **changes):
+        out = {"kind": "docs", "revision": "abc1234",
+               "observed": {"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T01:00:00Z"},
+               "sources": ["https://example.com/logs/1"],
+               "criteria": [{"criterion": "A test passes", "result": "pass", "evidence": "ci"},
+                            {"criterion": "Live: the daily line shows it", "result": "pass",
+                             "evidence": "log"}]}
+        out.update(changes)
+        return out
+
+    def test_a_valid_proof_ticks_the_criteria_and_verifies_through_proof_py(self):
+        self.result(self.good())
+        self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertNotIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(len(proof.criteria(self.fake.issues[5]["body"])), 2)
+        self.assertTrue(all(done for done, _ in proof.criteria(self.fake.issues[5]["body"])))
+        comments = [c["body"] for c in self.fake.comments[5]]
+        self.assertTrue(any(c.startswith(proof.PROOF_MARKER) for c in comments))
+
+    def test_an_invalid_proof_leaves_the_ticket_shipped_with_one_note(self):
+        self.result(self.good(criteria=[]))
+        self.run_pass()
+        self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["body"], SHIPPED_BODY)
+        self.assertEqual(len(self.fake.comments[5]), 1)
+        self.assertIn("proof", self.fake.comments[5][0]["body"])
+
+    def test_a_missing_result_names_the_missing_evidence_in_one_note(self):
+        self.result({"missing": "the deployed station log for 2026-10-16"})
+        self.run_pass()
+        self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(len(self.fake.comments[5]), 1)
+        self.assertIn("the deployed station log for 2026-10-16", self.fake.comments[5][0]["body"])
+
+    def test_a_proof_holding_a_credential_is_refused_with_one_note(self):
+        self.result(self.good(sources=["token=abcdef0123456789"]))
+        self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["body"], SHIPPED_BODY)
+        self.assertEqual(len(self.fake.comments[5]), 1)
+
+    def test_no_verify_json_leaves_it_shipped_with_one_note(self):
+        self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(len(self.fake.comments[5]), 1)
+        self.assertIn("verify.json", self.fake.comments[5][0]["body"])

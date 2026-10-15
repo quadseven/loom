@@ -29,6 +29,11 @@ still needs to produce a commit. Any value other than `answer` parks the brief,
 and an answer brief with no issue number (from `Issue:` or the ticket name) is
 parked too.
 
+`Deliverable: verify` is written only by the station (a ticket cannot ask for
+it) and hands a lane one shipped ticket to verify. The agent changes no code
+and writes `verify.json`; the runner copies it to the lane's log folder, moves
+the brief to `done/`, and opens no pull request (docs/LANES.md, "Verify runs").
+
 The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
 what order the station claims it (docs/BRAIN.md); they stay on the ticket and
 are not written into the brief.
@@ -44,7 +49,7 @@ Repo: <owner/name>
 Branch: loom/T0001-<slug>
 Base: <target branch, optional>
 Model: <model id, optional>
-Deliverable: answer (optional; any other value parks the brief)
+Deliverable: answer (optional; the station also writes verify; any other value parks the brief)
 
 # T0001: <short title>
 
