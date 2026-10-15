@@ -186,9 +186,9 @@ class Reverts:
         self.trusted = {t.lower() for t in trusted}
         self.review_check = review_check
         # Builds the factory whose lane load picks the revert's lane; only
-        # called when a revert is briefed. Factory's optional close hook is
-        # unused here, so its default does not need forwarding.
-        self.lanes = lanes or (lambda: Factory(gh, self.repos, now, trusted=list(trusted)))
+        # called when a revert is briefed. Its close hook is unused here.
+        self.lanes = lanes or (lambda: Factory(gh, self.repos, now,
+                                             trusted=list(trusted), close=None))
         self._factory: Optional[Factory] = None
         self.state_dir = state_dir
         self.move = move
