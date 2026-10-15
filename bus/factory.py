@@ -619,9 +619,9 @@ class Factory:
         self.landed: set = set()
         self.updated: set = set()
         self._runs: Dict[str, List[Dict[str, Any]]] = {}
-        # The tickets named by After: lines, read once a pass.
+        # The tickets named by After: lines, and closed tickets whose lane
+        # pull requests are still open, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
-        self._ticket_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self._merged_prs: Dict[str, Dict[int, int]] = {}
 
     # -- reads -----------------------------------------------------------
@@ -643,15 +643,10 @@ class Factory:
         return self._depends[key]
 
     def _ticket(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
-        """Read a ticket issue once; None when unreadable."""
-        key = "%s#%d" % (repo, number)
-        if key not in self._ticket_cache:
-            try:
-                data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
-                self._ticket_cache[key] = data if isinstance(data, dict) and self._trusted(data) else None
-            except GitHubError:
-                self._ticket_cache[key] = None
-        return self._ticket_cache[key]
+        """A trusted ticket issue, read once a pass; None when it cannot be
+        read or a stranger opened it."""
+        data = self._dependency(repo, number)
+        return data if data is not None and self._trusted(data) else None
 
     def _tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         data = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)

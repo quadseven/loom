@@ -79,7 +79,7 @@ class FakeGitHub:
     # -- the GitHub client surface the factory uses --------------------
     def paginate(self, path):
         if re.search(r"/issues\?labels=loom:ticket", path):
-            return list(self.issues.values())
+            return [i for i in self.issues.values() if i.get("state") == "open"]
         if path.endswith("/pulls?state=open") or re.search(r"/pulls\?.*state=open", path):
             return [p for p in self.pulls.values() if p.get("state") == "open"]
         if path.endswith("/pulls?state=closed") or re.search(r"/pulls\?.*state=closed", path):
@@ -538,6 +538,16 @@ class PullRequests(Base):
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
         self.assertEqual(self.gh.comments[50][-1]["body"], "Superseded by #51.")
         self.assertEqual(self.merged, [])
+
+    def test_lane_pull_request_closed_when_its_closed_ticket_shipped_elsewhere(self):
+        self.gh.ticket(5, "shipped")
+        self.gh.issues[5]["state"] = "closed"
+        self.gh.pull(51, 5, created=7200, updated=7200, branch="loom/5-some-title-r2",
+                     state="closed", merged_at=iso(100), merged=True)
+        self.gh.pull(50, 5, created=9000, updated=9000, branch="loom/5-some-title")
+        self.go()
+        self.assertEqual(self.closed, [(50, "Superseded by #51.")])
+        self.assertEqual(self.gh.pulls[50]["state"], "closed")
 
     def test_non_loom_branch_pull_request_is_left_open(self):
         self.gh.ticket(5, "merged")
