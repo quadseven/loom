@@ -167,6 +167,7 @@ class RewriteIssueTest(Base):
         self.assertIn("It is slow.", prompt)
         self.assertIn("## Acceptance criteria", prompt)
         self.assertIn("Difficulty: easy | medium | hard", prompt)
+        self.assertIn("Do not write header lines such as Priority, Difficulty, After or Not before", prompt)
 
     def test_missing_brief_format_section_writes_nothing_and_logs_why(self):
         self.fake.add_triage(7)
