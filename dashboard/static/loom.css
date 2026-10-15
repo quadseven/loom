@@ -461,3 +461,8 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .goal-metric .sparkline i { flex: 1; background: var(--line); }
 .goal-metric .sparkline i.last { background: var(--accent); }
 .goal-card p { color: var(--body); font-size: 13.5px; line-height: 1.45; }
+
+.results-table { width: 100%; border-collapse: collapse; margin: 0.5rem 0 1.5rem; }
+.results-table th, .results-table td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--line, rgba(127,127,127,0.25)); min-height: 44px; }
+.results-table td { font-variant-numeric: tabular-nums; }
+.results-table td.not-looked { color: var(--muted, #888); font-style: normal; }
