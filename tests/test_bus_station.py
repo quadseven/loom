@@ -3816,7 +3816,7 @@ class VerifyResultTest(Base):
                "sources": ["https://example.com/logs/1"],
                "criteria": [{"criterion": "A test passes", "result": "pass", "evidence": "ci"},
                             {"criterion": "Live: the daily line shows it", "result": "pass",
-                             "evidence": "log"}]}
+                             "evidence": "daily line seen at 2026-10-15T14:11Z"}]}
         out.update(changes)
         return out
 
@@ -3859,3 +3859,31 @@ class VerifyResultTest(Base):
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(len(self.fake.comments[5]), 1)
         self.assertIn("verify.json", self.fake.comments[5][0]["body"])
+
+
+class UnseenLiveEvidenceTest(unittest.TestCase):
+    """A live criterion passes only on something seen, with its time
+    (2026-10-15: a lane passed one on what the logs 'would show')."""
+
+    def record(self, evidence, criterion="Live proof: on the first raid night, the line appears"):
+        return {"criteria": [
+            {"criterion": "A test fails without the change", "result": "pass",
+             "evidence": "tests/test_x.py would fail on main"},
+            {"criterion": criterion, "result": "pass", "evidence": evidence}]}
+
+    def test_a_prediction_is_refused(self):
+        why = station.unseen_live_evidence(self.record(
+            "Server logs would show 'lowest durability' before each boss pull."))
+        self.assertIn("would", why)
+
+    def test_evidence_without_a_time_is_refused(self):
+        why = station.unseen_live_evidence(self.record("The line appears in the log."))
+        self.assertIn("names no time", why)
+
+    def test_an_observed_line_with_its_time_passes(self):
+        self.assertEqual(station.unseen_live_evidence(self.record(
+            "worldserver log 2026-10-15T21:04:11Z: 'lowest durability Grug 64%' before encounter 8")), "")
+
+    def test_non_live_criteria_are_not_judged(self):
+        self.assertEqual(station.unseen_live_evidence(
+            {"criteria": [{"criterion": "A test fails without it", "evidence": "it would fail"}]}), "")
