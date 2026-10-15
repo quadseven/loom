@@ -1,11 +1,13 @@
 """Snapshot behavior with a GitHub boundary that controls request latency."""
 import os
+import json
 import threading
 import time
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
-from bus.github import GitHubError
+from bus.github import GitHub, GitHubError
 from dashboard.github import TicketStore
 
 
@@ -47,8 +49,53 @@ class SlowGitHub:
                 self.active -= 1
                 self.request_time += time.monotonic() - started
 
+    def paginate_parallel(self, path, workers=8):
+        return self.paginate(path)
+
 
 class SnapshotTest(unittest.TestCase):
+    def test_pull_request_pages_overlap_within_a_repo_and_keep_page_order(self):
+        repo = REPOS[0]
+        active = 0
+        max_active = 0
+        first_started = None
+        last_finished = None
+        request_time = 0.0
+        lock = threading.Lock()
+
+        def transport(method, url, headers, body):
+            nonlocal active, max_active, first_started, last_finished, request_time
+            path = urlsplit(url).path
+            if path != "/repos/%s/pulls" % repo:
+                return 200, {}, b"[]"
+            page = int(parse_qs(urlsplit(url).query).get("page", ["1"])[0])
+            started = time.monotonic()
+            with lock:
+                first_started = first_started or started
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.08)
+                links = "" if page == 8 else (
+                    '<https://api.github.com/repos/%s/pulls?state=all&per_page=100&page=%d>; rel="next", '
+                    '<https://api.github.com/repos/%s/pulls?state=all&per_page=100&page=8>; rel="last"'
+                    % (repo, page + 1, repo))
+                return 200, {"Link": links}, json.dumps([{"number": page}]).encode()
+            finally:
+                with lock:
+                    active -= 1
+                    last_finished = time.monotonic()
+                    request_time += last_finished - started
+
+        gh = GitHub("", transport=transport)
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=gh)
+            store.refresh()
+        self.assertGreater(max_active, 1)
+        self.assertLess(last_finished - first_started, request_time * 0.7)
+        self.assertEqual([row["number"] for row in store.response()["pull_requests"]],
+                         [1, 2, 3, 4, 5, 6, 7, 8])
+
     def test_repo_reads_overlap_and_keep_input_order(self):
         gh = SlowGitHub()
         with patch.dict(os.environ, {}, clear=True):
@@ -68,6 +115,29 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(store.errors, {REPOS[1]: "ticket read failed"})
         self.assertEqual([store.data[repo][0]["number"] for repo in (REPOS[0], REPOS[2])], [1, 3])
         self.assertEqual([row["number"] for row in store.response()["pull_requests"]], [11, 12, 13])
+
+    def test_pull_request_page_error_stays_with_its_repo(self):
+        repos = REPOS[:2]
+
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if "/pulls" not in path or "/pulls/comments" in path:
+                return 200, {}, b"[]"
+            repo = next(repo for repo in repos if "/repos/" + repo + "/pulls" == path)
+            page = int(parse_qs(urlsplit(url).query).get("page", ["1"])[0])
+            if repo == repos[1] and page == 2:
+                raise GitHubError("pull page failed", status=403)
+            links = ("<https://api.github.com/repos/%s/pulls?state=all&per_page=100&page=2>; rel=\"last\""
+                     % repo) if page == 1 else ""
+            return 200, {"Link": links}, json.dumps([{"repo": repo, "number": page}]).encode()
+
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore(repos, gh=GitHub("", transport=transport))
+            store.refresh()
+        self.assertEqual(store.response()["pull_requests"],
+                         [{"repo": repos[0], "number": 1}, {"repo": repos[0], "number": 2}])
+        self.assertIn("%s pull requests: pull page failed" % repos[1],
+                      store.response()["dashboard_errors"])
 
     def test_empty_snapshot_is_not_ready(self):
         with patch.dict(os.environ, {}, clear=True):

@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 DEFAULT_API = "https://api.github.com"
@@ -326,10 +327,13 @@ class GitHub:
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
+        return self._paginate_from(path, self.rest("GET", path))
+
+    def _paginate_from(self, path: str, first: Response) -> List[Any]:
         items: List[Any] = []
         url: Optional[str] = path
+        resp = first
         while url:
-            resp = self.rest("GET", url)
             page = resp.data if isinstance(resp.data, list) else []
             items.extend(page)
             nxt = _next_link(resp.headers.get("link", ""))
@@ -341,6 +345,31 @@ class GitHub:
                 # ask for the following page, which has its own ETag.
                 nxt = _with_page(url, _page_of(url) + 1)
             url = nxt
+            if url:
+                resp = self.rest("GET", url)
+        return items
+
+    def paginate_parallel(self, path: str, workers: int = 8) -> List[Any]:
+        """Read known pages concurrently, preserving their page order."""
+        if "per_page=" not in path:
+            path += ("&" if "?" in path else "?") + "per_page=100"
+        first = self.rest("GET", path)
+        last = _last_link(first.headers.get("link", ""))
+        if not last or _page_of(last) <= 1:
+            return self._paginate_from(path, first)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pages = list(pool.map(lambda page: self.rest("GET", _with_page(path, page)),
+                                  range(2, _page_of(last) + 1)))
+        items = list(first.data) if isinstance(first.data, list) else []
+        for response in pages:
+            if isinstance(response.data, list):
+                items.extend(response.data)
+        final = pages[-1]
+        next_url = _next_link(final.headers.get("link", ""))
+        if next_url:
+            items.extend(self.paginate(next_url))
+        elif final.status == 304 and isinstance(final.data, list) and len(final.data) >= _per_page(path):
+            items.extend(self.paginate(_with_page(path, _page_of(last) + 1)))
         return items
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
@@ -370,9 +399,17 @@ def _with_page(url: str, page: int) -> str:
 
 
 def _next_link(header: str) -> Optional[str]:
+    return _link(header, "next")
+
+
+def _last_link(header: str) -> Optional[str]:
+    return _link(header, "last")
+
+
+def _link(header: str, relation: str) -> Optional[str]:
     for part in header.split(","):
         m = re.match(r'\s*<([^>]+)>\s*;(.*)', part)
-        if m and re.search(r'rel\s*=\s*"?next"?', m.group(2)):
+        if m and re.search(r'rel\s*=\s*"?%s"?' % relation, m.group(2)):
             return m.group(1)
     return None
 

@@ -349,7 +349,8 @@ class TicketStore:
 
     def _read_pull_requests(self, repo, prs, errors):
         try:
-            items = self.gh.paginate("/repos/%s/pulls?state=all&per_page=100" % quote(repo, safe="/"))
+            items = self.gh.paginate_parallel("/repos/%s/pulls?state=all&per_page=100" % quote(repo, safe="/"),
+                                              workers=READ_WORKERS)
             prs.extend(item for item in items if isinstance(item, dict))
         except (GitHubError, OSError, ValueError) as exc:
             errors.append("%s pull requests: %s" % (repo, self._error_reason(exc)))
