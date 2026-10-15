@@ -1439,6 +1439,7 @@ def merge(gh: GitHub, repo: str, number: int,
                    or factory.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
         association = _validate_ticket_association(gh, repo, number, pr, ticket, "pr")
+        _refuse_pending_fix(gh, association, env)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -1457,6 +1458,19 @@ def merge(gh: GitHub, repo: str, number: int,
                 {"body": ADOPT_COMMENT})
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
+
+
+def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
+                        env: Optional[Dict[str, str]]) -> None:
+    """Refuse a merge while the ticket's brain fix has not run: status marks
+    such a pull request "READY - pending brain fix", and merging it then would
+    land the head the fix was sent to change (2026-10-15)."""
+    authors = trusted_authors(env)
+    if ticket is None or not authors:
+        return
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
+    if _pending_brain_fix(list(comments), authors):
+        raise ValueError("a brain fix is pending on the ticket; merge after it runs")
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
