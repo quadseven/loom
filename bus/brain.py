@@ -1343,7 +1343,11 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
 
 
 def _moved_labels(have: List[str], state: str, lane: Optional[str]) -> List[str]:
-    states = ["loom:" + item for item in STATES]
+    # Every state label goes, not only the ones a move can set: a ticket
+    # moved to shipped that kept loom:ready read as "ready" everywhere
+    # (tickets.ticket_state), and the Priorities list showed shipped work as
+    # lane work (2026-10-15).
+    states = ["loom:" + item for item in STATES + tickets.TICKET_STATES]
     kept = [x for x in have if x not in states
             and not (lane is not None and x.startswith("lane:"))]
     kept.append("loom:" + state)
