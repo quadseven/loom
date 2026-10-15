@@ -16,6 +16,7 @@ from bus import brain, labels, tickets
 from bus.github import DEFAULT_API, GitHub, GitHubError
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
+from . import goals, views
 
 
 def repos_from_env() -> List[str]:
@@ -202,9 +203,30 @@ class TicketStore:
         data["floor_context"] = _floor_context(reports, journals, self.operator_items, errors)
         data["lanes"] = lanes
         data["pull_requests"] = prs
+        # One pass at refresh, not per page (server.footer_models).
+        data["footer_models"] = views.footer_models(prs)
         data["dashboard_errors"] = errors
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
+        rows = [row for found in data.get("tickets", {}).values() if found for row in found]
+        data["goal_context"] = goals.goal_context(
+            rows, data.get("issue_comments", []), self._goal_titles(rows), metric_comments,
+            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc))
+
+    def _goal_titles(self, rows) -> Dict[str, Optional[str]]:
+        """Each goal issue's title, read once per process (titles rarely
+        change); an unreadable goal stays None and is read again next pass."""
+        cache = self.__dict__.setdefault("_titles", {})
+        for goal in {row["goal"] for row in rows if row.get("goal")}:
+            if cache.get(goal):
+                continue
+            repo, _, number = goal.partition("#")
+            try:
+                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
+                cache[goal] = str(issue.get("title") or "") or None if isinstance(issue, dict) else None
+            except (GitHubError, OSError, ValueError):
+                cache[goal] = None
+        return dict(cache)
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
@@ -355,9 +377,11 @@ class TicketStore:
                 "improving": snapshot.get("improving", {}),
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
+                "footer_models": snapshot.get("footer_models"),
                 "wait_rows": snapshot.get("wait_rows", []),
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),
+                "goal_context": snapshot.get("goal_context", {}),
                 "operator_items": list(self.operator_items),
                 "dashboard_errors": snapshot.get("dashboard_errors", []),
                 "brain_step": snapshot.get("brain_step"),
@@ -381,18 +405,7 @@ def _floor_context(reports, journals, asks, errors):
     latest_report = max(reports, key=lambda row: str(row.get("created_at") or ""), default=None)
     latest_journal = max(journals, key=lambda row: str(row.get("created_at") or ""), default=None)
     def sections(comment):
-        result = {}
-        if not comment:
-            return result
-        body = str(comment.get("body") or "")
-        for line in body.splitlines()[1:]:
-            match = re.match(r"^\s*(?:[-*]\s*)?(Going well|Not going well|Still stuck(?: since last report)?|Next)\s*:\s*(.*)$", line, re.I)
-            if match:
-                key = {"going well": "well", "not going well": "not well",
-                       "still stuck": "stuck", "still stuck since last report": "stuck",
-                       "next": "next"}[match.group(1).lower()]
-                result[key] = match.group(2).strip()
-        return result
+        return goals.sections(str(comment.get("body") or "")) if comment else {}
     report_body = str((latest_report or {}).get("body") or "")
     headline = next((line.strip() for line in report_body.splitlines()[1:] if line.strip()), None)
     journal_step = journal_next(str((latest_journal or {}).get("body") or ""))

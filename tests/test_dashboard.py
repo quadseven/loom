@@ -334,9 +334,12 @@ class DashboardViewTest(unittest.TestCase):
                       "- Next: Review the next ticket", "created_at": "2026-10-14T12:10:00Z"}],
             [{}, {}], [])
         body = _floor(state)
-        for item in ("Progress improved: 4 tickets verified.", "Going well", "Four tickets shipped",
-                     "Not going well", "One check failed", "Still stuck", "One item for two days",
-                     "Next", "Review the next ticket", "brain", "2026-10-14T12:10:00Z", "<strong>2</strong>"):
+        # The Floor reads times as "Oct 14 12:10 UTC" and labels the rows
+        # well / not well / stuck / next, as the design does.
+        for item in ("Progress improved: 4 tickets verified.", ">well<", "Four tickets shipped",
+                     ">not well<", "One check failed", ">stuck<", "One item for two days",
+                     ">next<", "Review the next ticket", "brain", "Oct 14 12:10 UTC",
+                     '<strong class="count">2</strong>', 'href="/brain"'):
             self.assertIn(item, body)
 
     def test_missing_goal_sources_keep_not_looked_reason(self):

@@ -21,6 +21,7 @@ from .shell import page
 from . import transcripts as transcript_store
 from . import usage as usage_store
 from . import ticket as ticket_view
+from . import goals as goals_view
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
@@ -30,17 +31,14 @@ from . import brain_view, hot_spots
 def _all_tickets(state):
     payload = state.response()
     rows = [row for tickets in payload["tickets"].values() if tickets for row in tickets]
-    prs = payload.get("pull_requests", [])
+    models = payload.get("footer_models")
+    if models is None:
+        models = views.footer_models(payload.get("pull_requests", []))
     for row in rows:
-        if row.get("model"):
-            continue
-        matching = []
-        for pr in prs:
-            parsed = views.footer(pr.get("body"))
-            if parsed and parsed[0] == row.get("repo") and parsed[1] == str(row.get("number")):
-                matching.append((str(pr.get("updated_at") or ""), parsed[3]))
-        if matching:
-            row["model"] = max(matching)[1]
+        if not row.get("model"):
+            model = models.get("%s#%s" % (row.get("repo"), row.get("number")))
+            if model:
+                row["model"] = model
     return rows
 
 
@@ -124,35 +122,105 @@ def _conveyor(state, rows):
     return "".join(cards), bottleneck
 
 
+MOVING_ORDER = ("running", "pr", "briefed", "merged", "shipped")
+
+
+def _when(stamp):
+    """A comment time as the operator reads it: 'Oct 15 02:48 UTC', or in
+    LOOM_DASHBOARD_TZ (an IANA name) when that zone is available."""
+    from datetime import datetime, timezone
+    try:
+        moment = datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    zone_name = os.environ.get("LOOM_DASHBOARD_TZ", "").strip()
+    if zone_name:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            local = moment.astimezone(ZoneInfo(zone_name))
+        except (ZoneInfoNotFoundError, ValueError):
+            # An unknown or malformed zone name reads in UTC, which says so.
+            return moment.strftime("%b %d %H:%M UTC")
+        return local.strftime("%b %d %H:%M ") + (local.tzname() or zone_name)
+    return moment.strftime("%b %d %H:%M UTC")
+
+
+def _start_here_line(state):
+    """Hunt's start-here: the top epic and its next ticket, from backlog.json."""
+    raw = _backlog_bytes()
+    if raw is None:
+        return None, "the backlog source is not set or unreadable"
+    epics = _backlog_document(raw).get("epics") or []
+    if not epics or not isinstance(epics[0], dict):
+        return None, "the backlog has no epics"
+    first, nxt = epics[0], epics[0].get("next") or {}
+    return (str(first.get("title") or ""), _issue_url({**first, **nxt}),
+            str(nxt.get("title") or ("#%s" % nxt.get("number") if nxt.get("number") else ""))), None
+
+
 def _floor(state):
     rows = _all_tickets(state)
     conveyor, bottleneck = _conveyor(state, rows)
-    moving = [row for row in rows if row.get("state") in ("running", "pr", "briefed", "merged", "shipped")]
-    context = getattr(state, "context", None) or state.response().get("floor_context", {})
-    report_line = html.escape(str(context.get("report_headline") or ("not looked: " + str(context.get("report_reason") or "no goal report found"))))
-    report_time = context.get("report_time")
-    if report_time:
-        report_line += " <small>%s</small>" % html.escape(str(report_time))
-    brain = context.get("journal_step") or ("not looked: " + str(context.get("journal_reason") or "no goal journal found"))
-    if context.get("journal_holder") or context.get("journal_time"):
-        brain += " (%s%s%s)" % (context.get("journal_holder") or "", ", " if context.get("journal_holder") and context.get("journal_time") else "", context.get("journal_time") or "")
-    hunt = context.get("hunt") or "Start here not looked"
-    parts = ['<section class="standup">%s</section>' % report_line,
-             '<section class="section"><h2>Conveyor</h2><div class="conveyor">%s</div>' % conveyor]
-    if bottleneck:
-        parts.append('<p class="bottleneck-note">%s is the bottleneck: longest median wait.</p>' % html.escape(bottleneck))
-    parts.append('</section><div class="floor-columns"><section class="section"><h2>Moving now</h2><div class="ticket-grid">%s</div></section>' % (
-        "".join(_ticket_row(row) for row in moving) or '<p class="empty-state">Nothing is moving right now.</p>'))
-    parts.append('<aside class="floor-aside"><section class="card"><h2>Brain\'s next move</h2><p>%s</p></section>' % html.escape(str(brain)))
-    parts.append('<section class="card"><h2>Hunt - start here</h2><p>%s</p></section>' % html.escape(str(hunt)))
+    order = {name: index for index, name in enumerate(MOVING_ORDER)}
+    moving = sorted((row for row in rows if row.get("state") in order),
+                    key=lambda row: (order[row["state"]], str(row.get("updated_at") or "")[::-1]))
+    payload = state.response()
+    context = getattr(state, "context", None) or payload.get("floor_context", {})
+    esc = html.escape
+    headline = context.get("report_headline")
+    if headline:
+        when = _when(context.get("report_time"))
+        standup = '<p class="standup-line">%s</p><p class="standup-meta machine-fact">standup%s</p>' % (
+            esc(goals_view.short(str(headline), 220)), esc(" - %s report" % when) if when else "")
+    else:
+        standup = '<p class="standup-line">No standup yet.</p><p class="standup-meta machine-fact">not looked: %s</p>' % esc(
+            str(context.get("report_reason") or "no goal report found"))
+    head = '<div class="section-head"><span class="label">Conveyor - count and median wait</span>%s</div>' % (
+        '<span class="bottleneck-note">%s is the bottleneck</span>' % esc(bottleneck) if bottleneck else "")
+    parts = ['<section class="standup">%s</section>' % standup,
+             '<section class="section">%s<div class="conveyor">%s</div></section>' % (head, conveyor)]
+    parts.append('<div class="floor-columns"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
+                 '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list">%s</div></section>' % (
+                     "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'))
+    step = context.get("journal_step")
+    if step:
+        title = goals_view.short(str(step), 140)
+        rest = " ".join(str(step).split())[len(title.rstrip(" .")):].strip(" .")
+        who = ", ".join(x for x in (context.get("journal_holder"), _when(context.get("journal_time"))) if x)
+        brain = '<p class="next-move">%s</p>%s<p class="machine-fact">%s</p><a href="/brain">see the reasoning &rarr;</a>' % (
+            esc(title), '<p class="muted">%s</p>' % esc(goals_view.short(rest, 200)) if rest else "", esc(who))
+    else:
+        brain = '<p class="muted">not looked: %s</p>' % esc(str(context.get("journal_reason") or "no goal journal found"))
+    parts.append('<aside class="floor-aside"><section class="card next-move-card"><span class="label">Brain\'s next move</span>%s</section>' % brain)
+    start, why = _start_here_line(state)
+    if start:
+        epic, url, ticket = start
+        hunt = '<p class="next-move">%s</p><p><a href="%s">%s</a></p><a href="/backlog">the backlog &rarr;</a>' % (
+            esc(epic), esc(url, quote=True), esc(ticket or "first ticket"))
+    else:
+        hunt = '<p class="muted">not looked: %s</p>' % esc(why)
+    parts.append('<section class="card"><span class="label">Hunt - start here</span>%s</section>' % hunt)
     since = context.get("since_report") or {}
-    parts.append('<section class="card"><h2>Since last report</h2>%s</section>' % "".join(
-        '<p><b>%s</b> %s</p>' % (html.escape(label), html.escape(str(since.get(key, "not looked: " + str(context.get("report_reason") or "section missing")))))
-        for key, label in (("well", "Going well"), ("not well", "Not going well"), ("stuck", "Still stuck"), ("next", "Next"))))
+    missing = "not in the latest report" if headline else "no report found"
+    parts.append('<section class="card"><span class="label">Since last report</span><dl class="since">%s</dl></section>' % "".join(
+        '<dt class="since-%s">%s</dt><dd>%s</dd>' % (key.replace(" ", "-"), esc(label), esc(str(since.get(key) or missing)))
+        for key, label in (("well", "well"), ("not well", "not well"), ("stuck", "stuck"), ("next", "next"))))
     needs = context.get("needs_you")
-    parts.append('<section class="card"><h2>Needs you</h2><strong>%s</strong> - <a href="/needs-you">View asks</a></section></aside></div>' % (
-        str(needs) if isinstance(needs, int) else "not looked: " + str(context.get("needs_you_reason") or "needs-operator source unavailable")))
+    asks = payload.get("operator_items") or []
+    if isinstance(needs, int):
+        top = asks[0] if asks else None
+        needs_html = '<p><strong class="count">%d</strong> %s</p>%s<a href="/needs-you">all asks &rarr;</a>' % (
+            needs, "ask" if needs == 1 else "asks",
+            '<p>%s</p>' % esc(str(top.get("title") or "")) if top else "")
+    else:
+        needs_html = '<p class="muted">not looked: %s</p>' % esc(str(context.get("needs_you_reason") or "needs-operator source unavailable"))
+    parts.append('<section class="card"><span class="label">Needs you</span>%s</section></aside></div>' % needs_html)
     return page("Floor", "floor", "".join(parts), status="snapshot")
+
+
+def _short_ref(goal):
+    """quadseven/loom#30 -> loom#30: the owner is the same everywhere."""
+    return goal.split("/", 1)[-1]
 
 
 def _goals(state):
@@ -161,27 +229,38 @@ def _goals(state):
     for row in rows:
         if row.get("goal"):
             grouped.setdefault(row["goal"], []).append(row)
-    context = getattr(state, "context", {}) or {}
-    goal_data = context.get("goals", {})
+    context = getattr(state, "context", None) or {}
+    goal_data = context.get("goals") or state.response().get("goal_context") or {}
+    esc = html.escape
     cards = []
-    for goal, tickets in sorted(grouped.items()):
+    for goal, tickets in sorted(grouped.items(), key=lambda item: -len(item[1])):
         info = goal_data.get(goal, {}) if isinstance(goal_data, dict) else {}
-        bars = info.get("history", [])[-7:]
-        spark = ''.join('<i style="height:%d%%"></i>' % max(5, min(100, int(v))) for v in bars)
+        history = [v for v in info.get("history", [])][-7:]
+        scale = info.get("scale") or max([v for v in history if isinstance(v, (int, float))] or [1]) or 1
+        spark = "".join('<i style="height:%d%%"%s></i>' % (
+            max(6, min(100, int(100 * v / scale))) if isinstance(v, (int, float)) else 6,
+            ' class="last"' if index == len(history) - 1 else "")
+            for index, v in enumerate(history))
         counts = "".join('<a class="chip" href="/tickets?state=%s&amp;goal=%s">%s %d</a>' % (
-            html.escape(name, quote=True), quote(goal, safe=""), html.escape(name),
+            esc(name, quote=True), quote(goal, safe=""), esc(name),
             sum(row.get("state") == name for row in tickets)) for name in STATES
             if any(row.get("state") == name for row in tickets))
-        title = info.get("title", goal)
-        cards.append('<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
-                     '<div class="metric">%s</div><div class="machine-fact">%s / was %s</div>'
-                     '<div class="sparkline" aria-label="Seven recent measurements">%s</div>'
-                     '<div class="chips">%s</div><p>%s</p><a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
-                         html.escape(goal), html.escape(str(title)), html.escape(str(info.get("metric", "not looked"))),
-                         html.escape(str(info.get("unit", "metric"))), html.escape(str(info.get("previous", "not looked"))),
-                         spark or '<span>History not looked</span>', counts,
-                         html.escape(str(info.get("report", "No report loaded."))), quote(goal, safe=""), len(tickets)))
-    body = '<div class="goal-grid">%s</div>' % ("".join(cards) or '<p class="empty-state">No goals with ticket data.</p>')
+        title = info.get("title") or _short_ref(goal)
+        report = info.get("report")
+        measure = info.get("measure")
+        cards.append(
+            '<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
+            '<div class="goal-metric"><div><div class="metric">%s</div><div class="machine-fact">%s%s</div></div>'
+            '<div class="sparkline" aria-label="Last 7 days, one bar a day">%s</div></div>%s'
+            '<div class="chips">%s</div><p>%s</p><a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
+                esc(_short_ref(goal)), esc(str(title)), esc(str(info.get("metric", "-"))),
+                esc(str(info.get("unit") or "not looked: the goal has no snapshot data")),
+                esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else "",
+                spark, '<p class="machine-fact">measure: %s</p>' % esc(measure) if measure else "",
+                counts, esc(report) if report else "No report on this goal in the last two weeks.",
+                quote(goal, safe=""), len(tickets)))
+    body = '<p class="page-lede">Each goal home, measured by what reached a live proof.</p><div class="goal-grid">%s</div>' % (
+        "".join(cards) or '<p class="empty-state">No goals with ticket data.</p>')
     return page("Goals", "goals", body, status="snapshot")
 
 
@@ -584,8 +663,19 @@ def _dispatch_basic(handler, state, path):
     if path == "/readyz":
         return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
     if path == "/api/tickets":
-        return handler.send_json(200, state.response())
+        return handler.send_json(200, _api_tickets(state.response()))
     return handler.send_text(404, "not found")
+
+
+# The raw sources the views read in-process, served as counts: whole pull
+# requests and two weeks of comments made /api/tickets 164 MB (2026-10-15).
+RAW_SOURCES = ("pull_requests", "issue_comments", "review_comments", "footer_models")
+
+
+def _api_tickets(payload):
+    out = {key: value for key, value in payload.items() if key not in RAW_SOURCES}
+    out["source_counts"] = {key: len(payload.get(key) or ()) for key in RAW_SOURCES}
+    return out
 
 
 def _dispatch_usage(handler, state):
