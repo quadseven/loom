@@ -309,6 +309,12 @@ class MetricsTest(unittest.TestCase):
         self.assertIn("1 unfixed regressions", result.value)
         self.assertIn("1 fix PRs without tests", result.value)
 
+    def test_a_config_only_fix_needs_no_test(self):
+        self.gh.pr["body"] = "Fixes the lane check"
+        self.gh.files = [{"filename": ".loom/validation.conf", "status": "modified"},
+                         {"filename": "production/kustomization.yaml", "status": "modified"}]
+        self.assertIn("0 fix PRs without tests", self.numbers()[4].value)
+
     def test_untrusted_metrics_comment_does_not_suppress_daily_post(self):
         self.gh.comments[1].append({"body": metrics.MARKER +
                                     "\n2030-01-02: 9/9 pass; streak 7 day(s)",
