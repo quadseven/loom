@@ -83,6 +83,11 @@ class FakeGH:
             self.issues[int(m.group(1))].update(body)
             return Response(200, {})
         if method == "POST" and path.endswith("/comments"):
+            m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
+            if m:
+                self.comments.setdefault((m.group(1), int(m.group(2))), []).append(
+                    {"body": body["body"], "created_at": stamp(T0 + 10),
+                     "user": {"login": AUTHOR}})
             return Response(201, {"id": 1})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100", path)
         if m:
@@ -298,6 +303,40 @@ class FilerTest(unittest.TestCase):
                 for i in range(invariants.WRITES_MAX + 3)]
         invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run(many)
         self.assertEqual(len(self.gh.issues), invariants.WRITES_MAX)
+
+    def test_quiet_triage_issue_is_explained_and_closed_but_recurring_stays_open(self):
+        breach = self.breach(at=T0 - 7 * 3600)
+        self.file(breach, now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        issue = self.gh.issues[number]
+        issue.update(created_at=stamp(T0 - 7 * 3600), labels=[{"name": x} for x in invariants.LABELS])
+        self.gh.comments[(REPO, number)] = [
+            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 2 * 86400)},
+            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 86400)},
+        ]
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run([])
+        self.assertEqual(issue["state"], "open")
+        self.assertIn("loom:recurring", [label["name"] if isinstance(label, dict) else label
+                                          for label in issue["labels"]])
+        self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 0)
+
+    def test_quiet_triage_issue_closes_once_and_rewritten_issue_is_untouched(self):
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        issue = self.gh.issues[number]
+        issue.update(created_at=stamp(T0 - 7 * 3600), labels=[{"name": x} for x in invariants.LABELS])
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run([])
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(issue.get("state_reason"), "not_planned")
+        self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 1)
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 + invariants.CHECK_EVERY,
+                         self.said.append).run([])
+        self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 1)
+
+        issue.update(state="open", labels=[{"name": invariants.LABEL}, {"name": "loom:rewritten"}])
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0 + 2 * invariants.CHECK_EVERY,
+                         self.said.append).run([])
+        self.assertEqual(issue["state"], "open")
 
 
 class InvariantTest(unittest.TestCase):

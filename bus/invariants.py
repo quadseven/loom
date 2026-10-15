@@ -36,6 +36,8 @@ from .github import GitHubError
 from .labels import REMOTE_LANES
 
 DAY = 24 * 3600
+CLEAR_AFTER = 6 * 3600
+RECURRING_AFTER = 7 * DAY
 # No journal from any brain for this long is a brain that stopped ticking.
 BRAIN_SILENT = 90 * 60
 # Two loom:report comments on one goal closer than this are one too many.
@@ -463,6 +465,53 @@ class Filer:
         self.writes += 1
         self.say("invariants: reopened %s#%d: %s" % (self.repo, number, b.title))
 
+    def _comments(self, number: int) -> List[Dict[str, Any]]:
+        return [c for c in self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                            % (self.repo, number)) if isinstance(c, dict)]
+
+    def _clear_stale(self, current: Dict[str, Breach]) -> None:
+        for key, number in self._listing().items():
+            if self.writes >= WRITES_MAX:
+                return
+            if key in current:
+                continue
+            issue = self._issue(number)
+            if issue is None or issue.get("state") != "open":
+                continue
+            labels = [str(x.get("name", "")) for x in issue.get("labels", [])
+                      if isinstance(x, dict)]
+            if "loom:triage" not in labels:
+                continue
+            comments = self._comments(number)
+            breaches = [_epoch(issue.get("created_at"))]
+            breaches += [_epoch(c.get("created_at")) for c in comments
+                         if "Broken again after this was closed:" in str(c.get("body", ""))]
+            times = [at for at in breaches if at is not None]
+            if not times or self.now - max(times) < CLEAR_AFTER:
+                continue
+            recent = [at for at in times if 0 <= self.now - at <= RECURRING_AFTER]
+            if len(recent) >= 3:
+                if "loom:recurring" not in labels:
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                                 {"labels": labels + ["loom:recurring"]})
+                    self.writes += 1
+                continue
+            if self.writes + 2 > WRITES_MAX:
+                return
+            body = ("The invariant cleared by %s; its last breach was observed at %s, "
+                    "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
+            already_explained = any("The invariant cleared by " in str(c.get("body", ""))
+                                    for c in comments)
+            if not already_explained:
+                _text.check(body)
+                self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
+                             {"body": body})
+                self.writes += 1
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                         {"state": "closed", "state_reason": "not_planned"})
+            self.writes += 1
+            self.say("invariants: closed cleared %s#%d" % (self.repo, number))
+
     def _one(self, b: Breach) -> None:
         known = self.state.get(b.key)
         number = (known if isinstance(known, int) and not isinstance(known, bool)
@@ -480,13 +529,19 @@ class Filer:
             self._reopen(b, number)
 
     def run(self, breaches: Iterable[Breach]) -> None:
-        for b in breaches:
+        current = {b.key: b for b in breaches}
+        for b in current.values():
             if not self.write or self.writes >= WRITES_MAX:
                 return
             try:
                 self._one(b)
             except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
                 self.say("invariants: could not file %s (%s): %s" % (b.invariant, b.title, err))
+        if self.write and self.writes < WRITES_MAX:
+            try:
+                self._clear_stale(current)
+            except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+                self.say("invariants: could not close cleared issues: %s" % err)
 
 
 def load(path: str, say: Say) -> Dict[str, Any]:
