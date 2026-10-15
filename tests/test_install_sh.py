@@ -108,6 +108,13 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.station_interval(), "180")
 
+    def test_station_path_prefers_the_lanes_opencode_install(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_REWRITE_OPENCODE</key><string>%s/.opencode/bin/opencode</string>"
+                      % self.home, plist)
+
     def test_a_bad_station_interval_installs_nothing(self):
         for bad in ("soon", "30"):
             with self.subTest(bad=bad):

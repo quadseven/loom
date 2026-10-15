@@ -2893,6 +2893,10 @@ class Station:
             try:
                 action = rewrite.rewrite_issue(self.gh, repo, goal, issue, cmd,
                                                REWRITE_TIMEOUT)
+            except rewrite.CommandFailure as err:
+                tried.pop(str(number), None)
+                _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
+                continue
             except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
                 continue
