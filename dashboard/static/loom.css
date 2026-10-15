@@ -231,3 +231,33 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .ticket-columns { display: block; }
   .ticket-columns > [hidden] { display: none; }
 }
+/* Brain and Hot spots */
+.brain-card, .hot-spot { margin-bottom: 18px; }
+.tick-steps { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; margin: 10px 0 0; padding: 0; list-style: none; }
+.tick-step { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--row); font: 12px var(--font-mono); }
+.tick-step span { color: var(--dim); font-size: 10.5px; }
+.tick-step small { color: var(--muted); font-size: 10.5px; }
+.tick-step.done { border-color: color-mix(in srgb, var(--good) 50%, transparent); }
+.tick-step.done small { color: var(--good); }
+.tick-step.current { border-color: var(--accent); }
+.tick-step.current small { color: var(--accent); }
+.thoughts, .ranking, .recent-ticks, .wait-list, .finding-list, .stuck-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.thoughts li, .recent-ticks li, .wait-list li, .finding-list li, .stuck-list li, .ranking li { padding: 8px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.tag { display: inline-block; padding: 1px 6px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--muted); font: 10.5px var(--font-mono); text-transform: uppercase; }
+.tag-regression { border-color: var(--bad); color: var(--bad); }
+.tag-operator, .tag-verifying { border-color: var(--accent); color: var(--accent); }
+.tag-merged { border-color: var(--good); color: var(--good); }
+.ranking li span { display: block; color: var(--muted); font: 12px var(--font-mono); }
+.markers { margin: 0; padding: 10px; border-radius: 8px; background: var(--code); white-space: pre-wrap; overflow-wrap: anywhere; font: 11.5px/1.5 var(--font-mono); }
+.outcome-ok { color: var(--good); }
+.outcome-failed { color: var(--bad); }
+.outcome-degraded { color: var(--accent); }
+.wait-list li.bottleneck strong { color: var(--accent); }
+.wait-list span, .finding-list span { color: var(--muted); font: 12px var(--font-mono); }
+.lane-bars { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; align-items: start; }
+.lane-bar { display: flex; flex-direction: column; gap: 3px; font: 11px var(--font-mono); overflow-wrap: anywhere; }
+.lane-bar .bar { display: flex; align-items: flex-end; height: 96px; border-radius: 6px; background: var(--raised); }
+.lane-bar .bar i { display: block; width: 100%; border-radius: inherit; background: var(--muted); }
+.lane-bar small { color: var(--muted); }
+.lane-bar.bad .bar i { background: var(--bad); }
+.lane-bar.bad small { color: var(--bad); }
