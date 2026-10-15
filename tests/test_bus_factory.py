@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from unittest import mock
 
 from bus import factory, station
-from bus.github import Response
+from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
 REPO = "example-org/example-repo"
@@ -53,20 +53,23 @@ class FakeGitHub:
 
     def pull(self, number, ticket, created=3600, mergeable=True, green=True,
              resolved=True, runs=(("unittest", "completed"), (factory.DEFAULT_REVIEW_CHECK, "completed")),
-             updated=3600, files=("bus/a.py", "tests/test_a.py"), labels=()):
+             updated=3600, files=("bus/a.py", "tests/test_a.py"), labels=(),
+             branch=None, state="open", merged_at=None, merged=False, user=ME, body=""):
         sha = "sha%d" % number
         self.files[number] = list(files)
+        ref = branch if branch is not None else ("loom/%d-some-title" % ticket)
         self.pulls[number] = {
-            "number": number, "state": "open", "draft": False, "body": "", "user": ME,
+            "number": number, "state": state, "draft": False, "body": body, "user": user,
             "labels": [{"name": x} for x in labels],
-            "head": {"ref": "loom/%d-some-title" % ticket, "sha": sha,
+            "head": {"ref": ref, "sha": sha,
                      "repo": {"full_name": REPO}},
             "base": {"ref": "main", "repo": {"full_name": REPO}},
-            "created_at": iso(created), "updated_at": iso(updated), "mergeable": mergeable}
+            "created_at": iso(created), "updated_at": iso(updated), "mergeable": mergeable,
+            "merged_at": merged_at, "merged": merged or bool(merged_at)}
         self.runs[sha] = [{"name": n, "status": s} for n, s in runs]
         self.details[number] = {
             "isDraft": False, "mergeable": "MERGEABLE" if mergeable else "CONFLICTING",
-            "headRefName": "loom/%d-some-title" % ticket, "headRefOid": sha,
+            "headRefName": ref, "headRefOid": sha,
             "headRepository": {"nameWithOwner": REPO},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {
                 "state": "SUCCESS" if green else "FAILURE"}}}]},
@@ -76,14 +79,18 @@ class FakeGitHub:
     # -- the GitHub client surface the factory uses --------------------
     def paginate(self, path):
         if re.search(r"/issues\?labels=loom:ticket", path):
-            return list(self.issues.values())
-        if path.endswith("/pulls?state=open"):
+            return [i for i in self.issues.values() if i.get("state") == "open"]
+        if path.endswith("/pulls?state=open") or re.search(r"/pulls\?.*state=open", path):
+            return [p for p in self.pulls.values() if p.get("state") == "open"]
+        if path.endswith("/pulls?state=closed") or re.search(r"/pulls\?.*state=closed", path):
+            return [p for p in self.pulls.values() if p.get("state") == "closed"]
+        if path.endswith("/pulls?state=all") or re.search(r"/pulls\?.*state=all", path) or path.endswith("/pulls"):
             return list(self.pulls.values())
         if path.endswith("/issues?labels=loom:triage&state=open"):
             return list(self.filed)
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
-            return list(self.comments[int(m.group(1))])
+            return list(self.comments.get(int(m.group(1)), []))
         m = re.search(r"/issues/(\d+)/events$", path)
         if m:
             return list(self.events[int(m.group(1))])
@@ -147,7 +154,7 @@ class FakeGitHub:
                     self.pulls[number]["labels"] = [
                         {"name": x} for x in dict.fromkeys(have + list(body["labels"]))]
             elif m.group(2) == "/comments":
-                self.comments[number].append({"body": body["body"], "created_at": iso(0), "user": ME})
+                self.comments.setdefault(number, []).append({"body": body["body"], "created_at": iso(0), "user": ME})
             elif method == "PATCH":
                 self.issues[number]["body"] = body["body"]
         m = re.search(r"/pulls/(\d+)$", path)
@@ -176,7 +183,7 @@ class FakeGitHub:
 class Base(unittest.TestCase):
     def setUp(self):
         self.gh = FakeGitHub()
-        self.merged, self.fixed, self.moved = [], [], []
+        self.merged, self.fixed, self.moved, self.closed = [], [], [], []
 
     def go(self, limited=(), no_test_repos=(), available=None):
         def merge(gh, repo, number, ticket):
@@ -190,9 +197,13 @@ class Base(unittest.TestCase):
             self.fixed.append((number, ticket, gh.issues[ticket[1]]["labels"][:]))
         def move(gh, repo, number, state, lane=None, note=None):
             self.moved.append((number, state, lane))
+        def close(gh, repo, number, comment):
+            self.closed.append((number, comment))
+            factory._default_close(gh, repo, number, comment)
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
-                            merge=merge, fix=fix, move=move, limited=limited,
-                            no_test_repos=no_test_repos, available=available)
+                            merge=merge, fix=fix, move=move, close=close,
+                            limited=limited, no_test_repos=no_test_repos,
+                            available=available)
         f.run()
         return f
 
@@ -506,6 +517,65 @@ class PullRequests(Base):
         self.gh.pulls[51] = dict(self.gh.pulls[50], number=51, head={"ref": "feature/x"})
         self.go()
         self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_older_lane_pull_request_closed_when_newer_lane_pr_exists(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200, updated=7200, branch="loom/5-some-title")
+        self.gh.pull(52, 5, created=3600, updated=3600, branch="loom/5-some-title-r2")
+        self.go()
+        self.assertEqual(self.closed, [(50, "Superseded by #52.")])
+        self.assertEqual(self.gh.pulls[50]["state"], "closed")
+        self.assertEqual(self.gh.comments[50][-1]["body"], "Superseded by #52.")
+        self.assertEqual(self.merged, [(52, (REPO, 5))])
+
+    def test_lane_pull_request_closed_when_ticket_merged_through_different_pr(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, created=7200, updated=7200, branch="loom/5-some-title-r2",
+                     state="closed", merged_at=iso(100), merged=True)
+        self.gh.pull(50, 5, created=9000, updated=9000, branch="loom/5-some-title")
+        self.go()
+        self.assertEqual(self.closed, [(50, "Superseded by #51.")])
+        self.assertEqual(self.gh.pulls[50]["state"], "closed")
+        self.assertEqual(self.gh.comments[50][-1]["body"], "Superseded by #51.")
+        self.assertEqual(self.merged, [])
+
+    def test_lane_pull_request_closed_when_its_closed_ticket_shipped_elsewhere(self):
+        self.gh.ticket(5, "shipped")
+        self.gh.issues[5]["state"] = "closed"
+        self.gh.pull(51, 5, created=7200, updated=7200, branch="loom/5-some-title-r2",
+                     state="closed", merged_at=iso(100), merged=True)
+        self.gh.pull(50, 5, created=9000, updated=9000, branch="loom/5-some-title")
+        self.go()
+        self.assertEqual(self.closed, [(50, "Superseded by #51.")])
+        self.assertEqual(self.gh.pulls[50]["state"], "closed")
+
+    def test_non_loom_branch_pull_request_is_left_open(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, created=7200, updated=7200, branch="loom/5-some-title-r2",
+                     state="closed", merged_at=iso(100), merged=True)
+        self.gh.pull(60, 5, created=9000, updated=9000, branch="feature/my-branch",
+                     body="Refs %s#5\n" % REPO)
+        self.gh.pull(70, 5, created=9000, updated=9000, branch="loom/5-some-title",
+                     user=STRANGER)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[60]["state"], "open")
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+
+    def test_failed_close_does_not_stop_the_rest_of_the_pass(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200, updated=7200, branch="loom/5-some-title")
+        self.gh.pull(52, 5, created=3600, updated=3600, branch="loom/5-some-title-r2")
+        real_rest = self.gh.rest
+
+        def rest(method, path, *args, **kwargs):
+            if method == "PATCH" and path.endswith("/pulls/50"):
+                raise GitHubError("boom", 500)
+            return real_rest(method, path, *args, **kwargs)
+        with mock.patch.object(self.gh, "rest", side_effect=rest):
+            self.go()
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+        self.assertEqual(len(self.merged), 1)
 
 
 LEAK_JOB = "leak-scan / Scan diff and PR/issue text for private identifiers"
