@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 from datetime import datetime, timezone
 
-from bus import metrics, station
+from bus import metrics, proof, station
 from bus.github import GitHubError, Response
 
 REPO = "example-owner/example-repo"
@@ -108,6 +108,21 @@ class MetricsTest(unittest.TestCase):
         spread = next(n for n in self.numbers() if n.name == "Spread")
         self.assertIn("codex 2", spread.line())
         self.assertIn("verify 1;", spread.line())
+
+    def test_throughput_splits_verified_tickets_into_lane_and_brain_proofs(self):
+        def proof_comment(by):
+            body = proof.PROOF_MARKER + "\n```json\n%s\n```" % json.dumps({"verified_by": by})
+            return {"body": body, "created_at": iso(NOW - 500), "user": {"login": "trusted-bot"}}
+        self.gh.comments[2] = [proof_comment("zen/opencode/model-free")]
+        for number, by in ((4, "brain"), (5, "codex/model-x")):
+            self.gh.issues.append(dict(self.gh.ticket, number=number))
+            self.gh.events[number] = self.gh.events[2]
+            self.gh.comments[number] = [proof_comment(by)]
+        self.gh.comments[5].append({"body": proof.PROOF_MARKER + "\n```json\n{}\n```",
+                                    "user": {"login": "someone-else"}})
+        gh = metrics.Collector(self.gh, [REPO], self.home, NOW, "Review", trusted=["trusted-bot"])
+        throughput = next(n for n in gh.collect() if n.name == "Throughput")
+        self.assertIn("verified 3/3 (lane 2, brain 1)", throughput.line())
 
     def test_ticket_waits_include_reentered_state_and_current_state(self):
         events = []

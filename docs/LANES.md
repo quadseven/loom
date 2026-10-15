@@ -294,12 +294,17 @@ The agent changes no code, opens no pull request and moves no label; it reads
 the ticket's Live criterion and gathers evidence with read-only reads, then
 writes `verify.json`: a proof record (`bus/proof.py`) or
 `{"missing": "<the evidence that does not exist yet>"}`. The runner copies it
-to the lane's log folder as `<brief>.verify.json`. The station checks a
-record with `bus/proof.py`, ticks the criteria and moves the ticket to
-verified with the proof. A refused record, a missing result or no
+to the lane's log folder as `<brief>.verify.json`, with the run's model
+beside it in `<brief>.verify.model`. The station checks a record with
+`bus/proof.py`, ticks the criteria and moves the ticket to verified with the
+proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
+run recorded no model). A refused record, a missing result or no
 `verify.json` leaves the ticket shipped with one note on it. The run is
 counted like any lane run, and the Spread line also shows how many were
-verify runs.
+verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a
+lane whose proof failed its audit in the last 24 hours is handed no verify
+run, and the daily line's Throughput number splits the verified tickets into
+lane and brain proofs.
 
 ### Talking to the brain from Discord
 

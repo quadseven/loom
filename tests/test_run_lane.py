@@ -126,6 +126,10 @@ if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
   printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
+  printf '{"missing": "the station log"}' > verify.json
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = limit ]; then
   echo "ERROR: You've hit your usage limit. Try again at 12:21 PM."
   exit 1
@@ -546,6 +550,17 @@ class LaneRunnerTest(unittest.TestCase):
                 failed = list((self.inbox / "failed").glob("*.md"))
                 self.assertTrue(failed)
                 failed[0].rename(self.inbox / failed[0].name)
+
+    def test_verify_deliverable_records_the_result_and_the_model_that_made_it(self):
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: verify"))
+        result = self.run_lane(FAKE_AGENT="verify-file")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        logs = self.loom / "logs" / "codex"
+        self.assertEqual((logs / "T042-fix-the-thing.verify.json").read_text(),
+                         '{"missing": "the station log"}')
+        self.assertEqual((logs / "T042-fix-the-thing.verify.model").read_text(), "gpt-test-default\n")
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_answer_deliverable_without_file_fails_as_no_answer_written(self):
         brief = BRIEF.replace("Difficulty: medium", "Difficulty: medium\nDeliverable: answer")

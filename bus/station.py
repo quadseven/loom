@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from . import audit
 from . import factory
 from . import handoff
 from . import health
@@ -1262,10 +1263,10 @@ class Station:
         return lanes
 
     def _proven(self, repo: str, number: int) -> bool:
-        allowed = {a.lower() for a in self.s.authors}
+        """A trusted proof stands on the ticket: a failed audit after it
+        (bus/audit.py) makes the ticket due again."""
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        return any(isinstance(c, dict) and tickets._login(c.get("user")) in allowed
-                   and proof.read(str(c.get("body") or "")) is not None for c in comments)
+        return audit.proven(comments, self.s.authors)
 
     def _shipped_stamp(self, repo: str, issue: Dict[str, Any]) -> float:
         """When loom:shipped was last applied; the issue's update time if the
@@ -1276,15 +1277,16 @@ class Station:
                   and (e.get("label") or {}).get("name") == "loom:shipped"]
         return max(stamps) if stamps else metrics.stamp(issue.get("updated_at"))
 
+    def _verify_repos(self) -> List[str]:
+        return [repo for repo in self.s.repos if tickets.REPO_RE.fullmatch(repo)]
+
     def _verify_pool(self, attempts: Dict[str, Any]
                      ) -> Tuple[List[Tuple[str, Dict[str, Any]]], set]:
         """(the tickets due a verify run, oldest ship first; the lanes queued
-        build work could take)."""
-        held: set = set()
+        build work could take, or a failed audit holds)."""
+        held = set(self._audit_holds())
         shipped: List[Tuple[str, Dict[str, Any]]] = []
-        for repo in self.s.repos:
-            if not tickets.REPO_RE.fullmatch(repo):
-                continue
+        for repo in self._verify_repos():
             issues = self._tickets_open(repo)
             held |= self._queued_lanes(repo, issues)
             shipped += [(repo, i) for i in issues]
@@ -1296,6 +1298,15 @@ class Station:
             issue["has_proof"] = self._proven(repo, int(issue["number"]))
             found.append((repo, issue))
         return verify_due(found, attempts, self.now), held
+
+    def _audit_holds(self) -> Dict[str, float]:
+        """The lanes a failed audit of their proof holds from verify runs,
+        with when each hold ends (bus/audit.py)."""
+        holds = audit.held(self.gh, self._verify_repos(), self.s.authors, self.now)
+        for lane, until in sorted(holds.items()):
+            _say("lane %s takes no verify run until %s: a proof it made failed its audit"
+                 % (lane, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(until))))
+        return holds
 
     def _hand_verifies(self, idle: List[str]) -> None:
         """Give each idle slot that may verify, has no build work and is
@@ -1378,13 +1389,28 @@ class Station:
             self._verify_note(repo, number, lane, "Missing evidence: %s" % self._note_text(
                 result["missing"]))
         else:
-            self._apply_proof(lane, repo, number, result)
+            self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True
 
-    def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any]) -> None:
+    def _verify_model(self, lane: str, name: str) -> str:
+        """The model the verify run used, as the runner recorded it next to
+        verify.json; "unknown" when it recorded none."""
+        path = os.path.join(self.s.home, "logs", lane, name + ".verify.model")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                model = fh.read().strip()
+        except FileNotFoundError:
+            model = ""
+        if not tickets.MODEL_RE.fullmatch(model):
+            _say("verify run %s recorded no usable model; its proof says unknown" % name)
+            return "unknown"
+        return model
+
+    def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any],
+                     model: str) -> None:
         """Check the record with bus/proof.py, tick the criteria and move the
-        ticket to verified with it; a refused record leaves the ticket shipped
-        with one note."""
+        ticket to verified with it, marked verified_by "<lane>/<model>"; a
+        refused record leaves the ticket shipped with one note."""
         issue = self._issue(repo, number)
         names = _label_names(issue)
         if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
@@ -1406,7 +1432,8 @@ class Station:
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
-            brain.move(self.gh, repo, number, "verified", record=record)
+            brain.move(self.gh, repo, number, "verified", record=record,
+                       verified_by="%s/%s" % (lane, model))
         except ValueError as err:
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))

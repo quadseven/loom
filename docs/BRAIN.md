@@ -321,11 +321,34 @@ runtime work is verified only once shipped. The move refuses when:
 - any acceptance criterion checkbox in the ticket body is unchecked.
 
 The move posts the record as a `<!-- loom:proof v1 -->` comment with a hash
-of the criteria texts (not their check marks), then sets the label.
+of the criteria texts (not their check marks), then sets the label. The
+posted record says who made it: `"verified_by": "brain"` for a brain's move,
+whatever the file says, and `"verified_by": "<lane>/<model>"` for a proof the
+station applied from a lane's verify run (docs/LANES.md, Verify runs).
 `close` refuses a completed closure unless the ticket is `loom:verified`,
 every criterion is checked, and the newest proof comment from a
 `LOOM_BRIEF_AUTHORS` login matches the criteria as they are now. Rewording,
 adding or removing a criterion after the proof means verifying again.
+
+### Proof audits
+
+A lane proof passed the shape check, which cannot tell evidence a lane read
+from evidence a weak model wrote to look complete. So each tick audits one:
+`resume` lists the oldest verified ticket whose newest proof a lane made in
+the last 24 hours and no audit has judged, as a `resume audit` item. Re-read
+each criterion's evidence yourself (the logs, endpoints or pages the proof
+names), then record the result:
+
+    python3 -m bus.brain audit OWNER/NAME#N --result pass --note "what you re-read"
+    python3 -m bus.brain audit OWNER/NAME#N --result fail --note "what did not hold"
+
+A pass posts a `<!-- loom:audit v1 result=pass lane=LANE -->` comment and
+leaves the ticket as it is. A fail reopens the ticket when it was closed,
+labels it `loom:audit-failed`, and moves it back to shipped with the note,
+which names what failed. The station then hands that lane no verify run for
+24 hours, and the ticket is due a verify run again. Evidence you cannot read
+from where you run (a lane machine log, from Muse) is not a fail: leave the
+audit to the lane machine's tick and say so in the journal.
 
 ## Trust
 

@@ -27,7 +27,9 @@
 # the PR, and never opens a second one.
 # A verify brief (Deliverable: verify, from the station) changes no code: the
 # agent leaves verify.json in its tree, the runner copies it to the lane's log
-# folder, and the station checks it and moves the ticket. No pull request.
+# folder with the run's model beside it (<ticket>.verify.model), and the
+# station checks it and moves the ticket, naming lane and model as the proof's
+# maker. No pull request.
 # Lanes never merge. codex runs sandboxed: no network, no .git writes.
 #
 # Env: LOOM_REPO_OWNERS (required: space-separated GitHub owners whose repos
@@ -1549,6 +1551,7 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "no verify.json written"; continue
     fi
     cp "$RESULT" "$LOGDIR/$TICKET.verify.json"
+    printf '%s\n' "$MODEL" > "$LOGDIR/$TICKET.verify.model"
     echo "[$(date -u +%FT%TZ)] $TICKET done, verify result recorded" >> "$LOG"
     mv "$BRIEF" "$INBOX/done/"
     continue

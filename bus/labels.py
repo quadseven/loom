@@ -59,6 +59,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:closed-unmerged": {"color": "d93f0b", "description": "Linked pull request closed without merging"},
     "loom:shipped": {"color": "2ea44f", "description": "Deployed by the project's ship owner"},
     "loom:verified": {"color": "006b75", "description": "Verified live"},
+    "loom:audit-failed": {"color": "d93f0b", "description": "A lane proof failed the brain's audit; holds that lane's verify runs a day"},
     "loom:triage": {"color": "f9d0c4", "description": "Open issue not yet a ticket; the brain rewrites it"},
     "loom:rewritten": {"color": "ededed", "description": "Rewritten as a ticket that refs this issue"},
     "loom:human": {"color": "b60205", "description": "Only a person can do this; see the comment"},

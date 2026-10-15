@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
 
+from . import audit, proof
 from .github import GitHub, GitHubError, token_from_env
 from .factory import lacks_test
 from .labels import LANES
@@ -144,6 +145,9 @@ class Totals:
     past_rung: int = 0
     merged_tickets: int = 0
     verified: int = 0
+    # Of the verified: proofs a lane's verify run made, and the brain's.
+    verified_lane: int = 0
+    verified_brain: int = 0
     asks: int = 0
     regressions: int = 0
     unchecked: int = 0
@@ -370,8 +374,19 @@ class Collector:
         merged = self.label_time(repo, issue, "loom:merged")
         if merged >= self.since:
             total.merged_tickets += 1
-            total.verified += "loom:verified" in labels
+            if "loom:verified" in labels:
+                self._count_verified(comments, total)
             self._merge_time(repo, number, merged, total)
+
+    @staticmethod
+    def _count_verified(comments: List[Dict[str, Any]], total: Totals) -> None:
+        """Count a verified ticket, and who made its newest proof: a proof
+        from before verified_by existed counts as neither."""
+        total.verified += 1
+        records = [r for r in (proof.read(str(c.get("body") or "")) for c in comments) if r]
+        newest = records[-1] if records else {}
+        total.verified_brain += newest.get("verified_by") == audit.BRAIN
+        total.verified_lane += bool(audit.lane_of(newest))
 
     def _merge_time(self, repo: str, number: int, merged: float, total: Totals) -> None:
         briefed = min((stamp(e.get("created_at"))
@@ -461,9 +476,10 @@ def flow_number(total: Totals) -> Number:
 def throughput_number(total: Totals) -> Number:
     ok = (bool(total.goals) and all(total.merged_by_repo[r] for r in total.goal_repos)
           and total.merged_tickets > 0 and total.verified * 2 >= total.merged_tickets)
-    return Number("Throughput", "%s; verified %d/%d" %
+    return Number("Throughput", "%s; verified %d/%d (lane %d, brain %d)" %
                   (", ".join("%s %d" % pair for pair in total.merged_by_repo.items()),
-                   total.verified, total.merged_tickets),
+                   total.verified, total.merged_tickets, total.verified_lane,
+                   total.verified_brain),
                   "each goal repo >=1 merge; >=50% verified", ok)
 
 
