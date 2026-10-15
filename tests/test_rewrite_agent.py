@@ -46,6 +46,7 @@ case "$(ps -axo args= 2>/dev/null)" in *"${key:-no-key-set}"*) argv=key-visible 
 } >> "$log"
 printf '%s' "$prompt" > "$log.stdin"
 case "$prompt" in
+  *MODE=rate-first*) case "$*" in *"@RATE_MODEL@"*) printf '%s\n' '{"type":"error","error":{"name":"RateLimitError","data":{"message":"temporarily rate limited"}}}'; exit 0 ;; esac ;;
   *MODE=fail*) echo "connection reset" >&2; exit 3 ;;
   *MODE=error*) printf '{"type":"error","error":{"name":"APIError","data":{"message":"bad key %s"}}}\n' "$key"; exit 0 ;;
   *MODE=notext*) printf '%s\n' '{"type":"step_start","part":{"type":"step-start"}}'; exit 0 ;;
@@ -69,6 +70,12 @@ while [ $# -gt 0 ]; do [ "$1" = --name ] && name="$2"; shift; done
 printf '%s\\n' "$FAKE_SECRET"
 """
 
+FAKE_SANDBOX = """#!/usr/bin/env bash
+[ "$1" = -p ] || exit 2
+shift 2
+exec "$@"
+"""
+
 
 class RewriteAgentTest(unittest.TestCase):
     def setUp(self):
@@ -84,6 +91,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.agent_log = root / "agent.log"
         self.write_fake_opencode("1.18.4")
         self.write_tool(self.bin / "aws", FAKE_AWS)
+        self.write_tool(self.bin / "sandbox-exec", FAKE_SANDBOX)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -192,6 +200,33 @@ class RewriteAgentTest(unittest.TestCase):
                 result = self.run_wrapper(args=args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.agent_log.exists())
+
+    def test_rate_limited_model_falls_back_to_the_next_model(self):
+        first, second = MODEL, "openrouter/other-free-model"
+        self.write_fake_opencode("1.18.4")
+        path = self.bin / "opencode"
+        path.write_text(path.read_text().replace("@RATE_MODEL@", first))
+        path.chmod(0o755)
+        result = self.run_wrapper("MODE=rate-first", args=("loom/test/key", first + "," + second))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, ANSWER + "\n")
+        self.assertIn(first, result.stderr)
+        self.assertIn("rate", result.stderr.lower())
+        self.assertIn(f"run -m {second} --format json", self.agent()["argv"])
+
+    def test_bad_entry_in_model_list_is_refused_before_any_run(self):
+        result = self.run_wrapper(args=("loom/test/key", MODEL + ",someprovider/model"))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.agent_log.exists())
+
+    def test_all_failed_models_are_named_with_their_reasons(self):
+        second = "openrouter/other-free-model"
+        result = self.run_wrapper("MODE=notext", args=("loom/test/key", MODEL + "," + second))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(MODEL, result.stderr)
+        self.assertIn(second, result.stderr)
+        self.assertIn("no text", result.stderr)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_opencode_2_runs_against_its_own_server(self):

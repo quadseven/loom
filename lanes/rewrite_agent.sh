@@ -2,7 +2,7 @@
 # Loom triage rewriter agent: the command bus/rewrite.py runs for
 # LOOM_REWRITE_CMD and LOOM_REWRITE_PRIVATE_CMD.
 #
-#   rewrite_agent.sh <key-ssm> <provider/model>   (the prompt on stdin)
+#   rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]>   (the prompt on stdin)
 #
 # Reads the provider key from the SSM parameter <key-ssm> and runs
 # `opencode run` on <provider/model> with the prompt on its stdin, in the
@@ -22,18 +22,23 @@ set -uo pipefail
 
 fail() { echo "rewrite_agent: $1" >&2; exit "${2:-1}"; }
 
-KEY_SSM="${1:-}" MODEL="${2:-}"
-[ $# -eq 2 ] || fail "usage: rewrite_agent.sh <key-ssm> <provider/model>" 2
+KEY_SSM="${1:-}" MODEL_LIST="${2:-}"
+[ $# -eq 2 ] || fail "usage: rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]>" 2
 [[ "$KEY_SSM" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "bad SSM parameter name" 2
-[[ "$MODEL" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._:/@-]+$ ]] || fail "bad model '$MODEL': want provider/model" 2
-# The variable each provider's key travels in, as the lanes pass it.
-case "${MODEL%%/*}" in
-  opencode|opencode-go) KEY_VAR=OPENCODE_API_KEY ;;
-  openrouter) KEY_VAR=OPENROUTER_API_KEY ;;
-  zai) KEY_VAR=ZHIPU_API_KEY ;;
-  anthropic) KEY_VAR=ANTHROPIC_API_KEY ;;
-  *) fail "no key variable known for provider ${MODEL%%/*}" 2 ;;
-esac
+[ -n "$MODEL_LIST" ] || fail "no models supplied" 2
+IFS=, read -r -a MODELS <<< "$MODEL_LIST"
+KEY_VARS=()
+for MODEL in "${MODELS[@]}"; do
+  [[ "$MODEL" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._:/@-]+$ ]] || fail "bad model '$MODEL': want provider/model" 2
+  case "${MODEL%%/*}" in
+    opencode|opencode-go) KEY_VARS+=(OPENCODE_API_KEY) ;;
+    openrouter) KEY_VARS+=(OPENROUTER_API_KEY) ;;
+    zai) KEY_VARS+=(ZHIPU_API_KEY) ;;
+    anthropic) KEY_VARS+=(ANTHROPIC_API_KEY) ;;
+    *) fail "no key variable known for provider ${MODEL%%/*}" 2 ;;
+  esac
+done
+MODEL="${MODELS[0]}" KEY_VAR="${KEY_VARS[0]}"
 
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -66,15 +71,7 @@ cat > "$AGENT_STDIN" || fail "cannot read the prompt"
 API_KEY="$(ssm_value "$KEY_SSM")"
 [ -n "$API_KEY" ] || fail "no key readable at the SSM parameter $KEY_SSM"
 
-# JSON events, one per line, so the final text is told apart from anything
-# else opencode or the sandbox writes (api_agent merges stderr into stdout).
-cd "$AGENT_HOME/work" || fail "cannot enter the scratch working directory"
-OUT="$RUN_DIR/out"
-opencode_run "$KEY_VAR" "$BIN" --format json > "$OUT"
-status=$?
-
-# The last text part, or the reason there is none. opencode can exit 0
-# after a provider error, so an error event fails the run too.
+# JSON events, one per line, so final text is told apart from tool output.
 # shellcheck disable=SC2016 # python source, not shell
 EXTRACT='
 import json, sys
@@ -99,15 +96,34 @@ if text is None:
     sys.exit("the agent gave no text")
 sys.stdout.write(text.strip() + "\n")
 '
-# -I: the working directory is the agent's, and python would import from it.
-reason="$(python3 -I -c "$EXTRACT" "$OUT" 2>&1 > "$RUN_DIR/answer")" || {
-  [ "$status" -eq 0 ] || reason="opencode exited $status; $reason"
-  # shellcheck disable=SC2031 # API_KEY is this shell's
-  fail "${reason//"$API_KEY"/[key]}"
-}
-[ "$status" -eq 0 ] || fail "opencode exited $status"
-ANSWER="$(cat "$RUN_DIR/answer")" || fail "cannot read the answer"
-# An answer holding the key goes nowhere. (A test in bash, not grep: the key
-# stays out of every argv.)
-case "$ANSWER" in *"$API_KEY"*) fail "the answer holds the provider key" ;; esac
-printf '%s\n' "$ANSWER"
+REASONS=""
+for i in "${!MODELS[@]}"; do
+  MODEL="${MODELS[$i]}" KEY_VAR="${KEY_VARS[$i]}"
+  OUT="$RUN_DIR/out" ANSWER_FILE="$RUN_DIR/answer"
+  : > "$OUT"
+  cd "$AGENT_HOME/work" || fail "cannot enter the scratch working directory"
+  opencode_run "$KEY_VAR" "$BIN" --format json > "$OUT"
+  status=$?
+  reason="$(python3 -I -c "$EXTRACT" "$OUT" 2>&1 > "$ANSWER_FILE")"
+  extracted=$?
+  if [ "$status" -eq 0 ] && [ "$extracted" -eq 0 ]; then
+    ANSWER="$(cat "$ANSWER_FILE")" || fail "cannot read the answer"
+    case "$ANSWER" in *"$API_KEY"*) fail "the answer holds the provider key" ;; esac
+    printf '%s\n' "$ANSWER"
+    exit 0
+  fi
+  [ "$extracted" -eq 0 ] || reason="${reason//"$API_KEY"/[key]}"
+  lower="$(printf '%s' "$reason" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+    why="timed out"
+  elif [[ "$lower" == *"rate limit"* || "$lower" == *"rate-limit"* || "$lower" == *"overload"* || "$lower" == *"too many requests"* ]]; then
+    why="rate limited or overloaded"
+  elif [[ "$lower" == *"no text"* ]]; then
+    why="opencode exited $status with no text"
+  else
+    why="opencode exited $status: ${reason:-no usable answer}"
+  fi
+  REASONS="${REASONS:+$REASONS; }$MODEL: $why"
+  echo "rewrite_agent: passed over $MODEL: $why" >&2
+done
+fail "all models failed: $REASONS"
