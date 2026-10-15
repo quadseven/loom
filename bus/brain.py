@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -1582,6 +1583,7 @@ def merge(gh: GitHub, repo: str, number: int,
         _validate_adopt_pr(gh, repo, pr, details, env)
         association: Optional[Tuple[str, int]] = None
     else:
+        pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
@@ -1640,6 +1642,44 @@ def _checks_green(details: Dict[str, Any]) -> bool:
 def _threads_resolved(details: Dict[str, Any]) -> bool:
     threads = (details.get("reviewThreads") or {}).get("nodes") or []
     return all(thread.get("isResolved") for thread in threads)
+
+
+# A brain tick asked to merge a pull request GitHub had not finished judging
+# ("still computing mergeability", a check still running) gave up and waited
+# for its next tick, 30 minutes later, twice in a row on 2026-10-15. Both
+# states clear in a minute or two, so the merge waits for them here.
+MERGE_SETTLE_SECONDS = 180
+MERGE_SETTLE_POLL = 15
+_sleep = time.sleep
+_clock = time.monotonic
+
+
+def _unsettled(pr: Dict[str, Any], details: Dict[str, Any]) -> str:
+    """Why GitHub has not finished judging the pull request, or ""."""
+    if pr.get("mergeable") is None:
+        return "GitHub is still computing mergeability"
+    commits = (details.get("commits") or {}).get("nodes") or []
+    rollup = commits[-1].get("commit", {}).get("statusCheckRollup") if commits else None
+    if (rollup or {}).get("state") in ("PENDING", "EXPECTED"):
+        return "checks are still running"
+    return ""
+
+
+def _await_settled(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                   details: Dict[str, Any], env: Optional[Dict[str, str]] = None
+                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The pull request once GitHub has judged it, re-read every
+    MERGE_SETTLE_POLL seconds for up to LOOM_MERGE_SETTLE_SECONDS (default
+    MERGE_SETTLE_SECONDS); after that the last read is returned and the
+    usual checks refuse it."""
+    raw = (env if env is not None else os.environ).get("LOOM_MERGE_SETTLE_SECONDS", "")
+    limit = int(raw) if raw.strip().isdigit() else MERGE_SETTLE_SECONDS
+    deadline = _clock() + limit
+    while _unsettled(pr, details) and _clock() < deadline:
+        _sleep(MERGE_SETTLE_POLL)
+        pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        details = _pr_graphql(gh, repo, number)
+    return pr, details
 
 
 def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> None:

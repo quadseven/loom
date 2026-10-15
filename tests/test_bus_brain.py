@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
@@ -888,8 +889,10 @@ class SensitiveResumeTests(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case):
                 fake = Fake(*self._merge_replies(case))
+                # With no wait, a pending check is refused at once.
                 with self.assertRaises(ValueError):
-                    brain.merge(GitHub("t", transport=fake), REPO, 8)
+                    brain.merge(GitHub("t", transport=fake), REPO, 8,
+                                env={"LOOM_MERGE_SETTLE_SECONDS": "0"})
                 self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
     def test_good_merge_uses_checked_sha_then_deletes_and_moves_ticket(self):
@@ -2557,3 +2560,68 @@ class LogExcerptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeWaitsForGitHubToSettle(unittest.TestCase):
+    """2026-10-15: a brain tick gave up on two merges because GitHub was still
+    computing mergeability or a check was running, and retried 30 minutes
+    later. The merge now waits for both to settle."""
+
+    def setUp(self):
+        self.clock = [0.0]
+        self.slept = []
+        patches = [
+            unittest.mock.patch.object(brain, "_clock", lambda: self.clock[0]),
+            unittest.mock.patch.object(brain, "_sleep", self.sleep),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.clock[0] += seconds
+
+    @staticmethod
+    def details(state):
+        return {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": state}}}]}}
+
+    def test_unknown_mergeability_and_pending_checks_are_waited_out(self):
+        reads = iter([({"mergeable": None}, "SUCCESS"), ({"mergeable": True}, "PENDING"),
+                      ({"mergeable": True}, "SUCCESS")])
+
+        class GH:
+            def rest(self, method, path, data=None):
+                self.last = next(reads)
+                return types.SimpleNamespace(data=self.last[0])
+
+        gh = GH()
+        with unittest.mock.patch.object(brain, "_pr_graphql",
+                                        lambda g, r, n: self.details(g.last[1])):
+            pr, details = brain._await_settled(
+                gh, REPO, 7, {"mergeable": None}, self.details("SUCCESS"), env={})
+        self.assertEqual(pr, {"mergeable": True})
+        self.assertEqual(brain._unsettled(pr, details), "")
+        self.assertEqual(self.slept, [15, 15, 15])
+
+    def test_it_gives_up_at_the_limit_and_leaves_the_refusal_to_the_checks(self):
+        class GH:
+            def rest(self, method, path, data=None):
+                return types.SimpleNamespace(data={"mergeable": None})
+
+        with unittest.mock.patch.object(brain, "_pr_graphql",
+                                        lambda g, r, n: self.details("SUCCESS")):
+            pr, _ = brain._await_settled(GH(), REPO, 7, {"mergeable": None},
+                                         self.details("SUCCESS"),
+                                         env={"LOOM_MERGE_SETTLE_SECONDS": "60"})
+        self.assertIsNone(pr["mergeable"])
+        self.assertEqual(sum(self.slept), 60)
+
+    def test_a_settled_pull_request_is_not_read_again(self):
+        class GH:
+            def rest(self, method, path, data=None):
+                raise AssertionError("no re-read")
+
+        pr, _ = brain._await_settled(GH(), REPO, 7, {"mergeable": True},
+                                     self.details("SUCCESS"), env={})
+        self.assertEqual(self.slept, [])
