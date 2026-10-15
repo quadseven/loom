@@ -15,15 +15,17 @@ from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tu
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 # GitHub work any brain can do. Ships and rolls are not here: they stay with
 # whoever a goal's rules name.
-STAGES = ("review", "merge", "failed", "ask", "regression")
+STAGES = ("review", "merge", "failed", "ask", "regression", "brief")
 # The old rule: a brain outside its own scope acts only when no other brain
 # journaled in this window.
 QUIET = timedelta(hours=2)
 _HOLDER = r"[A-Za-z0-9._-]+"
 _ITEM = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+"
 _REV = r"[A-Za-z0-9._:-]+"
-_MARK = re.compile(r"<!-- loom:(defer|done) v1 stage=([a-z]+) item=(%s)(?: rev=(%s))? holder=(%s) -->"
-                   % (_ITEM, _REV, _HOLDER))
+_NOTE = r'(?:"([^"]*)"|([^\s>]+))'
+_MARK = re.compile(
+    r'<!-- loom:(defer|done) v1 stage=([a-z]+) item=(%s)(?: rev=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
+    % (_ITEM, _REV, _NOTE, _HOLDER, _NOTE))
 _TICK = re.compile(r"^Tick \S+, (%s)\s*$" % _HOLDER, re.M)
 
 
@@ -34,27 +36,35 @@ class Mark(NamedTuple):
     rev: str
     holder: str
     at: str
+    note: str = ""
 
 
 def item_ref(item: Tuple[str, int]) -> str:
     return "%s#%d" % item
 
 
-def _check(stage: str, holder: str, rev: Optional[str]) -> None:
+def _check(stage: str, holder: str, rev: Optional[str], note: Optional[str] = None) -> None:
     if stage not in STAGES:
         raise ValueError("stage is one of %s" % ", ".join(STAGES))
     if not re.fullmatch(_HOLDER, holder or ""):
         raise ValueError("holder may only use letters, digits, '.', '_' and '-'")
     if rev is not None and not re.fullmatch(_REV, rev):
         raise ValueError("revision is not a revision")
+    if note is not None:
+        if "\n" in note or "\r" in note:
+            raise ValueError("note must be one line")
+        if '"' in note:
+            raise ValueError("note must not contain double quotes")
 
 
-def defer_marker(stage: str, item: Tuple[str, int], rev: str, holder: str) -> str:
+def defer_marker(stage: str, item: Tuple[str, int], rev: str, holder: str,
+                 note: Optional[str] = None) -> str:
     """The line a brain puts in its journal for stage work it leaves undone.
     The revision is the item as the brain left it (bus.brain defer)."""
-    _check(stage, holder, rev)
-    return "<!-- loom:defer v1 stage=%s item=%s rev=%s holder=%s -->" % (
-        stage, item_ref(item), rev, holder)
+    _check(stage, holder, rev, note)
+    extra = (' note="%s"' % note) if note else ""
+    return "<!-- loom:defer v1 stage=%s item=%s rev=%s holder=%s%s -->" % (
+        stage, item_ref(item), rev, holder, extra)
 
 
 def done_marker(stage: str, item: Tuple[str, int], holder: str) -> str:
@@ -76,11 +86,14 @@ def marks(found: Iterable[Dict[str, Any]]) -> List[Mark]:
     out: List[Mark] = []
     for comment in found:
         for m in _MARK.finditer(str(comment.get("body") or "")):
-            kind, stage, ref, rev, holder = m.groups()
+            kind, stage, ref = m.group(1), m.group(2), m.group(3)
+            rev = m.group(4) or ""
+            note = m.group(5) or m.group(6) or m.group(8) or m.group(9) or ""
+            holder = m.group(7)
             if stage not in STAGES or (kind == "defer" and not rev):
                 continue
             repo, _, number = ref.partition("#")
-            out.append(Mark(kind, stage, (repo, int(number)), rev or "", holder, str(comment["at"])))
+            out.append(Mark(kind, stage, (repo, int(number)), rev, holder, str(comment["at"]), note))
     return out
 
 

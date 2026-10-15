@@ -133,14 +133,15 @@ def comment(entry):
 
 
 class ResumeCommandTests(unittest.TestCase):
-    def routes(self, pr_head="abcdef1234567890", pr_state="open", **lock):
-        goal = {"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}]}
+    def routes(self, pr_head="abcdef1234567890", pr_state="open", goal_state="open", **lock):
+        goal = {"number": 1, "title": "Goal", "state": goal_state, "labels": [{"name": "loom:goal"}]}
         comments = [comment(journal(35, "muse", defer(PR, "pr-abcdef123456"))),
                     comment(journal(5, "muse", defer(PR, "pr-abcdef123456"),
                                     defer(TICKET, "failed-c2", stage="failed")))]
         routes = lock_routes(**lock)
         routes.update({
             ("GET", "/repos/%s/issues" % REPO): (200, [goal]),
+            ("GET", "/repos/%s/issues/1" % REPO): (200, goal),
             ("GET", "/repos/%s/issues/1/comments" % REPO): (200, comments),
             ("GET", "/repos/%s/issues/7" % REPO): (200, {"state": pr_state, "pull_request": {}}),
             ("GET", "/repos/%s/pulls/7" % REPO): (200, {"state": pr_state, "head": {"sha": pr_head}}),
@@ -196,6 +197,53 @@ class ResumeCommandTests(unittest.TestCase):
             brain.defer(GitHub("t", transport=Routes(self.routes())), "merge", TICKET, "muse")
         with self.assertRaises(ValueError):
             brain.defer(GitHub("t", transport=Routes(self.routes())), "failed", PR, "muse")
+        with self.assertRaises(ValueError):
+            brain.defer(GitHub("t", transport=Routes(self.routes())), "brief", TICKET, "muse",
+                        note="party-trip fix")
+
+    def test_defer_brief_writes_marker_listed_by_resume_and_dropped_by_done(self):
+        routes = self.routes()
+        marker = brain.defer(GitHub("t", transport=Routes(routes)), "brief",
+                             (REPO, 1), "muse", note="party-trip fix")
+        self.assertEqual(
+            '<!-- loom:defer v1 stage=brief item=%s#1 rev=open holder=muse note="party-trip fix" -->' % REPO,
+            marker)
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(10, "muse", marker)),
+        ])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW,
+                           {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        self.assertIn("- resume brief %s#1: party-trip fix (deferred by muse at %s)" % (
+            REPO, at(10)), out)
+
+        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(10, "muse", marker)),
+            comment(journal(5, "lane-machine", done_line)),
+        ])
+        out_after_done = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                                      "lane-machine", LOCK_REPO, NOW,
+                                      {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        self.assertNotIn("- resume brief", out_after_done)
+
+    def test_brief_handoff_whose_goal_home_was_closed_is_dropped_from_resume(self):
+        routes = self.routes(goal_state="closed")
+        marker = handoff.defer_marker("brief", (REPO, 1), "open", "muse",
+                                     note="party-trip fix")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(10, "muse", marker)),
+        ])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW,
+                           {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        self.assertNotIn("- resume brief", out)
+        self.assertIn("- dropped brief %s#1: finished or closed since the defer" % REPO, out)
+
+    def test_defer_refuses_brief_without_note(self):
+        routes = self.routes()
+        with self.assertRaises(ValueError):
+            brain.defer(GitHub("t", transport=Routes(routes)), "brief", (REPO, 1), "muse")
 
 
 if __name__ == "__main__":

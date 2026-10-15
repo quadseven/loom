@@ -1998,6 +1998,8 @@ def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:
         pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         sha = str((pr.get("head") or {}).get("sha") or "")
         return "pr-" + sha[:12] if pr.get("state") == "open" and sha else None
+    if "loom:goal" in _labels(data):
+        return "open"
     state = next((x for x in _labels(data) if x.startswith("loom:") and x[5:] in STATES), "open")
     return "%s-c%d" % (state.replace("loom:", ""), int(data.get("comments") or 0))
 
@@ -2011,6 +2013,7 @@ def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
         "failed": ("loom:failed" in names, "a failed item is a loom:failed ticket"),
         "ask": ("needs-operator" in names, "an ask item is a needs-operator issue"),
         "regression": ("pull_request" not in issue, "a regression item is an issue"),
+        "brief": ("loom:goal" in names, "a brief item is a loom:goal issue"),
     }
     if stage not in rules:
         raise ValueError("unknown stage %s; stages are %s" % (stage, ", ".join(handoff.STAGES)))
@@ -2019,14 +2022,21 @@ def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
         raise ValueError(reason)
 
 
-def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str) -> str:
+def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str,
+          note: Optional[str] = None) -> str:
     """The journal line that yields stage work on an open item to any peer."""
-    handoff.defer_marker(stage, item, "x", holder)
+    if stage == "brief" and not (note and note.strip()):
+        raise ValueError("a brief defer requires --note naming the problem statement")
+    if note is not None:
+        if "\n" in note or "\r" in note:
+            raise ValueError("note must be one line")
+        _check_written_text(note)
+    handoff.defer_marker(stage, item, "x", holder, note=note)
     _check_stage_item(gh, stage, *item)
     rev = item_revision(gh, *item)
     if rev is None:
         raise ValueError("only an open item is deferred")
-    return handoff.defer_marker(stage, item, rev, holder)
+    return handoff.defer_marker(stage, item, rev, holder, note=note)
 
 
 def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None:
@@ -2133,8 +2143,9 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
     for m in items:
         if m in alive:
+            item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
             out.append("- resume %s %s (deferred by %s at %s)" % (
-                m.stage, handoff.item_ref(m.item), m.holder, m.at))
+                m.stage, item_text, m.holder, m.at))
         else:
             out.append("- dropped %s %s: %s since the defer" % (
                 m.stage, handoff.item_ref(m.item),
@@ -2539,7 +2550,7 @@ def parser() -> argparse.ArgumentParser:
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
-    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True)
+    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True)
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
@@ -2622,7 +2633,7 @@ def _cmd_escalate(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_defer(gh: GitHub, args: argparse.Namespace) -> None:
-    print(defer(gh, args.stage, _ref(args.item, "item"), args.holder))
+    print(defer(gh, args.stage, _ref(args.item, "item"), args.holder, args.note))
 
 
 def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:

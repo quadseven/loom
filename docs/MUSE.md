@@ -105,15 +105,17 @@ Every brain may stop short: out of budget, out of time, or out of scope.
 Work it leaves must not wait for that brain's next tick while it keeps
 journaling, so stage work is handed off per goal and stage, not by who
 journaled last. The stages are `review`, `merge`, `failed` (re-brief or
-close a `loom:failed` ticket), `ask` and `regression` (admit a brief for a
-live regression).
+close a `loom:failed` ticket), `ask`, `regression` (admit a brief for a
+live regression) and `brief` (a brief named but not written this tick).
 
 - Defer: for each item ready for a stage that you leave undone this tick,
   run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
+  (for a brief, pass the goal home and `--note "<one line problem statement>"`,
+  and the evidence stays on the goal home)
   after your last write on the item, and put the line it prints in your
   journal. That yields the stage to the next brain holding the lock.
 - Done: for each stage action you finish (a merge, a re-brief or close of a
-  failed ticket, an answered ask, an admitted regression), put the line
+  failed ticket, an answered ask, an admitted regression, a written brief), put the line
   from `python3 -m bus.brain done OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
   in your journal.
 - The newest marker for an item wins, and `resume` drops a defer whose
@@ -250,7 +252,9 @@ this tick"; a step with no note shows nothing there.
    lane of its Difficulty tier, by priority, then oldest queued first. Use `--lane LANE`
    when the brain needs to choose the lane itself. A queued ticket without a
    readable Difficulty line stays queued and appears in the goal's next
-   station standup as needing a difficulty.
+   station standup as needing a difficulty. A brief named but not written this
+   tick is deferred with the `brief` stage (`defer OWNER/NAME#GOAL --stage brief --holder muse --note "one-line problem statement"`),
+   never only in journal prose.
 8. First run `python3 -m bus.brain step triage --holder muse`. Triage the backlog. The station runs `python3 -m bus.brain triage
    OWNER/NAME --goal N` once an hour on every backlog goal home (the goal
    home onboard opens for a repo has a title starting `Backlog:`), with the
