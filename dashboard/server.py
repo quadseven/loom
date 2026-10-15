@@ -402,29 +402,63 @@ def _backlog_page(document, parsed, state):
     return page("Backlog", "backlog", "".join(out), status="Read only")
 
 
+_ASK_SECTION = re.compile(r"^##\s*Ask\s*\n(.*?)(?=^##\s|\Z)", re.M | re.S)
+
+
+def _exact_ask(item):
+    """The issue's "## Ask" section, else a one-line ask as written, else
+    None: a missing ask is shown as missing, never stood in by the title."""
+    body = str(item.get("ask") or item.get("body") or "")
+    found = _ASK_SECTION.search(body)
+    text = found.group(1).strip() if found else ("" if "\n" in body.strip() else body.strip())
+    return text if text and text != str(item.get("title") or "").strip() else None
+
+
+def _ask_card(item):
+    esc = html.escape
+    waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
+    since = item.get("created_at") or item.get("waiting_since")
+    age = views.format_age(since) if since and since != "9999" else None
+    ask = _exact_ask(item)
+    ask_html = ('<blockquote>%s</blockquote>' % esc(ask) if ask else
+                '<p class="ask-missing">No exact ask is written on the issue (no "## Ask" section).</p>')
+    return ('<article class="card ask-card"><div class="ask-head"><span>%s - needs-operator</span>'
+            '<span>%s</span></div><h2><a href="%s">%s</a></h2>%s'
+            '<p class="machine-fact">%s | unblocks %s | <a href="%s">open the issue</a></p></article>') % (
+        esc(_repo_number(item)), esc(age or "age unknown"), esc(_issue_url(item), quote=True),
+        esc(str(item.get("title") or _repo_number(item))), ask_html, waiting,
+        esc(str(item.get("unblocks", 0))), esc(_issue_url(item), quote=True))
+
+
 def _needs_you(document, state, *, source_missing=False):
-    merged = {}
-    for field in ("needs_operator", "ready_for_human"):
-        for item in document.get(field) or []:
-            key = _repo_number(item)
-            if key:
-                merged.setdefault(key, {**item, "queue": field})
-    for item in getattr(state, "operator_items", []):
+    order = lambda item: (-_number(item.get("unblocks")), str(item.get("waiting_since", "9999")))
+    asks = {}
+    for item in list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", [])):
         key = _repo_number(item)
         if key:
-            merged.setdefault(key, item)
-    items = sorted(merged.values(), key=lambda item: (-_number(item.get("unblocks")), str(item.get("waiting_since", "9999"))))
-    out = []
+            asks.setdefault(key, {**item, "queue": "needs_operator"})
+    backlog = {}
+    for item in document.get("ready_for_human") or []:
+        key = _repo_number(item)
+        if key and key not in asks:
+            backlog.setdefault(key, {**item, "queue": "ready_for_human"})
+    out = ['<p class="page-lede">Only what only you can do. Everything else the brain does itself.</p>']
     if source_missing:
-        out.append('<p class="card">Backlog source unavailable.</p>')
-    for item in items:
-        ask = item.get("ask") or item.get("body") or item.get("title", "")
-        waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
-        out.append('<article class="card"><div class="label">%s | %s</div><h2><a href="%s">%s</a></h2><blockquote>%s</blockquote><p>%s | unblocks %s</p></article>' % (
-            html.escape(str(item.get("queue", "needs_operator"))), waiting, html.escape(_issue_url(item), quote=True),
-            html.escape(_repo_number(item)), html.escape(str(ask)), waiting, html.escape(str(item.get("unblocks", 0)))))
+        out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
+    if not asks:
+        out.append('<p class="empty-state">Nothing needs you right now: no open needs-operator issue.</p>')
+    out.extend(_ask_card(item) for item in sorted(asks.values(), key=order))
+    if backlog:
+        out.append('<details class="backlog-asks"><summary>From the backlog (%d), ready for a person</summary>' % len(backlog))
+        for item in sorted(backlog.values(), key=order):
+            waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
+            out.append('<p class="backlog-ask"><a href="%s">%s</a> %s <span class="machine-fact">%s | unblocks %s</span></p>' % (
+                html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item)),
+                html.escape(str(item.get("title") or "")), waiting, html.escape(str(item.get("unblocks", 0)))))
+        out.append('</details>')
     counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
-    out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(", ".join("%s: %s" % (repo, count) for repo, count in counts.items())))
+    out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(
+        ", ".join("%s: %s" % (repo, count) for repo, count in counts.items()) or "none"))
     return page("Needs you", "needs-you", "".join(out), status="Read only")
 
 
@@ -806,6 +840,19 @@ def _lane_quota(lane, rows):
     return max(used) if used else None
 
 
+def _hold_reason(lane, rows):
+    """Why a held lane is held, from the usage records' heartbeat reasons:
+    "limit: out of credit; unavailable until 2026-10-16T00:01:27Z" reads
+    "out of credit until 2026-10-16 00:01 UTC"."""
+    reason = next((row["holds"][lane] for row in rows
+                   if isinstance(row.get("holds"), dict) and lane in row["holds"]), "")
+    if not reason:
+        return "held: the lane machine sent no reason"
+    reason = re.sub(r"^limit:\s*", "", reason)
+    return re.sub(r";\s*(?:lane waits|unavailable) until (\d{4}-\d\d-\d\d)T(\d\d:\d\d)(?::\d\d)?Z",
+                  r" until \1 \2 UTC", reason)
+
+
 def _lane_view_data(payload, tickets, state=None):
     lane_rows = _merge_lane_rows(payload.get("lanes", []))
     prs = payload.get("pull_requests", [])
@@ -828,7 +875,7 @@ def _lane_view_data(payload, tickets, state=None):
             "ticket": active,
             "model": model_display,
             "quota": lane_quota,
-            "reason": None if item["available"] else "held reason missing from lane status comment",
+            "reason": None if item["available"] else _hold_reason(lane_name, usage_records),
         })
         lanes.append(item)
 
