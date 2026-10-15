@@ -176,6 +176,22 @@ def _improvement_stage(ticket, state, moved):
     return 1 if ticket else 0
 
 
+def footer_models(prs):
+    """Each ticket's model from its newest lane pull request footer, as
+    {"owner/name#N": model}: one pass over the pull requests. Matching every
+    ticket against every pull request cost 618,472 regex searches, about 5 s
+    of CPU, on each page after each refresh (2026-10-15)."""
+    newest = {}
+    for pr in prs:
+        parsed = footer(pr.get("body"))
+        if not parsed:
+            continue
+        key, when = "%s#%s" % (parsed[0], parsed[1]), str(pr.get("updated_at") or "")
+        if key not in newest or when >= newest[key][0]:
+            newest[key] = (when, parsed[3])
+    return {key: model for key, (_, model) in newest.items()}
+
+
 def build_scoreboard(pull_requests):
     """Count lane PRs by footer model and difficulty tier."""
     tiers = {}
