@@ -28,30 +28,43 @@ order, instead of waiting for someone to notice and file them.
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `key` | Stable id of one problem: the same problem has the same key on every read. Loom stores only its sha1. |
-| `title` | One line, ASCII, at most 90 characters. It becomes the ticket title. |
-| `area` | One word naming the part of the project (quests, dungeons, bags, ...). |
-| `affected` | How many things it hits now (members, runs, items), a number of at least 0. |
-| `hours` | How long it has lasted, in hours. |
-| `impact` | Optional. The project's own loss measure; without it, `affected x hours`. |
-| `evidence` | One or two plain sentences with the numbers that show it. |
-| `since` | Optional. When it started, as a UTC time. |
+| Field | Shape | Meaning |
+|---|---|---|
+| `key` | `[A-Za-z0-9:._ -]{1,120}` | Stable id of one problem: the same problem has the same key on every read. Loom stores and shows only its sha1. |
+| `title` | ASCII, one line, at most 90 characters | What is wrong, in plain words. |
+| `area` | `[a-z-]{1,20}` | The part of the project (quests, dungeons, bags, ...). |
+| `affected` | number, 0 to 10000000 | How many things it hits now (members, runs, items). |
+| `hours` | number, 0 to 10000000 | How long it has lasted, in hours. |
+| `impact` | optional number, 0 to 10000000 | The project's own loss measure; without it, `affected x hours`. |
+| `evidence` | ASCII, one line, at most 600 characters | One or two plain sentences with the numbers that show it. |
+| `since` | optional UTC time like `2026-10-14T09:40:00Z` | When it started. |
+
+`checked_at`, when present, is a UTC time in the same form.
 
 Rules:
 
 - A finding stays in the list while the problem lasts. When it clears it is
-  simply absent.
-- An empty list means "looked, found nothing".
-- Findings become public GitHub issues. Every text field must be ASCII and
-  must not name a host, an address, a URL or a secret. Names inside the
-  product (a character, an item) are fine; names of real people are not.
-- Anything else is "not looked": an error status, a redirect, an answer over
-  256 KB, invalid JSON, a missing field, two findings with one key, or a
-  field that breaks the rules above. A "not looked" read files nothing,
+  simply absent. An empty list means "looked, found nothing".
+- Anything outside the shapes above is "not looked": an error status, a
+  redirect, an answer over 256 KB, invalid JSON, a missing or mistyped
+  field, or two findings with one key. A "not looked" read files nothing,
   changes nothing and notes nothing absent, so a broken endpoint never reads
   as "everything cleared".
+- Findings become public GitHub issues that a lane agent reads. A `title` or
+  `evidence` that is not plain ASCII, or that looks like it names a URL, a
+  host or address (any word.word other than a decimal number), an email or
+  at-handle, a path (any slash other than a ratio such as 3/35, a backslash
+  or a tilde) or a credential (`=`, or a long run of mixed letters and
+  digits) refuses that finding. It is logged by the first 12 characters of
+  its key's sha1, never filed and never scrubbed into something fileable,
+  and it still counts as reported, so its open ticket is not told it went
+  absent. Names inside the product (a character, an item) are fine; names
+  of real people are not.
+- What remains has markdown and HTML control (backticks, angle and square
+  brackets, `#`, `*`, `|`, quotes) turned into spaces. Loom writes every
+  section of the ticket itself; the finding's title and evidence appear only
+  inside a fenced block labelled as untrusted data from the health endpoint,
+  and the ticket title is `Health: ` and the cleaned title.
 
 ## Priority
 
@@ -73,8 +86,8 @@ Per finding, on each read:
 
 - No open ticket carries the finding's marker
   (`<!-- loom:health key=<sha1> -->`): it briefs one on the goal home through
-  `bus.brain brief`, with Difficulty medium, Size M, the evidence in Why, and
-  the Live criterion "the finding is absent from the health endpoint for 24
+  `bus.brain brief`, with Difficulty medium, Size M, the quoted finding in
+  Why, and the Live criterion "the finding is absent from the health endpoint for 24
   hours". At most 3 new tickets a pass, and never past the goal's cap
   (`LOOM_GOAL_CAP`).
 - An open ticket carries it: when the impact moves the finding to another
