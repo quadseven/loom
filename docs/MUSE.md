@@ -179,7 +179,8 @@ this tick"; a step with no note shows nothing there.
    proof yet), oldest ship first, as `resume verify` items after the stage
    work and before any new brief. Verify them as step 4 says; write a proof
    only from evidence you saw in this tick, and otherwise leave a one-line
-   note on the ticket naming what evidence is missing.
+   note on the ticket naming what evidence is missing. Last, `resume` lists
+   one lane-made proof to audit as a `resume audit` item; audit it in step 4.
 3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
    the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
@@ -205,7 +206,12 @@ this tick"; a step with no note shows nothing there.
    `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
    and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
    refuse a missing proof or an unchecked criterion: never invent evidence to
-   get past them; leave the ticket open and say what is missing.
+   get past them; leave the ticket open and say what is missing. Then audit
+   the `resume audit` item, if any: re-read each criterion's evidence the
+   lane's proof names and record the result with
+   `python3 -m bus.brain audit OWNER/NAME#N --result pass|fail --note TEXT`
+   (docs/BRAIN.md, Proof audits). Put it in the journal as
+   `- Audit: OWNER/NAME#N proof by LANE/MODEL: pass|fail, what was re-read`.
 5. First run `python3 -m bus.brain step failed --holder muse`. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each

@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import brain, proof, spend, station, tickets  # noqa: E402
+from bus import audit, brain, proof, spend, station, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -207,6 +207,9 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
+        if "labels=loom:audit-failed&" in query:
+            return reply(200, [i for i in self.issues.values()
+                               if "loom:audit-failed" in self.names(i["number"])])
         if "labels=loom%3Apr" in query or "labels=loom:pr&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:pr" in self.names(i["number"])])
@@ -3769,6 +3772,36 @@ class VerifyDispatchTest(Base):
         self.run_pass()
         self.assertIn("Issue: %s#1\n" % REPO, self.text())
 
+    def failed_audit(self, lane, hours_ago, login="alice-example"):
+        """A closed ticket whose lane proof failed its audit hours_ago."""
+        self.fake.add(9, lane=lane, state="shipped")
+        self.fake.issues[9]["state"] = "closed"
+        self.fake.issues[9]["labels"].append({"name": audit.LABEL})
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - hours_ago * HOUR))
+        self.fake.comments[9] = [{"body": audit.marker("fail", lane) + "\nAudit failed.",
+                                  "user": {"login": login}, "created_at": stamp}]
+
+    def test_a_failed_audit_holds_the_lane_from_verify_runs_for_a_day(self):
+        self.failed_audit("codex", 2)
+        self.run_pass()
+        self.assertEqual(self.briefs(), [])
+
+    def test_the_hold_ends_after_a_day_and_only_a_trusted_audit_holds(self):
+        for hours, login in ((25, "alice-example"), (2, "someone-else")):
+            with self.subTest(hours=hours, login=login):
+                self.failed_audit("codex", hours, login)
+                self.run_pass()
+                self.assertIn("Issue: %s#2\n" % REPO, self.text())
+                os.remove(os.path.join(self.inbox(), self.briefs()[0]))
+                os.remove(os.path.join(self.home, "state", "station", station.VERIFY_FILE))
+
+    def test_a_ticket_whose_proof_failed_its_audit_is_due_again(self):
+        self.fake.comments[2] = [
+            {"body": proof.PROOF_MARKER + "\n```json\n{}\n```", "user": {"login": "alice-example"}},
+            {"body": audit.marker("fail", "zen"), "user": {"login": "alice-example"}}]
+        self.run_pass()
+        self.assertIn("Issue: %s#2\n" % REPO, self.text())
+
     def test_an_anthropic_slot_is_never_handed_a_verify_brief(self):
         self.heartbeat("codex", available=False)
         self.heartbeat("anthropic")
@@ -3829,6 +3862,23 @@ class VerifyResultTest(Base):
         self.assertTrue(all(done for done, _ in proof.criteria(self.fake.issues[5]["body"])))
         comments = [c["body"] for c in self.fake.comments[5]]
         self.assertTrue(any(c.startswith(proof.PROOF_MARKER) for c in comments))
+
+    def proofs(self):
+        return [c["body"] for c in self.fake.comments[5] if c["body"].startswith(proof.PROOF_MARKER)]
+
+    def test_a_lane_proof_names_the_lane_and_model_that_made_it(self):
+        # The lane cannot pass its proof off as the brain's.
+        self.result(self.good(verified_by="brain"))
+        self.write(os.path.join(self.home, "logs", "codex", self.name + ".verify.model"), "model-x\n")
+        self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertEqual(proof.read(self.proofs()[0])["verified_by"], "codex/model-x")
+        self.assertIn("Verified by: `codex/model-x`", self.proofs()[0])
+
+    def test_a_run_that_recorded_no_model_still_names_its_lane(self):
+        self.result(self.good())
+        self.run_pass()
+        self.assertEqual(proof.read(self.proofs()[0])["verified_by"], "codex/unknown")
 
     def test_an_invalid_proof_leaves_the_ticket_shipped_with_one_note(self):
         self.result(self.good(criteria=[]))

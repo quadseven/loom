@@ -111,7 +111,9 @@ $((MINUTES / 3)) minutes on them. Resume also lists up to 5 verify-due \
 tickets (shipped, no proof yet): spend up to a third of the tick on them, \
 oldest first. Write a proof only from evidence you saw in this tick; for a \
 ticket you cannot verify, leave a one-line note on it naming what evidence is \
-missing. Resume's sensitive pull requests are yours even when another brain \
+missing. Resume also lists one lane-made proof to audit: re-read the \
+evidence each criterion names and record it with python3 -m bus.brain audit \
+(docs/BRAIN.md, Proof audits). Resume's sensitive pull requests are yours even when another brain \
 journaled in the last 2 hours: read the ticket and diff, answer or resolve \
 each review thread, then run bus.brain merge with its ticket when ready. Do \
 not wait for that brain's next tick. Review, merge, brief and answer asks beyond \

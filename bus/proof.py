@@ -4,6 +4,8 @@ The brain writes the record as JSON and passes it to `move --to verified`. The
 record is checked, then posted on the ticket as a `loom:proof` comment that
 carries the record and a hash of the ticket's acceptance criteria, so a
 completed closure can read it back and refuse when the criteria changed.
+The record also says who made it: verified_by is "brain" or, for a proof the
+station applied from a lane's verify run, "<lane>/<model>" (bus/audit.py).
 """
 from __future__ import annotations
 
@@ -134,6 +136,8 @@ def check(record: Any, body: str) -> Dict[str, Any]:
     if not isinstance(sources, list) or not sources or not all(
             isinstance(x, str) and x.strip() for x in sources):
         raise ValueError("proof sources must list at least one reference")
+    if "verified_by" in record:
+        _text(record, "verified_by")
     check_criteria(body)
     _check_record_criteria(record, body)
     return record
@@ -147,6 +151,9 @@ def render(record: Dict[str, Any], body: str) -> str:
     """The proof comment: a readable summary, then the record with the
     acceptance contract it was checked against."""
     lines = [PROOF_MARKER, "Proof (%s) at revision %s" % (record["kind"], record["revision"])]
+    if "verified_by" in record:
+        # In code: a model name such as provider/@org/model is no mention.
+        lines.append("Verified by: `%s`" % _line(record["verified_by"]).replace("`", "'"))
     if record["kind"] == "runtime":
         lines.append("Environment: %s, artifact: %s" % (
             _line(record["environment"]), _line(record["artifact"])))

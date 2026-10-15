@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, token_from_env
-from . import change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
+from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
 from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -1523,10 +1523,12 @@ def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
          record: Optional[Dict[str, Any]] = None,
-         model: Optional[str] = None) -> None:
+         model: Optional[str] = None, verified_by: str = audit.BRAIN) -> None:
     """Move a ticket to a state. Verified takes a proof record (bus/proof.py),
-    posted on the ticket before the label changes; no other state takes one.
-    A model (briefed only) is written to the body's Model: line first."""
+    posted on the ticket before the label changes, with verified_by naming
+    who made it (the brain unless the station says which lane); no other
+    state takes one. A model (briefed only) is written to the body's Model:
+    line first."""
     _check_move_args(state, lane, note, model)
     if (state == "verified") != (record is not None):
         raise ValueError("verified needs a proof record, and no other state takes one")
@@ -1547,7 +1549,7 @@ def move(gh: GitHub, repo: str, number: int, state: str,
                               ", ".join(model_lanes(effective_model)) or "none"))
     kept = _moved_labels(_labels(issue), state, lane)
     if record is not None:
-        comment = _proof_comment(gh, repo, issue, record)
+        comment = _proof_comment(gh, repo, issue, dict(record, verified_by=verified_by))
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
     if model is not None:
         _set_model(gh, repo, number, issue, model)
@@ -1841,6 +1843,48 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
             {"state": "closed", "state_reason": reason})
+
+
+def _audit_comment(result: str, record: Dict[str, Any], note: str) -> str:
+    lane = audit.lane_of(record)
+    made = "the proof by `%s`" % _one_line(record.get("verified_by"), 120).replace("`", "'")
+    if result == "pass":
+        return "%s\nAudit: the brain re-read the evidence of %s and it holds. %s" % (
+            audit.marker(result, lane), made, note)
+    return ("%s\nAudit: the brain re-read the evidence of %s and it does not hold: %s\n\n"
+            "The ticket is back to shipped, and lane %s takes no verify run for %d hours." % (
+                audit.marker(result, lane), made, note, lane, audit.HOLD // 3600))
+
+
+def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
+                env: Optional[Dict[str, str]] = None) -> str:
+    """Record the brain's audit of a verified ticket's newest proof, which a
+    lane made and no audit has judged (bus/audit.py). A pass leaves the
+    ticket as it is. A fail reopens it when closed, labels it
+    loom:audit-failed, which holds the lane's verify runs for a day, and
+    moves it back to shipped with a note naming what failed."""
+    if result not in audit.RESULTS:
+        raise ValueError("an audit result is pass or fail")
+    if not str(note or "").strip():
+        raise ValueError("an audit needs a note naming the evidence read or what failed")
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    if "loom:ticket" not in _labels(issue) or "loom:verified" not in _labels(issue):
+        raise ValueError("only a verified ticket is audited")
+    authors = trusted_authors(env)
+    found = audit.unaudited(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), authors)
+    if found is None:
+        raise ValueError("the ticket's newest proof is not a lane proof waiting for an audit")
+    comment = _audit_comment(result, found[1], " ".join(note.split()))
+    _check_written_text(comment)
+    if result == "pass":
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+        return "audit of %s#%d passed" % (repo, number)
+    if issue.get("state") != "open":
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
+    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [audit.LABEL]})
+    move(gh, repo, number, "shipped", note=comment)
+    return "audit of %s#%d failed: back to shipped, lane %s held" % (
+        repo, number, audit.lane_of(found[1]))
 
 
 FAILED_CONCLUSIONS = ("failure", "timed_out", "cancelled", "action_required", "startup_failure")
@@ -2258,6 +2302,21 @@ def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime) -> Lis
     return out if due else out + ["- none"]
 
 
+def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
+                        env: Optional[Dict[str, str]]) -> List[str]:
+    """The one lane-made proof this tick audits: the oldest of the last day
+    that no audit has judged."""
+    due = audit.due(gh, repos, trusted_authors(env), now.timestamp())
+    out = ["", "## Lane proof audit (one a tick, oldest first)"]
+    for posted, repo, issue, record in due[:1]:
+        out.append("- resume audit %s#%s proof by `%s` %dh ago: re-read each criterion's "
+                   "evidence, then run python3 -m bus.brain audit %s#%s --result pass|fail "
+                   "--note TEXT" % (
+                       repo, issue["number"], _one_line(record.get("verified_by"), 120),
+                       max(0, int(now.timestamp() - posted) // 3600), repo, issue["number"]))
+    return out if due else out + ["- none"]
+
+
 def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
                      check: str) -> Optional[Dict[str, Any]]:
     """A needs-brain sensitive pull request older than 2 hours whose checks
@@ -2320,7 +2379,8 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     for repo, issue, found in goals:
         out += _goal_resume_lines(gh, repo, issue, found)
     return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
-                      + _verify_resume_lines(gh, repos, now))
+                      + _verify_resume_lines(gh, repos, now)
+                      + _audit_resume_lines(gh, repos, now, env))
 
 
 STUCK_STATES = ("failed", "briefed", "pr")
@@ -2629,6 +2689,7 @@ def parser() -> argparse.ArgumentParser:
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES, required=True); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
+    au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note")
@@ -2687,6 +2748,11 @@ def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
     prioritize(gh, repo, number, args.priority, args.note)
 
 
+def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    print(audit_proof(gh, repo, number, args.result, args.note))
+
+
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     close(gh, repo, number, args.reason, args.note)
@@ -2732,7 +2798,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "prioritize": _cmd_prioritize,
-            "close": _cmd_close, "merge": _cmd_merge, "reply": _cmd_reply,
+            "close": _cmd_close, "audit": _cmd_audit, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate}

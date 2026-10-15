@@ -76,6 +76,10 @@ _Avoid_: deploy, release
 Confirm on the live system that a shipped change shows its proof and moved the metric it targets.
 _Avoid_: test, check
 
+**Audit**:
+The brain re-reading the evidence of a proof a lane's verify run made; a failed audit moves the ticket back to shipped and holds that lane's verify runs for a day.
+_Avoid_: review, recheck
+
 **Journal**:
 The comment the brain leaves on a goal's home issue for each tick that changed something (shipped, briefed, waiting, asks and cost), with a five-line report every two hours.
 _Avoid_: log, summary

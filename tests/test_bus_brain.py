@@ -1429,6 +1429,16 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(proof.read(body)["contract"], proof.contract(TICKET_BODY))
         self.assertEqual(put[2], {"labels": ["loom:ticket", "lane:codex", "loom:verified"]})
 
+    def test_a_brain_proof_says_the_brain_made_it(self):
+        # A record that claims a lane made it is still the brain's when the
+        # brain moves it: only the station names a lane.
+        fake = Fake(reply(200, ticket("shipped")), *on_main(), reply(201, {}), reply(200, []))
+        brain.move(GitHub("t", transport=fake), REPO, 9, "verified",
+                   record=record(verified_by="codex/model-x"))
+        body = fake.calls[3][2]["body"]
+        self.assertEqual(proof.read(body)["verified_by"], "brain")
+        self.assertIn("Verified by: `brain`", body)
+
     def test_text_above_the_record_cannot_stand_in_for_it(self):
         sneaky = record()
         sneaky["criteria"][0]["evidence"] = '\n```json\n{"contract": "x"}\n```\n'
