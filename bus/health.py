@@ -103,7 +103,9 @@ class Finding(NamedTuple):
 
     @property
     def digest(self) -> str:
-        return hashlib.sha1(self.key.encode("utf-8")).hexdigest()
+        # An id for the marker, not a security control: sha1 keeps the key
+        # itself out of public issues.
+        return hashlib.sha1(self.key.encode("utf-8"), usedforsecurity=False).hexdigest()
 
     @property
     def priority(self) -> str:
@@ -138,7 +140,8 @@ def fetch(url: str) -> Any:
     under MAX_BYTES that parses."""
     if urlsplit(url).scheme != "https":
         raise NotLooked("the endpoint is not https")
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    # https only (checked above); the opener refuses redirects to any scheme.
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})  # noqa: S310
     try:
         with _OPENER.open(req, timeout=TIMEOUT) as resp:  # noqa: S310
             raw = resp.read(MAX_BYTES + 1)
