@@ -5,6 +5,7 @@ import http.client
 import re
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,7 +14,7 @@ from urllib.parse import urlsplit
 from bus.github import GitHub
 from dashboard.github import TicketStore
 from dashboard import views
-from dashboard.server import make_server
+from dashboard.server import make_server, _dispatch_basic
 
 from tests import sandbox_caps
 
@@ -759,6 +760,171 @@ class LaneCardsTest(unittest.TestCase):
         self.assertIn('<div class="quota"><span style="width:42%"></span></div>', body)
         self.assertIn("quota missing", body)
         self.assertIn("model missing", body)
+
+
+class DashboardParallelSnapshotTest(unittest.TestCase):
+    def test_snapshot_per_repo_reads_overlap_in_parallel(self):
+        """A test with a fake GitHub client that sleeps per request shows the
+        snapshot's per-repo reads overlap (wall time well under the serial sum),
+        and fails on main where per-repo reads run in serial."""
+        delay = 0.04
+        repos = ["org/repo-1", "org/repo-2", "org/repo-3", "org/repo-4"]
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+        total_sleep = 0.0
+
+        def sleeping_transport(method, url, headers, body):
+            nonlocal active, max_active, total_sleep
+            with lock:
+                active += 1
+                if active > max_active:
+                    max_active = active
+                total_sleep += delay
+            time.sleep(delay)
+            with lock:
+                active -= 1
+            return 200, {"Content-Type": "application/json"}, b"[]"
+
+        gh = GitHub("", transport=sleeping_transport)
+        store = TicketStore(repos=repos, gh=gh, budget_floor=0)
+        self.assertFalse(store.ready)
+
+        start = time.monotonic()
+        store.refresh()
+        elapsed = time.monotonic() - start
+
+        # Overlapping reads mean multiple requests executed concurrently.
+        self.assertGreater(max_active, 1)
+        # Wall time is well under the serial sum of request delays.
+        self.assertLess(elapsed, total_sleep * 0.7)
+        self.assertTrue(store.ready)
+        self.assertIsNotNone(store.first_snapshot_wall_time)
+        self.assertGreater(store.first_snapshot_wall_time, 0.0)
+        self.assertEqual(list(store.data.keys()), repos)
+
+    def test_one_repo_read_error_stays_attached_and_other_repos_complete(self):
+        """A test shows one repo's read error stays attached to that repo and
+        the other repos' data is complete."""
+        repos = ["org/good1", "org/failing", "org/good2"]
+
+        def error_transport(method, url, headers, body):
+            if "org/failing" in url:
+                return 403, {"Content-Type": "application/json"}, b'{"message": "forbidden rate limit"}'
+            if "labels=loom%3Aticket" in url:
+                repo_name = "good1" if "good1" in url else "good2"
+                num = 101 if repo_name == "good1" else 201
+                payload = [{
+                    "number": num,
+                    "title": "Ticket in %s" % repo_name,
+                    "state": "open",
+                    "body": "Difficulty: easy",
+                    "updated_at": "2026-10-15T12:00:00Z",
+                    "labels": [{"name": "loom:ticket"}],
+                }]
+                return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
+            if "labels=needs-operator" in url:
+                repo_name = "good1" if "good1" in url else "good2"
+                num = 102 if repo_name == "good1" else 202
+                payload = [{
+                    "number": num,
+                    "title": "Ask in %s" % repo_name,
+                    "body": "Please assist",
+                    "created_at": "2026-10-15T12:00:00Z",
+                    "updated_at": "2026-10-15T12:00:00Z",
+                }]
+                return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
+            if "/pulls?" in url:
+                repo_name = "good1" if "good1" in url else "good2"
+                num = 103 if repo_name == "good1" else 203
+                payload = [{
+                    "number": num,
+                    "title": "PR in %s" % repo_name,
+                    "body": "Fixes ticket",
+                    "created_at": "2026-10-15T12:00:00Z",
+                }]
+                return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
+            return 200, {"Content-Type": "application/json"}, b"[]"
+
+        gh = GitHub("", transport=error_transport)
+        store = TicketStore(repos=repos, gh=gh, budget_floor=0)
+        store.refresh()
+
+        # The failing repo's error stays attached to that repo.
+        self.assertIn("org/failing", store.errors)
+        self.assertIn("forbidden rate limit", store.errors["org/failing"])
+        self.assertNotIn("org/good1", store.errors)
+        self.assertNotIn("org/good2", store.errors)
+
+        # The good repos' ticket data is complete.
+        self.assertEqual(len(store.data["org/good1"]), 1)
+        self.assertEqual(store.data["org/good1"][0]["number"], 101)
+        self.assertEqual(len(store.data["org/good2"]), 1)
+        self.assertEqual(store.data["org/good2"][0]["number"], 201)
+        self.assertIsNone(store.data.get("org/failing"))
+
+        # Operator items and PRs keep stable order and omit failing repo.
+        self.assertEqual([item["number"] for item in store.operator_items], [102, 202])
+        self.assertEqual([pr["number"] for pr in store.response()["pull_requests"]], [103, 203])
+
+        # Failing repo errors appear in dashboard error fields.
+        dash_errors = "; ".join(store.response().get("dashboard_errors", []))
+        self.assertIn("org/failing pull requests", dash_errors)
+        self.assertIn("org/failing comments", store.response().get("hot_spots_error", ""))
+
+    def test_readyz_honest_only_after_first_snapshot_not_on_empty(self):
+        """Keep /readyz honest: ready only after the first snapshot, never on an empty one."""
+        def dummy_transport(method, url, headers, body):
+            return 200, {"Content-Type": "application/json"}, b"[]"
+
+        class DummyHandler:
+            def __init__(self):
+                self.status = None
+                self.body = None
+
+            def send_text(self, code, text):
+                self.status = code
+                self.body = text
+
+        gh = GitHub("", transport=dummy_transport)
+        store = TicketStore(repos=["org/sample"], gh=gh, budget_floor=0)
+
+        # Before the first snapshot, store is not ready.
+        self.assertFalse(store.ready)
+        handler = DummyHandler()
+        _dispatch_basic(handler, store, "/readyz")
+        self.assertEqual(handler.status, 503)
+        self.assertEqual(handler.body, "not ready")
+
+        store.refresh()
+
+        # After the first snapshot, store is ready.
+        self.assertTrue(store.ready)
+        handler = DummyHandler()
+        _dispatch_basic(handler, store, "/readyz")
+        self.assertEqual(handler.status, 200)
+        self.assertEqual(handler.body, "ready")
+
+    def test_first_snapshot_wall_time_logged_once(self):
+        """Log the first snapshot's wall time once at start."""
+        def dummy_transport(method, url, headers, body):
+            return 200, {"Content-Type": "application/json"}, b"[]"
+
+        gh = GitHub("", transport=dummy_transport)
+        store = TicketStore(repos=["org/sample"], gh=gh, budget_floor=0)
+        self.assertIsNone(store.first_snapshot_wall_time)
+
+        with self.assertLogs("dashboard.github", level="INFO") as captured:
+            store.refresh()
+
+        first_time = store.first_snapshot_wall_time
+        self.assertIsNotNone(first_time)
+        self.assertGreater(first_time, 0.0)
+        self.assertTrue(any("first snapshot wall time" in entry for entry in captured.output))
+
+        # A second refresh does not overwrite the recorded duration.
+        store.refresh()
+        self.assertEqual(store.first_snapshot_wall_time, first_time)
 
 
 if __name__ == "__main__":
