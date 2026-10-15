@@ -167,7 +167,7 @@ PRIORITIES_SHOWN = 5
 def _priorities_card(rows):
     """The open tickets not yet merged, in the order lanes take them:
     urgent and regression labels, then Priority (P0 first), then the oldest."""
-    waiting = [row for row in rows if row.get("state") not in
+    waiting = [row for row in rows if row.get("open", True) and row.get("state") not in
                ("merged", "shipped", "verified", "closed-unmerged")]
     waiting.sort(key=lambda row: bus_tickets.work_order(str(row.get("repo") or ""), row))
     esc = html.escape
@@ -185,7 +185,7 @@ def _floor(state):
     rows = _all_tickets(state)
     conveyor, bottleneck = _conveyor(state, rows)
     order = {name: index for index, name in enumerate(MOVING_ORDER)}
-    moving = sorted((row for row in rows if row.get("state") in order),
+    moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
                     key=lambda row: (order[row["state"]], str(row.get("updated_at") or "")[::-1]))
     payload = state.response()
     context = getattr(state, "context", None) or payload.get("floor_context", {})

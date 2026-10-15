@@ -715,7 +715,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_a_move_clears_every_state_label_including_ready(self):
         # A shipped move that kept loom:ready read as "ready" everywhere
-        # (2026-10-15: five WoW tickets listed as lane work in Priorities).
+        # (2026-10-15: five shipped tickets listed as lane work in Priorities).
         have = ["loom:ticket", "loom:merged", "loom:ready", "loom:closed-unmerged", "lane:claude"]
         self.assertEqual(brain._moved_labels(have, "shipped", None),
                          ["loom:ticket", "lane:claude", "loom:shipped"])

@@ -127,6 +127,18 @@ class PrioritiesCard(unittest.TestCase):
         self.assertIn("P0</span>", card)
         self.assertNotIn("Ticket 4", card)
 
+    def test_a_closed_ticket_is_never_waiting_or_moving(self):
+        # Tickets are read with state=all: a closed revert still labelled
+        # briefed sat at the top of the card (2026-10-15).
+        closed = dict(self.issue(8, "briefed", labels=("loom:revert",)), state="closed")
+        body = self.render([closed, self.issue(9, "queued", "P2")])
+        card = body[body.index('class="card priorities-card"'):]
+        card = card[:card.index("</section>")]
+        self.assertNotIn("Ticket 8", card)
+        self.assertIn("Ticket 9", card)
+        moving = body[body.index("Moving now"):body.index("Moving now") + 4000]
+        self.assertNotIn("Ticket 8", moving)
+
     def test_an_empty_floor_says_nothing_is_waiting(self):
         self.assertIn("Nothing is waiting.", self.render([self.issue(4, "verified")]))
 
