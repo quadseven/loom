@@ -9,8 +9,8 @@ import re
 import subprocess
 import sys
 import urllib.request
-from typing import Any, Callable
-from urllib.parse import quote
+from typing import Callable
+from urllib.parse import quote, urlsplit
 
 from .github import GitHub, GitHubError, token_from_env
 from .hunt_plan import problems
@@ -37,7 +37,10 @@ def targets(value: str) -> list[dict[str, str]]:
 
 
 def download(url: str) -> bytes:
-    with urllib.request.urlopen(url, timeout=60) as response:
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "codeload.github.com":
+        raise ValueError("tarball URL must use GitHub codeload over HTTPS")
+    with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
         return response.read()
 
 
