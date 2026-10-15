@@ -32,6 +32,19 @@ CREDENTIAL_RE = re.compile(
     r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+")
 # The same shapes plus long unbroken token runs.
 SECRET_RE = re.compile(CREDENTIAL_RE.pattern + r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
+# A host under a suffix that only resolves on a private network.
+PRIVATE_HOST_RE = re.compile(
+    r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
+HOST_RE = PRIVATE_HOST_RE
+
+
+def safe_line(line: str) -> bool:
+    """True when the line carries no credential shape and no private host."""
+    return not bool(CREDENTIAL_RE.search(line) or SECRET_RE.search(line)
+                    or PRIVATE_HOST_RE.search(line))
+
+
+is_safe_line = safe_line
 
 
 def scrub_paths(text: str) -> str:

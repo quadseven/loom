@@ -156,7 +156,9 @@ done
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
-# are filed on, and the review bot's plan check, docs/LANES.md Invariants). Runs from
+# are filed on, and the review bot's plan check, docs/LANES.md Invariants), and
+# LOOM_EVIDENCE_CMDS (per-repo command templates that gather log evidence for
+# verify briefs). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -212,6 +214,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REWRITE_PRIVATE_CMD</key><string>$(xml "${LOOM_REWRITE_PRIVATE_CMD:-}")</string>
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
+    <key>LOOM_EVIDENCE_CMDS</key><string>$(xml "${LOOM_EVIDENCE_CMDS:-}")</string>
   </dict>
 </dict>
 </plist>

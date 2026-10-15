@@ -9,3 +9,4 @@ lanes/opencode/config.json
 __pycache__/
 *.pyc
 .hermes-scratch/
+*.tmp

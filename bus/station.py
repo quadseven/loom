@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from . import evidence
 from . import factory
 from . import handoff
 from . import health
@@ -304,8 +305,10 @@ class Settings:
                  plan_check: str = invariants.DEFAULT_PLAN_CHECK,
                  report_digest: Sequence[Tuple[int, int]] = (),
                  health_urls: str = "",
-                 health_every: int = health.EVERY) -> None:
+                 health_every: int = health.EVERY,
+                 evidence_cmds: Optional[Dict[str, str]] = None) -> None:
         self.home = home
+        self.evidence_cmds = dict(evidence_cmds or {})
         # "owner/name#goal=https://..." entries: each goal home's health
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
@@ -409,7 +412,8 @@ class Settings:
                    plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
                                or invariants.DEFAULT_PLAN_CHECK),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
-                   health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY))
+                   health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
+                   evidence_cmds=evidence.parse_cmds(env.get("LOOM_EVIDENCE_CMDS", "")))
 
 
 def _seconds(raw: str, default: int) -> int:
@@ -1302,8 +1306,11 @@ class Station:
     def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
         number = int(issue["number"])
         stamp = int(self.now)
+        live = brain.live_criterion(issue.get("body"))
+        cmd = self.s.evidence_cmds.get(repo, "")
+        log_evidence = evidence.gather_evidence(cmd, live) if cmd else ""
         text = tickets.render_verify_brief(
-            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+            repo, issue, lane, stamp, live, log_evidence)
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))

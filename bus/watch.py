@@ -65,7 +65,7 @@ _MENTION_RE = re.compile(r"(?<![A-Za-z0-9_.-])@[A-Za-z0-9][A-Za-z0-9-]*")
 _IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b"
                     r"|\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b")
 # A host under a suffix that only resolves on a private network.
-_HOST_RE = re.compile(r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
+_HOST_RE = _text.PRIVATE_HOST_RE
 _REF_RE = re.compile(r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+\b")
 # owner/name: two words around one slash, each with a letter.
 _REPO_RE = re.compile(r"(?<![A-Za-z0-9_./<-])[A-Za-z0-9_.-]*[A-Za-z][A-Za-z0-9_.-]*"
