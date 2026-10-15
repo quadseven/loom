@@ -43,7 +43,8 @@ Neither needs a model:
 - The merge rule follows the pull request's class:<name> label
   (bus/change_class.py; docs/MUSE.md, Merge by change class). docs and tests
   defer a minor finding at once; logic is the rule above; a sensitive change
-  is never merged here: it is marked needs-brain and left for the brain.
+  is never merged here: it is marked needs-brain for the brain's merge, and
+  its conflicts, failing checks and high findings go back to its lane.
 - A pull request whose only fault is a failed Actions job gets that job run
   once more before it is sent back, since one flaky run should not cost a
   lane round.
@@ -895,11 +896,14 @@ class Factory:
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
-        if class_of(full) == "sensitive":
+        sensitive = class_of(full) == "sensitive"
+        if sensitive:
             # A change to the code that merges, closes or deploys never lands
-            # on the factory's say-so alone: mark it for the brain and stop.
+            # on the factory's say-so alone: it is marked for the brain, and
+            # only its merge waits. A conflict, a failing check or a high
+            # finding still goes back to its lane like any pull request
+            # (2026-10-14: sensitive conflicts waited on hand-sent fix briefs).
             self._mark_sensitive(repo, number, full)
-            return
         review = self._review_state(repo, number, sha, _ts(full.get("updated_at")))
         if review == "wait":
             return
@@ -908,11 +912,12 @@ class Factory:
         if (ended and not self._reviewed_since(sha, ended)
                 and self.now - ended <= REVIEW_GRACE):
             return  # the review the lane asked for has not answered yet
-        self._judge(repo, number, full, issue, comments, review)
+        self._judge(repo, number, full, issue, comments, review, sensitive)
 
     def _judge(self, repo: str, number: int, full: Dict[str, Any], issue: Dict[str, Any],
-               comments: List[Dict[str, Any]], review: str) -> None:
-        """Land, defer minor findings and land, rerun a flaky job, or send back."""
+               comments: List[Dict[str, Any]], review: str, sensitive: bool = False) -> None:
+        """Land, defer minor findings and land, rerun a flaky job, or send back.
+        A sensitive pull request is judged the same way but never landed."""
         sha = str((full.get("head") or {}).get("sha") or "")
         self._resolve_bot_fixed(repo, number)
         details = brain._pr_graphql(self.gh, repo, number)
@@ -935,7 +940,7 @@ class Factory:
             self._send_back(repo, full, issue, comments,
                             ", ".join(faults), open_thread_ids(details), "failing checks" in faults)
         elif review == "reviewed":
-            self._land_or_ask_test(repo, number, full, issue, comments)
+            self._land_or_ask_test(repo, number, full, issue, comments, sensitive)
 
     def _repair_body_leak(self, repo: str, number: int, full: Dict[str, Any],
                           issue: Dict[str, Any], comments: List[Dict[str, Any]],
@@ -979,13 +984,14 @@ class Factory:
         return True
 
     def _land_or_ask_test(self, repo: str, number: int, full: Dict[str, Any],
-                          issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
+                          issue: Dict[str, Any], comments: List[Dict[str, Any]],
+                          sensitive: bool = False) -> None:
         """Land a clean, reviewed pull request, or send it back when it
-        changes code without a test."""
+        changes code without a test. A clean sensitive one waits for the brain."""
         if self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
-        else:
+        elif not sensitive:
             self._land(repo, number, full, issue)
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
