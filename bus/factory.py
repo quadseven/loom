@@ -596,10 +596,10 @@ class Factory:
                  merge: Callable[..., Any] = brain.merge,
                  fix: Callable[..., Any] = brain.fix,
                  move: Callable[..., Any] = brain.move,
-                 close: Optional[Callable[..., Any]] = None,
                  limited: Sequence[str] = (),
                  no_test_repos: Sequence[str] = (),
-                 available: Optional[Sequence[str]] = None) -> None:
+                 available: Optional[Sequence[str]] = None,
+                 close: Optional[Callable[..., Any]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
