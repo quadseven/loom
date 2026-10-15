@@ -152,18 +152,34 @@
   if (window.matchMedia('(max-width: 959px)').matches) {
     document.querySelectorAll('[data-pane]').forEach((pane) => { pane.hidden = pane.dataset.pane !== initialTab; });
   }
-  const liveRun = document.querySelector('.run-events[data-running="true"][data-run]');
-  if (liveRun && liveRun.dataset.run) {
+  const liveRun = document.querySelector('.run-events[data-running="true"][data-attempt]');
+  if (liveRun && liveRun.dataset.attempt) {
     let after = '';
-    const eventsUrl = () => `/api/tickets/${window.location.pathname.split('/').slice(2).join('/')}/runs/${encodeURIComponent(liveRun.dataset.run)}${after ? `?after=${encodeURIComponent(after)}` : ''}`;
+    const ticketPath = window.location.pathname.split('/').slice(2).join('/');
+    const eventsUrl = () => `/api/tickets/${ticketPath}/runs/${encodeURIComponent(liveRun.dataset.attempt)}${after ? `?after=${encodeURIComponent(after)}` : ''}`;
+    const liveRow = liveRun.querySelector('.transcript-event.live');
+    const labelOf = (event) => event.role === 'user' ? 'brief' : event.role === 'thinking' ? 'thought'
+      : event.kind === 'tool_use' ? 'ran' : event.kind === 'tool_result' ? 'output'
+      : event.role === 'runner' ? 'runner' : 'said';
     window.loomPoll(eventsUrl, 5000, (payload) => {
       (payload.events || []).forEach((event) => {
+        const label = labelOf(event);
         const row = document.createElement('div');
-        row.className = `transcript-event ${event.role === 'thinking' ? 'thought' : ''}`;
-        if (event.role === 'thinking') row.dataset.thought = '';
-        const label = document.createElement('b'); label.textContent = event.role === 'runner' ? 'runner' : event.role === 'user' ? 'brief' : 'said';
-        const content = document.createElement('p'); content.textContent = event.text || '';
-        row.append(label, content); liveRun.append(row); after = event.ts || after;
+        row.className = `transcript-event ${label}`;
+        if (label === 'thought') {
+          row.dataset.thought = '';
+          row.hidden = thoughtToggle ? !thoughtToggle.checked : false;
+        }
+        const head = document.createElement('div'); head.className = 'tx-head';
+        const name = document.createElement('span'); name.className = 'tx-label'; name.textContent = label;
+        const at = document.createElement('span'); at.className = 'tx-at'; at.textContent = (event.ts || '').slice(11, 16);
+        head.append(name, at);
+        const content = document.createElement(label === 'said' || label === 'brief' ? 'p' : label === 'thought' ? 'em' : 'pre');
+        if (content.tagName === 'PRE') content.className = label === 'runner' ? 'runner' : 'tool-block';
+        content.textContent = event.text || '';
+        row.append(head, content);
+        liveRun.insertBefore(row, liveRow);
+        after = event.ts || after;
       });
     });
   }

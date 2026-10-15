@@ -5,7 +5,7 @@ import importlib.util
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 _ISSUE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$")
@@ -193,6 +193,23 @@ def _backend():
     raise RuntimeError("Transcript database requires the pg8000 package")
 
 
+def _plain(row):
+    """A stored row with every datetime as an ISO time ending in Z: Postgres
+    returns datetime objects for started_at and finished_at, which JSON cannot
+    carry (the runs API answered 502 on 2026-10-15), while the memory store
+    returns the strings it was given."""
+    if row is None:
+        return None
+    out = {}
+    for key, value in row.items():
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                value = value.astimezone(timezone.utc).replace(tzinfo=None)
+            value = value.isoformat(timespec="seconds") + "Z"
+        out[key] = value
+    return out
+
+
 class Store:
     def __init__(self, backend=None):
         self.backend = backend if backend is not None else _backend()
@@ -204,10 +221,11 @@ class Store:
         self.backend.initialize()
 
     def list(self, ticket=None):
-        return self.backend.read("list", ticket)
+        return [_plain(row) for row in self.backend.read("list", ticket)]
 
     def attempts(self, ticket):
-        return [dict(row, attempt=i) for i, row in enumerate(self.backend.read("attempts", ticket), 1)]
+        return [dict(_plain(row), attempt=i)
+                for i, row in enumerate(self.backend.read("attempts", ticket), 1)]
 
     def get(self, id_):
-        return self.backend.get(id_)
+        return _plain(self.backend.get(id_))
