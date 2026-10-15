@@ -183,16 +183,20 @@ def _floor(state):
     parts.append('<div class="floor-columns"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
                  '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list">%s</div></section>' % (
                      "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'))
-    step = context.get("journal_step")
+    step = context.get("journal_step") or context.get("journal_lead")
+    label = "Brain's next move" if context.get("journal_step") else "Brain, last tick"
     if step:
         title = goals_view.short(str(step), 140)
         rest = " ".join(str(step).split())[len(title.rstrip(" .")):].strip(" .")
         who = ", ".join(x for x in (context.get("journal_holder"), _when(context.get("journal_time"))) if x)
         brain = '<p class="next-move">%s</p>%s<p class="machine-fact">%s</p><a href="/brain">see the reasoning &rarr;</a>' % (
             esc(title), '<p class="muted">%s</p>' % esc(goals_view.short(rest, 200)) if rest else "", esc(who))
+    elif context.get("journal_time"):
+        brain = '<p class="muted">The newest journal (%s) names no move.</p><a href="/brain">the Brain view &rarr;</a>' % esc(
+            _when(context.get("journal_time")) or str(context.get("journal_time")))
     else:
         brain = '<p class="muted">not looked: %s</p>' % esc(str(context.get("journal_reason") or "no goal journal found"))
-    parts.append('<aside class="floor-aside"><section class="card next-move-card"><span class="label">Brain\'s next move</span>%s</section>' % brain)
+    parts.append('<aside class="floor-aside"><section class="card next-move-card"><span class="label">%s</span>%s</section>' % (esc(label), brain))
     start, why = _start_here_line(state)
     if start:
         epic, url, ticket = start

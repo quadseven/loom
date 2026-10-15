@@ -67,6 +67,31 @@ class GoalContext(unittest.TestCase):
         self.assertIsNone(card["title"])
 
 
+class LastTick(unittest.TestCase):
+    def render(self, journal):
+        from dashboard.github import _floor_context
+
+        class State:
+            context = _floor_context([], [{"body": journal, "created_at": "2026-10-15T06:19:48Z"}], [], [])
+            data = {}
+
+            def response(self):
+                return {"tickets": {}, "operator_items": []}
+        return server._floor(State())
+
+    def test_a_journal_without_a_next_line_shows_its_lead_as_the_last_tick(self):
+        body = self.render("<!-- loom:journal v1 -->\nBrain tick journal, lane machine.\n\n"
+                           "- Merged the stray-file fix once checks were green.\n- Deferred meow-now.")
+        self.assertIn("Brain, last tick", body)
+        self.assertIn("Merged the stray-file fix once checks were green.", body)
+        self.assertNotIn("no goal journal found", body)
+
+    def test_a_next_line_is_still_the_next_move(self):
+        body = self.render("<!-- loom:journal v1 -->\nTick, brain\n- Next: ship #5")
+        self.assertIn("Brain&#x27;s next move", body)
+        self.assertIn("ship #5", body)
+
+
 class FooterIndex(unittest.TestCase):
     def test_each_ticket_gets_its_newest_footer_model_in_one_pass(self):
         prs = [{"body": "Loom ticket example-owner.sample-7, lane codex, model old.", "updated_at": "2026-10-01"},
