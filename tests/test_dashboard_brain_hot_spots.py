@@ -41,10 +41,12 @@ def outcome(lane, text, at="2030-01-07T10:00:00Z", number=5):
 class BrainViewTest(unittest.TestCase):
     def test_current_step_is_marked_and_markers_are_verbatim(self):
         body = brain_view.render_brain(brain_view.build_brain(RECORD, "", [OLDER, JOURNAL]))
-        self.assertIn('<li class="tick-step current" aria-current="step">'
-                      '<span>3</span>merge <small>current</small></li>', body)
-        self.assertIn('<li class="tick-step done"><span>1</span>lock <small>done</small></li>', body)
-        self.assertIn('<li class="tick-step ahead"><span>4</span>verify <small>ahead</small></li>', body)
+        self.assertIn('<li class="tick-step current" aria-current="step"><span class="tick-bar"></span>'
+                      '<span class="tick-name">merge</span><span class="visually-hidden">current</span></li>', body)
+        self.assertIn('<span class="tick-name">lock</span><span class="visually-hidden">done</span>', body)
+        self.assertIn('<span class="tick-name">verify</span><span class="visually-hidden">ahead</span>', body)
+        self.assertEqual(body.count('class="tick-step '), 10)
+        self.assertIn("brain-a holds the lock / started 11:30", body)
         self.assertIn("&lt;!-- loom:defer v1 stage=merge item=example-owner/sample#40 "
                       "rev=abc123 holder=brain-a --&gt;", body)
         self.assertIn("&lt;!-- loom:done v1 stage=merge item=example-owner/sample#41 "
@@ -79,13 +81,102 @@ class BrainViewTest(unittest.TestCase):
                 {"state": "merged", "median_h": None, "n": 0}]
         ranking = brain_view.rank_waits(rows, "")
         self.assertEqual(ranking["items"][0]["why"],
-                         "4 tickets x 2.5h median wait = 10.0 ticket-hours lost")
+                         "4 tickets x 2.5 h median wait = 10 ticket-hours lost")
+        self.assertEqual(ranking["items"][0]["text"], "4 pull requests waiting to merge")
+        self.assertEqual(ranking["items"][0]["score"], "10h")
         self.assertEqual([item["state"] for item in ranking["items"]], ["pr", "queued"])
         self.assertIn("waits are missing: rate limited", brain_view.render_ranking(
             brain_view.rank_waits([], "rate limited")))
 
 
+class BrainLayoutTest(unittest.TestCase):
+    def test_next_move_is_a_headline_and_its_reason(self):
+        line, why = brain_view.split_next(
+            "Fix the p95 regression before briefing anything new. It moved after #38 shipped.")
+        self.assertEqual(line, "Fix the p95 regression before briefing anything new.")
+        self.assertEqual(why, "It moved after #38 shipped.")
+        journal = dict(JOURNAL, body=JOURNAL["body"].replace(
+            "merge example-owner/sample#41 once its review is clean",
+            "Merge #41 first. Its review is clean and two tickets wait on it."))
+        body = brain_view.render_brain(brain_view.build_brain(RECORD, "", [journal]))
+        self.assertIn('<p class="next-line">Merge #41 first.</p>'
+                      '<p class="next-why">Its review is clean and two tickets wait on it.</p>', body)
+
+    def test_a_long_first_sentence_is_cut_and_keeps_the_whole_text_as_reason(self):
+        text = "word " * 60 + "end."
+        line, why = brain_view.split_next(text)
+        self.assertTrue(line.endswith(" ...") and len(line) <= brain_view.HEADLINE_MAX + 4)
+        self.assertEqual(why, " ".join(text.split()))
+
+    def test_ranking_and_side_column_sit_beside_the_tick(self):
+        rows = [{"state": "shipped", "median_h": 16.5, "n": 92}]
+        body = brain_view.render_brain(brain_view.build_brain(RECORD, "", [JOURNAL], rows, ""))
+        self.assertIn('<div class="brain-layout"><div class="brain-main">', body)
+        self.assertIn('<div class="brain-side"><section class="card ranking-card">', body)
+        self.assertIn("92 shipped tickets waiting for live proof", body)
+        self.assertIn('<span class="score machine-fact">1518h</span>', body)
+
+
+class TickHeaderTest(unittest.TestCase):
+    def test_loose_tick_headers_still_name_their_holder(self):
+        for header, holder in (("Brain tick 2026-10-15 01:57Z, holder muse.", "muse"),
+                               ("Tick 2026-10-15 03:05Z, muse", "muse"),
+                               ("Brain tick 2026-10-14 ~09:57-10:40Z (muse). Usage 51%.", "muse"),
+                               ("# Brain journal, tick 10:27Z (holder lane-machine, lock acquired).",
+                                "lane-machine")):
+            journal = {"created_at": "2030-01-08T11:00:00Z",
+                       "body": "<!-- loom:journal v1 -->\n%s\n- Briefed: x" % header}
+            self.assertEqual(brain_view.build_brain(None, "x", [journal])["ticks"][0]["holder"], holder, header)
+
+    def test_one_tick_journaled_to_two_goal_homes_is_listed_once(self):
+        ticks = brain_view.build_brain(None, "x", [JOURNAL, dict(JOURNAL)])["ticks"]
+        self.assertEqual(len(ticks), 1)
+
+    def test_a_long_next_move_is_cut_at_its_first_clause(self):
+        text = ("Verify-due backlog keeps growing (dashboard tickets shipped 1-21h ago, most with no "
+                "Live criterion); evidence from this tick went to two other tickets instead. Next tick verifies.")
+        line, why = brain_view.split_next(text)
+        self.assertEqual(line, "Verify-due backlog keeps growing (dashboard tickets shipped 1-21h ago, "
+                               "most with no Live criterion).")
+        self.assertTrue(why.startswith("evidence from this tick"))
+
+
 class HotSpotsTest(unittest.TestCase):
+    def test_a_ticket_that_climbed_and_merged_is_not_stuck(self):
+        tickets = [{"repo": "example-owner/sample", "number": 5, "title": "Done", "state": "merged"}]
+        comments = [outcome("codex", "x\n<!-- loom:rung 3 -->", number=5)]
+        self.assertEqual(hot_spots.stuck_tickets(tickets, comments), [])
+
+    def test_waits_are_bars_scaled_to_the_slowest_state_with_the_bottleneck_marked(self):
+        data = {"waits": [{"state": "pr", "median_h": 2.0, "worst_h": 9.0, "n": 4},
+                          {"state": "shipped", "median_h": 8.0, "worst_h": 30.0, "n": 10,
+                           "worst_ticket": "example-owner/sample#3"}],
+                "bottleneck": "shipped", "waits_error": ""}
+        body = hot_spots.render_waits(data)
+        self.assertIn('<li class="wait"><p class="bar-head machine-fact"><span class="state">pr</span>', body)
+        self.assertIn('style="width:25%"', body)
+        self.assertIn('<li class="wait bottleneck">', body)
+        self.assertIn('style="width:100%"', body)
+        self.assertIn("shipped is the bottleneck: median 8.0h, the longest.", body)
+
+    def test_findings_show_a_bar_and_a_worded_trend_with_its_direction(self):
+        data = {"comments_error": "", "findings": [
+            {"rule": "no-test", "count": 4, "trend": "up from 1", "direction": "up"},
+            {"rule": "em-dash", "count": 2, "trend": "down from 5", "direction": "down"}]}
+        body = hot_spots.render_findings(data)
+        self.assertIn('<span class="trend trend-up">up from 1</span>', body)
+        self.assertIn('<span class="trend trend-down">down from 5</span>', body)
+        self.assertIn('style="width:50%"', body)
+
+    def test_stuck_tickets_render_as_ticket_rows_with_their_ladder(self):
+        data = {"comments_error": "", "stuck": [
+            {"repo": "example-owner/sample", "number": 5, "title": "Climbing", "state": "pr",
+             "rung": 2, "attempts": 4, "lane": "codex", "model": "gpt-x"}]}
+        body = hot_spots.render_stuck(data)
+        self.assertIn('<div class="stuck-grid"><a class="ticket-row" href="/t/example-owner/sample/5">', body)
+        self.assertIn('<span class="state-failed">rung 2 / 4 attempts</span>', body)
+        self.assertIn("pr / codex / gpt-x", body)
+
     def test_lane_failure_rates_mark_a_lane_above_20_percent_with_a_word(self):
         comments = ([outcome("zen", "failed: tests failed")] * 2
                     + [outcome("zen", "opened a pull request: https://example.com/pr/1")] * 3
@@ -98,9 +189,11 @@ class HotSpotsTest(unittest.TestCase):
         self.assertEqual((by_lane["zen"]["failed"], by_lane["zen"]["runs"]), (2, 5))
         self.assertEqual((by_lane["codex"]["failed"], by_lane["codex"]["runs"]), (1, 5))
         body = hot_spots.render_failure_rates(rates)
-        self.assertRegex(body, r'class="lane-bar bad"[^>]*>.*?zen.*?40% failed.*?failing often')
-        self.assertRegex(body, r'class="lane-bar"[^>]*>.*?codex.*?20% failed')
-        self.assertNotRegex(body, r'codex[^<]*<[^>]*>[^<]*20% failed[^<]*failing often')
+        self.assertRegex(body, r'class="lane-bar bad"[^>]*>.*?zen.*?40%.*?2 of 5 failed, failing often')
+        self.assertRegex(body, r'class="lane-bar"[^>]*>.*?codex.*?20%.*?1 of 5 failed<')
+        # Bar heights are relative to the worst lane, so the worst fills its bar.
+        self.assertIn('height:100%"></i></span><strong>zen</strong>', body)
+        self.assertIn('height:50%"></i></span><strong>codex</strong>', body)
 
     def test_findings_counted_over_seven_days_with_a_trend(self):
         def finding(rule, at, login="review-bot[bot]"):
@@ -200,7 +293,7 @@ class RouteTest(unittest.TestCase):
         code, body = self._get("/brain", payload)
         self.assertEqual(code, 200)
         self.assertIn('aria-current="page">Brain</a>', body)
-        self.assertIn("merge <small>current</small>", body)
+        self.assertIn('<span class="tick-name">merge</span><span class="visually-hidden">current</span>', body)
         code, body = self._get("/hot-spots", payload)
         self.assertEqual(code, 200)
         self.assertIn("Where it slows", body)

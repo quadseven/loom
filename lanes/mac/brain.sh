@@ -92,7 +92,8 @@ PROMPT="You are the Loom brain for one tick. Follow $WORK/loom/docs/MUSE.md, \
 with these differences: the checkout is already up to date, and the tick lock \
 is already held for you as holder $HOLDER by the wrapper, so skip the lock and unlock steps \
 (never lock or unlock). Record each other tick step with python3 -m bus.brain \
-step NAME --holder $HOLDER --lock-repo $LOCK_REPO in place of the step \
+step NAME --holder $HOLDER --lock-repo $LOCK_REPO --note \"one line: what this \
+step found or decided\" in place of the step \
 command MUSE.md gives; the wrapper records lock and unlock. LOOM_REPOS is \
 set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
