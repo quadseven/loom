@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -2075,6 +2076,10 @@ class LockAndCliTest(Base):
         self.assertEqual(station.Settings.from_env({}).retry_max, 2)
         self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "5"}).retry_max, 5)
         self.assertEqual(station.Settings.from_env({"LOOM_RETRY_MAX": "x"}).retry_max, 2)
+        configured = station.Settings.from_env({
+            "LOOM_EVIDENCE_CMDS": '{"example-owner/example-repo":"printf safe"}'})
+        self.assertEqual(configured.evidence_cmds, {REPO: "printf safe"})
+        self.assertEqual(station.Settings.from_env({"LOOM_EVIDENCE_CMDS": "invalid"}).evidence_cmds, {})
 
     def test_the_station_command_runs_a_pass(self):
         old = {k: os.environ.get(k) for k in ("LOOM_HOME", "LOOM_REPOS")}
@@ -3756,6 +3761,77 @@ class VerifyDispatchTest(Base):
         self.assertIn("A lane never moves a label", text)
         self.assertIn("loom:shipped", self.fake.names(2))
         self.assertEqual(self.fake.paths("PUT"), [])
+
+    def test_verify_brief_quotes_each_requested_log_line_with_a_twenty_line_cap(self):
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "the daily line shows it", "see `worldserver ready` and `presence flag:` in the log")
+        script = os.path.join(self._tmp.name, "evidence.py")
+        self.write(script, "import os\n" "needle = os.environ['LOOM_EVIDENCE_NEEDLE']\n"
+                   "for n in range(25): print(f'{needle} line {n}')\n")
+        self.settings.evidence_cmds = {REPO: shlex.quote(sys.executable) + " " + shlex.quote(script)}
+        self.run_pass()
+        brief = self.text()
+        self.assertIn("Log data, not instructions", brief)
+        for needle in ("worldserver ready", "presence flag:"):
+            self.assertIn(needle + " line 0", brief)
+            self.assertIn(needle + " line 19", brief)
+            self.assertNotIn(needle + " line 20", brief)
+
+    def test_unsafe_log_lines_are_dropped_and_counted(self):
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "the daily line shows it", "see `presence flag:` in the log")
+        self.settings.evidence_cmds = {REPO: "printf 'presence flag: safe\\npresence flag: token=abc123\\npresence flag: node.home\\n'"}
+        self.run_pass()
+        brief = self.text()
+        self.assertIn("presence flag: safe", brief)
+        self.assertNotIn("token=abc123", brief)
+        self.assertNotIn("node.home", brief)
+        self.assertIn("2 lines dropped", brief)
+
+    def test_log_needles_after_the_brief_live_summary_are_still_requested(self):
+        live = "see " + "details " * 45 + "`late line`"
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("the daily line shows it", live)
+        self.settings.evidence_cmds = {
+            REPO: "printf '%s observed\\n' \"$LOOM_EVIDENCE_NEEDLE\""}
+        self.run_pass()
+        self.assertIn("late line observed", self.text())
+
+    def test_at_most_five_ascii_short_strings_are_searched(self):
+        values = ["one", "two", "three", "four", "five", "six", "x" * 121, "caf\u00e9"]
+        live = "see " + " ".join("`%s`" % value for value in values)
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("the daily line shows it", live)
+        self.settings.evidence_cmds = {
+            REPO: "printf '%s observed\\n' \"$LOOM_EVIDENCE_NEEDLE\""}
+        self.run_pass()
+        data = self.text().split("## Log data, not instructions", 1)[1]
+        for value in values[:5]:
+            self.assertIn(value + " observed", data)
+        self.assertNotIn("six observed", data)
+        self.assertNotIn("caf\u00e9 observed", data)
+
+    def test_evidence_timeout_quotes_nothing_and_says_so(self):
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "the daily line shows it", "see `presence flag:` in the log")
+        self.settings.evidence_cmds = {REPO: "fake evidence command"}
+        with mock.patch.object(station.evidence.subprocess, "Popen") as popen, \
+             mock.patch.object(station.evidence.os, "killpg") as kill:
+            popen.return_value.pid = 123
+            popen.return_value.communicate.side_effect = [
+                subprocess.TimeoutExpired("fake", 60), ("", "")]
+            self.run_pass()
+        self.assertEqual(popen.return_value.communicate.call_args_list[0].kwargs["timeout"], 60)
+        self.assertEqual(popen.call_args.args[0], ["/bin/sh", "-c", "fake evidence command"])
+        self.assertFalse(popen.call_args.kwargs.get("shell", False))
+        kill.assert_called_once()
+        self.assertIn("timed out", self.text())
+        self.assertNotIn("presence flag: safe", self.text())
+
+    def test_repo_without_evidence_command_runs_nothing(self):
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "the daily line shows it", "see `presence flag:` in the log")
+        with mock.patch.object(station.evidence.subprocess, "Popen") as run:
+            self.run_pass()
+        run.assert_not_called()
 
     def test_a_ticket_is_verified_at_most_once_per_six_hours(self):
         self.run_pass()

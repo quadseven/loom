@@ -568,10 +568,12 @@ SENSITIVE_RESUME_MAX = 5
 _LIVE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]*)?(?:\[[ xX]\][ \t]*)?(Live\b.*?)[ \t]*$", re.M)
 
 
-def live_criterion(body: Optional[str]) -> str:
+def live_criterion(body: Optional[str], limit: Optional[int] = 300) -> str:
     """The ticket's acceptance line that starts with Live, or a note that it has none."""
     found = _LIVE_LINE.search(body or "")
-    return _one_line(found.group(1), 300) if found else "(no Live criterion on the ticket)"
+    if not found:
+        return "(no Live criterion on the ticket)"
+    return _one_line(found.group(1), limit) if limit is not None else " ".join(found.group(1).split())
 
 
 # Concurrent GitHub reads in status: few enough that GitHub's burst limits

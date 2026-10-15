@@ -82,7 +82,7 @@ X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")
 # Every LOOM_* setting in the environment, as plist entries.
 loom_env() {
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
-    case "$k" in LOOM_HOME|LOOM_REPO_OWNERS) continue ;; LOOM_*) ;; *) continue ;; esac
+    case "$k" in LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS) continue ;; LOOM_*) ;; *) continue ;; esac
     v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
   done
@@ -156,6 +156,8 @@ done
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and
+# LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
+# verify briefs, docs/LANES.md Verify runs), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
 # are filed on, and the review bot's plan check, docs/LANES.md Invariants). Runs from
 # this checkout, like the lanes, through
@@ -210,6 +212,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_TRANSCRIPT_URL</key><string>$(xml "${LOOM_TRANSCRIPT_URL:-}")</string>
     <key>LOOM_TRANSCRIPT_TOKEN_SSM</key><string>$(xml "${LOOM_TRANSCRIPT_TOKEN_SSM:-}")</string>
     <key>LOOM_WATCH</key><string>$(xml "${LOOM_WATCH:-}")</string>
+    <key>LOOM_EVIDENCE_CMDS</key><string>$(xml "${LOOM_EVIDENCE_CMDS:-}")</string>
     <key>LOOM_REWRITE_CMD</key><string>$(xml "${LOOM_REWRITE_CMD:-}")</string>
     <key>LOOM_REWRITE_PRIVATE_CMD</key><string>$(xml "${LOOM_REWRITE_PRIVATE_CMD:-}")</string>
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
