@@ -120,6 +120,11 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
 REPORT_CHECK = 300
+# The station's standup goes out this long before a goal's report turns two
+# hours old. Posting only once a goal was overdue (past REPORT_EVERY and its
+# grace) left every report 2.0 to 2.4 hours old before the next one, so the
+# visibility number (each goal report at most 2 hours old) could never pass.
+STANDUP_LEAD = 15 * 60
 # The operator's two reading times (2026-10-14: "Twice a day. Morning and
 # evening. 10am and 9pm"): one digest of every goal's reports each, instead of
 # each report as it is posted. LOOM_REPORT_DIGEST_TIMES="" turns it off.
@@ -3289,7 +3294,7 @@ class Station:
         key = "%s#%d" % (repo, number)
         sent = state.get(key)
         if isinstance(sent, (int, float)) and not isinstance(sent, bool) \
-                and 0 <= self.now - sent < brain.REPORT_EVERY:
+                and 0 <= self.now - sent < brain.REPORT_EVERY - STANDUP_LEAD:
             return
         comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" %
                                     (repo, number))
@@ -3298,7 +3303,10 @@ class Station:
              "author": {"login": tickets._login(c.get("user"))}}
             for c in comments if isinstance(c, dict)]}}
         ledger = brain.goal_ledger(goal, node, now, authors)
-        if ledger["state"] != "overdue":
+        last = self._epoch(str(ledger.get("report") or ""))
+        due = (ledger["state"] == "overdue"
+               or (last is not None and self.now - last >= brain.REPORT_EVERY - STANDUP_LEAD))
+        if not due:
             return
         children = brain.goal_children(self.gh, repo, number)
         breaches = (self._open_breaches(repo, number)

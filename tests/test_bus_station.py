@@ -2928,6 +2928,24 @@ class ReportsTest(Base):
         self.assertIn("Needs difficulty: #41 Needs a tier.", body)
         self.assertEqual(body.count("Needs difficulty:"), 1)
 
+    def report_aged(self, seconds):
+        self.add_goal()
+        self.comment(40, 1, "<!-- loom:report v1 -->\nearlier report")
+        self.fake.comments[40][0]["created_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        return [c for c in self.fake.comments[40][1:]
+                if str(c.get("body", "")).startswith(station.REPORT_MARKER)]
+
+    def test_station_posts_before_a_report_turns_two_hours_old(self):
+        made = self.report_aged(brain.REPORT_EVERY - station.STANDUP_LEAD + 300)
+        self.assertEqual(len(made), 1)
+
+    def test_station_waits_while_the_report_is_well_inside_two_hours(self):
+        made = self.report_aged(brain.REPORT_EVERY - station.STANDUP_LEAD - 900)
+        self.assertEqual(made, [])
+
     def test_station_does_not_post_for_a_fresh_report(self):
         self.add_goal()
         fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))

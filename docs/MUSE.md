@@ -132,7 +132,8 @@ live regression).
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
    including live. If the brain cannot write it, the station posts the
-   data-only report; never hand an owed report to another brain. Each lane
+   data-only report once the last report is 1 hour 45 minutes old, so no
+   goal's report passes 2 hours; never hand an owed report to another brain. Each lane
    pull request's line ends in `READY`
    or `blocked:` and its blockers; take that verdict as given rather than
    re-deriving it from the review list.
