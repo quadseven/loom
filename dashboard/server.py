@@ -135,12 +135,13 @@ def _when(stamp):
         return None
     zone_name = os.environ.get("LOOM_DASHBOARD_TZ", "").strip()
     if zone_name:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
         try:
-            from zoneinfo import ZoneInfo
             local = moment.astimezone(ZoneInfo(zone_name))
-            return local.strftime("%b %d %H:%M ") + (local.tzname() or zone_name)
-        except Exception:  # noqa: BLE001 - an unknown zone falls back to UTC
-            pass
+        except (ZoneInfoNotFoundError, ValueError):
+            # An unknown or malformed zone name reads in UTC, which says so.
+            return moment.strftime("%b %d %H:%M UTC")
+        return local.strftime("%b %d %H:%M ") + (local.tzname() or zone_name)
     return moment.strftime("%b %d %H:%M UTC")
 
 

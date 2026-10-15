@@ -126,6 +126,43 @@ def _factory(metric_comments: Sequence[Dict[str, Any]], now: datetime) -> Option
             "history": [by_day.get(day) for day in days], "scale": 9}
 
 
+def _index(comments: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, List[str]]]:
+    """Reports and journals by goal issue, and proof record days by ticket."""
+    notes: Dict[str, List[Dict[str, Any]]] = {}
+    proofs: Dict[str, List[str]] = {}
+    for comment in comments:
+        ref, body = issue_ref(comment), str(comment.get("body") or "")
+        if not ref:
+            continue
+        if body.startswith((REPORT_MARKER, JOURNAL_MARKER)):
+            notes.setdefault(ref, []).append(comment)
+        elif body.startswith(PROOF_MARKER) and _stamp(comment.get("created_at")):
+            proofs.setdefault(ref, []).append(str(comment.get("created_at"))[:10])
+    return notes, proofs
+
+
+def _latest_measure(notes: Sequence[Dict[str, Any]]) -> Optional[str]:
+    found = [m.group(1).strip() for c in notes for m in [_MEASURE.search(str(c.get("body") or ""))] if m]
+    found = [value for value in found if value.lower() not in ("", "none")]
+    return found[-1] if found else None
+
+
+def _goal_record(title: Optional[str], notes: Sequence[Dict[str, Any]], tickets: Sequence[str],
+                 proofs: Dict[str, List[str]], now: datetime) -> Dict[str, Any]:
+    ordered = sorted(notes, key=lambda c: str(c.get("created_at") or ""))
+    reports = [c for c in ordered if str(c.get("body") or "").startswith(REPORT_MARKER)]
+    newest = reports[-1] if reports else None
+    history, before = _verified(tickets, proofs, now)
+    return {
+        "title": title,
+        "report": short(headline(str(newest.get("body") or "")) or "", 220) if newest else None,
+        "report_time": newest.get("created_at") if newest else None,
+        "measure": _latest_measure(ordered),
+        "metric": str(sum(history)), "unit": "verified with proof, last 7 days",
+        "previous": str(before), "history": history, "scale": None,
+    }
+
+
 def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, Any]],
                  titles: Dict[str, Optional[str]], metric_comments: Sequence[Dict[str, Any]],
                  metrics_goal: Optional[str], now: datetime) -> Dict[str, Dict[str, Any]]:
@@ -134,34 +171,10 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
     for row in rows:
         if row.get("goal"):
             by_goal.setdefault(row["goal"], []).append("%s#%s" % (row.get("repo"), row.get("number")))
-    on_goal: Dict[str, List[Dict[str, Any]]] = {}
-    proofs: Dict[str, List[str]] = {}
-    for comment in comments:
-        ref, body = issue_ref(comment), str(comment.get("body") or "")
-        if not ref:
-            continue
-        if body.startswith((REPORT_MARKER, JOURNAL_MARKER)):
-            on_goal.setdefault(ref, []).append(comment)
-        elif body.startswith(PROOF_MARKER) and _stamp(comment.get("created_at")):
-            proofs.setdefault(ref, []).append(str(comment.get("created_at"))[:10])
-    out: Dict[str, Dict[str, Any]] = {}
-    for goal, tickets in by_goal.items():
-        notes = sorted(on_goal.get(goal, []), key=lambda c: str(c.get("created_at") or ""))
-        reports = [c for c in notes if str(c.get("body") or "").startswith(REPORT_MARKER)]
-        measures = [m.group(1).strip() for c in notes for m in [_MEASURE.search(str(c.get("body") or ""))]
-                    if m and m.group(1).strip().lower() not in ("", "none")]
-        history, before = _verified(tickets, proofs, now)
-        record: Dict[str, Any] = {
-            "title": titles.get(goal),
-            "report": short(headline(str(reports[-1].get("body") or "")) or "", 220) if reports else None,
-            "report_time": reports[-1].get("created_at") if reports else None,
-            "measure": measures[-1] if measures else None,
-            "metric": str(sum(history)), "unit": "verified with proof, last 7 days",
-            "previous": str(before), "history": history, "scale": None,
-        }
-        if goal == metrics_goal:
-            factory = _factory(metric_comments, now)
-            if factory:
-                record.update(factory)
-        out[goal] = record
+    notes, proofs = _index(comments)
+    out = {goal: _goal_record(titles.get(goal), notes.get(goal, []), tickets, proofs, now)
+           for goal, tickets in by_goal.items()}
+    factory = _factory(metric_comments, now) if metrics_goal in out else None
+    if factory:
+        out[metrics_goal].update(factory)
     return out
