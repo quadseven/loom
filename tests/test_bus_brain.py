@@ -773,6 +773,26 @@ class SensitiveResumeTests(unittest.TestCase):
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
 
+    def test_merge_refuses_while_a_brain_fix_is_pending(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        pending = [{"user": {"login": "alice-example"},
+                    "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
+        fake = Fake(pr, query, reply(200, issue), reply(200, pending))
+        with self.assertRaisesRegex(ValueError, "brain fix is pending"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_goes_ahead_once_no_brain_fix_is_pending(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
+                    reply(204), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                             env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertTrue(result["merged"])
+
     def test_merge_refuses_an_unrelated_closed_or_non_ticket_issue_before_write(self):
         cases = [
             ((REPO, 999), {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
