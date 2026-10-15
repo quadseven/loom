@@ -16,6 +16,8 @@ import ipaddress
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 
+from bus import tickets as bus_tickets
+
 from .github import TicketStore
 from .shell import page
 from . import transcripts as transcript_store
@@ -159,6 +161,26 @@ def _start_here_line(state):
             str(nxt.get("title") or ("#%s" % nxt.get("number") if nxt.get("number") else ""))), None
 
 
+PRIORITIES_SHOWN = 5
+
+
+def _priorities_card(rows):
+    """The open tickets not yet merged, in the order lanes take them:
+    urgent and regression labels, then Priority (P0 first), then the oldest."""
+    waiting = [row for row in rows if row.get("state") not in
+               ("merged", "shipped", "verified", "closed-unmerged")]
+    waiting.sort(key=lambda row: bus_tickets.work_order(str(row.get("repo") or ""), row))
+    esc = html.escape
+    items = "".join(
+        '<li><span class="machine-fact">%s</span><div><a href="%s">%s</a><span class="muted">%s</span></div></li>' % (
+            esc(bus_tickets.priority_of(row)), esc(_ticket_href(row), quote=True),
+            esc(goals_view.short(str(row.get("title") or "Untitled ticket"), 90)),
+            esc("%s#%s - %s" % (row.get("repo", ""), row.get("number", ""), row.get("state") or "unlabeled")))
+        for row in waiting[:PRIORITIES_SHOWN])
+    body = '<ol class="priority-list">%s</ol>' % items if items else '<p class="muted">Nothing is waiting.</p>'
+    return '<section class="card priorities-card"><span class="label">Priorities</span>%s<a href="/tickets">all tickets &rarr;</a></section>' % body
+
+
 def _floor(state):
     rows = _all_tickets(state)
     conveyor, bottleneck = _conveyor(state, rows)
@@ -197,6 +219,7 @@ def _floor(state):
     else:
         brain = '<p class="muted">not looked: %s</p>' % esc(str(context.get("journal_reason") or "no goal journal found"))
     parts.append('<aside class="floor-aside"><section class="card next-move-card"><span class="label">%s</span>%s</section>' % (esc(label), brain))
+    parts.append(_priorities_card(rows))
     start, why = _start_here_line(state)
     if start:
         epic, url, ticket = start

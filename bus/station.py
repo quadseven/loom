@@ -2,8 +2,8 @@
 
 One pass (python3 -m bus station, run by launchd) does three things under one
 lock: finishes any claim left half done, reports finished runs back to their
-tickets, and claims the oldest trusted briefed ticket for each lane that can
-take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
+tickets, and claims the first trusted briefed ticket (by priority, then age)
+for each lane that can take one. docs/BRAIN.md ("Claim and outcome", "Polling budget") is the contract.
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import factory
 from . import handoff
+from . import health
 from . import invariants
 from . import metrics
 from . import rewrite
@@ -274,8 +275,14 @@ class Settings:
                  self_repo: str = "",
                  invariant_goal: str = "",
                  plan_check: str = invariants.DEFAULT_PLAN_CHECK,
-                 report_digest: Sequence[Tuple[int, int]] = ()) -> None:
+                 report_digest: Sequence[Tuple[int, int]] = (),
+                 health_urls: str = "",
+                 health_every: int = health.EVERY) -> None:
         self.home = home
+        # "owner/name#goal=https://..." entries: each goal home's health
+        # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
+        self.health_urls = health_urls
+        self.health_every = health_every
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
         self.report_digest = tuple(report_digest)
@@ -373,7 +380,15 @@ class Settings:
                    self_repo=env.get("LOOM_SELF_REPO", "").strip(),
                    invariant_goal=env.get("LOOM_INVARIANT_GOAL", "").strip(),
                    plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
-                               or invariants.DEFAULT_PLAN_CHECK))
+                               or invariants.DEFAULT_PLAN_CHECK),
+                   health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
+                   health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY))
+
+
+def _seconds(raw: str, default: int) -> int:
+    """A whole number of seconds of at least 60, else default."""
+    raw = raw.strip()
+    return int(raw) if raw.isdigit() and int(raw) >= 60 else default
 
 
 def _origin_repo() -> str:
@@ -1122,13 +1137,14 @@ class Station:
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:
-        """Claim the oldest ticket for one free lane that can be claimed."""
+        """Claim the first ticket in work order for one free lane that can be
+        claimed."""
         # A revert of a red default branch (bus/revert.py) goes first, then
-        # a regression fix (bus.brain brief --regresses).
+        # a regression fix (bus.brain brief --regresses), then the rest in
+        # tickets.work_order: urgent, then priority, then the oldest.
         cands = sorted(found, key=lambda c: (
             factory.REVERT_LABEL not in _label_names(c[1]),
-            REGRESSION not in _label_names(c[1]),
-            str(c[1].get("created_at") or ""), c[0], int(c[1]["number"])))
+            REGRESSION not in _label_names(c[1])) + tickets.work_order(*c))
         for repo, issue in cands:
             try:
                 if self._try_ticket(repo, lane, issue, free):
@@ -2933,6 +2949,28 @@ class Station:
             if budget <= 0 or self._deferred():
                 break
 
+    # -- health findings -------------------------------------------------
+    def health_intake(self) -> None:
+        """Read each goal home's health endpoint (LOOM_HEALTH_URLS) at most
+        every LOOM_HEALTH_EVERY seconds and turn its findings into ranked
+        tickets (bus/health.py). bus.brain status reads the ledger it keeps
+        (health.ledger_path) for its Health findings section."""
+        if not self.s.health_urls:
+            return
+        path = health.ledger_path(self.s.home)
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        last = state.get("last")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < self.s.health_every:
+            return
+        sources, problems = health.parse_sources(self.s.health_urls)
+        for problem in problems:
+            _say("ignoring a LOOM_HEALTH_URLS entry: %s" % problem)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now))
+        health.Intake(self.gh, state, self.now, stamp, _say).run(sources)
+        _write_json(path, state)
+
     # -- log watch -------------------------------------------------------
     def watch_logs(self) -> None:
         """Read each component's new log lines and file one loom:triage issue
@@ -3990,6 +4028,7 @@ class Station:
         # Below the budget floor these wait for the reset; trees are local.
         for step in (self.ship_deployed, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.health_intake,
                      self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
                      self.watch_default_branches, self.run_factory, self.check_invariants):

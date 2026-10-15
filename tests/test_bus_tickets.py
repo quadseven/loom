@@ -297,3 +297,55 @@ class AfterLineTest(unittest.TestCase):
                          "not-planned")
         self.assertEqual(dependency_state(ticket(1, state="closed")), "closed")
         self.assertEqual(dependency_state(None), "unreadable")
+
+
+class PriorityTest(unittest.TestCase):
+    """Priority: P0 to P3 orders every queue after the FIRST labels."""
+
+    def issue(self, number, priority=None, created="2030-01-01T00:00:00Z", labels=()):
+        body = ("Priority: %s\n\n## Why\nx\n" % priority) if priority else "## Why\nx\n"
+        return {"number": number, "body": body, "created_at": created,
+                "labels": [{"name": "loom:ticket"}] + [{"name": x} for x in labels]}
+
+    def test_parse_accepts_p0_to_p3_and_refuses_anything_else(self):
+        self.assertEqual(parse("Priority: P1\n\nbody")[0], {"Priority": "P1"})
+        for bad in ("high", "p1", "P4", ""):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "Priority:"):
+                parse("Priority: %s\n\nbody" % bad)
+
+    def test_a_ticket_without_a_readable_priority_is_p2(self):
+        from bus.tickets import priority_of
+        self.assertEqual(priority_of(self.issue(1)), "P2")
+        self.assertEqual(priority_of({"body": "Priority: urgent\n\nx"}), "P2")
+        self.assertEqual(priority_of(self.issue(1, "P0")), "P0")
+
+    def test_work_order_is_first_labels_then_priority_then_oldest(self):
+        from bus.tickets import work_order
+        found = [self.issue(1, "P3", "2030-01-01T00:00:00Z"),
+                 self.issue(2, None, "2030-01-02T00:00:00Z"),
+                 self.issue(3, "P0", "2030-01-05T00:00:00Z"),
+                 self.issue(4, "P3", "2030-01-06T00:00:00Z", labels=("loom:regression",)),
+                 self.issue(5, None, "2030-01-01T00:00:00Z")]
+        ordered = sorted(found, key=lambda i: work_order(REPO, i))
+        self.assertEqual([i["number"] for i in ordered], [4, 3, 5, 2, 1])
+
+    def test_priority_bands_follow_impact(self):
+        from bus.tickets import priority_for_impact
+        cases = {0: "P3", 9.9: "P3", 10: "P2", 49: "P2", 50: "P1", 199: "P1", 200: "P0", 5000: "P0"}
+        for impact, band in cases.items():
+            with self.subTest(impact=impact):
+                self.assertEqual(priority_for_impact(impact), band)
+
+    def test_with_header_sets_or_adds_the_line(self):
+        from bus.tickets import with_header
+        self.assertEqual(with_header("Difficulty: medium\nPriority: P2\n\n## Why", "Priority", "P0"),
+                         "Difficulty: medium\nPriority: P0\n\n## Why")
+        self.assertEqual(with_header("Difficulty: medium\n\n## Why", "Priority", "P1"),
+                         "Difficulty: medium\nPriority: P1\n\n## Why")
+        self.assertEqual(with_header("## Why", "Priority", "P3"), "Priority: P3\n\n## Why")
+
+    def test_the_lane_brief_leaves_out_the_priority_line(self):
+        issue = {"number": 3, "title": "T", "body": "Difficulty: easy\nPriority: P0\n\n## Why\nx"}
+        text = render_brief(REPO, issue, "codex")
+        self.assertIn("Difficulty: easy\n", text)
+        self.assertNotIn("Priority", text)

@@ -64,3 +64,4 @@ settings.
 - docs/LANES.md: lanes, the station and the installer
 - docs/BRIEF_FORMAT.md: how a ticket is written
 - docs/DASHBOARD.md: dashboard settings
+- docs/HEALTH.md: how a project reports live problems that become ranked tickets

@@ -459,6 +459,15 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.merged, [(50, (REPO, 5))])
 
+    def test_a_p0_tickets_pull_request_lands_before_an_older_one(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, created=7200)
+        self.gh.ticket(6, "pr")
+        self.gh.issues[6]["body"] = "Priority: P0\n\n" + str(self.gh.issues[6].get("body") or "")
+        self.gh.pull(60, 6, created=3600)
+        self.go()
+        self.assertEqual(self.merged, [(60, (REPO, 6))])
+
     def test_an_urgent_tickets_pull_request_lands_first(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, created=7200)
@@ -998,6 +1007,13 @@ class Queued(Base):
     def test_oldest_takes_the_free_lane_first(self):
         self.queued(7, age=60)
         self.queued(8, age=600)
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_a_p0_queued_ticket_takes_the_free_lane_before_an_older_one(self):
+        self.queued(7, age=600)
+        self.queued(8, body="Difficulty: medium\nPriority: P0\n\n## Why\nx\n", age=60)
         self.assign(available=["codex"])
         self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")

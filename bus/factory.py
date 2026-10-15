@@ -26,7 +26,8 @@ Neither needs a model:
   update-branch), and lands only once its checks and review pass again on
   the new head. Each repo lands at most one pull request a pass, so the
   next one is checked against the base that includes it. Pull requests of
-  loom:urgent and loom:regression tickets land first, then the oldest.
+  loom:urgent and loom:regression tickets land first, then by priority,
+  then the oldest.
 - A pull request that changes a code file and no test file goes back to its
   lane asking for a test that fails without the change, instead of landing
   (north star 5: on 2026-10-13, 6 of 45 merged lane pull requests changed no
@@ -68,8 +69,9 @@ Neither needs a model:
   with no lane claiming it does not: it never ran, so it moves to the
   least-loaded other lane of its tier (a ladder ticket, of its rung), writing
   no rung marker.
-- Each pass gives the oldest queued tickets free lanes in their difficulty
-  tier, leaving held tickets and tickets without a readable tier queued.
+- Each pass gives queued tickets (FIRST labels, then priority, then the
+  oldest) free lanes in their difficulty tier, leaving held tickets and
+  tickets without a readable tier queued.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
   spark lane's does while its box is hot) moves at once to a free lane in its
   difficulty tier (TIERS), or a ladder ticket to a free lane of its own rung.
@@ -112,7 +114,7 @@ from urllib.parse import quote
 from . import brain, change_class, tickets
 from .github import GitHub, GitHubError
 from .labels import REMOTE_LANES
-from .tickets import FIX_MARKER
+from .tickets import FIX_MARKER, PRIORITIES, priority_of
 
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
@@ -230,7 +232,7 @@ MODEL_LINE = re.compile(r"^Model:[^\n]*\n?", re.M)
 GREEN = ("success", "neutral", "skipped")
 # bus/revert.py's revert tickets, landed first and on green.
 REVERT_LABEL = "loom:revert"
-FIRST = ("loom:urgent", "loom:regression", REVERT_LABEL)
+FIRST = tickets.FIRST_LABELS
 
 FIX_NOTES = """The factory sent this pull request back: it has failing checks, open \
 review threads or a conflict with the default branch, listed below.
@@ -546,11 +548,15 @@ def held_until(issue: Dict[str, Any]) -> float:
 def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
                   linked: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Pull requests of loom:urgent, loom:regression and loom:revert tickets
-    first, then the oldest."""
+    first, then by their ticket's priority (P0 first), then the oldest."""
     urgent = {n for n, issue in tickets.items() if set(FIRST) & set(_labels(issue))}
     ticket_of = {int(pr["number"]): n for n, pr in linked.items()}
+
+    def rank(pr: Dict[str, Any]) -> int:
+        issue = tickets.get(ticket_of.get(int(pr["number"])) or 0)
+        return PRIORITIES.index(priority_of(issue or {}))
     return sorted(prs, key=lambda p: (ticket_of.get(int(p["number"])) not in urgent,
-                                      str(p.get("created_at") or "")))
+                                      rank(p), str(p.get("created_at") or "")))
 
 
 def with_model(body: str, model: str) -> str:
@@ -1364,13 +1370,13 @@ class Factory:
 
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
-        the tier is up), oldest first across repos."""
+        the tier is up) across repos in tickets.work_order: FIRST labels,
+        then priority, then the oldest."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
         queued = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
                   if _state(issue) == "queued"]
-        for repo, issue in sorted(queued, key=lambda item: (
-                str(item[1].get("created_at") or ""), item[0], int(item[1]["number"]))):
+        for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item)):
             if self.now < held_until(issue):
                 continue
             model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)

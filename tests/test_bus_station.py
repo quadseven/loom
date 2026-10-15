@@ -1148,6 +1148,20 @@ class ClaimTest(Base):
         self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
         self.assertIn("loom:briefed", self.fake.names(7))
 
+    def test_a_p0_ticket_is_claimed_before_older_ones_without_a_priority(self):
+        self.fake.add(7, created="2030-01-01T00:00:00Z")
+        self.fake.add(8, created="2030-01-02T00:00:00Z", body="Priority: P1\n" + BODY)
+        self.fake.add(9, created="2030-01-03T00:00:00Z", body="Priority: P0\n" + BODY)
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+
+    def test_a_regression_is_claimed_before_a_p0_ticket(self):
+        self.fake.add(7, created="2030-01-01T00:00:00Z", body="Priority: P0\n" + BODY)
+        self.fake.add(9, created="2030-01-03T00:00:00Z", body="Priority: P3\n" + BODY)
+        self.fake.issues[9]["labels"].append({"name": "loom:regression"})
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+
     def test_a_revert_ticket_is_claimed_before_a_regression_and_older_ones(self):
         self.fake.add(7, created="2030-01-01T00:00:00Z")
         self.fake.add(8, created="2030-01-02T00:00:00Z")

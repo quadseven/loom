@@ -4,6 +4,7 @@ Live, every Goals card read "not looked", the Floor's Since last report read
 "section missing" four times, and every page took 8 to 12 seconds: these pin
 the readers and the one-pass footer index that fixed them.
 """
+import re
 import unittest
 from datetime import datetime, timezone
 
@@ -90,6 +91,44 @@ class LastTick(unittest.TestCase):
         body = self.render("<!-- loom:journal v1 -->\nTick, brain\n- Next: ship #5")
         self.assertIn("Brain&#x27;s next move", body)
         self.assertIn("ship #5", body)
+
+
+class PrioritiesCard(unittest.TestCase):
+    def render(self, rows):
+        from dashboard.github import _floor_context, ticket_record
+
+        class State:
+            context = _floor_context([], [], [], [])
+            data = {}
+
+            def response(self):
+                return {"tickets": {REPO: [ticket_record(REPO, r) for r in rows]},
+                        "operator_items": [], "footer_models": {}}
+        return server._floor(State())
+
+    @staticmethod
+    def issue(number, state, priority=None, created="2026-10-01T00:00:00Z", labels=()):
+        return {"number": number, "title": "Ticket %d" % number, "created_at": created,
+                "body": ("Priority: %s\n\n## Why\nx" % priority) if priority else "## Why\nx",
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]
+                + [{"name": x} for x in labels]}
+
+    def test_the_floor_lists_waiting_tickets_in_the_order_lanes_take_them(self):
+        body = self.render([
+            self.issue(1, "queued", "P3"), self.issue(2, "briefed"),
+            self.issue(3, "pr", "P0", "2026-10-09T00:00:00Z"),
+            self.issue(4, "merged", "P0"),
+            self.issue(5, "failed", "P3", labels=("loom:regression",)),
+            self.issue(6, "running", "P1"), self.issue(7, "queued", "P2", "2026-10-02T00:00:00Z")])
+        card = body[body.index('class="card priorities-card"'):]
+        card = card[:card.index("</section>")]
+        order = [int(n) for n in re.findall(r'<span class="muted">%s#(\d+)' % REPO, card)]
+        self.assertEqual(order, [5, 3, 6, 2, 7])
+        self.assertIn("P0</span>", card)
+        self.assertNotIn("Ticket 4", card)
+
+    def test_an_empty_floor_says_nothing_is_waiting(self):
+        self.assertIn("Nothing is waiting.", self.render([self.issue(4, "verified")]))
 
 
 class FooterIndex(unittest.TestCase):
