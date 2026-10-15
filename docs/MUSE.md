@@ -9,19 +9,34 @@ you). The lock lives in `quadseven/loom`.
 
 ## What Muse does and leaves
 
-Muse reads live data only through REST APIs on the tailnet, through its
-proxy, and has no cluster or database access. The lane machine's tick runs
-with `LOOM_BRAIN_SCOPE=live` and does what needs the cluster: ships and rolls,
-and checks that need cluster or database access. Muse does everything else:
-reviews, merges, briefs, failed tickets, asks, journals, and verification
-from REST APIs. Never write to a live system. When a step needs a fact no API
-serves, write what is needed on the ticket and leave it; never claim a live
-result you did not read yourself.
+Muse reads live data through REST APIs on the tailnet and, for logs and
+rows, through the lane machine read-only evidence endpoint (Operate, do not
+report). It has no direct cluster or database access. The lane machine's tick
+runs with `LOOM_BRAIN_SCOPE=live` and does what needs the cluster: ships and
+rolls, and checks that need cluster or database access. Muse does everything
+else: reviews, merges, briefs, failed tickets, asks, journals, and
+verification from REST APIs. Never write to a live system. When a step needs
+a fact no API serves, write what is needed on the ticket and leave it; never
+claim a live result you did not read yourself.
 
 Read and write GitHub only from the shell, through the Loom commands or the
 GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
 for GitHub or anything else in a scheduled run: each new web request asks
 the operator for approval, and the run stops until someone answers.
+
+## Operate, do not report
+
+When a diagnosis needs live evidence, read it directly before deciding or
+writing a result:
+
+1. Use the supported read-only API for facts it serves.
+2. Do not infer a live result from source code or from what a command would
+   return.
+3. If an authorized read is unavailable, name the missing evidence on the
+   ticket and leave the result unclaimed.
+4. Read runs, logs, and database rows through the lane machine's read-only
+   evidence endpoint (`docs/EVIDENCE.md`). It accepts named sources and named
+   queries only; never use it to write or run arbitrary SQL or shell commands.
 
 ## The brain's job
 
