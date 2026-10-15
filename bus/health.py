@@ -374,9 +374,12 @@ class Intake:
     def _open_tickets(self, repo: str) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         for issue in self.gh.paginate("/repos/%s/issues?state=open&labels=loom:ticket" % repo):
-            m = MARKER_RE.search(str(issue.get("body") or ""))
-            if m and "pull_request" not in issue:
-                out.setdefault(m.group(1), issue)
+            if "pull_request" in issue:
+                continue
+            # Every marker counts: one ticket can own several findings that
+            # share one cause (the same problem in two places, say).
+            for digest in MARKER_RE.findall(str(issue.get("body") or "")):
+                out.setdefault(digest, issue)
         return out
 
     def _finding(self, source: Source, f: Finding, rec: Dict[str, Any],

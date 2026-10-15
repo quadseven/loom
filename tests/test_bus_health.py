@@ -100,6 +100,17 @@ class Intake(Base):
         self.assertEqual(len(self.briefs), 1)
         self.assertEqual(self.gh.writes, [])
 
+    def test_one_ticket_with_two_markers_owns_both_findings(self):
+        # One cause, two findings (the same problem in two places): a
+        # ticket carrying both markers absorbs both, and nothing is filed.
+        second = finding(key="bags:Bo", title="Bo carries full bags")
+        self.doc["findings"] = [finding(), second]
+        self.gh.open.append({"number": 100, "labels": [{"name": "loom:ticket"}], "body":
+                             "Priority: P1\n\n## Why\nx\n\n%s\n%s"
+                             % (health.MARKER % sha(), health.MARKER % sha(second))})
+        self.run_once()
+        self.assertEqual(self.briefs, [])
+
     def test_the_ticket_body_passes_the_brief_and_plan_checks(self):
         body = health.ticket_body(health._finding(finding())[0])
         self.assertEqual(brain.plan_problems(body), [])
