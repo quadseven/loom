@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
 
 from .github import GitHub, GitHubError, token_from_env
+from .factory import lacks_test
 from .labels import LANES
 
 WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
@@ -103,7 +104,6 @@ def waits_main(argv: Sequence[str] | None = None) -> int:
 MARKER = "<!-- loom:metrics v1 -->"
 REPORT = "<!-- loom:report v1 -->"
 WINDOW = 86400
-TEST_FILE = re.compile(r"(^|/)(test_[^/]+\.py|[^/]+_test\.[^/]+|[^/]+\.(test|spec)\.[^/]+)$")
 FIX = re.compile(r"<!-- loom:fix|\bfix(?:es|ed)?\b", re.I)
 REGRESSION = re.compile(r"\bregression\b", re.I)
 GENERIC_TERMS = re.compile(r"\b(wow|warcraft|guild|raid|realm|dungeon|playerbot)\b", re.I)
@@ -399,9 +399,13 @@ class Collector:
         if not sha or not self.passes(repo, sha):
             total.unchecked += 1
         if FIX.search(str(pr.get("body") or "")):
+            # The factory's own rule (factory.lacks_test): a fix that changes
+            # code needs a test; a config, doc or digest-pin change needs none.
+            # Counting every untested fix-worded body flagged three
+            # config-only pull requests on 2026-10-15.
             files = self.list("/repos/%s/pulls/%d/files" % (repo, int(pr["number"])))
-            if not any(TEST_FILE.search(str(f.get("filename") or ""))
-                       and f.get("status") != "removed" for f in files):
+            if lacks_test([str(f.get("filename") or "") for f in files
+                           if f.get("status") != "removed"]):
                 total.fix_no_test += 1
 
     def _scan(self, total: Totals) -> None:

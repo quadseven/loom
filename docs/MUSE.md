@@ -132,7 +132,8 @@ live regression).
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
    including live. If the brain cannot write it, the station posts the
-   data-only report; never hand an owed report to another brain. Each lane
+   data-only report once the last report is 1 hour 45 minutes old, so no
+   goal's report passes 2 hours; never hand an owed report to another brain. Each lane
    pull request's line ends in `READY`
    or `blocked:` and its blockers; take that verdict as given rather than
    re-deriving it from the review list.
@@ -414,7 +415,9 @@ say-so alone:
   finding still sends the pull request back.
 - `sensitive`: the factory never merges it. It marks the pull request
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
-  requests", and leaves it for the brain. A brain merges it with
+  requests", and leaves the merge to the brain. Its conflicts, failing
+  checks, high findings and missing tests still go back to its lane, and its
+  medium and low findings are deferred, as for any class. A brain merges it with
   `python3 -m bus.brain merge`, which for this class also requires that the
   review check passed and no high or critical finding is open on the head
   commit.

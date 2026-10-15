@@ -25,6 +25,7 @@ from . import ticket as ticket_view
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
 from . import views
+from . import brain_view, hot_spots
 
 def _all_tickets(state):
     payload = state.response()
@@ -484,6 +485,8 @@ def _dispatch_get(handler, state):
         return _send_dashboard_view(handler, state, path)
     if path == "/usage":
         return _dispatch_usage(handler, state)
+    if path in ("/brain", "/hot-spots"):
+        return _dispatch_brain_hot_spots(handler, state, path)
     if path in ("/", "/goals", "/tickets"):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
@@ -595,6 +598,22 @@ def _dispatch_usage(handler, state):
     for row in rows:
         body.append(views.render_usage_row(row, now))
     return handler.send_page(page("Usage", "usage", "".join(body), status="Live"))
+
+
+def _dispatch_brain_hot_spots(handler, state, path):
+    from datetime import datetime, timezone
+    payload = state.response()
+    waits_error = getattr(state, "waits_error", "")
+    if path == "/brain":
+        data = brain_view.build_brain(payload.get("brain_step"), payload.get("brain_step_error"),
+                                      payload.get("improving", {}).get("journals", []),
+                                      payload.get("wait_rows"), waits_error)
+        body, title, active = brain_view.render_brain(data), "Brain", "brain"
+    else:
+        bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or hot_spots.DEFAULT_REVIEW_BOT
+        data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
+        body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
+    return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))
 
 
 def _send_dashboard_view(handler, state, path):
