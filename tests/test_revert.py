@@ -35,7 +35,8 @@ def run(state, ago=3600, name=CI, run_id=1):
         return {"id": run_id, "name": name, "status": "in_progress", "conclusion": None}
     conclusion = {"green": "success", "red": "failure", "cancelled": "cancelled"}[state]
     return {"id": run_id, "name": name, "status": "completed", "conclusion": conclusion,
-            "completed_at": iso(ago)}
+            "completed_at": iso(ago),
+            "output": {"title": "::error:: manifest pin is stale"} if state == "red" else {}}
 
 
 class FakeGitHub:
@@ -100,6 +101,8 @@ class FakeGitHub:
         m = re.search(r"/commits/([0-9a-f]{40})/check-runs\?per_page=100$", path)
         if m:
             return Response(200, {"check_runs": self.runs.get(m.group(1), [])})
+        if re.search(r"/commits/[0-9a-f]{40}/status$", path):
+            return Response(200, {"statuses": []})
         m = re.search(r"/issues/(\d+)$", path)
         if m:
             return Response(200, self.issues[int(m.group(1))])
@@ -142,6 +145,29 @@ class Base(unittest.TestCase):
 
 
 class Bisect(Base):
+    def test_lane_merge_gets_fix_forward_before_revert(self):
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=3000), ago=3100)
+        log = self.go()
+        self.assertEqual(self.gh.filed, [])
+        self.assertIn("fix-forward brief", log)
+        self.assertTrue(any("::error::" in c["body"] for c in self.gh.comments[4]))
+        # After the 45 minute fix window, a still-red main gets a revert.
+        later = NOW + 45 * 60
+        log = self.go(now=later)
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("fix-forward failed", log)
+
+    def test_check_red_before_lane_merge_files_factory_ticket_without_revert(self):
+        self.green_base()
+        self.gh.commit("already-red", run("red", ago=3600), ago=3700)
+        self.gh.merge("m1", 41, 4, run("red", ago=3000), ago=3100)
+        log = self.go()
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("Investigate failing check: unittest", self.gh.filed[0]["title"])
+        self.assertNotIn("loom:revert", [x["name"] for x in self.gh.filed[0]["labels"]])
+        self.assertIn("no revert", log)
+
     def test_green_to_red_across_three_merges_reverts_the_first_red_one(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("green", ago=4000), ago=4200)

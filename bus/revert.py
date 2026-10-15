@@ -1,4 +1,4 @@
-"""The revert pass: a default branch a factory merge turned red is reverted.
+"""The default-branch regression pass: fix forward first, revert if needed.
 
 Loom has no merge queue and no global lock: a lane pull request lands as
 soon as it is green and reviewed on its own. Two changes that are each green
@@ -54,6 +54,7 @@ RECENT = 6 * 3600
 # A red commit is reverted once it has been red this long with no newer
 # commit turning the branch green.
 RED_HOLD = 30 * 60
+FIX_FORWARD_HOLD = 45 * 60
 # A commit with no check runs is waited on this long, then skipped.
 NO_RUNS_WAIT = 30 * 60
 # The default branch's newest commits read per pass (one page).
@@ -195,6 +196,8 @@ class Reverts:
         self._runs: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         self._said: Dict[str, str] = {}
         self._briefed: List[str] = []
+        self._forward: Dict[str, float] = {}
+        self._reported: List[str] = []
         self._load()
 
     # -- the decision ledger ---------------------------------------------
@@ -212,10 +215,16 @@ class Reverts:
         if not isinstance(kept, dict):
             return
         said, briefed = kept.get("said"), kept.get("briefed")
+        forward = kept.get("forward")
+        reported = kept.get("reported")
         if isinstance(said, dict):
             self._said = {str(k): str(v) for k, v in said.items()}
         if isinstance(briefed, list):
             self._briefed = [str(x) for x in briefed]
+        if isinstance(forward, dict):
+            self._forward = {str(k): float(v) for k, v in forward.items()}
+        if isinstance(reported, list):
+            self._reported = [str(x) for x in reported]
 
     def _save(self) -> None:
         if not self.state_dir:
@@ -223,7 +232,8 @@ class Reverts:
         os.makedirs(self.state_dir, exist_ok=True)
         tmp = self._path() + ".tmp"
         with open(tmp, "w") as fh:
-            json.dump({"said": self._said, "briefed": self._briefed[-BRIEFED_KEEP:]}, fh)
+            json.dump({"said": self._said, "briefed": self._briefed[-BRIEFED_KEEP:],
+                       "forward": self._forward, "reported": self._reported[-BRIEFED_KEEP:]}, fh)
         os.replace(tmp, self._path())
 
     def _decide(self, repo: str, line: str) -> None:
@@ -313,6 +323,14 @@ class Reverts:
 
     def _judge(self, repo: str, branch: str, states: List[Tuple[str, str]],
                merged: List[Dict[str, Any]], reverts: List[Dict[str, Any]]) -> None:
+        if states and states[0][1] == "red":
+            head_pr = self._merge_of(repo, branch, states[0][0], merged)
+            if head_pr is not None:
+                names = sorted({str(r.get("name")) for r in red_checks(
+                    self._check_runs(repo, states[0][0]), self.review_check)})
+                if self._red_before(repo, states, names):
+                    self._factory_ticket(repo, branch, states[0][0], names)
+                    return
         verdict, sha = bisect(states)
         if verdict in ("green", "running"):
             self._said.pop(repo, None)
@@ -325,7 +343,7 @@ class Reverts:
                                "nothing to bisect" % (branch, len(states)))
         else:
             assert sha is not None
-            self._red(repo, branch, sha, self._merge_of(repo, branch, sha, merged), reverts)
+            self._red(repo, branch, sha, self._merge_of(repo, branch, sha, merged), reverts, states)
 
     def _redo_all(self, repo: str, reverts: List[Dict[str, Any]]) -> None:
         for issue in reverts:
@@ -351,7 +369,7 @@ class Reverts:
         return states
 
     def _red(self, repo: str, branch: str, sha: str, pr: Optional[Dict[str, Any]],
-             reverts: List[Dict[str, Any]]) -> None:
+             reverts: List[Dict[str, Any]], states: List[Tuple[str, str]]) -> None:
         short = sha[:12]
         if pr is None:
             self._decide(repo, "%s is red from %s, which no lane merged; nothing "
@@ -364,6 +382,9 @@ class Reverts:
                          % (branch, short, int(pr["number"])))
             return
         names = sorted({str(r.get("name")) for r in failing})
+        if self._red_before(repo, states, names):
+            self._factory_ticket(repo, branch, sha, names)
+            return
         open_ = [i for i in reverts if in_flight(i)]
         named = revert_shas(reverts).get(sha)
         red_since = min((_ts(r.get("completed_at")) for r in failing), default=self.now)
@@ -377,11 +398,90 @@ class Reverts:
             self._decide(repo, "%s is red from %s (#%d) for %d minutes; a newer commit may "
                                "turn it green first" % (branch, short, int(pr["number"]),
                                                        (self.now - red_since) // 60))
+        elif sha not in self._forward:
+            self._fix_forward(repo, branch, sha, pr, failing, names)
+        elif self.now - self._forward[sha] < FIX_FORWARD_HOLD:
+            self._decide(repo, "%s is red from %s; fix-forward brief is still active"
+                         % (branch, short))
         elif self._pr_head_state(repo, pr) != "green":
             self._decide(repo, "%s is red from %s, but #%d's head was not green; nothing "
                                "reverted, left for the brain" % (branch, short, int(pr["number"])))
         else:
+            self._decide(repo, "%s is red from %s; fix-forward failed after 45 minutes"
+                         % (branch, short))
             self._brief(repo, branch, sha, pr, names, red_since)
+
+    def _fix_forward(self, repo: str, branch: str, sha: str, pr: Dict[str, Any],
+                     failing: List[Dict[str, Any]], names: List[str]) -> None:
+        """Return the merged ticket to its lane with main's failing check details."""
+        association = brain._ticket_association(repo, pr)
+        if association is None:
+            self._decide(repo, "%s is red from %s; no linked ticket for fix-forward"
+                         % (branch, sha[:12]))
+            return
+        number = association[1]
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % association).data or {}
+        lane = _lane(issue)
+        if not lane:
+            self._decide(repo, "%s is red from %s; ticket #%d has no lane for fix-forward"
+                         % (branch, sha[:12], number))
+            return
+        body = ["<!-- loom:fix v1 -->", "Pull request: %s#%d, branch %s"
+                % (repo, int(pr["number"]), (pr.get("head") or {}).get("ref") or "loom/%d" % number),
+                brain.BRAIN_FIX_MARKER, "",
+                "Fix main without undoing this ticket's change.", ""]
+        for check in failing:
+            name = str(check.get("name") or "unnamed check")
+            tail = "\n".join(str(x) for x in (
+                (check.get("output") or {}).get("title"),
+                (check.get("output") or {}).get("summary"),
+                (check.get("output") or {}).get("text")) if x)
+            if (check.get("app") or {}).get("slug") == "github-actions":
+                try:
+                    log = brain._job_log_tail(self.gh, repo, int(check["id"]))
+                    if log:
+                        tail = log
+                except (GitHubError, ValueError, KeyError, TypeError):
+                    pass
+            if not tail:
+                tail = "no log was available (conclusion %s)" % check.get("conclusion")
+            body += ["### Check: %s" % name, ""] + brain._quoted(tail) + [""]
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % association,
+                     {"body": "\n".join(body)})
+        self.move(self.gh, repo, number, "briefed", lane=lane,
+                  note="Main is red after this merge: %s. Fix forward without undoing the change."
+                       % _failing(names))
+        self._forward[sha] = self.now
+        self._decide(repo, "%s is red from %s; sent fix-forward brief to ticket #%d on lane %s"
+                     % (branch, sha[:12], number, lane))
+
+    def _red_before(self, repo: str, states: List[Tuple[str, str]], names: List[str]) -> bool:
+        """Whether one of the failing checks was already red on the parent."""
+        if len(states) < 2:
+            return False
+        previous = {str(run.get("name")) for run in red_checks(
+            self._check_runs(repo, states[1][0]), self.review_check)}
+        return bool(previous & set(names))
+
+    def _factory_ticket(self, repo: str, branch: str, sha: str, names: List[str]) -> None:
+        """File a factory-owned ticket for a check that was red before the merge."""
+        if sha in self._reported:
+            self._decide(repo, "%s is red from %s before and after merge; factory ticket already filed"
+                         % (branch, sha[:12]))
+            return
+        line = "%s is red from check(s) %s on the commit before %s; no revert"
+        title = "Investigate failing check: %s" % ", ".join(names)
+        body = ("Difficulty: easy\n\n## Why\nThe check(s) %s were already red on the commit before "
+                "the merge %s on `%s`. This failure is not caused by that merge.\n\n"
+                "## What\n- Investigate and fix the failing check(s).\n\n"
+                "## Acceptance criteria\n- [ ] Main is green.\n\n## Size\nS\n\n"
+                "## Out of scope\n- Reverting the merge.\n" % (", ".join(names), sha[:12], branch))
+        brain._check_written_text(title + "\n" + body)
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {"title": title, "body": body,
+            "labels": ["loom:ticket", "loom:queued", CLASS_LABEL]}).data or {}
+        self._reported.append(sha)
+        self._decide(repo, line % (branch, ", ".join(names), sha[:12]) + "; factory ticket #%s"
+                     % made.get("number", "?"))
 
     def _blaming(self, repo: str, sha: str, pr: Dict[str, Any]) -> List[Dict[str, Any]]:
         """The failing checks on sha that also ran on the merged pull
