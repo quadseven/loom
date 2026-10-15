@@ -2022,7 +2022,10 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
         {k: record[k] for k in ("started_at", "step", "step_index", "notes")}, separators=(",", ":"))
     created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
         "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
-    gh.rest("PATCH", ref_path, {"sha": created.data["sha"], "force": True})
+    # GitHub reads a ref at git/ref/<ref> but updates it at git/refs/<ref>;
+    # the read path answers 404 to a PATCH, so no step was ever recorded.
+    gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (lock_repo, lock.LOCK_BRANCH),
+            {"sha": created.data["sha"], "force": True})
     return record
 
 
