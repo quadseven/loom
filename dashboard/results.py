@@ -53,10 +53,13 @@ _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _count_prs(prs: List[Dict[str, Any]], start: datetime, lane: bool, merged: bool) -> int:
-    """Pull requests merged (or, with merged False, closed unmerged) since start."""
+    """Lane pull requests (lane True) or the others (lane False) merged, or with
+    merged False closed unmerged, since start. The two are never added up: a
+    Results page that mixes work people and sessions merged with the lanes'
+    reads as the factory's work (2026-10-15)."""
     n = 0
     for pr in prs:
-        if lane and not _is_lane_pr(pr):
+        if _is_lane_pr(pr) != lane:
             continue
         if merged:
             at = _when(pr.get("merged_at"))
@@ -110,7 +113,7 @@ def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
 
     rows = [
         ("Lane pull requests merged", lambda d: _count_prs(prs, now - d, True, True)),
-        ("All pull requests merged", lambda d: _count_prs(prs, now - d, False, True)),
+        ("Pull requests merged outside the lanes", lambda d: _count_prs(prs, now - d, False, True)),
         ("Tickets closed as done", lambda d: _count_closed(tickets, now - d, "completed")),
         ("Tickets closed as not planned", lambda d: _count_closed(tickets, now - d, "not_planned")),
         ("Live proofs posted", lambda d: comment_count(d, _is_proof)),

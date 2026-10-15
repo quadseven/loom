@@ -53,7 +53,9 @@ class ResultsCounts(unittest.TestCase):
     def test_each_window_counts_its_own_events(self):
         data = results.build_results(payload(), NOW)
         self.assertEqual(values(data, "Lane pull requests merged"), {"day": 1, "week": 2, "month": 3})
-        self.assertEqual(values(data, "All pull requests merged"), {"day": 2, "week": 3, "month": 4})
+        # Never lane and other work added up: one non-lane merge.
+        self.assertEqual(values(data, "Pull requests merged outside the lanes"),
+                         {"day": 1, "week": 1, "month": 1})
         self.assertEqual(values(data, "Tickets closed as done"), {"day": 1, "week": 1, "month": 1})
         self.assertEqual(values(data, "Tickets closed as not planned"), {"day": 0, "week": 1, "month": 1})
         self.assertEqual(values(data, "Lane pull requests closed unmerged"), {"day": 0, "week": 1, "month": 1})
