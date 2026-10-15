@@ -1,3 +1,4 @@
+import unittest
 import re
 from html.parser import HTMLParser
 from pathlib import Path
@@ -97,8 +98,9 @@ def test_text_background_token_pairs_meet_wcag_aa_in_both_themes():
 
 
 def test_shared_interactive_components_have_44px_minimum_targets():
-    css = (ROOT / "dashboard/static/loom.css").read_text()
-    for selector in (".nav-row", ".chip", ".filter-chip", ".segment-tab", ".theme-toggle", ".icon-button", ".tab-link"):
+    css = re.sub(r"/\*.*?\*/", "", (ROOT / "dashboard/static/loom.css").read_text(), flags=re.S)
+    for selector in (".nav-row", ".chip", ".filter-chip", ".segment-tab", ".theme-toggle", ".icon-button", ".tab-link",
+                     ".attempt-chip", ".page-content h2 > a", ".page-content li > a", ".page-content p > a"):
         declarations = [
             body for selectors, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css)
             if selector in [part.strip() for part in selectors.split(",")]
@@ -113,3 +115,20 @@ def test_shared_interactive_components_have_44px_minimum_targets():
         for body in overrides:
             for prop, size in re.findall(r"(?<![\w-])(min-height|height|min-width|width):\s*(\d+)px", body):
                 assert int(size) >= 44, f"{selector} has {prop}: {size}px"
+
+
+class ShellTests(unittest.TestCase):
+    """Runs the checks above under unittest: CI's `unittest discover` never
+    collects bare test functions, so until 2026-10-15 none of them ran there."""
+
+    def test_page_renders_all_views_as_links_with_one_active_view(self):
+        test_page_renders_all_views_as_links_with_one_active_view()
+
+    def test_theme_toggle_names_the_theme_it_switches_to_and_the_current_one(self):
+        test_theme_toggle_names_the_theme_it_switches_to_and_the_current_one()
+
+    def test_text_background_token_pairs_meet_wcag_aa_in_both_themes(self):
+        test_text_background_token_pairs_meet_wcag_aa_in_both_themes()
+
+    def test_shared_interactive_components_have_44px_minimum_targets(self):
+        test_shared_interactive_components_have_44px_minimum_targets()
