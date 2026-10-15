@@ -111,6 +111,13 @@ class Intake(Base):
         self.run_once()
         self.assertEqual(self.briefs, [])
 
+    def test_the_ticket_forbids_silencing_the_finding(self):
+        # 2026-10-15: a fix held a resource back so the finding's threshold was
+        # never crossed, while everyone the finding counted got less.
+        body = health.ticket_body(health._finding(finding())[0])
+        self.assertIn("Never make the finding stop by changing what the endpoint measures", body)
+        self.assertIn("affected count falls", body)
+
     def test_the_ticket_body_passes_the_brief_and_plan_checks(self):
         body = health.ticket_body(health._finding(finding())[0])
         self.assertEqual(brain.plan_problems(body), [])

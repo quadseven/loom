@@ -269,8 +269,12 @@ def ticket_body(f: Finding) -> str:
         "## What", "",
         "Find why the health endpoint reports this problem and fix the cause in this "
         "repo, so the problem stops for everything it affects rather than for one case.", "",
+        "Never make the finding stop by changing what the endpoint measures, by holding a "
+        "resource back so its threshold is not crossed, or by hiding the affected from "
+        "it: the fix must make the affected count fall because their situation got better.", "",
         "## Acceptance criteria", "",
-        "- [ ] The pull request names the cause with the numbers that show it.",
+        "- [ ] The pull request names the cause with the numbers that show it, and how the "
+        "affected count falls because of the fix.",
         "- [ ] A test fails without the fix and passes with it.",
         "- [ ] Live: the finding is absent from the health endpoint for 24 hours.", "",
         "## Size", "", "M", "",
