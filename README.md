@@ -121,6 +121,11 @@ whose goal journals and child tickets feed `/improving`; set
 `LOOM_METRICS_GOAL=OWNER/NAME#N` for the daily factory numbers. Improvement
 homes may also be specific goal issues as `OWNER/NAME#N`. Set
 `LOOM_STATUS_REPO=OWNER/NAME` to read the station's lane status comment for
-`/lanes`. `.env.example` lists the dashboard variables with placeholder
+`/lanes` and the brain's tick record on its lock branch for `/brain`.
+`/brain` also reads the goal journals; `/hot-spots` reads ticket waits and
+the last two weeks of issue and review comments in `LOOM_REPOS`. With
+`LOOM_BRIEF_AUTHORS` set, only those logins' comments count as station
+outcomes, and `LOOM_REVIEW_BOT` names the review bot whose findings are
+counted (default `grug-tribe`). `.env.example` lists the dashboard variables with placeholder
 values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
 and station so completed runs can upload to `POST /api/transcripts`.

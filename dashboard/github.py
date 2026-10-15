@@ -8,12 +8,14 @@ import re
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlsplit
 
-from bus import labels, tickets
+from bus import brain, labels, tickets
 from bus.github import DEFAULT_API, GitHub, GitHubError
 from bus.metrics import waits_for_repos
+from .hot_spots import WINDOW as HOT_SPOT_WINDOW
 
 
 def repos_from_env() -> List[str]:
@@ -179,9 +181,12 @@ class TicketStore:
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
         """Read optional view sources; errors stay visible without failing tickets."""
         if self._below_floor():
+            skipped = "optional view sources were not refreshed because the GitHub request budget is below its floor"
             data.update({"improving": {"journals": [], "metrics_comments": []},
                          "lanes": [], "pull_requests": [],
-                         "dashboard_errors": ["optional view sources were not refreshed because the GitHub request budget is below its floor"]})
+                         "brain_step": None, "brain_step_error": skipped,
+                         "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
+                         "dashboard_errors": [skipped]})
             return
 
         journals, reports, metric_comments, prs, lanes = [], [], [], [], []
@@ -198,6 +203,40 @@ class TicketStore:
         data["lanes"] = lanes
         data["pull_requests"] = prs
         data["dashboard_errors"] = errors
+        data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
+        self._read_hot_spot_comments(data)
+
+    def _read_brain_step(self, status_home):
+        """The brain's tick record from the lock branch (bus.brain step --show)."""
+        if not (status_home and tickets.REPO_RE.fullmatch(status_home)):
+            return None, "LOOM_STATUS_REPO is not set, so the lock branch is unknown"
+        try:
+            return brain.tick_step(self.gh, status_home), ""
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as exc:
+            return None, "%s lock branch: %s" % (status_home, self._error_reason(exc))
+
+    def _read_hot_spot_comments(self, data):
+        """Issue and review comments from the last two weeks, one feed per repo.
+        The window starts at a UTC midnight, so the URL holds all day and a
+        refresh is usually a 304. With LOOM_BRIEF_AUTHORS set, only those
+        logins' issue comments count as station outcomes and rungs."""
+        day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        since = (day - 2 * HOT_SPOT_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
+        trusted = {login.lower() for login in brain.trusted_authors()}
+        issue_comments, review_comments, errors = [], [], []
+        for repo in self.repos:
+            path = quote(repo, safe="/")
+            try:
+                found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
+                issue_comments.extend(dict(c, repo=repo) for c in found if isinstance(c, dict) and (
+                    not trusted or str((c.get("user") or {}).get("login") or "").lower() in trusted))
+                found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
+                review_comments.extend(dict(c, repo=repo) for c in found if isinstance(c, dict))
+            except (GitHubError, OSError, ValueError) as exc:
+                errors.append("%s comments: %s" % (repo, self._error_reason(exc)))
+        data["issue_comments"], data["review_comments"] = issue_comments, review_comments
+        data["hot_spots_error"] = "; ".join(errors) if errors else (
+            "" if self.repos else "LOOM_REPOS is not set")
 
     def _read_dashboard_home(self, repo, issue_number, journals, reports, metric_comments, lanes, errors):
         try:
@@ -321,7 +360,21 @@ class TicketStore:
                 "floor_context": snapshot.get("floor_context", {}),
                 "operator_items": list(self.operator_items),
                 "dashboard_errors": snapshot.get("dashboard_errors", []),
+                "brain_step": snapshot.get("brain_step"),
+                "brain_step_error": snapshot.get("brain_step_error", "the dashboard has not read its sources yet"),
+                "issue_comments": snapshot.get("issue_comments", []),
+                "review_comments": snapshot.get("review_comments", []),
+                "hot_spots_error": snapshot.get("hot_spots_error", "the dashboard has not read its sources yet"),
                 "usage": usage_rows}
+
+
+def journal_next(body: str) -> Optional[str]:
+    """A journal's next move: its Next line, else a line saying next or will."""
+    step = re.search(r"^\s*-\s*(?:Next(?: step)?|Next move)\s*:\s*(.+)$", body, re.I | re.M)
+    if step:
+        return step.group(1).strip()
+    return next((line.strip()[2:].strip() for line in body.splitlines()[1:]
+                 if line.strip().startswith("- ") and re.search(r"\b(next|will)\b", line, re.I)), None)
 
 
 def _floor_context(reports, journals, asks, errors):
@@ -342,12 +395,7 @@ def _floor_context(reports, journals, asks, errors):
         return result
     report_body = str((latest_report or {}).get("body") or "")
     headline = next((line.strip() for line in report_body.splitlines()[1:] if line.strip()), None)
-    journal_body = str((latest_journal or {}).get("body") or "")
-    step = re.search(r"^\s*-\s*(?:Next(?: step)?|Next move)\s*:\s*(.+)$", journal_body, re.I | re.M)
-    journal_step = step.group(1).strip() if step else None
-    if not journal_step:
-        journal_step = next((line.strip()[2:].strip() for line in journal_body.splitlines()[1:]
-                             if line.strip().startswith("- ") and re.search(r"\b(next|will)\b", line, re.I)), None)
+    journal_step = journal_next(str((latest_journal or {}).get("body") or ""))
     header = next((line for line in str((latest_journal or {}).get("body") or "").splitlines()[1:2]
                    if line.startswith("Tick ")), "")
     holder_match = re.search(r"^Tick\s+[^,]+,\s*(.+)$", header)
