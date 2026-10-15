@@ -518,10 +518,15 @@ def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
 
 
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
-                  authors: Optional[Sequence[str]] = None) -> List[str]:
+                  authors: Optional[Sequence[str]] = None,
+                  into: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> List[str]:
+    """The repo's status section; with into, its open tickets are kept
+    there under the repo's name for the cross-repo Priorities section."""
     issues = _issues(gh, repo)
     goals = [i for i in issues if "loom:goal" in _labels(i)]
     tickets = [i for i in issues if "loom:ticket" in _labels(i)]
+    if into is not None:
+        into[repo] = tickets
     pulls = list(gh.paginate("/repos/%s/pulls?state=open" % repo))
     prs = [i for i in pulls if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
     trusted = {a.lower() for a in (authors or ())}
@@ -635,11 +640,55 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     # Each repo's reads are independent, so they run side by side; the
     # sections keep the order of `repos`. A status took 68 s here and 152 s
     # from a remote brain, over a 15-minute tick (2026-10-15).
+    found: Dict[str, List[Dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
-        for section in pool.map(lambda repo: _repo_section(gh, repo, now, bot, authors), repos):
-            out += section
+        sections = list(pool.map(
+            lambda repo: _repo_section(gh, repo, now, bot, authors, found), repos))
+    out += [""] + priority_lines(found, now)
+    out += [""] + _health_lines(env)
+    for section in sections:
+        out += section
     out += ["", "## Lane status", _lane_status(gh, lanes_repo)]
     return "\n".join(out)
+
+
+PRIORITIES_SHOWN = 10
+
+
+def priority_lines(found: Dict[str, List[Dict[str, Any]]], now: datetime,
+                   limit: int = PRIORITIES_SHOWN) -> List[str]:
+    """The "## Priorities" section: the open tickets not yet merged, across
+    repos, in the order lanes take them (tickets.work_order)."""
+    rows = [(repo, issue) for repo, issues in found.items() for issue in issues
+            if issue.get("state", "open") == "open"
+            and tickets.ticket_state(issue) not in tickets.MERGED_STATES + ("closed-unmerged",)]
+    rows.sort(key=lambda row: tickets.work_order(*row))
+    lines = ["## Priorities (the order lanes take work, top %d)" % limit]
+    for repo, issue in rows[:limit]:
+        first = sorted(set(_labels(issue)) & set(tickets.FIRST_LABELS))
+        lane = next((x for x in _labels(issue) if x.startswith("lane:")), "no lane")
+        lines.append("- %s %s#%s %s - %s - %s - %dh%s" % (
+            tickets.priority_of(issue), repo, issue["number"], issue.get("title", ""),
+            tickets.ticket_state(issue) or "no state", lane, _age(issue, now),
+            " - " + ", ".join(first) if first else ""))
+    return lines if rows else lines + ["- none"]
+
+
+def _health_lines(env: Dict[str, str]) -> List[str]:
+    """The station's health ledger as a section; read only where LOOM_HOME
+    names the station's home, so a status run elsewhere says so."""
+    from . import health  # health files tickets through this module
+    home = env.get("LOOM_HOME", "").strip()
+    if not home:
+        return ["## Health findings", "- not looked: LOOM_HOME is not set, so the "
+                "station's health ledger is not on this machine"]
+    try:
+        with open(health.ledger_path(home), encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = None
+    return health.status_lines(state if isinstance(state, dict) else None,
+                               env.get("LOOM_HEALTH_URLS", ""))
 
 
 def _check_model(model: Optional[str]) -> None:
@@ -936,10 +985,10 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
 
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
-                 after: Optional[str] = None) -> str:
+                 after: Optional[str] = None, priority: Optional[str] = None) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
                (("After", after), ("Not before", not_before),
-                ("Difficulty", difficulty), ("Model", model),
+                ("Difficulty", difficulty), ("Priority", priority), ("Model", model),
                 ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
@@ -970,7 +1019,8 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
           model: Optional[str] = None, base: Optional[str] = None,
           not_before: Optional[str] = None, refs: Optional[int] = None,
-          regresses: Optional[int] = None, after: Optional[str] = None) -> str:
+          regresses: Optional[int] = None, after: Optional[str] = None,
+          priority: Optional[str] = None) -> str:
     """File a ticket under the goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Refs #M", and the original gets a comment
     naming the ticket and loom:rewritten in place of loom:triage. The original
@@ -989,6 +1039,9 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     builds on ("#5", "owner/name#7"), and no lane claims it until each of
     them is merged.
 
+    With priority (P0 to P3), the ticket carries a "Priority:" line; lanes
+    take P0 first and a ticket without one counts as P2.
+
     When the goal home names a Trunk branch and no explicit --base is given,
     the ticket uses that branch as its base."""
     _check_brief_args(title, body, lane, model, base)
@@ -996,6 +1049,8 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     if after is not None:
         tickets.after_refs({"After": after})
+    if priority is not None and priority not in tickets.PRIORITIES:
+        raise ValueError("priority must be one of %s" % ", ".join(tickets.PRIORITIES))
     if refs is not None and regresses is not None:
         raise ValueError("a brief is a rewrite or a regression, not both")
     if refs is not None:
@@ -1009,7 +1064,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         goal_issue = _goal_issue(gh, repo, goal)
         base = goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
-    full_body = _ticket_body(body, difficulty, model, base, not_before, after)
+    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority)
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue)
@@ -2473,7 +2528,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int)
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
@@ -2512,7 +2567,7 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
-                args.regresses, args.after))
+                args.regresses, args.after, args.priority))
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:

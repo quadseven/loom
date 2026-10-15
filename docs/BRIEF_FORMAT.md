@@ -29,6 +29,10 @@ still needs to produce a commit. Any value other than `answer` parks the brief,
 and an answer brief with no issue number (from `Issue:` or the ticket name) is
 parked too.
 
+The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
+what order the station claims it (docs/BRAIN.md); they stay on the ticket and
+are not written into the brief.
+
 The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that
 branch, and opens the pull request. Lanes never merge pull requests.

@@ -440,6 +440,11 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .floor-aside .card { margin-bottom: 12px; }
 .floor-aside .label { display: block; margin-bottom: 8px; font-family: var(--font-mono); }
 .next-move-card { border-color: color-mix(in oklch, var(--accent) 38%, transparent); border-radius: 14px; }
+.priority-list { margin: 0 0 8px; padding-left: 0; list-style: none; display: grid; gap: 8px; }
+.priority-list li { display: grid; grid-template-columns: 2.4em 1fr; column-gap: 6px; align-items: start; font-size: 13px; line-height: 1.42; }
+.priority-list .machine-fact { padding-top: 12px; font-weight: 600; }
+.priority-list .muted { display: block; font-size: 12px; }
+.floor-aside .priority-list a { display: flex; align-items: center; min-height: 44px; font-family: inherit; font-size: 14px; font-weight: 600; line-height: 1.35; color: var(--text); }
 .next-move { margin: 0 0 6px; font-size: 15px; font-weight: 600; line-height: 1.35; color: var(--text); }
 .floor-aside .muted, .goal-card p.muted { color: var(--muted); font-size: 13px; line-height: 1.42; }
 .floor-aside a { font: 12px var(--font-mono); color: var(--accent-on-bg); }

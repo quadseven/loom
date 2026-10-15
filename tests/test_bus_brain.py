@@ -179,6 +179,48 @@ class SensitiveResumeTests(unittest.TestCase):
         # replies left, so any extra call fails the test.
         self.assertEqual(gh.requests, 4)
 
+    def test_status_ranks_open_tickets_across_repos_in_work_order(self):
+        def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
+            return {"number": number, "title": "T%d" % number, "created_at": created,
+                    "body": ("Priority: %s\n\nx" % priority) if priority else "x",
+                    "labels": [{"name": "loom:ticket"}] + [{"name": x} for x in labels]}
+        found = {REPO: [t(1, "P3"), t(2), t(3, "P0", "2030-01-03T00:00:00Z",
+                                            ("loom:pr", "lane:codex")),
+                        t(4, "P0", labels=("loom:merged",))],
+                 "other-owner/other-repo": [t(5, "P1", "2030-01-02T00:00:00Z"),
+                                            t(6, "P3", labels=("loom:failed", "loom:regression"))]}
+        now = datetime(2030, 1, 3, 12, 0, tzinfo=timezone.utc)
+        lines = brain.priority_lines(found, now)
+        self.assertEqual(lines[0], "## Priorities (the order lanes take work, top 10)")
+        self.assertEqual([line.split()[2] for line in lines[1:]],
+                         ["other-owner/other-repo#6", REPO + "#3", "other-owner/other-repo#5",
+                          REPO + "#2", REPO + "#1"])
+        self.assertEqual(lines[2], "- P0 %s#3 T3 - pr - lane:codex - 12h" % REPO)
+        self.assertTrue(lines[1].endswith(" - loom:regression"))
+        self.assertEqual(brain.priority_lines({}, now)[1:], ["- none"])
+
+    def test_status_shows_the_station_health_ledger(self):
+        gh = GitHub("t", transport=Fake(
+            reply(200, []), reply(200, []),
+            reply(200, {"data": {"repository": {}}}), reply(200, [])))
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, "state", "station"))
+            with open(os.path.join(home, "state", "station", "health.json"), "w") as fh:
+                json.dump({"sources": {REPO + "#1": {"checked_at": "2030-01-01T00:00:00Z",
+                                                     "findings": [{"title": "Bags are full",
+                                                                   "area": "bags", "impact": 60.0,
+                                                                   "priority": "P1"}]},
+                                       REPO + "#2": {"error": "the answer is not JSON"}}}, fh)
+            report = brain.status(gh, [REPO], REPO, env={"LOOM_HOME": home})
+        self.assertIn("## Health findings\n- %s#1: 1 finding (checked 2030-01-01T00:00:00Z)\n"
+                      "  - P1 Bags are full (bags, impact 60)\n"
+                      "- %s#2: not looked: the answer is not JSON" % (REPO, REPO), report)
+        self.assertIn("## Priorities", report)
+        report = brain.status(GitHub("t", transport=Fake(
+            reply(200, []), reply(200, []), reply(200, {"data": {"repository": {}}}),
+            reply(200, []))), [REPO], REPO, env={})
+        self.assertIn("## Health findings\n- not looked: LOOM_HOME is not set", report)
+
     def test_status_reads_lane_comments_with_one_more_request(self):
         lanes_issue = {"number": 9, "title": "Loom lane status", "labels": [{"name": "loom:lanes"}]}
         gh = GitHub("t", transport=Fake(
@@ -538,6 +580,24 @@ class SensitiveResumeTests(unittest.TestCase):
                 fake = Fake(reply(200, goal()))
                 with self.assertRaises(ValueError):
                     brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex", **kw)
+                self.assertEqual(fake.calls, [])
+
+    def test_brief_with_a_priority_writes_the_priority_line(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex",
+                    difficulty="medium", priority="P1")
+        made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
+        self.assertTrue(made["body"].startswith("Difficulty: medium\nPriority: P1\n\n"))
+        self.assertEqual(tickets.priority_of(made), "P1")
+
+    def test_brief_refuses_a_priority_outside_p0_to_p3(self):
+        for bad in ("P4", "high", "p1"):
+            with self.subTest(priority=bad):
+                fake = Fake(reply(200, goal()))
+                with self.assertRaisesRegex(ValueError, "priority"):
+                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY,
+                                "codex", priority=bad)
                 self.assertEqual(fake.calls, [])
 
     def test_brief_refuses_an_after_value_that_is_not_a_list_of_tickets(self):

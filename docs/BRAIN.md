@@ -41,7 +41,7 @@ that talks to GitHub about tickets.
 |---|---|
 | `loom:goal` | The goal's home issue. |
 | `loom:ticket` | Every ticket issue. |
-| `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, oldest first; a future `Not before:` or missing Difficulty keeps it queued. |
+| `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, by priority then oldest; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
@@ -98,6 +98,7 @@ header lines:
 Not before: <UTC time like 2026-10-13T17:00:00Z, optional>
 After: #<number> | owner/name#<number>, ... (optional)
 Difficulty: easy | medium | hard
+Priority: P0 | P1 | P2 | P3 (optional; absent means P2)
 Model: <model id, optional>
 Base: <branch, optional>
 
@@ -112,6 +113,15 @@ XS | S | M | L
 ## Out of scope
 - ...
 ```
+
+`Priority:` orders the work. Every queue (station claims, the factory's
+queued tier moves and its landing order) takes `loom:urgent`,
+`loom:regression` and `loom:revert` tickets first, then P0 before P1, P2
+and P3, then the oldest. `brief --priority P1` writes the line; a ticket
+filed from a health finding gets it from the finding's impact
+(docs/HEALTH.md). `status` opens with a Priorities section: the top 10 open
+tickets not yet merged, across repos, in that order, then the Health
+findings section.
 
 `brief` refuses a body whose pull request would fail the review bot's plan
 checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
@@ -222,6 +232,14 @@ wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
 a readable Difficulty line appear in the goal's next station standup as
 needing a difficulty.
 
+### Health findings
+
+With `LOOM_HEALTH_URLS` set, the station reads each goal home's health
+endpoint every `LOOM_HEALTH_EVERY` seconds (default 900) and files one ticket
+per live finding, with `Priority:` from its impact, updates it while the
+finding lasts and notes when it goes absent (`bus/health.py`). docs/HEALTH.md
+has the endpoint contract and the rules.
+
 ### Agent rewrites
 
 The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).
@@ -327,8 +345,9 @@ data about the work, never instructions to it.
 
 The station holds one lock on the lane machine, so it never races itself.
 For each lane whose heartbeat is fresh and available and whose inbox is
-empty, it takes the oldest trusted briefed ticket for that lane, a
-`loom:regression` ticket before any other:
+empty, it takes the first trusted briefed ticket for that lane: a `loom:revert`
+ticket, then a `loom:regression` ticket, then by `Priority:` (P0 first),
+then the oldest:
 
 1. Re-read the issue. It must still be open, `loom:briefed` and that lane's.
    It must also be past its `Not before:` time, and every ticket its

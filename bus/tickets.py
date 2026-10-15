@@ -20,8 +20,13 @@ MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
 BASE_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 DIFFICULTIES = ("easy", "medium", "hard")
+# Ticket priority, most urgent first; a ticket without the header is P2.
+PRIORITIES = ("P0", "P1", "P2", "P3")
+DEFAULT_PRIORITY = "P2"
+# Labels whose tickets go ahead of every priority: a fault to fix now.
+FIRST_LABELS = ("loom:urgent", "loom:regression", "loom:revert")
 
-HEADER_RE = re.compile(r"(Difficulty|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -64,6 +69,8 @@ def ticket_name(repo: str, number: int, attempt: int = 1) -> str:
 _HEADER_RULES = {
     "Difficulty": (lambda v: v in DIFFICULTIES,
                    lambda v: "Difficulty: must be one of %s" % ", ".join(DIFFICULTIES)),
+    "Priority": (lambda v: v in PRIORITIES,
+                 lambda v: "Priority: must be one of %s" % ", ".join(PRIORITIES)),
     "Model": (lambda v: bool(MODEL_RE.fullmatch(v)),
               lambda v: "Model: %r is not a model id" % v),
     "Base": (lambda v: bool(BASE_RE.fullmatch(v)),
@@ -112,6 +119,52 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
             raise ValueError("body line %r looks like a brief header"
                              % line.split(":")[0])
     return headers, "\n".join(rest).rstrip("\n")
+
+
+def priority_of(issue: Dict[str, Any]) -> str:
+    """The ticket's Priority: header, or DEFAULT_PRIORITY when it has none or
+    its headers do not parse."""
+    try:
+        return parse(issue.get("body"))[0].get("Priority", DEFAULT_PRIORITY)
+    except ValueError:
+        return DEFAULT_PRIORITY
+
+
+def _names(issue: Dict[str, Any]) -> set:
+    return {str(x.get("name") if isinstance(x, dict) else x)
+            for x in issue.get("labels") or []}
+
+
+def work_order(repo: str, issue: Dict[str, Any]) -> Tuple[Any, ...]:
+    """The sort key every queue uses: a FIRST_LABELS ticket first, then by
+    priority (P0 first), then the oldest."""
+    return (not (_names(issue) & set(FIRST_LABELS)), PRIORITIES.index(priority_of(issue)),
+            str(issue.get("created_at") or ""), repo, int(issue.get("number") or 0))
+
+
+def priority_for_impact(impact: float) -> str:
+    """The priority band of a health finding's impact (affected x hours)."""
+    for floor, band in ((200, "P0"), (50, "P1"), (10, "P2")):
+        if impact >= floor:
+            return band
+    return "P3"
+
+
+def with_header(body: str, key: str, value: str) -> str:
+    """The body with its `key:` header line set to value, added after the
+    other header lines when it has none."""
+    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    header = 0
+    while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip()):
+        header += 1
+    line = "%s: %s" % (key, value)
+    for i in range(header):
+        if lines[i].startswith(key + ":"):
+            lines[i] = line
+            return "\n".join(lines)
+    if header == 0:
+        return "\n".join([line, ""] + lines) if (body or "").strip() else line + "\n"
+    return "\n".join(lines[:header] + [line] + lines[header:])
 
 
 class Fix:
@@ -342,7 +395,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
             out.append("Finding-%s: %s" % (f.id, summary))
     out += ["%s: %s" % (k, v) for k, v in headers.items()
-            if k not in ("Not before", "After")]
+            if k not in ("Not before", "After", "Priority")]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
     if body:
@@ -443,8 +496,7 @@ class After(NamedTuple):
 
 def ticket_state(issue: Dict[str, Any]) -> str:
     """The ticket's own state label ("queued", "pr", "merged", ...), or ""."""
-    names = {str(x.get("name") if isinstance(x, dict) else x)
-             for x in issue.get("labels") or []}
+    names = _names(issue)
     return next((s for s in TICKET_STATES if "loom:" + s in names), "")
 
 

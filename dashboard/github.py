@@ -55,6 +55,8 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         "lane": next((name[5:] for name in names if name.startswith("lane:")), None),
         "model": _body_field(body, "Model"),
         "difficulty": _body_field(body, "Difficulty"),
+        "priority": tickets.priority_of(issue),
+        "created_at": issue.get("created_at"),
         # Attempts and rung are computed from transcripts by the Ticket page.
         "attempts": None, "rung": None,
         "updated_at": issue.get("updated_at"),

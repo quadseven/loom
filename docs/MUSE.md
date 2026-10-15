@@ -242,8 +242,12 @@ this tick"; a step with no note shows nothing there.
    and the station holds the ticket until each of them is merged),
    regressions first, with
    `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
+   Give each brief `--priority P0` to `P3` by how much it costs the goal
+   while it stays unfixed (without it the ticket is P2); the station and the
+   factory take P0 first. Read the Priorities and Health findings sections
+   of `status` first: a finding at P0 or P1 outranks new feature work.
    A brief without `--lane` stays queued until the station gives it a free
-   lane of its Difficulty tier, oldest queued ticket first. Use `--lane LANE`
+   lane of its Difficulty tier, by priority, then oldest queued first. Use `--lane LANE`
    when the brain needs to choose the lane itself. A queued ticket without a
    readable Difficulty line stays queued and appears in the goal's next
    station standup as needing a difficulty.

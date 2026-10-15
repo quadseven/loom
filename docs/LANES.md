@@ -136,8 +136,8 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
 
-After claims on every pass, the station gives the oldest `loom:queued`
-tickets free lanes in their Difficulty tier and moves them to `loom:briefed`.
+After claims on every pass, the station gives `loom:queued` tickets, in
+priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 It skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup.
 
@@ -211,7 +211,8 @@ ticket climbs, and past the last rung it is left `loom:failed` for the brain. La
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
 checks and review pass again on the new head; each repo lands at most one a
-pass, `loom:urgent` and `loom:regression` tickets first, then the oldest. A pull request whose only
+pass, `loom:urgent` and `loom:regression` tickets first, then by their
+ticket's `Priority:`, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
 back. A ready pull request that changes a code file (by extension: `.py`,
 `.js`, `.ts`, `.tsx`, `.jsx`, `.css`, `.cpp`, `.h`, `.hpp`, `.go`, `.rs`,
