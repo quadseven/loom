@@ -1,131 +1,66 @@
 # Loom
 
-A software factory that drives goals forward on every AI subscription you
-have. You write a goal. Loom turns it into tickets, builds them in parallel,
-reviews and fixes them, ships them, proves they worked live, and keeps going
-until the goal is done.
+Loom is a software factory. You write a goal; Loom turns it into tickets,
+has AI agents build them on every subscription you pay for, reviews and
+fixes their pull requests, ships them, and checks live that they worked.
 
-## The factory
+## How a ticket moves
 
-```mermaid
-flowchart LR
-    G[Goal<br/>home issue] --> B[Brain<br/>plans and ranks]
-    B --> T[Ticket<br/>Why, What, 3 checks]
-    T --> S[Station<br/>hands it to a free lane]
-    S --> L[Lane<br/>builds on its own branch]
-    L --> P[Pull request]
-    P --> R[Review bot<br/>and CI]
-    R -- findings or a failed check --> L
-    R -- clean --> M[Brain merges]
-    M --> SH[Ship]
-    SH --> V[Verify live<br/>proof line + metric moved]
-    V --> B
-```
+1. **Goal.** An issue labelled `loom:goal` says what done looks like and how
+   it is measured.
+2. **Brief.** The brain writes tickets for the goal's most important problems.
+3. **Claim.** The station hands each ticket to a free lane.
+4. **Build.** The lane writes the change and a test on its own branch and
+   opens a pull request.
+5. **Review.** The review bot and CI check it. Findings go back to the same
+   lane until the pull request is clean.
+6. **Merge.** The factory merges clean pull requests; risky ones wait for the
+   brain.
+7. **Ship.** The change is deployed under the project's own rules.
+8. **Verify.** The ticket closes only when live evidence shows it worked.
 
-1. **Goal.** One issue in the project's repo, labelled `loom:goal`. It says
-   what done looks like, how progress is measured, and the project's ship
-   rules.
-2. **Brain.** Every tick it measures the goal, puts regressions first, ranks
-   the open problems by the goal's own measure, and writes tickets for the
-   top ones, enough to keep every lane busy.
-3. **Ticket.** An issue with Why, What, exactly three acceptance checks
-   (one names a test that fails without the fix, one is the live proof),
-   Size and Out of scope.
-4. **Station.** Runs once a minute on the lane machine (`LOOM_STATION_INTERVAL`
-   seconds). It hands each
-   ticket to a free lane and reports the outcome back on the ticket.
-5. **Lane.** One agent CLI on one subscription or API key, in its own clone
-   and branch. It never merges; the runner pushes and opens the pull
-   request.
-6. **Review.** The review bot and CI check every pull request. Findings and
-   failed checks go back to the lane that wrote it, which fixes them on the
-   same pull request and answers each thread. Clean pull requests are
-   marked ready.
-7. **Merge, ship, verify.** The brain merges ready pull requests, ships them
-   under the project's rules, and closes a ticket only when its proof shows
-   up live and the metric it targets moved.
-8. **Journal and report.** Each tick leaves a journal on the goal; every two
-   hours a short report goes to the operator's phone. Asks reach the
-   operator only when only the operator can act.
+Labels on the ticket show where it is: `loom:queued`, `briefed`, `running`,
+`pr`, `merged`, `shipped`, `verified`.
 
-GitHub is the conveyor belt: labels carry a ticket from `loom:queued`
-through `briefed`, `running`, `pr`, `merged` and `shipped` to `verified`.
-The brain, the station and the operator share nothing else.
+## Terms
 
-Being built: the automatic hand-back of review findings and the `ready`
-label (#94), and the report to the phone (#84); today the brain sends
-findings back with `bus.brain fix`.
-
-## Who does what
-
-| Part | Runs | Where |
-|---|---|---|
-| Brain | every 30 minutes, plus an hourly tick for ships and live checks | Muse, and the lane machine (`lanes/mac/brain.sh`) |
-| Station | every minute | lane machine (`python3 -m bus station`) |
-| Lanes | one ticket at a time each, many lanes at once | lane machine (`lanes/run_lane.sh`) |
-| Review bot | on every pull request | GitHub |
-| Operator | answers asks, edits goals | anywhere |
-
-Lanes: codex, claude, anthropic, opencode-go, openrouter, zen, zai,
-workersai, agy and spark (a local vLLM coder you host yourself), plus extra slots (anthropic-2 to anthropic-8, codex-2, opencode-go-2, opencode-go-3, opencode-go-4)
-that run in parallel. Hard work goes to paid lanes; providers that train on
-prompts take public repos only.
-
-## Layout
-
-- `bus/` - the GitHub layer: labels, tickets, the brain's commands, the tick
-  lock, journals, and the station
-- `lanes/` - the lane runner, the Mac installer and the brain tick
-- `docs/` - how each part works: BRAIN.md (the bus and labels), MUSE.md
-  (what a brain tick does), LANES.md (lanes, station, brain tick),
-  BRIEF_FORMAT.md (tickets), SDLC.md (the 8-stage life cycle from ticket to verified)
-- `dispatch/` - the older local dispatcher
-- `tests/` - the suite CI runs
-
-Briefs, logs and keys never go to GitHub: this repo is public.
+| Term | What it is |
+|---|---|
+| Goal | One issue per project that says what Loom is driving toward. |
+| Ticket | One issue for one change: why, what, three checks, size. |
+| Brain | The planner. It decides what to brief and rules on anything stuck. It runs every 30 minutes. |
+| Station | The dispatcher. One process on the lane machine that runs every minute: it hands tickets to free lanes, moves labels, runs the factory and posts reports. It does no coding itself. |
+| Lane | One worker slot: one AI coding tool on one subscription or key (codex, claude, agy, spark and others). Each works one ticket at a time. |
+| Factory | The station's merge step: lands clean pull requests, sends findings back to lanes, and moves stuck work up a model ladder. |
+| Review bot | Reviews every pull request on GitHub. |
+| Dashboard | The live view of all of it: tickets, lanes, the brain, usage, and what needs you. |
 
 ## Run it
 
-1. Install on the lane machine, naming your repos, trusted logins and each
-   lane's key parameter in the environment (they go only into local launchd
-   files): `bash lanes/mac/install.sh`. See docs/LANES.md.
-2. Give each project a goal home issue labelled `loom:goal`.
-   Set `LOOM_METRICS_GOAL=owner/name#N` to post the nine factory numbers on
-   Loom's goal home once a day after `LOOM_DIGEST_HOUR`. The station uses
-   `LOOM_REPOS` and its existing Discord bot or webhook configuration.
+1. On the lane machine: `bash lanes/mac/install.sh`, with your repos,
+   trusted logins and each lane's key parameter in the environment. See
+   docs/LANES.md.
+2. Give each project a goal issue labelled `loom:goal`.
 3. Point a brain at it: the installed brain tick, or Muse with docs/MUSE.md.
-4. Test: `python -B -m unittest discover -s tests -v`.
+4. Test: `python3 -B -m unittest discover -s tests`.
+
+The dashboard runs with `python3 -m dashboard`; docs/DASHBOARD.md lists its
+settings.
 
 ## Rules
 
 - One ticket, one branch, one pull request. Lanes never merge.
-- Tests fail without the fix. Every bot comment is answered before a squash
-  merge.
-- Merged is not shipped, and shipped is not done: a ticket closes only on
-  live proof and a moved metric.
-- Subscription CLIs run with the owner's own login; no credential sharing.
-- GitHub text is ASCII with no em dashes, never names the review bot with an
-  at-sign, and never puts a closing keyword next to an issue number.
+- Every fix has a test that fails without it.
+- Merged is not shipped, and shipped is not done.
+- Briefs, logs and keys never go to GitHub: this repo is public.
+- GitHub text is ASCII, never names the review bot with an at-sign, and never
+  puts a closing keyword next to an issue number.
 
-# Dashboard
+## Docs
 
-Run the stdlib dashboard with `python3 -m dashboard`. It serves on port 8080
-by default. Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
-space-separated list of `OWNER/NAME` repositories. Set
-`LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
-the dashboard also checks the standard GitHub CLI authentication. Set
-`LOOM_DASHBOARD_BUDGET_FLOOR` to change the remaining-request threshold below
-which the last ticket snapshot is served as stale. The default is 500. Set
-`LOOM_IMPROVEMENT_HOMES` to the space-separated `OWNER/NAME` repositories
-whose goal journals and child tickets feed `/improving`; set
-`LOOM_METRICS_GOAL=OWNER/NAME#N` for the daily factory numbers. Improvement
-homes may also be specific goal issues as `OWNER/NAME#N`. Set
-`LOOM_STATUS_REPO=OWNER/NAME` to read the station's lane status comment for
-`/lanes` and the brain's tick record on its lock branch for `/brain`.
-`/brain` also reads the goal journals; `/hot-spots` reads ticket waits and
-the last two weeks of issue and review comments in `LOOM_REPOS`. With
-`LOOM_BRIEF_AUTHORS` set, only those logins' comments count as station
-outcomes, and `LOOM_REVIEW_BOT` names the review bot whose findings are
-counted (default `grug-tribe`). `.env.example` lists the dashboard variables with placeholder
-values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
-and station so completed runs can upload to `POST /api/transcripts`.
+- docs/SDLC.md: the life cycle from ticket to verified
+- docs/BRAIN.md: labels, tickets and the brain's commands
+- docs/MUSE.md: what one brain tick does
+- docs/LANES.md: lanes, the station and the installer
+- docs/BRIEF_FORMAT.md: how a ticket is written
+- docs/DASHBOARD.md: dashboard settings
