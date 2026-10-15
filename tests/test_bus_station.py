@@ -3847,6 +3847,13 @@ class VerifyResultTest(Base):
         self.assertEqual(len(self.fake.comments[5]), 1)
         self.assertIn("the deployed station log for 2026-10-16", self.fake.comments[5][0]["body"])
 
+    def test_a_proof_holding_a_credential_is_refused_with_one_note(self):
+        self.result(self.good(sources=["token=abcdef0123456789"]))
+        self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["body"], SHIPPED_BODY)
+        self.assertEqual(len(self.fake.comments[5]), 1)
+
     def test_no_verify_json_leaves_it_shipped_with_one_note(self):
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))

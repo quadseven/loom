@@ -25,12 +25,13 @@ LOCAL_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])/(?:Users|home|private|tmp|var|etc|opt|System|Volumes)/\S*",
     re.IGNORECASE)
 # Credential shapes that must not reach a public comment: provider key
-# prefixes, bearer tokens, key=value secrets, and long unbroken token runs.
-SECRET_RE = re.compile(
+# prefixes, bearer tokens and key=value secrets.
+CREDENTIAL_RE = re.compile(
     r"(?i)\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat|xox[a-z]|glpat|AKIA|ASIA)[-_A-Za-z0-9]{12,}"
     r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
-    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+"
-    r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
+    r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+")
+# The same shapes plus long unbroken token runs.
+SECRET_RE = re.compile(CREDENTIAL_RE.pattern + r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
 
 
 def scrub_paths(text: str) -> str:

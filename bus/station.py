@@ -1372,6 +1372,9 @@ class Station:
         except ValueError as err:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
             return
+        if _text.CREDENTIAL_RE.search(json.dumps(record)):
+            self._verify_note(repo, number, lane, "Its proof holds text shaped like a credential.")
+            return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
             brain.move(self.gh, repo, number, "verified", record=record)

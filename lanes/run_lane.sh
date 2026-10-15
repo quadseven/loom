@@ -1543,7 +1543,9 @@ for BRIEF in "$INBOX"/*.md; do
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.
     RESULT="$TREE/verify.json"
-    if [ ! -f "$RESULT" ] || [ -L "$RESULT" ] || [ "$(wc -c < "$RESULT")" -gt 65536 ]; then
+    # Only a file the agent made counts: one the repo tracks was there before.
+    if [ ! -f "$RESULT" ] || [ -L "$RESULT" ] || [ "$(wc -c < "$RESULT")" -gt 65536 ] ||
+       safe_git ls-files --error-unmatch verify.json > /dev/null 2>&1; then
       park "$BRIEF" "no verify.json written"; continue
     fi
     cp "$RESULT" "$LOGDIR/$TICKET.verify.json"
