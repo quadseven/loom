@@ -49,6 +49,12 @@ class FakeGitHub:
         self.filed = []
         self.writes = []
         self.reads = []
+        self.annotations = {}
+        self.logs = {}
+        self.requests = 0
+
+    def transport(self, method, url, headers, body):
+        return 200, {}, self.logs[url].encode()
 
     # -- recorded history ------------------------------------------------
     def commit(self, name, *runs, ago=3600):
@@ -100,6 +106,13 @@ class FakeGitHub:
         m = re.search(r"/commits/([0-9a-f]{40})/check-runs\?per_page=100$", path)
         if m:
             return Response(200, {"check_runs": self.runs.get(m.group(1), [])})
+        m = re.search(r"/check-runs/(\d+)/annotations\?per_page=100$", path)
+        if m:
+            return Response(200, self.annotations.get(int(m.group(1)), []))
+        m = re.search(r"/actions/jobs/(\d+)/logs$", path)
+        if m:
+            url = "https://example.com/log/%s" % m.group(1)
+            return Response(302, headers={"location": url}) if url in self.logs else Response(404)
         m = re.search(r"/issues/(\d+)$", path)
         if m:
             return Response(200, self.issues[int(m.group(1))])
@@ -108,7 +121,11 @@ class FakeGitHub:
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
         if method == "POST" and path.endswith("/issues"):
-            made = dict(body, number=900 + len(self.filed), user=ME, state="open",
+            is_revert = "loom:revert" in body["labels"]
+            number = (900 if is_revert else 1000) + sum(
+                ("loom:revert" in [x["name"] for x in i["labels"]]) == is_revert
+                for i in self.filed)
+            made = dict(body, number=number, user=ME, state="open",
                         labels=[{"name": x} for x in body["labels"]])
             self.filed.append(made)
             return Response(201, made)
@@ -140,17 +157,62 @@ class Base(unittest.TestCase):
     def green_base(self):
         self.gh.commit("base", run("green", ago=8000), ago=8000)
 
+    def revert_tickets(self):
+        return [i for i in self.gh.filed if "loom:revert" in
+                [label["name"] for label in i["labels"]]]
+
+    def forward_then_revert(self):
+        self.go()
+        return self.go(now=NOW + revert.FIX_FORWARD_WAIT)
+
 
 class Bisect(Base):
+    def test_lane_merge_gets_fix_forward_with_errors_then_revert_after_45_minutes(self):
+        self.green_base()
+        failed = run("red", ago=2400)
+        failed["app"] = {"slug": "github-actions"}
+        self.gh.annotations[1] = [{"annotation_level": "failure", "message":
+                                    "::error::Update the image pin"}]
+        self.gh.logs["https://example.com/log/1"] = "Build failed: stale pin\n##[error]exit 1\n"
+        self.gh.merge("m1", 41, 4, failed, ago=2500)
+        first = self.go()
+        self.assertIn("fix-forward", first)
+        self.assertEqual(self.revert_tickets(), [])
+        brief = self.gh.filed[0]["body"]
+        self.assertIn("::error::Update the image pin", brief)
+        self.assertIn("Build failed: stale pin", brief)
+        self.assertIn("follow-up pull request", brief)
+        self.assertIn("lane:codex", [x["name"] for x in self.gh.filed[0]["labels"]])
+        self.assertIn("Fix-forward ticket #1000", self.gh.comments[4][-1]["body"])
+        self.assertIn("fix-forward", self.go(now=NOW + 2699))
+        later = self.go(now=NOW + 2700)
+        self.assertEqual(len(self.revert_tickets()), 1)
+        self.assertIn("fix-forward", later)
+        self.assertIn("git revert --no-edit %s" % sha("m1"), self.revert_tickets()[0]["body"])
+
+    def test_check_also_red_before_merge_files_one_factory_ticket_without_revert(self):
+        self.green_base()
+        self.gh.commit("before", run("red", ago=4000, name="nightly invariants"), ago=4100)
+        self.gh.merge("m1", 41, 4, run("red", ago=3000, name="nightly invariants"),
+                      ago=3100, head_runs=(run("green", name="nightly invariants"),))
+        first = self.go()
+        self.assertIn("nightly invariants", first)
+        self.assertIn("already red before", first)
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertNotIn("loom:revert", [x["name"] for x in self.gh.filed[0]["labels"]])
+        self.assertIn("nightly invariants", self.gh.filed[0]["body"])
+        self.go()
+        self.assertEqual(len(self.gh.filed), 1)
+
     def test_green_to_red_across_three_merges_reverts_the_first_red_one(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("green", ago=4000), ago=4200)
         self.gh.merge("m2", 51, 5, run("red", ago=3000), ago=3300)
         self.gh.merge("m3", 61, 6, run("red", ago=2400), ago=2600)
         self.gh.merge("m4", 71, 7, run("red", ago=2000), ago=2100)
-        log = self.go()
-        self.assertEqual(len(self.gh.filed), 1)
-        made = self.gh.filed[0]
+        log = self.forward_then_revert()
+        self.assertEqual(len(self.revert_tickets()), 1)
+        made = self.revert_tickets()[0]
         self.assertEqual(made["title"], "Revert %s: Change m2" % sha("m2")[:12])
         self.assertIn("git revert --no-edit %s" % sha("m2"), made["body"])
         self.assertIn("- [ ] The check `unittest` passes on this pull request.", made["body"])
@@ -175,29 +237,28 @@ class Bisect(Base):
         self.gh.merge("m1", 41, 4, run("green", ago=4000),
                       run("red", ago=3500, name="nightly invariants", run_id=2), ago=4200)
         log = self.go()
-        self.assertEqual(self.gh.filed, [])
+        self.assertEqual(self.revert_tickets(), [])
         self.assertIn("only from checks that never ran on #41", log)
 
     def test_a_check_that_ran_on_the_pull_request_still_reverts(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000),
                       run("red", ago=3500, name="nightly invariants", run_id=2), ago=4200)
-        self.go()
-        self.assertEqual(len(self.gh.filed), 1)
+        self.forward_then_revert()
+        self.assertEqual(len(self.revert_tickets()), 1)
         self.assertIn("check `unittest` fails", self.gh.comments[4][-1]["body"])
-        self.assertNotIn("nightly invariants", self.gh.comments[4][-1]["body"])
 
     def test_a_red_a_later_commit_fixes_within_30_minutes_reverts_nothing(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=1500), ago=1600)
-        # Red for 25 minutes: it waits for a newer commit to turn it green.
+        # Red for 25 minutes: fix-forward starts before a later commit clears it.
         log = self.go()
-        self.assertEqual(self.gh.filed, [])
-        self.assertIn("for 25 minutes", log)
+        self.assertEqual(self.revert_tickets(), [])
+        self.assertIn("fix-forward", log)
         self.gh.merge("m2", 51, 5, run("green", ago=600), ago=900)
         # Long after, the branch is green: m1's red is never reverted.
         self.assertEqual(self.go(now=NOW + 7200), "")
-        self.assertEqual(self.gh.filed, [])
+        self.assertEqual(self.revert_tickets(), [])
 
     def test_a_red_commit_no_lane_merged_reverts_nothing_and_is_said_once(self):
         self.green_base()
@@ -206,8 +267,8 @@ class Bisect(Base):
         self.gh.merge("m2", 51, 5, run("red", ago=3000), ago=3100)
         first = self.go()
         second = self.go()
-        self.assertEqual(self.gh.filed, [])
-        self.assertIn("%s, which no lane merged" % sha("by-hand")[:12], first)
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("already red before the merge", first)
         self.assertEqual(second, "")
 
     def test_a_lane_merge_past_the_first_page_of_closed_pulls_is_still_found(self):
@@ -217,45 +278,46 @@ class Bisect(Base):
             self.gh.pulls.append({"number": 100 + n, "user": STRANGER, "merged_at": None,
                                   "head": {"ref": "stale-%d" % n}, "base": {"ref": "main"}})
         self.gh.merge("m2", 51, 5, run("red", ago=3000), ago=3100)
-        self.assertNotIn("which no lane merged", self.go())
-        self.assertIn(sha("m1"), self.gh.filed[0]["body"])
+        self.assertNotIn("which no lane merged", self.forward_then_revert())
+        self.assertIn(sha("m1"), self.revert_tickets()[0]["body"])
 
     def test_a_lane_pull_request_by_a_stranger_is_not_a_lane_merge(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100, user=STRANGER)
         self.gh.merge("m2", 51, 5, run("red", ago=3000), ago=3100)
-        self.assertIn("which no lane merged", self.go())
-        self.assertEqual(self.gh.filed, [])
+        self.assertIn("already red before the merge", self.go())
+        self.assertEqual(len(self.gh.filed), 1)
 
     def test_a_second_red_while_a_revert_is_in_flight_waits(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100)
-        self.go()
-        self.assertEqual(len(self.gh.filed), 1)
-        self.gh.reverts = list(self.gh.filed)
+        self.forward_then_revert()
+        self.assertEqual(len(self.revert_tickets()), 1)
+        self.gh.reverts = list(self.revert_tickets())
         # A re-run clears m1, and a later merge breaks the branch on its own
         # while m1's revert is still in flight.
         self.gh.runs[sha("m1")].append(run("green", ago=3500, run_id=2))
         self.gh.merge("m5", 81, 8, run("red", ago=3000), ago=3100)
-        log = self.go()
-        self.assertEqual(len(self.gh.filed), 1)
+        self.go()
+        log = self.go(now=NOW + revert.FIX_FORWARD_WAIT)
+        self.assertEqual(len(self.revert_tickets()), 1)
         self.assertIn("it waits for revert #900, still in flight", log)
 
     def test_a_red_commit_already_named_by_a_revert_is_not_reverted_again(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100)
-        self.go()
-        self.gh.reverts = [dict(self.gh.filed[0], labels=[{"name": "loom:revert"},
+        self.forward_then_revert()
+        self.gh.reverts = [dict(self.revert_tickets()[0], labels=[{"name": "loom:revert"},
                                                           {"name": "loom:closed-unmerged"}])]
-        self.assertIn("revert #900 already names it", self.go())
-        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("revert #900 already names it", self.go(now=NOW + revert.FIX_FORWARD_WAIT))
+        self.assertEqual(len(self.revert_tickets()), 1)
 
     def test_a_revert_the_label_list_does_not_show_yet_is_not_filed_twice(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100)
+        self.forward_then_revert()
         self.go()
-        self.go()
-        self.assertEqual(len(self.gh.filed), 1)
+        self.assertEqual(len(self.revert_tickets()), 1)
 
     def test_a_failed_redo_does_not_stop_the_bisect(self):
         self.green_base()
@@ -264,9 +326,10 @@ class Bisect(Base):
                             "body": "Reverted ticket: #404\n",
                             "labels": [{"name": "loom:merged"}, {"name": "loom:revert"}]}]
         self.gh.comments[404] = []
-        log = self.go()
+        self.go()
+        log = self.go(now=NOW + revert.FIX_FORWARD_WAIT)
         self.assertIn("revert #700 reverted failed", log)
-        self.assertEqual(len(self.gh.filed), 1)
+        self.assertEqual(len(self.revert_tickets()), 1)
 
     def test_a_commit_with_no_runs_yet_is_waited_on(self):
         self.green_base()
@@ -280,8 +343,8 @@ class Bisect(Base):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("cancelled", ago=4000), ago=4100)
         self.gh.merge("m2", 51, 5, run("red", ago=3000), ago=3100)
-        self.go()
-        self.assertIn(sha("m2"), self.gh.filed[0]["body"])
+        self.forward_then_revert()
+        self.assertIn(sha("m2"), self.revert_tickets()[0]["body"])
 
     def test_a_merge_whose_pull_request_head_was_not_green_is_left(self):
         self.green_base()
@@ -316,7 +379,7 @@ class Bisect(Base):
         self.gh.merge("m2", 51, 5, run("red", ago=3000), ago=3300)
         self.gh.merge("m3", 61, 6, run("red", ago=2400), ago=2600)
         self.go()
-        pages = [p for p in self.gh.reads if "/check-runs" in p]
+        pages = [p for p in self.gh.reads if p.endswith("/check-runs?per_page=100")]
         self.assertEqual(len(pages), len(set(pages)))
         self.assertTrue(all(p.endswith("/check-runs?per_page=100") for p in pages))
         # Head back to the last green one, and m2's pull request head.
@@ -327,8 +390,8 @@ class Redo(Base):
     def landed_revert(self, state="merged"):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100)
-        self.go()
-        made = self.gh.filed[0]
+        self.forward_then_revert()
+        made = self.revert_tickets()[0]
         made["labels"] = [{"name": "loom:ticket"}, {"name": "loom:" + state},
                           {"name": "loom:revert"}]
         made["updated_at"] = iso(60)
@@ -362,7 +425,7 @@ class StationStep(Base):
         path = os.path.join(st.s.home, "state", "usage")
         os.makedirs(path, exist_ok=True)
         with open(os.path.join(path, lane + ".json"), "w") as fh:
-            json.dump({"available": available, "at": NOW, "reason": reason}, fh)
+            json.dump({"available": available, "at": st.now, "reason": reason}, fh)
 
     def test_the_station_reverts_with_the_factory_on_and_not_with_it_off(self):
         self.green_base()
@@ -373,8 +436,11 @@ class StationStep(Base):
             off.watch_default_branches()
             self.assertEqual((self.gh.filed, self.gh.reads), ([], []))
             on.watch_default_branches()
-        self.assertEqual(len(self.gh.filed), 1)
-        made = self.gh.filed[0]
+            on.now = NOW + revert.FIX_FORWARD_WAIT
+            self.beat(on, "opencode-go")
+            on.watch_default_branches()
+        self.assertEqual(len(self.revert_tickets()), 1)
+        made = self.revert_tickets()[0]
         self.assertTrue(made["title"].startswith("Revert %s:" % sha("m1")[:12]))
         self.assertIn("lane:opencode-go", [x["name"] for x in made["labels"]])
         self.assertTrue(made["body"].startswith("Difficulty: easy\n"))
@@ -387,7 +453,11 @@ class StationStep(Base):
         self.beat(on, "codex-2")
         with contextlib.redirect_stdout(io.StringIO()):
             on.watch_default_branches()
-        made = self.gh.filed[0]
+            on.now = NOW + revert.FIX_FORWARD_WAIT
+            self.beat(on, "spark", available=False, reason="limit: hot")
+            self.beat(on, "codex-2")
+            on.watch_default_branches()
+        made = self.revert_tickets()[0]
         self.assertIn("lane:codex-2", [x["name"] for x in made["labels"]])
         self.assertTrue(made["body"].startswith("Difficulty: medium\n"))
 
@@ -395,9 +465,12 @@ class StationStep(Base):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100)
         out = io.StringIO()
+        on = self.station(True)
         with contextlib.redirect_stdout(out):
-            self.station(True).watch_default_branches()
-        self.assertEqual(self.gh.filed, [])
+            on.watch_default_branches()
+            on.now = NOW + revert.FIX_FORWARD_WAIT
+            on.watch_default_branches()
+        self.assertEqual(self.revert_tickets(), [])
         self.assertIn("no lane is up to take its revert", out.getvalue())
 
 

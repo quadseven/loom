@@ -3828,8 +3828,8 @@ class Station:
                                available=[x for x in LANES if self._heartbeat_ok(x)])
 
     def watch_default_branches(self) -> None:
-        """Revert a lane merge that turned a default branch red (bus/revert.py),
-        every pass, with the factory: LOOM_FACTORY=0 turns both off."""
+        """Fix forward after a red lane merge, then revert if it stays red.
+        Runs with the factory; LOOM_FACTORY=0 turns both off."""
         if not self.s.factory_on:
             return
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
