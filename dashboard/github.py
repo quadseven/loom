@@ -409,12 +409,17 @@ def _floor_context(reports, journals, asks, errors):
         return goals.sections(str(comment.get("body") or "")) if comment else {}
     report_body = str((latest_report or {}).get("body") or "")
     headline = next((line.strip() for line in report_body.splitlines()[1:] if line.strip()), None)
-    journal_step = journal_next(str((latest_journal or {}).get("body") or ""))
+    journal_body = str((latest_journal or {}).get("body") or "")
+    journal_step = journal_next(journal_body)
+    # A journal with no Next line still leads with the tick's main action.
+    journal_lead = next((line.strip()[2:].strip() for line in journal_body.splitlines()[1:]
+                         if line.strip().startswith("- ")), None)
     header = next((line for line in str((latest_journal or {}).get("body") or "").splitlines()[1:2]
                    if line.startswith("Tick ")), "")
     holder_match = re.search(r"^Tick\s+[^,]+,\s*(.+)$", header)
     return {"report_headline": headline, "report_time": (latest_report or {}).get("created_at"),
             "since_report": sections(latest_report), "journal_step": journal_step,
+            "journal_lead": journal_lead,
             "journal_holder": holder_match.group(1).strip() if holder_match else None,
             "journal_time": (latest_journal or {}).get("created_at"),
             "needs_you": len(asks),
