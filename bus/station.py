@@ -241,6 +241,27 @@ BUDGET_FLOOR = 0.15
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
+VERIFY_INTERVAL = 6 * 3600
+
+
+def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
+               attempts: Dict[str, Any], now: float) -> List[Tuple[str, Dict[str, Any]]]:
+    """Shipped tickets without a proof, oldest ship event first, outside cooldown."""
+    due = []
+    for repo, issue in issues:
+        labels = _label_names(issue)
+        key = "%s#%s" % (repo, issue.get("number"))
+        if (issue.get("state") != "open" or "loom:ticket" not in labels
+                or "loom:shipped" not in labels or "loom:verified" in labels
+                or issue.get("has_proof")):
+            continue
+        last = attempts.get(key)
+        if isinstance(last, (int, float)) and now - float(last) < VERIFY_INTERVAL:
+            continue
+        due.append((repo, issue))
+    return sorted(due, key=lambda item: (
+        float(item[1].get("shipped_at", 0) or 0),
+        item[0], int(item[1].get("number", 0))))
 
 
 def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:

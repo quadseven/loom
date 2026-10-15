@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import brain, spend, station, tickets  # noqa: E402
+from bus import brain, proof, spend, station, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -3692,3 +3692,19 @@ class PostTranscriptTest(unittest.TestCase):
             with self.assertRaises(OSError) as ctx:
                 station.post_transcript(UPLOAD_URL, UPLOAD_TOKEN, {"events": []})
         self.assertEqual(str(ctx.exception), "the transcript upload answered 401")
+
+
+class VerifyDueTest(unittest.TestCase):
+    def test_oldest_shipped_proofless_ticket_and_six_hour_cooldown(self):
+        def item(number, shipped_at, **extra):
+            return (REPO, {"number": number, "state": "open", "shipped_at": shipped_at,
+                           "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}],
+                           **extra})
+        tickets = [item(2, 200), item(1, 100), item(3, 50, has_proof=True)]
+        found = station.verify_due(tickets, {"%s#1" % REPO: 1000}, 1001)
+        self.assertEqual([issue["number"] for _, issue in found], [2])
+
+    def test_only_shipped_ticket_without_verified_state_is_due(self):
+        issue = {"number": 4, "state": "open", "shipped_at": 1,
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]}
+        self.assertEqual(station.verify_due([(REPO, issue)], {}, 99999), [])
