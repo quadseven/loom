@@ -10,6 +10,7 @@ VIEWS = (
     ("tickets", "Tickets", "/tickets"),
     ("brain", "Brain", "/brain"),
     ("hot-spots", "Hot spots", "/hot-spots"),
+    ("results", "Results", "/results"),
     ("improving", "Improving", "/improving"),
     ("lanes", "Lanes and models", "/lanes"),
     ("usage", "Usage", "/usage"),

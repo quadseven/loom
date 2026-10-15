@@ -60,6 +60,8 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         "goal": goal,
         # Tickets are read with state=all; a closed one is history, never work.
         "open": issue.get("state", "open") != "closed",
+        "closed_at": issue.get("closed_at"),
+        "state_reason": issue.get("state_reason"),
         "lane": next((name[5:] for name in names if name.startswith("lane:")), None),
         "model": _body_field(body, "Model"),
         "difficulty": _body_field(body, "Difficulty"),
