@@ -1036,6 +1036,25 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
     return str(made.get("html_url", ""))
 
 
+DIFFICULTIES = ("easy", "medium", "hard")
+
+
+def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional[str]) -> None:
+    """A brief the station must place needs a difficulty tier. Without one the
+    ticket gets no lane and waits for a brain to notice (2026-10-16: five
+    factory tickets briefed without --difficulty sat queued up to 17 hours).
+    A brief with --lane is claimed by that lane, so it needs none."""
+    if lane or difficulty:
+        return
+    try:
+        found = tickets.parse(body)[0].get("Difficulty", "")
+    except ValueError:
+        found = ""
+    if not found:
+        raise ValueError("a brief without --lane needs --difficulty easy, medium or hard "
+                         "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
+
+
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None) -> str:
@@ -1468,17 +1487,22 @@ def _with_model(body: str, model: str) -> str:
 
 def _with_priority(body: str, priority: str) -> str:
     """Set Priority in the leading headers without changing the remaining text."""
+    return _with_header(body, "Priority", priority)
+
+
+def _with_header(body: str, key: str, value: str) -> str:
+    """Set one leading header line without changing the remaining text."""
     lines = body.splitlines(keepends=True)
     header = 0
     while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip("\r\n").rstrip()):
         header += 1
     for index in range(header):
-        if lines[index].startswith("Priority:"):
+        if lines[index].startswith(key + ":"):
             ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
-            lines[index] = "Priority: " + priority + ending
+            lines[index] = "%s: %s%s" % (key, value, ending)
             return "".join(lines)
     newline = "\r\n" if "\r\n" in body else "\n"
-    lines.insert(header, "Priority: " + priority + newline)
+    lines.insert(header, "%s: %s%s" % (key, value, newline))
     if header == 0 and body and not body.startswith(("\n", "\r")):
         lines.insert(1, newline)
     return "".join(lines)
@@ -1494,8 +1518,9 @@ def _prioritize_write(gh: GitHub, repo: str, number: int, method: str,
                           exc.status, exc.body) from exc
 
 
-def _prioritize_body(issue: Dict[str, Any], priority: str,
-                     env: Optional[Dict[str, str]]) -> str:
+def _prioritize_body(issue: Dict[str, Any], priority: Optional[str],
+                     env: Optional[Dict[str, str]],
+                     difficulty: Optional[str] = None) -> str:
     """Validate that the issue is an open ticket by a trusted author."""
     if issue.get("state") != "open":
         raise ValueError("cannot prioritize a closed issue")
@@ -1510,7 +1535,11 @@ def _prioritize_body(issue: Dict[str, Any], priority: str,
     login = str((issue.get("user") or {}).get("login") or "").lower()
     if not login or login not in authors:
         raise ValueError("ticket author is not a trusted login")
-    updated = _with_priority(str(issue.get("body") or ""), priority)
+    updated = str(issue.get("body") or "")
+    if priority is not None:
+        updated = _with_priority(updated, priority)
+    if difficulty is not None:
+        updated = _with_header(updated, "Difficulty", difficulty)
     _check_written_text(updated)
     return updated
 
@@ -1526,19 +1555,27 @@ def _write_priority(gh: GitHub, repo: str, number: int, body: str,
                           {"body": note}, "note comment")
 
 
-def prioritize(gh: GitHub, repo: str, number: int, priority: str,
+def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                note: Optional[str] = None,
-               env: Optional[Dict[str, str]] = None) -> None:
-    """Rank an open ticket, requiring its author to be trusted."""
-    if priority not in tickets.PRIORITIES:
+               env: Optional[Dict[str, str]] = None,
+               difficulty: Optional[str] = None) -> None:
+    """Rank an open ticket, or set its Difficulty, requiring its author to be
+    trusted. A queued ticket with no Difficulty line gets no lane, and before
+    this a brain could only fix one by hand-editing the body (2026-10-16: five
+    factory tickets sat queued up to 17 hours)."""
+    if priority is None and difficulty is None:
+        raise ValueError("give a priority, a difficulty, or both")
+    if priority is not None and priority not in tickets.PRIORITIES:
         raise ValueError("priority must be one of %s" % ", ".join(tickets.PRIORITIES))
+    if difficulty is not None and difficulty not in DIFFICULTIES:
+        raise ValueError("difficulty must be one of %s" % ", ".join(DIFFICULTIES))
     if note is not None:
         _check_written_text(note)
         if "\n" in note or "\r" in note:
             raise ValueError("priority note must be one line")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     body = str(issue.get("body") or "")
-    updated = _prioritize_body(issue, priority, env)
+    updated = _prioritize_body(issue, priority, env, difficulty)
     if updated != body:
         _write_priority(gh, repo, number, updated, note)
     elif note is not None:
@@ -2848,11 +2885,11 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder")
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder")
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
-    pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES, required=True); pr.add_argument("--note")
+    pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
@@ -2887,7 +2924,9 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
-    print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
+    body = _read(args.file)
+    _check_brief_difficulty(body, args.lane, args.difficulty)
+    print(brief(gh, _repo(args.repo), args.goal, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder))
 
@@ -2910,7 +2949,7 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
-    prioritize(gh, repo, number, args.priority, args.note)
+    prioritize(gh, repo, number, args.priority, args.note, difficulty=args.difficulty)
 
 
 def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
