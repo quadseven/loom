@@ -1838,6 +1838,29 @@ cat > /dev/null
         self.assertEqual(agy, [])
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_agy_lane_adds_default_effort_to_a_bare_claude_model(self):
+        _, _, result, agy = self.agy_lane(model="claude-sonnet-5-5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("--model claude-sonnet-5-5-high", agy[0])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_agy_lane_uses_its_configured_effort_for_a_bare_model(self):
+        _, _, result, agy = self.agy_lane(model="claude-sonnet-5-5", LOOM_AGY_EFFORT="medium")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("--model claude-sonnet-5-5-medium", agy[0])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_refuses_unknown_model_as_transient_before_agent_run(self):
+        inbox, _, result, agy = self.agy_lane(model="gpt-6-sol")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [transient] model gpt-6-sol is not in the agy catalog", log)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
     @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
     def test_agy_lane_takes_public_repos_only(self):
         inbox, _, _, agy = self.agy_lane(FAKE_GH_PRIVATE="true")

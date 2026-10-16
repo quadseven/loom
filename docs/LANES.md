@@ -713,7 +713,10 @@ lookup leaves the brief for the next pass. The rule covers:
   directly with the brief in print mode and `--mode accept-edits` (never
   wrapped in another agent). Its catalog includes Gemini, Claude and GPT-OSS
   models (`gemini-*`, `claude-*`, `gpt-oss-*`); default
-  `gemini-3.8-flash-high`.
+  `gemini-3.8-flash-high`. A bare model in the brief gets
+  `LOOM_AGY_EFFORT` (`high` by default); a model with `-low`, `-medium`, or
+  `-high` keeps its suffix. A model outside the catalog is refused as a
+  transient lane mismatch before agy starts.
 - agy keeps its sign-in in the macOS keychain. A sandboxed agent that can
   reach the keychain server could ask for any of the operator's keychain
   entries, so the agent runs as a dedicated standard macOS user (default
