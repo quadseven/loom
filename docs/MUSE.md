@@ -13,25 +13,40 @@ you). The lock lives in `quadseven/loom`.
 ## What Muse does and leaves
 
 Muse reads live data through REST APIs on the tailnet, through its proxy,
-and has no cluster or database access. That is enough to operate: Muse does
-reviews, merges, briefs, failed tickets, asks, journals, verification, and
-also the ships and rolls a goal's own rules give the brain. A ship or a roll
+and reads logs and rows through the lane machine's read-only evidence endpoint
+(Operate, do not report). It has no direct cluster or database access. Muse
+does reviews, merges, briefs, failed tickets, asks, journals, verification,
+and the ships and rolls a goal's own rules give the brain. A ship or a roll
 is a pull request in the deployment repo (a pinned digest read from the
 build run's log, or a configuration change) plus the gates the goal's rules
 name, and those gates are read from the goal's REST endpoints. Follow the
 goal's ship and roll document step by step; when a gate stays closed and
 the rules allow an operator exception, ask for it once with the evidence
 (`bus.brain human`), and act on the answer. The lane machine's tick
-(`LOOM_BRAIN_SCOPE=live`) keeps only what needs that machine: reads from a
-database or a service log, until the evidence endpoint serves them. Never
-write to a live system except through those pull requests. When a step
-needs a fact no API serves, write what is needed on the ticket and leave it;
-never claim a live result you did not read yourself.
+(`LOOM_BRAIN_SCOPE=live`) keeps only reads that require direct cluster or
+database access and are not served by the evidence endpoint. Never write to
+a live system except through those pull requests. When a step needs a fact
+no API serves, write what is needed on the ticket and leave it; never claim
+a live result you did not read yourself.
 
 Read and write GitHub only from the shell, through the Loom commands or the
 GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
 for GitHub or anything else in a scheduled run: each new web request asks
 the operator for approval, and the run stops until someone answers.
+
+## Operate, do not report
+
+When a diagnosis needs live evidence, read it directly before deciding or
+writing a result:
+
+1. Use the supported read-only API for facts it serves.
+2. Do not infer a live result from source code or from what a command would
+   return.
+3. If an authorized read is unavailable, name the missing evidence on the
+   ticket and leave the result unclaimed.
+4. Read runs, logs, and database rows through the lane machine's read-only
+   evidence endpoint (`docs/EVIDENCE.md`). It accepts named sources and named
+   queries only; never use it to write or run arbitrary SQL or shell commands.
 
 ## The brain's job
 
