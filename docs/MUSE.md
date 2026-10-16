@@ -125,7 +125,35 @@ below; where the steps leave room, this is how to spend it.
    whose `updated_at` has not changed since the last journal is not read
    again; say "unchanged" and move on.
 8. Every failure the brain finds by hand becomes a factory ticket (Improving
-   Loom itself), so the factory catches it next time without the brain.
+   Loom itself), so the factory catches it next time without the brain. File
+   it in the same tick with `bus.brain brief` on the Loom goal home, quoting
+   the evidence; a journal line that names a factory problem without a ticket
+   number is a rule broken, and the next tick files it before anything else.
+9. Failed tickets get a decision every tick. For each ticket at loom:failed,
+   past the last rung or needs-brain, read the last run's log tail and the
+   ticket's comments, then do one thing and say which: the work is already
+   done or no longer applies (close it with the reason, or verify it), the
+   brief is wrong (rewrite it smaller with `--regresses` or a new brief), the
+   factory failed the run (file the factory ticket and hold this one), or
+   the model was not strong enough (escalate once, with the reason). The
+   same failure reason twice is never the model's fault: look for the
+   factory cause first. No failed ticket waits a second tick without a
+   decision on it.
+10. Open invariants are worked, not watched. Each tick takes the oldest open
+    invariant issue and either files the ticket that fixes its cause, closes
+    it with a comment when it has cleared, or labels it `loom:recurring`.
+    "Watching" is not a decision.
+11. Stay inside the tick's time. Spend at most a quarter of it reading
+    (status, resume, goal homes), at most a quarter merging (when more
+    pull requests are ready, merge the oldest and defer the rest with the
+    merge stage), and the rest acting on the Priorities list. When the
+    budget runs out, defer what is left with markers; never skip a stage
+    silently "on budget".
+12. The journal ends with what moved, counted: merged N, briefed N (with
+    numbers), closed or verified N, escalated N, factory tickets filed N,
+    deferred N with their stages. A tick that moved nothing says so as its
+    first line and names what stopped it; it never grades itself as
+    succeeded.
 
 ## Improving Loom itself
 
