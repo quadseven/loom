@@ -162,6 +162,7 @@ done
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and
+# LOOM_ROLL_SHIP_DOCS (goal ship documents for module source pins), and
 # LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
 # verify briefs, docs/LANES.md Verify runs), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
@@ -200,6 +201,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
     <key>LOOM_SELF_REPO</key><string>$(xml "${LOOM_SELF_REPO:-}")</string>
     <key>LOOM_PIN_TARGETS</key><string>$(xml "${LOOM_PIN_TARGETS:-}")</string>
+    <key>LOOM_ROLL_SHIP_DOCS</key><string>$(xml "${LOOM_ROLL_SHIP_DOCS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
