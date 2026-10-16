@@ -2944,6 +2944,31 @@ exit %d
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(marker.exists())
 
+    def test_contract_run_makes_uv_use_only_its_own_pythons(self):
+        # An x86_64 python3 on PATH that the host could not run made every
+        # muster check exit 2 on the base (2026-10-16); the check sets
+        # UV_MANAGED_PYTHON, and nothing else of the runner's leaks in.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run"))
+        tmp = Path(self._tmp.name)
+        fakes = tmp / "fakebin"
+        fakes.mkdir()
+        (fakes / "sandbox-exec").write_text('#!/bin/bash\nshift 2\nexec "$@"\n')
+        (fakes / "sandbox-exec").chmod(0o755)
+        (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+        (fakes / "timeout").chmod(0o755)
+        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        log = tmp / "log"
+        env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
+               "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
+               "RUNNER_SECRET": "x"}
+        result = subprocess.run(["bash", "-c", script, "test",
+                                 "echo uv=${UV_MANAGED_PYTHON:-unset} secret=${RUNNER_SECRET:-unset}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("uv=1 secret=unset", log.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

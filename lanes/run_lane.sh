@@ -896,7 +896,12 @@ contract_run() {
     cd "$TREE" || exit 125
     keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" home="$CHECK_HOME"
     for v in $(compgen -e); do unset "$v"; done
-    export PATH="$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang"
+    # UV_MANAGED_PYTHON: uv uses only the Pythons it installs, never one
+    # found on PATH. A PATH interpreter it cannot run (an x86_64 Homebrew
+    # python3 on an arm64 host without Rosetta) made uv exit 2 before any
+    # test, so every muster lane run failed on the unmodified base
+    # (2026-10-16).
+    export PATH="$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < /dev/null
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
