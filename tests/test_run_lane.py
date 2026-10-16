@@ -613,10 +613,10 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Validation: check exited 0", self.body.read_text())
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
-        pushed = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+        pushed = subprocess.run(["git", "--git-dir", str(self.remote), "show-ref", "--heads"],
                                 capture_output=True, text=True, check=True).stdout
-        self.assertIn("refs/heads/loom/T042-fix-the-thing", pushed)
-        heads = dict(line.split("\t", 1) for line in pushed.splitlines())
+        heads = dict(line.split(" ", 1)[::-1] for line in pushed.splitlines())
+        self.assertIn("refs/heads/loom/T042-fix-the-thing", heads, pushed)
         self.assertNotEqual(heads["refs/heads/loom/T042-fix-the-thing"], heads["refs/heads/main"])
 
     def test_runner_commit_failure_is_transient(self):
