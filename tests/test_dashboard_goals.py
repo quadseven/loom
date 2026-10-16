@@ -4,8 +4,10 @@ Live, every Goals card read "not looked", the Floor's Since last report read
 "section missing" four times, and every page took 8 to 12 seconds: these pin
 the readers and the one-pass footer index that fixed them.
 """
+import os
 import re
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 
 from dashboard import goals, server, views
@@ -160,6 +162,65 @@ class ApiTickets(unittest.TestCase):
             self.assertNotIn(key, out)
         self.assertEqual(out["source_counts"]["pull_requests"], 3)
         self.assertEqual(out["source_counts"]["issue_comments"], 5)
+
+
+class UnprovenWork(unittest.TestCase):
+    def rows(self, *states):
+        return [{"repo": REPO, "number": 7 + n, "goal": REPO + "#30", "state": state}
+                for n, state in enumerate(states)]
+
+    def test_only_merged_or_shipped_tickets_count_as_unproven(self):
+        card = goals.goal_context(self.rows("shipped", "merged", "verified", "queued"),
+                                  [], {}, [], None, NOW)[REPO + "#30"]
+        self.assertEqual(card["unproven"], 2)
+        self.assertEqual(card["unproven_limit"], 15)
+
+    def test_a_goal_card_shows_the_count_against_the_limit(self):
+        from dashboard.github import ticket_record
+
+        def issue(number, state):
+            return {"number": number, "title": "Ticket %d" % number,
+                    "created_at": "2026-10-15T10:00:00Z",
+                    "body": "Part of %s#30\n\n## Why\nx" % REPO,
+                    "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
+
+        rows = [ticket_record(REPO, issue(7, "shipped")), ticket_record(REPO, issue(8, "verified"))]
+
+        class State:
+            context = {}
+            data = {}
+
+            def response(self):
+                return {"tickets": {REPO: rows}, "operator_items": [],
+                        "goal_context": goals.goal_context(rows, [], {}, [], None, NOW)}
+
+        body = server._goals(State())
+        self.assertIn("unproven work 1/15", body)
+        self.assertNotIn("over limit", body)
+
+    def test_an_over_limit_goal_card_says_no_new_build_tickets(self):
+        from dashboard.github import ticket_record
+
+        def issue(number):
+            return {"number": number, "title": "Ticket %d" % number,
+                    "created_at": "2026-10-15T10:00:00Z",
+                    "body": "Part of %s#30\n\n## Why\nx" % REPO,
+                    "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+
+        rows = [ticket_record(REPO, issue(7)), ticket_record(REPO, issue(8))]
+
+        class State:
+            context = {}
+            data = {}
+
+            def response(self):
+                return {"tickets": {REPO: rows}, "operator_items": [],
+                        "goal_context": goals.goal_context(rows, [], {}, [], None, NOW)}
+
+        with unittest.mock.patch.dict(os.environ, {"LOOM_UNVERIFIED_LIMIT": "1"}):
+            body = server._goals(State())
+        self.assertIn("unproven work 2/1", body)
+        self.assertIn("over limit: no new build tickets", body)
 
 
 if __name__ == "__main__":

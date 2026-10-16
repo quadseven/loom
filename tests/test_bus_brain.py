@@ -232,14 +232,15 @@ class SensitiveResumeTests(unittest.TestCase):
                         {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
-            reply(200, []), reply(200, [])))
+            reply(200, []), reply(200, []), reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env={})
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
-        # Project repo: issues, pulls, one GraphQL request; lane repo: issues
-        # (no loom:lanes issue here, so no comments read). The fake has no
-        # replies left, so any extra call fails the test.
-        self.assertEqual(gh.requests, 4)
+        # Project repo: issues, pulls, one GraphQL request, the goal's
+        # unproven-work read; lane repo: issues (no loom:lanes issue here, so
+        # no comments read). The fake has no replies left, so any extra call
+        # fails the test.
+        self.assertEqual(gh.requests, 5)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -301,7 +302,7 @@ class SensitiveResumeTests(unittest.TestCase):
                          "labels": [{"name": "class:sensitive"}]}]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
-            reply(200, [])))
+            reply(200, []), reply(200, [])))
         lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
@@ -317,6 +318,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, []),
             reply(200, comments_with),
             reply(200, []))
         report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
@@ -333,6 +335,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, []),
             reply(200, comments_without),
             reply(200, []))
         report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
@@ -392,6 +395,7 @@ class SensitiveResumeTests(unittest.TestCase):
         gh = GitHub("t", transport=Fake(
             reply(200, goals), reply(200, []),
             reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
+            reply(200, []), reply(200, []),
             reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env={}, now=now, authors=["brain-bot"])
         self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
@@ -503,6 +507,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "g1": {"comments": {"nodes": []}},
                         "defaultBranchRef": {"name": "main"},
                         "merged": {"nodes": merged}}}}),
+                    reply(200, []),
                     reply(200, []))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
         self.assertIn("warning: work merges into side; set Trunk: side on the goal home", report)
@@ -515,6 +520,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "g1": {"comments": {"nodes": []}},
                         "defaultBranchRef": {"name": "main"},
                         "merged": {"nodes": merged}}}}),
+                    reply(200, []),
                     reply(200, []))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
         self.assertNotIn("warning: work merges into", report)
@@ -528,6 +534,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "g1": {"comments": {"nodes": []}},
                         "defaultBranchRef": {"name": "main"},
                         "merged": {"nodes": merged}}}}),
+                    reply(200, []),
                     reply(200, []))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
         self.assertNotIn("warning: work merges into", report)
@@ -543,6 +550,7 @@ class SensitiveResumeTests(unittest.TestCase):
                                 "g1": {"comments": {"nodes": []}},
                                 "defaultBranchRef": {"name": "main"},
                                 "merged": {"nodes": merged}}}}),
+                            reply(200, []),
                             reply(200, []))
                 report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
                 if should_warn:

@@ -9,6 +9,7 @@ import os
 import sys
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -82,6 +83,26 @@ class UnprovenLimitTests(unittest.TestCase):
                     reply(200, {}))         # PUT its labels
         url = self.brief(fake, body, regresses=5)
         self.assertEqual(url, "https://example.com/t/5")
+
+
+class StatusTests(unittest.TestCase):
+    def lines(self, children):
+        gh = GitHub("t", transport=Fake(reply(200, children)))
+        now = datetime(2030, 1, 1, 20, 0, tzinfo=timezone.utc)
+        return brain._goal_lines([goal()], {"goals": {1: {}}}, now, None, gh, REPO)
+
+    def test_status_shows_each_goals_unproven_count_against_the_limit(self):
+        children = [ticket(10 + n, "merged" if n % 2 else "shipped") for n in range(16)]
+        text = "\n".join(self.lines(children))
+        self.assertIn("unproven work 16/15", text)
+        self.assertIn("OVER LIMIT", text)
+        self.assertIn("no new build ticket", text)
+
+    def test_a_goal_under_the_limit_shows_the_count_with_no_warning(self):
+        children = [ticket(10 + n, "shipped") for n in range(3)]
+        text = "\n".join(self.lines(children))
+        self.assertIn("unproven work 3/15", text)
+        self.assertNotIn("OVER LIMIT", text)
 
 
 if __name__ == "__main__":

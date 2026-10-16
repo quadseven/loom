@@ -17,6 +17,14 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from bus import brain
+
+# A goal's unproven work (loom#483): its tickets at merged or shipped. A
+# verified ticket carries loom:verified instead, so it never counts; a
+# failed audit moves a ticket back to shipped, so it does. The snapshot rows
+# already carry each ticket's state, so the Floor needs no comment reads.
+UNPROVEN_STATES = ("merged", "shipped")
+
 REPORT_MARKER = "<!-- loom:report v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 PROOF_MARKER = "<!-- loom:proof v1 -->"
@@ -147,8 +155,15 @@ def _latest_measure(notes: Sequence[Dict[str, Any]]) -> Optional[str]:
     return found[-1] if found else None
 
 
+def _unproven(tickets: Sequence[str], states: Dict[str, str]) -> int:
+    """The goal's tickets at merged or shipped: unproven work still waiting on
+    a live check, against the limit the station and the brain enforce."""
+    return sum(1 for ref in tickets if states.get(ref) in UNPROVEN_STATES)
+
+
 def _goal_record(title: Optional[str], notes: Sequence[Dict[str, Any]], tickets: Sequence[str],
-                 proofs: Dict[str, List[str]], now: datetime) -> Dict[str, Any]:
+                 states: Dict[str, str], proofs: Dict[str, List[str]],
+                 limit: int, now: datetime) -> Dict[str, Any]:
     ordered = sorted(notes, key=lambda c: str(c.get("created_at") or ""))
     reports = [c for c in ordered if str(c.get("body") or "").startswith(REPORT_MARKER)]
     newest = reports[-1] if reports else None
@@ -160,6 +175,7 @@ def _goal_record(title: Optional[str], notes: Sequence[Dict[str, Any]], tickets:
         "measure": _latest_measure(ordered),
         "metric": str(sum(history)), "unit": "verified with proof, last 7 days",
         "previous": str(before), "history": history, "scale": None,
+        "unproven": _unproven(tickets, states), "unproven_limit": limit,
     }
 
 
@@ -168,11 +184,16 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
                  metrics_goal: Optional[str], now: datetime) -> Dict[str, Dict[str, Any]]:
     """One record per goal the tickets name (their `Part of` line)."""
     by_goal: Dict[str, List[str]] = {}
+    states: Dict[str, str] = {}
     for row in rows:
         if row.get("goal"):
-            by_goal.setdefault(row["goal"], []).append("%s#%s" % (row.get("repo"), row.get("number")))
+            ref = "%s#%s" % (row.get("repo"), row.get("number"))
+            by_goal.setdefault(row["goal"], []).append(ref)
+            states[ref] = str(row.get("state") or "")
     notes, proofs = _index(comments)
-    out = {goal: _goal_record(titles.get(goal), notes.get(goal, []), tickets, proofs, now)
+    limit = brain.unverified_limit()
+    out = {goal: _goal_record(titles.get(goal), notes.get(goal, []), tickets, states,
+                             proofs, limit, now)
            for goal, tickets in by_goal.items()}
     factory = _factory(metric_comments, now) if metrics_goal in out else None
     if factory:

@@ -252,9 +252,11 @@ def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
 
 
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
-                authors: Optional[Sequence[str]] = None) -> List[str]:
+                authors: Optional[Sequence[str]] = None, gh: Optional[GitHub] = None,
+                repo: str = "") -> List[str]:
     lines = ["### Goals"]
     owed = []
+    limit = unverified_limit()
     for issue in goals:
         node = data["goals"].get(int(issue["number"])) or {}
         led = goal_ledger(issue, node, now, authors)
@@ -264,6 +266,15 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                          led.get("journal", "none"), led.get("report", "none"),
                          led.get("measure", "none"), led.get("action", "none"),
                          led["state"], led["due"] or "unknown"))
+        if gh is not None and repo:
+            # loom#483: each goal's unproven count against the limit, beside
+            # the brain's own ledger, so the operator sees why new work waits.
+            held = _goal_unproven(gh, repo, int(issue["number"]), issue)
+            lines.append("  - unproven work %d/%d (merged or shipped with no standing proof)"
+                         % (held, limit))
+            if held > limit:
+                lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
+                             "brain files no ordinary brief for this goal until it is back under")
         if led["state"] != "ok":
             owed.append("- #%s report %s since %s" % (
                 issue["number"], led["state"].upper(), led["due"] or "an unknown time"))
@@ -549,7 +560,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     warn = _trunk_warning(goals, data)
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
-    lines += _goal_lines(goals, data, now, authors) + [""]
+    lines += _goal_lines(goals, data, now, authors, gh, repo) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or ())
