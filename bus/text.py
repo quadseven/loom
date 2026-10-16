@@ -24,6 +24,9 @@ PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/\S*")
 LOCAL_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])/(?:Users|home|private|tmp|var|etc|opt|System|Volumes)/\S*",
     re.IGNORECASE)
+# Host suffixes used by private networks and local service discovery.
+PRIVATE_HOST_RE = re.compile(
+    r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
 # Credential shapes that must not reach a public comment: provider key
 # prefixes, bearer tokens and key=value secrets.
 CREDENTIAL_RE = re.compile(
@@ -46,6 +49,8 @@ def check(text: str) -> None:
     """Raise ValueError for text the brain must never post."""
     if LOCAL_PATH_RE.search(text):
         raise ValueError("text contains an absolute path")
+    if PRIVATE_HOST_RE.search(text):
+        raise ValueError("text contains a private hostname")
     if _HANDLE.search(text):
         raise ValueError("text mentions the review bot's short name after an at-sign")
     if _CLOSING.search(text):
