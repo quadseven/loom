@@ -819,7 +819,7 @@ safe_git() {
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
 load_contract() {
-  local rev="$BASE" mode line key val
+  local rev="$BASE" mode line key val canon
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
   if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
        -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
@@ -830,6 +830,10 @@ load_contract() {
   [ -n "$mode" ] || return 0
   HAS_CONTRACT=1
   [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
+  # bus/contract.py reads every contract form repos use and prints the
+  # key: value lines below; a form it cannot read is a setup failure.
+  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" ||
+    { SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"; return 1; }
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -841,7 +845,7 @@ load_contract() {
       check) C_CHECK="$val" ;;
       *) SETUP_REASON="$CONTRACT_FILE has an unknown line '${line:0:40}'"; return 1 ;;
     esac
-  done < <(safe_git cat-file blob "$rev:$CONTRACT_FILE")
+  done <<< "$canon"
   [ -n "$C_CHECK" ] || { SETUP_REASON="$CONTRACT_FILE has no check: line"; return 1; }
   case "$C_SUBMODULES" in yes|no) ;; *) SETUP_REASON="$CONTRACT_FILE submodules: must be yes or no"; return 1 ;; esac
   [ -z "$C_INTERP" ] || [[ "$C_INTERP" =~ ^[A-Za-z0-9._+-]+$ ]] ||
