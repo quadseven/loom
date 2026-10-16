@@ -40,7 +40,24 @@ def command_for(public_cmd: str, private_cmd: str, private: bool) -> str:
     """The agent command for a repo, or "" when the repo is skipped. A
     private repo only ever gets the private command: the public one may run a
     provider that trains on prompts."""
-    return (private_cmd if private else public_cmd).strip()
+    command = (private_cmd if private else public_cmd).strip()
+    if not private or not command:
+        return command
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return ""
+    if not argv or not argv[0].endswith("/rewrite_agent.sh"):
+        return command
+    if len(argv) != 3:
+        return ""
+    for model in argv[2].split(","):
+        provider, separator, name = model.partition("/")
+        if not separator or not name or provider not in {"codex", "claude", "anthropic", "opencode-go"}:
+            return ""
+        if provider == "opencode-go" and "muse-spark" in name and "contributor" in name:
+            return ""
+    return command
 
 
 def brief_format() -> str:

@@ -148,15 +148,24 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # this table). A limit is not a failure, so the move stays in the tier and
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
+SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 TIERS: Dict[str, Tuple[str, ...]] = {
-    # The operator's priority (2026-10-14): Muse and agy first on public
-    # repos, so their allowances are spent before the rest. Both are public
-    # only, so a private repo's ticket still starts at spark or codex.
-    "easy": ("muse", "agy", "spark", "spark-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-             "openrouter", "workersai", "zen", "zai"),
+    # The operator's priorities: Muse and agy first on public repos, so their
+    # allowances are spent before the rest (2026-10-14); then the Sparks,
+    # much more (2026-10-16): four local slots on the operator's own
+    # hardware, free, and open to private repos. Tiers follow the Artificial
+    # Analysis Intelligence Index (the operator's yardstick).
+    "easy": ("muse", "agy") + SPARKS + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                                         "openrouter", "workersai", "zen", "zai"),
+    # The Sparks run Qwen3.8 27B since 2026-10-16 (Intelligence Index 26 to
+    # 34, beside Kimi K2.7 Code's 26 here), so they take medium work too.
     "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
-               "opencode-go-4") + ANTHROPIC,
-    "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
+               "opencode-go-4") + SPARKS + ANTHROPIC,
+    # agy runs Gemini 4 Argon on the operator's Google plan since 2026-10-15:
+    # Artificial Analysis Intelligence Index 53 at high effort, beside Claude
+    # Opus 5.5 high (54) and GPT-6.1 Sol high (50), so it takes hard work on
+    # public repos (agy stays public only).
+    "hard": ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
 # takes a free lane of these tiers instead, in order: the next harder tier,

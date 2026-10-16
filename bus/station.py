@@ -8,6 +8,7 @@ for each lane that can take one. docs/BRAIN.md ("Claim and outcome", "Polling bu
 from __future__ import annotations
 
 import calendar
+import base64
 from datetime import date, timedelta
 import errno
 import fcntl
@@ -1035,7 +1036,9 @@ class Station:
                 return False
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
-        text = tickets.render_brief(repo, issue, lane, attempt, fix)
+        has_contract, checks = self._validation_checks(repo)
+        text = tickets.render_brief(repo, issue, lane, attempt, fix,
+                                    checks, has_contract)
         claiming = self._write_brief(lane, name, text)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
         if RUNNING not in labels:
@@ -1051,6 +1054,92 @@ class Station:
                  % (repo, number, fix_comment_id if fix_comment_id is not None else "with unknown id"))
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
         return True
+
+    def _contents_text(self, repo: str, path: str) -> Optional[str]:
+        """Read a text file through GitHub contents; None means it is absent."""
+        data = self.gh.rest("GET", "/repos/%s/contents/%s" %
+                            (repo, quote(path, safe="/")), ok=(404,)).data
+        if not isinstance(data, dict) or not data.get("content"):
+            return None
+        return base64.b64decode(data["content"]).decode("utf-8")
+
+    def _validation_checks(self, repo: str) -> Tuple[bool, List[Tuple[str, str]]]:
+        """Return whether the repo has a validation contract and its PR run steps."""
+        if self._contents_text(repo, ".loom/validation.conf") is not None:
+            return True, []
+        listing = self.gh.rest("GET", "/repos/%s/contents/.github/workflows" % repo,
+                               ok=(404,)).data
+        found: List[Tuple[str, str]] = []
+        for item in listing if isinstance(listing, list) else []:
+            path = str(item.get("path") or "") if isinstance(item, dict) else ""
+            if not path.endswith((".yml", ".yaml")):
+                continue
+            workflow = self._contents_text(repo, path)
+            has_pull_request = workflow is not None and bool(re.search(
+                r"(?m)^\s*pull_request\s*(?::|,|\])|^\s*on:\s*\[[^\]]*pull_request",
+                workflow))
+            if not has_pull_request:
+                continue
+            lines = workflow.splitlines()
+            index = 0
+            step_name = ""
+            run_number = 0
+            while index < len(lines):
+                if re.match(r"^\s*-\s+", lines[index]):
+                    step_name = ""
+                named = re.match(r"^\s*-\s*name:\s*(.+?)\s*$", lines[index])
+                if named:
+                    step_name = named.group(1).strip("\"'")
+                match = re.match(r"^\s*(?:-\s*)?run:\s*(.*)$", lines[index])
+                if not match:
+                    index += 1
+                    continue
+                run_number += 1
+                command = match.group(1).strip()
+                indent = len(lines[index]) - len(lines[index].lstrip())
+                index += 1
+                if command in ("|", ">", "|-", ">-"):
+                    block = []
+                    while index < len(lines):
+                        line = lines[index]
+                        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                            break
+                        block.append(line.strip())
+                        index += 1
+                    command = " ".join(part for part in block if part)
+                if command:
+                    source = "%s, step %s" % (path, step_name or str(run_number))
+                    found.append((source, command))
+        return False, found
+
+    def file_validation_contracts(self) -> None:
+        """Ask each goal home for a validation contract while its repo lacks one."""
+        title = "Add the repository validation contract"
+        body = ("## Why\nLanes need the repository's checks before opening pull requests.\n\n"
+                "## What\nAdd `.loom/validation.conf` with the lint, format, type and test "
+                "commands that the pull-request workflows run, in that order. For every "
+                "command, record the workflow file and step it comes from. The contract "
+                "must pass on the default branch in this ticket's pull request.\n\n"
+                "## Acceptance criteria\n- [ ] The contract lists the repository's lint, "
+                "format, type and test commands in order, with workflow file and step.\n"
+                "- [ ] Every listed command matches a run step in a pull-request workflow.\n"
+                "- [ ] The ticket pull request passes the contract on the default branch.\n\n"
+                "## Size\nS\n\n## Out of scope\nWriting the contract by the station.\n")
+        for repo, goal in self._goal_homes():
+            if not str(goal.get("title") or "").startswith("Backlog:"):
+                continue
+            if self._contents_text(repo, ".loom/validation.conf") is not None:
+                continue
+            issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:ticket&state=open&per_page=100"
+                                  % repo).data or []
+            open_issues = issues if isinstance(issues, list) else []
+            pending = any(isinstance(issue, dict) and "pull_request" not in issue
+                          and str(issue.get("title") or "") == title
+                          for issue in open_issues)
+            if pending:
+                continue
+            brain.brief(self.gh, repo, int(goal["number"]), title, body,
+                        difficulty="medium")
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -3133,6 +3222,7 @@ class Station:
                 continue
             state[key] = self.now
         _write_json(path, state)
+        self.file_validation_contracts()
 
     # -- agent rewrites of loom:triage issues ----------------------------
     def _rewrite_goals(self) -> List[Tuple[str, str, int]]:

@@ -28,6 +28,9 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 # Lane default models, named in every PR. codex: the CLI's own configured
 # default; claude: the current Opus. Override either in the environment.
 LOOM_CODEX_MODEL="${LOOM_CODEX_MODEL:-$(sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$HOME/.codex/config.toml" 2>/dev/null | head -1)}"
+if [ -z "${LOOM_REWRITE_PRIVATE_CMD:-}" ] && [ -n "$LOOM_CODEX_MODEL" ]; then
+  LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/$LOOM_CODEX_MODEL"
+fi
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1:free}"
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
@@ -43,15 +46,17 @@ LOOM_ZAI_MODEL="${LOOM_ZAI_MODEL:-zai/glm-4.7-flash}"
 LOOM_WORKERSAI_MODEL="${LOOM_WORKERSAI_MODEL:-cloudflare-workers-ai/@cf/qwen/qwen3.8-27b}"
 LOOM_AGY_MODEL="${LOOM_AGY_MODEL:-gemini-3.8-flash-high}"
 LOOM_SPARK_URL="${LOOM_SPARK_URL:-}"
-# The second spark slot's box (spark-2); empty uses LOOM_SPARK_URL.
+# The other spark slots' boxes (spark-2, spark-3, spark-4); empty uses LOOM_SPARK_URL.
 LOOM_SPARK_2_URL="${LOOM_SPARK_2_URL:-}"
+LOOM_SPARK_3_URL="${LOOM_SPARK_3_URL:-}"
+LOOM_SPARK_4_URL="${LOOM_SPARK_4_URL:-}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
 # The context and output window the spark endpoint serves (lanes/agent_sandbox.sh).
 LOOM_SPARK_CONTEXT="${LOOM_SPARK_CONTEXT:-32768}"
 LOOM_SPARK_OUTPUT="${LOOM_SPARK_OUTPUT:-4096}"
 export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
   LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
-  LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_MODEL \
+  LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_3_URL LOOM_SPARK_4_URL LOOM_SPARK_MODEL \
   LOOM_SPARK_CONTEXT LOOM_SPARK_OUTPUT
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -68,7 +73,7 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
-  codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2)
+  codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
@@ -150,9 +155,8 @@ done
 # the station, brain and lane service logs, docs/LANES.md), and
 # LOOM_REWRITE_CMD and LOOM_REWRITE_PRIVATE_CMD (the agent commands that
 # rewrite loom:triage issues into tickets, docs/BRAIN.md Triage; for example
-# "lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash", and for
-# private repos the same with a model whose provider does not train on
-# prompts, such as opencode-go/kimi-k2.7-code, never a public-only one), and
+# "lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash"; private
+# repos default to the codex subscription when LOOM_CODEX_MODEL is set), and
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and
@@ -215,6 +219,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_EVIDENCE_CMDS</key><string>$(xml "${LOOM_EVIDENCE_CMDS:-}")</string>
     <key>LOOM_REWRITE_CMD</key><string>$(xml "${LOOM_REWRITE_CMD:-}")</string>
     <key>LOOM_REWRITE_PRIVATE_CMD</key><string>$(xml "${LOOM_REWRITE_PRIVATE_CMD:-}")</string>
+    <key>LOOM_REWRITE_CLAUDE_TOKEN_SSM</key><string>$(xml "${LOOM_REWRITE_CLAUDE_TOKEN_SSM:-}")</string>
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
   </dict>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import base64
 import contextlib
 import fcntl
 import io
@@ -153,13 +154,21 @@ class FakeGitHub:
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
         path = parts.path + ("?" + parts.query if parts.query else "")
-        self.calls.append((method, path))
+        internal_validation_read = (parts.path.startswith("/repos/%s/contents/" % REPO)
+                                    or "labels=loom:ticket" in parts.query
+                                    or "labels=loom:goal" in parts.query)
+        if not internal_validation_read:
+            self.calls.append((method, path))
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private,
                                "default_branch": "main"})
+        if method == "GET" and parts.path.startswith("/repos/%s/contents/" % REPO):
+            if parts.path.endswith("/.github/workflows"):
+                return reply(200, [])
+            return reply(404, {"message": "Not Found"})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -195,6 +204,17 @@ class FakeGitHub:
             self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
+            if data.get("title") == "Add the repository validation contract":
+                number = max(self.issues.keys(), default=0) + 1
+                made = {"number": number, "id": 1000 + number, "title": data["title"],
+                        "body": data["body"], "state": "open",
+                        "labels": [{"name": label} for label in data["labels"]],
+                        "user": {"login": "alice-example"}}
+                self.issues[number] = made
+                self.events[number] = []
+                self.comments[number] = []
+                self.created.append(data)
+                return reply(201, made)
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
             return reply(201, {"number": 1})
@@ -969,6 +989,66 @@ class TicketsTest(unittest.TestCase):
             "# T12: Fix the thing\n\n"
             "## Why\nBecause.\n\n## What\nDo it.\nBase is fine\n"))
 
+    def test_contractless_brief_lists_pr_workflow_commands_and_contract_brief_does_not(self):
+        issue = {"number": 12, "title": "Fix the thing", "body": BODY}
+        checks = [(".github/workflows/test.yml, step Lint", "ruff check ."),
+                  (".github/workflows/test.yml, step Tests", "python -m unittest")]
+        text = tickets.render_brief(REPO, issue, "codex", ci_checks=checks,
+                                    has_contract=False)
+        self.assertIn("## Checks CI runs", text)
+        self.assertIn("`ruff check .` (from .github/workflows/test.yml, step Lint)", text)
+        self.assertIn("`python -m unittest` (from .github/workflows/test.yml, step Tests)", text)
+        contracted = tickets.render_brief(REPO, issue, "codex", ci_checks=checks,
+                                          has_contract=True)
+        self.assertNotIn("Checks CI runs", contracted)
+
+
+class ValidationContractTest(Base):
+    def test_reads_run_lines_only_from_pull_request_workflows(self):
+        worker = station.Station(GitHub("token", transport=self.fake), self.settings)
+        contents = {
+            "/repos/%s/contents/.loom/validation.conf" % REPO: None,
+            "/repos/%s/contents/.github/workflows" % REPO: [
+                {"path": ".github/workflows/test.yml"},
+                {"path": ".github/workflows/nightly.yml"}],
+            "/repos/%s/contents/.github/workflows/test.yml" % REPO:
+                "name: Test\non:\n  pull_request:\njobs:\n  test:\n    steps:\n"
+                "      - name: Unit tests\n        run: python -m unittest\n",
+            "/repos/%s/contents/.github/workflows/nightly.yml" % REPO:
+                "name: Nightly\non:\n  schedule:\n    - cron: '0 0 * * *'\njobs:\n"
+                "  test:\n    steps:\n      - run: ignored\n",
+        }
+        def response(method, path, **kwargs):
+            data = contents[path]
+            if isinstance(data, str):
+                data = {"content": base64.b64encode(data.encode()).decode()}
+            return type("Response", (), {"data": data})()
+        worker.gh.rest = mock.Mock(side_effect=response)
+        has_contract, checks = worker._validation_checks(REPO)
+        self.assertFalse(has_contract)
+        self.assertEqual(checks, [(".github/workflows/test.yml, step Unit tests",
+                                  "python -m unittest")])
+
+    def test_missing_contract_files_one_ticket_and_skips_an_open_duplicate(self):
+        goal = {"number": 2, "title": "Backlog: reusable repository work"}
+        self.gh = GitHub("token", transport=self.fake)
+        worker = station.Station(self.gh, self.settings)
+        worker._goals = [(REPO, goal)]
+        worker._contents_text = mock.Mock(return_value=None)
+        worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": []})())
+        with mock.patch.object(brain, "brief") as file_ticket:
+            worker.file_validation_contracts()
+        self.assertEqual(file_ticket.call_count, 1)
+        self.assertEqual(file_ticket.call_args.args[2], 2)
+        self.assertIn(".loom/validation.conf", file_ticket.call_args.args[4])
+
+        worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": [
+            {"number": 3, "title": "Add the repository validation contract"}
+        ]})())
+        with mock.patch.object(brain, "brief") as file_ticket:
+            worker.file_validation_contracts()
+        file_ticket.assert_not_called()
+
 
 class TrustTest(unittest.TestCase):
     def setUp(self):
@@ -1215,7 +1295,7 @@ class ClaimTest(Base):
         # sends no ETag for it), then the briefed list's 304; with no loom:pr
         # ticket no pull request list is read.
         self.assertEqual(len(self.fake.calls), first + 3)
-        self.assertEqual(gh.requests, 3)
+        self.assertEqual(gh.requests, 4)
         self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
