@@ -1846,6 +1846,47 @@ class EscalateTests(unittest.TestCase):
                          [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
 
+    def finished_pr_routes(self, green=True, review="success", resolved=True):
+        """Two fix rounds on lane codex, and pull request #8 in the given state."""
+        issue = stuck_ticket("pr", body="Model: gpt-6-sol\n\n" + BODY)
+        history = [claim("2030-01-01T00:10:00Z", "codex"), fixc("2030-01-01T00:20:00Z"),
+                   claim("2030-01-01T00:25:00Z", "codex"), fixc("2030-01-01T00:30:00Z")]
+        routes = ticket_routes(issue, [], history)
+        details = {"headRefOid": "abc123", "mergeable": "MERGEABLE",
+                   "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                       "state": "SUCCESS" if green else "FAILURE"}}}]},
+                   "reviewThreads": {"nodes": [{"id": "T1", "isResolved": resolved,
+                                                "comments": {"nodes": []}}]}}
+        routes[("POST", "/graphql")] = reply(200, {"data": {"repository": {"pullRequest": details}}})
+        routes[("GET", "/commits/abc123/check-runs")] = reply(200, {"check_runs": [
+            {"name": brain.review_check_name({}), "status": "completed", "conclusion": review}]})
+        return routes
+
+    def test_escalate_refuses_a_ticket_whose_pull_request_has_nothing_to_fix(self):
+        # 2026-10-16: two fix rounds escalated a pull request whose head was
+        # green, reviewed and threadless, and the same model ran it again.
+        fake = Routed(self.finished_pr_routes())
+        with unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_CHECK": ""}):
+            with self.assertRaises(ValueError) as caught:
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        said = str(caught.exception)
+        self.assertIn("pull request #8 has nothing to fix", said)
+        self.assertIn("head abc123 is green", said)
+        self.assertIn("the review check %s passed on it" % brain.review_check_name({}), said)
+        self.assertIn("no review thread is open", said)
+        self.assertEqual([c for c in fake.calls if c[0] in ("PUT", "PATCH")
+                          or (c[0] == "POST" and "/graphql" not in c[1])], [])
+
+    def test_escalate_still_sends_back_a_pull_request_with_something_to_fix(self):
+        cases = {"failing checks": {"green": False}, "review not passed": {"review": "failure"},
+                 "open thread": {"resolved": False}}
+        for name, state in cases.items():
+            with self.subTest(name), unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_CHECK": ""}):
+                fake, outcome = self.run_escalate(self.finished_pr_routes(**state))
+                self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+                self.assertTrue(fake.sent("POST", "/issues/9/comments")[-1]["body"]
+                                .startswith("<!-- loom:escalate v1 -->"))
+
     def test_escalate_refuses_a_ticket_that_is_not_repeatedly_stuck(self):
         issue = dict(stuck_ticket("failed"), created_at="2999-01-01T00:00:00Z")
         fake = Routed(ticket_routes(issue, [event("labeled", "loom:failed", "2999-01-01T00:00:00Z")], []))

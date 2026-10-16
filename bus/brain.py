@@ -2824,10 +2824,28 @@ def _waiting_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> List[tickets.A
     return tickets.after_holds(repo, headers, lookup)[0]
 
 
+def _nothing_to_fix(gh: GitHub, repo: str, pr: int) -> Optional[str]:
+    """The finished state of an open pull request, or None while it still has
+    something to fix: its head is green, the review check passed on that
+    head, no review thread is open and it does not conflict. Fix rounds alone
+    escalated such a pull request on 2026-10-16, and a fourth run of the same
+    model changed nothing before the brain merged the head it already had."""
+    details = _pr_graphql(gh, repo, pr)
+    sha = str(details.get("headRefOid") or "")
+    check = review_check_name()
+    if (not sha or details.get("mergeable") == "CONFLICTING" or not _checks_green(details)
+            or not _threads_resolved(details) or not _review_check_passed(gh, repo, sha, check)):
+        return None
+    return ("pull request #%d has nothing to fix (head %s is green, the review check "
+            "%s passed on it, and no review thread is open)" % (pr, sha[:12], check))
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
-    ladder whose lane is available, and return a one-line outcome."""
+    ladder whose lane is available, and return a one-line outcome. A ticket
+    whose open pull request has nothing to fix is refused: fix rounds that
+    already landed a green, reviewed head are not a stuck ticket."""
     _check_written_text(notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
@@ -2845,6 +2863,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     history = _history(gh, repo, issue, datetime.now(timezone.utc))
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
+    open_pr = _pr_for_ticket(gh, repo, number)
+    finished = _nothing_to_fix(gh, repo, open_pr) if open_pr is not None else None
+    if finished:
+        raise ValueError("ticket is not escalated: %s; land it instead" % finished)
     if history.rung is None:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                 {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
@@ -2872,7 +2894,7 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
                          "Rung: %d %s %s" % (rung + 1, model, lane)])
     _check_written_text(comment)
-    pr = _pr_for_ticket(gh, repo, number) if "loom:pr" in names else None
+    pr = open_pr if "loom:pr" in names else None
     if pr is not None:
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:
