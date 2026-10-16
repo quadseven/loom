@@ -1175,7 +1175,7 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.model(7), self.model(8)), (None, None))
 
-    def limited_easy(self, busy=(), available=None, limited=("spark", "spark-2")):
+    def limited_easy(self, busy=(), available=None, limited=factory.SPARKS):
         """An easy ticket briefed on spark at a limit (both local coder slots
         by default), with a ticket waiting on each lane in `busy`."""
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
@@ -1209,7 +1209,7 @@ class Tickets(Base):
         self.assertIn("opencode-go-4", factory.PUBLIC_ONLY)
 
     def test_a_private_easy_ticket_goes_to_spark_2_when_spark_is_busy(self):
-        self.assertEqual(factory.lanes_of("easy", True)[:2], ("spark", "spark-2"))
+        self.assertEqual(factory.lanes_of("easy", True)[:4], factory.SPARKS)
         self.gh.private = True
         self.limited_easy(limited=("spark",))
         self.assertEqual(self.lane(7), "spark-2")
@@ -1282,7 +1282,7 @@ class Tickets(Base):
         self.assertIn("fallback: no medium lane is up", self.gh.comments[7][-1]["body"])
 
     def test_a_private_ticket_never_falls_back_to_a_public_only_lane(self):
-        busy = ("claude", "spark", "spark-2", "openrouter", "workersai")
+        busy = ("claude",) + factory.SPARKS + ("openrouter", "workersai")
         self.limited_medium(busy=busy)
         self.assertEqual(self.lane(7), "codex")  # waits; zen, zai and agy are public only
         self.setUp()
