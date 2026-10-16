@@ -396,8 +396,9 @@ on hard work):
   which trains on prompts).
   Never anthropic or claude for an easy ticket.
 - Medium: on a public repo muse first, then agy; then codex or opencode-go
-  (opencode-go-4 on public repos only); an anthropic slot only when every
-  codex and opencode-go slot already holds work.
+  (opencode-go-4 on public repos only); then a spark slot (Qwen3.8 27B, any
+  repo); an anthropic slot only when every codex, opencode-go and spark slot
+  already holds work.
 - Hard: anthropic, claude, agy (Gemini 4 Argon, public repos only) or codex,
   never a free lane or spark. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence

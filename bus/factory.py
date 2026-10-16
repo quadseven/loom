@@ -154,12 +154,13 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # allowances are spent before the rest (2026-10-14); then the Sparks,
     # much more (2026-10-16): four local slots on the operator's own
     # hardware, free, and open to private repos. Tiers follow the Artificial
-    # Analysis Intelligence Index (the operator's yardstick): the Sparks'
-    # model, Qwen3 Coder Next, scores 9, so they stay in easy.
+    # Analysis Intelligence Index (the operator's yardstick).
     "easy": ("muse", "agy") + SPARKS + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
                                          "openrouter", "workersai", "zen", "zai"),
+    # The Sparks run Qwen3.8 27B since 2026-10-16 (Intelligence Index 26 to
+    # 34, beside Kimi K2.7 Code's 26 here), so they take medium work too.
     "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
-               "opencode-go-4") + ANTHROPIC,
+               "opencode-go-4") + SPARKS + ANTHROPIC,
     # agy runs Gemini 4 Argon on the operator's Google plan since 2026-10-15:
     # Artificial Analysis Intelligence Index 53 at high effort, beside Claude
     # Opus 5.5 high (54) and GPT-6.1 Sol high (50), so it takes hard work on
