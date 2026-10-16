@@ -491,6 +491,61 @@ answers only localhost Host headers; the viewer itself sends nothing off
 the machine (the uploads above do). API-lane agents run on the same machine, so their sandbox denies every
 loopback connection; they cannot query the viewer or any other local service.
 
+## The evidence endpoint
+
+The remote brain (docs/MUSE.md) has no cluster or database access of its
+own. `bus/evidence_endpoint.py` (installed as `com.loom.evidence` when
+`LOOM_EVIDENCE_CONFIG` is set) lets it read service logs and database rows on
+the lane machine, read-only:
+
+- `GET /evidence` lists the named log sources (and whether each takes
+  `since`) and the named queries with their parameter types.
+- `GET /evidence/logs?source=<name>&match=<fixed string>&since=<hours>`
+  answers the newest lines of that source's output that contain `match`
+  (`since` is 1 to 168 hours, default 24).
+- `GET /evidence/query?name=<name>&<param>=<value>...` answers the first rows
+  of that query.
+
+The names live in a private JSON file, never in this repo
+(`lanes/mac/evidence.example.json` shows the shape). A log source is a fixed
+`command`, an argument list run without a shell; `{since}` and `{match}` in an
+argument become the call's values. A query is a fixed `sql` (one `SELECT` or
+`WITH`, no semicolon, no write keyword) with typed `params` (`int` or `text`,
+used as `:param`), sent on stdin to a fixed `command`, such as `psql --csv`
+with a `service=` entry whose role can only read (keep passwords in
+`~/.pgpass`, not in the argument list). Nothing else runs: an unknown name
+answers 404, and a parameter that is unknown, missing, repeated or of the
+wrong type answers 400. That includes any text value with a character outside
+letters, digits, spaces and `. _ : @ / + = , -`, with `--`, or starting
+with `-`, so no SQL or shell metacharacter and no command option gets
+through. Choose names that may appear in public
+text: the brain quotes them in journals.
+
+An answer holds at most 200 lines or rows and 64 KB. A line that fails the
+verify-brief check (`bus/evidence.py`: credentials, private hosts, IP
+addresses, local paths, non-ASCII) is dropped and counted in the service log,
+never in the answer: a count there would tell a caller whether a withheld
+line contains a guessed `match`, and so read a secret one character at a
+time. `truncated` says safe lines were left out. A command's output is spooled to
+a temporary file and at most 16 MB of it is read (the newest end of a log, the
+start of a query's rows); `output_cut` says the rest was not read. At most two
+commands run at once, and a call beyond that answers 503. A command that fails answers 502
+with its exit code, and one that runs past 60 seconds answers 504. Neither
+answer includes the command's output. Every call needs
+`Authorization: Bearer <token>`, read at start from the SSM parameter
+`LOOM_EVIDENCE_TOKEN_SSM` (at least 24 characters). A call without it answers
+401, and lanes are never given it, though a lane's sandbox can reach a
+tailnet address. Every call, refused or answered, is logged to
+`$LOOM_HOME/logs/evidence.log` with its source, parameters, status, line
+count, dropped count and size. Only `GET` is served.
+
+The service binds `LOOM_EVIDENCE_HOST` (default: `tailscale ip -4`) on
+`LOOM_EVIDENCE_PORT` (default 7341) and refuses to start on anything but a
+tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48) or loopback address. Muse calls
+it with `LOOM_EVIDENCE_URL` and `LOOM_EVIDENCE_TOKEN` from its own
+environment. It loads its code and the token at start, so after a Loom update
+or a token rotation run `launchctl kickstart -k gui/$(id -u)/com.loom.evidence`.
+
 ## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
 
 - `openrouter` (free models via opencode), `opencode-go` (subscription models

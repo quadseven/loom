@@ -1,0 +1,23 @@
+{
+  "logs": {
+    "station": {
+      "command": ["tail", "-n", "50000", "YOUR_LOOM_HOME/logs/station.log"]
+    },
+    "app": {
+      "command": ["kubectl", "logs", "deployment/YOUR_DEPLOYMENT", "--namespace", "YOUR_NAMESPACE",
+                  "--since={since}h", "--timestamps"]
+    }
+  },
+  "queries": {
+    "run": {
+      "command": ["psql", "--no-psqlrc", "--csv", "--set", "ON_ERROR_STOP=1", "service=YOUR_READ_ONLY_SERVICE"],
+      "sql": "SELECT id, state, room, updated_at FROM YOUR_RUN_TABLE WHERE id = :id",
+      "params": {"id": "int"}
+    },
+    "refusals": {
+      "command": ["psql", "--no-psqlrc", "--csv", "--set", "ON_ERROR_STOP=1", "service=YOUR_READ_ONLY_SERVICE"],
+      "sql": "SELECT module, reason, created_at FROM YOUR_REFUSAL_TABLE WHERE module = :module AND created_at > now() - make_interval(hours => :hours) ORDER BY created_at DESC LIMIT 200",
+      "params": {"module": "text", "hours": "int"}
+    }
+  }
+}

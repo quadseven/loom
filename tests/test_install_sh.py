@@ -121,6 +121,37 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn('<key>LOOM_PIN_TARGETS</key><string>[{"repo":"example-owner/deploy"}]</string>', plist)
 
+    def evidence_plist(self):
+        return self.home / "Library" / "LaunchAgents" / "com.loom.evidence.plist"
+
+    def test_the_evidence_endpoint_installs_with_its_private_config(self):
+        result = self.run_install(LOOM_EVIDENCE_CONFIG="/example/evidence.json",
+                                  LOOM_EVIDENCE_HOST="100.64.0.9",
+                                  LOOM_EVIDENCE_TOKEN_SSM="/example/evidence-token",
+                                  LOOM_AWS_REGION="us-east-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("installed com.loom.evidence", result.stdout)
+        plist = self.evidence_plist().read_text()
+        for entry in ("<string>bus.evidence_endpoint</string>",
+                      "<key>KeepAlive</key><true/>",
+                      "<key>LOOM_EVIDENCE_CONFIG</key><string>/example/evidence.json</string>",
+                      "<key>LOOM_EVIDENCE_HOST</key><string>100.64.0.9</string>",
+                      "<key>LOOM_EVIDENCE_PORT</key><string>7341</string>",
+                      "<key>LOOM_EVIDENCE_TOKEN_SSM</key><string>/example/evidence-token</string>",
+                      "<key>LOOM_AWS_REGION</key><string>us-east-1</string>"):
+            self.assertIn(entry, plist)
+        self.assertIn("bootstrap", self.log.read_text())
+
+    def test_the_evidence_endpoint_needs_its_config_and_a_tailnet_address(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("skipped com.loom.evidence: LOOM_EVIDENCE_CONFIG is not set", result.stdout)
+        # No tailscale on this PATH and no LOOM_EVIDENCE_HOST: no address to bind.
+        result = self.run_install(LOOM_EVIDENCE_CONFIG="/example/evidence.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("skipped com.loom.evidence: no tailnet address", result.stdout)
+        self.assertFalse(self.evidence_plist().exists())
+
     def test_a_bad_station_interval_installs_nothing(self):
         for bad in ("soon", "30"):
             with self.subTest(bad=bad):

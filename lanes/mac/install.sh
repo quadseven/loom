@@ -309,3 +309,62 @@ EOF
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "installed $LABEL -> http://localhost:$VIEWER_PORT/"
 fi
+
+# The evidence endpoint (bus/evidence_endpoint.py, docs/LANES.md): a
+# long-running read-only HTTP service the remote brain reads service logs and
+# database rows through. Installed only when LOOM_EVIDENCE_CONFIG names its
+# private JSON config (lanes/mac/evidence.example.json shows the shape; keep
+# the real file outside this checkout). It binds LOOM_EVIDENCE_HOST (default:
+# this machine's tailnet address, from tailscale ip -4) on LOOM_EVIDENCE_PORT
+# (default 7341) and reads its bearer token from the SSM parameter named by
+# LOOM_EVIDENCE_TOKEN_SSM, in LOOM_AWS_REGION. Without LOOM_EVIDENCE_CONFIG an
+# installed one is left as it is. It loads code at start: after a Loom update,
+# launchctl kickstart -k gui/$(id -u)/com.loom.evidence runs the new code.
+LABEL="com.loom.evidence"
+if [ -z "${LOOM_EVIDENCE_CONFIG:-}" ]; then
+  echo "skipped $LABEL: LOOM_EVIDENCE_CONFIG is not set"
+else
+  EVIDENCE_HOST="${LOOM_EVIDENCE_HOST:-$(tailscale ip -4 2>/dev/null | head -1 || true)}"
+  if [ -z "$EVIDENCE_HOST" ]; then
+    echo "skipped $LABEL: no tailnet address (set LOOM_EVIDENCE_HOST)"
+  else
+    EVIDENCE_PORT="${LOOM_EVIDENCE_PORT:-7341}"
+    PLIST="$AGENTS/$LABEL.plist"
+    cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>-m</string>
+    <string>bus.evidence_endpoint</string>
+  </array>
+  <key>WorkingDirectory</key><string>$X_REPO</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>$X_LOOM/logs/evidence.log</string>
+  <key>StandardErrorPath</key><string>$X_LOOM/logs/evidence.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$X_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$X_HOME</string>
+    <key>LOOM_EVIDENCE_CONFIG</key><string>$(xml "$LOOM_EVIDENCE_CONFIG")</string>
+    <key>LOOM_EVIDENCE_HOST</key><string>$(xml "$EVIDENCE_HOST")</string>
+    <key>LOOM_EVIDENCE_PORT</key><string>$(xml "$EVIDENCE_PORT")</string>
+    <key>LOOM_EVIDENCE_TOKEN_SSM</key><string>$(xml "${LOOM_EVIDENCE_TOKEN_SSM:-}")</string>
+    <key>LOOM_AWS_REGION</key><string>$(xml "${LOOM_AWS_REGION:-}")</string>
+  </dict>
+</dict>
+</plist>
+PLIST_EOF
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    wait_job_gone "gui/$(id -u)/$LABEL"
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    echo "installed $LABEL -> http://$EVIDENCE_HOST:$EVIDENCE_PORT/evidence"
+  fi
+fi
