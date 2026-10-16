@@ -504,13 +504,18 @@ def _ticket_page(state, parsed):
     params = parse_qs(parsed.query)
     rows = _all_tickets(state)
     filtered = [row for row in rows if (not params.get("state") or row.get("state") == params["state"][0])
-                and (not params.get("goal") or row.get("goal") == params["goal"][0])]
+                and (not params.get("goal") or row.get("goal") == params["goal"][0])
+                and (not params.get("model") or row.get("model") == params["model"][0])]
     state_chips = ''.join('<a class="chip" href="/tickets?state=%s">%s %d</a>' % (
         name, name, sum(row.get("state") == name for row in rows)) for name in STATES
         if any(row.get("state") == name for row in rows))
     goals = sorted({row["goal"] for row in rows if row.get("goal")})
     goal_chips = ''.join('<a class="chip" href="/tickets?goal=%s">%s</a>' % (quote(goal, safe=""), html.escape(goal)) for goal in goals)
-    body = '<div class="chips">%s %s</div>' % (state_chips, goal_chips)
+    models = sorted({row["model"] for row in rows if row.get("model")})
+    model_chips = ''.join('<a class="chip" href="/tickets?model=%s">%s %d</a>' % (
+        quote(model, safe=""), html.escape(model),
+        sum(row.get("model") == model for row in rows)) for model in models)
+    body = '<div class="chips">%s %s %s</div>' % (state_chips, goal_chips, model_chips)
     if filtered:
         body += '<div class="ticket-grid">%s</div>' % ''.join(_ticket_row(row) for row in filtered)
     else:

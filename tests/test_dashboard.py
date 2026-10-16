@@ -378,6 +378,19 @@ class DashboardViewTest(unittest.TestCase):
         self.assertIn("Other ticket", body)
         self.assertNotIn("Elsewhere ticket", body)
 
+    def test_ticket_model_filter_lists_only_that_model(self):
+        from dashboard.server import _tickets
+        from urllib.parse import urlsplit
+        body = _tickets(self.State(), urlsplit("/tickets?model=model-x"))
+        self.assertIn("Sample ticket", body)
+        self.assertNotIn("Other ticket", body)
+        body = _tickets(self.State(), urlsplit("/tickets?model=model-y"))
+        self.assertIn("Other ticket", body)
+        self.assertNotIn("Sample ticket", body)
+        body = _tickets(self.State(), urlsplit("/tickets"))
+        self.assertIn('href="/tickets?model=model-x"', body)
+        self.assertIn('href="/tickets?model=model-y"', body)
+
     def test_ticket_filters_without_params(self):
         from dashboard.server import _tickets
         from urllib.parse import urlsplit
