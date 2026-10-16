@@ -2097,42 +2097,49 @@ class Station:
         return True
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
-        """Hold a ticket after the same consecutive failure and record its run table."""
+        """Hold a ticket after the same consecutive failure or three attempts in
+        six hours, and record its attempt table."""
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        previous = None
-        for comment in reversed(comments):
-            body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
-            match = re.match(r"^Lane ([a-z0-9-]+) failed: (.*)$", body)
-            if match:
-                previous = (match.group(1), match.group(2))
-                break
-        claimed = []
-        for comment in comments:
-            if not isinstance(comment, dict) or not CLAIM_RE.fullmatch(str(comment.get("body") or "").strip()):
-                continue
-            at = str(comment.get("created_at") or "")
-            try:
-                parsed = time.strptime(at, "%Y-%m-%dT%H:%M:%SZ")
-                claimed.append((calendar.timegm(parsed), comment))
-            except ValueError:
-                continue
-        cutoff = self.now - 6 * 3600
-        recent = [(at, item) for at, item in claimed if at >= cutoff]
-        reason_repeat = previous is not None and previous[1] == reason
+        attempts = self._attempts(comments, reason)
+        failures = [a[3] for a in attempts[:-1] if a[3]]
+        reason_repeat = bool(failures) and failures[-1] == reason
+        recent = [a for a in attempts if a[0] >= self.now - 6 * 3600]
         if not reason_repeat and len(recent) < 3:
             return False
         issue = self._issue(repo, number)
-        names = _label_names(issue)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                     {"labels": sorted(set(names) | {RUNAWAY})})
+                     {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
+        model = self._issue_model(issue)
         rows = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
-        rows.append("| %s | %s | %s | %s |" % (
-            str(self.now), previous[0], self._issue_model(issue), reason))
-        rows.append("| %s | %s | %s | %s |" % (
-            str(self.now), lane, self._issue_model(issue), reason))
+        for _, stamp, row_lane, row_reason in attempts:
+            rows.append("| %s | %s | %s | %s |" % (stamp, row_lane, model, row_reason or "-"))
         self._comment(repo, number, "\n".join(rows))
         return True
+
+    @staticmethod
+    def _attempts(comments: List[Any], current: str) -> List[Tuple[int, str, str, str]]:
+        """Each claim as (epoch, time, lane, reason it failed), oldest first, from the
+        claim and "Lane X failed:" comments. The last attempt is the one being
+        reported, so it takes the current reason; an earlier one the failure
+        that followed it, or "" when none was recorded."""
+        attempts: List[List[Any]] = []
+        for comment in comments:
+            body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
+            claim = re.match(r"Claimed for lane ([a-z0-9-]+) ", body)
+            if claim and CLAIM_RE.fullmatch(body):
+                stamp = str(comment.get("created_at") or "")
+                try:
+                    at = calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+                except ValueError:
+                    continue
+                attempts.append([at, stamp, claim.group(1), ""])
+            failure = re.match(r"^Lane [a-z0-9-]+ failed: (.*)$", body)
+            if failure and attempts and not attempts[-1][3]:
+                attempts[-1][3] = failure.group(1)
+        if attempts:
+            attempts[-1][3] = current
+        return [(a[0], a[1], a[2], a[3]) for a in attempts]
 
     @staticmethod
     def _issue_model(issue: Dict[str, Any]) -> str:

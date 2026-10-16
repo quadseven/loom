@@ -1753,6 +1753,20 @@ class RetryTest(Base):
                          "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
         self.assertEqual(self.listing("codex-2"), [])
 
+    def test_three_recent_attempts_with_no_earlier_failure_flag_the_ticket(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane, "created_at": at}
+            for lane in ("codex", "codex-2", "codex")]
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        table = self.bodies()[-1]
+        self.assertIn("Runaway: three attempts within six hours.", table)
+        self.assertEqual(table.count("\n| %s |" % at), 3)
+        self.assertIn("| codex-2 | model-x | - |", table)
+        self.assertIn("| codex | model-x | [work] agent made no commit", table)
+
     def test_a_reason_without_a_class_is_a_work_failure(self):
         self.heartbeat("codex-2")
         self.failed(reason="agent exited 1")
