@@ -389,8 +389,10 @@ this tick"; a step with no note shows nothing there.
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close.
-9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
-   before unlocking. It states the goal's metrics against the last journal,
+9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md --holder muse`,
+   before unlocking. `--holder` adds the `Tick <UTC time>, muse` line after
+   the marker; without that line a peer reads the journal as another brain's
+   and stays to its resume items, and `journal` refuses it. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
    A step of this tick that failed or ran degraded gets its own line,

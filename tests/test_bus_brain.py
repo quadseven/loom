@@ -1412,7 +1412,8 @@ class TextAndCloseTests(unittest.TestCase):
     def test_journal_posts_get_the_same_checks(self):
         handle = "@" + text.REVIEW_BOT_SHORT_NAME
         with self.assertRaises(ValueError):
-            journal.post(GitHub("t", transport=Fake()), REPO, 1, journal.JOURNAL_MARKER + "\n" + handle)
+            journal.post(GitHub("t", transport=Fake()), REPO, 1,
+                         journal.JOURNAL_MARKER + "\nTick 2030-01-01T00:00:00Z, muse\n" + handle)
 
     def test_slash_commands_without_the_at_sign_pass(self):
         text.check("/%s improve" % text.REVIEW_BOT_SHORT_NAME)
