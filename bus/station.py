@@ -3434,16 +3434,12 @@ class Station:
         return {lane: held.get(lane, self.now) for lane in self.limited_lanes()}
 
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
-        """Goal homes with their sub-issue counts, and their journals and
-        marker posts; a source that cannot be read stays None."""
+        """Goal home journals and marker posts; an unread source stays None."""
         try:
             homes = self._goal_homes()
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal homes: %s" % err)
             return
-        facts.goals = [(self._invariant_ref(repo, int(g["number"])),
-                        int((g.get("sub_issues_summary") or {}).get("total") or 0))
-                       for repo, g in homes]
         try:
             facts.journals, facts.posts = self._invariant_comments(homes)
         except (GitHubError, OSError) as err:

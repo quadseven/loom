@@ -749,7 +749,7 @@ def _goal_issue(gh: GitHub, repo: str, goal: int) -> Dict[str, Any]:
     return issue
 
 
-# GitHub refuses a 101st sub-issue (422), so a ticket also names its goal
+# GitHub refuses a 101st sub-issue (422), so every ticket names its goal
 # with a "Part of #N" line, the parentage rule the backlog board uses too.
 SEARCH_PAGES = 10
 SUB_ISSUE_LIMIT = 100
@@ -805,9 +805,8 @@ def _goal_children(gh: GitHub, repo: str, goal: int,
 
 
 def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """Sub-issues of the goal, then, once the goal holds GitHub's limit of
-    sub-issues (the only way a ticket gets a Part of line instead), the Part
-    of #goal issues not already listed. Below the limit it costs no search."""
+    """Sub-issues of the goal, plus Part-of tickets past GitHub's limit.
+    Below the limit factory tickets ordinarily also have a sub-issue link."""
     children = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal)))
     if len(children) < SUB_ISSUE_LIMIT:
         return children
@@ -929,14 +928,13 @@ def _regression_slot(children: List[Dict[str, Any]], cap: int) -> Optional[str]:
 
 def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
                  lane: Optional[str], extra: Sequence[str] = ()) -> Dict[str, Any]:
+    body = _with_part_of(body, goal)
     names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
     if lane:
         names.append("lane:" + lane)
     issue = gh.rest("POST", "/repos/%s/issues" % repo, {
         "title": title, "body": body, "labels": names + list(extra)}).data
     if not _link_to_goal(gh, repo, goal, issue):
-        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
-                {"body": _with_part_of(body, goal)})
         print("#%s is linked to goal #%d by a Part of line: GitHub refused it as a "
               "sub-issue" % (issue.get("number"), goal), file=sys.stderr)
     return issue
@@ -1183,8 +1181,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     the goal, while the goal has room; the rest get loom:triage and one
     comment naming what is missing. Only labels, sub-issue links and that
     comment are written, plus a Part of line at the end of a ready issue's
-    body when GitHub refuses the sub-issue link: an issue is never closed or
-    retitled, and nothing else in it is edited.
+    body: an issue is never closed or retitled, and nothing else is edited.
     Returns one line per issue looked at.
     """
     if limit < 1:
@@ -1206,11 +1203,12 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
                 continue
-            if not _link_to_goal(gh, repo, goal, issue):
-                # The goal is at GitHub's sub-issue limit (or refused it for
-                # another reason): the Part of line links it instead.
+            if not _names_goal(issue.get("body"), goal):
                 gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
                         {"body": _with_part_of(str(issue.get("body") or ""), goal)})
+            if not _link_to_goal(gh, repo, goal, issue):
+                print("#%d is linked to goal #%d by a Part of line: GitHub refused it as a "
+                      "sub-issue" % (number, goal), file=sys.stderr)
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:ticket", "loom:queued"]})
             in_flight += 1

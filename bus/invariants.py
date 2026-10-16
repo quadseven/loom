@@ -2,7 +2,7 @@
 
 Each invariant is one small function from Facts (what the station already
 reads: brain journals and the marker comments on goal homes, lane run
-outcomes, lane limits, queued tickets, sub-issue counts, the review bot's plan
+outcomes, lane limits, queued tickets, the review bot's plan
 check on lane pull requests, remote heartbeats) to a list of Breach. A Facts
 field the station could not read this pass is None, and the invariants that
 need it find nothing.
@@ -44,8 +44,6 @@ BRAIN_SILENT = 90 * 60
 REPORT_GAP = 90 * 60
 RUNS_MIN = 5
 HELD_MAX = 2 * 3600
-# GitHub refuses a goal's 101st sub-issue; 90 leaves time to act.
-SUB_ISSUES_MAX = 90
 PLAN_FAILED_AGE = 30 * 60
 # The station checks at most this often: goal homes and check runs are read
 # no more often than its other goal-home reads.
@@ -124,8 +122,6 @@ class Facts:
     held: Optional[Dict[str, float]] = None
     # (ticket, the lanes of its difficulty tier) for each queued ticket.
     queued: Optional[List[Tuple[Ref, Tuple[str, ...]]]] = None
-    # (goal home, its sub-issue count).
-    goals: Optional[List[Tuple[Ref, int]]] = None
     checks: Optional[List[Check]] = None
     # remote lane -> its newest heartbeat, None when it never posted one.
     beats: Optional[Dict[str, Optional[float]]] = None
@@ -307,19 +303,6 @@ def lane_held(f: Facts) -> List[Breach]:
     return out
 
 
-def goal_full(f: Facts) -> List[Breach]:
-    """A goal home at SUB_ISSUES_MAX or more sub-issues."""
-    if f.goals is None:
-        return []
-    return [Breach("goal-full", goal.key,
-                   "Goal home %s has %d sub-issues" % (goal.label, count),
-                   ("%d sub-issues; GitHub refuses the 101st, and tickets past it are linked "
-                    "only by a Part of line" % count,
-                    "Limit: %d" % SUB_ISSUES_MAX),
-                   f.now)
-            for goal, count in f.goals if count >= SUB_ISSUES_MAX]
-
-
 def plan_check_failed(f: Facts) -> List[Breach]:
     """An open lane pull request whose plan check failed over PLAN_FAILED_AGE ago."""
     if f.checks is None:
@@ -353,7 +336,7 @@ def remote_silent(f: Facts) -> List[Breach]:
 
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
-    goal_full, plan_check_failed, remote_silent)
+    plan_check_failed, remote_silent)
 
 
 def check(facts: Facts, say: Say,

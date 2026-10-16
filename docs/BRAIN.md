@@ -238,10 +238,11 @@ line below, because an automated pass over old issues over-calls work as
 done.
 
 GitHub holds at most 100 sub-issues under one issue and refuses the next one
-(422). A ticket a goal refuses that way, from `brief` or triage, gets a
-`Part of #N` line at the end of its body instead, and a goal's tickets are
-its sub-issues plus, once it holds 100, the issues whose body has that line
-(one search). The backlog board reads parentage the same way.
+(422). Every ticket from `brief` or triage gets a `Part of #N` line in its
+body. The sub-issue link is best effort; a refusal leaves the ticket queued
+with its Part-of line. A goal's tickets are its sub-issues plus, once it
+holds 100, the issues whose body has that line (one search). The backlog
+board reads parentage from that line.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without

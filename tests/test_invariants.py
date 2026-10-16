@@ -202,15 +202,11 @@ class StationTest(StationBase):
         self.settings.metrics_goal = "%s#12" % OTHER
         self.assertEqual(station.Station(self.gh, self.settings, now=T0)._invariant_goal(), (REPO, GOAL))
 
-    def test_a_private_goal_home_is_named_in_words_only(self):
+    def test_a_private_goal_at_the_sub_issue_cap_files_nothing(self):
         self.gh.goal_issues[OTHER] = [{"number": 3, "title": "Hidden", "labels": [],
-                                       "sub_issues_summary": {"total": 95}}]
+                                       "sub_issues_summary": {"total": 100}}]
         self.run_at(T0)
-        filed = self.gh.filed()
-        self.assertEqual(len(filed), 1, self.said)
-        text = filed[0]["title"] + filed[0]["body"]
-        self.assertIn("issue 3 of a private repo", text)
-        self.assertNotIn("hidden", text)
+        self.assertEqual(self.gh.filed(), [])
 
     def test_a_lane_plan_check_failed_over_half_an_hour_ago_files_a_ticket(self):
         self.gh.pulls[REPO] = [
@@ -238,7 +234,8 @@ class StationTest(StationBase):
         self.assertTrue(any("/issues?labels=loom:ticket" in c[1] for c in self.gh.calls))
 
     def test_breaches_wait_while_the_github_budget_is_low(self):
-        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
+        self.gh.comment(GOAL, T0 - 2400, journal(T0 - 2400))
+        self.gh.comment(GOAL, T0 - 600, journal(T0 - 600))
         self.gh.rate = {"core": (10, 5000, int(T0) + 3600)}
         self.run_at(T0)
         self.assertEqual(self.gh.filed(), [])
@@ -247,11 +244,12 @@ class StationTest(StationBase):
         self.assertEqual(len(self.gh.filed()), 1)
 
     def test_the_station_standup_on_the_invariant_goal_lists_open_breaches(self):
-        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
+        self.gh.comment(GOAL, T0 - 2400, journal(T0 - 2400))
+        self.gh.comment(GOAL, T0 - 600, journal(T0 - 600))
         st = self.run_at(T0)
         number = self.gh.filed()[0]["number"]
         body = st._overdue_standup_body([], None, st._open_breaches(REPO, GOAL))
-        self.assertIn("Invariants broken: #%d Goal home #30 has 100 sub-issues." % number, body)
+        self.assertIn("Invariants broken: #%d Brain muse reported" % number, body)
         self.assertNotIn("Invariants broken", st._overdue_standup_body([], None))
 
 
@@ -389,10 +387,6 @@ class InvariantTest(unittest.TestCase):
         (b,) = invariants.lane_held(f)
         self.assertEqual(b.subject, "agy")
         self.assertIn("#5", " ".join(b.evidence))
-
-    def test_a_goal_home_at_ninety_sub_issues(self):
-        self.assertEqual(invariants.goal_full(Facts(T0, goals=[(self.goal, 89)])), [])
-        self.assertEqual(len(invariants.goal_full(Facts(T0, goals=[(self.goal, 90)]))), 1)
 
     def test_a_plan_check_that_passed_or_failed_recently_is_not_a_breach(self):
         pr = Ref("%s#7" % REPO, "pull request #7")

@@ -740,17 +740,17 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(fake.calls[3][1].split("api.github.com")[1], "/repos/%s/issues/1/sub_issues" % REPO)
         self.assertEqual(fake.calls[3][2], {"sub_issue_id": 202})
 
-    def test_a_brief_the_goal_refuses_as_a_sub_issue_gets_a_part_of_line(self):
+    def test_a_brief_queues_at_the_sub_issue_cap_with_a_part_of_line(self):
         fake = Fake(reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "number": 7, "html_url": "https://example.com/ticket"}),
-                    reply(422, {"message": "sub-issue limit reached"}), reply(200, {}))
+                    reply(422, {"message": "sub-issue limit reached"}))
         gh = GitHub("t", transport=fake)
         with redirect_stderr(io.StringIO()) as err:
-            url = brain.brief(gh, REPO, 1, "Ticket", BODY, "codex", "hard")
+            url = brain.brief(gh, REPO, 1, "Ticket", BODY)
         self.assertEqual(url, "https://example.com/ticket")
-        method, path, payload = fake.calls[4]
-        self.assertEqual((method, path.split("api.github.com")[1]), ("PATCH", "/repos/%s/issues/7" % REPO))
-        self.assertEqual(payload["body"], fake.calls[2][2]["body"].rstrip("\n") + "\n\nPart of #1\n")
+        self.assertEqual(fake.calls[2][2]["labels"], ["loom:ticket", "loom:queued"])
+        self.assertTrue(fake.calls[2][2]["body"].endswith("\n\nPart of #1\n"))
+        self.assertEqual(len(fake.calls), 4)
         self.assertIn("Part of line", err.getvalue())
 
     def test_brief_uses_goal_trunk_as_default_base_and_explicit_base_wins(self):
@@ -907,11 +907,12 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_good_merge_uses_checked_sha_then_deletes_and_moves_ticket(self):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+        fake = Fake(pr, query, reply(200, issue), reply(200, []),
+                    reply(200, {"merged": True}), reply(204),
                     reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
-        self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "checked"})
-        self.assertIn("/git/refs/heads/loom/9-work", fake.calls[4][1])
+        self.assertEqual(fake.calls[4][2], {"merge_method": "squash", "sha": "checked"})
+        self.assertIn("/git/refs/heads/loom/9-work", fake.calls[5][1])
         self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
                                   "ticket": (REPO, 9), "head_sha": "checked"})
         self.assertTrue(fake.calls[-2][1].endswith("/repos/%s/issues/9" % REPO))
@@ -953,7 +954,7 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_a_branch_already_deleted_still_counts_as_merged(self):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
                     reply(422, {"message": "Reference does not exist"}), reply(200, issue), reply(200, {}))
         brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
         self.assertEqual(fake.calls[-1][0], "PUT")
@@ -1048,7 +1049,7 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_a_sensitive_pr_with_a_passed_review_and_no_high_finding_merges(self):
         pr, query = self._sensitive_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, self._passing_check(), reply(200, issue),
+        fake = Fake(pr, query, self._passing_check(), reply(200, issue), reply(200, []),
                     reply(200, {"merged": True}), reply(204), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
         self.assertTrue(result["merged"])
@@ -1064,7 +1065,7 @@ class SensitiveResumeTests(unittest.TestCase):
                 "statusCheckRollup": {"state": "SUCCESS"}}}]},
             "reviewThreads": {"nodes": [high]}}})
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
                     reply(204), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
         self.assertTrue(result["merged"])
@@ -2021,7 +2022,8 @@ class TriageTests(unittest.TestCase):
                       routes.calls)
         self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
         self.assertEqual(lines, ["#5 queued under #1"])
-        self.assert_never_edited(routes)
+        patches = [call for call in routes.calls if call[0] == "PATCH"]
+        self.assertEqual(patches[0][2]["body"], item(5)["body"].rstrip("\n") + "\n\nPart of #1\n")
 
     def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
         no_boxes = BODY.replace("- [ ] ", "")
@@ -2148,7 +2150,8 @@ class HumanAndRefsTests(unittest.TestCase):
         brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
         # Words, not "Refs #6": lanes copy the brief into their pull request,
         # and a linked original in no epic fails the plan check.
-        self.assertTrue(fake.calls[3][2]["body"].endswith("\n\nRewritten from issue 6.\n"))
+        self.assertTrue(fake.calls[3][2]["body"].endswith(
+            "\n\nRewritten from issue 6.\n\nPart of #1\n"))
         self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
         self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])

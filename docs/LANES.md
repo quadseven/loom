@@ -444,7 +444,7 @@ Each station pass runs `bus/invariants.py`, at most every 5 minutes, on what
 the station already reads: the journals and marker comments trusted logins
 posted on every goal home in the last day, the lane runs that ended in the
 last day (`briefs/<lane>/done` and `failed`, timed by their logs), the lanes
-held by a limit, queued tickets, sub-issue counts, the review bot's plan
+held by a limit, queued tickets, the review bot's plan
 check on open lane pull requests (`LOOM_PLAN_CHECK`, default
 `Grug - Chief`) and remote heartbeats. Each invariant is one function
 returning breaches with evidence:
@@ -456,7 +456,6 @@ returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
 - A lane held by a limit for over 2 hours while tickets of its tier are queued.
-- A goal home at 90 or more sub-issues.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 
