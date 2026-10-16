@@ -65,3 +65,30 @@ settings.
 - docs/BRIEF_FORMAT.md: how a ticket is written
 - docs/DASHBOARD.md: dashboard settings
 - docs/HEALTH.md: how a project reports live problems that become ranked tickets
+
+## Roll source pins
+
+To let the station open a source-pin pull request after a module merge, set
+`LOOM_ROLL_SHIP_DOCS` as shown in `.env.example`. Each entry identifies a goal
+home and its ship document. The document must contain one fenced
+`loom-roll-pins` JSON block:
+
+```loom-roll-pins
+{"deployment_repo":"YOUR_OWNER/YOUR_DEPLOY_REPO","build_workflow":"build-image.yml","sources":[{"repo":"YOUR_OWNER/YOUR_MODULE_REPO","pins":[{"path":"config/source.env","key":"MODULE_SHA"},{"path":"modules/your-module","kind":"gitlink"},{"path":"scripts/drift.py","kind":"dict_dev","entry":"MODULE"}]}]}
+```
+
+An env pin names one `KEY=<40-character SHA>` line; optional quotes are kept.
+A `gitlink` pin names a submodule path. A `dict_dev` pin names a Python
+dictionary entry with a `dev` SHA field; its `deployed_dev` value is left for
+the image pin step. List every location that the roll's source-pin step moves.
+`build_workflow` accepts a workflow file name or a run display name.
+For a module whose deployed revision comes from a fork branch, add
+`revision_repo` and `revision_ref` to that source; the merge still triggers the
+pass, and the named branch supplies the SHA. The station checks merged module
+pull requests each pass (normally every 60 seconds),
+opens one deployment pull request per goal, and updates that pull request if
+another merge lands before it. It leaves the pull request for review. When the
+deployment repository exposes a build run for the pull request's head commit,
+the station comments with the run link on the goal home. The repository
+configuration must give the station token read access to the ship document
+and write access to the deployment repository and goal home.

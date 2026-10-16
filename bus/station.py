@@ -37,6 +37,7 @@ from . import invariants
 from . import metrics
 from . import proof
 from . import rewrite
+from . import roll_pin
 from . import revert
 from . import spend
 from . import usage
@@ -337,13 +338,15 @@ class Settings:
                  report_digest: Sequence[Tuple[int, int]] = (),
                  health_urls: str = "",
                  health_every: int = health.EVERY,
-                 evidence_cmds: Optional[Dict[str, str]] = None) -> None:
+                 evidence_cmds: Optional[Dict[str, str]] = None,
+                 roll_ship_docs: Optional[List[Dict[str, str]]] = None) -> None:
         self.home = home
         # "owner/name#goal=https://..." entries: each goal home's health
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
         self.health_every = health_every
         self.evidence_cmds = evidence_cmds or {}
+        self.roll_ship_docs = roll_ship_docs or []
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
         self.report_digest = tuple(report_digest)
@@ -444,7 +447,8 @@ class Settings:
                                or invariants.DEFAULT_PLAN_CHECK),
                    evidence_cmds=_evidence_commands(env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
-                   health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY))
+                   health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
+                   roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")))
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -4425,6 +4429,13 @@ class Station:
         except OSError as err:
             _say("could not keep the GitHub budget: %s" % err)
 
+    def roll_source_pins(self) -> None:
+        if self.s.roll_ship_docs:
+            try:
+                roll_pin.run(self.gh, self.s.roll_ship_docs)
+            except ValueError as err:
+                raise GitHubError("invalid roll ship document or pin: %s" % err) from err
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
@@ -4436,7 +4447,7 @@ class Station:
         if not self._deferred():
             try:
                 self.hand_back()
-            except (GitHubError, OSError, ValueError) as err:
+            except (GitHubError, OSError) as err:
                 _say("hand_back failed: %s" % err)
         self.claim_new()
         if not self._deferred():
@@ -4449,7 +4460,7 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.ship_deployed, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.roll_source_pins, self.ship_deployed, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,
@@ -4459,7 +4470,7 @@ class Station:
                 break
             try:
                 step()
-            except (GitHubError, OSError) as err:
+            except (GitHubError, OSError, ValueError) as err:
                 _say("%s failed: %s" % (step.__name__, err))
         try:
             self.watch_logs()
