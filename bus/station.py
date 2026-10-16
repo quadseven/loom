@@ -678,6 +678,19 @@ def _label_names(issue: Dict[str, Any]) -> List[str]:
     return names
 
 
+_PART_OF_RE = re.compile(r"^Part of #(\d+)(?!\d)", re.M)
+
+
+def _ticket_goal(issue: Dict[str, Any]) -> Optional[int]:
+    """The goal a ticket names: its Part of #N line, else the parent of its
+    sub-issue link, else None."""
+    match = _PART_OF_RE.search(str(issue.get("body") or ""))
+    if match:
+        return int(match.group(1))
+    match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
+    return int(match.group(1)) if match else None
+
+
 def _lane_of(issue: Dict[str, Any]) -> Optional[str]:
     """The one lane the issue names, or None when it names none or several."""
     lanes = [n[len("lane:"):] for n in _label_names(issue) if n.startswith("lane:")]
@@ -1199,12 +1212,51 @@ class Station:
             self._claim_candidates([])
             self._record_slot_sample(False)
             return
-        by_lane = self._claim_candidates(free)
+        by_lane = self._apply_unproven_gate(self._claim_candidates(free))
         for lane in free:
             self._claim_for_lane(lane, by_lane[lane], free)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in free))
         self._hand_verifies([lane for lane in free if not by_lane[lane]])
+
+    def _unproven_gate(self, repo: str, issue: Dict[str, Any], limit: int,
+                       counts: Dict[Tuple[str, int], int]) -> Optional[str]:
+        """Why the station must not claim this build ticket, or None when the
+        claim may go (loom#483). Regressions, reverts and urgent tickets are
+        never gated: the limit holds back new work, not repairs."""
+        names = set(_label_names(issue))
+        if names & {REGRESSION, factory.REVERT_LABEL, URGENT}:
+            return None
+        goal = _ticket_goal(issue)
+        if goal is None:
+            return None
+        key = (repo, goal)
+        if key not in counts:
+            counts[key] = brain.goal_unproven(self.gh, repo, goal)
+        held = counts[key]
+        if held <= limit:
+            return None
+        return ("goal #%d has %d tickets at merged or shipped without a proof "
+                "(limit %d); the goal verifies them before the station starts more"
+                % (goal, held, limit))
+
+    def _apply_unproven_gate(self, by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]]
+                             ) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
+        """Drop the build tickets the unproven-work limit blocks, counting each
+        (repo, goal) once per pass. A lane left with nothing is handed to
+        _hand_verifies, so free slots run verify runs instead."""
+        limit = brain.unverified_limit()
+        counts: Dict[Tuple[str, int], int] = {}
+        gated = {lane: [] for lane in by_lane}
+        for lane, found in by_lane.items():
+            for repo, issue in found:
+                reason = self._unproven_gate(repo, issue, limit, counts)
+                if reason is None:
+                    gated[lane].append((repo, issue))
+                else:
+                    _say("not claiming %s#%s for lane %s: %s"
+                         % (repo, issue.get("number"), lane, reason))
+        return gated
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:

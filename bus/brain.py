@@ -882,6 +882,13 @@ def _goal_unproven(gh: GitHub, repo: str, goal: int,
     return sum(1 for i in _goal_children(gh, repo, goal, issue) if _unproven(i))
 
 
+def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
+    """The goal's tickets at merged or shipped: unproven work still waiting on
+    a live check. A verified ticket carries loom:verified instead, so it
+    never counts; a failed audit moves a ticket back to shipped, so it does."""
+    return _goal_unproven(gh, repo, goal)
+
+
 def _check_goal_unproven(children: List[Dict[str, Any]], goal: int) -> None:
     count = sum(1 for i in children if _unproven(i))
     limit = unverified_limit()
