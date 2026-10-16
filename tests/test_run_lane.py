@@ -171,6 +171,7 @@ if [ "${FAKE_AGENT:-commit}" = binref ]; then
 fi
 printf '%s\\n' "${FAKE_AGENT_TEXT:-fixed}" > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = detached ]; then git checkout -q --detach HEAD; fi
 git add fix.txt
 git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 """
@@ -602,6 +603,34 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("fix.txt", files)
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agent_owned_commit_is_validated_and_pushed_without_touching_main(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT="detached")
+        if "sandbox_apply: Operation not permitted" in self.lane_log():
+            self.skipTest("the host blocks sandbox-exec validation")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Validation: check exited 0", self.body.read_text())
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        pushed = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertIn("refs/heads/loom/T042-fix-the-thing", pushed)
+        heads = dict(line.split("\t", 1) for line in pushed.splitlines())
+        self.assertNotEqual(heads["refs/heads/loom/T042-fix-the-thing"], heads["refs/heads/main"])
+
+    def test_runner_commit_failure_is_transient(self):
+        real_git = shutil.which("git")
+        wrapper = self.bin / "git"
+        wrapper.write_text("#!/bin/sh\ncase \" $* \" in *commit*) echo runner-commit-failed >&2; exit 1;; esac\n"
+                          f"exec {shlex.quote(real_git)} \"$@\"\n")
+        wrapper.chmod(0o755)
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="edit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.run_log()
+        self.assertIn("failed: [transient] could not commit the agent's changes", log)
+        self.assertNotIn("failed: [work] could not commit the agent's changes", log)
 
     def test_a_repo_without_the_class_labels_still_gets_its_pr(self):
         # gh pr create fails outright on a label the repo lacks; the label is
