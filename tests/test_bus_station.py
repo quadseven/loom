@@ -1753,6 +1753,66 @@ class RetryTest(Base):
                          "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
         self.assertEqual(self.listing("codex-2"), [])
 
+    def test_three_recent_attempts_with_no_earlier_failure_flag_the_ticket(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane, "created_at": at, "user": {"login": "alice-example"}}
+            for lane in ("codex", "codex-2", "codex")]
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        table = self.bodies()[-1]
+        self.assertIn("Runaway: three attempts within six hours.", table)
+        self.assertEqual(table.count("\n| %s |" % at), 3)
+        self.assertIn("| codex-2 | model-x | - |", table)
+        self.assertIn("| codex | model-x | [work] agent made no commit", table)
+
+    def test_the_same_failure_reason_twice_in_a_row_flags_the_ticket(self):
+        reason = "[work] could not commit the agent's changes"
+        self.failed(body=BODY, reason=reason)
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 3600))
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Lane codex failed: " + reason, "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": now, "user": {"login": "alice-example"}}]
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        table = self.bodies()[-1]
+        self.assertIn("Runaway: repeated failure reason.", table)
+        self.assertIn("| %s | codex | model-x | %s |" % (old, reason), table)
+        self.assertIn("| %s | codex-2 | model-x | %s |" % (now, reason), table)
+
+    def test_a_strangers_comments_do_not_flag_the_ticket(self):
+        reason = "[work] could not commit the agent's changes"
+        self.failed(body=BODY, reason=reason)
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 3600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": old},
+            {"body": "Lane codex failed: " + reason, "created_at": old},
+            {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": old}]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_a_different_failure_reason_does_not_flag_the_ticket(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 3600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Lane codex failed: [work] could not commit the agent's changes", "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": old, "user": {"login": "alice-example"}}]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_a_runaway_ticket_is_not_claimed(self):
+        self.fake.add(12)
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.fake.comments[12], [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+
     def test_a_reason_without_a_class_is_a_work_failure(self):
         self.heartbeat("codex-2")
         self.failed(reason="agent exited 1")

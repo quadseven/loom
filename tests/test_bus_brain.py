@@ -326,6 +326,7 @@ class SensitiveResumeTests(unittest.TestCase):
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
         self.assertIn("- #4 Sensitive - blocked: review check has not passed on the head commit",
                       report)
+        self.assertIn("## Runaway tickets\n- none", report)
 
     def test_status_lists_a_docs_pr_with_a_neutral_review_as_ready(self):
         pr = {"number": 4, "title": "Docs", "head": {"ref": "loom/4-work", "sha": "head1"},
@@ -781,6 +782,18 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(payload["body"], fake.calls[2][2]["body"].rstrip("\n") + "\n\nPart of #1\n")
         self.assertIn("Part of line", err.getvalue())
 
+    def test_a_brief_on_a_goal_at_the_cap_queues_with_a_part_of_line_whatever_the_refusal(self):
+        for status in (403, 404, 422, 500):
+            fake = Fake(reply(200, goal()), reply(200, []),
+                        reply(201, {"id": 202, "number": 7, "html_url": "https://example.com/ticket"}),
+                        reply(status, {"message": "sub-issue limit reached"}), reply(200, {}))
+            with redirect_stderr(io.StringIO()) as err:
+                url = brain.brief(GitHub("t", transport=fake),
+                                  REPO, 1, "Ticket", BODY, "codex", "hard")
+            self.assertEqual(url, "https://example.com/ticket", status)
+            self.assertTrue(fake.calls[4][2]["body"].endswith("\n\nPart of #1\n"), status)
+            self.assertIn("refused the sub-issue link", err.getvalue())
+
     def test_brief_uses_goal_trunk_as_default_base_and_explicit_base_wins(self):
         trunk_goal = dict(goal(), body="Trunk: side\n\n## Destination\n")
         fake = Fake(reply(200, trunk_goal), reply(200, []),
@@ -937,7 +950,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
                     reply(200, issue), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "checked"})
         self.assertIn("/git/refs/heads/loom/9-work", fake.calls[4][1])
         self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
@@ -983,7 +996,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
                     reply(422, {"message": "Reference does not exist"}), reply(200, issue), reply(200, {}))
-        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[-1][0], "PUT")
         # Merged is not deployed: the ticket says merged until the project's
         # ship owner deploys it.
@@ -1078,7 +1091,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, self._passing_check(), reply(200, issue),
                     reply(200, {"merged": True}), reply(204), reply(200, issue), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
     def test_a_logic_pr_with_a_resolved_high_finding_keeps_todays_rule(self):
@@ -1094,7 +1107,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
                     reply(204), reply(200, issue), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
     TRUSTED = {"LOOM_BRIEF_AUTHORS": "example-brain"}
@@ -1681,6 +1694,21 @@ class EscalateTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         return fake, brain.escalate(gh, REPO, 9)
 
+    def test_runaway_tickets_have_a_dedicated_status_section(self):
+        rows = [dict(ticket("briefed"), number=12, title="Ordinary"),
+                dict(ticket("briefed"), number=13, title="Ticket")]
+        rows[1]["labels"] = rows[1]["labels"] + [{"name": "loom:runaway"}]
+        self.assertEqual(["### Runaway tickets", "- #13 Ticket"],
+                         brain.runaway_lines(rows))
+
+    def test_runaway_ticket_cannot_be_escalated(self):
+        issue = dict(ticket("failed"), labels=[{"name": "loom:ticket"},
+                                        {"name": "loom:runaway"}])
+        fake = Routed({("GET", "/repos/%s/issues/9" % REPO): reply(200, issue)})
+        with self.assertRaisesRegex(ValueError, "held for runaway review"):
+            brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(["GET"], [method for method, _, _ in fake.calls])
+
     def stuck_cases(self):
         sonnet_claim = [claim("2030-01-01T00:11:00Z")]
         return {
@@ -1806,6 +1834,18 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(outcome, "needs-brain")
         self.assertIn("needs-brain", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
         self.assertFalse(fake.sent("PATCH", "/issues/9"))
+
+    def test_escalating_after_every_rung_was_tried_flags_the_ticket_runaway(self):
+        history = [claim("2030-01-01T00:11:00Z"), claim("2030-01-01T00:20:00Z", "codex"),
+                   {"body": "<!-- loom:escalate v1 -->\nRung: 3 claude-opus-5-5 claude", "created_at": "2030-01-01T00:30:00Z"},
+                   claim("2030-01-01T00:31:00Z")]
+        issue = stuck_ticket("failed", body="Model: claude-opus-5-5\n\n" + BODY)
+        fake, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
+        self.assertEqual(outcome, "needs-brain")
+        self.assertIn("loom:runaway", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
+        body = fake.sent("POST", "/issues/9/comments")[0]["body"]
+        self.assertIn("Runaway: escalation after every rung was tried.", body)
+        self.assertIn("held for brain review", body)
 
     def test_escalate_tracks_the_rewritten_model_per_claim(self):
         # Sonnet claimed, escalated to codex and claimed again: the next rung is the last.
@@ -2173,6 +2213,28 @@ class TriageTests(unittest.TestCase):
         few = Routes([], goal_children=full[:3])
         self.assertEqual(len(brain.goal_children(GitHub("t", transport=few), REPO, 1)), 3)
         self.assertFalse(any(c[1].startswith("/search/") for c in few.calls))
+
+    def test_unassociated_tickets_mention_the_goal_without_its_part_of_line(self):
+        ticket = ["loom:ticket"]
+        found = [item(7, body="Part of #1\n", labels=ticket),
+                 item(9, body="see Part of #1 inline", labels=ticket),
+                 item(12, body="part of #1", labels=["bug"])]
+        routes = Routes([], search=found)
+        loose = brain.unassociated_tickets(GitHub("t", transport=routes), REPO, 1)
+        self.assertEqual([i["number"] for i in loose], [9])
+
+    def test_a_sub_issue_of_the_goal_or_a_loose_search_match_is_not_unassociated(self):
+        ticket = ["loom:ticket"]
+        parent = "https://api.github.com/repos/%s/issues/" % REPO
+        found = [item(9, body="see Part of #1 inline", labels=ticket),
+                 # A sub-issue of the goal that names it inside a sentence.
+                 item(13, body="Work that is Part of #1.", labels=ticket, parent_issue_url=parent + "1"),
+                 # The search matched loose words: it is Part of another issue.
+                 item(14, body="Part of #8. Goal #1 asks for it", labels=ticket,
+                      parent_issue_url=parent + "8")]
+        routes = Routes([], search=found)
+        loose = brain.unassociated_tickets(GitHub("t", transport=routes), REPO, 1)
+        self.assertEqual([i["number"] for i in loose], [9])
 
     def test_bad_limit_and_bad_goal_write_nothing(self):
         routes = Routes([item(5)])

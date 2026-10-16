@@ -56,7 +56,7 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         "refs": re.findall(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)", body),
         "html_url": issue.get("html_url"),
         "state": next((name[5:] for name in names if name in labels.LABELS and name.startswith("loom:")
-                        and name not in ("loom:ticket", "loom:goal")), None),
+                        and name not in ("loom:ticket", "loom:goal", "loom:runaway")), None),
         "goal": goal,
         # Tickets are read with state=all; a closed one is history, never work.
         "open": issue.get("state", "open") != "closed",

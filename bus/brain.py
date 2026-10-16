@@ -39,6 +39,7 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 REPORT_EVERY = 2 * 3600
 REPORT_GRACE = 30 * 60
 TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
+RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
@@ -286,6 +287,13 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
                 issue["number"], issue.get("title", ""), lane, _age(issue, now),
                 (marks or {}).get(int(issue["number"]), "")))
     return lines
+
+
+def runaway_lines(tickets: List[Dict[str, Any]]) -> List[str]:
+    """List held runaway tickets for immediate brain review."""
+    rows = [i for i in tickets if RUNAWAY in _labels(i)]
+    return ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
+                                      for i in rows] or ["- none"])
 
 
 HELD_HEADING = "### Held tickets"
@@ -558,6 +566,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors) + [""]
+    lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check)
@@ -662,6 +671,10 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
         sections = list(pool.map(
             lambda repo: _repo_section(gh, repo, now, bot, authors, found,
                                        review_check_name(env)), repos))
+    runaway = [(repo, issue) for repo, items in found.items() for issue in items
+               if RUNAWAY in _labels(issue)]
+    out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
+        repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
     out += [""] + _health_lines(env)
     for section in sections:
@@ -785,10 +798,9 @@ def _with_part_of(body: str, goal: int) -> str:
     return body.rstrip("\n") + "\n\n" + part_of_line(goal) + "\n"
 
 
-def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """loom:ticket issues in the repo whose body has a Part of #goal line
-    (search, then the label and the exact line checked here: the search
-    also matches loose words)."""
+def _part_of_hits(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo that the Part of #goal search finds
+    (the search also matches loose words, so the line is not yet checked)."""
     q = quote('repo:%s is:issue label:loom:ticket in:body "%s"' % (repo, part_of_line(goal)))
     url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
     found: List[Dict[str, Any]] = []
@@ -803,10 +815,32 @@ def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
         # someone who may write.
         found.extend(item for item in data.get("items") or []
                      if isinstance(item, dict) and "pull_request" not in item
-                     and "loom:ticket" in _labels(item)
-                     and _names_goal(item.get("body"), goal))
+                     and "loom:ticket" in _labels(item))
         url = _next_link(resp.headers.get("link", ""))
     return found
+
+
+def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo whose body has a Part of #goal line."""
+    return [i for i in _part_of_hits(gh, repo, goal) if _names_goal(i.get("body"), goal)]
+
+
+def _mentions_goal(body: Any, goal: int) -> bool:
+    """Part of #goal anywhere in the body, inside a sentence too."""
+    return bool(re.search(r"\bPart of #%d(?!\d)" % goal, str(body or ""), re.I))
+
+
+def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
+    return str(issue.get("parent_issue_url") or "").endswith("/repos/%s/issues/%d" % (repo, goal))
+
+
+def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues that say Part of #goal but are neither its sub-issues
+    nor carry the line on a line of its own, so goal_children does not count
+    them as the goal's. Search hits that only match loose words are left out."""
+    return [i for i in _part_of_hits(gh, repo, goal)
+            if _mentions_goal(i.get("body"), goal) and not _names_goal(i.get("body"), goal)
+            and not _sub_issue_of(i, repo, goal)]
 
 
 def _goal_children(gh: GitHub, repo: str, goal: int,
@@ -836,15 +870,16 @@ def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
 
 
 def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
-    """Add the issue as a sub-issue of the goal. False when GitHub refuses it
-    (422, for example a goal already at its 100 sub-issue limit): the Part of
-    line is then the only link, which goal_children reads."""
+    """Add the issue as a sub-issue of the goal, best effort. False when GitHub
+    refuses it (for example a goal already at its 100 sub-issue limit): the
+    refusal is logged and the Part of line is then the only link, which
+    goal_children reads."""
     try:
         gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
                 {"sub_issue_id": issue["id"]})
     except GitHubError as exc:
-        if exc.status != 422:
-            raise
+        print("#%s: GitHub refused the sub-issue link to goal #%d (%s)"
+              % (issue.get("number"), goal, exc), file=sys.stderr)
         return False
     return True
 
@@ -2701,6 +2736,8 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     _check_written_text(notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
+    if RUNAWAY in names:
+        raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
     held = _waiting_for(gh, repo, issue)
@@ -2715,10 +2752,11 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         raise ValueError("ticket is not repeatedly stuck")
     if history.rung is None:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                {"labels": sorted(set(names) | {"needs-brain"})})
+                {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-                "Past the model ladder (tried %s); %s. Needs the brain to rewrite the brief "
-                "smaller or ask the operator." % (", ".join(history.tried), "; ".join(history.reasons))})
+                "Runaway: escalation after every rung was tried. Past the model ladder "
+                "(tried %s); %s. The ticket is held for brain review." % (
+                    ", ".join(history.tried), "; ".join(history.reasons))})
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
     choice = None

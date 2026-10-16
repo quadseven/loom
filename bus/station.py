@@ -54,6 +54,7 @@ from .labels import REMOTE_LANES
 HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
+RUNAWAY = "loom:runaway"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
@@ -1591,6 +1592,8 @@ class Station:
 
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
                     free: List[str]) -> bool:
+        if RUNAWAY in _label_names(issue):
+            return False
         if self._skip_known(repo, issue):
             return False
         try:
@@ -2051,6 +2054,8 @@ class Station:
     def _report_failure(self, repo: str, number: int, lane: str, text: str, name: str) -> bool:
         """Report a failed brief, keeping fix rounds on their existing pull request."""
         reason = self._failure_reason(lane, name)
+        if self._flag_repeated_failure(repo, number, lane, reason):
+            return True
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
         # Thermal-limit briefs carry "limit:" with or without a class and
@@ -2089,6 +2094,26 @@ class Station:
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
+        return True
+
+    def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
+        """Hold a ticket after the same consecutive failure or three attempts in
+        six hours, and record its attempt table."""
+        authors = {author.lower() for author in self.s.authors}
+        comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                    if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
+        attempts = factory.attempts(comments, reason)
+        failures = [a[3] for a in attempts[:-1] if a[3]]
+        reason_repeat = bool(failures) and failures[-1] == reason
+        recent = [a for a in attempts if a[0] >= self.now - 6 * 3600]
+        if not reason_repeat and len(recent) < 3:
+            return False
+        issue = self._issue(repo, number)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
+        trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
+        self._comment(repo, number, factory.runaway_comment(
+            trigger, attempts, factory.issue_model(issue)))
         return True
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
@@ -3433,17 +3458,28 @@ class Station:
         held = {k: v for k, v in held.items() if self._num(v)} if isinstance(held, dict) else {}
         return {lane: held.get(lane, self.now) for lane in self.limited_lanes()}
 
+    def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
+        """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
+        search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
+        a refused sub-issue link leaves the Part of line as the only one."""
+        total = int((goal.get("sub_issues_summary") or {}).get("total") or 0)
+        if total < invariants.SUB_ISSUES_MAX:
+            return 0
+        return len(brain.unassociated_tickets(self.gh, repo, int(goal["number"])))
+
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
-        """Goal homes with their sub-issue counts, and their journals and
+        """Goal homes with their unlinked tickets, and their journals and
         marker posts; a source that cannot be read stays None."""
         try:
             homes = self._goal_homes()
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal homes: %s" % err)
             return
-        facts.goals = [(self._invariant_ref(repo, int(g["number"])),
-                        int((g.get("sub_issues_summary") or {}).get("total") or 0))
-                       for repo, g in homes]
+        try:
+            facts.goals = [(self._invariant_ref(repo, int(g["number"])), self._unassociated(repo, g))
+                           for repo, g in homes]
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the goal tickets: %s" % err)
         try:
             facts.journals, facts.posts = self._invariant_comments(homes)
         except (GitHubError, OSError) as err:
