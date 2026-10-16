@@ -38,6 +38,7 @@ from . import metrics
 from . import proof
 from . import rewrite
 from . import revert
+from . import roll_pin
 from . import spend
 from . import usage
 from . import text as _text
@@ -1824,6 +1825,16 @@ class Station:
                 continue
             _say("shipped %s#%d: deployed %s carries #%d" % (
                 repo, number, revision[:12], int(pr["number"])))
+
+    def roll_source_pins(self) -> None:
+        """Inspect goal homes for roll-shipped module merges and update source pins."""
+        state_path = os.path.join(self.state, "roll-pins.json")
+        try:
+            count = roll_pin.run_station(self.gh, self._goal_homes(), state_path, self.now, _say)
+            if count:
+                _say("roll_source_pins: updated %d source pin(s)" % count)
+        except (GitHubError, OSError, ValueError) as err:
+            _say("roll_source_pins failed: %s" % err)
 
     def hand_back(self) -> None:
         """Return completed lane PRs with failed checks or bot findings."""
@@ -4449,7 +4460,7 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.ship_deployed, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.ship_deployed, self.roll_source_pins, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,
