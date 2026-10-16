@@ -208,7 +208,7 @@ class StationTest(StationBase):
     def test_a_private_goal_home_is_named_in_words_only(self):
         self.gh.goal_issues[OTHER] = [{"number": 3, "title": "Hidden", "labels": [],
                                        "sub_issues_summary": {"total": 95}}]
-        self.search_loose_ticket()
+        self.search_loose_ticket(3)
         self.run_at(T0)
         filed = self.gh.filed()
         self.assertEqual(len(filed), 1, self.said)
@@ -246,14 +246,24 @@ class StationTest(StationBase):
         self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
         self.search_loose_ticket()
 
-    def search_loose_ticket(self):
-        self.gh.search_items = [{"number": 7, "body": "part of #30 inline",
+    def search_loose_ticket(self, goal=GOAL):
+        self.gh.search_items = [{"number": 7, "body": "part of #%d inline" % goal,
                                  "labels": [{"name": "loom:ticket"}]}]
 
     def test_a_goal_at_the_sub_issue_cap_with_every_ticket_linked_by_part_of_is_healthy(self):
         self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
         self.gh.search_items = [{"number": 7, "body": "## Why\nx\n\nPart of #30\n",
                                  "labels": [{"name": "loom:ticket"}]}]
+        self.run_at(T0)
+        self.assertEqual(self.gh.filed(), [])
+        self.assertTrue(any(c[1].startswith("/search/issues?") for c in self.gh.calls))
+
+    def test_a_goal_at_the_cap_whose_sub_issues_name_it_inline_is_healthy(self):
+        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
+        self.gh.search_items = [{"number": 7, "body": "Work that is Part of #30.",
+                                 "labels": [{"name": "loom:ticket"}],
+                                 "parent_issue_url": "https://api.github.com/repos/%s/issues/%d"
+                                                     % (REPO, GOAL)}]
         self.run_at(T0)
         self.assertEqual(self.gh.filed(), [])
         self.assertTrue(any(c[1].startswith("/search/issues?") for c in self.gh.calls))

@@ -125,7 +125,7 @@ class Facts:
     held: Optional[Dict[str, float]] = None
     # (ticket, the lanes of its difficulty tier) for each queued ticket.
     queued: Optional[List[Tuple[Ref, Tuple[str, ...]]]] = None
-    # (goal home, how many tickets mention it without a Part of line).
+    # (goal home, how many tickets name it without a sub-issue link or a Part of line).
     goals: Optional[List[Tuple[Ref, int]]] = None
     checks: Optional[List[Check]] = None
     # remote lane -> its newest heartbeat, None when it never posted one.
@@ -315,8 +315,9 @@ def goal_full(f: Facts) -> List[Breach]:
         return []
     return [Breach("goal-full", goal.key,
                    "Goal home %s has %d tickets not linked to it" % (goal.label, count),
-                   ("%d loom:ticket issues mention the goal without a Part of line of their "
-                    "own, so the goal does not count them" % count,),
+                   ("%d loom:ticket issues say Part of the goal but are neither its sub-issues "
+                    "nor carry a Part of line of their own, so the goal does not count them"
+                    % count,),
                    f.now)
             for goal, count in f.goals if count > 0]
 

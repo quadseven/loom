@@ -3459,7 +3459,7 @@ class Station:
         return {lane: held.get(lane, self.now) for lane in self.limited_lanes()}
 
     def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
-        """Tickets mentioning the goal without its Part of line. Read (one
+        """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
         search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
         a refused sub-issue link leaves the Part of line as the only one."""
         total = int((goal.get("sub_issues_summary") or {}).get("total") or 0)

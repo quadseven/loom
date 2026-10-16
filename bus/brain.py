@@ -810,10 +810,22 @@ def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
     return [i for i in _part_of_hits(gh, repo, goal) if _names_goal(i.get("body"), goal)]
 
 
+def _mentions_goal(body: Any, goal: int) -> bool:
+    """Part of #goal anywhere in the body, inside a sentence too."""
+    return bool(re.search(r"\bPart of #%d(?!\d)" % goal, str(body or ""), re.I))
+
+
+def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
+    return str(issue.get("parent_issue_url") or "").endswith("/repos/%s/issues/%d" % (repo, goal))
+
+
 def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """loom:ticket issues that mention Part of #goal without the exact line on
-    a line of its own, so goal_children does not count them as the goal's."""
-    return [i for i in _part_of_hits(gh, repo, goal) if not _names_goal(i.get("body"), goal)]
+    """loom:ticket issues that say Part of #goal but are neither its sub-issues
+    nor carry the line on a line of its own, so goal_children does not count
+    them as the goal's. Search hits that only match loose words are left out."""
+    return [i for i in _part_of_hits(gh, repo, goal)
+            if _mentions_goal(i.get("body"), goal) and not _names_goal(i.get("body"), goal)
+            and not _sub_issue_of(i, repo, goal)]
 
 
 def _goal_children(gh: GitHub, repo: str, goal: int,

@@ -2160,6 +2160,19 @@ class TriageTests(unittest.TestCase):
         loose = brain.unassociated_tickets(GitHub("t", transport=routes), REPO, 1)
         self.assertEqual([i["number"] for i in loose], [9])
 
+    def test_a_sub_issue_of_the_goal_or_a_loose_search_match_is_not_unassociated(self):
+        ticket = ["loom:ticket"]
+        parent = "https://api.github.com/repos/%s/issues/" % REPO
+        found = [item(9, body="see Part of #1 inline", labels=ticket),
+                 # A sub-issue of the goal that names it inside a sentence.
+                 item(13, body="Work that is Part of #1.", labels=ticket, parent_issue_url=parent + "1"),
+                 # The search matched loose words: it is Part of another issue.
+                 item(14, body="Part of #8. Goal #1 asks for it", labels=ticket,
+                      parent_issue_url=parent + "8")]
+        routes = Routes([], search=found)
+        loose = brain.unassociated_tickets(GitHub("t", transport=routes), REPO, 1)
+        self.assertEqual([i["number"] for i in loose], [9])
+
     def test_bad_limit_and_bad_goal_write_nothing(self):
         routes = Routes([item(5)])
         with self.assertRaises(ValueError):
