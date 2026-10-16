@@ -728,7 +728,8 @@ def _check_model(model: Optional[str]) -> None:
 
 
 def _check_brief_args(title: str, body: str, lane: Optional[str],
-                      model: Optional[str], base: Optional[str]) -> None:
+                      model: Optional[str], base: Optional[str],
+                      holder: Optional[str] = None) -> None:
     if lane is not None and lane not in LANES:
         raise ValueError("unknown lane")
     # The same patterns lanes/run_lane.sh applies, so a header line can never
@@ -736,6 +737,8 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
     _check_model(model)
     if base is not None and not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._/-]*", base):
         raise ValueError("base is not a branch name")
+    if holder is not None and not re.fullmatch(handoff._HOLDER, holder):
+        raise ValueError("holder may only use letters, digits, '.', '_' and '-'")
     if "\n" in title or "\r" in title:
         raise ValueError("title is one line")
     if any(section not in body for section in SECTIONS):
@@ -1068,12 +1071,46 @@ def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
                          "(for example \"issue 12 of another repo\"), not as owner/name#N")
 
 
+def _has_live_brief_defer(gh: GitHub, repo: str, goal: int,
+                          env: Optional[Dict[str, str]] = None) -> bool:
+    """Whether the goal home carries a live brief defer: its newest brief-stage
+    marker in allowed journals is a defer."""
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, goal))
+    authors = trusted_authors(env)
+    if not authors:
+        authors = list({(c.get("user") or {}).get("login") for c in comments
+                        if isinstance(c, dict) and (c.get("user") or {}).get("login")})
+    found = handoff.journals([
+        {"body": c.get("body"), "at": c.get("created_at"),
+         "login": (c.get("user") or {}).get("login")}
+        for c in comments if isinstance(c, dict)
+    ], authors)
+    marks = [m for m in handoff.marks(found) if m.stage == "brief" and m.item == (repo, goal)]
+    return bool(marks and marks[-1].kind == "defer")
+
+
+def _record_brief_done(gh: GitHub, repo: str, goal: int, ticket_number: int,
+                       holder: Optional[str] = None) -> None:
+    """Post a journal comment on the goal home recording the brief stage done."""
+    holder = holder or os.environ.get("LOOM_HOLDER") or "brain"
+    done_line = handoff.done_marker("brief", (repo, goal), holder)
+    comment = "\n".join([
+        handoff.JOURNAL_MARKER,
+        "Tick %s, %s" % (_iso(datetime.now(timezone.utc)), holder),
+        "- Briefed: #%d" % ticket_number,
+        done_line,
+    ])
+    _check_written_text(comment)
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, goal), {"body": comment})
+
+
 def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
           model: Optional[str] = None, base: Optional[str] = None,
           not_before: Optional[str] = None, refs: Optional[int] = None,
           regresses: Optional[int] = None, after: Optional[str] = None,
-          priority: Optional[str] = None) -> str:
+          priority: Optional[str] = None, holder: Optional[str] = None,
+          env: Optional[Dict[str, str]] = None) -> str:
     """File a ticket under the goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Rewritten from issue M." in words, and the
     original gets a comment naming the ticket and loom:rewritten in place of
@@ -1100,8 +1137,12 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     take P0 first and a ticket without one counts as P2.
 
     When the goal home names a Trunk branch and no explicit --base is given,
-    the ticket uses that branch as its base."""
-    _check_brief_args(title, body, lane, model, base)
+    the ticket uses that branch as its base.
+
+    When the goal home carries a live brief defer (its newest brief-stage marker
+    is a defer), a journal comment recording the brief stage as done is posted
+    on the goal home."""
+    _check_brief_args(title, body, lane, model, base, holder)
     if not_before is not None and not tickets.NOT_BEFORE_RE.fullmatch(not_before):
         raise ValueError("not-before is not a UTC time like 2026-10-13T17:00:00Z")
     if after is not None:
@@ -1123,9 +1164,16 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority)
     if regresses is not None:
-        return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
-                                 regresses, goal_issue)
+        live_defer = _has_live_brief_defer(gh, repo, goal, env)
+        url = _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
+                                regresses, goal_issue)
+        if live_defer:
+            m = re.search(r"/issues/(\d+)$", url)
+            if m:
+                _record_brief_done(gh, repo, goal, int(m.group(1)), holder)
+        return url
     _check_goal_capacity(gh, repo, goal, goal_issue)
+    live_defer = _has_live_brief_defer(gh, repo, goal, env)
     issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
@@ -1134,6 +1182,8 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         _remove_label(gh, repo, refs, "loom:triage")
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
+    if live_defer:
+        _record_brief_done(gh, repo, goal, int(issue["number"]), holder)
     return str(issue.get("html_url", ""))
 
 
@@ -2806,7 +2856,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES)
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder")
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
@@ -2847,7 +2897,7 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
-                args.regresses, args.after, args.priority))
+                args.regresses, args.after, args.priority, args.holder))
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:

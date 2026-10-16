@@ -108,10 +108,16 @@ class Routes:
     def __init__(self, routes):
         self.routes = routes
         self.calls = []
+        self.posted = {}
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com", 1)[-1].split("?")[0]
         self.calls.append((method, path))
+        if body:
+            try:
+                self.posted[(method, path)] = json.loads(body.decode())
+            except Exception:
+                pass
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
         if (method, path) not in self.routes:
@@ -280,6 +286,118 @@ class ResumeCommandTests(unittest.TestCase):
         routes = self.routes()
         with self.assertRaises(ValueError):
             brain.defer(GitHub("t", transport=Routes(routes)), "brief", (REPO, 1), "muse")
+
+    def test_brief_records_done_marker_retiring_live_brief_defer(self):
+        routes = self.routes()
+        defer_line = handoff.defer_marker("brief", (REPO, 1), "open", "muse", note="cache query")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(10, "muse", defer_line)),
+        ])
+        routes[("GET", "/repos/%s/issues/1/sub_issues" % REPO)] = (200, [])
+        routes[("POST", "/repos/%s/issues" % REPO)] = (200, {
+            "number": 2, "id": 102, "html_url": "https://github.com/%s/issues/2" % REPO,
+        })
+        routes[("POST", "/repos/%s/issues/1/sub_issues" % REPO)] = (200, {})
+        routes[("POST", "/repos/%s/issues/1/comments" % REPO)] = (200, {"id": 201})
+
+        fake = Routes(routes)
+        gh = GitHub("t", transport=fake)
+        env = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
+
+        # Before brief: resume lists the brief item
+        out_before = brain.resume(gh, [REPO], "lane-machine", LOCK_REPO, NOW, env)
+        self.assertIn("- resume brief %s#1: cache query (deferred by muse at %s)" % (
+            REPO, at(10)), out_before)
+
+        # Brain briefs the ticket
+        url = brain.brief(gh, REPO, 1, "T2: Cache query", VALID_BRIEF, lane="codex",
+                          holder="lane-machine", env=env)
+        self.assertEqual("https://github.com/%s/issues/2" % REPO, url)
+
+        # Check comment was posted on goal home with done marker and new ticket number
+        self.assertIn(("POST", "/repos/%s/issues/1/comments" % REPO), fake.calls)
+        posted_body = fake.posted[("POST", "/repos/%s/issues/1/comments" % REPO)]["body"]
+        self.assertTrue(posted_body.startswith(handoff.JOURNAL_MARKER))
+        self.assertIn("- Briefed: #2", posted_body)
+        self.assertIn(handoff.done_marker("brief", (REPO, 1), "lane-machine"), posted_body)
+
+        # Now resume no longer lists the resume brief item
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(10, "muse", defer_line)),
+            {"body": posted_body, "created_at": at(5), "user": {"login": "allowed-bot"}},
+        ])
+        out_after = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                                 "lane-machine", LOCK_REPO, NOW, env)
+        self.assertNotIn("- resume brief", out_after)
+        self.assertIn("- dropped brief %s#1: finished or closed since the defer" % REPO, out_after)
+
+    def test_brief_without_live_brief_defer_posts_no_extra_comment(self):
+        routes = self.routes()
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [])
+        routes[("GET", "/repos/%s/issues/1/sub_issues" % REPO)] = (200, [])
+        routes[("POST", "/repos/%s/issues" % REPO)] = (200, {
+            "number": 2, "id": 102, "html_url": "https://github.com/%s/issues/2" % REPO,
+        })
+        routes[("POST", "/repos/%s/issues/1/sub_issues" % REPO)] = (200, {})
+
+        fake = Routes(routes)
+        gh = GitHub("t", transport=fake)
+        env = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
+        url = brain.brief(gh, REPO, 1, "T2: Cache query", VALID_BRIEF, lane="codex",
+                          holder="lane-machine", env=env)
+        self.assertEqual("https://github.com/%s/issues/2" % REPO, url)
+        self.assertNotIn(("POST", "/repos/%s/issues/1/comments" % REPO), fake.calls)
+
+    def test_refused_brief_records_no_done_marker(self):
+        routes = self.routes()
+        defer_line = handoff.defer_marker("brief", (REPO, 1), "open", "muse", note="cache query")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(10, "muse", defer_line)),
+        ])
+        routes[("GET", "/repos/%s/issues/1/sub_issues" % REPO)] = (200, [])
+        routes[("POST", "/repos/%s/issues" % REPO)] = (500, {"message": "GitHub error"})
+
+        fake = Routes(routes)
+        gh = GitHub("t", transport=fake)
+        env = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
+
+        # Missing sections
+        with self.assertRaises(ValueError):
+            brain.brief(gh, REPO, 1, "T2: Incomplete", "## Why\nonly why",
+                        lane="codex", holder="lane-machine", env=env)
+        self.assertNotIn(("POST", "/repos/%s/issues/1/comments" % REPO), fake.calls)
+
+        # Bad title
+        with self.assertRaises(ValueError):
+            brain.brief(gh, REPO, 1, "T2: Bad\ntitle", VALID_BRIEF,
+                        lane="codex", holder="lane-machine", env=env)
+        self.assertNotIn(("POST", "/repos/%s/issues/1/comments" % REPO), fake.calls)
+
+        # GitHub error
+        with self.assertRaises(brain.GitHubError):
+            brain.brief(gh, REPO, 1, "T2: Cache query", VALID_BRIEF,
+                        lane="codex", holder="lane-machine", env=env)
+        self.assertNotIn(("POST", "/repos/%s/issues/1/comments" % REPO), fake.calls)
+
+
+VALID_BRIEF = """## Why
+The page query is slow for every visitor.
+
+## What
+Cache the query.
+
+## Acceptance criteria
+- [ ] The page loads in under a second.
+- [ ] A test fails without the cache.
+- [ ] The query runs once a minute.
+
+## Size
+
+S
+
+## Out of scope
+- Other pages.
+"""
 
 
 if __name__ == "__main__":

@@ -214,9 +214,11 @@ live regression) and `brief` (a brief named but not written this tick).
   after your last write on the item, and put the line it prints in your
   journal. That yields the stage to the next brain holding the lock.
 - Done: for each stage action you finish (a merge, a re-brief or close of a
-  failed ticket, an answered ask, an admitted regression, a written brief), put the line
+  failed ticket, an answered ask, an admitted regression), put the line
   from `python3 -m bus.brain done OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
-  in your journal.
+  in your journal. A written brief (`bus.brain brief`) records its own done
+  marker on the goal home when the goal carries a live brief defer, so no done
+  line is needed in your journal for it.
 - The newest marker for an item wins, and `resume` drops a defer whose
   item was closed or changed since (new commits, new comments, another
   state), so no brain repeats finished work. `status` shows, per goal and
