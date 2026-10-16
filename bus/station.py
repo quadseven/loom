@@ -178,6 +178,19 @@ DEPLOYED_FILE = "deployed.json"
 SHIP_PER_PASS = 20
 SHIP_PAGES = 5
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+# Shipping through a pin pull request (LOOM_PIN_SHIP_REPOS): a merged pull
+# request in a deployment repo that adds a "# Published from <repo> ..., merge
+# <sha>" comment line deploys that revision of the source repo, so it ships
+# the merged tickets the revision carries. Pin pull requests merged within
+# PIN_SHIP_LOOKBACK seconds are read, each until it has shipped all it
+# carries and for PIN_SHIP_SETTLE seconds, so a ticket reconciled to
+# loom:merged just after the pin merged still ships (PIN_SHIPS_FILE keeps the
+# finished ones).
+PUBLISHED_RE = re.compile(r"^\+\s*#\s*Published from\s+([A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?)"
+                          r"[\s,][^\n]*?\bmerge\s+([0-9a-f]{7,40})\b", re.M)
+PIN_SHIP_LOOKBACK = 7 * 24 * 3600
+PIN_SHIP_SETTLE = 3600
+PIN_SHIPS_FILE = "pin_ships.json"
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
@@ -339,8 +352,12 @@ class Settings:
                  health_urls: str = "",
                  health_every: int = health.EVERY,
                  evidence_cmds: Optional[Dict[str, str]] = None,
-                 roll_ship_docs: Optional[List[Dict[str, str]]] = None) -> None:
+                 roll_ship_docs: Optional[List[Dict[str, str]]] = None,
+                 pin_ship_repos: Sequence[str] = ()) -> None:
         self.home = home
+        # Deployment repos whose merged pin pull requests ship the tickets
+        # of the source revision they publish (ship_pins).
+        self.pin_ship_repos = list(pin_ship_repos)
         # "owner/name#goal=https://..." entries: each goal home's health
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
@@ -448,7 +465,8 @@ class Settings:
                    evidence_cmds=_evidence_commands(env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
-                   roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")))
+                   roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
+                   pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"))
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -1774,10 +1792,12 @@ class Station:
             return None
         return revision, float(at)
 
-    def _merged_pulls(self, repo: str, wanted: set) -> Dict[int, Dict[str, Any]]:
+    def _merged_pulls(self, repo: str, wanted: set,
+                      seen: Optional[List[Dict[str, Any]]] = None) -> Dict[int, Dict[str, Any]]:
         """Each wanted ticket's latest merged pull request, found by its Refs
         line or loom branch in the most recently updated closed pull requests
-        (the URL reconciliation reads), stopping once every one is found."""
+        (the URL reconciliation reads), stopping once every one is found.
+        Every merged pull request read is added to seen when it is given."""
         found: Dict[int, Dict[str, Any]] = {}
         url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                               "&direction=desc&per_page=100" % repo)
@@ -1787,6 +1807,8 @@ class Station:
                 if not isinstance(pr, dict) or not pr.get("merged_at") \
                         or not COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
                     continue
+                if seen is not None:
+                    seen.append(pr)
                 number = self._pr_ticket_number(repo, pr)
                 if number in wanted and (number not in found or str(pr["merged_at"])
                                          > str(found[number]["merged_at"])):
@@ -1806,28 +1828,167 @@ class Station:
         if deployed is None or not tickets.REPO_RE.fullmatch(repo or ""):
             return
         revision, at = deployed
-        listed = self.gh.rest("GET", "/repos/%s/issues?labels=loom:merged&state=open"
-                              "&per_page=100" % repo).data
-        merged = {int(i["number"]) for i in (listed if isinstance(listed, list) else [])
-                  if isinstance(i, dict) and "pull_request" not in i
-                  and "loom:ticket" in _label_names(i)}
+        merged = self._merged_tickets(repo)
         if not merged:
             return
         carried = sorted((str(pr["merged_at"]), number, pr)
                          for number, pr in self._merged_pulls(repo, merged).items()
                          if self.ancestor(str(pr["merge_commit_sha"]), revision))
         for _, number, pr in carried[:SHIP_PER_PASS]:
-            note = ("Shipped: the station deployed revision %s at %s, which carries "
-                    "pull request #%d (merge commit %s)." % (
-                        revision[:12], self._utc(at), int(pr["number"]),
-                        str(pr["merge_commit_sha"])[:12]))
-            try:
-                brain.move(self.gh, repo, number, "shipped", note=note)
-            except (GitHubError, ValueError) as err:
-                _say("could not ship %s#%d: %s" % (repo, number, err))
+            self._ship_one(repo, number, pr,
+                           "the station deployed revision %s at %s" % (
+                               revision[:12], self._utc(at)),
+                           "deployed %s" % revision[:12])
+
+    def _merged_tickets(self, repo: str) -> set:
+        """The numbers of the repo's open merged tickets."""
+        listed = self.gh.rest("GET", "/repos/%s/issues?labels=loom:merged&state=open"
+                              "&per_page=100" % repo).data
+        return {int(i["number"]) for i in (listed if isinstance(listed, list) else [])
+                if isinstance(i, dict) and "pull_request" not in i
+                and "loom:ticket" in _label_names(i)}
+
+    def _ship_one(self, repo: str, number: int, pr: Dict[str, Any], how: str,
+                  what: str) -> bool:
+        """Move one merged ticket to loom:shipped with a note naming how its
+        pull request's merge commit was deployed; whether it moved."""
+        note = "Shipped: %s, which carries pull request #%d (merge commit %s)." % (
+            how, int(pr["number"]), str(pr["merge_commit_sha"])[:12])
+        try:
+            brain.move(self.gh, repo, number, "shipped", note=note)
+        except (GitHubError, ValueError) as err:
+            _say("could not ship %s#%d: %s" % (repo, number, err))
+            return False
+        _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
+        return True
+
+    # -- shipping through a pin pull request ------------------------------
+    def ship_pins(self) -> None:
+        """Move the open merged tickets each recently merged pin pull request
+        of a deployment repo (LOOM_PIN_SHIP_REPOS) deploys to loom:shipped:
+        those of the source repo its published-from comment names whose pull
+        request's merge commit the published revision carries, unless a later
+        revert pull request the revision also carries undid it. At most
+        SHIP_PER_PASS move a pass; a pin pull request is read again until
+        everything it carries has moved and it merged PIN_SHIP_SETTLE ago."""
+        repos = [r for r in self.s.pin_ship_repos if tickets.REPO_RE.fullmatch(r)]
+        if not repos:
+            return
+        path = os.path.join(self.state, PIN_SHIPS_FILE)
+        saved = _read_json(path, {}, strict=False)
+        done = saved if isinstance(saved, dict) else {}
+        cutoff = self.now - PIN_SHIP_LOOKBACK
+        done = {k: v for k, v in done.items() if (self._epoch(str(v)) or 0) >= cutoff}
+        left = [SHIP_PER_PASS]
+        try:
+            for deploy in repos:
+                for pin in self._merged_pins(deploy, cutoff):
+                    key = "%s#%d" % (deploy, int(pin["number"]))
+                    if key in done:
+                        continue
+                    try:
+                        finished = self._ship_pin(deploy, pin, left)
+                    except GitHubError as err:
+                        _say("could not ship pin pull request %s: %s" % (key, err))
+                        continue
+                    settled = self.now - (self._epoch(str(pin["merged_at"])) or self.now)
+                    if finished and settled >= PIN_SHIP_SETTLE:
+                        done[key] = str(pin["merged_at"])
+        finally:
+            _write_json(path, done)
+
+    def _merged_pins(self, deploy: str, cutoff: float) -> List[Dict[str, Any]]:
+        """The deployment repo's pull requests merged since cutoff, oldest
+        first, from its most recently updated closed pull requests."""
+        data = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
+                            "&direction=desc&per_page=100" % deploy).data
+        pins = [pr for pr in (data if isinstance(data, list) else [])
+                if isinstance(pr, dict) and isinstance(pr.get("number"), int)
+                and (self._epoch(str(pr.get("merged_at") or "")) or 0) >= cutoff]
+        return sorted(pins, key=lambda pr: str(pr["merged_at"]))
+
+    def _ship_pin(self, deploy: str, pin: Dict[str, Any], left: List[int]) -> bool:
+        """Ship what one merged pin pull request publishes; whether every
+        ticket it carries has moved (a pull request that publishes nothing
+        has nothing left to ship)."""
+        files = self.gh.paginate("/repos/%s/pulls/%d/files" % (deploy, int(pin["number"])))
+        published = sorted({m.groups() for f in files if isinstance(f, dict)
+                            for m in PUBLISHED_RE.finditer(str(f.get("patch") or ""))})
+        finished = True
+        for name, short in published:
+            source = self._pin_source(deploy, name)
+            if not source:
+                _say("pin pull request %s#%d publishes %s, not a watched repo" % (
+                    deploy, int(pin["number"]), name))
                 continue
-            _say("shipped %s#%d: deployed %s carries #%d" % (
-                repo, number, revision[:12], int(pr["number"])))
+            finished = self._ship_published(source, short, deploy, pin, left) and finished
+        return finished
+
+    def _pin_source(self, deploy: str, name: str) -> str:
+        """The watched repo a published-from comment names: owner/name as
+        written, else the one watched repo of that name, else the deployment
+        repo's owner's."""
+        if "/" in name:
+            return name if self._repo_ok(name) else ""
+        named = [r for r in self.s.repos if r.split("/")[-1] == name and self._repo_ok(r)]
+        if len(named) == 1:
+            return named[0]
+        same = deploy.split("/")[0] + "/" + name
+        return same if self._repo_ok(same) else ""
+
+    def _carries(self, repo: str, commit: str, revision: str) -> bool:
+        """The commit is the revision or one of its ancestors in the repo on
+        GitHub (the compare API); an unknown commit is not."""
+        resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision),
+                            ok=(404,))
+        data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
+        return data.get("status") in ("ahead", "identical")
+
+    def _ship_published(self, source: str, short: str, deploy: str, pin: Dict[str, Any],
+                        left: List[int]) -> bool:
+        commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (source, short),
+                              ok=(404, 422))
+        revision = str((commit.data or {}).get("sha") or "") \
+            if commit.status not in (404, 422) and isinstance(commit.data, dict) else ""
+        if not COMMIT_RE.fullmatch(revision):
+            _say("pin pull request %s#%d names %s merge %s, not a commit there" % (
+                deploy, int(pin["number"]), source, short))
+            return True
+        merged = self._merged_tickets(source)
+        if not merged:
+            return True
+        seen: List[Dict[str, Any]] = []
+        pulls = self._merged_pulls(source, merged, seen)
+        carried = sorted((str(pr["merged_at"]), number, pr) for number, pr in pulls.items()
+                         if self._carries(source, str(pr["merge_commit_sha"]), revision)
+                         and not self._reverted(source, pr, seen, revision))
+        how = "pin pull request %s#%d merged at %s, publishing %s revision %s" % (
+            deploy, int(pin["number"]), str(pin["merged_at"]).replace("T", " "),
+            source, revision[:12])
+        finished = True
+        for _, number, pr in carried:
+            if left[0] <= 0:
+                return False
+            left[0] -= 1
+            finished = self._ship_one(source, number, pr, how, "pin %s#%d" % (
+                deploy, int(pin["number"]))) and finished
+        return finished
+
+    def _reverted(self, repo: str, pr: Dict[str, Any], seen: List[Dict[str, Any]],
+                  revision: str) -> bool:
+        """A later merged pull request the revision carries reverts this one:
+        its body says "Reverts <repo>#<n>" or its title is 'Revert "<title>"',
+        the forms GitHub's revert button writes."""
+        number, title = int(pr["number"]), str(pr.get("title") or "")
+        body = re.compile(r"\bReverts\s+(?:%s)?#%d\b" % (re.escape(repo), number))
+        for other in seen:
+            if other is pr or str(other.get("merged_at")) <= str(pr["merged_at"]):
+                continue
+            if body.search(str(other.get("body") or "")) or (
+                    title and str(other.get("title") or "") == 'Revert "%s"' % title):
+                if self._carries(repo, str(other["merge_commit_sha"]), revision):
+                    return True
+        return False
 
     def hand_back(self) -> None:
         """Return completed lane PRs with failed checks or bot findings."""
@@ -4460,7 +4621,7 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.roll_source_pins, self.ship_deployed, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,

@@ -83,7 +83,26 @@ time, and one log line per move. The pull request is the merged one whose
 `Refs` line or `loom/<number>` branch names the ticket. At most 20 move a
 pass, oldest merge first. A deploy that did not happen records nothing, so it
 ships nothing. Tickets of every other repo are never moved here; their goal
-home's ship rules decide.
+home's ship rules decide, unless they ship through a pin pull request (below).
+
+### Shipping through a pin pull request
+
+A repo that deploys through a pull request in a deployment repo (a digest
+pin whose comment line reads `# Published from <repo> <what shipped>, merge
+<sha>, ...`) ships at that pull request's merge. List each deployment repo in
+`LOOM_PIN_SHIP_REPOS` (space separated `OWNER/NAME`). Each pass, the station
+reads that repo's pull requests merged in the last 7 days; for every
+published-from line one adds, it resolves the named watched repo (`OWNER/NAME`
+as written, else the one watched repo of that name) and merge commit, and
+moves each open `loom:merged` ticket of that repo whose pull request's merge
+commit the published revision carries (the compare API) to `loom:shipped`.
+A ticket whose pull request a later merged pull request reverted (its body
+says `Reverts OWNER/NAME#N`, or its title is `Revert "<title>"`), when the
+revision carries that revert too, stays at `loom:merged`. The note names the
+pin pull request, its merge time and the source revision. The same limit of
+20 moves a pass applies; a pin pull request is read again each pass until all
+it carries has moved and an hour has passed since its merge, so a ticket
+reconciled just after the pin still ships.
 
 Set `LOOM_PIN_TARGETS` in the install environment to a private JSON array of
 `repo`, `path`, `revision_var`, and `sha256_var` objects (see `.env.example`).
