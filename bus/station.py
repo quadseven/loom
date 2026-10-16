@@ -54,6 +54,7 @@ from .labels import REMOTE_LANES
 HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
+RUNAWAY = "loom:runaway"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
@@ -1588,6 +1589,8 @@ class Station:
 
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
                     free: List[str]) -> bool:
+        if RUNAWAY in _label_names(issue):
+            return False
         if self._skip_known(repo, issue):
             return False
         try:
@@ -2043,6 +2046,8 @@ class Station:
     def _report_failure(self, repo: str, number: int, lane: str, text: str, name: str) -> bool:
         """Report a failed brief, keeping fix rounds on their existing pull request."""
         reason = self._failure_reason(lane, name)
+        if self._flag_repeated_failure(repo, number, lane, reason):
+            return True
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
         # Thermal-limit briefs carry "limit:" with or without a class and
@@ -2082,6 +2087,49 @@ class Station:
         self._comment(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
+        """Hold a ticket after the same consecutive failure and record its run table."""
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        previous = None
+        for comment in reversed(comments):
+            body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+            match = re.match(r"^Lane ([a-z0-9-]+) failed: (.*)$", body)
+            if match:
+                previous = (match.group(1), match.group(2))
+                break
+        claimed = []
+        for comment in comments:
+            if not isinstance(comment, dict) or not CLAIM_RE.fullmatch(str(comment.get("body") or "").strip()):
+                continue
+            at = str(comment.get("created_at") or "")
+            try:
+                parsed = time.strptime(at, "%Y-%m-%dT%H:%M:%SZ")
+                claimed.append((calendar.timegm(parsed), comment))
+            except ValueError:
+                continue
+        cutoff = self.now - 6 * 3600
+        recent = [(at, item) for at, item in claimed if at >= cutoff]
+        reason_repeat = previous is not None and previous[1] == reason
+        if not reason_repeat and len(recent) < 3:
+            return False
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": sorted(set(names) | {RUNAWAY})})
+        trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
+        rows = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
+        rows.append("| %s | %s | %s | %s |" % (
+            str(self.now), previous[0], self._issue_model(issue), reason))
+        rows.append("| %s | %s | %s | %s |" % (
+            str(self.now), lane, self._issue_model(issue), reason))
+        self._comment(repo, number, "\n".join(rows))
+        return True
+
+    @staticmethod
+    def _issue_model(issue: Dict[str, Any]) -> str:
+        match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
+        return match.group(1) if match else "unspecified"
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
         """Brief a running ticket to another lane after a limit or transient

@@ -1619,6 +1619,21 @@ class EscalateTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         return fake, brain.escalate(gh, REPO, 9)
 
+    def test_runaway_tickets_have_a_dedicated_status_section(self):
+        rows = [dict(ticket("briefed"), number=12, title="Ordinary"),
+                dict(ticket("briefed"), number=13, title="Ticket")]
+        rows[1]["labels"] = rows[1]["labels"] + [{"name": "loom:runaway"}]
+        self.assertEqual(["### Runaway tickets", "- #13 Ticket"],
+                         brain.runaway_lines(rows))
+
+    def test_runaway_ticket_cannot_be_escalated(self):
+        issue = dict(ticket("failed"), labels=[{"name": "loom:ticket"},
+                                        {"name": "loom:runaway"}])
+        fake = Routed({("GET", "/repos/%s/issues/9" % REPO): reply(200, issue)})
+        with self.assertRaisesRegex(ValueError, "held for runaway review"):
+            brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(["GET"], [method for method, _, _ in fake.calls])
+
     def stuck_cases(self):
         sonnet_claim = [claim("2030-01-01T00:11:00Z")]
         return {
