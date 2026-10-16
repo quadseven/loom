@@ -309,7 +309,9 @@ def push_branch(gh: GitHub, repo: str, number: int) -> str:
     if remote_head:
         base, exists = remote_head, True
     else:
-        base, exists = _git("merge-base", "HEAD", "origin/main"), False
+        info = gh.rest("GET", "/repos/%s" % repo).data or {}
+        default = str(info.get("default_branch") or "main")
+        base, exists = _git("merge-base", "HEAD", "origin/" + default), False
     commits = _git("rev-list", "--reverse", base + "..HEAD").splitlines()
     api_parent, local_parent = base, base
     for sha in commits:
