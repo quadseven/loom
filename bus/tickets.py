@@ -108,7 +108,17 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
         if not m:
             break
         key, value = m.group(1), m.group(2).strip()
+        if key == "Difficulty":
+            # A hand-edited "Difficulty: Medium" failed the check, so the
+            # ticket read as having no tier and no lane ever claimed it
+            # (2026-10-16).
+            value = value.lower()
         if key in headers:
+            if headers[key] == value:
+                # The same line twice (a brief whose file repeated the header
+                # the brief tool also writes) says one thing; keep it.
+                i += 1
+                continue
             raise ValueError("%s: given twice" % key)
         _check_header(key, value)
         headers[key] = value
