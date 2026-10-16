@@ -599,6 +599,7 @@ class LaneRunnerTest(unittest.TestCase):
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
         self.assertIn("agent made no commit and wrote no reason", log)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
 
     def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
         self.drop_brief()
@@ -608,6 +609,7 @@ class LaneRunnerTest(unittest.TestCase):
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
         self.assertNotIn("failed:", log)
         self.assertIn("T042-fix-the-thing done, answered: nothing to change", log)
+        self.assertTrue((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
         calls = self.calls()
         comments = [c for c in calls if c.startswith("gh issue comment 42")]
         self.assertEqual(len(comments), 1, calls)

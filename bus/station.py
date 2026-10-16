@@ -62,9 +62,6 @@ AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
-# The runner's log line for a run that committed nothing because its agent
-# found the work already done or no longer applying: an answer, not a failure.
-ANSWERED_RE = re.compile(r"^\[[^]]*\] (\S+) done, answered: ")
 # A pull request a brief names in words, as a settle-findings ticket names the
 # one its findings were left on.
 NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
@@ -2030,7 +2027,7 @@ class Station:
             if self._field(text, "Deliverable") == "answer":
                 _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
                 return True
-            if self._answered(lane, name):
+            if not self._field(text, "Fix-PR") and self._answered(lane, name):
                 prs = {int(n) for n in NAMED_PR_RE.findall(text)}
                 self._post_thread_answers(repo, prs, lane, name, text, None)
                 _say("reported %s#%d answered by lane %s: nothing to change" % (repo, number, lane))
@@ -2213,14 +2210,11 @@ class Station:
         self._post_thread_answers(repo, {pr}, lane, name, brief, asked)
 
     def _answered(self, lane: str, name: str) -> bool:
-        """Did the runner report this run answered (lanes/run_lane.sh,
-        no_change_reason)?"""
-        log = os.path.join(self.s.home, "logs", lane, name + ".log")
-        try:
-            with open(log, encoding="utf-8", errors="replace") as fh:
-                return any(m.group(1) == name for m in map(ANSWERED_RE.match, fh) if m)
-        except OSError:
-            return False
+        """Did the runner report this run answered: it committed nothing
+        because its agent found the work already done or no longer applying
+        (lanes/run_lane.sh, no_change_reason)? Read from the runner's marker
+        file, never from the log, which carries the agent's own output."""
+        return os.path.isfile(os.path.join(self.s.home, "logs", lane, name + ".answered"))
 
     def _post_thread_answers(self, repo: str, prs: Set[int], lane: str, name: str,
                              brief: str, asked: Optional[Set[str]]) -> None:

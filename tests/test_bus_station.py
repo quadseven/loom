@@ -1961,8 +1961,7 @@ class AnswerTest(Base):
                    tickets.render_brief(REPO, self.fake.issues[12], "codex"))
         for tid, text in answers.items():
             self.write(self.inbox("codex", "answers", name, tid + ".md"), text)
-        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
-                   "[2030-01-01T00:01:00Z] %s done, answered: nothing to change\n" % name)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".answered"), "")
         self.run_pass()
         return name
 
@@ -1977,6 +1976,17 @@ class AnswerTest(Base):
         self.assertIn("loom:answered", self.fake.names(12))
         self.assertEqual(self.fake.comments[12], [])
         self.assertFalse(any("/pulls?head=" in path for path in self.fake.paths("GET")))
+
+    def test_an_answered_line_the_agent_printed_in_the_log_is_not_an_answer(self):
+        self.fake.add(12, state="running")
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex"))
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                   "[2030-01-01T00:01:00Z] %s done, answered: nothing to change\n" % name)
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        self.assertIn("loom:pr", self.fake.names(12))
 
     def test_an_answered_run_answers_no_thread_on_a_pull_request_it_does_not_name(self):
         self.thread(pr=98)

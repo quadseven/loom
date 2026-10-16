@@ -1531,6 +1531,7 @@ for BRIEF in "$INBOX"/*.md; do
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
+  rm -f "$LOGDIR/$TICKET.answered"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
@@ -1774,6 +1775,8 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "agent made no commit and its reason has no ticket number to go on"; continue
     fi
     if ! WHY="$(post_no_change)"; then park "$BRIEF" "$WHY" transient; continue; fi
+    # The station reads this marker, not the log, which carries agent output.
+    : > "$LOGDIR/$TICKET.answered"
     echo "[$(date -u +%FT%TZ)] $TICKET done, answered: nothing to change" >> "$LOG"
     mv "$BRIEF" "$INBOX/done/"
     continue
