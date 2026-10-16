@@ -1357,6 +1357,20 @@ class Tickets(Base):
         self.go(limited=["claude"])
         self.assertEqual((self.lane(7), self.model(7)), ("anthropic", "claude-opus-5-5"))
 
+    def test_a_model_agy_lacks_does_not_move_to_agy_at_a_limit(self):
+        self.gh.private = False
+        body = "Model: gpt-6-sol\nDifficulty: easy\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="spark", body=body)
+        self.go(limited=["spark"], available=["agy"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", "gpt-6-sol"))
+
+    def test_a_stalled_ticket_with_a_model_agy_lacks_does_not_move_to_agy(self):
+        self.gh.private = False
+        body = "Model: gpt-6-sol\nDifficulty: easy\n\n## Why\nx\n"
+        self.stalled(7, lane="spark", body=body)
+        self.go(available=["agy"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", "gpt-6-sol"))
+
     def test_a_ticket_on_a_lane_that_is_not_limited_waits_as_before(self):
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},

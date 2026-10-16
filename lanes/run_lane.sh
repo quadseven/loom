@@ -1472,8 +1472,15 @@ for BRIEF in "$INBOX"/*.md; do
     workersai:cloudflare-workers-ai/@cf/*) ;;
     spark:spark/?*) ;;
     spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
-    agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
-    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
+    agy:gemini-*|agy:claude-*|agy:gpt-oss-*)
+      case "$MODEL" in
+        *-low|*-medium|*-high) ;;
+        *) case "${LOOM_AGY_EFFORT:-high}" in
+             low|medium|high) MODEL="$MODEL-${LOOM_AGY_EFFORT:-high}" ;;
+             *) park "$BRIEF" "agy effort must be low, medium, or high" transient; continue ;;
+           esac ;;
+      esac ;;
+    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)" transient; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
   if [ -n "$CONFIGURED_MODELS" ] && [ -z "$PINNED_MODEL" ]; then

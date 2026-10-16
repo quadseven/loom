@@ -627,6 +627,18 @@ def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
     return lanes_of(difficulty_of(issue), private)
 
 
+def agy_takes_header(issue: Dict[str, Any], rung_only: bool = False) -> bool:
+    """Whether agy can take the ticket's Model: header when it is kept."""
+    match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+    if not match:
+        return True
+    model = match.group(1)
+    if rung_only and model not in (rung_model for _, rung_model in LADDER):
+        return True
+    from .station import lane_takes_model
+    return lane_takes_model("agy", model)
+
+
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
@@ -722,14 +734,17 @@ class Factory:
         fallback saying so. (None, "") when it should wait."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
+        agy_ok = agy_takes_header(issue, rung_only=True)
         own = [x for x in lanes_of(difficulty, private)
-               if x != old and (allow_remote or x not in REMOTE_LANES)]
+               if x != old and (allow_remote or x not in REMOTE_LANES)
+               and (x != "agy" or agy_ok)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._up(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
             fallback_lanes = [x for x in lanes_of(tier, private)
-                              if x != old and (allow_remote or x not in REMOTE_LANES)]
+                              if x != old and (allow_remote or x not in REMOTE_LANES)
+                              and (x != "agy" or agy_ok)]
             lane = next((x for x in fallback_lanes if self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
@@ -1303,7 +1318,8 @@ class Factory:
         its rung, or of its difficulty tier. Never up the ladder."""
         old = _lane(issue)
         pool = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
-        return [x for x in pool if x != old and self._up(x)]
+        return [x for x in pool if x != old and self._up(x)
+                and (x != "agy" or agy_takes_header(issue))]
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
