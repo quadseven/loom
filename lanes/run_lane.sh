@@ -1457,7 +1457,9 @@ for BRIEF in "$INBOX"/*.md; do
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed" transient; continue
   fi
-  BASE="$(git -C "$TREE" rev-parse HEAD)"
+  if ! BASE="$(git -C "$TREE" rev-parse HEAD)" || [ -z "$BASE" ]; then
+    park "$BRIEF" "could not read the base commit" transient; continue
+  fi
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED=""
@@ -1503,8 +1505,12 @@ for BRIEF in "$INBOX"/*.md; do
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
+  if ! TREE_STATUS="$(safe_git status --porcelain 2>> "$LOG")" ||
+     ! TREE_HEAD="$(safe_git rev-parse HEAD 2>> "$LOG")"; then
+    park "$BRIEF" "could not read the agent's git state" transient; continue
+  fi
   EDITED=""
-  { [ -n "$(safe_git status --porcelain)" ] || [ "$(safe_git rev-parse HEAD)" != "$BASE" ]; } && EDITED=edited
+  { [ -n "$TREE_STATUS" ] || [ "$TREE_HEAD" != "$BASE" ]; } && EDITED=edited
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
   FAIL_CLASS=work
@@ -1619,8 +1625,23 @@ PY
   if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
     if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
            safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
-      park "$BRIEF" "could not commit the agent's changes"; continue
+      park "$BRIEF" "could not commit the agent's changes" transient; continue
     fi
+  fi
+  # A non-sandboxed agent may commit while HEAD is detached. Adopt that clean
+  # commit onto the lane branch before validation and push.
+  if ! TREE_STATUS="$(safe_git status --porcelain 2>> "$LOG")" ||
+     ! TREE_HEAD="$(safe_git rev-parse HEAD 2>> "$LOG")" ||
+     ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")"; then
+    park "$BRIEF" "could not read the committed git state" transient; continue
+  fi
+  if [ -z "$TREE_STATUS" ] && [ "$TREE_HEAD" != "$BRANCH_HEAD" ] && [ "$TREE_HEAD" != "$BASE" ]; then
+    if ! safe_git update-ref "refs/heads/$BRANCH" "$TREE_HEAD" >> "$LOG" 2>&1; then
+      park "$BRIEF" "could not record the agent's commit on $BRANCH" transient; continue
+    fi
+  fi
+  if ! safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1; then
+    park "$BRIEF" "could not check out $BRANCH after the agent run" transient; continue
   fi
   COMMITTED=0
   # A lane pull request never carries the files its agent wrote to probe
@@ -1628,9 +1649,12 @@ PY
   # files from the agent's commits and names each one in the run log (and,
   # for a new PR, in the Intent section).
   if ! drop_probe_files >> "$LOG" 2>&1; then
-    park "$BRIEF" "could not drop sandbox probe files"; continue
+    park "$BRIEF" "could not drop sandbox probe files" transient; continue
   fi
-  if [ "$(safe_git rev-parse "$BRANCH")" != "$BASE" ]; then
+  if ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")" || [ -z "$BRANCH_HEAD" ]; then
+    park "$BRIEF" "could not read the lane branch after validation" transient; continue
+  fi
+  if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
   fi
   # An agent's exit code is not evidence: only a passing check on the
