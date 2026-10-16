@@ -45,12 +45,45 @@ def _interpreter(commands: List[str]) -> str:
         try:
             words = shlex.split(cmd)
         except ValueError:
-            raise ValueError("a command does not parse: %s" % cmd[:60])
+            raise ValueError("a command does not parse: %s" % cmd[:60]) from None
         programs.append(words[0] if words else "")
     if any(p in ("uv", "uvx") for p in programs):
         return "uv"
     first = programs[0] if programs else ""
     return first if first and "=" not in first and first != "cd" else "bash"
+
+
+def _key_value(lines: List[str]) -> str:
+    for line in lines:
+        if not LEGACY.match(line):
+            raise ValueError("has an unknown line '%s'" % line[:40])
+    return "\n".join(lines) + "\n"
+
+
+def _from_tables(lines: List[str]) -> List[Tuple[str, str]]:
+    found: List[Tuple[str, str]] = []
+    kind = ""
+    for line in lines:
+        table = TABLE.match(line)
+        if table:
+            kind = table.group(1)
+            continue
+        cmd = COMMAND.match(line)
+        if cmd and kind:
+            found.append((kind, cmd.group(1).replace('\\"', '"').replace("\\\\", "\\")))
+        elif not re.match(r"^(workflow|step)\s*=", line):
+            raise ValueError("has an unknown line '%s'" % line[:40])
+    return found
+
+
+def _from_pipes(lines: List[str]) -> List[Tuple[str, str]]:
+    found: List[Tuple[str, str]] = []
+    for line in lines:
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) < 2 or not fields[1]:
+            raise ValueError("has an unknown line '%s'" % line[:40])
+        found.append((fields[0], fields[1]))
+    return found
 
 
 def normalize(text: str) -> str:
@@ -61,30 +94,9 @@ def normalize(text: str) -> str:
             return "check: true\n"
         raise ValueError("has no check: line")
     if any(LEGACY.match(line) for line in lines):
-        for line in lines:
-            if not LEGACY.match(line):
-                raise ValueError("has an unknown line '%s'" % line[:40])
-        return "\n".join(lines) + "\n"
-    found: List[Tuple[str, str]] = []
-    if any(TABLE.match(line) for line in lines):
-        kind = ""
-        for line in lines:
-            table = TABLE.match(line)
-            if table:
-                kind = table.group(1)
-                continue
-            cmd = COMMAND.match(line)
-            if cmd and kind:
-                found.append((kind, cmd.group(1).replace('\\"', '"').replace("\\\\", "\\")))
-            elif not re.match(r"^(workflow|step)\s*=", line):
-                raise ValueError("has an unknown line '%s'" % line[:40])
-    else:
-        for line in lines:
-            fields = [f.strip() for f in line.split("|")]
-            if len(fields) < 2 or not fields[1]:
-                raise ValueError("has an unknown line '%s'" % line[:40])
-            found.append((fields[0], fields[1]))
-    commands = _ordered(found)
+        return _key_value(lines)
+    tables = any(TABLE.match(line) for line in lines)
+    commands = _ordered(_from_tables(lines) if tables else _from_pipes(lines))
     if not commands:
         return "check: true\n"
     return "interpreter: %s\ncheck: %s\n" % (_interpreter(commands), " && ".join(commands))
