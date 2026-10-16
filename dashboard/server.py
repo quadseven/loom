@@ -183,6 +183,7 @@ def _priorities_card(rows):
 
 def _floor(state):
     rows = _all_tickets(state)
+    runaway = [row for row in rows if "loom:runaway" in (row.get("labels") or []) and row.get("open", True)]
     conveyor, bottleneck = _conveyor(state, rows)
     order = {name: index for index, name in enumerate(MOVING_ORDER)}
     moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
@@ -202,6 +203,9 @@ def _floor(state):
         '<span class="bottleneck-note">%s is the bottleneck</span>' % esc(bottleneck) if bottleneck else "")
     parts = ['<section class="standup">%s</section>' % standup,
              '<section class="section">%s<div class="conveyor">%s</div></section>' % (head, conveyor)]
+    runaway_rows = "".join(_ticket_row(row) for row in runaway)
+    parts.append('<section class="section runaway-tickets"><div class="section-head"><span class="label">Runaway tickets</span></div>%s</section>' % (
+        runaway_rows or '<p class="empty-state">None held for review.</p>'))
     parts.append('<div class="floor-columns"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
                  '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list">%s</div></section>' % (
                      "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'))
