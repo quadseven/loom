@@ -39,6 +39,7 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 REPORT_EVERY = 2 * 3600
 REPORT_GRACE = 30 * 60
 TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
+RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
@@ -286,6 +287,13 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
                 issue["number"], issue.get("title", ""), lane, _age(issue, now),
                 (marks or {}).get(int(issue["number"]), "")))
     return lines
+
+
+def runaway_lines(tickets: List[Dict[str, Any]]) -> List[str]:
+    """List held runaway tickets for immediate brain review."""
+    rows = [i for i in tickets if RUNAWAY in _labels(i)]
+    return ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
+                                      for i in rows] or ["- none"])
 
 
 HELD_HEADING = "### Held tickets"
@@ -545,6 +553,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors) + [""]
+    lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or ())
@@ -647,6 +656,10 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
             lambda repo: _repo_section(gh, repo, now, bot, authors, found), repos))
+    runaway = [(repo, issue) for repo, items in found.items() for issue in items
+               if RUNAWAY in _labels(issue)]
+    out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
+        repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
     out += [""] + _health_lines(env)
     for section in sections:
@@ -2692,6 +2705,8 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     _check_written_text(notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
+    if RUNAWAY in names:
+        raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
     held = _waiting_for(gh, repo, issue)
@@ -2706,10 +2721,11 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         raise ValueError("ticket is not repeatedly stuck")
     if history.rung is None:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                {"labels": sorted(set(names) | {"needs-brain"})})
+                {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-                "Past the model ladder (tried %s); %s. Needs the brain to rewrite the brief "
-                "smaller or ask the operator." % (", ".join(history.tried), "; ".join(history.reasons))})
+                "Runaway: escalation after every rung was tried. Past the model ladder "
+                "(tried %s); %s. The ticket is held for brain review." % (
+                    ", ".join(history.tried), "; ".join(history.reasons))})
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
     choice = None

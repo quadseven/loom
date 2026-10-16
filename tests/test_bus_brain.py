@@ -1631,6 +1631,21 @@ class EscalateTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         return fake, brain.escalate(gh, REPO, 9)
 
+    def test_runaway_tickets_have_a_dedicated_status_section(self):
+        rows = [dict(ticket("briefed"), number=12, title="Ordinary"),
+                dict(ticket("briefed"), number=13, title="Ticket")]
+        rows[1]["labels"] = rows[1]["labels"] + [{"name": "loom:runaway"}]
+        self.assertEqual(["### Runaway tickets", "- #13 Ticket"],
+                         brain.runaway_lines(rows))
+
+    def test_runaway_ticket_cannot_be_escalated(self):
+        issue = dict(ticket("failed"), labels=[{"name": "loom:ticket"},
+                                        {"name": "loom:runaway"}])
+        fake = Routed({("GET", "/repos/%s/issues/9" % REPO): reply(200, issue)})
+        with self.assertRaisesRegex(ValueError, "held for runaway review"):
+            brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(["GET"], [method for method, _, _ in fake.calls])
+
     def stuck_cases(self):
         sonnet_claim = [claim("2030-01-01T00:11:00Z")]
         return {
@@ -1756,6 +1771,18 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(outcome, "needs-brain")
         self.assertIn("needs-brain", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
         self.assertFalse(fake.sent("PATCH", "/issues/9"))
+
+    def test_escalating_after_every_rung_was_tried_flags_the_ticket_runaway(self):
+        history = [claim("2030-01-01T00:11:00Z"), claim("2030-01-01T00:20:00Z", "codex"),
+                   {"body": "<!-- loom:escalate v1 -->\nRung: 3 claude-opus-5-5 claude", "created_at": "2030-01-01T00:30:00Z"},
+                   claim("2030-01-01T00:31:00Z")]
+        issue = stuck_ticket("failed", body="Model: claude-opus-5-5\n\n" + BODY)
+        fake, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
+        self.assertEqual(outcome, "needs-brain")
+        self.assertIn("loom:runaway", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
+        body = fake.sent("POST", "/issues/9/comments")[0]["body"]
+        self.assertIn("Runaway: escalation after every rung was tried.", body)
+        self.assertIn("held for brain review", body)
 
     def test_escalate_tracks_the_rewritten_model_per_claim(self):
         # Sonnet claimed, escalated to codex and claimed again: the next rung is the last.

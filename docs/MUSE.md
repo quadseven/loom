@@ -276,6 +276,12 @@ this tick"; a step with no note shows nothing there.
    only from evidence you saw in this tick, and otherwise leave a one-line
    note on the ticket naming what evidence is missing. Last, `resume` lists
    one lane-made proof to audit as a `resume audit` item; audit it in step 4.
+   Review every ticket in the `Runaway tickets` section before merge or briefs.
+   Read its latest run log tail and record one decision on the ticket: factory
+   fault (file a factory ticket and keep the runaway hold), brief problem
+   (rewrite the brief, then clear `loom:runaway`), or model limit (escalate
+   once with the reason, then clear `loom:runaway`). Do not clear a factory
+   fault hold until its fix ships.
 3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
    the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
