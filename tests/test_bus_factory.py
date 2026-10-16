@@ -415,17 +415,28 @@ class PullRequests(Base):
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.moved, [(5, "failed", None)])
 
-    def test_a_rung_skipped_while_busy_is_still_tried_later(self):
-        # Spilled straight to rung 3 while rungs 1 and 2 were busy: stuck
-        # again, it goes to rung 1, not past the end of the ladder.
+    def test_a_move_to_a_lower_rung_than_one_reached_flags_the_ticket_runaway(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 3, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
-        self.assertEqual(self.moved, [])
-        self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
-        self.assertEqual(factory.tried_rungs(self.gh.comments[5]), {3})  # rung 1 is not claimed yet
+        self.assertEqual((self.fixed, self.moved), ([], []))
+        self.assertIn("loom:runaway", [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertEqual(self.model(5), None)
+        note = self.gh.comments[5][-1]["body"]
+        self.assertIn("Runaway: ladder move from rung 3 down to rung 1.", note)
+        self.assertIn("| Time | Lane | Model | Reason |", note)
+        self.assertNotIn("loom:rung", note)
+
+    def test_a_runaway_ticket_is_not_climbed_or_given_up_on(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.issues[5]["labels"].append({"name": "loom:runaway"})
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual((self.fixed, self.moved), ([], []))
+        self.assertEqual(len(self.gh.comments[5]), len(ALL_RUNGS) + 1)
 
     def test_a_ticket_that_failed_on_a_ladder_model_does_not_get_it_again(self):
         self.gh.ticket(6, "failed", lane="claude",

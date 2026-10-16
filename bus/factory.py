@@ -198,6 +198,8 @@ NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 # bus/station.py's note on a failed run, and the runner's reason when a run
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
+CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
+RUNAWAY = "loom:runaway"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
                  ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved path'
@@ -441,6 +443,45 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
             else:
                 pending = pending | {rung}
     return tried
+
+
+def reached_rung(comments: Sequence[Dict[str, Any]]) -> int:
+    """The highest rung the ticket has run on since its ladder last started, 0
+    when none."""
+    return max(tried_rungs(comments), default=0)
+
+
+def issue_model(issue: Dict[str, Any]) -> str:
+    match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
+    return match.group(1) if match else "unspecified"
+
+
+def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
+    """Each claim as (epoch, time, lane, reason it failed), oldest first, from
+    the claim and "Lane X failed:" comments. An attempt takes the failure that
+    followed it, or "" when none was recorded; with `current` given, the last
+    attempt is the one being reported and takes that reason."""
+    found: List[List[Any]] = []
+    for comment in comments:
+        body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
+        claim = CLAIMED_RE.fullmatch(body)
+        at = _ts(comment.get("created_at")) if claim else 0.0
+        if claim and at:
+            found.append([int(at), str(comment["created_at"]), claim.group(1), ""])
+        failure = FAILED_RE.match(body)
+        if failure and found and not found[-1][3]:
+            found[-1][3] = body[failure.end():]
+    if found and current:
+        found[-1][3] = current
+    return [(a[0], a[1], a[2], a[3]) for a in found]
+
+
+def runaway_comment(trigger: str, rows: Sequence[Tuple[int, str, str, str]], model: str) -> str:
+    """The comment a flagged ticket carries: why, and its attempt table."""
+    lines = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s |" % (stamp, lane, model, reason or "-")
+              for _, stamp, lane, reason in rows]
+    return "\n".join(lines)
 
 
 def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
@@ -881,6 +922,8 @@ class Factory:
         a rung marker. The rung it ran on counts as tried when it failed
         there. Returns the lane, or None once every rung was tried."""
         number = int(issue["number"])
+        if RUNAWAY in _labels(issue):
+            return None  # held until a brain clears the label
         tried = tried_rungs(comments)
         if failed_here:
             tried |= {current_rung(issue)} - {0}
@@ -891,6 +934,10 @@ class Factory:
                     if any(lane in available_lanes for lane in lanes)}
         rung = next_rung(tried | ({skip} - {0}), self.load, eligible)
         if not rung:
+            return None
+        if rung < max(tried, default=0):
+            self._flag_runaway(repo, issue, comments, "ladder move from rung %d down to rung %d"
+                               % (max(tried), rung))
             return None
         lanes, model = LADDER[rung - 1]
         lanes = tuple(lane for lane in lanes if lane in available_lanes)
@@ -909,8 +956,22 @@ class Factory:
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
+    def _flag_runaway(self, repo: str, issue: Dict[str, Any],
+                      comments: Sequence[Dict[str, Any]], trigger: str) -> None:
+        """Hold a ticket for the brain: the runaway label and its attempt table."""
+        number = int(issue["number"])
+        kept = _labels(issue) + [RUNAWAY]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+            "body": runaway_comment(trigger, attempts(comments), issue_model(issue))})
+        self.actions += 1
+        _say("%s#%d is a runaway (%s); held for the brain" % (repo, number, trigger))
+
     def _give_up(self, repo: str, issue: Dict[str, Any], why: str) -> None:
         number = int(issue["number"])
+        if RUNAWAY in _labels(issue):
+            return
         if _state(issue) != "failed":
             self.move(self.gh, repo, number, "failed",
                       note="The factory tried every rung of the model ladder (%s). "

@@ -2100,7 +2100,7 @@ class Station:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        attempts = self._attempts(comments, reason)
+        attempts = factory.attempts(comments, reason)
         failures = [a[3] for a in attempts[:-1] if a[3]]
         reason_repeat = bool(failures) and failures[-1] == reason
         recent = [a for a in attempts if a[0] >= self.now - 6 * 3600]
@@ -2110,41 +2110,9 @@ class Station:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
-        model = self._issue_model(issue)
-        rows = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
-        for _, stamp, row_lane, row_reason in attempts:
-            rows.append("| %s | %s | %s | %s |" % (stamp, row_lane, model, row_reason or "-"))
-        self._comment(repo, number, "\n".join(rows))
+        self._comment(repo, number, factory.runaway_comment(
+            trigger, attempts, factory.issue_model(issue)))
         return True
-
-    @staticmethod
-    def _attempts(comments: List[Any], current: str) -> List[Tuple[int, str, str, str]]:
-        """Each claim as (epoch, time, lane, reason it failed), oldest first, from the
-        claim and "Lane X failed:" comments. The last attempt is the one being
-        reported, so it takes the current reason; an earlier one the failure
-        that followed it, or "" when none was recorded."""
-        attempts: List[List[Any]] = []
-        for comment in comments:
-            body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
-            claim = re.match(r"Claimed for lane ([a-z0-9-]+) ", body)
-            if claim and CLAIM_RE.fullmatch(body):
-                stamp = str(comment.get("created_at") or "")
-                try:
-                    at = calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
-                except ValueError:
-                    continue
-                attempts.append([at, stamp, claim.group(1), ""])
-            failure = re.match(r"^Lane [a-z0-9-]+ failed: (.*)$", body)
-            if failure and attempts and not attempts[-1][3]:
-                attempts[-1][3] = failure.group(1)
-        if attempts:
-            attempts[-1][3] = current
-        return [(a[0], a[1], a[2], a[3]) for a in attempts]
-
-    @staticmethod
-    def _issue_model(issue: Dict[str, Any]) -> str:
-        match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
-        return match.group(1) if match else "unspecified"
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
         """Brief a running ticket to another lane after a limit or transient
