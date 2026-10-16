@@ -4,27 +4,24 @@
 #
 #   rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]>   (the prompt on stdin)
 #
-# Reads the provider key from the SSM parameter <key-ssm> and runs
-# `opencode run` on <provider/model> with the prompt on its stdin, in the
-# opencode lanes' sandbox (lanes/agent_sandbox.sh): an emptied environment,
-# a scratch HOME made for this run and removed after it, an empty working
-# directory, and the key exported to the agent only. Every opencode tool is
-# denied: the answer is text. Prints only the agent's final text and exits
-# non-zero on any failure, with the reason on stderr. The key is never
-# printed.
+# For OpenCode entries, reads the provider key from SSM. For subscription
+# CLI entries, use - as the key argument. Every entry uses the shared sandbox
+# with an emptied environment, scratch HOME and empty working directory.
+# OpenCode and Claude tools are denied; Codex tools are read-only. Prints only
+# final text and exits non-zero when every entry fails.
 #
 # Env: LOOM_HOME (default ~/loom; the scratch home goes under its run/),
 # LOOM_REWRITE_TIMEOUT (seconds for the agent, default 480, under the
 # station's 600), LOOM_NET_TIMEOUT (seconds for the SSM read, default 120),
-# LOOM_AWS_REGION, LOOM_REWRITE_OPENCODE (the opencode binary, default
-# opencode from PATH).
+# LOOM_AWS_REGION, LOOM_REWRITE_OPENCODE (default opencode from PATH), and
+# LOOM_REWRITE_CLAUDE_TOKEN_SSM for a Claude subscription entry.
 set -uo pipefail
 
 fail() { echo "rewrite_agent: $1" >&2; exit "${2:-1}"; }
 
 KEY_SSM="${1:-}" MODEL_LIST="${2:-}"
 [ $# -eq 2 ] || fail "usage: rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]>" 2
-[[ "$KEY_SSM" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "bad SSM parameter name" 2
+[[ "$KEY_SSM" = - || "$KEY_SSM" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "bad SSM parameter name" 2
 [ -n "$MODEL_LIST" ] || fail "no models supplied" 2
 IFS=, read -r -a MODELS <<< "$MODEL_LIST"
 KEY_VARS=()
@@ -35,6 +32,7 @@ for MODEL in "${MODELS[@]}"; do
     openrouter) KEY_VARS+=(OPENROUTER_API_KEY) ;;
     zai) KEY_VARS+=(ZHIPU_API_KEY) ;;
     anthropic) KEY_VARS+=(ANTHROPIC_API_KEY) ;;
+    codex|claude) KEY_VARS+=(-) ;;
     *) fail "no key variable known for provider ${MODEL%%/*}" 2 ;;
   esac
 done
@@ -52,7 +50,6 @@ AGENT_TIMEOUT="${LOOM_REWRITE_TIMEOUT:-480}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 OPENCODE_PERMISSION='{"*": "deny"}'
 BIN="${LOOM_REWRITE_OPENCODE:-opencode}"
-command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
 command -v sandbox-exec > /dev/null || fail "sandbox-exec not available"
 
 # The run's own files (prompt, output, answer) sit beside the scratch home,
@@ -68,8 +65,36 @@ AGENT_STDIN="$RUN_DIR/prompt"
 cat > "$AGENT_STDIN" || fail "cannot read the prompt"
 [ -s "$AGENT_STDIN" ] || fail "no prompt on stdin"
 
-API_KEY="$(ssm_value "$KEY_SSM")"
-[ -n "$API_KEY" ] || fail "no key readable at the SSM parameter $KEY_SSM"
+if [ "$KEY_SSM" != - ]; then
+  API_KEY="$(ssm_value "$KEY_SSM")"
+  [ -n "$API_KEY" ] || fail "no key readable at the SSM parameter $KEY_SSM"
+fi
+
+# Subscription CLIs use the same isolated home. Codex's login file is copied
+# before the agent starts; Claude can use an OAuth token supplied by the
+# installer. No other settings, hooks or plugins from the operator home enter.
+if [[ ",${MODEL_LIST}," == *",codex/"* ]] && [ -f "$HOME/.codex/auth.json" ]; then
+  mkdir -p "$AGENT_HOME/.codex" || fail "cannot prepare codex home"
+  cp "$HOME/.codex/auth.json" "$AGENT_HOME/.codex/auth.json" || fail "cannot copy codex login"
+  chmod 600 "$AGENT_HOME/.codex/auth.json"
+fi
+
+LANE_EXTRACT='
+import json, sys
+provider = sys.argv[2]
+answer = None
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try: event = json.loads(line)
+    except ValueError: continue
+    if provider == "codex" and event.get("type") == "item.completed":
+        item = event.get("item") or {}
+        if item.get("type") == "agent_message": answer = item.get("text")
+    elif provider == "claude" and event.get("type") == "result":
+        if event.get("is_error"): sys.exit("the agent reported an error")
+        answer = event.get("result")
+if not isinstance(answer, str) or not answer.strip(): sys.exit("the agent gave no text")
+sys.stdout.write(answer.strip() + "\n")
+'
 
 # JSON events, one per line, so final text is told apart from tool output.
 # shellcheck disable=SC2016 # python source, not shell
@@ -99,29 +124,62 @@ sys.stdout.write(text.strip() + "\n")
 REASONS=""
 for i in "${!MODELS[@]}"; do
   MODEL="${MODELS[$i]}" KEY_VAR="${KEY_VARS[$i]}"
+  PROVIDER="${MODEL%%/*}" MODEL_ID="${MODEL#*/}"
+  AGENT_EXTRA_ENV=""
+  [ "$KEY_VAR" = - ] || [ -n "$API_KEY" ] || fail "keyed model $MODEL needs an SSM parameter" 2
   OUT="$RUN_DIR/out" ANSWER_FILE="$RUN_DIR/answer"
   : > "$OUT"
   cd "$AGENT_HOME/work" || fail "cannot enter the scratch working directory"
-  opencode_run "$KEY_VAR" "$BIN" --format json > "$OUT"
+  case "$PROVIDER" in
+    codex)
+      api_agent - codex exec --sandbox read-only --skip-git-repo-check --json \
+        --model "$MODEL_ID" - > "$OUT" ;;
+    claude)
+      if [ -n "${LOOM_REWRITE_CLAUDE_TOKEN_SSM:-}" ]; then
+        CLAUDE_CODE_OAUTH_TOKEN="$(ssm_value "$LOOM_REWRITE_CLAUDE_TOKEN_SSM")"
+        [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || fail "no Claude subscription token readable" 2
+      fi
+      AGENT_EXTRA_ENV="${CLAUDE_CODE_OAUTH_TOKEN:+CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN}"
+      api_agent - claude -p --model "$MODEL_ID" --output-format stream-json \
+        --verbose --tools "" --strict-mcp-config --disable-slash-commands \
+        --setting-sources "" < "$AGENT_STDIN" > "$OUT" ;;
+    *)
+      command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
+      opencode_run "$KEY_VAR" "$BIN" --format json > "$OUT" ;;
+  esac
   status=$?
-  reason="$(python3 -I -c "$EXTRACT" "$OUT" 2>&1 > "$ANSWER_FILE")"
+  if [ "$PROVIDER" = codex ] || [ "$PROVIDER" = claude ]; then
+    reason="$(python3 -I -c "$LANE_EXTRACT" "$OUT" "$PROVIDER" 2>&1 > "$ANSWER_FILE")"
+  else
+    reason="$(python3 -I -c "$EXTRACT" "$OUT" 2>&1 > "$ANSWER_FILE")"
+  fi
   extracted=$?
   if [ "$status" -eq 0 ] && [ "$extracted" -eq 0 ]; then
     ANSWER="$(cat "$ANSWER_FILE")" || fail "cannot read the answer"
-    case "$ANSWER" in *"$API_KEY"*) fail "the answer holds the provider key" ;; esac
+    if [ -n "$API_KEY" ]; then
+      case "$ANSWER" in *"$API_KEY"*) fail "the answer holds the provider key" ;; esac
+    fi
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+      case "$ANSWER" in *"$CLAUDE_CODE_OAUTH_TOKEN"*) fail "the answer holds the subscription token" ;; esac
+    fi
     printf '%s\n' "$ANSWER"
     exit 0
   fi
-  [ "$extracted" -eq 0 ] || reason="${reason//"$API_KEY"/[key]}"
+  if [ "$extracted" -ne 0 ] && [ -n "$API_KEY" ]; then
+    reason="${reason//"$API_KEY"/[key]}"
+  fi
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    reason="${reason//"$CLAUDE_CODE_OAUTH_TOKEN"/[token]}"
+  fi
   lower="$(printf '%s' "$reason" | tr '[:upper:]' '[:lower:]')"
   if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
     why="timed out"
   elif [[ "$lower" == *"rate limit"* || "$lower" == *"rate-limit"* || "$lower" == *"overload"* || "$lower" == *"too many requests"* ]]; then
     why="rate limited or overloaded"
   elif [[ "$lower" == *"no text"* ]]; then
-    why="opencode exited $status with no text"
+    why="$PROVIDER exited $status with no text"
   else
-    why="opencode exited $status: ${reason:-no usable answer}"
+    why="$PROVIDER exited $status: ${reason:-no usable answer}"
   fi
   REASONS="${REASONS:+$REASONS; }$MODEL: $why"
   echo "rewrite_agent: passed over $MODEL: $why" >&2

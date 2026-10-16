@@ -284,6 +284,15 @@ class StationRewriteTest(Base):
         self.assertFalse(os.path.exists(public_prompt))
         self.assertEqual(len(self.fake.created), 1)
 
+    def test_a_private_repo_refuses_a_training_provider_command(self):
+        self.fake.private = True
+        self.fake.add_triage(7)
+        private = "lanes/rewrite_agent.sh - zai/glm-4.7-flash"
+        err = self.run_station(self.station(private_cmd=private))
+        self.assertEqual(self.fake.created, [])
+        self.assertIn("skipped", err)
+        self.assertEqual(self.fake.read_comments(), [])
+
     def test_a_repo_whose_visibility_cannot_be_read_counts_as_private(self):
         self.fake.add_triage(7)
         base = self.fake
