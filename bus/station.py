@@ -3458,17 +3458,28 @@ class Station:
         held = {k: v for k, v in held.items() if self._num(v)} if isinstance(held, dict) else {}
         return {lane: held.get(lane, self.now) for lane in self.limited_lanes()}
 
+    def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
+        """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
+        search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
+        a refused sub-issue link leaves the Part of line as the only one."""
+        total = int((goal.get("sub_issues_summary") or {}).get("total") or 0)
+        if total < invariants.SUB_ISSUES_MAX:
+            return 0
+        return len(brain.unassociated_tickets(self.gh, repo, int(goal["number"])))
+
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
-        """Goal homes with their sub-issue counts, and their journals and
+        """Goal homes with their unlinked tickets, and their journals and
         marker posts; a source that cannot be read stays None."""
         try:
             homes = self._goal_homes()
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal homes: %s" % err)
             return
-        facts.goals = [(self._invariant_ref(repo, int(g["number"])),
-                        int((g.get("sub_issues_summary") or {}).get("total") or 0))
-                       for repo, g in homes]
+        try:
+            facts.goals = [(self._invariant_ref(repo, int(g["number"])), self._unassociated(repo, g))
+                           for repo, g in homes]
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the goal tickets: %s" % err)
         try:
             facts.journals, facts.posts = self._invariant_comments(homes)
         except (GitHubError, OSError) as err:
