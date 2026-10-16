@@ -28,6 +28,9 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 # Lane default models, named in every PR. codex: the CLI's own configured
 # default; claude: the current Opus. Override either in the environment.
 LOOM_CODEX_MODEL="${LOOM_CODEX_MODEL:-$(sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$HOME/.codex/config.toml" 2>/dev/null | head -1)}"
+if [ -z "${LOOM_REWRITE_PRIVATE_CMD:-}" ] && [ -n "$LOOM_CODEX_MODEL" ]; then
+  LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/$LOOM_CODEX_MODEL"
+fi
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1:free}"
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
@@ -152,9 +155,8 @@ done
 # the station, brain and lane service logs, docs/LANES.md), and
 # LOOM_REWRITE_CMD and LOOM_REWRITE_PRIVATE_CMD (the agent commands that
 # rewrite loom:triage issues into tickets, docs/BRAIN.md Triage; for example
-# "lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash", and for
-# private repos the same with a model whose provider does not train on
-# prompts, such as opencode-go/kimi-k2.7-code, never a public-only one), and
+# "lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash"; private
+# repos default to the codex subscription when LOOM_CODEX_MODEL is set), and
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and
@@ -217,6 +219,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_EVIDENCE_CMDS</key><string>$(xml "${LOOM_EVIDENCE_CMDS:-}")</string>
     <key>LOOM_REWRITE_CMD</key><string>$(xml "${LOOM_REWRITE_CMD:-}")</string>
     <key>LOOM_REWRITE_PRIVATE_CMD</key><string>$(xml "${LOOM_REWRITE_PRIVATE_CMD:-}")</string>
+    <key>LOOM_REWRITE_CLAUDE_TOKEN_SSM</key><string>$(xml "${LOOM_REWRITE_CLAUDE_TOKEN_SSM:-}")</string>
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
   </dict>
