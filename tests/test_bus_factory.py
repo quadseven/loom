@@ -1081,9 +1081,13 @@ class Tickets(Base):
         return {"body": "Lane zai failed: [work] agent made no commit and wrote no reason "
                         "on loom/%d-x" % number, "user": ME}
 
+    # Its claim on lane zai, which runs no ladder model: a claim on lane claude
+    # would count rung 1 as tried (factory.ran_rungs).
+    ZAI_CLAIM = {"body": "Claimed for lane zai (body sha256 0123456789ab)", "user": ME}
+
     def test_a_first_no_reason_no_commit_failure_climbs(self):
         self.gh.ticket(6, "failed", lane="zai")
-        self.gh.comments[6] += [CLAIM, self.no_reason_failure(6)]
+        self.gh.comments[6] += [self.ZAI_CLAIM, self.no_reason_failure(6)]
         self.go()
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
 
@@ -1104,14 +1108,14 @@ class Tickets(Base):
     def test_a_no_reason_failure_after_a_ladder_restart_climbs_again(self):
         self.gh.ticket(6, "failed", lane="zai")
         self.gh.comments[6] += [self.no_reason_failure(6), {"body": factory.RUNG_MARKER % 0, "user": ME},
-                                CLAIM, self.no_reason_failure(6)]
+                                self.ZAI_CLAIM, self.no_reason_failure(6)]
         self.go()
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
 
     def test_a_stranger_cannot_hold_a_ticket_with_a_no_reason_comment(self):
         self.gh.ticket(6, "failed", lane="zai")
         forged = dict(self.no_reason_failure(6), user=STRANGER)
-        self.gh.comments[6] += [forged, CLAIM, self.no_reason_failure(6)]
+        self.gh.comments[6] += [forged, self.ZAI_CLAIM, self.no_reason_failure(6)]
         self.go()
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
 
@@ -1400,6 +1404,50 @@ class Tickets(Base):
         self.assertEqual(lanes.count("claude"), factory.RUNG_BUSY)
         moved = [n for n in range(1, 6) if self.lane(n) != "claude"]
         self.assertTrue(all(self.model(n) == "gpt-6-sol" for n in moved))
+
+    def escalated_after_sol(self, number, state):
+        """A ticket whose first attempts ran on gpt-6-sol (its Model: line, two
+        codex claims, no rung marker) and that the brain escalated to rung 1."""
+        self.gh.ticket(number, state, lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        sol_claim = {"body": "Claimed for lane codex (body sha256 0123456789ab)", "user": ME}
+        self.gh.comments[number] += [sol_claim, sol_claim, {
+            "body": "<!-- loom:escalate v1 -->\nEscalated to rung 1 of 3: claude-sonnet-5-5 "
+                    "on lane claude.\nReason: 2 fix rounds (attempts 2, tried gpt-6-sol).\n"
+                    "Rung: 1 claude-sonnet-5-5 claude", "user": ME}]
+
+    def test_a_ticket_that_ran_on_sol_is_never_spread_back_to_sol(self):
+        # 2026-10-16: three attempts on gpt-6-sol with no rung marker, escalated
+        # to rung 1, then spread off the busy claude lane to gpt-6-sol again.
+        for n in range(1, 4):
+            self.gh.ticket(n, "briefed", lane="claude")
+        self.escalated_after_sol(7, "briefed")
+        self.go()
+        self.assertNotIn(self.lane(7), ("codex", "codex-2"))
+        self.assertNotEqual(self.model(7), "gpt-6-sol")
+        self.assertIn((self.lane(7), self.model(7)),
+                      [("claude", "claude-sonnet-5-5")]
+                      + [(lane, "claude-opus-5-5") for lane in factory.ANTHROPIC])
+        self.go(limited=factory.ANTHROPIC)  # rung 3 full: it waits on its rung
+        self.assertNotEqual(self.model(7), "gpt-6-sol")
+
+    def test_a_ticket_that_ran_on_sol_climbs_past_sol_when_it_fails(self):
+        self.escalated_after_sol(7, "failed")
+        self.gh.comments[7].append(CLAIM)  # it ran on rung 1 and failed there
+        self.go()
+        self.assertEqual(self.model(7), "claude-opus-5-5")
+        self.assertIn("rung 3", self.gh.comments[7][-1]["body"])
+
+    def test_ran_models_reads_claims_the_model_line_and_markers(self):
+        sol = {"body": "Claimed for lane codex (body sha256 0123456789ab)"}
+        opus = {"body": "Model: claude-opus-5-5\n\n## Why\nx\n"}
+        self.assertEqual(factory.ran_models(opus, [CLAIM]), {"claude-opus-5-5"})
+        self.assertEqual(factory.ran_rungs({"body": "x"}, [sol, CLAIM]), {1, 2})
+        marked = [sol, {"body": factory.RUNG_MARKER % 3}, CLAIM]
+        self.assertEqual(factory.ran_models(opus, marked), {"gpt-6-sol", "claude-opus-5-5"})
+        # A rung 0 marker starts the ladder again; an unclaimed ticket ran on nothing.
+        self.assertEqual(factory.ran_models(opus, [sol, {"body": factory.RUNG_MARKER % 0}]), set())
+        self.assertEqual(factory.ran_models(opus, []), set())
 
     def test_a_first_brief_is_never_spread(self):
         for n in range(1, 6):

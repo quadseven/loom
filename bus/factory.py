@@ -445,6 +445,54 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     return tried
 
 
+def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
+    """Whether a comment sets the ticket's model, and the model it sets: a
+    factory rung marker gives its rung's model (rung 0 restarts the ladder
+    and sets none), a brain escalation its `Rung:` line's model."""
+    found = [int(m.group(1)) for m in RUNG_RE.finditer(body)]
+    if found:
+        rung = found[-1]
+        return True, LADDER[rung - 1][1] if 1 <= rung <= len(LADDER) else None
+    line = brain._RUNG_LINE.search(body) if body.startswith(brain.ESCALATE_MARKER) else None
+    return (True, line.group(2)) if line else (False, None)
+
+
+def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set:
+    """The models the ticket was claimed on since its ladder last started
+    (the newest rung 0 marker). A rung marker or a brain escalation sets the
+    model for the claims after it. A claim before the first such comment ran
+    on the body's Model: line when none rewrote it since; once one did, and
+    on a body with no Model: line, a claim ran on its lane's own rung model
+    (bus/brain.py _lane_model). On 2026-10-16 a ticket's three attempts on
+    gpt-6-sol carried no rung marker, and the factory moved it back to
+    gpt-6-sol for a fourth."""
+    match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
+    body_model = match.group(1) if match else None
+    bodies = [str(c.get("body") or "") for c in comments]
+    marks = [i for i, body in enumerate(bodies) if _mark_model(body)[0]]
+    current = body_model if not marks else None
+    ran: set = set()
+    for i, body in enumerate(bodies):
+        sets, model = _mark_model(body)
+        if sets:
+            if [m.group(1) for m in RUNG_RE.finditer(body)][-1:] == ["0"]:
+                ran = set()  # a rung 0 marker starts the ladder again
+            current = (body_model or model) if i == marks[-1] else model
+            continue
+        claim = CLAIMED_RE.fullmatch(body.strip())
+        if claim:
+            ran |= {current or brain._lane_model(claim.group(1))} - {None}
+    return ran
+
+
+def ran_rungs(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set:
+    """The rungs whose model the ticket already ran on (ran_models), with or
+    without a rung marker: the ladder never gives a ticket a model that
+    already failed it (docs/MUSE.md, Repeatedly stuck work)."""
+    models = ran_models(issue, comments)
+    return {n for n, (_, model) in enumerate(LADDER, 1) if model in models}
+
+
 def reached_rung(comments: Sequence[Dict[str, Any]]) -> int:
     """The highest rung the ticket has run on since its ladder last started, 0
     when none."""
@@ -930,9 +978,12 @@ class Factory:
         number = int(issue["number"])
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
-        tried = tried_rungs(comments)
+        climbed = tried_rungs(comments)
         if failed_here:
-            tried |= {current_rung(issue)} - {0}
+            climbed |= {current_rung(issue)} - {0}
+        # A rung whose model the ticket ran on before the ladder counts as
+        # tried, but only the ladder's own climbs make a lower rung a move down.
+        tried = climbed | ran_rungs(issue, comments)
         available_lanes = {lane for lanes, _ in LADDER for lane in lanes
                            if lane not in self.limited
                            and (self.available is None or lane in self.available)}
@@ -941,9 +992,9 @@ class Factory:
         rung = next_rung(tried | ({skip} - {0}), self.load, eligible)
         if not rung:
             return None
-        if rung < max(tried, default=0):
+        if rung < max(climbed, default=0):
             self._flag_runaway(repo, issue, comments, "ladder move from rung %d down to rung %d"
-                               % (max(tried), rung))
+                               % (max(climbed), rung))
             return None
         lanes, model = LADDER[rung - 1]
         lanes = tuple(lane for lane in lanes if lane in available_lanes)
@@ -1437,7 +1488,7 @@ class Factory:
         if not here or self.load.get(old, 0) <= RUNG_BUSY:
             return False
         comments = self._comments(repo, int(issue["number"]))
-        tried = tried_rungs(comments) | {here}
+        tried = tried_rungs(comments) | ran_rungs(issue, comments) | {here}
         if not any(min(self.load.get(lane, 0) for lane in LADDER[n - 1][0]) < RUNG_BUSY
                    for n in range(1, len(LADDER) + 1) if n not in tried):
             return False
