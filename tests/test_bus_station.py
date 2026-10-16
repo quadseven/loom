@@ -584,6 +584,209 @@ class ShipDeployedTest(Base):
         self.assertFalse(station._is_ancestor("0" * 40, sha))
 
 
+DEPLOY = "example-owner/deploy"
+PUBLISHED = "e" * 40
+PIN_MERGED = "2030-01-03T12:00:00Z"
+PIN_MERGED_AT = calendar.timegm((2030, 1, 3, 12, 0, 0))
+
+
+class ShipPinTest(Base):
+    """A merged pin pull request in a deployment repo ships the merged
+    tickets of the source revision its published-from comment names."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.pin_ship_repos = [DEPLOY]
+        self.carried = set()
+        self.pins = []
+        self.files = {}
+        self.reads = []
+
+    def merged(self, number, pr, merged_at="2030-01-02T00:00:00Z", carried=True,
+               title="Fix the thing", body=None):
+        self.fake.add(number, state="merged", title=title)
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": title,
+                                "body": "Refs %s#%d" % (REPO, number) if body is None else body,
+                                "head": {"ref": "loom/%d-fix" % number}})
+        if carried:
+            self.carried.add(sha)
+        return sha
+
+    def revert(self, pr, of, title, carried=True, merged_at="2030-01-02T06:00:00Z"):
+        """A merged pull request GitHub's revert button opened for pull request of."""
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": 'Revert "%s"' % title,
+                                "body": "Reverts %s#%d" % (REPO, of),
+                                "head": {"ref": "revert-%d" % of}})
+        if carried:
+            self.carried.add(sha)
+
+    def pin(self, number=7, merged_at=PIN_MERGED, revision=PUBLISHED, name="example-repo"):
+        self.pins.append({"number": number, "state": "closed", "merged_at": merged_at,
+                          "merge_commit_sha": "f" * 40, "head": {"ref": "pin"}})
+        patch = ("@@ -4,3 +4,3 @@ images:\n"
+                 "-  # Published from %s #98, merge %s, build run 1.\n"
+                 "+  # Published from %s #99, merge %s, build run 2.\n"
+                 "   - name: registry.example/example-repo\n"
+                 % (name, "a" * 10, name, revision[:10]))
+        self.files[number] = [{"filename": "deploy/kustomization.yaml", "patch": patch}]
+
+    def transport(self, method, url, headers, body):
+        parts = urlsplit(url)
+        path = parts.path
+        if path.startswith("/repos/%s/" % DEPLOY):
+            self.reads.append(path)
+            if path == "/repos/%s/pulls" % DEPLOY:
+                return reply(200, self.pins)
+            files = re.match(r"/repos/%s/pulls/(\d+)/files$" % DEPLOY, path)
+            if files:
+                return reply(200, self.files.get(int(files.group(1)), []))
+            raise AssertionError("unexpected call %s %s" % (method, url))
+        commit = re.match(r"/repos/%s/commits/([0-9a-f]+)$" % REPO, path)
+        if commit:
+            if PUBLISHED.startswith(commit.group(1)):
+                return reply(200, {"sha": PUBLISHED})
+            return reply(404, {"message": "Not Found"})
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO, path)
+        if compare:
+            base, head = compare.groups()
+            status = "ahead" if head == PUBLISHED and base in self.carried else "diverged"
+            return reply(200, {"status": "identical" if base == head else status})
+        return self.fake(method, url, headers, body)
+
+    def ship(self, now=PIN_MERGED_AT + 600):
+        gh = GitHub("token", transport=self.transport)
+        station.Station(gh, self.settings, now=now).ship_pins()
+
+    def test_a_merged_pin_ships_the_tickets_its_source_revision_carries(self):
+        self.merged(12, 99)
+        self.merged(13, 100, carried=False)
+        self.pin()
+        with mock.patch("bus.station._say") as say:
+            self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertIn("loom:merged", self.fake.names(13))
+        self.assertNotIn("loom:shipped", self.fake.names(13))
+        self.assertEqual(self.fake.comments[13], [])
+        say.assert_called_once_with("shipped %s#12: pin %s#7 carries #99" % (REPO, DEPLOY))
+
+    def test_the_note_names_the_pin_pull_request_the_revision_and_the_merge_time(self):
+        self.merged(12, 99)
+        self.pin()
+        self.ship()
+        note = self.fake.comments[12][-1]["body"]
+        self.assertIn("%s#7" % DEPLOY, note)
+        self.assertIn(PUBLISHED[:12], note)
+        self.assertIn("2030-01-03 12:00:00Z", note)
+        self.assertIn("#99", note)
+
+    def test_a_ticket_a_carried_revert_undid_stays_merged(self):
+        self.merged(12, 99)
+        self.revert(101, of=99, title="Fix the thing")
+        self.merged(14, 102, title="Fix another thing")
+        self.revert(103, of=102, title="Fix another thing", carried=False)
+        self.pin()
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+        # A revert the published revision does not carry undoes nothing yet.
+        self.assertIn("loom:shipped", self.fake.names(14))
+
+    def test_a_revert_named_only_by_its_title_also_holds_the_ticket(self):
+        self.merged(12, 99, title="Fix the thing")
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T06:00:00Z",
+                                "merge_commit_sha": "%040x" % 101,
+                                "title": 'Revert "Fix the thing"', "body": "",
+                                "head": {"ref": "undo"}})
+        self.carried.add("%040x" % 101)
+        self.pin()
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_merged_pull_request_that_publishes_nothing_moves_nothing(self):
+        self.merged(12, 99)
+        self.pins.append({"number": 8, "state": "closed", "merged_at": PIN_MERGED})
+        self.files[8] = [{"filename": "README.md", "patch": "+# Published notes\n"}]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_an_unwatched_source_or_unknown_commit_moves_nothing(self):
+        self.merged(12, 99)
+        self.pin(number=7, name="other-repo")
+        self.pin(number=8, revision="0" * 40)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_an_old_or_unmerged_pull_request_is_never_read(self):
+        self.merged(12, 99)
+        self.pin(number=7, merged_at="2029-12-01T00:00:00Z")
+        self.pins.append({"number": 8, "state": "closed", "merged_at": None})
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.reads, ["/repos/%s/pulls" % DEPLOY])
+
+    def test_a_settled_pin_is_read_once_and_a_fresh_one_until_it_settles(self):
+        self.merged(12, 99)
+        self.pin()
+        files = "/repos/%s/pulls/7/files" % DEPLOY
+        self.ship(now=PIN_MERGED_AT + 600)
+        self.assertIn("loom:shipped", self.fake.names(12))
+        # Within the settle time a ticket reconciled late still ships.
+        self.merged(13, 100)
+        self.ship(now=PIN_MERGED_AT + 1200)
+        self.assertIn("loom:shipped", self.fake.names(13))
+        self.ship(now=PIN_MERGED_AT + station.PIN_SHIP_SETTLE + 1)
+        self.ship(now=PIN_MERGED_AT + station.PIN_SHIP_SETTLE + 60)
+        self.assertEqual(self.reads.count(files), 3)
+
+    def test_at_most_twenty_move_a_pass_and_the_pin_is_read_again(self):
+        for n in range(22):
+            self.merged(100 + n, 500 + n, merged_at="2030-01-02T00:%02d:00Z" % n)
+        self.pin()
+        self.ship(now=PIN_MERGED_AT + 2 * station.PIN_SHIP_SETTLE)
+        left = [n for n in range(100, 122) if "loom:merged" in self.fake.names(n)]
+        self.assertEqual(left, [120, 121])
+        self.ship(now=PIN_MERGED_AT + 2 * station.PIN_SHIP_SETTLE + 60)
+        self.assertTrue(all("loom:shipped" in self.fake.names(n) for n in range(100, 122)))
+
+    def test_without_deployment_repos_nothing_is_read(self):
+        self.settings.pin_ship_repos = []
+        self.merged(12, 99)
+        self.pin()
+        self.ship()
+        self.assertEqual(self.reads, [])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_pass_ships_merged_pins(self):
+        self.merged(12, 99)
+        self.pin()
+        gh = GitHub("token", transport=self.transport)
+        self.assertEqual(station.run(self.settings, gh, now=PIN_MERGED_AT + 600), 0)
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_deployment_repos_come_from_the_environment(self):
+        env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
+               "LOOM_PIN_SHIP_REPOS": DEPLOY + " example-owner/second"}
+        self.assertEqual(station.Settings.from_env(env).pin_ship_repos,
+                         [DEPLOY, "example-owner/second"])
+
+    def test_the_published_from_line_is_read_from_added_lines_only(self):
+        patch = ("-  # Published from example-repo #1, merge 1111111111, build run 1.\n"
+                 "+  # Published from example-repo #857 and #858, merge 67151ececc, build run 3.\n"
+                 "+# Published from example-owner/example-repo, merge abcdef1234.\n")
+        self.assertEqual([m.groups() for m in station.PUBLISHED_RE.finditer(patch)],
+                         [("example-repo", "67151ececc"),
+                          ("example-owner/example-repo", "abcdef1234")])
+
+
 class BudgetTest(Base):
     """The station's GitHub budget (T218): conditional list reads, a floor
     under which a pass only claims and reports, and idle repos scanned every
