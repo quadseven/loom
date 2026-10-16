@@ -770,10 +770,9 @@ def _with_part_of(body: str, goal: int) -> str:
     return body.rstrip("\n") + "\n\n" + part_of_line(goal) + "\n"
 
 
-def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """loom:ticket issues in the repo whose body has a Part of #goal line
-    (search, then the label and the exact line checked here: the search
-    also matches loose words)."""
+def _part_of_hits(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo that the Part of #goal search finds
+    (the search also matches loose words, so the line is not yet checked)."""
     q = quote('repo:%s is:issue label:loom:ticket in:body "%s"' % (repo, part_of_line(goal)))
     url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
     found: List[Dict[str, Any]] = []
@@ -788,10 +787,20 @@ def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
         # someone who may write.
         found.extend(item for item in data.get("items") or []
                      if isinstance(item, dict) and "pull_request" not in item
-                     and "loom:ticket" in _labels(item)
-                     and _names_goal(item.get("body"), goal))
+                     and "loom:ticket" in _labels(item))
         url = _next_link(resp.headers.get("link", ""))
     return found
+
+
+def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo whose body has a Part of #goal line."""
+    return [i for i in _part_of_hits(gh, repo, goal) if _names_goal(i.get("body"), goal)]
+
+
+def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues that mention Part of #goal without the exact line on
+    a line of its own, so goal_children does not count them as the goal's."""
+    return [i for i in _part_of_hits(gh, repo, goal) if not _names_goal(i.get("body"), goal)]
 
 
 def _goal_children(gh: GitHub, repo: str, goal: int,
@@ -821,15 +830,16 @@ def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
 
 
 def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
-    """Add the issue as a sub-issue of the goal. False when GitHub refuses it
-    (422, for example a goal already at its 100 sub-issue limit): the Part of
-    line is then the only link, which goal_children reads."""
+    """Add the issue as a sub-issue of the goal, best effort. False when GitHub
+    refuses it (for example a goal already at its 100 sub-issue limit): the
+    refusal is logged and the Part of line is then the only link, which
+    goal_children reads."""
     try:
         gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
                 {"sub_issue_id": issue["id"]})
     except GitHubError as exc:
-        if exc.status != 422:
-            raise
+        print("#%s: GitHub refused the sub-issue link to goal #%d (%s)"
+              % (issue.get("number"), goal, exc), file=sys.stderr)
         return False
     return True
 

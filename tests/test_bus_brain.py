@@ -753,6 +753,18 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(payload["body"], fake.calls[2][2]["body"].rstrip("\n") + "\n\nPart of #1\n")
         self.assertIn("Part of line", err.getvalue())
 
+    def test_a_brief_on_a_goal_at_the_cap_queues_with_a_part_of_line_whatever_the_refusal(self):
+        for status in (403, 404, 422, 500):
+            fake = Fake(reply(200, goal()), reply(200, []),
+                        reply(201, {"id": 202, "number": 7, "html_url": "https://example.com/ticket"}),
+                        reply(status, {"message": "sub-issue limit reached"}), reply(200, {}))
+            with redirect_stderr(io.StringIO()) as err:
+                url = brain.brief(GitHub("t", transport=fake),
+                                  REPO, 1, "Ticket", BODY, "codex", "hard")
+            self.assertEqual(url, "https://example.com/ticket", status)
+            self.assertTrue(fake.calls[4][2]["body"].endswith("\n\nPart of #1\n"), status)
+            self.assertIn("refused the sub-issue link", err.getvalue())
+
     def test_brief_uses_goal_trunk_as_default_base_and_explicit_base_wins(self):
         trunk_goal = dict(goal(), body="Trunk: side\n\n## Destination\n")
         fake = Fake(reply(200, trunk_goal), reply(200, []),
@@ -2111,6 +2123,15 @@ class TriageTests(unittest.TestCase):
         few = Routes([], goal_children=full[:3])
         self.assertEqual(len(brain.goal_children(GitHub("t", transport=few), REPO, 1)), 3)
         self.assertFalse(any(c[1].startswith("/search/") for c in few.calls))
+
+    def test_unassociated_tickets_mention_the_goal_without_its_part_of_line(self):
+        ticket = ["loom:ticket"]
+        found = [item(7, body="Part of #1\n", labels=ticket),
+                 item(9, body="see Part of #1 inline", labels=ticket),
+                 item(12, body="part of #1", labels=["bug"])]
+        routes = Routes([], search=found)
+        loose = brain.unassociated_tickets(GitHub("t", transport=routes), REPO, 1)
+        self.assertEqual([i["number"] for i in loose], [9])
 
     def test_bad_limit_and_bad_goal_write_nothing(self):
         routes = Routes([item(5)])

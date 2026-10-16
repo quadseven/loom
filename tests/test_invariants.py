@@ -44,6 +44,7 @@ class FakeGH:
         self.private = {OTHER}
         self.calls = []
         self.writes = []
+        self.search_items = []
 
     def paginate(self, path):
         self.calls.append(("GET", path))
@@ -71,6 +72,8 @@ class FakeGH:
             self.issues[number] = dict(body, number=number, id=9000 + number, state="open",
                                        closed_at=None)
             return Response(201, {"number": number, "id": 9000 + number})
+        if method == "GET" and path.startswith("/search/issues?"):
+            return Response(200, {"items": self.search_items})
         if method == "POST" and path.endswith("/sub_issues"):
             return Response(201, {})
         m = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/(\d+)", path)
@@ -205,6 +208,7 @@ class StationTest(StationBase):
     def test_a_private_goal_home_is_named_in_words_only(self):
         self.gh.goal_issues[OTHER] = [{"number": 3, "title": "Hidden", "labels": [],
                                        "sub_issues_summary": {"total": 95}}]
+        self.search_loose_ticket()
         self.run_at(T0)
         filed = self.gh.filed()
         self.assertEqual(len(filed), 1, self.said)
@@ -237,8 +241,25 @@ class StationTest(StationBase):
         self.assertEqual(self.gh.filed(), [])
         self.assertTrue(any("/issues?labels=loom:ticket" in c[1] for c in self.gh.calls))
 
-    def test_breaches_wait_while_the_github_budget_is_low(self):
+    def unlinked_goal(self):
+        """A goal at the sub-issue cap with one ticket naming it loosely."""
         self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
+        self.search_loose_ticket()
+
+    def search_loose_ticket(self):
+        self.gh.search_items = [{"number": 7, "body": "part of #30 inline",
+                                 "labels": [{"name": "loom:ticket"}]}]
+
+    def test_a_goal_at_the_sub_issue_cap_with_every_ticket_linked_by_part_of_is_healthy(self):
+        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
+        self.gh.search_items = [{"number": 7, "body": "## Why\nx\n\nPart of #30\n",
+                                 "labels": [{"name": "loom:ticket"}]}]
+        self.run_at(T0)
+        self.assertEqual(self.gh.filed(), [])
+        self.assertTrue(any(c[1].startswith("/search/issues?") for c in self.gh.calls))
+
+    def test_breaches_wait_while_the_github_budget_is_low(self):
+        self.unlinked_goal()
         self.gh.rate = {"core": (10, 5000, int(T0) + 3600)}
         self.run_at(T0)
         self.assertEqual(self.gh.filed(), [])
@@ -247,11 +268,11 @@ class StationTest(StationBase):
         self.assertEqual(len(self.gh.filed()), 1)
 
     def test_the_station_standup_on_the_invariant_goal_lists_open_breaches(self):
-        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
+        self.unlinked_goal()
         st = self.run_at(T0)
         number = self.gh.filed()[0]["number"]
         body = st._overdue_standup_body([], None, st._open_breaches(REPO, GOAL))
-        self.assertIn("Invariants broken: #%d Goal home #30 has 100 sub-issues." % number, body)
+        self.assertIn("Invariants broken: #%d Goal home #30 has 1 tickets not linked to it." % number, body)
         self.assertNotIn("Invariants broken", st._overdue_standup_body([], None))
 
 
@@ -265,7 +286,7 @@ class FilerTest(unittest.TestCase):
         invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append, write).run([breach])
 
     def breach(self, at=T0, evidence=("one line",)):
-        return invariants.Breach("goal-full", "x/y#1", "Goal home #1 has 95 sub-issues",
+        return invariants.Breach("goal-full", "x/y#1", "Goal home #1 has 2 tickets not linked to it",
                                  tuple(evidence), at)
 
     def test_a_closed_issue_reopens_only_for_evidence_newer_than_the_close(self):
@@ -390,9 +411,9 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(b.subject, "agy")
         self.assertIn("#5", " ".join(b.evidence))
 
-    def test_a_goal_home_at_ninety_sub_issues(self):
-        self.assertEqual(invariants.goal_full(Facts(T0, goals=[(self.goal, 89)])), [])
-        self.assertEqual(len(invariants.goal_full(Facts(T0, goals=[(self.goal, 90)]))), 1)
+    def test_a_goal_home_with_tickets_not_linked_to_it(self):
+        self.assertEqual(invariants.goal_full(Facts(T0, goals=[(self.goal, 0)])), [])
+        self.assertEqual(len(invariants.goal_full(Facts(T0, goals=[(self.goal, 1)]))), 1)
 
     def test_a_plan_check_that_passed_or_failed_recently_is_not_a_breach(self):
         pr = Ref("%s#7" % REPO, "pull request #7")

@@ -238,7 +238,9 @@ line below, because an automated pass over old issues over-calls work as
 done.
 
 GitHub holds at most 100 sub-issues under one issue and refuses the next one
-(422). A ticket a goal refuses that way, from `brief` or triage, gets a
+(422). The sub-issue link is best effort everywhere: any refusal is logged,
+not raised, and the ticket is still queued. A ticket a goal refuses, from
+`brief` or triage, gets a
 `Part of #N` line at the end of its body instead, and a goal's tickets are
 its sub-issues plus, once it holds 100, the issues whose body has that line
 (one search). The backlog board reads parentage the same way.
