@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import audit
 from . import factory
+from . import evidence
 from . import handoff
 from . import health
 from . import invariants
@@ -330,12 +331,14 @@ class Settings:
                  plan_check: str = invariants.DEFAULT_PLAN_CHECK,
                  report_digest: Sequence[Tuple[int, int]] = (),
                  health_urls: str = "",
-                 health_every: int = health.EVERY) -> None:
+                 health_every: int = health.EVERY,
+                 evidence_cmds: Optional[Dict[str, str]] = None) -> None:
         self.home = home
         # "owner/name#goal=https://..." entries: each goal home's health
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
         self.health_every = health_every
+        self.evidence_cmds = evidence_cmds or {}
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
         self.report_digest = tuple(report_digest)
@@ -434,8 +437,22 @@ class Settings:
                    invariant_goal=env.get("LOOM_INVARIANT_GOAL", "").strip(),
                    plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
                                or invariants.DEFAULT_PLAN_CHECK),
+                   evidence_cmds=_evidence_commands(env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY))
+
+
+def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
+    try:
+        commands = json.loads(env.get("LOOM_EVIDENCE_CMDS", "{}") or "{}")
+        if not isinstance(commands, dict) or not all(
+                isinstance(repo, str) and isinstance(command, str)
+                for repo, command in commands.items()):
+            raise ValueError("expected a JSON object of repo to command")
+    except (ValueError, TypeError) as err:
+        _say("ignoring LOOM_EVIDENCE_CMDS: %s" % err)
+        return {}
+    return commands
 
 
 def _seconds(raw: str, default: int) -> int:
@@ -1340,6 +1357,8 @@ class Station:
         stamp = int(self.now)
         text = tickets.render_verify_brief(
             repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+        text += evidence.section(self.s.evidence_cmds, repo,
+                                 brain.live_criterion(issue.get("body"), limit=None))
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))

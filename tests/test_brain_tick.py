@@ -197,7 +197,10 @@ class BrainTickTest(unittest.TestCase):
     def test_live_scope_leaves_github_steps_to_muse(self):
         _, calls = self.tick(LOOM_BRAIN_SCOPE="live")
         claude = [c for c in calls if c.startswith("claude ")][0]
-        self.assertIn("Do only what needs this machine", claude)
+        # Muse ships and rolls; this tick keeps the cluster, log and
+        # database reads, and a ship or roll Muse left undone.
+        self.assertIn("Muse does the GitHub steps, ships and rolls", claude)
+        self.assertIn("checks or measurements that need cluster, log or", claude)
         # Finish-work comes first and is bounded; the freshness rule no longer
         # holds back work another brain yielded.
         # resume checks the tick's own lock, not the parser's default repo.

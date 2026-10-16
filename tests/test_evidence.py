@@ -62,6 +62,7 @@ class EvidenceEndpointTest(unittest.TestCase):
         self.server.server_close()
         self.temp.cleanup()
 
+    # The default is a test-only fixture matching the handler's bearer value.
     def get_json(self, path, token="test-bearer"):
         request = Request(self.base + path, headers={"Authorization": "Bearer " + token})  # noqa: S310 - URL uses this test's local server.
         with urlopen(request) as response:  # noqa: S310 - URL uses this test's local server.

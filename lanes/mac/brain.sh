@@ -100,11 +100,11 @@ $WORK/loom. Read each goal's home issue and its rules before acting on that \
 goal. This replaces the 15-minute limit in MUSE.md: stop within \
 $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
 if [ "$SCOPE" = live ]; then
-  PROMPT="$PROMPT Muse does the GitHub steps and reads live data through \
-REST APIs, but has no cluster or database access. Do only what needs this \
-machine: ships and rolls where a goal's rules make them the brain's, and \
-checks or measurements that need cluster or database access; put what you \
-find on the ticket. Before any measurement, run timeout 120 python3 -m bus.brain \
+  PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \
+live data through REST APIs, but has no cluster or database access. Do what \
+needs this machine: checks or measurements that need cluster, log or \
+database access, put on the ticket for Muse to act on; and a ship or roll \
+that is due when Muse has not done it within its tick. Before any measurement, run timeout 120 python3 -m bus.brain \
 resume \$LOOM_REPOS --holder $HOLDER --lock-repo $LOCK_REPO (it walks every goal on GitHub, so a stall must not eat the tick) and finish every resume item it lists: work \
 another brain yielded, yours however fresh its journals are. Spend at most \
 $((MINUTES / 3)) minutes on them. Resume also lists up to 5 verify-due \

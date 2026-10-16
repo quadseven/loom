@@ -281,6 +281,7 @@ def main() -> None:
         sys.exit("evidence service requires a non-loopback interface address and valid port")
     _require_tailnet_address(bind_host, tailscale_bin)
     config = _read_config(config_path)
+    # Read the bearer value at startup; token_ssm is only its parameter name.
     token = _read_ssm(token_ssm, region)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logger = logging.getLogger("loom.evidence")

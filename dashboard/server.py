@@ -624,6 +624,8 @@ def _dispatch_get(handler, state):
         return _dispatch_static(handler, path)
     if path in ("/improving", "/lanes"):
         return _send_dashboard_view(handler, state, path)
+    if path == "/results":
+        return _dispatch_results(handler, state)
     if path == "/usage":
         return _dispatch_usage(handler, state)
     if path in ("/brain", "/hot-spots"):
@@ -783,6 +785,15 @@ def _dispatch_brain_hot_spots(handler, state, path):
         data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
         body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
     return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))
+
+
+def _dispatch_results(handler, state):
+    from datetime import datetime, timezone
+    from . import results
+    payload = state.response()
+    body = results.render_results(results.build_results(payload, datetime.now(timezone.utc)))
+    return handler.send_page(page("Results", "results", body,
+                                  status="stale" if payload.get("stale") else "live"))
 
 
 def _send_dashboard_view(handler, state, path):

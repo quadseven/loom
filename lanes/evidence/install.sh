@@ -4,6 +4,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 : "${LOOM_EVIDENCE_CONFIG:?LOOM_EVIDENCE_CONFIG is required}"
+# This is the SSM parameter name; the bearer value is fetched by the service.
 : "${LOOM_EVIDENCE_TOKEN_SSM:?LOOM_EVIDENCE_TOKEN_SSM is required}"
 : "${LOOM_EVIDENCE_BIND_HOST:?LOOM_EVIDENCE_BIND_HOST must be the tailnet interface address}"
 : "${LOOM_AWS_REGION:?LOOM_AWS_REGION is required}"

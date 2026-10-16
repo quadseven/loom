@@ -9,15 +9,22 @@ you). The lock lives in `quadseven/loom`.
 
 ## What Muse does and leaves
 
-Muse reads live data through REST APIs on the tailnet and, for logs and
-rows, through the lane machine read-only evidence endpoint (Operate, do not
-report). It has no direct cluster or database access. The lane machine's tick
-runs with `LOOM_BRAIN_SCOPE=live` and does what needs the cluster: ships and
-rolls, and checks that need cluster or database access. Muse does everything
-else: reviews, merges, briefs, failed tickets, asks, journals, and
-verification from REST APIs. Never write to a live system. When a step needs
-a fact no API serves, write what is needed on the ticket and leave it; never
-claim a live result you did not read yourself.
+Muse reads live data through REST APIs on the tailnet, through its proxy,
+and reads logs and rows through the lane machine's read-only evidence endpoint
+(Operate, do not report). It has no direct cluster or database access. Muse
+does reviews, merges, briefs, failed tickets, asks, journals, verification,
+and the ships and rolls a goal's own rules give the brain. A ship or a roll
+is a pull request in the deployment repo (a pinned digest read from the
+build run's log, or a configuration change) plus the gates the goal's rules
+name, and those gates are read from the goal's REST endpoints. Follow the
+goal's ship and roll document step by step; when a gate stays closed and
+the rules allow an operator exception, ask for it once with the evidence
+(`bus.brain human`), and act on the answer. The lane machine's tick
+(`LOOM_BRAIN_SCOPE=live`) keeps only reads that require direct cluster or
+database access and are not served by the evidence endpoint. Never write to
+a live system except through those pull requests. When a step needs a fact
+no API serves, write what is needed on the ticket and leave it; never claim
+a live result you did not read yourself.
 
 Read and write GitHub only from the shell, through the Loom commands or the
 GitHub REST API with `LOOM_GITHUB_TOKEN`. Never use the web or browser tool
