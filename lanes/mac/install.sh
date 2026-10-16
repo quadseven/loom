@@ -151,8 +151,7 @@ done
 # LOOM_REWRITE_CMD and LOOM_REWRITE_PRIVATE_CMD (the agent commands that
 # rewrite loom:triage issues into tickets, docs/BRAIN.md Triage; for example
 # "lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash", and for
-# private repos the same with a model whose provider does not train on
-# prompts, such as opencode-go/kimi-k2.7-code, never a public-only one), and
+# private repos a codex/<model> or claude/<model> lane entry), and
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and

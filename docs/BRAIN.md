@@ -261,22 +261,21 @@ has the endpoint contract and the rules.
 The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
-`lanes/rewrite_agent.sh <key-ssm> <provider/model>` is one: it reads the
-provider key from the SSM parameter `<key-ssm>` and runs `opencode run` on the
-model in the opencode lanes' sandbox (`lanes/agent_sandbox.sh`), with an empty
-scratch home and working directory and every opencode tool denied, and prints
-only the agent's final text. The station runs from the checkout, so for
-example:
+`lanes/rewrite_agent.sh <key-ssm> <provider/model>` runs an opencode model for
+public repos. For private repos, use `lanes/rewrite_agent.sh codex/<model>` or
+`lanes/rewrite_agent.sh claude/<model>`; those lane CLI entries run in the
+shared sandbox (`lanes/agent_sandbox.sh`) with an empty scratch home and
+working directory, and tools denied or read-only. Each form prints only the
+agent's final text. The station runs from the checkout, so for example:
 
 ```sh
 LOOM_REWRITE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash"
-LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/kimi-k2.7-code"
+LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh codex/<model>"
 ```
 
 `<key-ssm>` is the parameter the opencode-go lanes read
-(`LOOM_OPENCODE_GO_KEY_SSM`). The private command's model must come from a
-provider that does not train on prompts: never a public-only one (docs/LANES.md,
-"Public repos only"), such as a Muse Spark Contributor model. The prompt
+(`LOOM_OPENCODE_GO_KEY_SSM`). Private commands are restricted to the Codex and
+Claude lane providers. The prompt
 holds the issue (title, body, labels, last 10 comments) and the ticket format
 above. The answer is one of:
 

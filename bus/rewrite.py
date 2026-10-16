@@ -43,6 +43,19 @@ def command_for(public_cmd: str, private_cmd: str, private: bool) -> str:
     return (private_cmd if private else public_cmd).strip()
 
 
+def validate_private_command(cmd: str) -> None:
+    """Refuse private issue content unless every named provider is a lane CLI."""
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        raise Invalid("the private rewrite command line cannot be parsed") from None
+    entries = [part for arg in argv for part in arg.split(",")
+               if re.match(r"^[A-Za-z0-9._-]+/", part)]
+    providers = [entry.split("/", 1)[0] for entry in entries]
+    if not providers or any(provider not in ("codex", "claude") for provider in providers):
+        raise Invalid("private rewrite provider is not on the non-training allowlist")
+
+
 def brief_format() -> str:
     """The ticket body format, from the Ticket issues section of docs/BRAIN.md."""
     with open(DOCS, encoding="utf-8") as fh:
@@ -191,10 +204,12 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
 
 
 def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,
-                  timeout: float = 600) -> str:
+                  timeout: float = 600, private: bool = False) -> str:
     """Rewrite one loom:triage issue. Returns "brief", "human" or "skip".
     Raises Invalid for a bad answer (nothing written); GitHub errors and
     brain's own refusals (ValueError) pass through."""
+    if private:
+        validate_private_command(cmd)
     number = int(issue["number"])
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
     prompt = build_prompt(issue, [c for c in comments if isinstance(c, dict)], brief_format())

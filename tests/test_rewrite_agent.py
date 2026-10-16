@@ -72,6 +72,7 @@ printf '%s\\n' "$FAKE_SECRET"
 
 FAKE_SANDBOX = """#!/usr/bin/env bash
 [ "$1" = -p ] || exit 2
+printf 'sandbox=%s\\n' "$*" >> "$FAKE_LOG"
 shift 2
 exec "$@"
 """
@@ -200,6 +201,44 @@ class RewriteAgentTest(unittest.TestCase):
                 result = self.run_wrapper(args=args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.agent_log.exists())
+
+    def test_codex_and_claude_entries_run_with_tools_denied_and_fallback(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                fake = self.bin / provider
+                fake.write_text("""#!/usr/bin/env bash
+printf 'argv=%%s\\n' \"$*\" >> \"%s\"
+prompt=\"$(cat)\"
+case \"$*\" in *model-a*) exit 3 ;; esac
+printf 'prompt=%%s\\n' \"$prompt\" >> \"%s\"
+echo '{\"type\":\"result\",\"result\":\"final answer\"}'
+""" % (self.agent_log, self.agent_log))
+                fake.chmod(0o755)
+                self.agent_log.write_text("")
+                (self.bin / "opencode").unlink(missing_ok=True)
+                env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+                       "LOOM_HOME": str(self.loom), "FAKE_LOG": str(self.log)}
+                result = subprocess.run(["bash", str(WRAPPER), provider + "/model-a," + provider + "/model-b"],
+                                        input="prompt", env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "final answer\n")
+                seen = self.agent_log.read_text()
+                self.assertIn("model-a", seen)
+                self.assertIn("model-b", seen)
+                self.assertIn("prompt=prompt", seen)
+                sandbox_calls = self.log.read_text()
+                self.assertIn("sandbox=-p (version 1)", sandbox_calls)
+                if provider == "codex":
+                    self.assertIn("--sandbox read-only", seen)
+                    self.assertIn("--ask-for-approval never", seen)
+                else:
+                    self.assertIn("--tools ", seen)
+
+    def test_private_rewrite_rejects_a_provider_outside_the_lane_allowlist(self):
+        from bus import rewrite
+
+        with self.assertRaises(rewrite.Invalid):
+            rewrite.validate_private_command("lanes/rewrite_agent.sh openrouter/model")
 
     def test_rate_limited_model_falls_back_to_the_next_model(self):
         first, second = MODEL, "openrouter/other-free-model"

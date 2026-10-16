@@ -115,6 +115,13 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_REWRITE_OPENCODE</key><string>%s/.opencode/bin/opencode</string>"
                       % self.home, plist)
 
+    def test_private_rewrite_command_is_installed_for_the_station(self):
+        result = self.run_install(LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh codex/model-test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_REWRITE_PRIVATE_CMD</key><string>lanes/rewrite_agent.sh codex/model-test</string>",
+                      plist)
+
     def test_pin_targets_are_written_to_station_plist(self):
         result = self.run_install(LOOM_PIN_TARGETS='[{"repo":"example-owner/deploy"}]')
         self.assertEqual(result.returncode, 0, result.stderr)

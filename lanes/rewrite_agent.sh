@@ -2,35 +2,35 @@
 # Loom triage rewriter agent: the command bus/rewrite.py runs for
 # LOOM_REWRITE_CMD and LOOM_REWRITE_PRIVATE_CMD.
 #
-#   rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]>   (the prompt on stdin)
+#   rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]>
+#   rewrite_agent.sh <codex/model[,claude/model...]>   (the prompt on stdin)
 #
-# Reads the provider key from the SSM parameter <key-ssm> and runs
-# `opencode run` on <provider/model> with the prompt on its stdin, in the
-# opencode lanes' sandbox (lanes/agent_sandbox.sh): an emptied environment,
-# a scratch HOME made for this run and removed after it, an empty working
-# directory, and the key exported to the agent only. Every opencode tool is
-# denied: the answer is text. Prints only the agent's final text and exits
-# non-zero on any failure, with the reason on stderr. The key is never
-# printed.
+# The two-argument form reads a provider key from SSM and runs opencode. The
+# one-argument form runs codex or claude with the prompt on stdin. Both use
+# the shared sandbox (lanes/agent_sandbox.sh), a scratch HOME and empty work
+# directory, and print only the final text. The lane CLIs use read-only or no
+# tools. Failures exit non-zero with the reason on stderr.
 #
 # Env: LOOM_HOME (default ~/loom; the scratch home goes under its run/),
 # LOOM_REWRITE_TIMEOUT (seconds for the agent, default 480, under the
 # station's 600), LOOM_NET_TIMEOUT (seconds for the SSM read, default 120),
-# LOOM_AWS_REGION, LOOM_REWRITE_OPENCODE (the opencode binary, default
-# opencode from PATH).
+# LOOM_AWS_REGION, LOOM_REWRITE_OPENCODE, LOOM_REWRITE_CODEX and
+# LOOM_REWRITE_CLAUDE (CLI binaries, default their names from PATH).
 set -uo pipefail
 
 fail() { echo "rewrite_agent: $1" >&2; exit "${2:-1}"; }
 
-KEY_SSM="${1:-}" MODEL_LIST="${2:-}"
-[ $# -eq 2 ] || fail "usage: rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]>" 2
-[[ "$KEY_SSM" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "bad SSM parameter name" 2
+KEY_SSM="${1:-}" MODEL_LIST="${2:-}" LANE_CLI=0
+if [ $# -eq 1 ]; then MODEL_LIST="$1"; KEY_SSM=""; LANE_CLI=1; fi
+[ $# -eq 1 ] || [ $# -eq 2 ] || fail "usage: rewrite_agent.sh <key-ssm> <provider/model[,provider/model...]> or <codex/model[,claude/model...]>" 2
+[ -z "$KEY_SSM" ] || [[ "$KEY_SSM" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "bad SSM parameter name" 2
 [ -n "$MODEL_LIST" ] || fail "no models supplied" 2
 IFS=, read -r -a MODELS <<< "$MODEL_LIST"
 KEY_VARS=()
 for MODEL in "${MODELS[@]}"; do
   [[ "$MODEL" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._:/@-]+$ ]] || fail "bad model '$MODEL': want provider/model" 2
   case "${MODEL%%/*}" in
+    codex|claude) [ "$LANE_CLI" -eq 1 ] || fail "lane CLI entries need the one-argument form" 2; KEY_VARS+=(-) ;;
     opencode|opencode-go) KEY_VARS+=(OPENCODE_API_KEY) ;;
     openrouter) KEY_VARS+=(OPENROUTER_API_KEY) ;;
     zai) KEY_VARS+=(ZHIPU_API_KEY) ;;
@@ -38,6 +38,11 @@ for MODEL in "${MODELS[@]}"; do
     *) fail "no key variable known for provider ${MODEL%%/*}" 2 ;;
   esac
 done
+if [ "$LANE_CLI" -eq 1 ]; then
+  for MODEL in "${MODELS[@]}"; do
+    case "${MODEL%%/*}" in codex|claude) ;; *) fail "private lane entries must use codex or claude" 2 ;; esac
+  done
+fi
 MODEL="${MODELS[0]}" KEY_VAR="${KEY_VARS[0]}"
 
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
@@ -52,7 +57,7 @@ AGENT_TIMEOUT="${LOOM_REWRITE_TIMEOUT:-480}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 OPENCODE_PERMISSION='{"*": "deny"}'
 BIN="${LOOM_REWRITE_OPENCODE:-opencode}"
-command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
+[ "$LANE_CLI" -eq 1 ] || command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
 command -v sandbox-exec > /dev/null || fail "sandbox-exec not available"
 
 # The run's own files (prompt, output, answer) sit beside the scratch home,
@@ -68,8 +73,10 @@ AGENT_STDIN="$RUN_DIR/prompt"
 cat > "$AGENT_STDIN" || fail "cannot read the prompt"
 [ -s "$AGENT_STDIN" ] || fail "no prompt on stdin"
 
-API_KEY="$(ssm_value "$KEY_SSM")"
-[ -n "$API_KEY" ] || fail "no key readable at the SSM parameter $KEY_SSM"
+if [ "$LANE_CLI" -eq 0 ]; then
+  API_KEY="$(ssm_value "$KEY_SSM")"
+  [ -n "$API_KEY" ] || fail "no key readable at the SSM parameter $KEY_SSM"
+fi
 
 # JSON events, one per line, so final text is told apart from tool output.
 # shellcheck disable=SC2016 # python source, not shell
@@ -84,6 +91,11 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     if not isinstance(event, dict):
         continue
     part = event.get("part") if isinstance(event.get("part"), dict) else {}
+    if isinstance(event.get("result"), str) and event["result"].strip():
+        text = event["result"]
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+        text = item["text"]
     if event.get("type") == "text" and isinstance(part.get("text"), str) and part["text"].strip():
         text = part["text"]
     elif event.get("type") == "error":
@@ -102,13 +114,29 @@ for i in "${!MODELS[@]}"; do
   OUT="$RUN_DIR/out" ANSWER_FILE="$RUN_DIR/answer"
   : > "$OUT"
   cd "$AGENT_HOME/work" || fail "cannot enter the scratch working directory"
-  opencode_run "$KEY_VAR" "$BIN" --format json > "$OUT"
+  if [ "$LANE_CLI" -eq 1 ]; then
+    PROVIDER="${MODEL%%/*}" ID="${MODEL#*/}"
+    case "$PROVIDER" in
+      codex) BIN="${LOOM_REWRITE_CODEX:-codex}"; set -- exec --json --sandbox read-only --ask-for-approval never --model "$ID" - ;;
+      claude) BIN="${LOOM_REWRITE_CLAUDE:-claude}"; set -- -p --model "$ID" --output-format json --tools "" ;;
+    esac
+    command -v "$BIN" > /dev/null || fail "$BIN not on PATH"
+    PROFILE="$(sandbox_profile "$PWD" "$BIN")" || fail "cannot create lane CLI sandbox"
+    timeout "$AGENT_TIMEOUT" sandbox-exec -p "$PROFILE" /usr/bin/env -i \
+      PATH="$PATH" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" TMP="$AGENT_HOME/tmp" \
+      TEMP="$AGENT_HOME/tmp" TERM=dumb LANG="${LANG:-en_US.UTF-8}" "$BIN" "$@" \
+      < "$AGENT_STDIN" > "$OUT"
+  else
+    opencode_run "$KEY_VAR" "${LOOM_REWRITE_OPENCODE:-opencode}" --format json > "$OUT"
+  fi
   status=$?
   reason="$(python3 -I -c "$EXTRACT" "$OUT" 2>&1 > "$ANSWER_FILE")"
   extracted=$?
   if [ "$status" -eq 0 ] && [ "$extracted" -eq 0 ]; then
     ANSWER="$(cat "$ANSWER_FILE")" || fail "cannot read the answer"
-    case "$ANSWER" in *"$API_KEY"*) fail "the answer holds the provider key" ;; esac
+    if [ -n "$API_KEY" ]; then
+      case "$ANSWER" in *"$API_KEY"*) fail "the answer holds the provider key" ;; esac
+    fi
     printf '%s\n' "$ANSWER"
     exit 0
   fi
@@ -119,9 +147,9 @@ for i in "${!MODELS[@]}"; do
   elif [[ "$lower" == *"rate limit"* || "$lower" == *"rate-limit"* || "$lower" == *"overload"* || "$lower" == *"too many requests"* ]]; then
     why="rate limited or overloaded"
   elif [[ "$lower" == *"no text"* ]]; then
-    why="opencode exited $status with no text"
+    why="$([[ "$LANE_CLI" -eq 1 ]] && echo 'lane CLI' || echo opencode) exited $status with no text"
   else
-    why="opencode exited $status: ${reason:-no usable answer}"
+    why="$([[ "$LANE_CLI" -eq 1 ]] && echo 'lane CLI' || echo opencode) exited $status: ${reason:-no usable answer}"
   fi
   REASONS="${REASONS:+$REASONS; }$MODEL: $why"
   echo "rewrite_agent: passed over $MODEL: $why" >&2

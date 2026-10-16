@@ -280,9 +280,19 @@ class StationRewriteTest(Base):
         self.fake.add_triage(7)
         public = self.agent({"action": "skip", "reason": "public ran"}, "public.py")
         public_prompt = self.prompt_file
-        self.run_station(self.station(cmd=public, private_cmd=self.agent(BRIEF, "private.py")))
+        private = self.agent(BRIEF, "private.py") + " codex/model-test"
+        self.run_station(self.station(cmd=public, private_cmd=private))
         self.assertFalse(os.path.exists(public_prompt))
         self.assertEqual(len(self.fake.created), 1)
+
+    def test_a_private_repo_rejects_an_unapproved_rewrite_provider(self):
+        self.fake.private = True
+        self.fake.add_triage(7)
+        cmd = self.agent(BRIEF) + " openrouter/model-test"
+        with self.assertRaisesRegex(rewrite.Invalid, "non-training allowlist"):
+            rewrite.rewrite_issue(self.gh(), REPO, GOAL, self.fake.triage[7], cmd, private=True)
+        self.assertEqual(self.fake.read_comments(), [])
+        self.assertEqual(self.fake.created, [])
 
     def test_a_repo_whose_visibility_cannot_be_read_counts_as_private(self):
         self.fake.add_triage(7)

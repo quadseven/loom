@@ -3183,7 +3183,7 @@ class Station:
             done += 1
             try:
                 action = rewrite.rewrite_issue(self.gh, repo, goal, issue, cmd,
-                                               REWRITE_TIMEOUT)
+                                               REWRITE_TIMEOUT, private=not self._public(repo))
             except rewrite.CommandFailure as err:
                 tried.pop(str(number), None)
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
