@@ -361,9 +361,11 @@ this tick"; a step with no note shows nothing there.
    of `status` first: a finding at P0 or P1 outranks new feature work.
    A brief without `--lane` stays queued until the station gives it a free
    lane of its Difficulty tier, by priority, then oldest queued first. Use `--lane LANE`
-   when the brain needs to choose the lane itself. A queued ticket without a
+   when the brain needs to choose the lane itself. `brief` refuses a brief
+   with neither `--lane` nor `--difficulty`. A queued ticket without a
    readable Difficulty line stays queued and appears in the goal's next
-   station standup as needing a difficulty. A brief named but not written this
+   station standup as needing a difficulty; set one in the same tick with
+   `python3 -m bus.brain prioritize OWNER/NAME#N --difficulty easy|medium|hard`. A brief named but not written this
    tick is deferred with the `brief` stage (`defer OWNER/NAME#GOAL --stage brief --holder muse --note "one-line problem statement"`),
    never only in journal prose.
 8. First run `python3 -m bus.brain step triage --holder muse`. Triage the backlog. The station runs `python3 -m bus.brain triage
