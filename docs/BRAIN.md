@@ -664,11 +664,11 @@ A lane pull request is merge-ready if and only if all four hold:
 `python3 -m bus.brain status` prints this per pull request: `READY`, or
 `blocked:` and every blocker that applies, for example `blocked: checks
 failure, grug changes_requested, 3 unresolved threads`. It is computed by
-`bus.brain.merge_ready` from the one GraphQL read status already makes and
-nothing else, so two runs over the same pull request state print the same
-verdict. A tick takes that line as given instead of re-reading the review
-list. `bus.brain merge` keeps its own checks; this signal does not change
-what it accepts.
+`bus.brain.merge_ready` from the one GraphQL read status already makes.
+For a sensitive pull request that would otherwise be READY, status
+also checks the named review run on the head and blocks it unless that run
+completed with `success`. A tick takes that line as given instead of
+re-reading the review list. `bus.brain merge` keeps its own checks.
 
 ## Merge by change class
 
@@ -703,9 +703,9 @@ ticketless pull request when all of these hold:
 - it is not a draft, and it has no ticket (a linked ticket is refused:
   merge that without `--adopt`);
 - its head commit's check rollup is `SUCCESS`;
-- the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) ran and
-  passed on the head commit, because every change is reviewed before it
-  lands;
+- the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) completed
+  with `success` or `neutral` on the head commit. A sensitive-class pull
+  request still requires `success`;
 - every review thread is resolved.
 
 It pins the head SHA in the squash merge, deletes the branch only after
