@@ -1005,6 +1005,31 @@ class SensitiveResumeTests(unittest.TestCase):
                              env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertTrue(result["merged"])
 
+    def test_merge_heals_ticket_stuck_in_running_when_pr_is_open(self):
+        # A ticket in loom:running with an open PR should be moved to loom:pr
+        # instead of refusing the merge. This heals the label drift when a lane
+        # opens the PR but the label update never lands.
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:running"},
+                                             {"name": "lane:muse"}]}
+        healed = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                              {"name": "lane:muse"}]}
+        fake = Fake(pr, query,
+                    reply(200, issue),  # _validate_ticket_association reads ticket
+                    reply(200, healed),  # PUT labels returns healed issue
+                    # _refuse_pending_fix returns early with empty env (no authors)
+                    reply(200, {"merged": True}),
+                    reply(204),
+                    reply(200, healed), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+        # The label update must have been sent before the merge.
+        put_calls = [c for c in fake.calls if c[0] == "PUT" and "/labels" in c[1]]
+        self.assertTrue(put_calls, "expected a label PUT to heal the ticket")
+        sent = put_calls[0][2]["labels"]
+        self.assertIn("loom:pr", sent)
+        self.assertNotIn("loom:running", sent)
+
     def test_merge_refuses_an_unrelated_closed_or_non_ticket_issue_before_write(self):
         cases = [
             ((REPO, 999), {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
