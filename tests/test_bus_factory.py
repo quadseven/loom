@@ -1066,6 +1066,44 @@ class Tickets(Base):
         self.assertIn({"name": "loom:pr"}, self.fixed[0][2])
         self.assertNotIn({"name": "loom:failed"}, self.fixed[0][2])
 
+    def no_reason_failure(self, number):
+        return {"body": "Lane zai failed: [work] agent made no commit and wrote no reason "
+                        "on loom/%d-x" % number, "user": ME}
+
+    def test_a_first_no_reason_no_commit_failure_climbs(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.comments[6] += [CLAIM, self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude")])
+
+    def test_a_second_no_reason_no_commit_failure_is_held_for_the_brain(self):
+        self.gh.ticket(6, "failed", lane="claude")
+        self.gh.comments[6] += [CLAIM, self.no_reason_failure(6),
+                                {"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertIn({"name": "needs-brain"}, self.gh.issues[6]["labels"])
+        self.assertIn("does not climb", self.gh.comments[6][-1]["body"])
+        self.assertNotIn("loom:rung", self.gh.comments[6][-1]["body"])
+        posted = len(self.gh.comments[6])
+        self.go()  # once: the next pass says nothing more
+        self.assertEqual((self.moved, len(self.gh.comments[6])), ([], posted))
+
+    def test_a_no_reason_failure_after_a_ladder_restart_climbs_again(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.comments[6] += [self.no_reason_failure(6), {"body": factory.RUNG_MARKER % 0, "user": ME},
+                                CLAIM, self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude")])
+
+    def test_a_stranger_cannot_hold_a_ticket_with_a_no_reason_comment(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        forged = dict(self.no_reason_failure(6), user=STRANGER)
+        self.gh.comments[6] += [forged, CLAIM, self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude")])
+
     def test_a_failed_ticket_past_the_last_rung_is_left_alone(self):
         self.gh.ticket(6, "failed")
         self.gh.comments[6] += ALL_RUNGS

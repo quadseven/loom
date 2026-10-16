@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import audit
 from . import factory
@@ -62,6 +62,12 @@ AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
+# The runner's log line for a run that committed nothing because its agent
+# found the work already done or no longer applying: an answer, not a failure.
+ANSWERED_RE = re.compile(r"^\[[^]]*\] (\S+) done, answered: ")
+# A pull request a brief names in words, as a settle-findings ticket names the
+# one its findings were left on.
+NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
 # A lane tree (lanes/run_lane.sh clones one a brief attempt) whose brief is no
 # longer waiting or running is removed once it is this old. On 2026-10-13 the
 # 385 left behind held 7.8 GB and the disk filled.
@@ -2024,6 +2030,11 @@ class Station:
             if self._field(text, "Deliverable") == "answer":
                 _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
                 return True
+            if self._answered(lane, name):
+                prs = {int(n) for n in NAMED_PR_RE.findall(text)}
+                self._post_thread_answers(repo, prs, lane, name, text, None)
+                _say("reported %s#%d answered by lane %s: nothing to change" % (repo, number, lane))
+                return True
             branch = self._field(text, "Branch")
             prs = self.gh.rest("GET", "/repos/%s/pulls?head=%s:%s&state=all"
                                % (repo, repo.split("/")[0], branch)).data
@@ -2196,9 +2207,26 @@ class Station:
         _say("reported %s#%d: branch moved on lane %s: %s" % (repo, number, lane, reason))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
-        """Post each answer the lane wrote instead of a fix as the reply on its
-        thread. Only a thread the brief asked about, on this pull request,
-        gets one. It is resolved when the round ran on a ladder model and the
+        """Post each answer a fix round's lane wrote instead of a fix. Only a
+        thread the brief asked about, on its pull request, gets one."""
+        asked = set(factory.FIX_THREAD_RE.findall(brief))
+        self._post_thread_answers(repo, {pr}, lane, name, brief, asked)
+
+    def _answered(self, lane: str, name: str) -> bool:
+        """Did the runner report this run answered (lanes/run_lane.sh,
+        no_change_reason)?"""
+        log = os.path.join(self.s.home, "logs", lane, name + ".log")
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                return any(m.group(1) == name for m in map(ANSWERED_RE.match, fh) if m)
+        except OSError:
+            return False
+
+    def _post_thread_answers(self, repo: str, prs: Set[int], lane: str, name: str,
+                             brief: str, asked: Optional[Set[str]]) -> None:
+        """Post each answer the lane wrote as the reply on its thread: an open
+        thread on one of prs and, unless asked is None, one the brief asked
+        about. It is resolved when the round ran on a ladder model and the
         thread is the review bot's own medium or low finding; otherwise it
         stays open, and the factory reads it as a finding that survived."""
         folder = os.path.join(self.inbox(lane), "answers", name)
@@ -2206,28 +2234,28 @@ class Station:
             entries = sorted(os.listdir(folder))
         except OSError:
             return
-        asked = set(factory.FIX_THREAD_RE.findall(brief))
         strong = self._field(brief, "Model") in STRONG_MODELS
         try:
             for entry in entries:
                 m = ANSWER_FILE_RE.match(entry)
-                if not (m and m.group(1) in asked):
+                if not (m and (asked is None or m.group(1) in asked)):
                     continue
                 try:
-                    self._answer(repo, pr, lane, m.group(1), os.path.join(folder, entry), strong)
+                    self._answer(repo, prs, lane, m.group(1), os.path.join(folder, entry), strong)
                 except GitHubError as err:
                     # One thread's failure must not stop the rest, and the
                     # report must still be recorded: a retried report would
                     # post the answers already posted a second time.
-                    _say("answer to %s on %s#%d failed: %s" % (m.group(1), repo, pr, err))
+                    _say("answer to %s on %s failed: %s" % (m.group(1), repo, err))
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
-    def _answer(self, repo: str, pr: int, lane: str, thread_id: str, path: str,
+    def _answer(self, repo: str, prs: Set[int], lane: str, thread_id: str, path: str,
                 strong: bool) -> None:
         said = _read_answer(path)
         node = (self.gh.graphql(THREAD_QUERY, {"id": thread_id}) or {}).get("node") or {}
-        if not said or not _open_on(node, repo, pr):
+        pr = next((n for n in sorted(prs) if _open_on(node, repo, n)), None)
+        if not said or pr is None:
             return
         body = "Lane %s answered this finding instead of changing the code:\n\n%s" % (
             lane, "\n".join("> " + line for line in said.splitlines()))
