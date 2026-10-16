@@ -94,6 +94,34 @@ class BrainTests(unittest.TestCase):
             self.assertFalse(any(method in ("PATCH", "POST", "PUT", "DELETE")
                                  for method, _, _ in fake.calls))
 
+    def test_prioritize_sets_difficulty_and_keeps_priority(self):
+        # Five factory tickets briefed without a difficulty sat queued with no
+        # lane for up to 17 hours (2026-10-16); a brain had no command to fix one.
+        original = "Priority: P1\n\n## Why\nKeep this.\n"
+        expected = "Priority: P1\nDifficulty: medium\n\n## Why\nKeep this.\n"
+        fake = Fake(reply(200, {"state": "open", "body": original,
+                                "labels": [{"name": "loom:ticket"}],
+                                "user": {"login": "trusted"}}), reply(200, {}))
+        brain.prioritize(GitHub("t", transport=fake), REPO, 8, None,
+                         env={"LOOM_BRIEF_AUTHORS": "trusted"}, difficulty="medium")
+        self.assertEqual(fake.calls[1][2], {"body": expected})
+
+    def test_prioritize_refuses_no_change_and_an_unknown_difficulty(self):
+        for priority, difficulty in ((None, None), (None, "extreme")):
+            fake = Fake()
+            with self.assertRaises(ValueError):
+                brain.prioritize(GitHub("t", transport=fake), REPO, 8, priority,
+                                 env={"LOOM_BRIEF_AUTHORS": "trusted"}, difficulty=difficulty)
+            self.assertEqual(fake.calls, [])
+
+    def test_brief_cli_refuses_a_brief_no_lane_can_claim(self):
+        body = "## Why\nx\n"
+        with self.assertRaisesRegex(ValueError, "needs --difficulty"):
+            brain._check_brief_difficulty(body, None, None)
+        brain._check_brief_difficulty(body, None, "easy")
+        brain._check_brief_difficulty(body, "agy", None)
+        brain._check_brief_difficulty("Difficulty: hard\n\n" + body, None, None)
+
     def test_prioritize_without_trusted_authors_names_the_setting(self):
         # A remote brain without LOOM_BRIEF_AUTHORS saw only "not a trusted
         # login" and could not tell what to fix.
