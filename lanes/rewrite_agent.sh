@@ -139,8 +139,9 @@ for i in "${!MODELS[@]}"; do
         CLAUDE_CODE_OAUTH_TOKEN="$(ssm_value "$LOOM_REWRITE_CLAUDE_TOKEN_SSM")"
         [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || fail "no Claude subscription token readable" 2
       fi
-      AGENT_EXTRA_ENV="${CLAUDE_CODE_OAUTH_TOKEN:+CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN}"
-      api_agent - claude -p --model "$MODEL_ID" --output-format stream-json \
+      CLAUDE_KEY_VAR=-
+      [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || CLAUDE_KEY_VAR=CLAUDE_CODE_OAUTH_TOKEN
+      API_KEY="${CLAUDE_CODE_OAUTH_TOKEN:-}" api_agent "$CLAUDE_KEY_VAR" claude -p --model "$MODEL_ID" --output-format stream-json \
         --verbose --tools "" --strict-mcp-config --disable-slash-commands \
         --setting-sources "" < "$AGENT_STDIN" > "$OUT" ;;
     *)

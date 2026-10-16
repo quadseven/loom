@@ -82,6 +82,10 @@ log=@LANE_LOG@
 printf '%s|%s|%s|%s\n' "$(basename "$0")" "$*" "$HOME" "$PWD" >> "$log"
 cat > "$log.prompt"
 if [ "$(basename "$0")" = codex ] && grep -q 'MODE=fail-codex' "$log.prompt"; then exit 3; fi
+if [ "$(basename "$0")" = claude ]; then
+  case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in *$'\nINJECTED=present') intact=yes ;; *) intact=no ;; esac
+  printf 'token-intact=%s injected=%s\n' "$intact" "${INJECTED:-absent}" > "$log.env"
+fi
 case "$(basename "$0")" in
   codex) printf '%s\n' '{"type":"thread.started"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"action\\":\\"skip\\",\\"reason\\":\\"fake\\"}"}}' ;;
   claude) printf '%s\n' '{"type":"result","result":"{\\"action\\":\\"skip\\",\\"reason\\":\\"fake\\"}"}' ;;
@@ -122,7 +126,7 @@ class RewriteAgentTest(unittest.TestCase):
                         .replace("@VERSION@", version))
 
     def run_wrapper(self, prompt="Rewrite issue 7 into a ticket.", args=("loom/test/key", MODEL),
-                    secret=KEY):
+                    secret=KEY, env_overrides=None):
         env = {
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
@@ -132,6 +136,8 @@ class RewriteAgentTest(unittest.TestCase):
             "LANE_LOG": str(self.lane_log),
             "SANDBOX_LOG": str(self.sandbox_log),
         }
+        if env_overrides:
+            env.update(env_overrides)
         return subprocess.run(["bash", str(WRAPPER), *args], input=prompt, env=env,
                               capture_output=True, text=True, timeout=60)
 
@@ -166,6 +172,15 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(result.stdout, '{"action":"skip","reason":"fake"}\n')
         self.assertEqual([line.split("|", 1)[0] for line in self.lane_log.read_text().splitlines()],
                          ["codex", "claude"])
+
+    def test_claude_token_cannot_add_another_environment_variable(self):
+        result = self.run_wrapper(
+            args=("-", "claude/test-model"), secret="placeholder\nINJECTED=present",
+            env_overrides={"LOOM_REWRITE_CLAUDE_TOKEN_SSM": "loom/test/key"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("token-intact=yes injected=absent",
+                      Path(str(self.lane_log) + ".env").read_text())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_prompt_reaches_the_agent_on_stdin_and_only_the_final_text_is_printed(self):
