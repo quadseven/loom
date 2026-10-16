@@ -397,6 +397,18 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> st
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
 
+def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
+                    node: Optional[Dict[str, Any]], bot: str, check: str) -> str:
+    line = _pr_line(pr, node, bot)
+    if not line.endswith(" - READY") or change_class.class_of(pr) != "sensitive":
+        return line
+    sha = str((pr.get("head") or {}).get("sha") or "")
+    if sha and _review_check_passed(gh, repo, sha, check):
+        return line
+    return (line.removesuffix("READY")
+            + "blocked: review check has not passed on the head commit")
+
+
 def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
     allowed = {a.lower() for a in authors}
     last_claim = newest = -1
@@ -500,12 +512,12 @@ def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optiona
 
 def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                         data: Dict[str, Any], bot: str,
-                        authors: Sequence[str] = ()) -> List[str]:
+                        authors: Sequence[str] = (), check: str = "Grug - Elder") -> List[str]:
     """The pull request lines for status: heading, merge readiness for each
     loom pull request, and the pending brain fix mark when one waits."""
     lines = ["### Pull requests"]
     for pr in prs:
-        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
+        line = _status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
         try:
             ticket = _ticket_association(repo, pr)
         except ValueError:
@@ -528,7 +540,8 @@ def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
 
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
-                  into: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> List[str]:
+                  into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+                  check: str = "Grug - Elder") -> List[str]:
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section."""
     issues = _issues(gh, repo)
@@ -556,11 +569,12 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
-    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or ())
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check)
     lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
-    lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
+    lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
+              for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
     lines += ["", INVARIANTS_HEADING]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
@@ -655,7 +669,8 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     found: Dict[str, List[Dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
-            lambda repo: _repo_section(gh, repo, now, bot, authors, found), repos))
+            lambda repo: _repo_section(gh, repo, now, bot, authors, found,
+                                       review_check_name(env)), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)]
     out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
@@ -1808,9 +1823,10 @@ def _ticketless(repo: str, pr: Dict[str, Any]) -> bool:
         return False
 
 
-def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str) -> bool:
-    """The named review check ran and passed on this head commit. The
-    operator's rule is that every change is reviewed before it lands, and a
+def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str,
+                         allow_neutral: bool = False) -> bool:
+    """The named review check completed on this head with an allowed conclusion.
+    The operator's rule is that every change is reviewed before it lands, and a
     green rollup alone does not prove the review check ever ran. Every page:
     a commit in a repo with a CI matrix has more runs than one page holds."""
     try:
@@ -1822,10 +1838,11 @@ def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str) -> bool:
             runs = data["check_runs"]
             for run in runs:
                 if not isinstance(run, dict):
-                    return False
+                    continue
                 if run.get("name") == check:
+                    conclusions = ("success", "neutral") if allow_neutral else ("success",)
                     return (run.get("status") == "completed"
-                            and run.get("conclusion") == "success")
+                            and run.get("conclusion") in conclusions)
             if len(runs) < 100:
                 return False
     except GitHubError:
@@ -1855,7 +1872,9 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
     for ok, reason in rules:
         if not ok:
             raise ValueError(reason)
-    if not sha or not _review_check_passed(gh, repo, sha, review_check_name(env)):
+    if not sha or not _review_check_passed(
+            gh, repo, sha, review_check_name(env),
+            allow_neutral=change_class.class_of(pr) != "sensitive"):
         raise ValueError("the review check has not passed on the head commit")
 
 

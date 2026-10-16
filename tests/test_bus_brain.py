@@ -315,6 +315,35 @@ class SensitiveResumeTests(unittest.TestCase):
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
 
+    def test_status_blocks_a_sensitive_pr_with_a_neutral_review(self):
+        pr = {"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work", "sha": "head1"},
+              "labels": [{"name": "class:sensitive"}]}
+        fake = Fake(reply(200, []), reply(200, [pr]),
+                    reply(200, {"data": {"repository": {"p4": ready_node()}}}),
+                    reply(200, {"check_runs": [
+                        {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]}),
+                    reply(200, []))
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        self.assertIn("- #4 Sensitive - blocked: review check has not passed on the head commit",
+                      report)
+        self.assertIn("## Runaway tickets\n- none", report)
+
+    def test_status_lists_a_docs_pr_with_a_neutral_review_as_ready(self):
+        pr = {"number": 4, "title": "Docs", "head": {"ref": "loom/4-work", "sha": "head1"},
+              "labels": [{"name": "class:docs"}]}
+        fake = Fake(reply(200, []), reply(200, [pr]),
+                    reply(200, {"data": {"repository": {"p4": ready_node()}}}),
+                    reply(200, []))
+
+        def transport(method, url, headers, body):
+            if "/check-runs?" in url:
+                return reply(200, {"check_runs": [
+                    {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]})
+            return fake(method, url, headers, body)
+
+        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={})
+        self.assertIn("- #4 Docs - READY", report)
+
     def test_status_pull_request_lines_with_and_without_pending_brain_fix(self):
         pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
         authors = ["alice-example"]
@@ -921,7 +950,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
                     reply(200, issue), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "checked"})
         self.assertIn("/git/refs/heads/loom/9-work", fake.calls[4][1])
         self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
@@ -967,7 +996,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
                     reply(422, {"message": "Reference does not exist"}), reply(200, issue), reply(200, {}))
-        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertEqual(fake.calls[-1][0], "PUT")
         # Merged is not deployed: the ticket says merged until the project's
         # ship owner deploys it.
@@ -1062,7 +1091,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, self._passing_check(), reply(200, issue),
                     reply(200, {"merged": True}), reply(204), reply(200, issue), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
     def test_a_logic_pr_with_a_resolved_high_finding_keeps_todays_rule(self):
@@ -1078,7 +1107,7 @@ class SensitiveResumeTests(unittest.TestCase):
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}),
                     reply(204), reply(200, issue), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertTrue(result["merged"])
 
     TRUSTED = {"LOOM_BRIEF_AUTHORS": "example-brain"}
@@ -1118,6 +1147,40 @@ class SensitiveResumeTests(unittest.TestCase):
         # The pull request is told it was adopted, after the branch is deleted.
         self.assertEqual(fake.calls[-1][0], "POST")
         self.assertIn(brain.ADOPT_MARKER, fake.calls[-1][2]["body"])
+
+    def test_adopt_merges_a_docs_pr_with_a_neutral_review_on_its_head(self):
+        runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]
+        fake = Fake(*self._merge_replies_for_adopt({
+            "pr": {"labels": [{"name": "class:docs"}]}, "runs": runs}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8,
+                             adopt=True, env=self.TRUSTED)
+        self.assertTrue(result["merged"])
+        self.assertEqual(fake.calls[3][2]["sha"], "head1")
+
+    def test_adopt_reads_a_valid_review_after_a_null_check_run(self):
+        runs = [None, {"name": "Grug - Elder", "status": "completed",
+                       "conclusion": "neutral"}]
+        fake = Fake(*self._merge_replies_for_adopt({
+            "pr": {"labels": [{"name": "class:docs"}]}, "runs": runs}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8,
+                             adopt=True, env=self.TRUSTED)
+        self.assertTrue(result["merged"])
+
+    def test_adopt_merges_a_tests_pr_with_a_neutral_review_on_its_head(self):
+        runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]
+        fake = Fake(*self._merge_replies_for_adopt({
+            "pr": {"labels": [{"name": "class:tests"}]}, "runs": runs}))
+        self.assertTrue(brain.merge(GitHub("t", transport=fake), REPO, 8,
+                                    adopt=True, env=self.TRUSTED)["merged"])
+
+    def test_adopt_refuses_a_sensitive_pr_with_a_neutral_review(self):
+        runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]
+        fake = Fake(*self._adopt_replies({
+            "pr": {"labels": [{"name": "class:sensitive"}]}, "runs": runs}))
+        with self.assertRaisesRegex(ValueError, "review check has not passed"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8,
+                        adopt=True, env=self.TRUSTED)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
     def test_adopt_refuses_a_pull_request_that_already_has_a_ticket(self):
         fake = Fake(*self._adopt_replies({"pr": {"body": "Refs %s#9" % REPO}}))
