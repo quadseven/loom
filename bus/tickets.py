@@ -377,7 +377,9 @@ ANSWER_NOTE = (
 
 
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
-                  fix: Optional[Fix] = None) -> str:
+                  fix: Optional[Fix] = None,
+                  ci_checks: Optional[List[Tuple[str, str]]] = None,
+                  has_contract: bool = True) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -400,6 +402,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             if k not in ("Not before", "After", "Priority")]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
+    if not has_contract and ci_checks:
+        text += "## Checks CI runs\n\nRun these checks before opening the pull request:\n\n"
+        for source, command in ci_checks:
+            text += "- `%s` (from %s)\n" % (command, source)
+        text += "\n"
     if body:
         text += body + "\n"
     if fix:
