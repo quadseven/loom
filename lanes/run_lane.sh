@@ -238,16 +238,17 @@ SUMMARY_FILE=.loom/summary.md
 
 # What the agent is told about the Intent summary: one line per behavior
 # change in .loom/summary.md, else the runner falls back to the ticket's
-# What section. The file itself is never committed.
+# What section, or the reason a run changed nothing (no_change_reason). The
+# file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. If there is no behavior change, leave the file out.\n' "$SUMMARY_FILE"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and the runner posts it on the ticket as the answer.\n' "$SUMMARY_FILE"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Commit your work. A run that ends with no commit fails the ticket.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
@@ -426,6 +427,82 @@ post_replies() {
 repair_pr_text() {
   NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
     --apply "$FIX_PR" --repo "$REPO" "$BRIEF" "$LANE" "$MODEL" "$TICKET"
+}
+
+# Prints the text of file $1 when it is fit for a ticket comment: at most
+# 32 KB of non-empty ASCII that passes bus/text.py's checks. Otherwise says
+# why on stderr and fails.
+checked_text() {
+  PYTHONPATH="$REPO_ROOT" python3 - "$1" <<'PY'
+import sys
+from pathlib import Path
+from bus import text
+path = Path(sys.argv[1])
+try:
+    data = path.read_bytes()
+    if len(data) > 32768: raise ValueError("answer is too large")
+    value = data.decode("utf-8")
+    if not value.strip(): raise ValueError("answer is empty")
+    if not value.isascii(): raise ValueError("answer is not ASCII")
+    text.check(value)
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(1)
+sys.stdout.write(value)
+PY
+}
+
+# Words with which an agent says its ticket's work is already done or no
+# longer applies.
+NO_CHANGE_RE='nothing (left )?to (change|fix|do)|no (code )?change (is )?needed|no longer (holds?|applies|apply)|already (done|fixed|in place|handled)|does not apply'
+# The runner's reason, read by the factory, when a run committed nothing
+# and its agent gave no such reason.
+NO_REASON="agent made no commit and wrote no reason"
+
+# A run that committed nothing is an answer, not a failure, when its agent
+# said why: an Intent summary that the work is already done or no longer
+# applies, or an answer to a thread kept aside by keep_answers. Sets
+# NO_CHANGE_TEXT to the ticket comment that quotes it. Fails with
+# NO_CHANGE_WHY empty when the agent gave no reason, or set to why its
+# reason cannot be posted.
+no_change_reason() {
+  local said="$WORKDIR/$TICKET.no-change.md" summary="$WORKDIR/$TICKET.summary.md" f found=""
+  NO_CHANGE_TEXT="" NO_CHANGE_WHY=""
+  [ -f "$summary" ] && grep -qiE "$NO_CHANGE_RE" "$summary" && found=1
+  compgen -G "$WORKDIR/$TICKET.answers/*.md" > /dev/null && found=1
+  [ -n "$found" ] || return 1
+  {
+    printf 'Lane %s made no change: the agent found this work already done or no longer applying. It said:\n\n' "$SLOT"
+    [ -f "$summary" ] && sed 's/^/> /' "$summary"
+    for f in "$WORKDIR/$TICKET.answers"/*.md; do
+      [ -f "$f" ] || continue
+      printf '>\n> On review thread %s:\n' "$(basename "$f" .md)"
+      sed 's/^/> /' "$f"
+    done
+  } > "$said"
+  if ! NO_CHANGE_TEXT="$(checked_text "$said" 2>&1)"; then
+    NO_CHANGE_WHY="${NO_CHANGE_TEXT:-its reason could not be read}"
+    NO_CHANGE_TEXT=""
+  fi
+  rm -f "$said"
+  [ -z "$NO_CHANGE_WHY" ]
+}
+
+# Post an answered run's reason on its ticket, label the ticket
+# loom:answered for the brain, and hand its thread answers to the station,
+# which posts each on the pull request the ticket names. Says what failed.
+post_no_change() {
+  if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
+    echo "answer comment failed"; return 1
+  fi
+  if ! timeout "$NET_TIMEOUT" gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label loom:answered --remove-label loom:running,loom:briefed,loom:queued >> "$LOG" 2>&1; then
+    echo "answer posted but ticket label update failed"; return 1
+  fi
+  if [ -d "$WORKDIR/$TICKET.answers" ]; then
+    rm -rf "$INBOX/answers/$TICKET"
+    mkdir -p "$INBOX/answers"
+    mv "$WORKDIR/$TICKET.answers" "$INBOX/answers/$TICKET"
+  fi
 }
 
 # A run that did not end in a PR: say why, park the brief, never retry it.
@@ -1100,18 +1177,21 @@ conflict_list() {
 
 # Paths of CONFLICTS that still hold a conflict marker line, comma-separated.
 # A fix brief's agent may answer a finding instead of fixing it, one file a
-# thread in .loom-answers/ (bus/tickets.py says how). The answers never go in
-# the commit: they move to the inbox, where the station posts each on its
-# thread. The copy opens the folder and each file without following links,
-# through the folder's descriptor, and keeps only a regular file with one
+# thread in .loom-answers/ (bus/tickets.py says how), and any agent may say
+# so for a run that changes nothing. The answers never go in the commit:
+# they move to the inbox, where the station posts each on its thread. The
+# copy opens the folder and each file without following links, through the
+# folder's descriptor, and keeps only a regular file with one
 # link, at most 8 KB, named for a thread: a symlink, a hard link to a file
 # outside the tree, a FIFO or a folder swapped for a link is dropped unread,
 # so an answer cannot carry a file the agent could not read itself.
 keep_answers() {
-  local dir="$TREE/.loom-answers"
+  local dir="$TREE/.loom-answers" dst="$INBOX/answers/$TICKET"
+  # A brief with no pull request keeps them aside: they go to the inbox only
+  # when the run ends answered (post_no_change).
+  if [ -z "$FIX_PR" ]; then dst="$WORKDIR/$TICKET.answers"; rm -rf "$dst"; fi
   [ -e "$dir" ] || [ -L "$dir" ] || return 0
-  if [ -n "$FIX_PR" ]; then
-    if ! python3 - "$dir" "$INBOX/answers/$TICKET" <<'PY' >> "$LOG" 2>&1
+  if ! python3 - "$dir" "$dst" <<'PY' >> "$LOG" 2>&1
 import os, re, stat, sys
 src, dst = sys.argv[1], sys.argv[2]
 nofollow = os.O_RDONLY | os.O_NOFOLLOW
@@ -1140,9 +1220,8 @@ try:
 finally:
     os.close(folder)
 PY
-    then
-      echo "[$(date -u +%FT%TZ)] $TICKET: the answers in .loom-answers could not be kept" >> "$LOG"
-    fi
+  then
+    echo "[$(date -u +%FT%TZ)] $TICKET: the answers in .loom-answers could not be kept" >> "$LOG"
   fi
   rm -rf "$dir"
 }
@@ -1393,8 +1472,15 @@ for BRIEF in "$INBOX"/*.md; do
     workersai:cloudflare-workers-ai/@cf/*) ;;
     spark:spark/?*) ;;
     spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
-    agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
-    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
+    agy:gemini-*|agy:claude-*|agy:gpt-oss-*)
+      case "$MODEL" in
+        *-low|*-medium|*-high) ;;
+        *) case "${LOOM_AGY_EFFORT:-high}" in
+             low|medium|high) MODEL="$MODEL-${LOOM_AGY_EFFORT:-high}" ;;
+             *) park "$BRIEF" "agy effort must be low, medium, or high" transient; continue ;;
+           esac ;;
+      esac ;;
+    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)" transient; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
   if [ -n "$CONFIGURED_MODELS" ] && [ -z "$PINNED_MODEL" ]; then
@@ -1452,12 +1538,15 @@ for BRIEF in "$INBOX"/*.md; do
 
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
+  rm -f "$LOGDIR/$TICKET.answered"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
   if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed" transient; continue
   fi
-  BASE="$(git -C "$TREE" rev-parse HEAD)"
+  if ! BASE="$(git -C "$TREE" rev-parse HEAD)" || [ -z "$BASE" ]; then
+    park "$BRIEF" "could not read the base commit" transient; continue
+  fi
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED=""
@@ -1503,8 +1592,12 @@ for BRIEF in "$INBOX"/*.md; do
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
+  if ! TREE_STATUS="$(safe_git status --porcelain 2>> "$LOG")" ||
+     ! TREE_HEAD="$(safe_git rev-parse HEAD 2>> "$LOG")"; then
+    park "$BRIEF" "could not read the agent's git state" transient; continue
+  fi
   EDITED=""
-  { [ -n "$(safe_git status --porcelain)" ] || [ "$(safe_git rev-parse HEAD)" != "$BASE" ]; } && EDITED=edited
+  { [ -n "$TREE_STATUS" ] || [ "$TREE_HEAD" != "$BASE" ]; } && EDITED=edited
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
   FAIL_CLASS=work
@@ -1561,25 +1654,7 @@ for BRIEF in "$INBOX"/*.md; do
     if [ ! -d "$TREE/.loom" ] || [ -L "$TREE/.loom" ] || [ ! -f "$ANSWER" ] || [ -L "$ANSWER" ]; then
       park "$BRIEF" "no answer written"; continue
     fi
-    ANSWER_TEXT="$(PYTHONPATH="$REPO_ROOT" python3 - "$ANSWER" 2> "$LOGDIR/$TICKET.answer-error" <<'PY'
-import sys
-from pathlib import Path
-from bus import text
-path = Path(sys.argv[1])
-try:
-    data = path.read_bytes()
-    if len(data) > 32768: raise ValueError("answer is too large")
-    value = data.decode("utf-8")
-    if not value.strip(): raise ValueError("answer is empty")
-    if not value.isascii(): raise ValueError("answer is not ASCII")
-    text.check(value)
-except Exception as exc:
-    print(str(exc), file=sys.stderr)
-    raise SystemExit(1)
-sys.stdout.write(value)
-PY
-    )"
-    if [ "$?" -ne 0 ]; then
+    if ! ANSWER_TEXT="$(checked_text "$ANSWER" 2> "$LOGDIR/$TICKET.answer-error")"; then
       REASON="$(cat "$LOGDIR/$TICKET.answer-error" 2>/dev/null)"
       [ -n "$REASON" ] || REASON="answer could not be read"
       park "$BRIEF" "answer refused: $REASON"; continue
@@ -1619,8 +1694,23 @@ PY
   if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
     if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
            safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
-      park "$BRIEF" "could not commit the agent's changes"; continue
+      park "$BRIEF" "could not commit the agent's changes" transient; continue
     fi
+  fi
+  # A non-sandboxed agent may commit while HEAD is detached. Adopt that clean
+  # commit onto the lane branch before validation and push.
+  if ! TREE_STATUS="$(safe_git status --porcelain 2>> "$LOG")" ||
+     ! TREE_HEAD="$(safe_git rev-parse HEAD 2>> "$LOG")" ||
+     ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")"; then
+    park "$BRIEF" "could not read the committed git state" transient; continue
+  fi
+  if [ -z "$TREE_STATUS" ] && [ "$TREE_HEAD" != "$BRANCH_HEAD" ] && [ "$TREE_HEAD" != "$BASE" ]; then
+    if ! safe_git update-ref "refs/heads/$BRANCH" "$TREE_HEAD" >> "$LOG" 2>&1; then
+      park "$BRIEF" "could not record the agent's commit on $BRANCH" transient; continue
+    fi
+  fi
+  if ! safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1; then
+    park "$BRIEF" "could not check out $BRANCH after the agent run" transient; continue
   fi
   COMMITTED=0
   # A lane pull request never carries the files its agent wrote to probe
@@ -1628,9 +1718,12 @@ PY
   # files from the agent's commits and names each one in the run log (and,
   # for a new PR, in the Intent section).
   if ! drop_probe_files >> "$LOG" 2>&1; then
-    park "$BRIEF" "could not drop sandbox probe files"; continue
+    park "$BRIEF" "could not drop sandbox probe files" transient; continue
   fi
-  if [ "$(safe_git rev-parse "$BRANCH")" != "$BASE" ]; then
+  if ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")" || [ -z "$BRANCH_HEAD" ]; then
+    park "$BRIEF" "could not read the lane branch after validation" transient; continue
+  fi
+  if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
   fi
   # An agent's exit code is not evidence: only a passing check on the
@@ -1675,7 +1768,25 @@ PY
     esac
   fi
   if [ "$COMMITTED" -eq 0 ] && [ "$METADATA_CHANGED" -eq 0 ] && [ -z "$REPLIES_FILE" ]; then
-    park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
+    if [ -n "$FIX_PR" ]; then
+      park "$BRIEF" "agent made no commit and PR text is current on $BRANCH"; continue
+    fi
+    # A correct "nothing to change" is an answer, not a failure: on
+    # 2026-10-13 five settle-findings tickets failed 4 to 6 times each, every
+    # model rightly finding their one finding no longer held.
+    if ! no_change_reason; then
+      [ -z "$NO_CHANGE_WHY" ] || { park "$BRIEF" "agent made no commit and its reason was refused: $NO_CHANGE_WHY"; continue; }
+      park "$BRIEF" "$NO_REASON on $BRANCH"; continue
+    fi
+    if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+      park "$BRIEF" "agent made no commit and its reason has no ticket number to go on"; continue
+    fi
+    if ! WHY="$(post_no_change)"; then park "$BRIEF" "$WHY" transient; continue; fi
+    # The station reads this marker, not the log, which carries agent output.
+    : > "$LOGDIR/$TICKET.answered"
+    echo "[$(date -u +%FT%TZ)] $TICKET done, answered: nothing to change" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
   fi
   # Never forced: a branch that moved on the remote refuses the push. A fix
   # brief's branch moved by someone else during the run (another lane's

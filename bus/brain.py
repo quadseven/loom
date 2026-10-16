@@ -2612,16 +2612,19 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
     tried = _tried_models(_first_model(issue, bodies), bodies)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
-    return History(failed, fixes, tried, reasons, _lowest_untried(tried),
-                   _trusted_rungs(comments, authors), held)
+    rungs = _trusted_rungs(comments, authors or trusted_authors())
+    return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
+                   rungs, held)
 
 
 def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
     return [at for body, at in bodies if at is not None and _CLAIM.fullmatch(body.strip())]
 
 
-def _lowest_untried(tried: List[str]) -> Optional[int]:
-    untried = [i for i, (_, model) in enumerate(ESCALATION) if model not in tried]
+def _lowest_untried(tried: List[str], rungs: Optional[set] = None) -> Optional[int]:
+    highest_reached = max(rungs or {0})
+    untried = [i for i, (_, model) in enumerate(ESCALATION)
+               if i + 1 > highest_reached and model not in tried]
     return untried[0] if untried else None
 
 

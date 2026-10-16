@@ -1769,6 +1769,16 @@ class EscalateTests(unittest.TestCase):
         _, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
 
+    def test_escalate_never_downgrades_below_a_recorded_rung(self):
+        history = [claim("2030-01-01T00:11:00Z"),
+                   rung_marker(3), rung_claim()]
+        issue = stuck_ticket("failed", body="Model: claude-opus-5-5\n\n" + BODY)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-brain"}):
+            fake, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
+        self.assertEqual(outcome, "needs-brain")
+        self.assertIn("needs-brain", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
+        self.assertFalse(fake.sent("PATCH", "/issues/9"))
+
 
 
 def item(number, body=BODY, labels=(), **extra):

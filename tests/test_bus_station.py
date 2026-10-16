@@ -1952,6 +1952,48 @@ class AnswerTest(Base):
         self.finish({"PRRT_abcd1": "Fixes #12 already."})
         self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
 
+    def answered(self, answers, title="Settle the review findings left from PR #99"):
+        """A run with no pull request that the runner reported answered."""
+        body = BODY.replace("Model: model-x", "Model: claude-opus-5-5")
+        self.fake.add(12, title=title, state="answered", body=body)
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex"))
+        for tid, text in answers.items():
+            self.write(self.inbox("codex", "answers", name, tid + ".md"), text)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".answered"), "")
+        self.run_pass()
+        return name
+
+    def test_an_answered_runs_thread_answers_go_on_the_pull_request_the_ticket_names(self):
+        self.thread()
+        name = self.answered({"PRRT_abcd1": "The finding no longer holds: a.py:2 guards it."})
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd1"])
+        self.assertIn("> The finding no longer holds", self.fake.replies[0][1])
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+        # The runner already labelled and commented; no pull request is looked for.
+        self.assertIn("loom:answered", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+        self.assertFalse(any("/pulls?head=" in path for path in self.fake.paths("GET")))
+
+    def test_an_answered_line_the_agent_printed_in_the_log_is_not_an_answer(self):
+        self.fake.add(12, state="running")
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex"))
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                   "[2030-01-01T00:01:00Z] %s done, answered: nothing to change\n" % name)
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_an_answered_run_answers_no_thread_on_a_pull_request_it_does_not_name(self):
+        self.thread(pr=98)
+        name = self.answered({"PRRT_abcd1": "Does not apply."})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+
 
 class RefusalTest(Base):
     def refused(self, **kw):

@@ -107,6 +107,8 @@ fi
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
 # only edits it ($FAKE_AGENT=edit), makes no file change ($FAKE_AGENT=noop),
+# makes none but writes $FAKE_SUMMARY to the Intent summary and
+# $FAKE_THREAD_ANSWER as an answer to thread PRRT_9 ($FAKE_AGENT=no-change),
 # exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
 # $FAKE_EXIT, editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
 # The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
@@ -121,6 +123,15 @@ if [ "${FAKE_AGENT:-commit}" = say ]; then
   exit "${FAKE_EXIT:-1}"
 fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = no-change ]; then
+  mkdir -p .loom
+  [ -z "${FAKE_SUMMARY:-}" ] || printf '%s\\n' "$FAKE_SUMMARY" > .loom/summary.md
+  if [ -n "${FAKE_THREAD_ANSWER:-}" ]; then
+    mkdir -p .loom-answers
+    printf '%s\\n' "$FAKE_THREAD_ANSWER" > .loom-answers/PRRT_9.md
+  fi
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
   mkdir -p .loom
   printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
@@ -171,6 +182,7 @@ if [ "${FAKE_AGENT:-commit}" = binref ]; then
 fi
 printf '%s\\n' "${FAKE_AGENT_TEXT:-fixed}" > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = detached ]; then git checkout -q --detach HEAD; fi
 git add fix.txt
 git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
 """
@@ -575,8 +587,56 @@ class LaneRunnerTest(unittest.TestCase):
         result = self.run_lane(FAKE_AGENT="noop")
         self.assertEqual(result.returncode, 0, result.stderr)
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("agent made no commit", log)
+        # Tagged so the factory climbs the ladder at most once for it.
+        self.assertIn("failed: [work] agent made no commit and wrote no reason", log)
         self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_summary_that_is_not_a_no_change_reason_is_still_a_failure(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="no-change", FAKE_SUMMARY="Make the thing work")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("agent made no commit and wrote no reason", log)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
+
+    def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="no-change",
+                               FAKE_SUMMARY="nothing to change: the finding no longer holds")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("failed:", log)
+        self.assertIn("T042-fix-the-thing done, answered: nothing to change", log)
+        self.assertTrue((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
+        calls = self.calls()
+        comments = [c for c in calls if c.startswith("gh issue comment 42")]
+        self.assertEqual(len(comments), 1, calls)
+        self.assertIn("\n> nothing to change: the finding no longer holds\n", self.log.read_text())
+        self.assertTrue(any(c.startswith("gh issue edit 42") and "--add-label loom:answered" in c
+                            for c in calls), calls)
+        self.assertFalse(any(c.startswith("gh pr create") or c.startswith("git push") for c in calls))
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_thread_answers_of_an_answered_run_go_to_the_station(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="no-change",
+                               FAKE_THREAD_ANSWER="Does not apply: a.py:2 already guards it.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        kept = self.inbox / "answers" / "T042-fix-the-thing" / "PRRT_9.md"
+        self.assertEqual(kept.read_text(), "Does not apply: a.py:2 already guards it.\n")
+        self.assertIn("> On review thread PRRT_9:\n> Does not apply: a.py:2 already guards it.\n",
+                      self.log.read_text())
+
+    def test_thread_answers_of_a_run_that_opens_a_pull_request_are_not_kept(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_SECRET_FILE=str(self.log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertFalse((self.inbox / "answers" / "T042-fix-the-thing").exists())
+        self.assertNotIn(".loom-answers/PRRT_1.md", self.pushed_files())
 
     def test_a_body_the_runner_wrote_is_current_to_the_pr_repair_helper(self):
         # The body comes from run_lane.sh::pr_body, not from pr_repair's own
@@ -602,6 +662,34 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("fix.txt", files)
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agent_owned_commit_is_validated_and_pushed_without_touching_main(self):
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_AGENT="detached")
+        if "sandbox_apply: Operation not permitted" in self.lane_log():
+            self.skipTest("the host blocks sandbox-exec validation")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Validation: check exited 0", self.body.read_text())
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        pushed = subprocess.run(["git", "--git-dir", str(self.remote), "show-ref", "--heads"],
+                                capture_output=True, text=True, check=True).stdout
+        heads = dict(line.split(" ", 1)[::-1] for line in pushed.splitlines())
+        self.assertIn("refs/heads/loom/T042-fix-the-thing", heads, pushed)
+        self.assertNotEqual(heads["refs/heads/loom/T042-fix-the-thing"], heads["refs/heads/main"])
+
+    def test_runner_commit_failure_is_transient(self):
+        real_git = shutil.which("git")
+        wrapper = self.bin / "git"
+        wrapper.write_text("#!/bin/sh\ncase \" $* \" in *commit*) echo runner-commit-failed >&2; exit 1;; esac\n"
+                          f"exec {shlex.quote(real_git)} \"$@\"\n")
+        wrapper.chmod(0o755)
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="edit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.run_log()
+        self.assertIn("failed: [transient] could not commit the agent's changes", log)
+        self.assertNotIn("failed: [work] could not commit the agent's changes", log)
 
     def test_a_repo_without_the_class_labels_still_gets_its_pr(self):
         # gh pr create fails outright on a label the repo lacks; the label is
@@ -1748,6 +1836,29 @@ cat > /dev/null
     def test_agy_lane_refuses_a_model_outside_its_catalog(self):
         inbox, _, _, agy = self.agy_lane(model="openrouter/vendor/model:free")
         self.assertEqual(agy, [])
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_agy_lane_adds_default_effort_to_a_bare_claude_model(self):
+        _, _, result, agy = self.agy_lane(model="claude-sonnet-5-5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("--model claude-sonnet-5-5-high", agy[0])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_agy_lane_uses_its_configured_effort_for_a_bare_model(self):
+        _, _, result, agy = self.agy_lane(model="claude-sonnet-5-5", LOOM_AGY_EFFORT="medium")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, self.calls())
+        self.assertIn("--model claude-sonnet-5-5-medium", agy[0])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
+    def test_agy_lane_refuses_unknown_model_as_transient_before_agent_run(self):
+        inbox, _, result, agy = self.agy_lane(model="gpt-6-sol")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(agy, [])
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [transient] model gpt-6-sol is not in the agy catalog", log)
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
