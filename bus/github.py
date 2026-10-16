@@ -21,6 +21,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import proof
+
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
 # A read that failed on the wire is tried again after these pauses (seconds).
@@ -29,6 +31,15 @@ RETRY_STATUSES = (502, 503, 504)
 
 Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
                      Tuple[int, Dict[str, str], bytes]]
+
+# A PATCH to one of these that sets state=closed is an issue close; every
+# programmatic close in the factory funnels through GitHub.rest, so this is
+# the choke point the close-completeness gate watches.
+_ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/[0-9]+$")
+
+# Labels that let an issue close as completed with unchecked boxes, mirroring
+# the close-completeness guard's escape hatches.
+_FORCE_CLOSE_LABELS = ("force-close", "wontfix")
 
 
 class GitHubError(Exception):
@@ -155,6 +166,7 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
         # the cache does, when there is one.
@@ -169,6 +181,41 @@ class GitHub:
         if method == "GET" and not etag:
             self._keep_answer(url, status, data, resp_headers)
         return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
+        """Refuse a PATCH that would close an issue as completed while its
+        acceptance criteria are unchecked.
+
+        The brain's close() already refuses this, but a close that bypasses it
+        -- the conducted#209 close five seconds after its PR merged is the
+        shape -- used to land anyway and get reopened by the close-completeness
+        guard seconds later. Every programmatic close passes through rest(),
+        so refusing here makes the bad close impossible instead of merely
+        caught. Closes as not_planned, force-close/wontfix labels, pull
+        requests, and issues with no criteria at all are left alone, matching
+        the guard's own escape hatches.
+        """
+        if method != "PATCH" or not _ISSUE_PATH.match(path):
+            return
+        if not isinstance(body, dict) or body.get("state") != "closed":
+            return
+        if body.get("state_reason", "completed") != "completed":
+            return
+        # Re-entering rest() for the verification GET is safe: the
+        # method != "PATCH" check above stops any recursion.
+        issue = self.rest("GET", path).data or {}
+        if "pull_request" in issue:
+            return
+        labels = [str(label.get("name") or "").lower()
+                  for label in issue.get("labels") or []]
+        if any(name in labels for name in _FORCE_CLOSE_LABELS):
+            return
+        unchecked = [text for checked, text in
+                     proof.criteria(str(issue.get("body") or "")) if not checked]
+        if unchecked:
+            raise ValueError(
+                "refusing to close %s as completed with unchecked acceptance "
+                "criterion: %s" % (path, unchecked[0]))
 
     def _request(self, body: Any,
                  if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
