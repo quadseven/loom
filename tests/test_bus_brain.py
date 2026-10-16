@@ -94,6 +94,15 @@ class BrainTests(unittest.TestCase):
             self.assertFalse(any(method in ("PATCH", "POST", "PUT", "DELETE")
                                  for method, _, _ in fake.calls))
 
+    def test_prioritize_without_trusted_authors_names_the_setting(self):
+        # A remote brain without LOOM_BRIEF_AUTHORS saw only "not a trusted
+        # login" and could not tell what to fix.
+        fake = Fake(reply(200, {"state": "open", "body": "", "labels": [{"name": "loom:ticket"}],
+                                "user": {"login": "trusted"}}))
+        with self.assertRaisesRegex(ValueError, "LOOM_BRIEF_AUTHORS is empty"):
+            brain.prioritize(GitHub("t", transport=fake), REPO, 8, "P1", env={})
+        self.assertFalse(any(m in ("PATCH", "POST") for m, _, _ in fake.calls))
+
     def test_prioritize_note_is_posted_after_body_update(self):
         fake = Fake(reply(200, {"state": "open", "body": "## Why\nx",
                                 "labels": [{"name": "loom:ticket"}],

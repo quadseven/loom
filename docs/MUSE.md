@@ -2,8 +2,11 @@
 
 At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
-Run every command from that checkout. Set `LOOM_GITHUB_TOKEN` and
-`LOOM_REPOS` (space separated `OWNER/NAME` values). Use `muse` as your lock
+Run every command from that checkout. Set `LOOM_GITHUB_TOKEN`,
+`LOOM_REPOS` (space separated `OWNER/NAME` values) and `LOOM_BRIEF_AUTHORS`
+(the login or logins that brief tickets and post proofs, the same value the
+station uses). Without it `prioritize`, `close`, verified moves and merges
+refuse every ticket as untrusted. Use `muse` as your lock
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
