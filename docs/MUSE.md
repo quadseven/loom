@@ -216,7 +216,10 @@ live regression) and `brief` (a brief named but not written this tick).
 - Done: for each stage action you finish (a merge, a re-brief or close of a
   failed ticket, an answered ask, an admitted regression, a written brief), put the line
   from `python3 -m bus.brain done OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
-  in your journal.
+  in your journal. A written brief records its own done marker: `brief
+  --holder HOLDER` on a goal whose brief stage stands deferred posts a
+  journal on the goal home with the `stage=brief` done line and the new
+  ticket, so you do not paste that line. A refused brief records nothing.
 - The newest marker for an item wins, and `resume` drops a defer whose
   item was closed or changed since (new commits, new comments, another
   state), so no brain repeats finished work. `status` shows, per goal and
@@ -354,7 +357,7 @@ this tick"; a step with no note shows nothing there.
    work not merged yet (`brief --after '#5, owner/name#7'` writes the line,
    and the station holds the ticket until each of them is merged),
    regressions first, with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
+   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --holder muse`.
    Give each brief `--priority P0` to `P3` by how much it costs the goal
    while it stays unfixed (without it the ticket is P2); the station and the
    factory take P0 first. Read the Priorities and Health findings sections

@@ -1073,7 +1073,8 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           model: Optional[str] = None, base: Optional[str] = None,
           not_before: Optional[str] = None, refs: Optional[int] = None,
           regresses: Optional[int] = None, after: Optional[str] = None,
-          priority: Optional[str] = None) -> str:
+          priority: Optional[str] = None, holder: Optional[str] = None,
+          env: Optional[Dict[str, str]] = None) -> str:
     """File a ticket under the goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Rewritten from issue M." in words, and the
     original gets a comment naming the ticket and loom:rewritten in place of
@@ -1098,6 +1099,10 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
 
     With priority (P0 to P3), the ticket carries a "Priority:" line; lanes
     take P0 first and a ticket without one counts as P2.
+
+    With holder, a brief filed while the goal's brief stage stands deferred
+    records its own done marker: a journal on the goal home with the line
+    from handoff.done_marker, so resume stops listing the finished brief.
 
     When the goal home names a Trunk branch and no explicit --base is given,
     the ticket uses that branch as its base."""
@@ -1126,6 +1131,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue)
     _check_goal_capacity(gh, repo, goal, goal_issue)
+    done = _brief_done_due(gh, repo, goal, holder, env)
     issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
@@ -1134,7 +1140,36 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         _remove_label(gh, repo, refs, "loom:triage")
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
-    return str(issue.get("html_url", ""))
+    url = str(issue.get("html_url", ""))
+    if done:
+        _journal_brief_done(gh, repo, goal, str(holder), done, url)
+    return url
+
+
+def _brief_done_due(gh: GitHub, repo: str, goal: int, holder: Optional[str],
+                    env: Optional[Dict[str, str]]) -> Optional[str]:
+    """The brief done line for the goal when its brief stage stands deferred
+    on the goal home (the newest brief marker for it is a defer), else None.
+    Read before the ticket is filed, so a refused brief records nothing."""
+    if holder is None:
+        return None
+    line = handoff.done_marker("brief", (repo, goal), holder)
+    found = _goal_home_journals(gh, repo, goal, trusted_authors(env))
+    standing = handoff.resume_items(handoff.marks(found))
+    return line if any(m.stage == "brief" and m.item == (repo, goal) for m in standing) else None
+
+
+def _journal_brief_done(gh: GitHub, repo: str, goal: int, holder: str, line: str,
+                        url: str) -> None:
+    """Post the brief's done line in a journal on the goal home. The ticket is
+    filed by then, so a failed post says which one and the line to journal."""
+    body = "\n".join([JOURNAL_MARKER, "Tick %s, %s" % (_iso(datetime.now(timezone.utc)), holder),
+                      "- Briefed: %s" % url, line])
+    try:
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, goal), {"body": body})
+    except GitHubError as exc:
+        raise GitHubError("filed %s, but its brief done marker was not posted (%s); put this "
+                          "line in your journal: %s" % (url, exc, line), exc.status, exc.body) from exc
 
 
 def _open_issue(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
@@ -2351,11 +2386,18 @@ def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
         for issue in _issues(gh, repo):
             if "loom:goal" not in _labels(issue):
                 continue
-            comments = gh.paginate("/repos/%s/issues/%s/comments" % (repo, issue["number"]))
-            goals.append((repo, issue, handoff.journals(
-                [{"body": c.get("body"), "at": c.get("created_at"),
-                  "login": (c.get("user") or {}).get("login")} for c in comments], authors)))
+            goals.append((repo, issue, _goal_home_journals(gh, repo, int(issue["number"]),
+                                                           authors)))
     return goals
+
+
+def _goal_home_journals(gh: GitHub, repo: str, number: int,
+                        authors: Sequence[str]) -> List[Dict[str, Any]]:
+    """The journals on one goal home from `authors`, oldest first."""
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    return handoff.journals(
+        [{"body": c.get("body"), "at": c.get("created_at"),
+          "login": (c.get("user") or {}).get("login")} for c in comments], authors)
 
 
 def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
@@ -2806,7 +2848,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES)
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder")
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
@@ -2847,7 +2889,7 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
-                args.regresses, args.after, args.priority))
+                args.regresses, args.after, args.priority, args.holder))
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:

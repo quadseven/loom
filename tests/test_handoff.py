@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, handoff
-from bus.github import GitHub
+from bus.github import GitHub, GitHubError
 
 REPO = "example-owner/example-repo"
 LOCK_REPO = "example-owner/loom"
@@ -108,10 +108,13 @@ class Routes:
     def __init__(self, routes):
         self.routes = routes
         self.calls = []
+        self.posted = []
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com", 1)[-1].split("?")[0]
         self.calls.append((method, path))
+        if method == "POST":
+            self.posted.append((path, json.loads(body) if body else None))
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
         if (method, path) not in self.routes:
@@ -280,6 +283,103 @@ class ResumeCommandTests(unittest.TestCase):
         routes = self.routes()
         with self.assertRaises(ValueError):
             brain.defer(GitHub("t", transport=Routes(routes)), "brief", (REPO, 1), "muse")
+
+
+BRIEF = ("## Why\nwhy: the page query is slow for every visitor.\n## What\nwhat\n"
+         "## Acceptance criteria\n- [ ] done\n- [ ] tested\n- [ ] live\n## Size\nS\n"
+         "## Out of scope\n- none")
+BRIEF_DEFER = handoff.defer_marker("brief", (REPO, 1), "open", "muse", note="party-trip fix")
+ENV = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
+
+
+class BriefDoneTests(unittest.TestCase):
+    """A brief filed under a goal whose brief stage stands deferred records
+    the done marker itself, so resume stops listing the finished brief."""
+
+    def routes(self, *journals, ticket=(201, {"id": 212, "number": 12,
+                                               "html_url": "https://example.com/12"})):
+        routes = ResumeCommandTests.routes(self)
+        routes.update({
+            ("GET", "/repos/%s/issues/1/comments" % REPO): (200, [comment(j) for j in journals]),
+            ("GET", "/repos/%s/issues/1/sub_issues" % REPO): (200, []),
+            ("POST", "/repos/%s/issues" % REPO): ticket,
+            ("POST", "/repos/%s/issues/1/sub_issues" % REPO): (201, {}),
+            ("POST", "/repos/%s/issues/1/comments" % REPO): (201, {}),
+        })
+        return routes
+
+    def journals_posted(self, fake):
+        return [body["body"] for path, body in fake.posted
+                if path == "/repos/%s/issues/1/comments" % REPO]
+
+    def test_a_brief_under_a_standing_brief_defer_retires_it_in_resume(self):
+        routes = self.routes(journal(10, "muse", BRIEF_DEFER))
+        fake = Routes(routes)
+        url = brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF,
+                          holder="lane-machine", env=ENV)
+        self.assertEqual("https://example.com/12", url)
+        [posted] = self.journals_posted(fake)
+        self.assertTrue(posted.startswith(handoff.JOURNAL_MARKER))
+        self.assertIn(handoff.done_marker("brief", (REPO, 1), "lane-machine"), posted)
+        self.assertIn("https://example.com/12", posted)
+        self.assertEqual("lane-machine", handoff.journal_holder({"body": posted}))
+
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(10, "muse", BRIEF_DEFER)),
+            comment({"body": posted, "at": at(0), "login": "allowed-bot"})])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW, ENV)
+        self.assertNotIn("- resume brief", out)
+        self.assertIn("- stage brief: held by lane-machine; last done %s#1" % REPO, out)
+
+    def test_a_brief_with_no_standing_brief_defer_posts_no_journal(self):
+        cases = {
+            "no markers": [journal(10, "muse")],
+            "defer already done": [journal(20, "muse", BRIEF_DEFER),
+                                   journal(10, "muse", done((REPO, 1), "muse", "brief"))],
+            "defer from an untrusted login": [journal(10, "muse", BRIEF_DEFER, login="stranger")],
+            "defer of another goal": [journal(10, "muse", handoff.defer_marker(
+                "brief", (REPO, 2), "open", "muse", note="other"))],
+        }
+        for name, journals in cases.items():
+            with self.subTest(name):
+                fake = Routes(self.routes(*journals))
+                brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF,
+                            holder="lane-machine", env=ENV)
+                self.assertEqual([], self.journals_posted(fake))
+                self.assertIn(("POST", "/repos/%s/issues" % REPO), fake.calls)
+        # Without a holder the brief reads no journals and writes none, as before.
+        fake = Routes(self.routes(journal(10, "muse", BRIEF_DEFER)))
+        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF, env=ENV)
+        self.assertEqual([], self.journals_posted(fake))
+        self.assertNotIn(("GET", "/repos/%s/issues/1/comments" % REPO), fake.calls)
+
+    def test_a_refused_brief_records_no_done_marker(self):
+        cases = {
+            "missing sections": dict(body="## Why\nmissing"),
+            "bad title": dict(title="Ticket\nRepo: evil/repo"),
+            "bad holder": dict(holder="muse -->"),
+            "GitHub error": dict(ticket=(422, {"message": "Validation Failed"})),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                fake = Routes(self.routes(journal(10, "muse", BRIEF_DEFER),
+                                          **{k: v for k, v in case.items() if k == "ticket"}))
+                with self.assertRaises((ValueError, GitHubError)):
+                    brain.brief(GitHub("t", transport=fake), REPO, 1,
+                                case.get("title", "Ticket"), case.get("body", BRIEF),
+                                holder=case.get("holder", "lane-machine"), env=ENV)
+                self.assertEqual([], self.journals_posted(fake))
+
+    def test_a_failed_done_post_names_the_ticket_and_the_line_to_journal(self):
+        routes = self.routes(journal(10, "muse", BRIEF_DEFER))
+        routes[("POST", "/repos/%s/issues/1/comments" % REPO)] = (502, {"message": "Bad Gateway"})
+        with self.assertRaises(GitHubError) as caught:
+            brain.brief(GitHub("t", transport=Routes(routes)), REPO, 1, "Ticket", BRIEF,
+                        holder="lane-machine", env=ENV)
+        self.assertIn("https://example.com/12", str(caught.exception))
+        self.assertIn(handoff.done_marker("brief", (REPO, 1), "lane-machine"),
+                      str(caught.exception))
 
 
 if __name__ == "__main__":

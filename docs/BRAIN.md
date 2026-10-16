@@ -749,9 +749,15 @@ work), each an HTML comment:
 
 `python3 -m bus.brain defer` and `done` print them; the revision is the item
 when deferred (a pull request's head commit, an issue's state and comment
-count). Only journals from `LOOM_BRIEF_AUTHORS` logins count. For each stage
-and item the newest line wins; `python3 -m bus.brain resume OWNER/NAME...
---holder NAME` lists the defers still standing whose item is open and
+count). A written brief records its own done marker: `python3 -m bus.brain
+brief OWNER/NAME --goal N ... --holder NAME`, after it files the ticket on a
+goal whose newest brief marker is a defer, posts a journal on that goal home
+with the `stage=brief` done line and the new ticket. A brief without
+`--holder`, on a goal with no standing brief defer, or refused, posts no
+journal and changes no marker; so does a `--regresses` brief, which is
+the `regression` stage. Only journals from `LOOM_BRIEF_AUTHORS` logins
+count. For each stage and item the newest line wins; `python3 -m bus.brain
+resume OWNER/NAME... --holder NAME` lists the defers still standing whose item is open and
 unchanged, and refuses unless that holder holds the tick lock.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
