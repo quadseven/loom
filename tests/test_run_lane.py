@@ -107,6 +107,8 @@ fi
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
 # only edits it ($FAKE_AGENT=edit), makes no file change ($FAKE_AGENT=noop),
+# makes none but writes $FAKE_SUMMARY to the Intent summary and
+# $FAKE_THREAD_ANSWER as an answer to thread PRRT_9 ($FAKE_AGENT=no-change),
 # exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
 # $FAKE_EXIT, editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
 # The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
@@ -121,6 +123,15 @@ if [ "${FAKE_AGENT:-commit}" = say ]; then
   exit "${FAKE_EXIT:-1}"
 fi
 if [ "${FAKE_AGENT:-commit}" = noop ]; then exit 0; fi
+if [ "${FAKE_AGENT:-commit}" = no-change ]; then
+  mkdir -p .loom
+  [ -z "${FAKE_SUMMARY:-}" ] || printf '%s\\n' "$FAKE_SUMMARY" > .loom/summary.md
+  if [ -n "${FAKE_THREAD_ANSWER:-}" ]; then
+    mkdir -p .loom-answers
+    printf '%s\\n' "$FAKE_THREAD_ANSWER" > .loom-answers/PRRT_9.md
+  fi
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
   mkdir -p .loom
   printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
@@ -576,8 +587,56 @@ class LaneRunnerTest(unittest.TestCase):
         result = self.run_lane(FAKE_AGENT="noop")
         self.assertEqual(result.returncode, 0, result.stderr)
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("agent made no commit", log)
+        # Tagged so the factory climbs the ladder at most once for it.
+        self.assertIn("failed: [work] agent made no commit and wrote no reason", log)
         self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_summary_that_is_not_a_no_change_reason_is_still_a_failure(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="no-change", FAKE_SUMMARY="Make the thing work")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("agent made no commit and wrote no reason", log)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
+
+    def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="no-change",
+                               FAKE_SUMMARY="nothing to change: the finding no longer holds")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("failed:", log)
+        self.assertIn("T042-fix-the-thing done, answered: nothing to change", log)
+        self.assertTrue((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
+        calls = self.calls()
+        comments = [c for c in calls if c.startswith("gh issue comment 42")]
+        self.assertEqual(len(comments), 1, calls)
+        self.assertIn("\n> nothing to change: the finding no longer holds\n", self.log.read_text())
+        self.assertTrue(any(c.startswith("gh issue edit 42") and "--add-label loom:answered" in c
+                            for c in calls), calls)
+        self.assertFalse(any(c.startswith("gh pr create") or c.startswith("git push") for c in calls))
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_thread_answers_of_an_answered_run_go_to_the_station(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="no-change",
+                               FAKE_THREAD_ANSWER="Does not apply: a.py:2 already guards it.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        kept = self.inbox / "answers" / "T042-fix-the-thing" / "PRRT_9.md"
+        self.assertEqual(kept.read_text(), "Does not apply: a.py:2 already guards it.\n")
+        self.assertIn("> On review thread PRRT_9:\n> Does not apply: a.py:2 already guards it.\n",
+                      self.log.read_text())
+
+    def test_thread_answers_of_a_run_that_opens_a_pull_request_are_not_kept(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="answer", FAKE_SECRET_FILE=str(self.log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        self.assertFalse((self.inbox / "answers" / "T042-fix-the-thing").exists())
+        self.assertNotIn(".loom-answers/PRRT_1.md", self.pushed_files())
 
     def test_a_body_the_runner_wrote_is_current_to_the_pr_repair_helper(self):
         # The body comes from run_lane.sh::pr_body, not from pr_repair's own

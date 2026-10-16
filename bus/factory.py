@@ -65,7 +65,11 @@ Neither needs a model:
   2026-10-13 were the bot's own "Fixed in" threads).
 - A round where the lane made no change and explained why waits for the
   review it asked for, up to REVIEW_GRACE, before the round is judged.
-- A failed ticket climbs the ladder. A ticket left briefed for BRIEFED_STALL
+- A failed ticket climbs the ladder, but only once for a run that committed
+  nothing and wrote no reason (lanes/run_lane.sh NO_REASON): at the second
+  such failure it is left failed with needs-brain for the brain, since a
+  stronger model made no commit either for five tickets on 2026-10-13.
+  A ticket left briefed for BRIEFED_STALL
   with no lane claiming it does not: it never ran, so it moves to the
   least-loaded other lane of its tier (a ladder ticket, of its rung), writing
   no rung marker.
@@ -191,6 +195,10 @@ CLAIM_RE = re.compile(r"^Claimed for lane ")
 STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+# bus/station.py's note on a failed run, and the runner's reason when a run
+# committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
+FAILED_RE = re.compile(r"^Lane \S+ failed: ")
+NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
                  ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved path'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
@@ -433,6 +441,22 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
             else:
                 pending = pending | {rung}
     return tried
+
+
+def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
+    """Did the ticket's newest failure commit nothing and give no reason, as
+    an earlier one did since its ladder last started (the newest rung 0
+    marker)? The ladder already climbed for that reason once, and a stronger
+    model did not help: five tickets climbed 4 to 6 times on it on
+    2026-10-13."""
+    seen: List[bool] = []
+    for c in comments:
+        body = str(c.get("body") or "")
+        if any(m.group(1) == "0" for m in RUNG_RE.finditer(body)):
+            seen = []
+        if FAILED_RE.match(body):
+            seen.append(NO_REASON in body)
+    return bool(seen) and seen[-1] and sum(seen) >= 2
 
 
 def current_rung(issue: Dict[str, Any]) -> int:
@@ -1171,6 +1195,9 @@ class Factory:
                prs: Dict[int, Dict[str, Any]]) -> None:
         number = int(issue["number"])
         comments = self._comments(repo, number)
+        if repeated_no_reason(comments):
+            self._hold_no_reason(repo, issue)
+            return
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue))
         if lane is None:
             return  # left for the brain; _give_up said so once
@@ -1184,6 +1211,26 @@ class Factory:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))
+
+    def _hold_no_reason(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Leave a ticket failed for the brain instead of climbing a second
+        time for a run that committed nothing and said nothing, once
+        (needs-brain says it was reported)."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        number = int(issue["number"])
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+            "Lane %s made no commit and wrote no reason, as a run on this ticket did "
+            "before. The factory climbed the model ladder once for that and does not "
+            "climb a second time for the same reason: the brain reads the run logs and "
+            "rewrites the brief, closes the ticket, or escalates it once more with its "
+            "reason." % _lane(issue)})
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names + ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d failed again with no commit and no reason; left for the brain"
+             % (repo, number))
 
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):

@@ -45,9 +45,9 @@ that talks to GitHub about tickets.
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
-| `loom:answered` | The runner posted a diagnosis answer; the brain reviews it, then closes/verifies the ticket or briefs it again. |
+| `loom:answered` | The runner posted a diagnosis answer, or a run's reason that its work is already done or no longer applies; the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
-| `needs-brain` | The automatic fix round limit was reached; review this ticket in full. |
+| `needs-brain` | The automatic fix round limit was reached, or a ticket failed a second time with no commit and no reason; review this ticket in full. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
@@ -435,8 +435,24 @@ When the runner finishes, the station finds the brief in `done/` or
 - Done: for code work, label `loom:pr` and comment with the pull request link;
   for `Deliverable: answer`, keep `loom:answered` and the runner's answer
   comment for the brain to review.
+- Answered: a run that committed nothing, whose agent said in
+  `.loom/summary.md` that the work is already done or no longer applies
+  ("nothing to change", "no longer holds", "already fixed", ...) or answered
+  a thread in `.loom-answers/`, is an answer, not a failure. The runner posts
+  that reason on the ticket and labels it `loom:answered`; the station posts
+  each thread answer on the pull request the ticket names (as a settle
+  findings ticket names the pull request its findings were left on),
+  resolving it by the fix round rules. The brain reviews it like any answer:
+  a settle findings ticket whose threads are all answered or resolved is
+  verified with that note as its evidence, or closed as not planned when no
+  pull request is left.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
+  A run that committed nothing and gave no reason fails with `agent made no
+  commit and wrote no reason`. The factory climbs the model ladder once for
+  it; at the second such failure since the ladder last started it does not
+  climb again but leaves the ticket failed with `needs-brain` and one
+  comment saying why.
 - Limited (a reason starting `limit:` after its class, the spark lane's
   guard refusing work for a while): not a failure, and not one of the
   automatic retries below. Label `loom:briefed` again (`loom:pr` for a fix
