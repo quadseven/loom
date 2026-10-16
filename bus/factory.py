@@ -476,10 +476,16 @@ def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str,
     return [(a[0], a[1], a[2], a[3]) for a in found]
 
 
+def _cell(text: str) -> str:
+    """A reason as one table cell: its first line, with pipes escaped."""
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    return first.replace("|", "\\|") or "-"
+
+
 def runaway_comment(trigger: str, rows: Sequence[Tuple[int, str, str, str]], model: str) -> str:
     """The comment a flagged ticket carries: why, and its attempt table."""
     lines = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
-    lines += ["| %s | %s | %s | %s |" % (stamp, lane, model, reason or "-")
+    lines += ["| %s | %s | %s | %s |" % (stamp, lane, model, _cell(reason))
               for _, stamp, lane, reason in rows]
     return "\n".join(lines)
 

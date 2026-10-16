@@ -2099,7 +2099,9 @@ class Station:
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        authors = {author.lower() for author in self.s.authors}
+        comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                    if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         attempts = factory.attempts(comments, reason)
         failures = [a[3] for a in attempts[:-1] if a[3]]
         reason_repeat = bool(failures) and failures[-1] == reason
