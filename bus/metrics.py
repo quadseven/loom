@@ -139,6 +139,44 @@ class Number:
             "PASS" if self.passed else "FAIL", self.name, self.value, self.target)
 
 
+class RefList(list):
+    """A list of reference strings that also compares equal to its length as an integer."""
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, int):
+            return len(self) == other
+        return super().__eq__(other)
+
+    def __int__(self) -> int:
+        return len(self)
+
+    def __add__(self, other: Any) -> Any:
+        if isinstance(other, int):
+            return len(self) + other
+        return super().__add__(other)
+
+    def __radd__(self, other: Any) -> Any:
+        if isinstance(other, int):
+            return other + len(self)
+        return super().__radd__(other)
+
+
+def _items(value: Any) -> tuple[int, List[str]]:
+    if isinstance(value, int):
+        return value, []
+    if isinstance(value, (list, tuple, set)):
+        return len(value), list(value)
+    return 0, []
+
+
+def _format_refs(refs: Sequence[str]) -> str:
+    if not refs:
+        return ""
+    if len(refs) <= 5:
+        return ": " + ", ".join(refs)
+    return ": " + ", ".join(refs[:5]) + " and %d more" % (len(refs) - 5)
+
+
 @dataclass
 class Totals:
     pull_old: int = 0
@@ -149,9 +187,9 @@ class Totals:
     verified_lane: int = 0
     verified_brain: int = 0
     asks: int = 0
-    regressions: int = 0
-    unchecked: int = 0
-    fix_no_test: int = 0
+    regressions: Any = field(default_factory=RefList)
+    unchecked: Any = field(default_factory=RefList)
+    fix_no_test: Any = field(default_factory=RefList)
     faults: int = 0
     goals: int = 0
     merge_times: List[float] = field(default_factory=list)
@@ -407,7 +445,10 @@ class Collector:
             total.asks += 1
         if ("loom:urgent" in labels and issue.get("state") == "open"
                 and self._urgent_regression(repo, issue, created)):
-            total.regressions += 1
+            if isinstance(total.regressions, list):
+                total.regressions.append("%s#%d" % (repo, int(issue["number"])))
+            else:
+                total.regressions += 1
         if "loom:ticket" in labels:
             self._ticket(repo, issue, labels, total)
 
@@ -422,8 +463,12 @@ class Collector:
 
     def _merged_pull(self, repo: str, pr: Dict[str, Any], total: Totals) -> None:
         sha = str((pr.get("head") or {}).get("sha") or "")
+        ref = "%s#%d" % (repo, int(pr["number"]))
         if not sha or not self.passes(repo, sha):
-            total.unchecked += 1
+            if isinstance(total.unchecked, list):
+                total.unchecked.append(ref)
+            else:
+                total.unchecked += 1
         if FIX.search(str(pr.get("body") or "")):
             # The factory's own rule (factory.lacks_test): a fix that changes
             # code needs a test; a config, doc or digest-pin change needs none.
@@ -432,7 +477,10 @@ class Collector:
             files = self.list("/repos/%s/pulls/%d/files" % (repo, int(pr["number"])))
             if lacks_test([str(f.get("filename") or "") for f in files
                            if f.get("status") != "removed"]):
-                total.fix_no_test += 1
+                if isinstance(total.fix_no_test, list):
+                    total.fix_no_test.append(ref)
+                else:
+                    total.fix_no_test += 1
 
     def _scan(self, total: Totals) -> None:
         for repo in self.repos:
@@ -494,16 +542,30 @@ def spread_number(runs: Dict[str, int], idle: int, samples: int, verify: int = 0
 
 
 def escalation_number(failures: Dict[str, Dict[str, int]], left_out: int = 0) -> Number:
+    offenders = [
+        "%s %s" % (ticket, model)
+        for ticket, models in failures.items()
+        for model, count in models.items()
+        if count >= 2
+    ]
     repeat = sum(any(n >= 2 for n in models.values()) for models in failures.values())
-    return Number("Escalation", "%d tickets failed twice on one model doing the work; "
-                  "%d failures left out as limit or transient" % (repeat, left_out),
+    refs = _format_refs(offenders)
+    return Number("Escalation", "%d tickets failed twice on one model doing the work%s; "
+                  "%d failures left out as limit or transient" % (repeat, refs, left_out),
                   "0", repeat == 0)
 
 
 def quality_number(total: Totals) -> Number:
-    return Number("Quality", "%d unfixed regressions >2h; %d unreviewed merges; %d fix PRs without tests" %
-                  (total.regressions, total.unchecked, total.fix_no_test), "0; 0; 0",
-                  total.regressions == total.unchecked == total.fix_no_test == 0)
+    n_reg, reg_refs = _items(total.regressions)
+    n_unc, unc_refs = _items(total.unchecked)
+    n_fix, fix_refs = _items(total.fix_no_test)
+    parts = [
+        "%d unfixed regressions >2h%s" % (n_reg, _format_refs(reg_refs)),
+        "%d unreviewed merges%s" % (n_unc, _format_refs(unc_refs)),
+        "%d fix PRs without tests%s" % (n_fix, _format_refs(fix_refs)),
+    ]
+    return Number("Quality", "; ".join(parts), "0; 0; 0",
+                  n_reg == 0 and n_unc == 0 and n_fix == 0)
 
 
 def autonomy_number(total: Totals) -> Number:
