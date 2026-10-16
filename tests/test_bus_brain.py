@@ -327,6 +327,22 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("- #4 Sensitive - blocked: review check has not passed on the head commit",
                       report)
 
+    def test_status_lists_a_docs_pr_with_a_neutral_review_as_ready(self):
+        pr = {"number": 4, "title": "Docs", "head": {"ref": "loom/4-work", "sha": "head1"},
+              "labels": [{"name": "class:docs"}]}
+        fake = Fake(reply(200, []), reply(200, [pr]),
+                    reply(200, {"data": {"repository": {"p4": ready_node()}}}),
+                    reply(200, []))
+
+        def transport(method, url, headers, body):
+            if "/check-runs?" in url:
+                return reply(200, {"check_runs": [
+                    {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]})
+            return fake(method, url, headers, body)
+
+        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={})
+        self.assertIn("- #4 Docs - READY", report)
+
     def test_status_pull_request_lines_with_and_without_pending_brain_fix(self):
         pr = {"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}
         authors = ["alice-example"]
@@ -1127,6 +1143,15 @@ class SensitiveResumeTests(unittest.TestCase):
                              adopt=True, env=self.TRUSTED)
         self.assertTrue(result["merged"])
         self.assertEqual(fake.calls[3][2]["sha"], "head1")
+
+    def test_adopt_reads_a_valid_review_after_a_null_check_run(self):
+        runs = [None, {"name": "Grug - Elder", "status": "completed",
+                       "conclusion": "neutral"}]
+        fake = Fake(*self._merge_replies_for_adopt({
+            "pr": {"labels": [{"name": "class:docs"}]}, "runs": runs}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8,
+                             adopt=True, env=self.TRUSTED)
+        self.assertTrue(result["merged"])
 
     def test_adopt_merges_a_tests_pr_with_a_neutral_review_on_its_head(self):
         runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]

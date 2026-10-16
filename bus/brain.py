@@ -1803,7 +1803,7 @@ def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str,
             runs = data["check_runs"]
             for run in runs:
                 if not isinstance(run, dict):
-                    return False
+                    continue
                 if run.get("name") == check:
                     conclusions = ("success", "neutral") if allow_neutral else ("success",)
                     return (run.get("status") == "completed"
