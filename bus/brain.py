@@ -1417,6 +1417,11 @@ def _prioritize_body(issue: Dict[str, Any], priority: str,
     if "loom:ticket" not in _labels(issue):
         raise ValueError("only a loom:ticket can be prioritized")
     authors = {author.lower() for author in trusted_authors(env)}
+    if not authors:
+        # A brain without the setting refused every ticket as untrusted and
+        # could not tell why (a remote brain, 2026-10-16).
+        raise ValueError("LOOM_BRIEF_AUTHORS is empty: set it to the login(s) that brief "
+                         "tickets (docs/MUSE.md)")
     login = str((issue.get("user") or {}).get("login") or "").lower()
     if not login or login not in authors:
         raise ValueError("ticket author is not a trusted login")
