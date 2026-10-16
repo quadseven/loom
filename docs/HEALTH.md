@@ -94,6 +94,14 @@ Per finding, on each read:
   band, the ticket's `Priority:` line moves with it (a priority the brain
   set by hand stands until the band changes). When the numbers or the
   evidence change, it posts them, at most once every 6 hours.
+- An open ticket carries it, the ticket is shipped or verified, and the
+  finding is still reported 24 hours after `loom:shipped` was applied: the
+  fix did not work. The station re-briefs that ticket as a regression
+  through `bus.brain brief --regresses`, with the line "Regresses #N", the
+  hours since the ship, the numbers and the quoted finding. The ticket goes
+  back to the queue with `loom:regression`, inside the goal's regression
+  slot rules, at most once per ticket every 48 hours. A ticket still in a
+  build state (queued to merged) gets only the updates above.
 - The finding is gone and its ticket is open: one comment, "finding absent
   since <time>". That is the evidence the brain verifies against. The
   station never closes a ticket.

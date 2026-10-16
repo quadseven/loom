@@ -9,7 +9,11 @@ station reads each endpoint and, per finding:
 - on the open ticket, moves the Priority line when the band changes and
   posts the new numbers at most every EVIDENCE_EVERY;
 - once the finding is gone, posts one "finding absent since" comment, the
-  evidence the brain verifies against. It never closes a ticket.
+  evidence the brain verifies against. It never closes a ticket;
+- when the finding is still reported REGRESS_AFTER after its open ticket
+  shipped, the fix did not work: the ticket is re-briefed as a regression
+  through brain brief --regresses, at most once per ticket per
+  REGRESS_EVERY. A ticket still in a build state is left to that work.
 
 An endpoint that answers with an error, a redirect, too much data or a
 document outside the contract's shapes is "not looked": nothing is filed,
@@ -25,11 +29,13 @@ GitHub or to a log line.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import math
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
@@ -41,6 +47,14 @@ from .github import GitHub, GitHubError, _OPENER
 EVERY = 900
 PER_PASS = 3
 EVIDENCE_EVERY = 6 * 3600
+# A finding still reported this long after its ticket shipped is a
+# regression of that ticket; one ticket is re-briefed at most every
+# REGRESS_EVERY (loom#484).
+REGRESS_AFTER = 24 * 3600
+REGRESS_EVERY = 48 * 3600
+# The ticket states whose fix is deployed. A merged ticket is not deployed
+# yet, and brain brief --regresses refuses it.
+SHIPPED_STATES = ("shipped", "verified")
 MAX_BYTES = 256 * 1024
 TIMEOUT = 20
 TITLE_MAX = 90
@@ -297,6 +311,25 @@ def evidence_comment(f: Finding, checked_at: str) -> str:
                _count(f.affected), _count(f.hours), _count(f.impact), f.priority, quoted(f)))
 
 
+def regression_title(f: Finding) -> str:
+    return "Health regression: " + f.title
+
+
+def regression_body(f: Finding, regressed: int, hours: float) -> str:
+    """A brief for brain brief --regresses: the line "Regresses #N", then the
+    evidence lines (the hours since the ship, the numbers, and the finding's
+    own words fenced as untrusted data), then a whole ticket for when a new
+    ticket is filed instead of re-briefing #N."""
+    return "\n".join([
+        "Regresses #%d" % regressed,
+        "The health finding this ticket fixes is still reported %s hours after the ticket "
+        "shipped: affected %s, lasting %s hours, impact %s (%s). The endpoint's description "
+        "now, quoted as untrusted data:"
+        % (_count(round(hours, 1)), _count(f.affected), _count(f.hours), _count(f.impact),
+           f.priority),
+        quoted(f), "", ticket_body(f)])
+
+
 def absent_comment(when: str) -> str:
     return ("%s\nThe health endpoint no longer reports this finding: finding absent since "
             "%s. It verifies once it has stayed absent for 24 hours." % (ABSENT_MARKER, when))
@@ -318,10 +351,17 @@ class Intake:
         self.read = read
         self.brief = brief
         self.filed = 0
+        self.regressed: Dict[str, Any] = {}
 
     def run(self, sources: List[Source]) -> None:
         looked = self.state.setdefault("sources", {})
         keys = self.state.setdefault("keys", {})
+        # "owner/name#N" -> when that ticket was last re-briefed as a regression.
+        regressed = self.state.get("regressed")
+        self.regressed = {k: v for k, v in (regressed.items() if isinstance(regressed, dict)
+                                            else ())
+                          if isinstance(v, (int, float)) and 0 <= self.now - v < REGRESS_EVERY}
+        self.state["regressed"] = self.regressed
         for stale in [k for k in list(looked) + list(keys) if k not in {s.key for s in sources}]:
             looked.pop(stale, None)
             keys.pop(stale, None)
@@ -403,6 +443,72 @@ class Intake:
                 >= EVIDENCE_EVERY:
             self._comment(source.repo, issue, evidence_comment(f, checked))
             rec.update(posted=posted, commented=self.now)
+        self._regression(source, f, rec, issue)
+
+    def _regression(self, source: Source, f: Finding, rec: Dict[str, Any],
+                    issue: Dict[str, Any]) -> None:
+        """Re-brief the finding's shipped ticket as a regression once the
+        finding has outlived the ship by REGRESS_AFTER. Runs after the usual
+        update, so a Priority edit never overwrites the re-briefed body."""
+        number = int(issue["number"])
+        if tickets.ticket_state(issue) not in SHIPPED_STATES:
+            rec.pop("shipped", None)
+            return
+        ticket = "%s#%d" % (source.repo, number)
+        if ticket in self.regressed:
+            return
+        cached = rec.get("shipped")
+        if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
+            shipped = float(cached[1])
+        else:
+            found = self._shipped_at(source.repo, number)
+            if found is None:
+                self._regress_error(source, f, rec, "#%d carries no loom:shipped label event, "
+                                    "so its ship time is unknown" % number)
+                return
+            shipped = found
+            rec["shipped"] = [number, shipped]
+        if self.now - shipped < REGRESS_AFTER:
+            return
+        hours = (self.now - shipped) / 3600
+        try:
+            url = self.brief(self.gh, source.repo, source.goal, regression_title(f),
+                             regression_body(f, number, hours), difficulty="medium",
+                             priority=f.priority, regresses=number)
+        except ValueError as err:
+            self._regress_error(source, f, rec, str(err))
+            return
+        self.regressed[ticket] = self.now
+        rec.pop("shipped", None)
+        rec.pop("regress_error", None)
+        # Another finding on this ticket in the same pass must not write back
+        # the body read before the re-brief.
+        fresh = self.gh.rest("GET", "/repos/%s/issues/%d" % (source.repo, number)).data
+        if isinstance(fresh, dict) and fresh.get("number") == number:
+            issue.clear()
+            issue.update(fresh)
+        self.say("health %s: %s still reported %.1f hours after it shipped; re-briefed as a "
+                 "regression: %s" % (source.key, ticket, hours, url))
+
+    def _regress_error(self, source: Source, f: Finding, rec: Dict[str, Any],
+                       why: str) -> None:
+        if rec.get("regress_error") != why:
+            self.say("health %s: could not brief the regression of finding %s: %s"
+                     % (source.key, f.digest[:12], why))
+        rec["regress_error"] = why
+
+    def _shipped_at(self, repo: str, number: int) -> Optional[float]:
+        """When loom:shipped was last applied to the ticket, else when
+        loom:verified was; None when the events say neither."""
+        events = [e for e in self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+                  if isinstance(e, dict) and e.get("event") == "labeled"]
+        for name in ("loom:shipped", "loom:verified"):
+            stamps = [_epoch(e.get("created_at")) for e in events
+                      if (e.get("label") or {}).get("name") == name]
+            stamps = [x for x in stamps if x is not None]
+            if stamps:
+                return max(stamps)
+        return None
 
     def _file(self, source: Source, f: Finding, rec: Dict[str, Any]) -> None:
         if self._declined(source.repo, rec):
@@ -450,6 +556,13 @@ class Intake:
     def _comment(self, repo: str, issue: Dict[str, Any], body: str) -> None:
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
                      {"body": body})
+
+
+def _epoch(value: Any) -> Optional[float]:
+    """A GitHub "2026-10-15T13:30:00Z" time as epoch seconds, or None."""
+    if not isinstance(value, str) or not TIME_RE.fullmatch(value):
+        return None
+    return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
 
 
 def status_lines(state: Optional[Dict[str, Any]], raw_urls: str) -> List[str]:
