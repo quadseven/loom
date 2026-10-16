@@ -2359,14 +2359,24 @@ def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
 
 
 def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
-                       found: List[Dict[str, Any]]) -> List[str]:
+                       found: List[Dict[str, Any]],
+                       latest: Optional[Dict[Tuple[str, Tuple[str, int]], handoff.Mark]] = None
+                       ) -> List[str]:
     found_marks = handoff.marks(found)
     items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
+    latest = latest or {(m.stage, m.item): m for m in found_marks}
     current = {m.item: item_revision(gh, *m.item) for m in items}
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
     for m in items:
+        newest = latest[(m.stage, m.item)]
+        if newest.kind == "defer" and newest != m:
+            continue
+        if newest.kind == "done":
+            out.append("- dropped %s %s: finished or closed since the defer" % (
+                m.stage, handoff.item_ref(m.item)))
+            continue
         if m in alive:
             item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
             out.append("- resume %s %s (deferred by %s at %s)" % (
@@ -2474,11 +2484,17 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     now = now or datetime.now(timezone.utc)
     _lock_holder(gh, lock_repo, holder, now)
     goals = _goal_journals(gh, repos, trusted_authors(env))
+    latest: Dict[Tuple[str, Tuple[str, int]], handoff.Mark] = {}
+    for _, _, found in goals:
+        for mark in handoff.marks(found):
+            key = (mark.stage, mark.item)
+            if key not in latest or mark.at >= latest[key].at:
+                latest[key] = mark
     out = ["# Resume for %s" % holder, "",
            _freshness_line(handoff.peer_journals(
                [j for _, _, found in goals for j in found], holder, now))]
     for repo, issue, found in goals:
-        out += _goal_resume_lines(gh, repo, issue, found)
+        out += _goal_resume_lines(gh, repo, issue, found, latest)
     return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
                       + _verify_resume_lines(gh, repos, now)
                       + _audit_resume_lines(gh, repos, now, env))

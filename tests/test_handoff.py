@@ -240,6 +240,42 @@ class ResumeCommandTests(unittest.TestCase):
         self.assertNotIn("- resume brief", out)
         self.assertIn("- dropped brief %s#1: finished or closed since the defer" % REPO, out)
 
+    def test_done_on_another_goal_drops_defer(self):
+        routes = self.routes()
+        goals = [dict(number=n, title="Goal %d" % n, state="open",
+                      labels=[{"name": "loom:goal"}]) for n in (1, 2)]
+        routes[("GET", "/repos/%s/issues" % REPO)] = (200, goals)
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [comment(
+            journal(30, "muse", handoff.defer_marker("brief", (REPO, 1), "open", "muse",
+                                                      note="example brief")) )])
+        routes[("GET", "/repos/%s/issues/2/comments" % REPO)] = (200, [comment(
+            journal(10, "lane-machine", handoff.done_marker("brief", (REPO, 1),
+                                                              "lane-machine")) )])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW,
+                           {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        self.assertIn("- dropped brief %s#1: finished or closed since the defer" % REPO, out)
+        self.assertNotIn("- resume brief %s#1" % REPO, out)
+
+    def test_newer_cross_goal_defer_is_listed_once_under_newest_goal(self):
+        routes = self.routes()
+        goals = [dict(number=n, title="Goal %d" % n, state="open",
+                      labels=[{"name": "loom:goal"}]) for n in (1, 2)]
+        routes[("GET", "/repos/%s/issues" % REPO)] = (200, goals)
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [comment(
+            journal(30, "muse", handoff.defer_marker("brief", (REPO, 1), "open", "muse",
+                                                      note="example brief")) )])
+        routes[("GET", "/repos/%s/issues/2/comments" % REPO)] = (200, [comment(
+            journal(10, "lane-machine", handoff.defer_marker("brief", (REPO, 1), "open",
+                                                              "lane-machine", note="example brief")) )])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW,
+                           {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        lines = [line for line in out.splitlines() if line.startswith("- resume brief %s#1" % REPO)]
+        self.assertEqual(1, len(lines))
+        self.assertIn("(deferred by lane-machine at %s)" % at(10), lines[0])
+        self.assertNotIn("- dropped brief %s#1" % REPO, out)
+
     def test_defer_refuses_brief_without_note(self):
         routes = self.routes()
         with self.assertRaises(ValueError):
