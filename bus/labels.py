@@ -44,10 +44,11 @@ ANTHROPIC_LANES = [x for x in LANES if x.startswith("anthropic")]
 
 def rung_lanes(rung: int) -> List[str]:
     """The lanes that can run a rung (0-based), best first."""
-    lane = ESCALATION[rung][0]
+    lane, model = ESCALATION[rung]
     if lane == "codex":
         return ["codex", "codex-2"]
-    return [lane] + (ANTHROPIC_LANES if rung == len(ESCALATION) - 1 else [])
+    agy = ["agy"] if any(model.startswith(p) for p in ("gemini-", "claude-", "gpt-oss-")) else []
+    return [lane] + agy + (ANTHROPIC_LANES if rung == len(ESCALATION) - 1 else [])
 
 # name -> (6-hex color, short ASCII description)
 LABELS: Dict[str, Dict[str, str]] = {

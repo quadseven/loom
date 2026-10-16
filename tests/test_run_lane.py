@@ -1837,6 +1837,27 @@ cat > /dev/null
         inbox, _, _, agy = self.agy_lane(model="openrouter/vendor/model:free")
         self.assertEqual(agy, [])
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("[transient]", log)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_agy_lane_runs_bare_model_with_default_effort_and_refuses_unknown_as_transient(self):
+        inbox, workdir, result, agy = self.agy_lane(model="claude-sonnet-5-5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(agy), 1, (self.calls(), result.stderr))
+        self.assertIn("--model claude-sonnet-5-5-high", agy[0])
+
+        inbox_med, workdir_med, result_med, agy_med = self.agy_lane(
+            model="claude-sonnet-5-5", LOOM_AGY_EFFORT="medium")
+        self.assertEqual(result_med.returncode, 0, result_med.stderr)
+        self.assertIn("--model claude-sonnet-5-5-medium", agy_med[0])
+
+        inbox_bad, _, _, agy_bad = self.agy_lane(model="unknown-model")
+        self.assertEqual(agy_bad, [])
+        self.assertTrue((inbox_bad / "failed" / "T042-fix-the-thing.md").exists())
+        log = (self.loom / "logs" / "agy" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("[transient]", log)
+        self.assertIn("model unknown-model is not in the agy catalog", log)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "the agy lane runs under macOS sandbox-exec")
     def test_agy_lane_takes_public_repos_only(self):

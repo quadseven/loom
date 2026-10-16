@@ -714,7 +714,9 @@ def lane_takes_model(lane: str, model: str) -> bool:
 
 def model_lanes(model: str) -> List[str]:
     """Compatible lanes, with the model ladder's lanes first when applicable."""
-    rung = next((lanes for lanes, rung_model in factory.LADDER if rung_model == model), ())
+    from .labels import rung_lanes
+    rung = next((rung_lanes(n) for n, (_, rung_model) in enumerate(factory.LADDER)
+                 if rung_model == model), ())
     return [lane for lane in dict.fromkeys([*rung, *LANES])
             if lane not in REMOTE_LANES and lane_takes_model(lane, model)]
 

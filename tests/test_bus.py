@@ -309,6 +309,10 @@ class LabelTests(unittest.TestCase):
     def test_the_lane_status_label_is_in_the_set(self):
         self.assertIn("loom:lanes", labels.LABELS)
 
+    def test_rung_lanes_includes_agy_only_when_in_catalog(self):
+        self.assertIn("agy", labels.rung_lanes(0))
+        self.assertNotIn("agy", labels.rung_lanes(1))
+        self.assertIn("agy", labels.rung_lanes(2))
 
     def test_set_shape(self):
         for lane in labels.LANES:

@@ -462,10 +462,11 @@ def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
 def current_rung(issue: Dict[str, Any]) -> int:
     """The rung whose model and lane the ticket runs on now, 0 when none: a
     brief can start on a ladder model, and failing there tries that rung."""
+    from .labels import rung_lanes
     m = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
     model = m.group(1) if m else ""
     return next((n for n, (lanes, rung_model) in enumerate(LADDER, 1)
-                 if rung_model == model and _lane(issue) in lanes), 0)
+                 if rung_model == model and _lane(issue) in rung_lanes(n - 1)), 0)
 
 
 def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None) -> int:
@@ -1301,9 +1302,14 @@ class Factory:
     def _stall_lanes(self, repo: str, issue: Dict[str, Any], rung: int) -> List[str]:
         """The other available lanes a stalled ticket may move to: those of
         its rung, or of its difficulty tier. Never up the ladder."""
+        from .labels import rung_lanes
+        from .station import lane_takes_model
         old = _lane(issue)
-        pool = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
-        return [x for x in pool if x != old and self._up(x)]
+        m = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+        model = m.group(1) if m else ""
+        pool = [x for x in rung_lanes(rung - 1) if not (self._is_private(repo) and x in PUBLIC_ONLY)] \
+            if rung else tier_lanes(issue, self._is_private(repo))
+        return [x for x in pool if x != old and self._up(x) and (not model or lane_takes_model(x, model))]
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
@@ -1379,7 +1385,14 @@ class Factory:
         rung = current_rung(issue)
         fallback = ""
         if rung:
-            lane = next((x for x in LADDER[rung - 1][0] if x != old and self._free(x)), None)
+            from .labels import rung_lanes
+            from .station import lane_takes_model
+            m = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+            model = m.group(1) if m else ""
+            lane = next((x for x in rung_lanes(rung - 1)
+                         if x != old and self._free(x)
+                         and not (self._is_private(repo) and x in PUBLIC_ONLY)
+                         and (not model or lane_takes_model(x, model))), None)
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None:

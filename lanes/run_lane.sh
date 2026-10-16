@@ -1455,6 +1455,19 @@ for BRIEF in "$INBOX"/*.md; do
   if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:][A-Za-z0-9._:/@-]*$ ]]; then
     park "$BRIEF" "no usable model '$MODEL': set Model: in the brief or $(lane_var MODEL)"; continue
   fi
+  if [ "$LANE" = agy ]; then
+    case "$MODEL" in
+      gemini-*|claude-*|gpt-oss-*)
+        case "$MODEL" in
+          *-low|*-medium|*-high) ;;
+          *)
+            AGY_EFFORT="$(lane_setting EFFORT)"
+            MODEL="$MODEL-${AGY_EFFORT:-high}"
+            ;;
+        esac
+        ;;
+    esac
+  fi
   case "$LANE:$MODEL" in
     codex:claude*|codex:opus*|codex:sonnet*|codex:haiku*|codex:fable*)
       park "$BRIEF" "model $MODEL is not a codex model"; continue ;;
@@ -1473,7 +1486,7 @@ for BRIEF in "$INBOX"/*.md; do
     spark:spark/?*) ;;
     spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
     agy:gemini-*|agy:claude-*|agy:gpt-oss-*) ;;
-    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)"; continue ;;
+    agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)" transient; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
   esac
   if [ -n "$CONFIGURED_MODELS" ] && [ -z "$PINNED_MODEL" ]; then

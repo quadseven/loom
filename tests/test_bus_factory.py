@@ -1127,6 +1127,18 @@ class Tickets(Base):
         self.assertEqual((self.lane(7), self.model(7)), ("codex-2", "gpt-6-sol"))
         self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
 
+    def test_factory_does_not_move_a_ticket_whose_model_header_names_a_model_agy_lacks_onto_agy(self):
+        # A ticket with a model agy lacks (e.g. gpt-6-sol) never moves to agy,
+        # even when agy is available on a public repo.
+        self.gh.private = False
+        body = "Model: gpt-6-sol\nDifficulty: easy\n\n## Why\nx\n"
+        self.stalled(7, lane="spark", body=body)
+        self.gh.ticket(8, "queued", body=body)
+        self.go(available=["agy"])
+        self.assertNotEqual(self.lane(7), "agy")
+        self.assertEqual(self.lane(7), "spark")
+        self.assertNotEqual(self.lane(8), "agy")
+
     def test_three_stalls_in_a_row_never_give_up(self):
         self.stalled(7)
         for _ in range(3):
