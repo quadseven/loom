@@ -213,6 +213,8 @@ class FakeGitHub:
         files = re.match(r"pulls/(\d+)/files$", rest)
         if method == "GET" and files:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
+        if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
+            return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
 
     def _post_page(self, data):
@@ -1148,6 +1150,99 @@ class TriageTest(Base):
             json.dump({"rates": {"core": [500, 5000, reset]}}, fh)
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
+
+
+class HandoffFake:
+    """The reads one handoff packet pass makes, and the comment writes."""
+
+    def __init__(self):
+        self.goal = {"number": 30, "title": "Loom goal", "state": "open",
+                     "labels": [{"name": "loom:goal"}]}
+        self.comments = []
+        self.writes = []
+        self.muse = base64.b64encode(b"# Muse\n\n## Rules\n\n- Write ASCII only.\n").decode()
+
+    def journal(self, holder, at, *lines):
+        self.comments.append({"id": len(self.comments) + 1, "user": {"login": AUTHORS[0]},
+                              "created_at": at, "body": "\n".join(
+                                  [station.JOURNAL_MARKER, "Tick %s, %s" % (at, holder)]
+                                  + list(lines))})
+
+    def rest(self, method, path, data=None, ok=()):
+        if method == "GET" and path.endswith("/git/ref/heads/loom-lock/brain"):
+            return mock.Mock(status=404, data=None)
+        if method == "GET" and path == "/repos/%s/contents/docs/MUSE.md?ref=%s" % (REPO, "c" * 40):
+            return mock.Mock(status=200, data={"content": self.muse})
+        if method == "POST" and path == "/repos/%s/issues/30/comments" % REPO:
+            self.writes.append((method, path))
+            self.comments.append({"id": 900 + len(self.writes), "user": {"login": AUTHORS[0]},
+                                  "created_at": "2030-01-01T00:00:00Z", "body": data["body"]})
+            return mock.Mock(status=201, data=self.comments[-1])
+        if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO):
+            self.writes.append((method, path))
+            found = next(c for c in self.comments if c["id"] == int(path.rsplit("/", 1)[1]))
+            found["body"] = data["body"]
+            return mock.Mock(status=200, data=found)
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def paginate(self, path):
+        if path.startswith("/repos/%s/issues?labels=loom:goal" % REPO):
+            return [self.goal]
+        if path.startswith("/repos/%s/issues/30/comments" % REPO):
+            return [dict(c) for c in self.comments]
+        raise AssertionError(path)
+
+
+class HandoffPacketTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = HandoffFake()
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS, status_repo=REPO)
+
+    def run_pass(self, minutes=0):
+        station.Station(self.gh, self.settings, now=self.now + 60 * minutes,
+                        head=lambda: "c" * 40).publish_handoff()
+
+    def packets(self):
+        return [c for c in self.gh.comments if c["body"].startswith("<!-- loom:handoff v1 -->")]
+
+    def test_a_pass_posts_one_packet_and_later_passes_edit_it_in_place(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one",
+                        "<!-- loom:defer v1 stage=merge item=%s#7 rev=pr-abc holder=muse -->" % REPO)
+        self.run_pass()
+        self.assertEqual([("POST", "/repos/%s/issues/30/comments" % REPO)], self.gh.writes)
+        body = self.packets()[0]["body"]
+        self.assertIn("2030-01-01T11:00:00Z muse, model unknown, on %s#30: 0 done, 1 deferred. "
+                      "Decided: merged one." % REPO, body)
+        self.assertIn("- merge %s#7, deferred by muse at 2030-01-01T11:00:00Z." % REPO, body)
+        self.assertIn("## Rules (docs/MUSE.md at %s)\n- Write ASCII only." % ("c" * 40), body)
+        # Nothing changed: no write at all on the next pass.
+        self.run_pass(minutes=1)
+        self.assertEqual(1, len(self.gh.writes))
+        # A brain ticks: the same comment is edited, never a second one posted.
+        self.gh.journal("lane-machine", "2030-01-01T12:01:30Z", "- Decided: merged it",
+                        "<!-- loom:done v1 stage=merge item=%s#7 holder=lane-machine -->" % REPO)
+        self.run_pass(minutes=2)
+        self.assertEqual(("PATCH", "/repos/%s/issues/comments/901" % REPO), self.gh.writes[-1])
+        self.assertEqual(1, len(self.packets()))
+        self.assertEqual(1, sum(1 for method, _ in self.gh.writes if method == "POST"))
+        body = self.packets()[0]["body"]
+        self.assertIn("lane-machine, model unknown, on %s#30: 1 done, 0 deferred" % REPO, body)
+        self.assertIn("## Open defers (0, 0 from brains no longer ticking)\n- none", body)
+
+    def test_a_marked_comment_from_a_stranger_is_not_the_packet(self):
+        self.gh.comments.append({"id": 5, "user": {"login": "stranger"},
+                                 "created_at": "2030-01-01T00:00:00Z",
+                                 "body": "<!-- loom:handoff v1 -->\nfake"})
+        self.run_pass()
+        self.assertEqual([("POST", "/repos/%s/issues/30/comments" % REPO)], self.gh.writes)
+
+    def test_the_packet_waits_for_one_loom_goal_home(self):
+        self.gh.goal["title"] = "Backlog: every open issue"
+        self.run_pass()
+        self.assertEqual([], self.gh.writes)
 
 
 class ReviewFake:

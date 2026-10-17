@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import calendar
 import base64
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import errno
 import fcntl
 import fnmatch
@@ -517,6 +517,17 @@ def _origin_repo() -> str:
     return m.group(1) if m else ""
 
 
+def _checkout_head() -> str:
+    """The commit this checkout is at, or "" when git cannot say."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
 def _is_ancestor(commit: str, revision: str) -> bool:
     """The commit is the revision or one of its ancestors in this checkout,
     the one lanes/mac/station.sh deploys. An unknown commit is not."""
@@ -840,13 +851,15 @@ class Station:
                  post: Optional[Poster] = None,
                  discord: Optional[DiscordCall] = None,
                  upload: Optional[Uploader] = None,
-                 ancestor: Optional[Callable[[str, str], bool]] = None) -> None:
+                 ancestor: Optional[Callable[[str, str], bool]] = None,
+                 head: Optional[Callable[[], str]] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
         self.ancestor = ancestor or _is_ancestor
+        self.head = head or _checkout_head
         # Where Claude Code and codex keep their sessions (the claude lane's
         # and the brain's transcripts, and codex rollouts).
         self.claude_projects = Path.home() / ".claude" / "projects"
@@ -5143,6 +5156,102 @@ class Station:
             line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
             self._metrics_notice(today, "discord", line)
 
+    # -- handoff packet --------------------------------------------------
+    def _handoff_home(self) -> Optional[Tuple[str, int]]:
+        """(repo, number) of the Loom goal home: the status repo's one open
+        goal home that is not a backlog; None when there is not exactly one."""
+        repo = self.s.status_repo
+        if not repo or not tickets.REPO_RE.fullmatch(repo):
+            return None
+        homes = [i for i in self._goal_issues(repo)
+                 if not str(i.get("title") or "").startswith("Backlog:")]
+        return (repo, int(homes[0]["number"])) if len(homes) == 1 else None
+
+    def _shown(self, repo: str, home: str) -> bool:
+        """Whether the packet on `home` may name the repo and quote its text:
+        its own repo, or a public one."""
+        if repo == home:
+            return True
+        if repo not in self._publics:
+            self._publics[repo] = self._public(repo)
+        return self._publics[repo]
+
+    def _handoff_rules(self, home: str) -> Tuple[str, List[str]]:
+        """(commit, Rules lines) of docs/MUSE.md at this checkout's HEAD, read
+        from GitHub so the packet quotes only what is public there; no lines
+        when the commit is not on GitHub or the repo may not be quoted."""
+        commit = self.head()
+        repo = self.s.self_repo
+        if not COMMIT_RE.fullmatch(commit or "") or not tickets.REPO_RE.fullmatch(repo or ""):
+            return "", []
+        if not self._shown(repo, home):
+            return commit, []
+        # A commit GitHub does not have answers 404 (or 422): no rules then.
+        data = self.gh.rest("GET", "/repos/%s/contents/docs/MUSE.md?ref=%s" % (repo, commit),
+                            ok=(404, 422)).data
+        if not isinstance(data, dict) or not data.get("content"):
+            return commit, []
+        doc = base64.b64decode(data["content"]).decode("utf-8", "replace")
+        return commit, handoff.rules_section(doc)
+
+    def _handoff_goals(self, home: str) -> Tuple[List[handoff.Goal], int, Dict[Tuple[str, int], List[Any]]]:
+        """Every goal home's trusted journals, the repos that could not be
+        read, and each home's raw comments. A repo that fails is counted and
+        skipped, so one unreadable repo does not freeze the packet."""
+        goals: List[handoff.Goal] = []
+        raw: Dict[Tuple[str, int], List[Any]] = {}
+        unread = 0
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                issues = self._goal_issues(repo)
+                read = [(int(i["number"]), self.gh.paginate(
+                    "/repos/%s/issues/%d/comments?per_page=100" % (repo, int(i["number"]))))
+                    for i in issues]
+            except GitHubError as err:
+                _say("handoff packet: could not read the goal homes of %s: %s" % (repo, err))
+                unread += 1
+                continue
+            for number, comments in read:
+                raw[(repo, number)] = comments
+                found = handoff.journals(
+                    [{"body": c.get("body"), "at": c.get("created_at"),
+                      "login": (c.get("user") or {}).get("login")}
+                     for c in comments if isinstance(c, dict)], self.s.authors)
+                goals.append(handoff.Goal(repo, number, self._shown(repo, home), found))
+        return goals, unread, raw
+
+    def publish_handoff(self) -> None:
+        """Keep the handoff packet (handoff.packet) in one comment on the Loom
+        goal home, marked HANDOFF_MARKER: posted once, then edited in place,
+        and only when its text changed."""
+        home = self._handoff_home()
+        if home is None:
+            return
+        repo, number = home
+        goals, unread, raw = self._handoff_goals(repo)
+        record = brain.tick_step(self.gh, repo)
+        body = handoff.packet(goals, record, self._handoff_rules(repo),
+                              datetime.fromtimestamp(self.now, timezone.utc),
+                              lambda r: self._shown(r, repo), unread)
+        _text.check(body)
+        comments = raw.get(home)
+        if comments is None:
+            comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % home)
+        allowed = {a.lower() for a in self.s.authors}
+        mine = [c for c in comments if isinstance(c, dict)
+                and tickets._login(c.get("user")).lower() in allowed
+                and str(c.get("body") or "").startswith(handoff.HANDOFF_MARKER)]
+        if mine and str(mine[0].get("body") or "") == body:
+            return
+        if mine:
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(mine[0]["id"])),
+                         {"body": body})
+        else:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % home, {"body": body})
+        _say("handoff packet updated on %s#%d" % home)
+
     def prune_trees(self) -> None:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
         or running) and that have not changed for TREE_KEEP seconds. A
@@ -5288,7 +5397,7 @@ class Station:
         for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.unwind_reverts, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
-                     self.post_metrics,
+                     self.post_metrics, self.publish_handoff,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
                      self.watch_default_branches, self.run_factory, self.check_invariants,
                      self.release_factory_held):

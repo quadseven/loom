@@ -417,5 +417,85 @@ class BriefDoneTests(unittest.TestCase):
                       str(caught.exception))
 
 
+def goal(*entries, repo=REPO, number=1, shown=True):
+    return handoff.Goal(repo, number, shown, handoff.journals(list(entries), AUTHORS))
+
+
+def packet(goals, record=None, now=NOW, public=lambda repo: True):
+    return handoff.packet(goals, record, ("c" * 40, ["- Write ASCII only."]),
+                          now, public)
+
+
+class HandoffPacketTests(unittest.TestCase):
+    def test_a_defer_from_a_brain_quiet_for_two_hours_is_open_work_for_any_brain(self):
+        stale = goal(journal(180, "muse", defer(PR, "pr-abc")),
+                     journal(10, "lane-machine", defer(TICKET, "failed-c3",
+                                                       holder="lane-machine", stage="failed")))
+        text = packet([stale])
+        self.assertIn("## Open defers (2, 1 from brains no longer ticking)", text)
+        merge = next(line for line in text.splitlines() if line.startswith("- merge %s#7" % REPO))
+        self.assertIn("Open work for any brain: muse last ticked at %s" % at(180), merge)
+        failed = next(line for line in text.splitlines() if line.startswith("- failed %s#9" % REPO))
+        self.assertNotIn("Open work for any brain", failed)
+
+    def test_a_done_marker_for_the_item_drops_the_standing_defer(self):
+        before = goal(journal(180, "muse", defer(PR, "pr-abc")))
+        self.assertIn("- merge %s#7, deferred by muse" % REPO, packet([before]))
+        after = goal(journal(180, "muse", defer(PR, "pr-abc")),
+                     journal(5, "lane-machine", done(PR)))
+        text = packet([after])
+        self.assertNotIn("- merge %s#7, deferred" % REPO, text)
+        self.assertIn("## Open defers (0, 0 from brains no longer ticking)\n- none", text)
+
+    def test_a_done_marker_on_another_goal_home_drops_the_defer_too(self):
+        text = packet([goal(journal(180, "muse", defer(PR, "pr-abc"))),
+                       goal(journal(5, "lane-machine", done(PR)), number=2)])
+        self.assertNotIn("deferred by muse", text)
+
+    def test_the_last_five_ticks_newest_first_with_holder_model_and_decision(self):
+        entries = [journal(m, "muse" if m % 20 else "lane-machine", "- Model: model-x")
+                   for m in (70, 60, 50, 40, 30, 20)]
+        entries[-1]["body"] += "\n- Decided: merged the ready pull request\n" + defer(PR, "pr-abc")
+        text = packet([goal(*entries)])
+        ticks = text.split("## Last 5 ticks\n", 1)[1].split("\n\n", 1)[0].splitlines()
+        self.assertEqual(5, len(ticks))
+        self.assertTrue(ticks[0].startswith("- %s lane-machine, model model-x, on %s#1: "
+                                            "0 done, 1 deferred." % (at(20), REPO)), ticks[0])
+        self.assertIn("Decided: merged the ready pull request.", ticks[0])
+        self.assertIn("Left open: merge %s#7." % REPO, ticks[0])
+        self.assertNotIn(at(70), text)
+
+    def test_a_tick_with_no_journal_since_its_lock_shows_its_step(self):
+        record = {"holder": "muse", "started_at": at(3), "step": "merge", "step_index": 3,
+                  "steps": list(brain.TICK_STEPS),
+                  "notes": [{"ts": at(2), "step": "merge", "text": "two ready"}]}
+        text = packet([goal(journal(40, "muse"))], record)
+        self.assertIn("- %s muse, no journal yet: at step merge (3/10). Last note: two ready."
+                      % at(3), text)
+
+    def test_a_private_goal_home_is_neither_named_nor_quoted(self):
+        secret = goal(journal(5, "muse", "- Decided: something private",
+                              handoff.defer_marker("brief", ("example-owner/hidden", 4), "open",
+                                                   "muse", note="private plan")),
+                      repo="example-owner/hidden", number=4, shown=False)
+        text = packet([secret], public=lambda repo: False)
+        self.assertNotIn("hidden", text)
+        self.assertNotIn("private plan", text)
+        self.assertNotIn("something private", text)
+        self.assertIn("issue 4 of a private repo", text)
+
+    def test_quoted_text_drops_at_signs_and_non_ascii(self):
+        self.assertEqual("ping someone ok?", handoff.quote("ping @someone ok\u2014"))
+
+    def test_the_packet_does_not_move_with_the_clock_alone(self):
+        found = [goal(journal(30, "muse", defer(PR, "pr-abc")))]
+        self.assertEqual(packet(found), packet(found, now=NOW + timedelta(minutes=30)))
+
+    def test_rules_section_reads_to_the_next_heading(self):
+        doc = "# Doc\n\n## Tick\n1. Lock.\n\n## Rules\n\n- One.\n  more.\n- Two.\n\n## After\nx\n"
+        self.assertEqual(["- One.", "  more.", "- Two."], handoff.rules_section(doc))
+        self.assertEqual([], handoff.rules_section("# Doc\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

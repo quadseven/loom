@@ -797,6 +797,21 @@ Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
 
+### Handoff packet
+
+Each pass the station keeps one comment on the Loom goal home (the status
+repo's one open goal home that is not a backlog), marked
+`<!-- loom:handoff v1 -->`. It posts it once and then edits it in place, and
+only when its text changed. It holds the last 5 ticks across the goal homes
+(holder, model from a `- Model:` journal line, done and deferred counts, one
+line decided from a `- Decided:` line or the first line of prose, and the
+items left open), a tick that holds the lock with no journal yet, the
+standing defers (the newest marker for a stage and item wins, as in
+`resume`), with each defer whose brain has not ticked in 2 hours marked open
+work for any brain, and the Rules section of docs/MUSE.md read from GitHub at
+the station checkout's commit. Journals from private repos count, but the
+packet names neither their repo nor their text.
+
 ### Report deadlines
 
 Each goal owes its own report every 2 hours, counted from its newest valid
