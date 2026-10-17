@@ -91,7 +91,8 @@ Neither needs a model:
   and low findings are deferred at once instead of after a fix round, and
   it needs no test of its own (the failing check it fixes is its test).
 - A lane pull request whose ticket has a newer open lane pull request, or whose
-  ticket is at merged, shipped or verified through a different pull request, is
+  ticket is at merged, shipped or verified through a different pull request
+  merged after its latest brief, is
   closed with a comment naming the pull request that superseded it. A pull
   request a person opened, or one not on a loom/ branch, is never closed this
   way.
@@ -839,7 +840,7 @@ class Factory:
         # The tickets named by After: lines, and closed tickets whose lane
         # pull requests are still open, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
-        self._merged_prs: Dict[str, Dict[int, int]] = {}
+        self._merged_prs: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -1138,10 +1139,10 @@ class Factory:
             return False
         return str((pr.get("head") or {}).get("ref") or "").startswith("loom/")
 
-    def _merged_pull(self, repo: str, ticket_number: int) -> Optional[int]:
-        """The newest pull request number that merged this ticket, or None."""
+    def _merged_pull(self, repo: str, ticket_number: int, since: str) -> Optional[int]:
+        """The newest pull request merged since this ticket's latest brief."""
         if repo not in self._merged_prs:
-            merged: Dict[int, int] = {}
+            merged: Dict[int, List[Dict[str, Any]]] = {}
             for pr in self.gh.paginate("/repos/%s/pulls?state=closed" % repo):
                 if not isinstance(pr, dict):
                     continue
@@ -1150,10 +1151,11 @@ class Factory:
                 assoc = self._association(repo, pr)
                 if assoc and assoc[0] == repo:
                     t_num = assoc[1]
-                    if t_num not in merged or int(pr["number"]) > merged[t_num]:
-                        merged[t_num] = int(pr["number"])
+                    merged.setdefault(t_num, []).append(pr)
             self._merged_prs[repo] = merged
-        return self._merged_prs[repo].get(ticket_number)
+        eligible = [int(pr["number"]) for pr in self._merged_prs[repo].get(ticket_number, [])
+                    if str(pr.get("merged_at") or "") >= since]
+        return max(eligible, default=None)
 
     def _close_pr(self, repo: str, pr: Dict[str, Any], superseded_by: int) -> None:
         """Close an open lane pull request and comment with the PR that superseded it."""
@@ -1176,13 +1178,14 @@ class Factory:
             closed.add(num)
 
     def _close_ticket_group(self, repo: str, item: Dict[str, Any],
-                            tickets: Dict[int, Dict[str, Any]],
+                            ticket_map: Dict[int, Dict[str, Any]],
                             prs: Sequence[Dict[str, Any]], closed: set) -> None:
         """Close the superseded lane pull requests of one ticket (item names it)."""
         ticket_number = int(item["number"])
-        ticket = tickets.get(ticket_number) or self._ticket(repo, ticket_number)
+        ticket = ticket_map.get(ticket_number) or self._ticket(repo, ticket_number)
         if ticket and _state(ticket) in ("merged", "shipped", "verified"):
-            merged = self._merged_pull(repo, ticket_number)
+            since = tickets.latest_brief_at(self.gh, repo, ticket_number)
+            merged = self._merged_pull(repo, ticket_number, since)
             if merged is not None:
                 self._close_all_but(repo, prs, merged, closed)
         elif len(prs) > 1:

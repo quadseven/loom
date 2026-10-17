@@ -43,6 +43,15 @@ FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverab
 SLUG_MAX = 40
 
 
+def latest_brief_at(gh: Any, repo: str, number: int) -> str:
+    """Time of the latest queue or brief label, or empty when unavailable."""
+    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+    return max((str(e.get("created_at") or "") for e in events
+                if isinstance(e, dict) and e.get("event") == "labeled"
+                and (e.get("label") or {}).get("name") in ("loom:queued", "loom:briefed")),
+               default="")
+
+
 def slug(title: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", str(title).lower()).strip("-")
     return s[:SLUG_MAX].strip("-")

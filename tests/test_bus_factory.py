@@ -216,6 +216,18 @@ class Base(unittest.TestCase):
 
 
 class PullRequests(Base):
+    def test_old_merge_does_not_supersede_a_regression_pull_request(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["labels"].append({"name": "loom:regression"})
+        self.gh.events[5] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(1800)}]
+        self.gh.pull(49, 5, state="closed", merged_at=iso(3600))
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+
     def test_a_ready_pull_request_is_merged(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)

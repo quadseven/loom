@@ -2036,6 +2036,9 @@ class Station:
         target = self._terminal_label(pr)
         if target is None or target in labels:
             return
+        if target == "loom:merged" and str(pr.get("merged_at") or "") < tickets.latest_brief_at(
+                self.gh, repo, int(ticket["number"])):
+            return
         state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
                        "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
@@ -2051,8 +2054,8 @@ class Station:
         # Only a closed pull request changes a ticket. Those PRs are the most
         # recently updated closed ones, so one page of them is read, never the
         # repo's whole PR history. A merged one delivers the ticket even while
-        # a second PR for it is still open (a duplicate lane run would
-        # otherwise keep taking fix rounds on work already on main); a closed
+        # a second PR for it is still open, unless the ticket was re-queued
+        # after that merge. A closed
         # unmerged one only counts for a ticket with no open PR left.
         open_prs = [p for p in self._open_pulls(repo)
                     if isinstance(p, dict) and p.get("state", "open") == "open"]

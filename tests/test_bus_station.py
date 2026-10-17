@@ -406,6 +406,21 @@ class Base(unittest.TestCase):
 
 
 class ReconcilePullRequestTest(Base):
+    def test_old_merge_does_not_complete_a_requeued_regression(self):
+        self.fake.add(12, state="pr", events=[{
+            "event": "labeled", "label": {"name": "loom:briefed"},
+            "created_at": "2030-01-03T00:00:00Z"}])
+        self.fake.issues[12]["labels"].append({"name": "loom:regression"})
+        self.fake.pulls = [
+            {"number": 99, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+             "body": "Refs %s#12" % REPO, "head": {"ref": "loom/12-first"}},
+            {"number": 100, "state": "open", "user": {"login": AUTHORS[0]},
+             "body": "Refs %s#12" % REPO,
+             "head": {"ref": "loom/12-regression", "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
     def test_trusted_same_repo_open_pr_promotes_queued_ticket(self):
         self.fake.add(12, state="queued")
         self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
@@ -487,6 +502,8 @@ class ReconcilePullRequestTest(Base):
                 raise station.GitHubError("server error", 500)
             if path == "/repos/%s/issues" % next_repo:
                 return reply(200, [next_ticket])
+            if path == "/repos/%s/issues/13/events" % next_repo:
+                return reply(200, [])
             if path == "/repos/%s/pulls" % next_repo:
                 return reply(200, [next_pr])
             if method == "PUT" and path == "/repos/%s/issues/13/labels" % next_repo:

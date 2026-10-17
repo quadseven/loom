@@ -621,6 +621,8 @@ fixes a measured regression of ticket M:
   cap. The slot never becomes room for new work.
 - Briefing the same regression again while its ticket is in flight files
   nothing and prints that ticket.
+- A pull request merged before the ticket's latest queue or brief event
+  cannot complete the re-queued ticket or supersede its newer pull request.
 
 ## Red default branch
 
