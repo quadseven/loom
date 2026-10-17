@@ -213,6 +213,8 @@ ADOPTS_MARKER = "<!-- loom:adopts pr=%d -->"
 ADOPT_TITLE = "Land or supersede #%d"
 ADOPT_TITLE_MAX = 200
 ADOPTIONS_FILE = "adoptions.json"
+# Issues another operator's Loom owns, each logged once (docs/LANES.md).
+OWNED_FILE = "owned.json"
 ADOPT_RETRY = 600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
@@ -948,6 +950,8 @@ class Station:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._branch_cache: Dict[str, str] = {}
+        # Repos whose claim:<login> label this pass has made sure of.
+        self._claim_labels: set = set()
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -1095,6 +1099,39 @@ class Station:
         seen[key] = {"sha": sha, "updated_at": issue.get("updated_at")}
         _write_json(path, seen)
 
+    # -- another operator's issues (docs/LANES.md, Two Looms) -------------
+    def _note_owned(self, key: str, why: str) -> None:
+        """Log once per issue and reason that another operator owns it."""
+        path = os.path.join(self.state, OWNED_FILE)
+        seen = _read_json(path, {}, strict=False)
+        seen = seen if isinstance(seen, dict) else {}
+        if seen.get(key) != why:
+            _say("leaving %s alone: %s" % (key, why))
+            seen[key] = why
+            _write_json(path, seen)
+
+    def _owned_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """True when the issue or pull request is assigned to a login outside
+        LOOM_BRIEF_AUTHORS: another operator's Loom owns it."""
+        owner = tickets.owned_elsewhere(issue, self.s.authors)
+        if owner is None:
+            return False
+        self._note_owned("%s#%s" % (repo, issue.get("number")),
+                         "assigned to %s, not a LOOM_BRIEF_AUTHORS login" % owner)
+        return True
+
+    def _goal_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """True when the ticket's goal home names another operator."""
+        goal = self._goal_of(repo, issue)
+        if goal is None:
+            return False
+        home = self._parent(repo, goal)
+        if tickets.goal_ours(home, self.s.authors):
+            return False
+        self._note_owned("%s#%s" % (repo, issue.get("number")),
+                         "its goal #%d names operator %s" % (goal, tickets.goal_operator(home)))
+        return True
+
     # -- claims ---------------------------------------------------------
     def _write_brief(self, lane: str, name: str, text: str) -> str:
         os.makedirs(self.inbox(lane), exist_ok=True)
@@ -1176,9 +1213,13 @@ class Station:
         text = tickets.render_brief(repo, issue, lane, attempt, fix,
                                     checks, has_contract)
         claiming = self._write_brief(lane, name, text)
+        self._assign_operator(repo, issue)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
         if RUNNING not in labels:
             labels.append(RUNNING)
+        mark = self._claim_label(repo)
+        if mark and mark not in [n.lower() for n in labels]:
+            labels.append(mark)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
@@ -1195,6 +1236,38 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _assign_operator(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Assign a claimed issue to this Loom's operator login, so another
+        operator's Loom sees the claim before it acts. A refused assignment
+        is logged and the claim goes on."""
+        login = tickets.operator_login(self.s.authors)
+        if not login or login.lower() in tickets.assignees(issue):
+            return
+        number = int(issue["number"])
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/assignees" % (repo, number),
+                         {"assignees": [login]})
+        except GitHubError as err:
+            _say("could not assign %s#%d to %s: %s" % (repo, number, login, err))
+
+    def _claim_label(self, repo: str) -> Optional[str]:
+        """The claim:<operator login> label a claim adds, created in the repo
+        the first time this pass needs it; None without an operator login."""
+        login = tickets.operator_login(self.s.authors)
+        if not login:
+            return None
+        name = tickets.claim_label(login)
+        if repo not in self._claim_labels:
+            try:
+                self.gh.rest("POST", "/repos/%s/labels" % repo,
+                             {"name": name, "color": "c5def5",
+                              "description": "Claimed by this operator's Loom or sessions"})
+            except GitHubError as err:
+                if err.status != 422:  # 422: the label already exists
+                    _say("could not create label %s in %s: %s" % (name, repo, err))
+            self._claim_labels.add(repo)
+        return name
 
     def _contents_text(self, repo: str, path: str) -> Optional[str]:
         """Read a text file through GitHub contents; None means it is absent."""
@@ -1706,7 +1779,8 @@ class Station:
         allowed = {a.lower() for a in self.s.authors}
         found = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-                and tickets._login(i.get("user")) in allowed]
+                and tickets._login(i.get("user")) in allowed
+                and not self._owned_elsewhere(repo, i)]
 
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]]) -> set:
         """The lanes a queued ticket of the repo may be given: its model's
@@ -2005,6 +2079,8 @@ class Station:
                     free: List[str]) -> bool:
         if RUNAWAY in _label_names(issue):
             return False
+        if self._owned_elsewhere(repo, issue):
+            return False
         if self._skip_known(repo, issue):
             return False
         try:
@@ -2020,6 +2096,8 @@ class Station:
         if not ok:
             self._refuse(repo, issue, reason)
             return False
+        if self._goal_elsewhere(repo, issue):
+            return False
         waiting, released = tickets.after_holds(repo, headers, self._dependency)
         if released and not waiting:
             self._release_hold(repo, issue, released)
@@ -2031,6 +2109,8 @@ class Station:
         labelled_lane = _lane_of(issue)
         if not self._still_ours(fresh, labelled_lane or lane):
             _say("%s#%s changed before the claim; leaving it" % (repo, issue["number"]))
+            return False
+        if self._owned_elsewhere(repo, fresh):
             return False
         if (fresh.get("body") or "") != (issue.get("body") or "") \
                 or fresh.get("updated_at") != issue.get("updated_at"):
@@ -2313,7 +2393,7 @@ class Station:
         found = [pr for pr in self._open_pulls(repo)
                  if isinstance(pr, dict) and pr.get("state", "open") == "open"
                  and not pr.get("draft") and tickets._login(pr.get("user")) in authors
-                 and brain._same_repo(repo, pr, {})]
+                 and brain._same_repo(repo, pr, {}) and not self._owned_elsewhere(repo, pr)]
         return sorted(found, key=lambda pr: (str(pr.get("created_at") or ""),
                                              int(pr.get("number") or 0)))
 
@@ -3850,9 +3930,18 @@ class Station:
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
         data = self.gh.paginate(
             "/repos/%s/issues?labels=loom:goal&state=open&per_page=100" % repo)
-        return [i for i in (data if isinstance(data, list) else [])
-                if isinstance(i, dict) and "pull_request" not in i
-                and str(i.get("number")).isdigit()]
+        found = [i for i in (data if isinstance(data, list) else [])
+                 if isinstance(i, dict) and "pull_request" not in i
+                 and str(i.get("number")).isdigit()]
+        # A goal home that names another operator is that operator's Loom's.
+        ours = []
+        for issue in found:
+            if tickets.goal_ours(issue, self.s.authors):
+                ours.append(issue)
+            else:
+                self._note_owned("%s#%s" % (repo, issue["number"]),
+                                 "goal home names operator %s" % tickets.goal_operator(issue))
+        return ours
 
     @staticmethod
     def _report_id(comment: Dict[str, Any]) -> int:

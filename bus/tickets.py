@@ -571,6 +571,79 @@ def trusted(issue: Dict[str, Any], events: List[Dict[str, Any]],
     return True, "ok"
 
 
+def assignees(issue: Dict[str, Any]) -> List[str]:
+    """The lower-case logins an issue or pull request is assigned to."""
+    found = [_login(a) for a in issue.get("assignees") or [] if isinstance(a, dict)]
+    if not found and isinstance(issue.get("assignee"), dict):
+        found = [_login(issue["assignee"])]
+    return [login for login in found if login]
+
+
+CLAIM_LABEL_PREFIX = "claim:"
+
+
+def claim_label(login: str) -> str:
+    """The label that marks an issue claimed by an operator login."""
+    return CLAIM_LABEL_PREFIX + login.lower()
+
+
+def claimed_by(issue: Dict[str, Any]) -> List[str]:
+    """The lower-case logins named by the issue's claim:<login> labels."""
+    found = []
+    for label in issue.get("labels") or []:
+        name = str(label.get("name") if isinstance(label, dict) else label or "")
+        if name.lower().startswith(CLAIM_LABEL_PREFIX) and len(name) > len(CLAIM_LABEL_PREFIX):
+            found.append(name[len(CLAIM_LABEL_PREFIX):].strip().lower())
+    return [login for login in found if login]
+
+
+def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str]) -> Optional[str]:
+    """The login that owns an issue when it is another operator's, else None.
+
+    An issue assigned to a login, or carrying a claim:<login> label, belongs
+    to that login (docs/LANES.md, "Two Looms on shared repos"). A Loom acts
+    only on issues with no owner and on issues with at least one owner among
+    its own operator logins (LOOM_BRIEF_AUTHORS); anything else is left
+    alone."""
+    logins = assignees(issue) + claimed_by(issue)
+    if not logins:
+        return None
+    allowed = {a.lower() for a in authors}
+    if any(login in allowed for login in logins):
+        return None
+    return logins[0]
+
+
+# A goal home may name the operator whose Loom works it, near the top of its
+# body (before its first heading), as it may name a Trunk: branch.
+_OPERATOR_RE = re.compile(r"^Operator:[ \t]*([A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?)[ \t]*$")
+
+
+def goal_operator(issue: Dict[str, Any]) -> Optional[str]:
+    """The lower-case login an Operator: line in a goal home's header names,
+    or None when the header has none."""
+    for line in str(issue.get("body") or "").splitlines():
+        if line.startswith("#"):
+            break
+        m = _OPERATOR_RE.match(line.strip())
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def goal_ours(issue: Dict[str, Any], authors: Iterable[str]) -> bool:
+    """Whether this Loom works the goal home: it names no operator (it then
+    belongs to every LOOM_BRIEF_AUTHORS login), or it names one of them."""
+    operator = goal_operator(issue)
+    return operator is None or operator in {a.lower() for a in authors}
+
+
+def operator_login(authors: Iterable[str]) -> Optional[str]:
+    """The login a claim assigns its issue to: the first LOOM_BRIEF_AUTHORS
+    login that is not an app's ("[bot]"), since GitHub cannot assign an app."""
+    return next((a for a in authors if a and not a.lower().endswith("[bot]")), None)
+
+
 def not_before(headers: Dict[str, str]) -> Optional[float]:
     """The ticket's Not before: time as epoch seconds, or None."""
     value = headers.get("Not before")

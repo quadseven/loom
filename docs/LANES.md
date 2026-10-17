@@ -331,6 +331,36 @@ home title. A failed line is retried on the next pass; once the line is out,
 a failed thread is only logged, so the line is never posted twice. Every
 station post, through the webhook or the bot, suppresses link previews.
 
+### Two Looms on shared repos
+
+Two operators may each run a Loom against the same repos. Each Loom works
+only what is its own, and adding an operator is configuration:
+
+- An issue or pull request assigned to a GitHub login belongs to that login.
+  So does one carrying a `claim:<login>` label, which marks claims an
+  operator's own sessions make outside a Loom. A Loom acts only on ones with
+  no owner and on ones with an owner among its own logins
+  (`LOOM_BRIEF_AUTHORS`). Triage, rewrite, the factory's queue
+  routing and pull request pass, `bus.brain move`, the station's claim, pull
+  request adoption and the verify picker all skip one assigned to anyone
+  else. The station logs each skip once (`state/station/owned.json`).
+- When the station claims a ticket, it assigns the issue to its operator
+  login, the first `LOOM_BRIEF_AUTHORS` login that is not an app (`[bot]`),
+  before it relabels it, and adds `claim:<that login>` with the relabel
+  (creating the label in the repo once a pass if it is missing), so the other
+  Loom sees the claim before it acts and a label search lists every claim. A
+  refused assignment is logged and the claim goes on.
+- A goal home may name its operator with an `Operator: <login>` line in its
+  header, above the first heading (as `Trunk:` is written). A Loom works only
+  goal homes that name one of its own logins, or name none: a goal home with
+  no such line belongs to every `LOOM_BRIEF_AUTHORS` login, as before. The
+  station leaves another operator's goal home out of triage, rewrites,
+  adoption, reports, standups and invariants, and claims no ticket under it.
+
+Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
+other's login. A person working a ticket by hand claims it the same way:
+assign it to yourself and add `claim:<your login>` before any Loom briefs it.
+
 ### Verify runs
 
 A slot of a lane that is not Anthropic (`anthropic*` and `claude` never take

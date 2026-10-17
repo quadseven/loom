@@ -857,8 +857,12 @@ class Factory:
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
+        """Opened by a trusted login, and not assigned to another operator
+        (docs/LANES.md, Two Looms on shared repos): that operator's Loom
+        moves it, not this one. The station logs each such skip once."""
         login = str((item.get("user") or {}).get("login") or "").lower()
-        return bool(login) and login in self.trusted
+        return (bool(login) and login in self.trusted
+                and tickets.owned_elsewhere(item, self.trusted) is None)
 
     def _dependency(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
         """The ticket an After: line names, read once a pass; None when it

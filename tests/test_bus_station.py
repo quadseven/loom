@@ -199,6 +199,9 @@ class FakeGitHub:
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
+        if method == "POST" and rest == "labels":
+            self.made_labels = getattr(self, "made_labels", []) + [data["name"]]
+            return reply(201, data)
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         if method == "GET" and rest.startswith("compare/"):
@@ -368,6 +371,10 @@ class FakeGitHub:
             return reply(201, {})
         if method in ("POST", "PUT") and sub == "labels":
             return self._update_labels(method, n, data)
+        if method == "POST" and sub == "assignees":
+            have = self.issues[n].setdefault("assignees", [])
+            have += [{"login": x} for x in data["assignees"]]
+            return reply(201, self.issues[n])
         raise AssertionError("unexpected issue call %s %s/%s" % (method, n, sub))
 
 
@@ -1943,7 +1950,8 @@ class ClaimTest(Base):
             text = fh.read()
         self.assertEqual(text, tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
         self.assertIn("Issue: %s#12" % REPO, text)
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
+                                               "claim:alice-example"])
         puts = [p for p in self.fake.paths("PUT")]
         self.assertEqual(puts, ["/repos/%s/issues/12/labels" % REPO])
         sha = __import__("hashlib").sha256(BODY.encode()).hexdigest()[:12]
@@ -2169,7 +2177,8 @@ class ClaimTest(Base):
         # Still briefed: the next pass claims it, once.
         self.run_pass()
         self.assertEqual(self.listing(), [name + ".md"])
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
+                                               "claim:alice-example"])
         self.assertEqual(len(self.fake.comments[12]), 1)
 
     def test_a_claiming_file_whose_ticket_is_running_is_just_renamed(self):
@@ -2224,7 +2233,8 @@ class FixTest(Base):
         # A header-looking line in the findings is quoted, never a header.
         self.assertIn("\n    Branch: loom/evil\n", fix)
         self.assertNotIn("drive-by", text)
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
+                                               "claim:alice-example"])
 
     def assert_plain_brief(self):
         text = self.claimed_brief()
@@ -2406,7 +2416,8 @@ class RetryTest(Base):
         self.assertEqual(retry, ["Automatic retry 1 of 2 (transient): moved from lane codex to "
                                  "lane codex-2. Lane codex failed: [transient] agent exited 1"])
         # The same pass claims it for codex-2 as a new attempt.
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex-2", "loom:running"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex-2", "loom:running",
+                                               "claim:alice-example"])
         name = "example-owner.example-repo-12-r2"
         self.assertEqual(self.listing("codex-2"), [name + ".md"])
         with open(self.inbox("codex-2", name + ".md")) as fh:
@@ -5580,3 +5591,205 @@ class UnprovenGateTest(unittest.TestCase):
         self.assertEqual(station._ticket_goal({"body": "x", "parent_issue_url":
                              "https://api.github.com/repos/o/r/issues/41"}), 41)
         self.assertIsNone(station._ticket_goal({"body": "x"}))
+
+
+class TwoLoomsTest(Base):
+    """An issue or goal another operator owns is left alone (loom#649)."""
+
+    OTHER = "carol-example"
+
+    def run_quiet(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        return err.getvalue()
+
+    def assign(self, number, *logins):
+        self.fake.issues[number]["assignees"] = [{"login": x} for x in logins]
+
+    def test_a_ticket_assigned_to_another_operator_is_not_claimed(self):
+        self.fake.add(12)
+        self.assign(12, self.OTHER)
+        err = self.run_quiet()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:codex"])
+        self.assertEqual(self.fake.comments[12], [])
+        self.assertNotIn("/repos/%s/issues/12/assignees" % REPO, self.fake.paths("POST"))
+        self.assertIn("leaving %s#12 alone: assigned to %s" % (REPO, self.OTHER), err)
+        # The skip is logged once, not every pass.
+        self.assertNotIn("leaving %s#12 alone" % REPO, self.run_quiet())
+
+    def test_a_ticket_assigned_to_one_of_our_logins_is_claimed(self):
+        self.fake.add(12)
+        self.assign(12, "bob-example")
+        self.run_quiet()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_a_claim_assigns_the_ticket_to_the_operator_login(self):
+        self.settings.authors = ["loom-app[bot]"] + list(AUTHORS)
+        self.fake.add(12)
+        self.run_quiet()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertEqual(tickets.assignees(self.fake.issues[12]), ["alice-example"])
+
+    def test_a_claim_adds_and_creates_the_operator_claim_label(self):
+        self.fake.add(12)
+        self.run_quiet()
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertEqual(self.fake.made_labels, ["claim:alice-example"])
+
+    def test_a_claim_label_for_another_login_is_skipped_like_an_assignment(self):
+        self.settings.factory_on = True
+        self.fake.add(12)
+        self.fake.issues[12]["labels"].append({"name": "claim:" + self.OTHER})
+        self.fake.add(14, state="queued")
+        self.fake.issues[14]["labels"].append({"name": "claim:" + self.OTHER})
+        err = self.run_quiet()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(14))
+        self.assertIn("leaving %s#12 alone: assigned to %s" % (REPO, self.OTHER), err)
+
+    def test_a_claim_label_for_our_own_login_is_claimed(self):
+        self.fake.add(12)
+        self.fake.issues[12]["labels"].append({"name": "claim:Bob-Example"})
+        self.run_quiet()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
+    def test_triage_adoption_and_rewrite_skip_a_claim_label_for_another_login(self):
+        from bus import rewrite
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.add_open_issue(100, body=READY_BODY)
+        self.fake.open_issues[0]["labels"] = [{"name": "claim:" + self.OTHER}]
+        self.fake.issues[100]["labels"] = [{"name": "claim:" + self.OTHER}]
+        self.fake.comments.setdefault(99, [])
+        self.fake.pulls.append({
+            "number": 99, "state": "open", "title": "Tidy the docs",
+            "user": {"login": "alice-example"}, "body": "", "draft": False,
+            "created_at": "2030-01-01T00:00:00Z", "labels": [{"name": "claim:" + self.OTHER}],
+            "head": {"ref": "fix/stray-files", "repo": {"full_name": REPO}},
+            "base": {"ref": "main", "repo": {"full_name": REPO}}})
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS)}):
+            self.run_quiet()
+            gh = mock.Mock()
+            gh.paginate.return_value = [
+                {"number": 1, "labels": [{"name": "claim:" + self.OTHER}]},
+                {"number": 2, "labels": [{"name": "claim:alice-example"}]}]
+            self.assertEqual([i["number"] for i in rewrite.candidates(gh, REPO)], [2])
+        self.assertEqual(self.fake.names(100), ["claim:" + self.OTHER])
+        self.assertEqual([c for c in self.fake.created
+                          if c["title"].startswith("Land or supersede #")], [])
+
+    def test_a_queued_ticket_assigned_elsewhere_gets_no_lane(self):
+        self.settings.factory_on = True
+        self.fake.add(12, state="queued")
+        self.assign(12, self.OTHER)
+        self.fake.add(13, state="queued")
+        self.run_quiet()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(13))
+
+    def test_triage_skips_an_issue_assigned_elsewhere(self):
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.add_open_issue(100, body=READY_BODY)
+        self.fake.add_open_issue(101, body="It is slow.")
+        self.fake.open_issues[0]["assignees"] = [{"login": self.OTHER}]
+        self.fake.open_issues[1]["assignees"] = [{"login": self.OTHER}]
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS)}):
+            self.run_quiet()
+        self.assertEqual(self.fake.names(100), [])
+        self.assertEqual(self.fake.names(101), [])
+        self.assertEqual(self.fake.comments[101], [])
+
+    def test_adoption_skips_a_pull_request_assigned_elsewhere(self):
+        self.fake.add_goal(30)
+        self.fake.comments.setdefault(99, [])
+        self.fake.pulls.append({
+            "number": 99, "state": "open", "title": "Tidy the docs",
+            "user": {"login": "alice-example"}, "body": "", "draft": False,
+            "created_at": "2030-01-01T00:00:00Z", "assignees": [{"login": self.OTHER}],
+            "head": {"ref": "fix/stray-files", "repo": {"full_name": REPO}},
+            "base": {"ref": "main", "repo": {"full_name": REPO}}})
+        self.run_quiet()
+        self.assertEqual([c for c in self.fake.created
+                          if c["title"].startswith("Land or supersede #")], [])
+
+    def test_the_verify_picker_skips_a_shipped_ticket_assigned_elsewhere(self):
+        self.fake.private = False
+        self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(30))
+        self.assign(2, self.OTHER)
+        self.run_quiet()
+        self.assertEqual([n for n in self.listing() if n.endswith(".md")], [])
+
+    def test_a_goal_home_naming_another_operator_is_not_worked(self):
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.goals[0]["body"] = "Operator: %s\n\n## Destination\nAll of it." % self.OTHER
+        self.fake.add_open_issue(100, body=READY_BODY)
+        err = self.run_quiet()
+        self.assertEqual(self.fake.names(100), [])
+        self.assertIn("leaving %s#30 alone: goal home names operator %s" % (REPO, self.OTHER),
+                      err)
+
+    def test_a_goal_home_naming_our_operator_is_worked(self):
+        self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
+        self.fake.goals[0]["body"] = "Operator: Alice-Example\n\n## Destination\nAll of it."
+        self.fake.add_open_issue(100, body=READY_BODY)
+        self.run_quiet()
+        self.assertIn("loom:queued", self.fake.names(100))
+
+    def test_a_ticket_under_another_operators_goal_is_not_claimed(self):
+        self.fake.add_goal(30)
+        self.fake.issues[30]["body"] = "Operator: %s\n\n## Destination\nAll." % self.OTHER
+        self.fake.add(12, body=BODY + "\nPart of #30\n")
+        err = self.run_quiet()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("leaving %s#12 alone: its goal #30 names operator %s" % (REPO, self.OTHER),
+                      err)
+        self.fake.issues[30]["body"] = "Operator: alice-example\n\n## Destination\nAll."
+        self.fake.issues[12]["updated_at"] = "2030-01-02T00:00:00Z"
+        self.fake.version += 1
+        self.run_quiet()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
+
+class OwnershipHelpersTest(unittest.TestCase):
+    def test_owned_elsewhere(self):
+        self.assertIsNone(tickets.owned_elsewhere({}, AUTHORS))
+        self.assertIsNone(tickets.owned_elsewhere(
+            {"assignees": [{"login": "Bob-Example"}, {"login": "carol-example"}]}, AUTHORS))
+        self.assertEqual(tickets.owned_elsewhere(
+            {"assignees": [{"login": "carol-example"}]}, AUTHORS), "carol-example")
+        self.assertEqual(tickets.owned_elsewhere(
+            {"assignee": {"login": "carol-example"}}, AUTHORS), "carol-example")
+
+    def test_goal_operator_reads_only_the_header(self):
+        self.assertEqual(tickets.goal_operator({"body": "Trunk: side\nOperator: Carol-Example\n"}),
+                         "carol-example")
+        self.assertIsNone(tickets.goal_operator({"body": "## Rules\nOperator: carol-example\n"}))
+        self.assertTrue(tickets.goal_ours({"body": "## Destination\n"}, AUTHORS))
+        self.assertFalse(tickets.goal_ours({"body": "Operator: carol-example\n"}, AUTHORS))
+
+    def test_operator_login_skips_apps(self):
+        self.assertEqual(tickets.operator_login(["loom-app[bot]", "alice-example"]),
+                         "alice-example")
+        self.assertIsNone(tickets.operator_login([]))
+
+    def test_move_refuses_another_operators_ticket(self):
+        fake = FakeGitHub()
+        fake.add(12, state="queued")
+        fake.issues[12]["assignees"] = [{"login": "carol-example"}]
+        gh = GitHub("token", transport=fake)
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS)}):
+            with self.assertRaisesRegex(ValueError, "assigned to carol-example"):
+                brain.move(gh, REPO, 12, "briefed", lane="codex")
+        self.assertIn("loom:queued", fake.names(12))
+
+    def test_rewrite_candidates_skip_another_operators_issue(self):
+        from bus import rewrite
+        fake = mock.Mock()
+        fake.paginate.return_value = [
+            {"number": 1, "assignees": [{"login": "carol-example"}]},
+            {"number": 2, "assignees": []}]
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS)}):
+            self.assertEqual([i["number"] for i in rewrite.candidates(fake, REPO)], [2])

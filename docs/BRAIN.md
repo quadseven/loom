@@ -403,7 +403,11 @@ credentials, so the station takes a ticket only when all of these hold:
 - The repo owner is in `LOOM_REPO_OWNERS`, as for local briefs.
 
 A ticket that fails these is left alone and reported once in the station
-log; it is never claimed.
+log; it is never claimed. So is a ticket assigned to a login outside
+`LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
+another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
+shared repos"). A claim assigns the ticket to this Loom's operator login and
+labels it `claim:<that login>`.
 
 The brain applies the same rule to what it reads: issue bodies, comments and
 reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
