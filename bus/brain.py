@@ -432,7 +432,9 @@ def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> st
 def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                     node: Optional[Dict[str, Any]], bot: str, check: str) -> str:
     line = _pr_line(pr, node, bot)
-    if not line.endswith(" - READY") or change_class.class_of(pr) != "sensitive":
+    needs_review_check = (change_class.class_of(pr) == "sensitive"
+                          or _ticketless(repo, pr))
+    if not line.endswith(" - READY") or not needs_review_check:
         return line
     sha = str((pr.get("head") or {}).get("sha") or "")
     if sha and _review_check_passed(gh, repo, sha, check):
@@ -1840,7 +1842,7 @@ def merge(gh: GitHub, repo: str, number: int,
         association: Optional[Tuple[str, int]] = None
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
-        _validate_merge_pr(repo, pr, details)
+        _validate_merge_pr(repo, pr, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
@@ -1938,12 +1940,17 @@ def _await_settled(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     return pr, details
 
 
-def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> None:
+def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
+                       env: Optional[Dict[str, str]] = None) -> None:
     head_ref = str((pr.get("head") or {}).get("ref") or details.get("headRefName") or "")
+    trusted_lane_head = (
+        _ticket_association(repo, pr) is not None
+        and _pr_author(pr).lower() in {a.lower() for a in trusted_authors(env)})
     rules = [
         (pr.get("state") == "open", "pull request is not open"),
         (not (details.get("isDraft") or pr.get("draft")), "pull request is a draft"),
-        (head_ref.startswith("loom/"), "pull request head is not a loom branch"),
+        (head_ref.startswith("loom/") or trusted_lane_head,
+         "pull request head is not a loom branch"),
         (_same_repo(repo, pr, details), "pull request must use the same repository"),
         (pr.get("mergeable") is True,
          "pull request is not mergeable (GitHub may still be computing it)"),

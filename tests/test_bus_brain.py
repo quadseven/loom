@@ -678,7 +678,11 @@ class SensitiveResumeTests(unittest.TestCase):
     def _ticketless_report(self, node, env=None):
         routes = {("GET", "/repos/%s/issues" % REPO): reply(200, []),
                   ("GET", "/repos/%s/pulls" % REPO): reply(200, [self._ticketless_pr()]),
-                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p6": node}}})}
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p6": node}}}),
+                  ("GET", "/repos/%s/commits/head1/check-runs" % REPO):
+                      reply(200, {"check_runs": [{"name": brain.review_check_name(),
+                                                  "status": "completed",
+                                                  "conclusion": "success"}]})}
         routes.update(lanes_routes(()))
         report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
                               env=env or {"LOOM_BRIEF_AUTHORS": "example-brain"})
@@ -1023,6 +1027,39 @@ class SensitiveResumeTests(unittest.TestCase):
                     brain.merge(GitHub("t", transport=fake), REPO, 8,
                                 env={"LOOM_MERGE_SETTLE_SECONDS": "0"})
                 self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_trusted_lane_author_can_merge_a_ticket_linked_non_loom_head(self):
+        pr, query = self._merge_replies({
+            "pr": {"head": {"ref": "feature/lane-work", "sha": "checked",
+                             "repo": {"full_name": REPO}},
+                   "user": {"login": "example-brain"}},
+            "details": {"headRefName": "feature/lane-work"}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
+                    reply(204), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                             env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        self.assertTrue(result["merged"])
+
+    def test_untrusted_author_cannot_merge_a_ticket_linked_non_loom_head(self):
+        pr, query = self._merge_replies({
+            "pr": {"head": {"ref": "feature/lane-work", "sha": "checked",
+                             "repo": {"full_name": REPO}},
+                   "user": {"login": "example-stranger"}},
+            "details": {"headRefName": "feature/lane-work"}})
+        fake = Fake(pr, query)
+        with self.assertRaisesRegex(ValueError, "not a loom branch"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_ticketless_status_blocks_when_review_check_has_not_passed(self):
+        pr = {"number": 8, "title": "Docs", "labels": [{"name": "class:docs"}],
+              "head": {"sha": "head1"}}
+        fake = Fake(reply(200, {"check_runs": []}))
+        line = brain._status_pr_line(GitHub("t", transport=fake), REPO, pr,
+                                     ready_node(), "grug-tribe", "Grug - Elder")
+        self.assertIn("blocked: review check has not passed on the head commit", line)
 
     def test_good_merge_uses_checked_sha_then_deletes_and_moves_ticket(self):
         pr, query = self._merge_replies()
