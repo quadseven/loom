@@ -12,7 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
 from bus import brain, labels, tickets
@@ -23,6 +23,10 @@ from . import goals, views
 
 
 READ_WORKERS = 8
+# A goal home's title and parent are read again this often (seconds), and at
+# most this many goal homes are read in one pass when following parents up.
+GOAL_INFO_TTL = 3600
+GOAL_INFO_MAX = 200
 LOG = logging.getLogger(__name__)
 
 
@@ -121,7 +125,9 @@ class TicketStore:
         self._snapshot = {"tickets": {repo: None for repo in self.repos}, "errors": {},
                           "stale": False, "ready": False,
                           "improving": {"journals": [], "metrics_comments": []},
-                          "lanes": [], "pull_requests": [], "dashboard_errors": []}
+                          "lanes": [], "pull_requests": [], "dashboard_errors": [],
+                          "goal_context": {},
+                          "goal_context_error": "the dashboard has not read its sources yet"}
         self.operator_items = []
         self.human_counts = {}
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
@@ -237,6 +243,14 @@ class TicketStore:
                          "brain_step": None, "brain_step_error": skipped,
                          "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
                          "dashboard_errors": [skipped]})
+            # The goal cards keep the last pass that read them. Dropping them
+            # here left every Goals card at "-" with "No report on this goal
+            # in the last two weeks" whenever the budget dipped (2026-10-17).
+            previous = self._snapshot.get("goal_context")
+            data["goal_context"] = previous or {}
+            data["goal_context_error"] = self._snapshot.get("goal_context_error", "") if previous else (
+                "goal comments were not read: the GitHub request budget is below its floor"
+                " and no earlier pass read them")
             return
 
         journals, reports, metric_comments, prs, lanes = [], [], [], [], []
@@ -252,6 +266,14 @@ class TicketStore:
             errors.extend(found_errors)
         if status_home and tickets.REPO_RE.fullmatch(status_home):
             self._read_lane_status(status_home, lanes, errors)
+        # The comment feed keeps only LOOM_BRIEF_AUTHORS logins when that is
+        # set; the goal-home reads get the same filter here, before any view
+        # reads them (Floor standup and next move, Improving, Lanes, Goals),
+        # so a marker-shaped comment from anyone else counts nowhere.
+        trusted = {login.lower() for login in brain.trusted_authors()}
+        journals, reports, metric_comments, lanes = (
+            [c for c in found if _by_trusted(c, trusted)]
+            for found in (journals, reports, metric_comments, lanes))
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             pull_results = list(pool.map(self._pull_requests_for_repo, self.repos))
         for found, repo_errors in pull_results:
@@ -268,24 +290,74 @@ class TicketStore:
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
         rows = [row for found in data.get("tickets", {}).values() if found for row in found]
+        configured = set(self.repos) | {repo for repo, _ in homes}
+        titles, parents = self._goal_info(rows, configured)
+        # Reports on the goal homes read in full above count too: a goal home
+        # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
+        # comment feed failed this pass.
+        unread = dict(data.get("comment_errors") or {})
+        for repo in {str(row.get("goal") or "").partition("#")[0] for row in rows if row.get("goal")}:
+            if repo not in self.repos and (repo, None) not in homes:
+                unread.setdefault(repo, "%s comments: the repo is not in LOOM_REPOS, so its comments"
+                                        " are not read" % repo)
         data["goal_context"] = goals.goal_context(
-            rows, data.get("issue_comments", []), self._goal_titles(rows), metric_comments,
-            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc))
+            rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
+            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
+            parents=parents, unread=unread)
+        data["goal_context_error"] = ""
 
-    def _goal_titles(self, rows) -> Dict[str, Optional[str]]:
-        """Each goal issue's title, read once per process (titles rarely
-        change); an unreadable goal stays None and is read again next pass."""
-        cache = self.__dict__.setdefault("_titles", {})
-        for goal in {row["goal"] for row in rows if row.get("goal")}:
-            if cache.get(goal):
+    def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+        """Each goal home's title and the goal it rolls up into (a `Parent
+        goal:` line or a sub-issue parent), read for every goal the tickets
+        name and every parent above them. A goal home is read again after
+        GOAL_INFO_TTL (a parent line can be added at any time; a conditional
+        read of an unchanged issue costs no request budget); an unreadable
+        one stays None and is read again next pass.
+
+        A parent counts only in a repo the dashboard is configured for
+        (`configured`: LOOM_REPOS and the goal-home repos), and only when it is
+        itself a goal home: a goal the tickets name, or an issue labelled
+        loom:goal. Any other parent is never read, and the goal stays
+        top-level."""
+        configured = set(self.repos) if configured is None else set(configured)
+        cache = self.__dict__.setdefault("_goal_info_cache", {})
+        named = {row["goal"] for row in rows if row.get("goal")}
+        pending = sorted(named)
+        seen = set()
+        now = time.time()
+        while pending and len(seen) < GOAL_INFO_MAX:
+            goal = pending.pop(0)
+            if goal in seen:
                 continue
-            repo, _, number = goal.partition("#")
-            try:
-                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
-                cache[goal] = str(issue.get("title") or "") or None if isinstance(issue, dict) else None
-            except (GitHubError, OSError, ValueError):
-                cache[goal] = None
-        return dict(cache)
+            seen.add(goal)
+            entry = cache.get(goal)
+            if not entry or not entry.get("title") or now - entry.get("read_at", 0) >= GOAL_INFO_TTL:
+                entry = self._read_goal_home(goal, entry, now, configured)
+                cache[goal] = entry
+            if entry.get("parent") and entry["parent"] not in seen:
+                pending.append(entry["parent"])
+
+        def accepted(parent):
+            if not parent or parent.partition("#")[0] not in configured:
+                return None
+            return parent if parent in named or (cache.get(parent) or {}).get("is_goal") else None
+
+        titles = {goal: entry.get("title") for goal, entry in cache.items()}
+        parents = {goal: accepted(entry.get("parent")) for goal, entry in cache.items()}
+        return titles, parents
+
+    def _read_goal_home(self, goal, entry, now, configured):
+        repo, _, number = goal.partition("#")
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
+        except (GitHubError, OSError, ValueError):
+            # Keep what an earlier read found; try again next pass.
+            return dict(entry or {}, read_at=0)
+        if not isinstance(issue, dict):
+            return {"title": None, "parent": None, "is_goal": False, "read_at": 0}
+        return {"title": str(issue.get("title") or "") or None,
+                "parent": goals.parent_of(repo, issue, configured),
+                "is_goal": "loom:goal" in _label_names(issue), "read_at": now}
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
@@ -305,14 +377,17 @@ class TicketStore:
         since = (day - 2 * HOT_SPOT_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
         trusted = {login.lower() for login in brain.trusted_authors()}
         issue_comments, review_comments, errors = [], [], []
+        comment_errors = {}
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             results = list(pool.map(lambda repo: self._comments_for_repo(repo, since, trusted), self.repos))
-        for issues, reviews, error in results:
+        for repo, (issues, reviews, error) in zip(self.repos, results, strict=True):
             issue_comments.extend(issues)
             review_comments.extend(reviews)
             if error:
                 errors.append(error)
+                comment_errors[repo] = error
         data["issue_comments"], data["review_comments"] = issue_comments, review_comments
+        data["comment_errors"] = comment_errors
         data["hot_spots_error"] = "; ".join(errors) if errors else (
             "" if self.repos else "LOOM_REPOS is not set")
 
@@ -321,8 +396,7 @@ class TicketStore:
         issues, reviews = [], []
         try:
             found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and (
-                not trusted or str((c.get("user") or {}).get("login") or "").lower() in trusted)]
+            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
             found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
             reviews = [dict(c, repo=repo) for c in found if isinstance(c, dict)]
         except (GitHubError, OSError, ValueError) as exc:
@@ -480,6 +554,7 @@ class TicketStore:
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),
                 "goal_context": snapshot.get("goal_context", {}),
+                "goal_context_error": snapshot.get("goal_context_error", ""),
                 "operator_items": list(self.operator_items),
                 "dashboard_errors": snapshot.get("dashboard_errors", []),
                 "brain_step": snapshot.get("brain_step"),
@@ -488,6 +563,12 @@ class TicketStore:
                 "review_comments": snapshot.get("review_comments", []),
                 "hot_spots_error": snapshot.get("hot_spots_error", "the dashboard has not read its sources yet"),
                 "usage": usage_rows}
+
+
+def _by_trusted(comment: Dict[str, Any], trusted) -> bool:
+    """Whether a comment counts: any author when no LOOM_BRIEF_AUTHORS is set,
+    else only those logins (as the comment feed reads them)."""
+    return not trusted or str((comment.get("user") or {}).get("login") or "").lower() in trusted
 
 
 def journal_next(body: str) -> Optional[str]:
