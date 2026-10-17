@@ -1163,6 +1163,7 @@ class HandoffFake:
         self.writes = []
         self.comment_reads = 0
         self.rules_refs = []
+        self.post_no_id = False
         self.muse = base64.b64encode(b"# Muse\n\n## Rules\n\n- Write ASCII only.\n").decode()
 
     def touch(self, at):
@@ -1187,7 +1188,7 @@ class HandoffFake:
             self.comments.append({"id": 900 + len(self.writes), "user": {"login": AUTHORS[0]},
                                   "created_at": "2030-01-01T00:00:00Z", "body": data["body"]})
             self.touch("2030-01-01T12:00:%02dZ" % len(self.writes))
-            return mock.Mock(status=201, data=self.comments[-1])
+            return mock.Mock(status=201, data={} if self.post_no_id else self.comments[-1])
         if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO):
             self.writes.append((method, path))
             found = next(c for c in self.comments if c["id"] == int(path.rsplit("/", 1)[1]))
@@ -1325,6 +1326,19 @@ class HandoffPacketTest(unittest.TestCase):
         st.publish_handoff()
         self.assertEqual([head], self.gh.rules_refs)
         self.assertIn("## Rules (docs/MUSE.md at %s)" % head, self.packets()[0]["body"])
+
+    def test_a_post_answered_without_an_id_never_leads_to_a_second_packet(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one")
+        self.gh.post_no_id = True
+        self.run_pass()
+        self.gh.post_no_id = False
+        self.gh.journal("lane-machine", "2030-01-01T12:12:00Z", "- Decided: briefed two")
+        self.run_pass(minutes=12)
+        # The post changed the home, so the next build reads it again and
+        # finds the packet it posted: an edit, not a second post.
+        self.assertEqual(["POST", "PATCH"], [method for method, _ in self.gh.writes])
+        self.assertEqual(1, len(self.packets()))
+        self.assertIn("briefed two", self.packets()[0]["body"])
 
     def test_a_marked_comment_from_a_stranger_is_not_the_packet(self):
         self.gh.comments.append({"id": 5, "user": {"login": "stranger"},
