@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, _next_link, token_from_env
+from .github import GitHub, GitHubError, _next_link, auth_from_env
 from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
 from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -3212,7 +3212,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gh: Optional[GitHub] = None
     try:
         args = parser().parse_args(argv)
-        gh = GitHub(token_from_env())
+        gh = GitHub(auth_from_env())
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:

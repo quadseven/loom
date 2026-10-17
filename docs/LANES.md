@@ -167,6 +167,23 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
 
+GitHub App: with `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (the name of the SSM parameter that holds the App's
+private key, never the key itself; region `LOOM_AWS_REGION`) all set, the
+station, the brain commands and any `bus` call in that environment send an
+App installation token instead, so their requests spend the installation's
+own hourly budget, not the operator account's. The token is minted at run
+time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
+CLI (key on stdin, never on the command line or on disk), and
+`POST /app/installations/<id>/access_tokens` returns a token kept in memory
+until 5 minutes before its `expires_at`. Mints count under `app token` in the
+requests line, and the budget line reads `GitHub App budget`. With any of the
+three unset, the token above is used as before. The App needs contents,
+issues and pull requests read and write, and checks and actions read, on the
+scanned repos. The dashboard takes the same three settings when its host has
+the `openssl` and `aws` CLIs, and otherwise keeps
+`LOOM_DASHBOARD_GITHUB_TOKEN`.
+
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 It skips future `Not before:` times and tickets without a readable Difficulty.

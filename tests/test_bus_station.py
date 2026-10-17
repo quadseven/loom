@@ -1169,6 +1169,40 @@ class BudgetTest(Base):
         self.assertNotIn("budget low", err)
         self.assertIn("budget 4000 of 5000 left", err)
 
+    def test_on_a_github_app_the_budget_line_names_the_app_budget(self):
+        from bus.github import AppToken
+        self.settings.status_repo = REPO
+        transport, _ = self.low(remaining=4000)
+        bearers = []
+
+        def app_transport(method, url, headers_in, body):
+            if method == "POST" and "/app/installations/" in url:
+                answer = {"token": "ghs_" + "x" * 396, "expires_at": "2099-01-01T00:00:00Z"}
+                return 201, {}, json.dumps(answer).encode()
+            bearers.append(headers_in["Authorization"])
+            return transport(method, url, headers_in, body)
+        app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
+        gh, err = self.passes(gh=GitHub(app, transport=app_transport))
+        self.assertEqual(app.minted, 1)
+        self.assertEqual(set(bearers), {"Bearer ghs_" + "x" * 396})
+        self.assertIn("app token 1", err)
+        self.assertIn("GitHub App budget 4000 of 5000 left", err)
+
+    def test_a_refused_app_token_is_logged_with_its_reason_and_sends_nothing_else(self):
+        from bus.github import AppToken
+        self.settings.status_repo = REPO
+        sent = []
+
+        def refusing(method, url, headers_in, body):
+            sent.append((method, headers_in.get("Authorization", "")))
+            return 401, {}, json.dumps({"message": "Bad credentials"}).encode()
+        app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
+        _, err = self.passes(gh=GitHub(app, transport=refusing))
+        self.assertIn("could not mint the GitHub App installation token", err)
+        self.assertIn("(Bad credentials)", err)
+        # Every request was a mint: none went out with a personal token.
+        self.assertEqual({m for m, _ in sent}, {"POST"})
+
     def test_an_idle_repo_is_scanned_once_per_ten_minutes(self):
         start = time.time()
         self.passes(now=start)

@@ -6,6 +6,7 @@ import json
 import ipaddress
 import logging
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -15,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlsplit
 
 from bus import brain, labels, tickets
-from bus.github import DEFAULT_API, GitHub, GitHubError
+from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
 from . import goals, views
@@ -28,6 +29,24 @@ LOG = logging.getLogger(__name__)
 def repos_from_env() -> List[str]:
     return [repo for repo in os.environ.get("LOOM_REPOS", "").split()
             if tickets.REPO_RE.fullmatch(repo)]
+
+
+def app_from_env(env: Optional[Dict[str, str]] = None) -> Optional[AppToken]:
+    """The GitHub App installation token when the App settings are present
+    and this host can mint one (the openssl and aws CLIs sign the JWT and
+    read the key); else None, and the dashboard keeps its own token."""
+    try:
+        app = AppToken.from_env(env)
+    except GitHubError as exc:
+        LOG.warning("ignoring the GitHub App settings: %s", exc)
+        return None
+    if app is None:
+        return None
+    missing = [tool for tool in ("openssl", "aws") if shutil.which(tool) is None]
+    if missing:
+        LOG.warning("GitHub App settings ignored: %s not installed", " and ".join(missing))
+        return None
+    return app
 
 
 def _label_names(issue: Dict[str, Any]) -> List[str]:
@@ -81,6 +100,7 @@ class TicketStore:
                  budget_floor: Optional[int] = None) -> None:
         self.repos = list(repos if repos is not None else repos_from_env())
         token = os.environ.get("LOOM_DASHBOARD_GITHUB_TOKEN", "").strip()
+        app = app_from_env() if gh is None else None
         if gh is None:
             api = os.environ.get("LOOM_DASHBOARD_GITHUB_API", DEFAULT_API)
             parsed_api = urlsplit(api)
@@ -93,7 +113,7 @@ class TicketStore:
             if parsed_api.scheme != "https" and not (
                     parsed_api.scheme == "http" and loopback_test_api):
                 raise ValueError("GitHub API base must use https, or a loopback HTTP URL for tests")
-            gh = GitHub(token, api=api,
+            gh = GitHub(app if app is not None else token, api=api,
                         cache_dir=tempfile.gettempdir() + "/loom-dashboard-github-cache")
         self.gh = gh
         self.budget_floor = (int(os.environ.get("LOOM_DASHBOARD_BUDGET_FLOOR", "500"))
@@ -105,7 +125,7 @@ class TicketStore:
         self.operator_items = []
         self.human_counts = {}
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
-        self.auth = "token" if token else "none"
+        self.auth = "app" if getattr(gh, "auth", "") == "app" else "token" if token else "none"
         self._snapshot_lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()

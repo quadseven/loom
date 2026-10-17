@@ -798,7 +798,7 @@ class SensitiveResumeTests(unittest.TestCase):
             with open(path, "w") as fh:
                 fh.write(BODY)
             err = io.StringIO()
-            with unittest.mock.patch("bus.brain.token_from_env", return_value="t"), \
+            with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
                     unittest.mock.patch("bus.brain.GitHub") as client, \
                     contextlib.redirect_stderr(err):
                 client.return_value.requests = 0
@@ -2660,7 +2660,7 @@ class OnboardTests(unittest.TestCase):
     def test_command_line_prints_the_lines(self):
         fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
         with unittest.mock.patch.object(brain, "GitHub", lambda token: GitHub(token, transport=fake)), \
-                unittest.mock.patch.object(brain, "token_from_env", lambda: "t"), \
+                unittest.mock.patch.object(brain, "auth_from_env", lambda: "t"), \
                 unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""}), \
                 unittest.mock.patch("sys.stdout") as out:
             self.assertEqual(brain.main(["onboard", REPO]), 0)

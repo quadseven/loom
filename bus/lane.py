@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import change_class, hunt_plan, pr_repair, tickets
-from .github import GitHub, GitHubError, token_from_env
+from .github import GitHub, GitHubError, auth_from_env
 from .labels import REMOTE_LANES
 
 CLAIM_RE = re.compile(r"^<!-- loom:remote-claim v1 ([^ ]+) ([0-9]+) ([0-9.]+) -->$")
@@ -313,7 +313,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             repos = [r for r in args.repos.replace(",", " ").split() if r]
             if not repos:
                 raise ValueError("claim requires --repos or LOOM_REPOS")
-            gh = GitHub(token_from_env())
+            gh = GitHub(auth_from_env())
             result = claim(gh, repos, args.lane)
             if result:
                 print(json.dumps(result))
@@ -323,13 +323,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             status_repo = args.repo or (args.repos.replace(",", " ").split() or [""])[0]
             if not tickets.REPO_RE.fullmatch(status_repo):
                 raise ValueError("heartbeat without a ticket requires --repo or LOOM_STATUS_REPO")
-            gh = GitHub(token_from_env())
+            gh = GitHub(auth_from_env())
             lane_heartbeat(gh, status_repo, args.lane)
             return 0
         if not tickets.REPO_RE.fullmatch(repo) or not raw.isdigit():
             raise ValueError("expected OWNER/NAME#N")
         number = int(raw)
-        gh = GitHub(token_from_env())
+        gh = GitHub(auth_from_env())
         if args.command == "heartbeat":
             heartbeat(gh, repo, number, args.lane)
         else:

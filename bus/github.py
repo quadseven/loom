@@ -5,9 +5,17 @@ remembers the rate limit headers of the last response, and takes an
 injectable transport so tests never touch the network. With a cache folder
 set, every GET sends the ETag of the last answer to the same URL and a 304
 returns that answer: GitHub does not count a 304 against the hourly budget.
+
+With the GitHub App settings present (auth_from_env), requests carry an App
+installation token instead of a personal token, so they spend the
+installation's own hourly budget. The token is minted at run time from the
+App's private key, read from SSM, kept in memory only, and refreshed before
+it expires.
 """
 from __future__ import annotations
 
+import base64
+import calendar
 import hashlib
 import http.client
 import json
@@ -19,13 +27,20 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
 # A read that failed on the wire is tried again after these pauses (seconds).
 RETRY_DELAYS = (2.0, 6.0)
 RETRY_STATUSES = (502, 503, 504)
+# An installation token is minted again this many seconds before it expires.
+APP_TOKEN_MARGIN = 300
+# The App's JWT: issued a minute in the past (clock drift), valid 9 minutes.
+APP_JWT_BACKDATE = 60
+APP_JWT_LIFETIME = 540
+APP_SETTINGS = ("LOOM_GITHUB_APP_ID", "LOOM_GITHUB_APP_INSTALLATION_ID",
+                "LOOM_GITHUB_APP_KEY_SSM")
 
 Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
                      Tuple[int, Dict[str, str], bytes]]
@@ -120,12 +135,171 @@ def _json_or_none(text: str) -> Any:
         return None
 
 
+def read_ssm(name: str, region: str) -> str:
+    """A SecureString parameter, read the way lanes/run_lane.sh reads keys.
+    The read is bounded by TIMEOUT, so a hung call cannot stall a pass. The
+    error never carries the value."""
+    out = subprocess.run(
+        ["aws", "ssm", "get-parameter", "--region", region, "--name", name,
+         "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
+        capture_output=True, text=True, timeout=TIMEOUT)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise OSError("could not read the parameter from SSM")
+    return out.stdout.strip()
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+class SigningError(GitHubError):
+    """openssl_sign failed; its text never carries the key or openssl's output."""
+
+
+def openssl_sign(data: bytes, key: str) -> bytes:
+    """The RS256 (RSASSA-PKCS1-v1_5, SHA-256) signature of data.
+
+    The standard library cannot sign with RSA, so the openssl CLI does: the
+    private key goes in on stdin and the data on a pipe, so neither is on
+    the command line or on disk. openssl's own error text is never passed on."""
+    out: Optional[subprocess.CompletedProcess] = None
+    failure = ""
+    read_fd, write_fd = os.pipe()
+    try:
+        try:
+            # The JWT's header and claims fit in the pipe's buffer.
+            os.write(write_fd, data)
+        finally:
+            os.close(write_fd)
+        out = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-binary", "-sign", "/dev/stdin",
+             "/dev/fd/%d" % read_fd],
+            input=key.encode("utf-8"), capture_output=True, pass_fds=(read_fd,),
+            timeout=TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as err:
+        failure = "openssl could not run (%s)" % type(err).__name__
+    finally:
+        os.close(read_fd)
+    if out is None or out.returncode != 0 or not out.stdout:
+        raise SigningError(failure or "openssl failed (exit %d)" % (out.returncode if out else -1))
+    return out.stdout
+
+
+def _expiry(value: Any) -> float:
+    """expires_at ("2026-10-17T18:00:00Z") as epoch seconds."""
+    try:
+        return float(calendar.timegm(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    raise GitHubError("the installation token answer has no readable expires_at")
+
+
+class AppToken:
+    """A GitHub App installation token, minted from the App's private key.
+
+    The key is read through read_key each time a token is minted and dropped
+    after signing; the token is kept in memory until APP_TOKEN_MARGIN seconds
+    before its expires_at. Neither is written to disk, and no error or log
+    line carries either. Thread safe: parallel reads share one token."""
+
+    def __init__(self, app_id: str, installation_id: str,
+                 read_key: Callable[[], str],
+                 sign: Callable[[bytes, str], bytes] = openssl_sign,
+                 clock: Callable[[], float] = time.time) -> None:
+        if not (str(app_id).isdigit() and str(installation_id).isdigit()):
+            raise GitHubError("the GitHub App id and installation id must be numbers")
+        self.app_id = str(app_id)
+        self.installation_id = str(installation_id)
+        self._read_key = read_key
+        self._sign = sign
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._token: Optional[str] = None
+        self._expires = 0.0
+        self.minted = 0
+
+    @classmethod
+    def from_env(cls, env: Optional[Dict[str, str]] = None,
+                 read_key: Optional[Callable[[str, str], str]] = None
+                 ) -> Optional["AppToken"]:
+        """The App token the settings name, or None when any is unset."""
+        env = os.environ if env is None else env
+        app_id, installation_id, key_ssm = (env.get(n, "").strip() for n in APP_SETTINGS)
+        if not (app_id and installation_id and key_ssm):
+            return None
+        region = env.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
+        reader = read_key or read_ssm
+        return cls(app_id, installation_id, lambda: reader(key_ssm, region))
+
+    def jwt(self) -> str:
+        """The App's RS256 JWT, signed with the key read just now."""
+        now = int(self._clock())
+        header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"},
+                                    separators=(",", ":")).encode("utf-8"))
+        claims = _b64url(json.dumps({"iat": now - APP_JWT_BACKDATE,
+                                     "exp": now + APP_JWT_LIFETIME,
+                                     "iss": self.app_id},
+                                    separators=(",", ":")).encode("utf-8"))
+        signing_input = (header + "." + claims).encode("ascii")
+        # Only the failures a key read or a signing can have are caught: the
+        # reader's OSError (SSM unreadable, aws missing) or SubprocessError
+        # (timeout), and the signer's SigningError, OSError or SubprocessError.
+        # They are reported by kind, since their text could carry the key, and
+        # raised outside the except blocks so none is chained as context. Any
+        # other exception is a bug and propagates as itself.
+        failure = ""
+        try:
+            key = self._read_key()
+        except (OSError, subprocess.SubprocessError) as err:
+            failure = "could not read the GitHub App private key: %s" % type(err).__name__
+        if failure:
+            raise GitHubError(failure)
+        try:
+            signature = self._sign(signing_input, key)
+        except (SigningError, OSError, subprocess.SubprocessError) as err:
+            failure = "could not sign the GitHub App JWT: %s" % (
+                str(err) if isinstance(err, SigningError) else type(err).__name__)
+        finally:
+            del key
+        if failure:
+            raise GitHubError(failure)
+        return signing_input.decode("ascii") + "." + _b64url(signature)
+
+    def token(self, mint: Callable[[str, str], Tuple[str, Any]]) -> str:
+        """The cached installation token, minted again through mint(path,
+        jwt) -> (token, expires_at) when none is held or it expires within
+        APP_TOKEN_MARGIN seconds."""
+        with self._lock:
+            if self._token is None or self._clock() >= self._expires - APP_TOKEN_MARGIN:
+                path = "/app/installations/%s/access_tokens" % self.installation_id
+                token, expires_at = mint(path, self.jwt())
+                self._token, self._expires = token, _expiry(expires_at)
+                self.minted += 1
+            return self._token
+
+    def invalidate(self) -> None:
+        """Forget the token (GitHub refused it): the next request mints one."""
+        with self._lock:
+            self._token = None
+            self._expires = 0.0
+
+    def __repr__(self) -> str:
+        return "AppToken(installation)"
+
+
+Auth = Union[str, AppToken]
+
+
 class GitHub:
-    def __init__(self, token: str, api: str = DEFAULT_API,
+    def __init__(self, token: Auth, api: str = DEFAULT_API,
                  transport: Optional[Transport] = None,
                  cache_dir: Optional[str] = None,
                  sleep: Callable[[float], None] = time.sleep) -> None:
+        # A personal token string, or an AppToken minted on first use.
         self._token = token
+        self.app: Optional[AppToken] = token if isinstance(token, AppToken) else None
+        # What the budget lines name: an App installation or a personal token.
+        self.auth = "app" if self.app is not None else "token"
         self._sleep = sleep
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
@@ -161,6 +335,9 @@ class GitHub:
         cached = self._cached(url) if method == "GET" and not etag else None
         headers, payload = self._request(body, etag or (cached or {}).get("etag"))
         status, resp_headers, text = self._send(method, url, headers, payload)
+        if status == 401 and self.app is not None:
+            # A revoked or early-expired installation token: mint a new one next.
+            self.app.invalidate()
         if not (200 <= status < 300 or status == 304 or status in ok):
             raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
         if status == 304 and cached is not None:
@@ -174,7 +351,7 @@ class GitHub:
                  if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
         """The headers and encoded body for one request."""
         headers = {
-            "Authorization": "Bearer " + self._token,
+            "Authorization": "Bearer " + self._bearer(),
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "loom-bus",
@@ -186,6 +363,40 @@ class GitHub:
         if if_none_match:
             headers["If-None-Match"] = if_none_match
         return headers, payload
+
+    def _bearer(self) -> str:
+        """The token for the Authorization header."""
+        if self.app is None:
+            return str(self._token)
+        return self.app.token(self._mint_app_token)
+
+    def _mint_app_token(self, path: str, jwt: str) -> Tuple[str, Any]:
+        """POST for a new installation token, authenticated with the App's
+        JWT: (token, expires_at). Counted as a request under "app token";
+        its rate headers are the App's own and leave self.rate alone."""
+        headers = {"Authorization": "Bearer " + jwt,
+                   "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28",
+                   "User-Agent": "loom-bus"}
+        url = self._url(path)
+        status, _, raw = self._transport_with_retry("POST", url, headers, None)
+        with self._count_lock:
+            self.kinds["app token"] = self.kinds.get("app token", 0) + 1
+        text = (raw or b"").decode("utf-8", "replace")
+        data = _json_or_none(text)
+        if status != 201 or not isinstance(data, dict):
+            # GitHub's own reason ("Bad credentials", "Integration not found")
+            # goes into the error the station logs; there is no fallback to
+            # the personal token, which would drain the shared budget unseen.
+            reason = data.get("message") if isinstance(data, dict) else None
+            raise GitHubError("could not mint the GitHub App installation token: "
+                              "POST %s -> %d%s" % (path, status,
+                                                   " (%s)" % str(reason)[:200] if reason else ""),
+                              status, text)
+        token = data.get("token")
+        if not isinstance(token, str) or not token.strip():
+            raise GitHubError("the installation token answer has no token", status)
+        return token.strip(), data.get("expires_at")
 
     def _send(self, method: str, url: str, headers: Dict[str, str],
               payload: Optional[bytes]) -> Tuple[int, Dict[str, str], str]:
@@ -414,8 +625,15 @@ def _link(header: str, relation: str) -> Optional[str]:
     return None
 
 
+def auth_from_env(env: Optional[Dict[str, str]] = None) -> Auth:
+    """The GitHub App installation token when LOOM_GITHUB_APP_ID,
+    LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM are all set,
+    else the personal token token_from_env finds."""
+    app = AppToken.from_env(env)
+    return app if app is not None else token_from_env()
+
+
 def token_from_env() -> str:
-    import os
     for name in ("LOOM_GITHUB_TOKEN", "GITHUB_TOKEN"):
         value = os.environ.get(name, "").strip()
         if value:
