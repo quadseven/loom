@@ -56,7 +56,7 @@ def _interpreter(commands: List[str]) -> str:
 def _key_value(lines: List[str]) -> str:
     for line in lines:
         if not LEGACY.match(line):
-            raise ValueError("has an unknown line '%s'" % line[:40])
+            raise ValueError("has an unknown line '%s'" % line)
     return "\n".join(lines) + "\n"
 
 
@@ -72,7 +72,7 @@ def _from_tables(lines: List[str]) -> List[Tuple[str, str]]:
         if cmd and kind:
             found.append((kind, cmd.group(1).replace('\\"', '"').replace("\\\\", "\\")))
         elif not re.match(r"^(workflow|step)\s*=", line):
-            raise ValueError("has an unknown line '%s'" % line[:40])
+            raise ValueError("has an unknown line '%s'" % line)
     return found
 
 
@@ -81,7 +81,7 @@ def _from_pipes(lines: List[str]) -> List[Tuple[str, str]]:
     for line in lines:
         fields = [f.strip() for f in line.split("|")]
         if len(fields) < 2 or not fields[1]:
-            raise ValueError("has an unknown line '%s'" % line[:40])
+            raise ValueError("has an unknown line '%s'" % line)
         found.append((fields[0], fields[1]))
     return found
 

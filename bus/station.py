@@ -197,9 +197,19 @@ PIN_SHIPS_FILE = "pin_ships.json"
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
-CLASS_RE = re.compile(r"^\[(limit|transient|work)\] ")
+# A [factory] brief is not a failure at all: the validation environment the
+# factory broke (a contract the runner cannot read, a check it cannot run,
+# a base check already red), so the ticket stays running on its lane and
+# keeps its rung, and the brain re-queues it when the incident closes.
+CLASS_RE = re.compile(r"^\[(limit|transient|work|factory)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
+# Where the runner files its validation incidents (lanes/run_lane.sh
+# FACTORY_REPO), and the marker and ticket line their bodies carry.
+FACTORY_REPO = "quadseven/loom"
+FACTORY_LABEL = "loom:factory"
+INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
+HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
@@ -2228,6 +2238,89 @@ class Station:
             for issue in issues:
                 self._hand_back_ticket(repo, issue, prs, rounds)
 
+    def release_factory_held(self) -> None:
+        """Re-queue tickets a factory incident held once that incident is
+        closed: they kept their rung and need no re-brief. A claim newer
+        than the incident's close means the lane picked the ticket back up
+        itself, so the release leaves it alone. A failed read of the
+        incidents releases nothing this pass; the holds wait for the next."""
+        held = self._held_tickets()
+        if not held:
+            return
+        try:
+            closed_incidents = self._closed_incidents()
+        except GitHubError as err:
+            _say("factory release: could not read the closed incidents: %s" % err)
+            return
+        for key, info in list(held.items()):
+            self._release_held(key, info, closed_incidents)
+
+    def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
+        """Closed factory incidents the runner filed, by "owner/repo#n"."""
+        closed: Dict[str, Dict[str, Any]] = {}
+        for incident in self.gh.paginate(
+                "/repos/%s/issues?state=closed&labels=%s&per_page=100" % (FACTORY_REPO, FACTORY_LABEL)):
+            if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
+                closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
+        return closed
+
+    def _release_held(self, key: str, info: Any,
+                      closed_incidents: Dict[str, Dict[str, Any]]) -> None:
+        """Re-queue one held ticket if its incident is closed and named on
+        it; forget it once it is no longer running."""
+        repo, _, num = key.rpartition("#")
+        number = int(num) if num.isdigit() else 0
+        ref = info.get("incident") if isinstance(info, dict) else None
+        incident = closed_incidents.get(ref) if ref else None
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+            comments = self.gh.paginate(
+                "/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        except GitHubError as err:
+            _say("factory release: could not read %s#%d: %s" % (repo, number, err))
+            return
+        if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
+            self._forget_held(key)
+            return
+        if incident is None or not any(isinstance(c, dict) and ref in str(c.get("body") or "")
+                                       for c in comments):
+            return
+        if self._claimed_since(comments, incident):
+            return
+        self._relabel(repo, number, "loom:queued")
+        self._comment(repo, number,
+                      "Factory incident %s is closed: the ticket is back in the queue "
+                      "on its lane." % ref)
+        self._forget_held(key)
+        _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
+        """A lane claim comment is newer than the incident's close."""
+        from . import factory as _factory
+        closed = self._epoch(str(incident.get("closed_at") or ""))
+        return closed is not None and any(
+            isinstance(c, dict)
+            and _factory.CLAIMED_RE.fullmatch(str(c.get("body") or "").strip())
+            and (self._epoch(str(c.get("created_at") or "")) or 0) > closed
+            for c in comments)
+
+    def _held_tickets(self) -> Dict[str, Any]:
+        """Tickets the station held for a factory incident and has not yet
+        re-queued: key "%s#%d" to {"incident": "owner/repo#n"}."""
+        held = _read_json(os.path.join(self.state, "factory_held.json"), {})
+        return held if isinstance(held, dict) else {}
+
+    def _note_held(self, repo: str, number: int, incident: Optional[str]) -> None:
+        held = self._held_tickets()
+        held["%s#%d" % (repo, number)] = {"incident": incident, "at": self.now}
+        _write_json(os.path.join(self.state, "factory_held.json"), held)
+
+    def _forget_held(self, key: str) -> None:
+        held = self._held_tickets()
+        if key in held:
+            del held[key]
+            _write_json(os.path.join(self.state, "factory_held.json"), held)
+
     def _pr_tickets(self, repo: str) -> List[Dict[str, Any]]:
         issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % repo).data or []
         found = [i for i in issues if isinstance(i, dict) and "pull_request" not in i]
@@ -2463,6 +2556,18 @@ class Station:
             self._post_answers(repo, int(fix_pr), lane, name, text)
             self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
             return True
+        if klass == "factory":
+            # The validation environment the factory broke, not the ticket's
+            # work: the ticket stays running on its lane and keeps its rung.
+            # release_factory_held re-queues it when the incident closes.
+            match = HELD_FOR_RE.search(bare)
+            self._note_held(repo, number,
+                            "%s#%s" % (match.group(1), match.group(2)) if match else None)
+            self._comment(repo, number,
+                          "Lane %s held: %s. The ticket keeps its rung and returns to the "
+                          "queue when the factory incident closes." % (lane, bare))
+            _say("held %s#%d for the factory: %s" % (repo, number, reason))
+            return True
         if fix_pr:
             # A fresh attempt would open a second pull request for the ticket.
             # A work failure goes to loom:failed, where the factory climbs the
@@ -2491,6 +2596,10 @@ class Station:
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
+        if failure_class(reason) == "factory":
+            # An incident is the factory's problem repeating, not the lane's:
+            # it must never flag the ticket or cost it a rung.
+            return False
         authors = {author.lower() for author in self.s.authors}
         comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
@@ -3600,7 +3709,7 @@ class Station:
         if not self._backlog_scan_due(state):
             goals: Dict[str, Tuple[str, int, Any]] = {}
             for key, last in state.items():
-                if key == "_scanned":
+                if key.startswith("_"):
                     continue
                 repo, num = key.rsplit("#", 1)
                 goals[key] = (repo, int(num), last)
@@ -3612,14 +3721,30 @@ class Station:
             return None
         goals = {}
         keep = {"_scanned"}
+        fallback = []
+        repos_with_backlog = set()
         for repo, goal in homes:
             title = str(goal.get("title") or "")
             if not title.startswith("Backlog:"):
+                continue
+            repos_with_backlog.add(repo)
+            number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            keep.add(key)
+            goals[key] = (repo, number, state.get(key))
+        for repo, goal in homes:
+            if repo in repos_with_backlog or str(goal.get("title") or "").startswith("Backlog:"):
                 continue
             number = int(goal["number"])
             key = "%s#%d" % (repo, number)
             keep.add(key)
             goals[key] = (repo, number, state.get(key))
+            fallback.append(key)
+        if fallback:
+            keep.add("_fallback")
+            state["_fallback"] = fallback
+        else:
+            state.pop("_fallback", None)
         for stale in [k for k in state if k not in keep]:
             del state[stale]
         state["_scanned"] = self.now
@@ -3651,11 +3776,25 @@ class Station:
         goals = self._backlog_goals(state)
         if goals is None:
             return
+        fallback = set(state.get("_fallback", []))
         for key, (repo, number, last) in goals.items():
             if self._triage_recent(last):
                 continue
             try:
-                self._run_triage(key, repo, number)
+                if key in fallback:
+                    queued = self.gh.paginate(
+                        "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
+                    if len(queued if isinstance(queued, list) else []) >= 3:
+                        continue
+                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT,
+                                         comment_limit=5)
+                    counts = (sum(" queued under #" in line for line in lines),
+                              sum(" loom:triage" in line for line in lines),
+                              sum(" held:" in line for line in lines))
+                    _say("triage %s: %d queued, %d triage, %d held (goal home)" %
+                         (key, *counts))
+                else:
+                    self._run_triage(key, repo, number)
             except (GitHubError, OSError, ValueError) as err:
                 _say("triage %s failed: %s" % (key, err))
                 continue
@@ -3669,6 +3808,8 @@ class Station:
         state = _read_json(os.path.join(self.state, "triage.json"), {}, strict=False)
         goals = []
         for key in state if isinstance(state, dict) else []:
+            if key.startswith("_"):
+                continue
             repo, _, num = key.rpartition("#")
             if repo and num.isdigit():
                 goals.append((key, repo, int(num)))
@@ -4875,9 +5016,12 @@ class Station:
     def roll_source_pins(self) -> None:
         if self.s.roll_ship_docs:
             try:
-                roll_pin.run(self.gh, self.s.roll_ship_docs)
+                roll_pin.run(self.gh, self.s.roll_ship_docs, self.s.authors,
+                             self.s.review_check)
             except ValueError as err:
                 raise GitHubError("invalid roll ship document or pin: %s" % err) from err
+            except health.NotLooked as err:
+                raise GitHubError("roll family gate could not be read: %s" % err) from err
 
     def run_pass(self) -> None:
         self.finish_claims()
@@ -4908,7 +5052,8 @@ class Station:
                      self.health_intake,
                      self.post_metrics,
                      self.watch_brain, self.upload_transcripts, self.relay_operator,
-                     self.watch_default_branches, self.run_factory, self.check_invariants):
+                     self.watch_default_branches, self.run_factory, self.check_invariants,
+                     self.release_factory_held):
             if self._deferred():
                 break
             try:

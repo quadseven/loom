@@ -57,6 +57,7 @@ class FakeGitHub:
         self.created = []
         self.edits = []
         self.posts = []
+        self.factory_incidents = []
         self.asks = []
         self.humans = []
         self.digest_issues = []
@@ -174,6 +175,9 @@ class FakeGitHub:
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
             return reply(200, found) if found else reply(404, {"message": "Not Found"})
+        if (method == "GET" and parts.path == "/repos/%s/issues" % station.FACTORY_REPO
+                and ("labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query)):
+            return reply(200, self.factory_incidents)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
             return self._post_page(data)
@@ -965,12 +969,60 @@ class TriageTest(Base):
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
 
-    def test_a_non_backlog_goal_is_never_triaged(self):
+    def test_a_goal_without_backlog_home_is_triaged(self):
         self.fake.add_goal(31, title="Ship the thing")
         self.fake.add_open_issue(102, body="It is slow.")
         self.run_at()
-        self.assertEqual(len(self.triage_reads()), 0)
-        self.assertEqual(self.fake.names(102), [])
+        self.assertEqual(len(self.triage_reads()), 1)
+        self.assertIn("loom:triage", self.fake.names(102))
+
+    def test_a_goal_without_backlog_home_is_triaged_and_rewritten(self):
+        self.fake.add_goal(31, title="Ship the thing")
+        self.fake.add_open_issue(102, body=READY_BODY)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
+            st.triage_backlogs()
+        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT,
+                                       comment_limit=5)
+        self.assertIn("loom:queued", self.fake.names(102))
+        triage_json = os.path.join(self.home, "state", "station", "triage.json")
+        with open(triage_json) as fh:
+            self.assertIn("%s#31" % REPO, json.load(fh))
+        with mock.patch.object(st, "_rewrite_goal", return_value=0) as rewrite_goal:
+            st.s.rewrite_cmd = "agent"
+            st.rewrite_triaged()
+        self.assertEqual(rewrite_goal.call_args.args[0:3], ("%s#31" % REPO, REPO, 31))
+        rewrite_json = os.path.join(self.home, "state", "station", "rewrite.json")
+        with open(rewrite_json) as fh:
+            self.assertIn("%s#31" % REPO, json.load(fh))
+
+    def test_fallback_goal_waits_at_three_queued_and_caps_not_ready_comments(self):
+        self.fake.add_goal(31, title="Ship the thing")
+        for number in range(100, 106):
+            self.fake.add_open_issue(number, body="It is slow.", created="2030-01-%02dT00:00:00Z" % (number - 90))
+        self.fake.add(90, state="queued")
+        self.fake.add(91, state="queued")
+        self.fake.add(92, state="queued")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        original_paginate = st.gh.paginate
+        with mock.patch.object(st.gh, "paginate", side_effect=lambda path: (
+                [{}, {}, {}] if "labels=loom:queued" in path else original_paginate(path))):
+            st.triage_backlogs()
+        self.assertEqual([p for p in self.fake.paths("POST") if p.endswith("/comments")], [])
+        self.fake.issues[92]["labels"] = [{"name": "loom:ticket"}]
+        state_path = os.path.join(self.home, "state", "station", "triage.json")
+        with open(state_path) as fh:
+            state = json.load(fh)
+        state["_scanned"] = self.start - station.TRIAGE_INTERVAL - 1
+        with open(state_path, "w") as fh:
+            json.dump(state, fh)
+        with mock.patch.object(st.gh, "paginate", side_effect=lambda path: (
+                [] if "labels=loom:queued" in path else original_paginate(path))):
+            st.triage_backlogs()
+        comments = [p for p in self.fake.paths("POST") if p.endswith("/comments")]
+        self.assertEqual(len(comments), 5)
 
     def test_below_the_budget_floor_triage_is_deferred(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
@@ -2189,6 +2241,127 @@ class DeadLaneRunawayTest(Base):
         self.assertIn("loom:runaway", self.fake.names(12))
         self.assertEqual(
             [b for b in self.bodies() if b.startswith("<!-- loom:runaway-dead-lane v1")], [])
+
+
+class FactoryIncidentTest(Base):
+    """A [factory] brief is not a work failure: the ticket stays running on
+    its lane and keeps its rung, and a closed incident re-queues it."""
+
+    def failed(self, lane="muse", number=12, attempt=1, reason=None):
+        reason = reason or ("[factory] setup failed: validation environment unavailable: "
+                            "the check exited 127 on the unmodified base; "
+                            "factory incident %s#99" % REPO)
+        self.fake.add(number, lane=lane, body=PLAIN, state="running")
+        for _ in range(attempt):
+            self.fake.comments[number].append(
+                {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
+        name = tickets.ticket_name(REPO, number, attempt)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[number], lane, attempt, None))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: %s\n" % (name, lane, name, reason))
+        return name
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def incident(self, closed_at="2030-01-01T00:10:00Z"):
+        self.fake.factory_incidents = [{
+            "number": 99,
+            "title": "Factory incident: %s validation environment" % REPO,
+            "state": "closed", "closed_at": closed_at,
+            "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: environment\n"
+                     "Ticket: %s#12\n\ncheck: make check (exit 127)\n" % (REPO, REPO)),
+            "labels": [{"name": "loom:factory"}]}]
+
+    def test_factory_is_a_failure_class_not_work(self):
+        self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
+        self.assertEqual(station.failure_class("[work] agent made no commit"), "work")
+
+    def test_a_factory_failure_holds_the_ticket_and_keeps_its_rung(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "lane:muse", "loom:running"})
+        self.assertFalse(any(b.startswith("Automatic retry") for b in self.bodies()))
+        hold = [b for b in self.bodies() if "held" in b]
+        self.assertEqual(len(hold), 1)
+        self.assertIn("keeps its rung", hold[0])
+        self.assertIn("factory incident %s#99" % REPO, hold[0])
+
+    def test_factory_failures_never_flag_runaway(self):
+        self.heartbeat("muse")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.failed(attempt=3)
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane muse (body sha256 0123456789ab)",
+             "created_at": at, "user": {"login": "alice-example"}}
+            for _ in range(3)]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+
+    def test_a_closed_factory_incident_requeues_its_ticket(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertTrue(any("back in the queue" in b for b in self.bodies()))
+
+    def test_a_claim_newer_than_the_incident_close_blocks_the_requeue(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident(closed_at="2030-01-01T00:10:00Z")
+        self.fake.comments[12].append(
+            {"body": "Claimed for lane muse (body sha256 0123456789ab)",
+             "created_at": "2030-01-01T00:20:00Z", "user": {"login": "alice-example"}})
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertFalse(any("back in the queue" in b for b in self.bodies()))
+
+    def test_a_failed_incident_read_says_so_and_keeps_the_hold(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO), \
+                mock.patch.object(station.Station, "_closed_incidents",
+                                  side_effect=station.GitHubError("boom", 502)), \
+                mock.patch("bus.station._say") as say:
+            self.run_pass()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertIn("factory release: could not read the closed incidents: boom", said)
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertFalse(any("back in the queue" in b for b in self.bodies()))
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_failed_ticket_read_says_so_and_keeps_the_hold(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        for path in ("/repos/%s/issues/12" % REPO, "/repos/%s/issues/12/comments" % REPO):
+            def transport(method, url, headers, body, path=path):
+                if method == "GET" and urlsplit(url).path == path:
+                    raise station.GitHubError("boom", 502)
+                return self.fake(method, url, headers, body)
+            runner = station.Station(GitHub("token", transport=transport), self.settings)
+            with mock.patch.object(station, "FACTORY_REPO", REPO), \
+                    mock.patch("bus.station._say") as say:
+                runner.release_factory_held()
+            said = [c.args[0] for c in say.call_args_list]
+            self.assertIn("factory release: could not read %s#12: boom" % REPO, said)
+            self.assertIn("loom:running", self.fake.names(12))
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertIn("loom:queued", self.fake.names(12))
 
 
 class PruneTest(Base):

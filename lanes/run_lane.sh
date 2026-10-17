@@ -844,16 +844,22 @@ load_contract() {
   if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
        -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
        rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
-    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"; return 1
+    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
+    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
+    return 1
   fi
   mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
   [ -n "$mode" ] || return 0
   HAS_CONTRACT=1
   [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
   # bus/contract.py reads every contract form repos use and prints the
-  # key: value lines below; a form it cannot read is a setup failure.
-  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" ||
-    { SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"; return 1; }
+  # key: value lines below; a form it cannot read is a factory incident:
+  # the runner's reader is behind the repos, not the ticket's work.
+  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" || {
+    SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"
+    note_factory_incident contract "contract: $canon" SETUP_REASON
+    return 1
+  }
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -902,6 +908,54 @@ record() {
     "$(date -u +%FT%TZ)" >> "$RECORD"
 }
 
+# A validation failure the repo did not cause is a factory incident, not a
+# [work] failure: the contract cannot be read, the environment cannot run
+# the check (exit 125/126/127), or the check is already red on the
+# unmodified base. The ticket keeps its rung: the brain holds it and
+# re-queues it when the incident closes. file_factory_incident files or
+# updates one incident issue on the factory repo and prints "factory
+# incident <owner>/<repo>#<number>". The record names the repo, the exact
+# failing line or command, and the exit code.
+FACTORY_REPO=quadseven/loom
+INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
+file_factory_incident() {  # kind, detail
+  local kind="$1" detail="$2" title body number existing
+  title="Factory incident: $REPO validation $kind"
+  body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
+    "$INCIDENT_MARKER" "$REPO" "$kind" "$TICKET" "$detail")"
+  existing="$(TITLE="$title" gh search issues --repo "$FACTORY_REPO" --state open \
+    --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
+    -- "$title" 2>>"$LOG" | head -1)"
+  if [ -n "$existing" ]; then
+    number="$existing"
+    gh issue comment --repo "$FACTORY_REPO" "$number" \
+      --body "Still failing on $TICKET: $detail" >>"$LOG" 2>&1 || true
+  else
+    number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
+      --body "$body" --label loom:factory 2>>"$LOG" || \
+      gh issue create --repo "$FACTORY_REPO" --title "$title" \
+      --body "$body" 2>>"$LOG")"
+    number="${number##*/}"
+    case "$number" in ''|*[!0-9]*) number="" ;; esac
+  fi
+  if [ -n "$number" ]; then
+    printf 'factory incident %s#%s' "$FACTORY_REPO" "$number"
+  else
+    printf 'factory incident filing failed'
+  fi
+}
+
+# File or update the factory incident for the current failure, append its
+# reference to the named reason variable, and park the brief as [factory]
+# so the ticket keeps its rung. (Assigns via printf -v, never in a
+# subshell, so PARK_CLASS survives.)
+note_factory_incident() {  # kind, detail, reason_var_name
+  local ref
+  ref="$(file_factory_incident "$1" "$2")"
+  PARK_CLASS=factory
+  printf -v "$3" '%s; %s' "${!3}" "$ref"
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -948,19 +1002,27 @@ exclude_untracked() {
 
 # Before the agent: interpreter, submodules, setup, then the check on the
 # base (recorded, so a failure the base already had is told apart from one
-# the agent caused; it does not stop the run, since a ticket may exist to fix
-# it). Returns 1 with SETUP_REASON when the environment cannot be prepared.
+# the agent caused). A failure the repo did not cause -- the contract cannot
+# be read, the environment cannot run the check, or the check is already
+# red on the unmodified base -- is a factory incident, not a [work]
+# failure: the ticket keeps its rung. Returns 1 with SETUP_REASON when the
+# environment cannot be prepared.
 prepare_validation() {
   local rc interp="" subs="" changed what
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
-  if ! command -v sandbox-exec > /dev/null; then SETUP_REASON="sandbox-exec not available"
-  elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then SETUP_REASON="interpreter $C_INTERP is not on PATH"
+  if ! command -v sandbox-exec > /dev/null; then
+    SETUP_REASON="sandbox-exec not available"
+    note_factory_incident environment "sandbox-exec not available" SETUP_REASON
+  elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
+    SETUP_REASON="interpreter $C_INTERP is not on PATH"
+    note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
   elif [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
          -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
     SETUP_REASON="submodule checkout failed"
+    note_factory_incident environment "submodule checkout failed" SETUP_REASON
   fi
   if [ -n "$SETUP_REASON" ]; then record prepare "$what" 1 "$BASE" false "$SETUP_REASON"; return 1; fi
   [ -n "$interp" ] && interp="$interp $("$interp" --version 2>&1 | head -1)"
@@ -982,6 +1044,20 @@ prepare_validation() {
   changed="$(tracked_changes)"
   record baseline "$C_CHECK" "$BASELINE_EXIT" "$BASE" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
+  # A check that cannot run, or is already red, on the unmodified base is
+  # the factory's problem, not the ticket's: file the incident and stop
+  # before the agent burns a run it can never validate.
+  case "$BASELINE_EXIT" in
+    125|126|127)
+      SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
+      note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      return 1 ;;
+  esac
+  if [ "$BASELINE_EXIT" -ne 0 ]; then
+    SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
+    note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+    return 1
+  fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
   exclude_untracked
 }
@@ -998,7 +1074,12 @@ final_validation() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
-    125|126|127) VALIDATION_REASON="validation environment unavailable: the check exited $rc" ;;
+    125|126|127)
+      # The environment broke between the baseline and the final check;
+      # the agent's work is not the cause.
+      VALIDATION_REASON="validation environment unavailable: the check exited $rc"
+      note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
+      ;;
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
@@ -1579,10 +1660,10 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
-  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED=""
+  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
   # A verify run changes no code, so there is nothing to validate.
   if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
-    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run"; continue
+    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
@@ -1772,7 +1853,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
-    park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF"; continue
+    park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
