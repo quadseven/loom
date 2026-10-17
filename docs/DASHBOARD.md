@@ -48,6 +48,14 @@ commitments and each source's newest rules still in force. It takes the
 upload token or `LOOM_HANDOFF_TOKEN`, a separate private value that can only
 read, for brains that must not write the rules they follow.
 
+`/tickets` lists the tickets in flight in one table per goal home; `?done=1`
+lists merged, shipped, verified and closed ones, and `state`, `goal` and
+`model` filter it. Its model column is the model of the newest run among
+three records: the stored transcript, the lane pull request footer, and the
+station's claim comment (whose model follows the ladder rules). It says "not
+run yet" when none exists and "model not recorded" when the newest run names
+no model. The age in state comes from the hourly label-event read.
+
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one
 repository, and startup logs the time taken for that snapshot.

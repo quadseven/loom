@@ -73,6 +73,13 @@ class UsageDashboardTests(unittest.TestCase):
         rendered = render_usage_row(row, now)
         self.assertIn("Stale", rendered)
 
+    def test_lane_limit_reason_is_rendered_in_dashboard_timezone(self):
+        from dashboard.views import render_lane_usage
+        with patch.dict(os.environ, {"LOOM_DASHBOARD_TZ": "America/New_York"}):
+            body = render_lane_usage([{"holds": {"claude": "limit: out of credit; unavailable until 2030-01-02T00:01:27Z"}}])
+        self.assertIn("claude", body)
+        self.assertIn("out of credit until 2030-01-01 19:01 EST", body)
+
 
 if __name__ == "__main__":
     unittest.main()

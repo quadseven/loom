@@ -203,6 +203,12 @@ class FakeCursor:
         self.description = [(name,) for name in names]
         self.rowcount = len(self.rows) if sql.startswith("UPDATE") else 0
 
+    def executemany(self, sql, param_sets):
+        param_sets = list(param_sets)
+        self.db.batches.append((sql, len(param_sets)))
+        self.db.statements.extend((sql, params) for params in param_sets)
+        self.rowcount = len(param_sets) if sql.startswith("UPDATE") else 0
+
     def fetchone(self):
         return self.rows[0] if self.rows else None
 
@@ -218,6 +224,7 @@ class FakeDb:
 
     def __init__(self, answers=()):
         self.statements = []
+        self.batches = []
         self.answers = list(answers)
         self.commits = 0
 
@@ -258,6 +265,16 @@ class PostgresBackendTest(unittest.TestCase):
         closed = [p for s, p in db.statements if s.startswith("UPDATE brain_commitments")]
         self.assertEqual(closed, [(8, "2026-10-17T02:20:00Z", "example/repo#5", "merge", "")])
         self.assertEqual(db.commits, 3)
+
+    def test_a_tick_sends_its_commitments_as_one_batch_per_statement(self):
+        db = FakeDb([(["id"], [(7,)])])
+        done = [dict(defer(n), state="done", due=None) for n in (3, 4)]
+        with patch.dict(os.environ, self.ENV):
+            result = brain_memory.Store(brain_memory.PostgresBackend(db)).record_tick(
+                tick(1, [defer(5), defer(6)] + done))
+        self.assertEqual([(s.split(" ")[0], n) for s, n in db.batches],
+                         [("INSERT", 2), ("UPDATE", 2)])
+        self.assertEqual((result["opened"], result["closed"]), (2, 2))
 
     def test_the_handoff_binds_its_limits_as_parameters_not_sql_text(self):
         db = FakeDb()

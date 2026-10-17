@@ -243,6 +243,7 @@ class TicketStore:
         data["pull_requests"] = prs
         # One pass at refresh, not per page (server.footer_models).
         data["footer_models"] = views.footer_models(prs)
+        data["footer_runs"] = views.footer_runs(prs)
         data["dashboard_errors"] = errors
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
@@ -414,20 +415,24 @@ class TicketStore:
             now = time.time()
             if now - self._waits_refreshed_at >= 3600 and not self._below_floor():
                 try:
-                    rows, bottleneck = waits_for_repos(self.gh, self.repos, now)
+                    entered = {}
+                    rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered)
                     self.waits = {row["state"]: [row["median_h"]] * row["n"]
                                   for row in rows if row.get("median_h") is not None and row.get("n")}
                     snapshot["wait_rows"] = rows
                     snapshot["wait_bottleneck"] = bottleneck
+                    snapshot["state_entered"] = entered
                     self.waits_error = ""
                 except (GitHubError, OSError, ValueError) as exc:
                     self.waits_error = self._error_reason(exc)
                     snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
                     snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+                    snapshot["state_entered"] = self._snapshot.get("state_entered", {})
                 self._waits_refreshed_at = now
             else:
                 snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
                 snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+                snapshot["state_entered"] = self._snapshot.get("state_entered", {})
             floor_context = snapshot.get("floor_context", {})
             floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
                                   "needs_you_reason": ask_error,
@@ -449,6 +454,8 @@ class TicketStore:
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
                 "footer_models": snapshot.get("footer_models"),
+                "footer_runs": snapshot.get("footer_runs"),
+                "state_entered": snapshot.get("state_entered", {}),
                 "wait_rows": snapshot.get("wait_rows", []),
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),

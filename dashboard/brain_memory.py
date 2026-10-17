@@ -264,6 +264,14 @@ def _decoded(row: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
+def _close_all(cur, rows) -> int:
+    """Close the open commitments rows match in one batch; the count actually closed."""
+    if not rows:
+        return 0
+    cur.executemany(_CLOSE, rows)
+    return max(cur.rowcount, 0)
+
+
 class PostgresBackend:
     def __init__(self, module):
         self.dbapi = module
@@ -290,26 +298,19 @@ class PostgresBackend:
                                     tick["ended"], tick["outcome"], json.dumps(tick["decided"]),
                                     json.dumps(tick["left_open"]), json.dumps(tick["handed_off"])))
             tick_id = cur.fetchone()[0]
-            opened = closed = 0
-            for c in tick["commitments"]:
-                if c["state"] == "open":
-                    cur.execute(_OPEN, (tick_id, c["item"], c["stage"], c["key"], c["what"],
-                                        c["due"]))
-                    opened += 1
-                else:
-                    cur.execute(_CLOSE, (tick_id, tick["ended"], c["item"], c["stage"], c["key"]))
-                    closed += max(cur.rowcount, 0)
-            return {"id": tick_id, "opened": opened, "closed": closed}
+            opens = [(tick_id, c["item"], c["stage"], c["key"], c["what"], c["due"])
+                     for c in tick["commitments"] if c["state"] == "open"]
+            closes = [(tick_id, tick["ended"], c["item"], c["stage"], c["key"])
+                      for c in tick["commitments"] if c["state"] != "open"]
+            if opens:
+                cur.executemany(_OPEN, opens)
+            return {"id": tick_id, "opened": len(opens), "closed": _close_all(cur, closes)}
         return self._run(write)
 
     def close(self, closings: List[Dict[str, Any]]) -> int:
-        def write(cur):
-            closed, at = 0, _now()
-            for c in closings:
-                cur.execute(_CLOSE, (None, at, c["item"], c["stage"], c["key"]))
-                closed += max(cur.rowcount, 0)
-            return closed
-        return self._run(write)
+        at = _now()
+        return self._run(lambda cur: _close_all(
+            cur, [(None, at, c["item"], c["stage"], c["key"]) for c in closings]))
 
     def put_rules(self, rules: List[Dict[str, str]]) -> int:
         def write(cur):
