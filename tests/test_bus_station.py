@@ -1870,10 +1870,10 @@ class RetryTest(Base):
         self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
 
     def test_a_ticket_body_that_does_not_parse_is_not_retried(self):
-        # Model: given twice, so no lane's eligibility can be judged.
+        # Model: given twice with two values, so no lane's eligibility can be judged.
         self.heartbeat("anthropic")
         self.failed(body=BODY)
-        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-sonnet-5-5\n\nWork."
+        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-opus-5-5\n\nWork."
         self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
         self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
