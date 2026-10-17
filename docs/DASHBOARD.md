@@ -29,6 +29,25 @@ accepts an upload, or serves a transcript read. This bounds retained history
 during normal dashboard use; it does not depend on how lane runs generate
 their transcripts.
 
+Brain memory (docs/decisions/0002, item 3) lives in the same database, in
+three tables the dashboard creates on first use: `brain_ticks` (one row per
+brain tick, keyed by holder and start: lane, model, end, outcome, and what it
+decided, left open and handed off), `brain_commitments` (work a tick
+deferred, keyed by item, stage and brief key, open until a later done marker
+closes it) and `brain_rules` (the reviewed rules, one row per source and the
+commit or comment it came from). The writes take the upload token and refuse
+a request without it: `POST /api/brain/ticks` stores a tick with its
+commitments (`{holder, lane, model, started, ended, outcome, decided,
+left_open, handed_off, commitments: [{item, stage, key, what, due,
+state}]}`, state `open` or `done`), `POST /api/brain/commitments` closes the
+open commitments a list of `done` ones match (`{commitments: [...]}`), and
+`POST /api/brain/rules` stores `{rules: [{source, source_ref, text}]}`, where
+an empty text retires its source. `GET /api/brain/handoff` answers the
+handoff packet, `{ticks, commitments, rules}`: the last 5 ticks, the open
+commitments and each source's newest rules still in force. It takes the
+upload token or `LOOM_HANDOFF_TOKEN`, a separate private value that can only
+read, for brains that must not write the rules they follow.
+
 `/tickets` lists the tickets in flight in one table per goal home; `?done=1`
 lists merged, shipped, verified and closed ones, and `state`, `goal` and
 `model` filter it. Its model column is the model of the newest run among

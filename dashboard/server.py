@@ -23,6 +23,7 @@ from .github import TicketStore
 from .shell import page
 from . import transcripts as transcript_store
 from . import usage as usage_store
+from . import brain_memory
 from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
@@ -709,16 +710,28 @@ def _ticket_detail(state, path):
     return body, 200 if row else 404
 
 
-def _handle_transcript_post(handler, state):
-    token = os.environ.get("LOOM_UPLOAD_TOKEN", "")
+def _authorized(handler, names=("LOOM_UPLOAD_TOKEN",)):
+    """Whether the request's bearer token is the value of one of the named
+    settings; a setting left empty matches nothing."""
     supplied = handler.headers.get("Authorization", "")
-    if not token or not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
+    if not supplied.startswith("Bearer "):
+        return False
+    tokens = [os.environ.get(name, "") for name in names]
+    return any(token and hmac.compare_digest(supplied[7:], token) for token in tokens)
+
+
+def _json_body(handler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length < 1 or length > 2_000_000:
+        raise ValueError("invalid request size")
+    return json.loads(handler.rfile.read(length))
+
+
+def _handle_transcript_post(handler, state):
+    if not _authorized(handler):
         return handler.send_json(401, {"error": "unauthorized"})
     try:
-        length = int(handler.headers.get("Content-Length", "0"))
-        if length < 1 or length > 2_000_000:
-            raise ValueError("invalid request size")
-        body = json.loads(handler.rfile.read(length))
+        body = _json_body(handler)
         store = getattr(state, "transcripts", None)
         if store is None:
             store = transcript_store.Store()
@@ -733,15 +746,10 @@ def _handle_transcript_post(handler, state):
 
 
 def _handle_usage_post(handler, state):
-    token = os.environ.get("LOOM_UPLOAD_TOKEN", "")
-    supplied = handler.headers.get("Authorization", "")
-    if not token or not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], token):
+    if not _authorized(handler):
         return handler.send_json(401, {"error": "unauthorized"})
     try:
-        length = int(handler.headers.get("Content-Length", "0"))
-        if length < 1 or length > 2_000_000:
-            raise ValueError("invalid request size")
-        body = json.loads(handler.rfile.read(length))
+        body = _json_body(handler)
         store = getattr(state, "usage", None)
         if store is None:
             store = usage_store.Store()
@@ -749,6 +757,40 @@ def _handle_usage_post(handler, state):
         return handler.send_json(201, store.upload(body))
     except (ValueError, json.JSONDecodeError) as exc:
         return handler.send_json(400, {"error": str(exc)})
+
+
+# Brain memory (dashboard/brain_memory.py): the station writes ticks,
+# closings and rules with the upload token. Every brain reads the handoff
+# packet with it or with LOOM_HANDOFF_TOKEN, which can only read.
+BRAIN_WRITES = {"/api/brain/ticks": "record_tick", "/api/brain/rules": "load_rules",
+                "/api/brain/commitments": "close_commitments"}
+BRAIN_READERS = ("LOOM_UPLOAD_TOKEN", "LOOM_HANDOFF_TOKEN")
+
+
+def _brain_store(state):
+    store = getattr(state, "brain_memory", None)
+    if store is None:
+        store = brain_memory.Store()
+        state.brain_memory = store
+    return store
+
+
+def _handle_brain(handler, state, write=None):
+    """A brain memory write (BRAIN_WRITES names the store method) or, with
+    write None, the handoff packet read."""
+    if not _authorized(handler, BRAIN_READERS if write is None else ("LOOM_UPLOAD_TOKEN",)):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        if write is None:
+            return handler.send_json(200, _brain_store(state).handoff())
+        body = _json_body(handler)
+        return handler.send_json(201, getattr(_brain_store(state), write)(body))
+    except ValueError as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    except RuntimeError as exc:
+        return handler.send_json(503, {"error": str(exc)})
+    except transcript_store.storage_errors():
+        return handler.send_json(503, {"error": "brain memory storage unavailable"})
 
 
 def _handler_for(state):
@@ -761,6 +803,8 @@ def _handler_for(state):
             path = self.path.split("?", 1)[0]
             if path == "/api/usage":
                 return _handle_usage_post(self, state)
+            if path in BRAIN_WRITES:
+                return _handle_brain(self, state, BRAIN_WRITES[path])
             if path != "/api/transcripts":
                 return self.send_text(404, "not found")
             return _handle_transcript_post(self, state)
@@ -936,6 +980,8 @@ def _dispatch_basic(handler, state, path):
         return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
     if path == "/api/tickets":
         return handler.send_json(200, _api_tickets(state.response()))
+    if path == "/api/brain/handoff":
+        return _handle_brain(handler, state)
     return handler.send_text(404, "not found")
 
 

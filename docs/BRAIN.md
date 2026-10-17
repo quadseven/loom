@@ -815,6 +815,19 @@ work for any brain, and the Rules section of docs/MUSE.md read from GitHub at
 the station checkout's commit. Journals from private repos count, but the
 packet names neither their repo nor their text.
 
+When the dashboard's brain memory answers (`GET /api/brain/handoff` with the
+transcript upload token, docs/MUSE.md, Handing off stage work), the station
+renders the packet from it instead: the last 5 ticks posted to brain_ticks
+(holder, lane, model, start, end, outcome, and how many items each decided,
+left open and handed off), the open commitments (stage, item, the tick that
+opened it, due), each rules digest source with its commit or comment, and the
+same Rules section from GitHub. A row's text is not quoted there, since a row
+does not say which goal home it came from; `python3 -m bus.brain_memory
+handoff` prints it in full. A private repo's item or goal home is shown as
+"issue N of a private repo". When the dashboard is not set, does not answer,
+refuses the token, or holds no tick yet, the packet is built from the goal
+homes as above.
+
 ### Report deadlines
 
 Each goal owes its own report every 2 hours, counted from its newest valid

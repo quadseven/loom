@@ -528,3 +528,48 @@ class HandoffPacketTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StoredPacketTests(unittest.TestCase):
+    """handoff.stored_packet: the packet rendered from the dashboard's brain
+    memory, for a public comment."""
+
+    STORED = {"ticks": [{"holder": "muse", "lane": "brain", "model": "model-x",
+                         "started": at(30), "ended": at(10), "outcome": "ok",
+                         "decided": ["shipped something private"],
+                         "left_open": ["brief example-owner/hidden#4: private plan"],
+                         "handed_off": []}],
+              "commitments": [{"tick_id": 2, "holder": "muse", "item": "example-owner/hidden#4",
+                               "stage": "brief", "what": "brief: private plan", "due": at(-90)},
+                              {"tick_id": 2, "holder": "muse", "item": "%s#7" % REPO,
+                               "stage": "merge", "what": "merge: wait", "due": None}],
+              "rules": [{"source": "example-owner/hidden#2", "source_ref": "comment 55",
+                         "text": "secret rule"},
+                        {"source": "docs/MUSE.md", "source_ref": "d" * 40, "text": "- one"}]}
+
+    def render(self, stored, public=lambda repo: repo == REPO):
+        return handoff.stored_packet(stored, ("c" * 40, ["- Write ASCII only."]), public)
+
+    def test_a_private_item_or_rules_source_is_neither_named_nor_quoted(self):
+        text = self.render(self.STORED)
+        self.assertNotIn("hidden", text)
+        self.assertNotIn("private plan", text)
+        self.assertNotIn("something private", text)
+        self.assertNotIn("secret rule", text)
+        self.assertNotIn("comment 55", text)
+        self.assertIn("- brief issue 4 of a private repo, from muse's tick 2, due %s." % at(-90), text)
+        self.assertIn("- merge %s#7, from muse's tick 2, due none." % REPO, text)
+        self.assertIn("- issue 2 of a private repo\n- docs/MUSE.md at %s" % ("d" * 40), text)
+        self.assertIn("1 decided, 1 left open, 0 handed off.", text)
+
+    def test_open_commitments_past_the_cap_are_counted(self):
+        many = dict(self.STORED, commitments=[dict(self.STORED["commitments"][1], tick_id=n)
+                                              for n in range(handoff.PACKET_DEFERS + 2)])
+        text = self.render(many)
+        self.assertIn("## Open commitments (%d)" % (handoff.PACKET_DEFERS + 2), text)
+        self.assertIn("- and 2 more; `resume` lists them all.", text)
+
+    def test_a_stored_name_that_fails_the_posting_checks_is_not_quoted(self):
+        tick = dict(self.STORED["ticks"][0], holder="@someone")
+        text = self.render(dict(self.STORED, ticks=[tick]))
+        self.assertNotIn("@", text)
