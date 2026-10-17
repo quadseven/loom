@@ -749,9 +749,13 @@ change on a `loom/` branch and closes the original with a comment naming
 the new pull request, or closes the original as superseded with the reason.
 The station marks the original with a `loom:adopted` comment naming the
 ticket, so it is adopted once, and files at most one adoption ticket per
-repo a pass. It never closes a pull request itself. The station log says
-`adopted OWNER/NAME#N as ticket ...` for each one, and `adoption OWNER/NAME:`
-with the count of open pull requests no ticket links whenever it changes.
+repo a pass. It never closes a pull request itself. It reads a pull
+request's comments for the marker at most once, remembering the adopted ones
+in `state/station/adoptions.json`, and a repo whose brief was refused (its
+goal at the cap) is tried again 10 minutes later, not every pass. The station
+log says `adopted OWNER/NAME#N as ticket ...` for each one, and
+`adoption OWNER/NAME:` with the count of open pull requests no ticket links
+whenever it changes.
 
 ## Journal
 

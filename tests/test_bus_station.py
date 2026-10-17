@@ -567,8 +567,13 @@ class AdoptUntrackedPullRequestTest(Base):
         self.fake.pulls.append(pr)
         return pr
 
-    def adopt(self):
-        station.Station(GitHub("token", transport=self.fake), self.settings).adopt_untracked_pulls()
+    def adopt(self, now=None):
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=now).adopt_untracked_pulls()
+
+    def comment_reads(self, number):
+        return self.fake.paths("GET").count("/repos/%s/issues/%d/comments?per_page=100"
+                                            % (REPO, number))
 
     def adoptions(self):
         return [c for c in self.fake.created if c["title"].startswith("Land or supersede #")]
@@ -634,17 +639,45 @@ class AdoptUntrackedPullRequestTest(Base):
         self.assertEqual(len(self.adoptions()), 2)
 
     def test_a_trusted_marker_comment_stops_adoption_and_an_untrusted_one_does_not(self):
-        self.pull(99)
         marker = station.adoption_comment(REPO, 7)
+        self.pull(98, created="2030-01-01T00:00:00Z", title="Marked by a trusted author")
+        self.pull(99, created="2030-01-02T00:00:00Z", title="Marked by a stranger")
+        self.fake.comments[98] = [{"body": marker, "user": {"login": "bob-example"}}]
         self.fake.comments[99] = [{"body": marker, "user": {"login": "stranger"}}]
         self.adopt()
-        self.assertEqual(len(self.adoptions()), 1)
-        self.fake.created = []
-        self.fake.issues = {n: i for n, i in self.fake.issues.items()
-                            if "loom:ticket" not in self.fake.names(n)}
-        self.fake.comments[99] = [{"body": marker, "user": {"login": "bob-example"}}]
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Marked by a stranger"])
+        self.assertEqual(len(self.fake.comments[98]), 1)
+
+    def test_an_adopted_pull_requests_comments_are_read_once(self):
+        self.pull(97, created="2030-01-01T00:00:00Z", title="Adopted before")
+        self.fake.comments[97] = [{"body": station.adoption_comment(REPO, 7),
+                                   "user": {"login": "alice-example"}}]
+        self.pull(98, created="2030-01-02T00:00:00Z", title="Untracked")
         self.adopt()
-        self.assertEqual(self.adoptions(), [])
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #98: Untracked"])
+        self.assertEqual((self.comment_reads(97), self.comment_reads(98)), (1, 1))
+        self.adopt()
+        self.adopt()
+        self.assertEqual((self.comment_reads(97), self.comment_reads(98)), (1, 1))
+        self.assertEqual(len(self.adoptions()), 1)
+
+    def test_a_refused_brief_waits_before_reading_or_briefing_again(self):
+        self.pull(99)
+        start = time.time()
+        with mock.patch.object(brain, "brief",
+                               side_effect=ValueError("goal already has 8 tickets in flight")) as made, \
+                mock.patch("bus.station._say") as say:
+            self.adopt(now=start)
+            self.adopt(now=start + 60)
+            self.adopt(now=start + station.ADOPT_RETRY - 1)
+            self.assertEqual((made.call_count, self.comment_reads(99)), (1, 1))
+            self.adopt(now=start + station.ADOPT_RETRY + 1)
+            self.assertEqual((made.call_count, self.comment_reads(99)), (2, 2))
+        refused = [c.args[0] for c in say.call_args_list if "in flight" in c.args[0]]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(self.fake.comments[99], [])
 
     def test_a_closing_keyword_in_the_title_files_the_ticket_without_it(self):
         # Built here, so this file never holds a closing keyword next to an issue number.

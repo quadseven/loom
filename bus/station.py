@@ -199,14 +199,17 @@ PIN_SHIPS_FILE = "pin_ships.json"
 # pull request first, and marks the pull request with ADOPTED_MARKER so it is
 # never adopted twice. The ticket's body carries ADOPTS_MARKER too, so a
 # marker comment that failed to post files no second ticket. ADOPTIONS_FILE
-# keeps the count and refusal last logged per repo, so each is logged when it
-# changes.
+# keeps, per repo, the pull requests known to be adopted (so each one's
+# comments are read once), the count and refusal last logged (each logged
+# when it changes), and when a brief was last refused: the repo is tried
+# again ADOPT_RETRY seconds later, not every pass.
 ADOPTED_MARKER = "<!-- loom:adopted v1 ticket=%s#%d -->"
 ADOPTED_RE = re.compile(r"<!-- loom:adopted v1 ticket=[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+ -->")
 ADOPTS_MARKER = "<!-- loom:adopts pr=%d -->"
 ADOPT_TITLE = "Land or supersede #%d"
 ADOPT_TITLE_MAX = 200
 ADOPTIONS_FILE = "adoptions.json"
+ADOPT_RETRY = 600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
@@ -2152,16 +2155,44 @@ class Station:
             open_tickets = [i for i in issues if isinstance(i, dict) and "pull_request" not in i
                             and "loom:ticket" in _label_names(i)]
         pulls = [pr for pr in pulls if not any(_linked_pr(t, repo, pr) for t in open_tickets)]
-        waiting = [pr for pr in pulls if not self._adopted(repo, pr, open_tickets)]
-        count = [len(pulls), len(pulls) - len(waiting)]
+        # The pull requests known to be adopted: remembered from an earlier
+        # pass, or named by an open ticket's ADOPTS_MARKER. Only those still
+        # open and untracked are kept.
+        numbers = [int(pr["number"]) for pr in pulls]
+        known = {n for n in rec.get("adopted") or [] if isinstance(n, int) and n in numbers}
+        known |= {n for n in numbers
+                  if any(ADOPTS_MARKER % n in str(t.get("body") or "") for t in open_tickets)}
+        rec["adopted"] = sorted(known)
+        if not self._adoption_backing_off(rec):
+            self._adopt_one(repo, rec, [pr for pr in pulls if int(pr["number"]) not in known])
+        count = [len(pulls), len(rec["adopted"])]
         if rec.get("count") != count:
             _say("adoption %s: %d open pull requests no ticket links, %d of them adopted"
                  % (repo, count[0], count[1]))
             rec["count"] = count
-        if not waiting:
+
+    def _adoption_backing_off(self, rec: Dict[str, Any]) -> bool:
+        """The repo's last brief was refused less than ADOPT_RETRY ago: no
+        comments are read and nothing is briefed until then."""
+        at = rec.get("refused_at")
+        return (bool(rec.get("refused")) and self._num(at)
+                and 0 <= self.now - at < ADOPT_RETRY)
+
+    def _adopt_one(self, repo: str, rec: Dict[str, Any], waiting: List[Dict[str, Any]]) -> None:
+        """Adopt the oldest waiting pull request that carries no adopted
+        marker. Comments are read oldest first and only until that one is
+        found; a marked pull request is remembered, so its comments are read
+        once."""
+        pr = None
+        for candidate in waiting:
+            if not self._marked_adopted(repo, int(candidate["number"])):
+                pr = candidate
+                break
+            rec["adopted"] = sorted(set(rec["adopted"]) | {int(candidate["number"])})
+        if pr is None:
             rec.pop("refused", None)
+            rec.pop("refused_at", None)
             return
-        pr = waiting[0]
         number = int(pr["number"])
         goal = self._adoption_goal(repo)
         if goal is None:
@@ -2171,11 +2202,13 @@ class Station:
             url = brain.brief(self.gh, repo, goal, self._adoption_title(repo, pr),
                               adoption_body(number, goal), difficulty="medium")
         except ValueError as err:
-            # The goal is at its cap or holds too much unproven work: the
-            # next pass tries again.
+            # The goal is at its cap or holds too much unproven work: tried
+            # again after ADOPT_RETRY.
             self._adoption_refused(repo, rec, "#%d: %s" % (number, err))
             return
         rec.pop("refused", None)
+        rec.pop("refused_at", None)
+        rec["adopted"] = sorted(set(rec["adopted"]) | {number})
         ticket = url.rstrip("/").rpartition("/")[2]
         if not ticket.isdigit():
             # The ticket's ADOPTS_MARKER still keeps the next pass from
@@ -2183,9 +2216,7 @@ class Station:
             _say("adopted %s#%d, but GitHub named no ticket number to mark it with" % (repo, number))
             return
         self._comment(repo, number, adoption_comment(repo, int(ticket)))
-        rec["count"] = [count[0], count[1] + 1]
-        _say("adopted %s#%d as ticket %s#%s (%d of %d untracked open pull requests adopted)"
-             % (repo, number, repo, ticket, count[1] + 1, count[0]))
+        _say("adopted %s#%d as ticket %s#%s" % (repo, number, repo, ticket))
 
     def _adoptable_pulls(self, repo: str) -> List[Dict[str, Any]]:
         """The repo's open pull requests that are not drafts and come from a
@@ -2200,12 +2231,8 @@ class Station:
         return sorted(found, key=lambda pr: (str(pr.get("created_at") or ""),
                                              int(pr.get("number") or 0)))
 
-    def _adopted(self, repo: str, pr: Dict[str, Any], open_tickets: List[Dict[str, Any]]) -> bool:
-        """An open ticket already adopts the pull request, or a trusted
-        author marked it adopted."""
-        number = int(pr["number"])
-        if any(ADOPTS_MARKER % number in str(t.get("body") or "") for t in open_tickets):
-            return True
+    def _marked_adopted(self, repo: str, number: int) -> bool:
+        """A trusted author marked the pull request adopted."""
         authors = {a.lower() for a in self.s.authors}
         comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return any(isinstance(c, dict) and tickets._login(c.get("user")) in authors
@@ -2240,6 +2267,7 @@ class Station:
         if rec.get("refused") != why:
             _say("adoption %s: could not file an adoption ticket: %s" % (repo, why))
         rec["refused"] = why
+        rec["refused_at"] = self.now
 
     # -- hand-made reverts -----------------------------------------------
     def _closed_pulls(self, repo: str) -> List[Dict[str, Any]]:
