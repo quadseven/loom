@@ -445,21 +445,23 @@ Choose only lanes that lane status shows as available, by the ticket's
 Anthropic credits, easy work on the free lanes and Spark, the credit spent
 on hard work):
 
-- Easy: on a public repo muse first, then agy (the operator's priority;
-  muse runs remotely); then `spark` to `spark-4` (the local coders, two per
-  Spark box, `LOOM_SPARK_URL` and `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`,
+- Easy: `spark` to `spark-4` first (the operator's priority since
+  2026-10-17: two slots per Spark box, `LOOM_SPARK_URL` and
+  `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
   model `spark/...`, any repo, private ones included) when lane status shows
-  them available, else a
+  them available; then on a public repo muse, then agy (muse runs
+  remotely); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
   opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
   which trains on prompts).
   Never anthropic or claude for an easy ticket.
-- Medium: on a public repo muse first, then agy; then codex or opencode-go
-  (opencode-go-4 on public repos only); then a spark slot (Qwen3.8 27B, any
-  repo); an anthropic slot only when every codex, opencode-go and spark slot
-  already holds work.
-- Hard: anthropic, claude, agy (Gemini 4 Argon, public repos only) or codex,
-  never a free lane or spark. Keep the anthropic slots busy with hard work
+- Medium: a spark slot first (any repo); then on a public repo muse, then
+  agy; then codex or opencode-go (opencode-go-4 on public repos only); an
+  anthropic slot only when every spark, codex and opencode-go slot already
+  holds work.
+- Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,
+  public repos only) or codex, never a free lane. A hard ticket a spark
+  fails climbs the model ladder. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.
 

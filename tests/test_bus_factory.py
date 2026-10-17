@@ -324,7 +324,7 @@ class PullRequests(Base):
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertNotEqual(self.lane(5), "muse")
-        self.assertEqual(self.lane(5), "codex")
+        self.assertEqual(self.lane(5), "spark")
 
     def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
@@ -1133,7 +1133,7 @@ class Tickets(Base):
     def test_a_briefed_ticket_nobody_claims_moves_within_its_tier(self):
         self.stalled(7)
         self.go()
-        self.assertEqual((self.lane(7), self.model(7)), ("codex-2", None))
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", None))
         self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
 
     def test_a_stalled_rung_two_ticket_moves_to_the_other_rung_two_lane(self):
@@ -1153,18 +1153,18 @@ class Tickets(Base):
     def test_a_moved_stalled_ticket_waits_a_full_stall_on_its_new_lane(self):
         self.stalled(7)
         self.go()
-        self.assertEqual(self.lane(7), "codex-2")
-        self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:codex-2"},
+        self.assertEqual(self.lane(7), "spark")
+        self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:spark"},
                                   "created_at": iso(0)})
         self.go()
-        self.assertEqual((self.lane(7), len(self.gh.comments[7])), ("codex-2", 1))
+        self.assertEqual((self.lane(7), len(self.gh.comments[7])), ("spark", 1))
 
     def test_a_moved_stalled_ticket_moves_again_after_another_stall(self):
         self.stalled(7)
         self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:codex"},
                                   "created_at": iso(factory.BRIEFED_STALL + 60)})
         self.go()
-        self.assertEqual(self.lane(7), "codex-2")
+        self.assertEqual(self.lane(7), "spark")
 
     def test_a_stall_with_no_available_lane_stays_briefed(self):
         self.stalled(7)
@@ -1269,13 +1269,15 @@ class Tickets(Base):
         self.limited_easy(limited=("spark",))
         self.assertEqual(self.lane(7), "spark-2")
 
-    def test_muse_then_agy_take_public_easy_and_medium_tickets_first(self):
-        # The operator's priority (2026-10-14): Muse's and agy's allowances
-        # are spent first; a private repo's ticket never reaches either.
-        self.assertEqual(factory.TIERS["easy"][:2], ("muse", "agy"))
-        self.assertEqual(factory.TIERS["medium"][:2], ("muse", "agy"))
-        self.assertEqual(factory.lanes_of("easy", True)[0], "spark")
-        self.assertEqual(factory.lanes_of("medium", True)[0], "codex")
+    def test_the_sparks_take_every_tier_first_then_muse_and_agy(self):
+        # The operator's priority (2026-10-17): the Sparks first in every tier;
+        # then Muse's and agy's allowances on public repos (2026-10-14). A
+        # private repo's ticket never reaches Muse or agy.
+        for tier in ("easy", "medium", "hard"):
+            self.assertEqual(factory.TIERS[tier][:4], factory.SPARKS, tier)
+        self.assertEqual(factory.TIERS["easy"][4:6], ("muse", "agy"))
+        self.assertEqual(factory.TIERS["medium"][4:6], ("muse", "agy"))
+        self.assertEqual(factory.lanes_of("medium", True)[4], "codex")
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
@@ -1304,7 +1306,7 @@ class Tickets(Base):
         self.gh.ticket(7, "briefed", lane="codex", body=body)
         self.gh.ticket(8, "briefed", lane="codex", body=body)
         self.go(limited=["codex"])
-        self.assertEqual(sorted((self.lane(7), self.lane(8))), ["codex-2", "opencode-go"])
+        self.assertEqual(sorted((self.lane(7), self.lane(8))), ["spark", "spark-2"])
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
         for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"), 20):
@@ -1363,7 +1365,7 @@ class Tickets(Base):
         self.limited_medium()
         self.assertEqual(self.lane(7), "claude")
         self.go(limited=["claude"])
-        self.assertEqual(self.lane(7), "codex")
+        self.assertEqual(self.lane(7), "spark")
         self.assertIn("in its difficulty tier", self.gh.comments[7][-1]["body"])
 
     def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
