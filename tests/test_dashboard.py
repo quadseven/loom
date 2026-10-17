@@ -98,7 +98,7 @@ class DashboardTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_backlog_bytes_order_start_here_and_health_inspectors(self):
+    def test_backlog_bytes_order_next_child_and_health_inspectors(self):
         fixture = {
             "generated_at": "today", "judged_by": "Cave", "repos": [], "totals": {},
             "epics": [
@@ -123,7 +123,7 @@ class DashboardTest(unittest.TestCase):
                 connection.request("GET", "/backlog")
                 body = connection.getresponse().read().decode()
                 self.assertLess(body.index("First next"), body.index("[odd] title"))
-                self.assertIn("First next", body[body.index("Start here"):])
+                self.assertIn("First next", body[body.index('<table class="epic-table">'):])
                 self.assertIn("Finished children, open epic", body)
                 self.assertIn("Children without parent link", body)
                 self.assertIn("Nonstandard titles", body)
