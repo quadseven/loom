@@ -323,8 +323,9 @@ def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
     if pr is None:
         return
     gate = health.fetch(spec["gate_url"])
-    if not isinstance(gate, dict) or type(gate.get("open")) is not bool:
-        raise ValueError("roll family gate must answer with a boolean open field")
+    if (not isinstance(gate, dict) or type(gate.get("open")) not in (bool, int)
+            or gate["open"] not in (0, 1)):
+        raise ValueError("roll family gate must answer with a boolean or 0/1 open field")
     if not gate["open"]:
         return
     env = {"LOOM_BRIEF_AUTHORS": " ".join(authors), "LOOM_REVIEW_CHECK": review_check}
