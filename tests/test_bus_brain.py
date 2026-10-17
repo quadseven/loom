@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -3001,3 +3002,92 @@ class MergeWaitsForGitHubToSettle(unittest.TestCase):
         pr, _ = brain._await_settled(GH(), REPO, 7, {"mergeable": True},
                                      self.details("SUCCESS"), env={})
         self.assertEqual(self.slept, [])
+
+
+class EpicWalk:
+    """A goal (#1) with a direct ticket (#5) and two epics: #10 holds three
+    sub-issue tickets; #20 holds two sub-issue tickets and one ticket that
+    names it only by its Part of line (#23)."""
+
+    def __init__(self, state="loom:briefed", closed_epic=False):
+        t = lambda n, body="": item(n, body=body, labels=("loom:ticket", state),
+                                    title="Ticket %d" % n)
+        self.subs = {
+            1: [t(5), item(10, labels=("epic",), title="Epic: first", body="Part of #1\n"),
+                item(20, labels=("epic",), title="Epic: second", body="Part of #1\n",
+                     state="closed" if closed_epic else "open")],
+            10: [t(11), t(12), t(13)],
+            20: [t(21), t(22)],
+        }
+        self.open_tickets = [t(23, body="## Why\nx\n\nPart of #20\n"), t(5), t(11)]
+        self.calls = []
+
+    def __call__(self, method, url, headers, body):
+        path = url.split("api.github.com")[1]
+        self.calls.append((method, path))
+        m = re.match(r"/repos/%s/issues/(\d+)/sub_issues" % re.escape(REPO), path)
+        if method == "GET" and m:
+            return reply(200, self.subs.get(int(m.group(1)), []))
+        if method == "GET" and path.startswith("/repos/%s/issues?labels=loom:ticket&state=open"
+                                               % REPO):
+            return reply(200, self.open_tickets)
+        if method == "GET" and path == "/repos/%s/issues/1" % REPO:
+            return reply(200, goal())
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+
+class GoalWalksEpicsTest(unittest.TestCase):
+    """loom#636: every goal count walks goal, epics and tickets."""
+
+    def test_the_in_flight_cap_counts_the_epics_tickets(self):
+        gh = GitHub("t", transport=EpicWalk())
+        self.assertEqual(brain._goal_in_flight(gh, REPO, 1), 7)
+        numbers = sorted(int(c["number"]) for c in brain.goal_children(gh, REPO, 1))
+        self.assertEqual(numbers, [5, 11, 12, 13, 21, 22, 23])
+
+    def test_the_unproven_limit_counts_the_epics_tickets(self):
+        gh = GitHub("t", transport=EpicWalk(state="loom:shipped"))
+        self.assertEqual(brain.goal_unproven(gh, REPO, 1), 7)
+
+    def test_a_closed_epics_tickets_still_count(self):
+        gh = GitHub("t", transport=EpicWalk(state="loom:shipped", closed_epic=True))
+        self.assertEqual(brain.goal_unproven(gh, REPO, 1), 7)
+
+    def test_the_brief_cap_refuses_through_the_epics(self):
+        gh = GitHub("t", transport=EpicWalk())
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "7"}):
+            with self.assertRaisesRegex(ValueError, "7 tickets in flight"):
+                brain._check_goal_capacity(brain.goal_children(gh, REPO, 1), 1)
+
+    def test_a_goal_without_epics_reads_no_ticket_list(self):
+        walk = EpicWalk()
+        walk.subs[1] = walk.subs[1][:1]
+        gh = GitHub("t", transport=walk)
+        self.assertEqual([c["number"] for c in brain.goal_children(gh, REPO, 1)], [5])
+        self.assertFalse(any("labels=loom:ticket" in p for _, p in walk.calls))
+
+    def test_status_prints_each_epic_against_its_cap_and_the_open_epics(self):
+        gh = GitHub("t", transport=EpicWalk())
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        lines = brain._goal_lines([goal()], {"goals": {}}, now, None, gh, REPO)
+        self.assertIn("  - open epics 2/6", lines)
+        self.assertIn("  - epic #10 Epic: first - tickets 3/15", lines)
+        self.assertIn("  - epic #20 Epic: second - tickets 3/15", lines)
+        self.assertIn("  - unproven work 0/%d (shipped with no standing proof; "
+                      "0 more await live evidence and do not count)" % brain.unverified_limit(),
+                      lines)
+
+    def test_a_closed_epic_is_not_an_open_epic_in_status(self):
+        gh = GitHub("t", transport=EpicWalk(closed_epic=True))
+        now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        lines = brain._goal_lines([goal()], {"goals": {}}, now, None, gh, REPO)
+        self.assertIn("  - open epics 1/6", lines)
+        self.assertFalse(any(line.startswith("  - epic #20") for line in lines))
+
+    def test_a_loose_mention_under_one_of_the_goals_epics_is_not_unassociated(self):
+        loose = [item(11, body="This is Part of #1 in words.", labels=("loom:ticket",)),
+                 item(30, body="Also Part of #1 in words.", labels=("loom:ticket",))]
+        gh = GitHub("t", transport=EpicWalk())
+        with unittest.mock.patch.object(brain, "_part_of_hits", return_value=loose):
+            found = brain.unassociated_tickets(gh, REPO, 1)
+        self.assertEqual([i["number"] for i in found], [30])

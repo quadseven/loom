@@ -4142,6 +4142,28 @@ class ReportsTest(Base):
                          "1 stuck, 2 in flight, 1 waiting on you since the last report.")
         brain._check_written_text(body)
 
+    def test_station_standup_lists_the_tickets_of_the_goals_epics(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        ticket = lambda n, title: {"number": n, "title": title, "state": "open",
+                                   "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        self.fake.sub_issues[40] = [
+            ticket(42, "Direct task"),
+            {"number": 50, "title": "Epic: one chunk", "state": "open",
+             "labels": [{"name": "epic"}]}]
+        self.fake.sub_issues[50] = [ticket(51, "Epic task one"), ticket(52, "Epic task two")]
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        body = self.fake.comments[40][-1]["body"]
+        for number, title in ((42, "Direct task"), (51, "Epic task one"),
+                              (52, "Epic task two")):
+            self.assertIn("#%d %s" % (number, title), body)
+        self.assertNotIn("#50 Epic", body)
+        self.assertIn("3 in flight", body.splitlines()[1])
+
     def test_station_standup_lists_only_what_changed_since_the_last_report(self):
         self.add_goal()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
