@@ -150,6 +150,19 @@ class BrainTests(unittest.TestCase):
         children = [ticket("loom:shipped")] * 3 + [waiting] * 20
         brain._check_goal_unproven(children, 30)
 
+    def test_the_awaiting_label_cannot_switch_the_limit_off(self):
+        # The label comes from a lane's verify.json: past twice the limit,
+        # awaiting tickets hold the limit again.
+        def ticket(*names):
+            return {"state": "open", "labels": [{"name": n} for n in ("loom:ticket",) + names]}
+        waiting = ticket("loom:shipped", brain.AWAITING_EVIDENCE)
+        cap = brain.AWAITING_CAP_FACTOR * brain.unverified_limit()
+        held, excluded = brain._count_unproven([ticket("loom:shipped")] + [waiting] * (cap + 5))
+        self.assertEqual((held, excluded), (1 + 5, cap))
+        brain._check_goal_unproven([waiting] * cap, 30)
+        with self.assertRaisesRegex(ValueError, "without a proof"):
+            brain._check_goal_unproven([waiting] * (cap + brain.unverified_limit() + 1), 30)
+
     def test_prioritize_without_trusted_authors_names_the_setting(self):
         # A remote brain without LOOM_BRIEF_AUTHORS saw only "not a trusted
         # login" and could not tell what to fix.

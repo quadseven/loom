@@ -35,6 +35,10 @@ UNPROVEN = ("loom:merged", "loom:shipped")
 # so it does not hold the unproven-work limit: 54 of the 58 loom tickets
 # counted on 2026-10-17 were in that state, and the limit froze the goal.
 AWAITING_EVIDENCE = "loom:awaiting-evidence"
+# A goal excludes at most this many times its limit in awaiting tickets: the
+# label comes from a lane's verify.json, so a lane that always says "missing"
+# must not be able to switch the limit off.
+AWAITING_CAP_FACTOR = 2
 DEFAULT_UNVERIFIED_LIMIT = 15
 # A ticket admitted for a measured regression of a shipped one. Past the cap,
 # a goal admits one such ticket at a time (its regression slot).
@@ -951,20 +955,26 @@ def _awaiting(issue: Dict[str, Any]) -> bool:
             and AWAITING_EVIDENCE in names and any(state in names for state in UNPROVEN))
 
 
+def _count_unproven(children: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """(tickets that hold the limit, awaiting tickets excluded from it). The
+    awaiting tickets past AWAITING_CAP_FACTOR times the limit hold it again."""
+    waiting = sum(1 for i in children if _awaiting(i))
+    excluded = min(waiting, AWAITING_CAP_FACTOR * unverified_limit())
+    return sum(1 for i in children if _unproven(i)) + (waiting - excluded), excluded
+
+
 def _goal_counts(gh: GitHub, repo: str, goal: int,
                  issue: Optional[Dict[str, Any]] = None) -> Tuple[int, int]:
-    """(unproven, awaiting live evidence) among the goal's tickets, from one
-    read of its children."""
-    children = _goal_children(gh, repo, goal, issue)
-    return (sum(1 for i in children if _unproven(i)),
-            sum(1 for i in children if _awaiting(i)))
+    """(tickets that hold the limit, awaiting tickets excluded) among the
+    goal's tickets, from one read of its children."""
+    return _count_unproven(_goal_children(gh, repo, goal, issue))
 
 
 def _goal_unproven(gh: GitHub, repo: str, goal: int,
                    issue: Optional[Dict[str, Any]] = None) -> int:
     """The goal's unproven tickets; ValueError for anything that is not an
     open loom:goal issue."""
-    return sum(1 for i in _goal_children(gh, repo, goal, issue) if _unproven(i))
+    return _count_unproven(_goal_children(gh, repo, goal, issue))[0]
 
 
 def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
@@ -975,7 +985,7 @@ def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
 
 
 def _check_goal_unproven(children: List[Dict[str, Any]], goal: int) -> None:
-    count = sum(1 for i in children if _unproven(i))
+    count = _count_unproven(children)[0]
     limit = unverified_limit()
     if count > limit:
         raise ValueError("goal #%d has %d tickets at merged or shipped without a proof "
