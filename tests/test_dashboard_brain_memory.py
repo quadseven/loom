@@ -259,6 +259,15 @@ class PostgresBackendTest(unittest.TestCase):
         self.assertEqual(closed, [(8, "2026-10-17T02:20:00Z", "example/repo#5", "merge", "")])
         self.assertEqual(db.commits, 3)
 
+    def test_the_handoff_binds_its_limits_as_parameters_not_sql_text(self):
+        db = FakeDb()
+        with patch.dict(os.environ, self.ENV):
+            brain_memory.Store(brain_memory.PostgresBackend(db)).handoff()
+        selects = [(s, p) for s, p in db.statements if s.startswith("SELECT")]
+        self.assertEqual([p for _, p in selects],
+                         [(brain_memory.PACKET_TICKS,), (brain_memory.COMMITMENTS_MAX,), ()])
+        self.assertTrue(all(s.endswith("LIMIT %s") for s, _ in selects[:2]))
+
 
 if __name__ == "__main__":
     unittest.main()

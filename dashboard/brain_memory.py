@@ -239,18 +239,18 @@ _CLOSE = ("UPDATE brain_commitments SET state='done', closed_tick=%s, closed_at=
 _PUT_RULE = ("INSERT INTO brain_rules (source, source_ref, text) VALUES (%s, %s, %s) "
              "ON CONFLICT (source, source_ref) DO UPDATE SET text=EXCLUDED.text, loaded_at=now()")
 _TICKS = ("SELECT id, holder, lane, model, started, ended, outcome, decided, left_open, "
-          "handed_off FROM brain_ticks ORDER BY started DESC, id DESC LIMIT %d" % PACKET_TICKS)  # noqa: S608 - a fixed integer constant
+          "handed_off FROM brain_ticks ORDER BY started DESC, id DESC LIMIT %s")
 _OPEN_COMMITMENTS = ("SELECT c.id, c.tick_id, t.holder, c.item, c.stage, c.key, c.what, c.due, "
                      "c.state FROM brain_commitments c JOIN brain_ticks t ON t.id = c.tick_id "
                      "WHERE c.state = 'open' ORDER BY c.due ASC NULLS LAST, c.id "
-                     "LIMIT %d" % COMMITMENTS_MAX)  # noqa: S608 - a fixed integer constant
+                     "LIMIT %s")
 _RULES = ("SELECT source, source_ref, text, loaded_at FROM (SELECT DISTINCT ON (source) "
           "source, source_ref, text, loaded_at FROM brain_rules "
           "ORDER BY source, loaded_at DESC, id DESC) newest WHERE text <> '' ORDER BY source")
 
 
-def _rows(cur, sql: str) -> List[Dict[str, Any]]:
-    cur.execute(sql)
+def _rows(cur, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    cur.execute(sql, params)
     names = [column[0] for column in cur.description]
     return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
 
@@ -320,8 +320,8 @@ class PostgresBackend:
 
     def handoff(self) -> Dict[str, List[Dict[str, Any]]]:
         return self._run(lambda cur: {
-            "ticks": [_decoded(row) for row in _rows(cur, _TICKS)],
-            "commitments": _rows(cur, _OPEN_COMMITMENTS),
+            "ticks": [_decoded(row) for row in _rows(cur, _TICKS, (PACKET_TICKS,))],
+            "commitments": _rows(cur, _OPEN_COMMITMENTS, (COMMITMENTS_MAX,)),
             "rules": _rows(cur, _RULES)})
 
 
