@@ -13,6 +13,7 @@ from __future__ import annotations
 import calendar
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from . import proof
@@ -29,16 +30,25 @@ DEFAULT_PRIORITY = "P2"
 FIRST_LABELS = ("loom:urgent", "loom:regression", "loom:revert")
 
 
+def _utc_timestamp(value: Any) -> float:
+    parsed = (value if isinstance(value, datetime)
+              else datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
 def merged_before_regression_requeue(issue: Dict[str, Any], merged_at: Any,
                                      events: Iterable[Dict[str, Any]]) -> bool:
     """Whether a merged PR predates this regression ticket's latest re-queue."""
     if not merged_at or "loom:regression" not in {
             label.get("name") for label in issue.get("labels", [])}:
         return False
-    requeues = [str(event.get("created_at") or "") for event in events
+    requeues = [_utc_timestamp(event["created_at"]) for event in events
                 if isinstance(event, dict) and event.get("event") == "labeled"
-                and (event.get("label") or {}).get("name") in ("loom:queued", "loom:briefed")]
-    return bool(requeues) and max(requeues) > str(merged_at)
+                and (event.get("label") or {}).get("name") in ("loom:queued", "loom:briefed")
+                and event.get("created_at")]
+    return bool(requeues) and max(requeues) > _utc_timestamp(merged_at)
 
 
 HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")

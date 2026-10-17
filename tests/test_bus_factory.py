@@ -570,6 +570,23 @@ class PullRequests(Base):
         self.assertEqual(self.closed, [])
         self.assertEqual(self.gh.pulls[50]["state"], "open")
 
+    def test_missing_merged_pull_details_leave_regression_pull_open(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["labels"].append({"name": "loom:regression"})
+        self.gh.pull(51, 5, state="closed", merged_at=iso(120), merged=True)
+        self.gh.pull(50, 5, branch="loom/5-some-title-r2")
+        original_get = self.gh._get
+
+        def get_without_old_pull(path):
+            if path.endswith("/pulls/51"):
+                return Response(200, None)
+            return original_get(path)
+
+        with mock.patch.object(self.gh, "_get", side_effect=get_without_old_pull):
+            self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+
     def test_merge_after_regression_requeue_supersedes_duplicate(self):
         self.gh.ticket(5, "merged")
         self.gh.issues[5]["labels"].append({"name": "loom:regression"})

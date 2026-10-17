@@ -1200,6 +1200,8 @@ class Factory:
             if merged is not None:
                 if "loom:regression" in _labels(ticket):
                     old = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, merged)).data
+                    if not isinstance(old, dict) or not old.get("merged_at"):
+                        return
                     events = self.gh.paginate("/repos/%s/issues/%d/events"
                                               % (repo, ticket_number))
                     if tickets.merged_before_regression_requeue(
