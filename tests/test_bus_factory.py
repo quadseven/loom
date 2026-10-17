@@ -483,13 +483,13 @@ class PullRequests(Base):
             with self.subTest(name), lane_models(**models):
                 self.setUp()
                 self.opus_runs(body)
-                ran = factory.claim_models(self.gh.issues[5], self.gh.comments[5],
-                                           factory.footer_run(body))
-                self.assertEqual([m for c, m in ran if c], ["claude-opus-5-5"] * 5)
+                issue, comments = dict(self.gh.issues[5]), list(self.gh.comments[5])
                 # No codex lane is up: Gemini 4 Argon high, never Opus again.
                 self.go(limited=("codex", "codex-2"))
                 self.assertEqual((self.lane(5), self.model(5)), ("agy", "gemini-4-argon-high"))
                 self.assertEqual(self.moved, [])
+                ran = factory.claim_models(issue, comments, factory.footer_run(body))
+                self.assertEqual([m for c, m in ran if c], ["claude-opus-5-5"] * 5)
             with self.subTest(name + ", private"), lane_models(**models):
                 self.setUp()
                 self.opus_runs(body, private=True)
