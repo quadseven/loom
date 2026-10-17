@@ -135,6 +135,7 @@ class TicketStore:
                              if budget_floor is None else budget_floor)
         self._snapshot = {"tickets": {repo: None for repo in self.repos}, "errors": {},
                           "stale": False, "ready": False,
+                          "ticket_refreshed_at": None, "next_refresh_at": None, "stale_reason": "",
                           "improving": {"journals": [], "metrics_comments": []},
                           "lanes": [], "pull_requests": [], "dashboard_errors": [],
                           "goal_context": {},
@@ -248,7 +249,7 @@ class TicketStore:
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
         """Read optional view sources; errors stay visible without failing tickets."""
         if self._below_floor():
-            skipped = "optional view sources were not refreshed because the GitHub request budget is below its floor"
+            skipped = "GitHub's request budget ran low; these details will refresh after the request limit resets"
             data.update({"improving": {"journals": [], "metrics_comments": []},
                          "lanes": [], "pull_requests": [],
                          "brain_step": None, "brain_step_error": skipped,
@@ -512,7 +513,17 @@ class TicketStore:
                 operator_items, human_counts, ask_error = self.operator_items, self.human_counts, self.operator_error
             else:
                 operator_items, human_counts, ask_error = self._read_operator_items()
+            refreshed_at = current.get("ticket_refreshed_at")
+            if not stale and not errors:
+                refreshed_at = time.time()
+            below_floor = self._below_floor()
+            refresh_interval = max(1, int(os.environ.get("LOOM_DASHBOARD_REFRESH_SECONDS", "60")))
+            reset_at = self._reset_at if below_floor and self._reset_at else int(time.time()) + refresh_interval
+            stale_reason = ("GitHub's request budget ran low" if below_floor else
+                            "GitHub could not refresh ticket data" if errors else "")
             snapshot = {"tickets": data, "errors": errors, "stale": stale,
+                        "ticket_refreshed_at": refreshed_at, "next_refresh_at": reset_at,
+                        "stale_reason": stale_reason,
                         "ready": any(rows is not None for rows in data.values())}
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
@@ -555,6 +566,9 @@ class TicketStore:
         usage_rows = [row for items in getattr(store, "providers", {}).values() for row in items] if store else []
         return {"tickets": snapshot["tickets"], "errors": snapshot["errors"],
                 "stale": snapshot["stale"], "auth": self.auth,
+                "ticket_refreshed_at": snapshot.get("ticket_refreshed_at"),
+                "next_refresh_at": snapshot.get("next_refresh_at"),
+                "stale_reason": snapshot.get("stale_reason", "GitHub could not refresh ticket data"),
                 "improving": snapshot.get("improving", {}),
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
