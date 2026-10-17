@@ -739,6 +739,20 @@ ticket", one line per open pull request from a trusted author with no
 ticket, ending in `READY` or `blocked:` and every blocker exactly as a lane
 pull request's line, so a brain sees them and adopts them.
 
+The station adopts the rest (decision 0002, item 1). Each pass, for the
+oldest open pull request in a scanned repo that is not a draft, comes from
+a `LOOM_BRIEF_AUTHORS` login on a branch of the repo itself, and that no
+open ticket links (by a `Refs` line or a `loom/N` branch), it files one
+ticket under the repo's goal home: "Land or supersede #N", in the normal
+brief format with `Difficulty: medium`. The lane that takes it lands the
+change on a `loom/` branch and closes the original with a comment naming
+the new pull request, or closes the original as superseded with the reason.
+The station marks the original with a `loom:adopted` comment naming the
+ticket, so it is adopted once, and files at most one adoption ticket per
+repo a pass. It never closes a pull request itself. The station log says
+`adopted OWNER/NAME#N as ticket ...` for each one, and `adoption OWNER/NAME:`
+with the count of open pull requests no ticket links whenever it changes.
+
 ## Journal
 
 One comment per tick that changed something, on the goal's home issue:
