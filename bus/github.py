@@ -41,6 +41,9 @@ APP_JWT_BACKDATE = 60
 APP_JWT_LIFETIME = 540
 APP_SETTINGS = ("LOOM_GITHUB_APP_ID", "LOOM_GITHUB_APP_INSTALLATION_ID",
                 "LOOM_GITHUB_APP_KEY_SSM")
+# The App's private key as a mounted file (a Kubernetes secret), in place of
+# the parameter-store setting; it wins when both are set.
+APP_KEY_FILE = "LOOM_GITHUB_APP_KEY_FILE"
 
 Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
                      Tuple[int, Dict[str, str], bytes]]
@@ -148,6 +151,12 @@ def read_ssm(name: str, region: str) -> str:
     return out.stdout.strip()
 
 
+def read_key_file(path: str) -> str:
+    """The App's private key from a mounted file, read at each mint."""
+    with open(path, encoding="ascii") as fh:
+        return fh.read()
+
+
 def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
@@ -217,16 +226,26 @@ class AppToken:
         self._token: Optional[str] = None
         self._expires = 0.0
         self.minted = 0
+        # Where the key is read from: "ssm" (the aws CLI) or "file".
+        self.key_source = "ssm"
+        self.key_file = ""
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None,
                  read_key: Optional[Callable[[str, str], str]] = None
                  ) -> Optional["AppToken"]:
-        """The App token the settings name, or None when any is unset."""
+        """The App token the settings name, or None when any is unset. The
+        key comes from LOOM_GITHUB_APP_KEY_FILE when that is set, else from
+        LOOM_GITHUB_APP_KEY_SSM."""
         env = os.environ if env is None else env
         app_id, installation_id, key_ssm = (env.get(n, "").strip() for n in APP_SETTINGS)
-        if not (app_id and installation_id and key_ssm):
+        key_file = env.get(APP_KEY_FILE, "").strip()
+        if not (app_id and installation_id and (key_ssm or key_file)):
             return None
+        if key_file:
+            app = cls(app_id, installation_id, lambda: read_key_file(key_file))
+            app.key_source, app.key_file = "file", key_file
+            return app
         region = env.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
         reader = read_key or read_ssm
         return cls(app_id, installation_id, lambda: reader(key_ssm, region))
@@ -627,8 +646,9 @@ def _link(header: str, relation: str) -> Optional[str]:
 
 def auth_from_env(env: Optional[Dict[str, str]] = None) -> Auth:
     """The GitHub App installation token when LOOM_GITHUB_APP_ID,
-    LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM are all set,
-    else the personal token token_from_env finds."""
+    LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM (or
+    LOOM_GITHUB_APP_KEY_FILE) are all set, else the personal token
+    token_from_env finds."""
     app = AppToken.from_env(env)
     return app if app is not None else token_from_env()
 

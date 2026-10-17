@@ -4,7 +4,17 @@ Run the stdlib dashboard with `python3 -m dashboard`. It serves on port 8080
 by default. Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
 space-separated list of `OWNER/NAME` repositories. Set
 `LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
-the dashboard also checks the standard GitHub CLI authentication. Set
+the dashboard also checks the standard GitHub CLI authentication. To read
+GitHub as the Loom GitHub App instead, so the dashboard spends the App
+installation's request budget and not the operator account's, set
+`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_FILE`, the path to the App's private key. The
+deployment mounts that key from a Kubernetes secret as a file; the dashboard
+reads it at each token mint, signs with the openssl CLI and never logs it.
+When the key file cannot be read at start, the dashboard logs the file's
+name and keeps its token. `LOOM_GITHUB_APP_KEY_SSM` (a parameter-store name)
+works too where the aws CLI is installed; the key file wins when both are
+set. Set
 `LOOM_DASHBOARD_BUDGET_FLOOR` to change the remaining-request threshold below
 which the last ticket snapshot is served as stale. The default is 500. Set
 `LOOM_IMPROVEMENT_HOMES` to the space-separated `OWNER/NAME` repositories

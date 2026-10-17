@@ -335,6 +335,65 @@ class DashboardAppTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(dash.TicketStore().auth, "token")
 
+    FILE_ENV = {"LOOM_REPOS": "example-owner/example-repo",
+                "LOOM_DASHBOARD_GITHUB_TOKEN": "dashboard-token",
+                "LOOM_GITHUB_APP_ID": "123", "LOOM_GITHUB_APP_INSTALLATION_ID": "456"}
+
+    def test_a_mounted_key_file_makes_the_dashboard_send_an_installation_token(self):
+        from dashboard import github as dash
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "app-key.pem")
+            with open(path, "w") as fh:
+                fh.write(KEY)
+            env = dict(self.FILE_ENV, LOOM_GITHUB_APP_KEY_FILE=path)
+            # No aws CLI in the pod: the key file needs only openssl.
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(dash.shutil, "which",
+                                      lambda tool: "/usr/bin/openssl" if tool == "openssl" else None):
+                store = dash.TicketStore()
+            self.assertEqual(store.auth, "app")
+            app = store.gh.app
+            signed = []
+            app._sign = fake_sign(signed)
+            fake = FakeGitHub(["ghs_from_file"])
+            gh = GitHub(app, transport=fake)
+            gh.rest("GET", "/rate_limit")
+            self.assertEqual(fake.bearers("GET"), ["Bearer ghs_from_file"])
+            self.assertEqual([key for _, key in signed], [KEY])
+            # The file is read at each mint, so a rotated key is used next time.
+            with open(path, "w") as fh:
+                fh.write(KEY.replace("FAKEKEY", "ROTATED"))
+            app.invalidate()
+            GitHub(app, transport=FakeGitHub(["ghs_next"])).rest("GET", "/rate_limit")
+            self.assertIn("ROTATED", signed[-1][1])
+
+    def test_an_unreadable_key_file_keeps_the_token_and_names_only_the_file(self):
+        from dashboard import github as dash
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "missing-key.pem")
+            env = dict(self.FILE_ENV, LOOM_GITHUB_APP_KEY_FILE=path)
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(dash.shutil, "which", lambda tool: "/usr/bin/" + tool), \
+                    self.assertLogs(dash.LOG, "WARNING") as logged:
+                store = dash.TicketStore()
+            self.assertEqual(store.auth, "token")
+            self.assertIsNone(store.gh.app)
+            self.assertEqual(len(logged.output), 1)
+            self.assertIn(path, logged.output[0])
+            # A file that exists but cannot be read: still only its name.
+            secret = os.path.join(tmp, "app-key.pem")
+            with open(secret, "w") as fh:
+                fh.write(KEY)
+            env = dict(self.FILE_ENV, LOOM_GITHUB_APP_KEY_FILE=secret)
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(dash.shutil, "which", lambda tool: "/usr/bin/" + tool), \
+                    mock.patch("builtins.open", side_effect=PermissionError("denied")), \
+                    self.assertLogs(dash.LOG, "WARNING") as logged:
+                store = dash.TicketStore()
+            self.assertEqual(store.auth, "token")
+            self.assertIn(secret, logged.output[0])
+            self.assertNotIn(KEY_MARK, "\n".join(logged.output))
+
 
 if __name__ == "__main__":
     unittest.main()
