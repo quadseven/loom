@@ -453,6 +453,17 @@ class HandoffPacketTests(unittest.TestCase):
         self.assertNotIn("- merge %s#7, deferred" % REPO, text)
         self.assertIn("## Open defers (0, 0 from brains no longer ticking)\n- none", text)
 
+    def test_a_brief_done_drops_only_the_brief_defer_with_its_key(self):
+        home = (REPO, 1)
+        first = handoff.defer_marker("brief", home, "open", "muse", note="one", key="aaaaaaaa")
+        second = handoff.defer_marker("brief", home, "open", "muse", note="two", key="bbbbbbbb")
+        finished = handoff.done_marker("brief", home, "lane-machine", key="aaaaaaaa")
+        text = packet([goal(journal(60, "muse", first, second),
+                            journal(5, "lane-machine", finished))])
+        self.assertIn("## Open defers (1,", text)
+        self.assertIn(": two.", text)
+        self.assertNotIn(": one", text)
+
     def test_a_done_marker_on_another_goal_home_drops_the_defer_too(self):
         text = packet([goal(journal(180, "muse", defer(PR, "pr-abc"))),
                        goal(journal(5, "lane-machine", done(PR)), number=2)])

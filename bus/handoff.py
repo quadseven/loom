@@ -368,14 +368,15 @@ def _quiet_since(holder: str, last: Dict[str, str], now: datetime) -> bool:
 
 def _open_defers(goals: Sequence[Goal]) -> List[Tuple[Mark, bool]]:
     """The standing defers across every goal home, oldest first, each with
-    whether its journal may be quoted. For each stage and item the newest
-    marker on any goal home wins, as in `resume`, so a done marker, or a newer
-    defer, retires an older defer."""
+    whether its journal may be quoted. For each stage and item (and brief
+    key) the newest marker on any goal home wins, as in `resume_items`, so a
+    done marker, or a newer defer, retires an older defer."""
     found = sorted(((m, g.shown) for g in goals for m in marks(g.journals)),
                    key=lambda pair: pair[0].at)
-    latest: Dict[Tuple[str, Tuple[str, int]], Tuple[Mark, bool]] = {}
+    latest: Dict[Tuple[str, Tuple[str, int], str], Tuple[Mark, bool]] = {}
     for mark, shown in found:
-        latest[(mark.stage, mark.item)] = (mark, shown)
+        identity = mark.key if mark.stage == "brief" else ""
+        latest[(mark.stage, mark.item, identity)] = (mark, shown)
     return sorted((pair for pair in latest.values() if pair[0].kind == "defer"),
                   key=lambda pair: pair[0].at)
 
