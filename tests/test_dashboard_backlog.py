@@ -96,6 +96,8 @@ class OutsideAnyEpic(unittest.TestCase):
         return {"repo": REPO, "number": number, "title": "Ticket %d" % number, "state": "queued", **extra}
 
     def section(self, body):
+        self.assertIn("Outside any epic", body)
+        self.assertIn("Epics by score", body)
         return body[body.index("Outside any epic"):body.index("Epics by score")]
 
     def test_an_open_ticket_with_no_epic_and_no_goal_home_is_listed(self):

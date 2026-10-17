@@ -449,9 +449,10 @@ def _epic_age(epic):
 
 def _link_or_text(url, text, css=""):
     cls = ' class="%s"' % css if css else ""
+    # The title attribute carries the full text where a narrow cell cuts it.
     if url:
-        return '<a%s href="%s">%s</a>' % (cls, html.escape(url, quote=True), html.escape(text))
-    return '<span%s>%s</span>' % (cls, html.escape(text))
+        return '<a%s href="%s" title="%s">%s</a>' % (cls, html.escape(url, quote=True), html.escape(text, quote=True), html.escape(text))
+    return '<span%s title="%s">%s</span>' % (cls, html.escape(text, quote=True), html.escape(text))
 
 
 def _epic_row(epic):
@@ -471,14 +472,13 @@ def _epic_row(epic):
     age = _epic_age(epic)
     epic_number = _int_or_none(epic.get("number"))
     title = str(epic.get("title") or "Untitled epic")
-    return ('<tr><td class="machine-fact">%s</td><td class="epic-title">%s%s</td>'
+    return ('<tr><td class="machine-fact">%s%s</td><td class="epic-title">%s</td>'
             '<td class="machine-fact%s">%s</td><td class="machine-fact num">%s</td>'
             '<td><span class="epic-bar" role="img" aria-label="%d of %d children done, %d open">'
             '<i style="width:%d%%"></i></span><span class="machine-fact">%d open / %d done</span></td>'
             '<td class="epic-next-cell">%s</td><td class="machine-fact%s">%s</td></tr>') % (
-        esc(_short_repo(epic.get("repo"))),
+        esc(_short_repo(epic.get("repo"))), "#%d" % epic_number if epic_number is not None else "",
         _link_or_text(epic.get("html_url") or epic.get("url"), title),
-        ' <span class="machine-fact">#%d</span>' % epic_number if epic_number is not None else "",
         "" if tier else " muted", esc(str(tier or "unjudged")),
         esc("%.1f" % score if score is not None else "-"),
         done, total, left, percent, left, done, next_html,
