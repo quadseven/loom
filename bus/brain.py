@@ -776,8 +776,10 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
         raise ValueError("base is not a branch name")
     if "\n" in title or "\r" in title:
         raise ValueError("title is one line")
-    if any(section not in body for section in SECTIONS):
-        raise ValueError("body must contain all required sections")
+    if any(section not in body for section in SECTIONS if section != "## Size") \
+            or hunt_plan.stated_size(body) is None:
+        raise ValueError("body must contain all required sections (Size as %s)"
+                         % hunt_plan.SIZE_FORMS)
     found = plan_problems(body)
     if found:
         raise ValueError("the pull request this brief makes would fail the review "
@@ -1631,7 +1633,11 @@ def missing_sections(body: Optional[str]) -> List[str]:
         elif current is not None:
             found[current].append(line)
     names = [section[3:] for section in SECTIONS]
-    missing = [name for name in names if name.lower() not in found]
+    present = {name: name.lower() in found for name in names}
+    # A size counts as a ## Size section or an inline Size: line (#668).
+    present["Size"] = hunt_plan.stated_size(body or "") is not None
+    missing = [("Size (%s)" % hunt_plan.SIZE_FORMS) if name == "Size" else name
+               for name in names if not present[name]]
     criteria = found.get("acceptance criteria")
     if criteria is not None and not any(_CHECKBOX.match(line) for line in criteria):
         missing.append("checkboxes under Acceptance criteria")

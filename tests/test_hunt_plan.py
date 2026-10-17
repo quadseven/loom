@@ -95,5 +95,37 @@ class BriefToPullRequestTest(unittest.TestCase):
         self.assertEqual(brain.plan_problems(BRIEF % "Medium"), [])
 
 
+class OneSizeParserTest(unittest.TestCase):
+    """#668: triage, the Hunt Plan gate and PR repair read the size through
+    hunt_plan.stated_size, whether it is a ## Size section or a Size: line."""
+
+    def test_heading_and_inline_forms_read_the_same_letter(self):
+        heading = BRIEF % "Small"
+        for inline in ("Size: S", "size: s", "**Size:** S", "**Size: S**"):
+            with self.subTest(inline=inline):
+                body = (BRIEF % "S").replace("## Size\n\nS\n", inline + "\n")
+                self.assertEqual(hunt_plan.size_letter(hunt_plan.stated_size(heading)), "S")
+                self.assertEqual(hunt_plan.size_letter(hunt_plan.stated_size(body)), "S")
+                self.assertEqual(pr_repair._brief_size(body), pr_repair._brief_size(heading))
+                self.assertEqual(hunt_plan.brief_size(body), "S")
+                self.assertEqual(brain.plan_problems(body), [])
+                self.assertEqual(brain.missing_sections(body), [])
+                generated = pr_repair._render_generated(body, "lane", "model", "T1")
+                self.assertIn("\nSize: S\n", generated)
+                self.assertEqual(hunt_plan.problems(generated), [])
+
+    def test_no_size_in_either_form_is_none(self):
+        body = (BRIEF % "S").replace("## Size\n\nS\n", "")
+        self.assertIsNone(hunt_plan.stated_size(body))
+        self.assertEqual(hunt_plan.brief_size(body), "")
+        # Prose that mentions a size is not a size line.
+        self.assertIsNone(hunt_plan.stated_size(body + "\nThe Size: S part is small.\n"))
+        self.assertIsNone(hunt_plan.stated_size(body + "\nSize: XL\n"))
+        self.assertEqual(hunt_plan.stated_size(BRIEF % ""), "")
+
+    def test_the_heading_wins_over_an_inline_line(self):
+        self.assertEqual(hunt_plan.stated_size((BRIEF % "Large") + "\nSize: S\n"), "Large")
+
+
 if __name__ == "__main__":
     unittest.main()

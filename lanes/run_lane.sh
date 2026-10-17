@@ -303,9 +303,9 @@ pr_body() {
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
   # passes whatever word the brief used; an unknown size is kept as written.
-  size="$(section Size "$1" | head -1)"
-  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan size "$size" 2>/dev/null ||
-    printf '%s' "$size" | awk '{print $1}' | tr -d ':')"
+  # bus.hunt_plan reads a ## Size section or an inline "Size: S" line.
+  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan brief-size "$1" 2>/dev/null ||
+    section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"

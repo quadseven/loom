@@ -2438,7 +2438,8 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {6: ["loom:triage"], 7: ["loom:triage"], 8: ["loom:triage"]})
         comments = {int(c[1].split("/issues/")[1].split("/")[0]): c[2]["body"]
                     for c in routes.calls if c[1].endswith("/comments")}
-        self.assertIn("Missing: What, Acceptance criteria, Size, Out of scope.", comments[6])
+        self.assertIn("Missing: What, Acceptance criteria, Size (a ## Size section or a "
+                      "Size: XS|S|M|L line), Out of scope.", comments[6])
         self.assertNotIn("Why", comments[6].split("Missing:")[1].split(".")[0])
         self.assertIn("Missing: checkboxes under Acceptance criteria.", comments[7])
         self.assertIn("Missing: Why, What", comments[8])
@@ -2447,6 +2448,24 @@ class TriageTests(unittest.TestCase):
             text.check(body)
         self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST" for c in routes.calls))
         self.assert_never_edited(routes)
+
+    def test_an_inline_size_line_is_a_ready_ticket(self):
+        # #668: "Size: S" on a line of its own (any case, optionally bold)
+        # is a size, the same as a ## Size section.
+        for line in ("Size: S", "size: m", "**Size:** XS", "**Size: L**"):
+            with self.subTest(line=line):
+                body = BODY.replace("## Size\nS\n", line + "\n")
+                routes = Routes([item(5, body=body)])
+                self.run_triage(routes)
+                self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
+                self.assertEqual(brain.missing_sections(body), [])
+                brain._check_brief_args("t", body, None, None, None)
+
+    def test_a_missing_size_names_both_forms(self):
+        missing = brain.missing_sections(BODY.replace("## Size\nS\n", ""))
+        self.assertEqual(missing, ["Size (a ## Size section or a Size: XS|S|M|L line)"])
+        with self.assertRaises(ValueError):
+            brain._check_brief_args("t", BODY.replace("## Size\nS\n", ""), None, None, None)
 
     def test_a_body_the_runner_would_refuse_is_not_ready(self):
         routes = Routes([item(9, body=BODY + "\nRepo: other/repo")])
