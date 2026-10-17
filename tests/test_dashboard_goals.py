@@ -169,11 +169,12 @@ class UnprovenWork(unittest.TestCase):
         return [{"repo": REPO, "number": 7 + n, "goal": REPO + "#30", "state": state}
                 for n, state in enumerate(states)]
 
-    def test_only_merged_or_shipped_tickets_count_as_unproven(self):
+    def test_only_shipped_tickets_count_as_unproven(self):
+        # A merged ticket waits on a deploy, not on a verifier (2026-10-17).
         card = goals.goal_context(self.rows("shipped", "merged", "verified", "queued"),
                                   [], {}, [], None, NOW)[REPO + "#30"]
-        self.assertEqual(card["unproven"], 2)
-        self.assertEqual(card["unproven_limit"], 15)
+        self.assertEqual(card["unproven"], 1)
+        self.assertEqual(card["unproven_limit"], 30)
 
     def test_a_goal_card_shows_the_count_against_the_limit(self):
         from dashboard.github import ticket_record
@@ -195,7 +196,7 @@ class UnprovenWork(unittest.TestCase):
                         "goal_context": goals.goal_context(rows, [], {}, [], None, NOW)}
 
         body = server._goals(State())
-        self.assertIn("unproven work 1/15", body)
+        self.assertIn("unproven work 1/30", body)
         self.assertNotIn("over limit", body)
 
     def test_an_over_limit_goal_card_says_no_new_build_tickets(self):

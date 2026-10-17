@@ -4522,7 +4522,7 @@ class UnseenLiveEvidenceTest(unittest.TestCase):
 
 class UnprovenGateTest(unittest.TestCase):
     """loom#483: a goal with too much unproven work gets no new build claim
-    from the station. Unproven = open loom:ticket at merged or shipped (a
+    from the station. Unproven = open loom:ticket at shipped (a
     verified ticket carries loom:verified instead, so it never counts)."""
 
     GOAL = 40
@@ -4554,7 +4554,8 @@ class UnprovenGateTest(unittest.TestCase):
         self.fake.events[number] = []
         return issue
 
-    def over_limit(self, count=16):
+    def over_limit(self, count=None):
+        count = brain.DEFAULT_UNVERIFIED_LIMIT + 1 if count is None else count
         for n in range(101, 101 + count):
             self.child(n)
         self.fake.sub_issues[self.GOAL] = [self.fake.issues[n] for n in range(101, 101 + count)]

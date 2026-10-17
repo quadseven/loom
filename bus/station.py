@@ -1364,7 +1364,7 @@ class Station:
         held = counts[key]
         if held <= limit:
             return None
-        return ("goal #%d has %d tickets at merged or shipped without a proof "
+        return ("goal #%d has %d tickets shipped without a proof "
                 "(limit %d); the goal verifies them before the station starts more"
                 % (goal, held, limit))
 

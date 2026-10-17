@@ -159,17 +159,21 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # much more (2026-10-16): four local slots on the operator's own
     # hardware, free, and open to private repos. Tiers follow the Artificial
     # Analysis Intelligence Index (the operator's yardstick).
-    "easy": ("muse", "agy") + SPARKS + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-                                         "openrouter", "workersai", "zen", "zai"),
-    # The Sparks run Qwen3.8 27B since 2026-10-16 (Intelligence Index 26 to
-    # 34, beside Kimi K2.7 Code's 26 here), so they take medium work too.
-    "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
-               "opencode-go-4") + SPARKS + ANTHROPIC,
+    # The Sparks come FIRST in every tier since 2026-10-17 (operator: "I wanna
+    # use my sparks"): both boxes run NVIDIA Nemotron 3.5 Super VL on vLLM
+    # (120B / 12B active; SWE-bench Verified 71.1 and Terminal-Bench 2.1 about
+    # 61 on its model card; 6/6 on assay's agentic_coding). Artificial
+    # Analysis has no listing for it yet. A ticket a Spark fails still climbs
+    # the model ladder, so nothing waits on them.
+    "easy": SPARKS + ("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                      "openrouter", "workersai", "zen", "zai"),
+    "medium": SPARKS + ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2",
+                        "opencode-go-3", "opencode-go-4") + ANTHROPIC,
     # agy runs Gemini 4 Argon on the operator's Google plan since 2026-10-15:
     # Artificial Analysis Intelligence Index 53 at high effort, beside Claude
     # Opus 5.5 high (54) and GPT-6.1 Sol high (50), so it takes hard work on
     # public repos (agy stays public only).
-    "hard": ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
+    "hard": SPARKS + ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
 # takes a free lane of these tiers instead, in order: the next harder tier,
