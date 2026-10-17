@@ -1,5 +1,6 @@
 """Test the Finding class and related functions in bus.tickets."""
 import unittest
+from datetime import datetime, timezone
 
 from bus import tickets
 from bus.tickets import (Finding, after_holds, after_refs, dependency_state, parse,
@@ -300,6 +301,25 @@ class AfterLineTest(unittest.TestCase):
         self.assertEqual(dependency_state(None), "unreadable")
 
 
+class DifficultyHeaderTest(unittest.TestCase):
+    """A hand-edited "Difficulty: Medium", or the same header written twice,
+    left tickets with no readable tier, so no lane ever claimed them
+    (2026-10-16)."""
+
+    def test_difficulty_is_read_in_any_case(self):
+        from bus.factory import difficulty_of
+        self.assertEqual(parse("Difficulty: Medium\n\nbody")[0], {"Difficulty": "medium"})
+        self.assertEqual(difficulty_of({"body": "Priority: P1\nDifficulty: HARD\n\n## Why\nx"}), "hard")
+
+    def test_the_same_header_twice_is_one_header(self):
+        self.assertEqual(parse("Difficulty: hard\nDifficulty: hard\n\nbody")[0], {"Difficulty": "hard"})
+
+    def test_two_different_values_or_an_unknown_tier_are_still_refused(self):
+        for bad in ("Difficulty: hard\nDifficulty: easy\n\nbody", "Difficulty: extreme\n\nbody"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse(bad)
+
+
 class PriorityTest(unittest.TestCase):
     """Priority: P0 to P3 orders every queue after the FIRST labels."""
 
@@ -372,3 +392,42 @@ class LandedStateWins(unittest.TestCase):
         self.assertEqual(tickets.ticket_state(self._issue("loom:ready")), "ready")
         self.assertEqual(tickets.ticket_state(self._issue("custom")), "")
 
+
+
+class HardModelBriefTest(unittest.TestCase):
+    """A hard ticket with no Model: line runs its lane's strongest model."""
+
+    def head(self, body, lane):
+        issue = {"number": 9, "title": "T", "body": body}
+        return render_brief(REPO, issue, lane).split("# T9")[0]
+
+    def test_a_hard_ticket_on_codex_renders_gpt_6_sol(self):
+        self.assertIn("\nModel: gpt-6-sol\n", self.head("Difficulty: hard\n\nWhy\n", "codex"))
+        self.assertIn("\nModel: gpt-6-sol\n", self.head("Difficulty: hard\n\nWhy\n", "codex-2"))
+        self.assertIn("\nModel: gemini-4-argon-high\n",
+                      self.head("Difficulty: hard\n\nWhy\n", "agy"))
+
+    def test_a_medium_ticket_keeps_the_lane_default(self):
+        self.assertNotIn("Model:", self.head("Difficulty: medium\n\nWhy\n", "codex"))
+
+    def test_a_pinned_model_or_a_lane_without_a_hard_model_is_kept(self):
+        head = self.head("Model: gpt-6-luna\nDifficulty: hard\n\nWhy\n", "codex")
+        self.assertEqual(head.count("Model:"), 1)
+        self.assertIn("Model: gpt-6-luna", head)
+        self.assertNotIn("Model:", self.head("Difficulty: hard\n\nWhy\n", "anthropic"))
+
+
+class RegressionRequeueTest(unittest.TestCase):
+    def test_datetime_merge_before_requeue_is_detected(self):
+        issue = ticket(5, "regression")
+        events = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                   "created_at": "2030-01-02T02:00:00Z"}]
+        merged_at = datetime(2030, 1, 2, 1, tzinfo=timezone.utc)
+        self.assertTrue(tickets.merged_before_regression_requeue(issue, merged_at, events))
+
+    def test_datetime_merge_after_requeue_is_current(self):
+        issue = ticket(5, "regression")
+        events = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                   "created_at": "2030-01-02T01:00:00Z"}]
+        merged_at = datetime(2030, 1, 2, 2, tzinfo=timezone.utc)
+        self.assertFalse(tickets.merged_before_regression_requeue(issue, merged_at, events))

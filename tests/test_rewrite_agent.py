@@ -3,6 +3,7 @@ and a fake aws on PATH, and the real sandbox-exec, as the station runs it."""
 
 import json
 import re
+import os
 import subprocess
 import tempfile
 import unittest
@@ -82,6 +83,7 @@ log=@LANE_LOG@
 printf '%s|%s|%s|%s\n' "$(basename "$0")" "$*" "$HOME" "$PWD" >> "$log"
 cat > "$log.prompt"
 if [ "$(basename "$0")" = codex ] && grep -q 'MODE=fail-codex' "$log.prompt"; then exit 3; fi
+[ "$(basename "$0")" = codex ] && printf 'cert=%s\n' "${SSL_CERT_FILE:-unset}" > "$log.codexenv"
 if [ "$(basename "$0")" = claude ]; then
   case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in *$'\nINJECTED=present') intact=yes ;; *) intact=no ;; esac
   printf 'token-intact=%s injected=%s\n' "$intact" "${INJECTED:-absent}" > "$log.env"
@@ -164,6 +166,18 @@ class RewriteAgentTest(unittest.TestCase):
                 self.assertIn('run/rewrite.', self.lane_log.read_text())
                 self.assertIn('home/work', self.lane_log.read_text())
                 self.assertNotIn('aws ssm', self.log.read_text())
+
+    def test_the_wrapper_is_executable_as_the_station_runs_it(self):
+        # LOOM_REWRITE_CMD names the script as the command itself, so a lost
+        # execute bit fails every rewrite with PermissionError (2026-10-17).
+        self.assertTrue(os.access(WRAPPER, os.X_OK), "%s lost its execute bit" % WRAPPER)
+
+    def test_codex_verifies_tls_from_the_system_bundle_with_the_keychain_denied(self):
+        result = self.run_wrapper("Rewrite this", args=("-", "codex/test-model"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(str(self.lane_log) + ".codexenv").read_text(),
+                         "cert=/etc/ssl/cert.pem\n")
+        self.assertIn('(global-name "com.apple.SecurityServer")', self.sandbox_log.read_text())
 
     def test_failed_lane_falls_back_to_next_entry(self):
         result = self.run_wrapper("MODE=fail-codex", args=("-", "codex/test-model,claude/test-model"),

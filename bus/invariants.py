@@ -44,6 +44,9 @@ BRAIN_SILENT = 90 * 60
 REPORT_GAP = 90 * 60
 RUNS_MIN = 5
 HELD_MAX = 2 * 3600
+# A gate that has refused a goal's briefed tickets for this long gets its own
+# invariant naming it (loom#564).
+GATE_HOLD_MAX = 3600
 # A goal home holding this many GitHub sub-issues is read for tickets that
 # name it without a Part of line (GitHub refuses a 101st sub-issue).
 SUB_ISSUES_MAX = 90
@@ -113,6 +116,18 @@ class Check(NamedTuple):
     title: str
 
 
+class GateHold(NamedTuple):
+    """A goal the unproven-work gate refuses briefed tickets for: the goal,
+    when the gate first refused it, the unproven count and the limit it hit,
+    the briefed tickets it holds, and the lanes left idle meanwhile."""
+    goal: Ref
+    since: float
+    count: int
+    limit: int
+    tickets: Tuple[Ref, ...]
+    idle: int
+
+
 @dataclass
 class Facts:
     now: float
@@ -128,6 +143,8 @@ class Facts:
     # (goal home, how many tickets name it without a sub-issue link or a Part of line).
     goals: Optional[List[Tuple[Ref, int]]] = None
     checks: Optional[List[Check]] = None
+    # goal key -> the unproven-work gate's hold on it, per loom#564.
+    gate_held: Optional[Dict[str, GateHold]] = None
     # remote lane -> its newest heartbeat, None when it never posted one.
     beats: Optional[Dict[str, Optional[float]]] = None
 
@@ -353,9 +370,36 @@ def remote_silent(f: Facts) -> List[Breach]:
     return out
 
 
+def gate_hold(f: Facts) -> List[Breach]:
+    """A goal the unproven-work gate refused briefed tickets for past
+    GATE_HOLD_MAX: the refusal would otherwise live only in the station log
+    until the operator asks why nothing moves (loom#564). The breach clears
+    when the gate stops holding the goal, as other invariants do."""
+    if f.gate_held is None:
+        return []
+    out = []
+    for key, hold in sorted(f.gate_held.items()):
+        if f.now - hold.since < GATE_HOLD_MAX:
+            continue
+        shown = ", ".join(t.label for t in hold.tickets[:SHOWN])
+        more = (" and %d more" % (len(hold.tickets) - SHOWN)
+                if len(hold.tickets) > SHOWN else "")
+        out.append(Breach("gate-hold", key,
+                          "The unproven-work gate holds goal %s for %s"
+                          % (hold.goal.label, _hours(f.now - hold.since)),
+                          ("The station refused every briefed ticket of goal %s for %s"
+                           % (hold.goal.label, _hours(f.now - hold.since)),
+                           "%d tickets shipped without a proof (limit %d)"
+                           % (hold.count, hold.limit),
+                           "Briefed tickets waiting: %s%s" % (shown or "none", more),
+                           "%d lanes idle meanwhile" % hold.idle),
+                          f.now))
+    return out
+
+
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
-    goal_full, plan_check_failed, remote_silent)
+    goal_full, plan_check_failed, remote_silent, gate_hold)
 
 
 def check(facts: Facts, say: Say,

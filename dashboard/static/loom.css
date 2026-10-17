@@ -96,7 +96,9 @@ button { color: inherit; font: inherit; }
 .status-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--good); }
 .theme-toggle, .icon-button { min-width: 44px; min-height: 44px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); cursor: pointer; }
 .theme-toggle { align-self: flex-start; padding: 0 12px; }
-.page-content { width: min(100%, 1320px); min-height: 100vh; margin-left: 232px; padding: 24px clamp(16px, 3.5vw, 40px) 120px; }
+/* The content fills the window beside the fixed nav: a 1320px cap left a
+   third of a widescreen empty (2026-10-17). Prose keeps its own max-width. */
+.page-content { min-width: 0; min-height: 100vh; margin-left: 232px; padding: 24px clamp(16px, 3.5vw, 40px) 120px; }
 .page-title { margin: 0 0 24px; font-size: clamp(24px, 3vw, 34px); font-weight: 600; letter-spacing: -.02em; }
 .mobile-topbar, .mobile-tabs { display: none; }
 .ticket-row, .card { border: 1px solid var(--line); border-radius: 10px; background: var(--row); padding: 12px 14px; }
@@ -154,12 +156,7 @@ button { color: inherit; font: inherit; }
 .backlog-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; }
 .backlog-filters label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .backlog-filters select, .backlog-filters button { min-height: 44px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
-.backlog-epic { margin-bottom: 12px; }
-.backlog-epic h2, .card h2 { font-size: 18px; }
-.backlog-epic ul { padding-left: 20px; }
-.backlog-epic li { padding: 4px 0; }
-.start-here { border-color: var(--accent); margin-bottom: 16px; }
-.start-here h2 { margin-bottom: 4px; }
+.card h2 { font-size: 18px; }
 blockquote { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--accent); white-space: pre-wrap; }
 footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .more-sheet .nav-row { min-height: 52px; }
@@ -250,6 +247,10 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .backlog-ask { margin: 6px 0; color: var(--body); font-size: 13px; }
 .usage-card { margin: 10px 0; }
 .usage-card p { margin: 8px 0 0; color: var(--body); overflow-wrap: anywhere; }
+.lane-usage { width: 100%; border-collapse: collapse; font-size: 13px; }
+.lane-usage th, .lane-usage td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; }
+.lane-usage th:first-child { width: 10rem; font-family: var(--font-mono); }
+.lane-usage td { color: var(--body); overflow-wrap: anywhere; }
 .usage-track { height: 10px; margin-top: 12px; border-radius: 8px; background: var(--raised); overflow: hidden; }
 .usage-track span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .share-track span, .quota span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
@@ -466,3 +467,104 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .results-table th, .results-table td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--line, rgba(127,127,127,0.25)); min-height: 44px; }
 .results-table td { font-variant-numeric: tabular-nums; }
 .results-table td.not-looked { color: var(--muted, #888); font-style: normal; }
+
+/* Backlog page (loom#607): one dense epics table, the "Outside any epic"
+   list, and collapsed groups for empty epics, overflow ranks and checks. */
+.backlog-note { max-width: 760px; margin: 0 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.backlog-outside { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 2px 18px; margin: 0; padding: 0; list-style: none; }
+.backlog-outside li { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; padding: 5px 0; border-bottom: 1px solid var(--line); }
+.backlog-outside li > a { min-width: 0; overflow: hidden; color: var(--body); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.backlog-outside li > a:hover { color: var(--text); }
+.backlog-outside li > .machine-fact { flex: none; }
+.epic-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+.epic-table caption { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.epic-table th { padding: 6px 8px; border-bottom: 1px solid var(--line-strong); color: var(--dim-on-bg); font: 500 10.5px var(--font-mono); letter-spacing: .08em; text-align: left; text-transform: uppercase; }
+.epic-table td { padding: 5px 8px; border-bottom: 1px solid var(--line); overflow: hidden; color: var(--body); text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+.epic-table tbody tr:hover { background: var(--raised); }
+.epic-table th:nth-child(1) { width: 11%; }
+.epic-table th:nth-child(2) { width: 34%; }
+.epic-table th:nth-child(3) { width: 7%; }
+.epic-table th:nth-child(4) { width: 6%; }
+.epic-table th:nth-child(5) { width: 13%; }
+.epic-table th:nth-child(6) { width: 24%; }
+.epic-table th:nth-child(7) { width: 5%; }
+.epic-table td.num, .epic-table th:nth-child(4) { text-align: right; }
+.epic-table td a { color: var(--text); }
+.epic-table td a:hover { color: var(--accent-on-bg); }
+.epic-table .epic-next { color: var(--body); }
+.epic-table .muted { color: var(--muted); }
+.epic-bar { display: inline-block; width: 56px; height: 5px; margin-right: 8px; overflow: hidden; border-radius: 3px; background: var(--future); vertical-align: middle; }
+.epic-bar i { display: block; height: 100%; background: var(--good-on-bg); }
+.backlog-group { margin: 0 0 18px; }
+.backlog-group > summary { color: var(--muted); font: 12px var(--font-mono); cursor: pointer; }
+.backlog-group h2 { margin: 14px 0 6px; font-size: 14px; font-weight: 500; }
+.backlog-group ul { margin: 6px 0; padding-left: 20px; }
+.backlog-group li { padding: 2px 0; color: var(--body); }
+@media (max-width: 959px) {
+  .epic-table, .epic-table tbody, .epic-table tr, .epic-table td { display: block; width: auto; }
+  .epic-table thead { display: none; }
+  .epic-table tr { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .epic-table td { padding: 0; border: 0; white-space: normal; }
+  .epic-table td.epic-title, .epic-table td.epic-next-cell { grid-column: 1 / -1; }
+  .epic-table td a { display: inline-flex; min-height: 44px; align-items: center; }
+  .backlog-outside li { align-items: center; }
+}
+
+/* Tickets page (loom#608): one dense table per goal home, in-flight first.
+   Rows are one line on a desktop so the in-flight tickets fit within two
+   screens of a 2056px window; on a phone each row stacks into a card with
+   44px tap targets. */
+.tickets-counters { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.tickets-counter { gap: 6px; font-size: 12px; }
+.tickets-counter b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.tickets-counter small { color: var(--muted); font-size: 11px; }
+.tickets-counter[aria-current="true"], .tickets-models .chip[aria-current="true"] { border-color: var(--accent); color: var(--accent-on-bg); }
+.tickets-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin: 0 0 14px; }
+.tickets-models summary { color: var(--muted); font: 12px var(--font-mono); cursor: pointer; }
+.tickets-models .chips { margin: 8px 0 0; }
+.tickets-active { margin: 0; }
+.tickets-active a { color: var(--accent-on-bg); }
+.tickets-group { margin: 0 0 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--row); }
+.tickets-group > summary { display: flex; align-items: baseline; gap: 10px; padding: 8px 12px; cursor: pointer; }
+.tickets-group-title { overflow: hidden; color: var(--text); font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.tickets-group > summary::before { width: 1ch; color: var(--muted); font: 12px var(--font-mono); content: "+"; }
+.tickets-group[open] > summary::before { content: "-"; }
+.tickets-count { margin-left: auto; }
+.tickets-goal-link { flex: none; color: var(--accent-on-bg); font: 11px var(--font-mono); }
+.tickets-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 13px; }
+.tickets-table .c-state { width: 112px; }
+.tickets-table .c-model { width: 290px; }
+.tickets-table .c-age { width: 84px; }
+.tickets-table .c-pr { width: 72px; }
+.tickets-table th { padding: 4px 12px; border-top: 1px solid var(--line); color: var(--dim-on-bg); font: 10.5px var(--font-mono); letter-spacing: .08em; text-align: left; text-transform: uppercase; }
+.tickets-table td { overflow: hidden; padding: 5px 12px; border-top: 1px solid var(--line); text-overflow: ellipsis; white-space: nowrap; }
+.tickets-table tbody tr:hover { background: var(--raised); }
+.tickets-ticket a { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.tickets-ticket .machine-fact { flex: none; }
+.tickets-title { overflow: hidden; color: var(--body-on-row); text-overflow: ellipsis; white-space: nowrap; }
+.tickets-table a:hover .tickets-title, .tickets-model a:hover, .tickets-pr a:hover { color: var(--text); text-decoration: underline; }
+.tickets-model a, .tickets-pr a { color: var(--body); }
+.tickets-none { color: var(--muted); }
+@media (max-width: 959px) {
+  .page-content .tickets-group > summary { display: flex; flex-wrap: wrap; align-items: center; }
+  .tickets-table, .tickets-table tbody { display: block; }
+  .tickets-table colgroup, .tickets-table thead { display: none; }
+  .tickets-table tr { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; column-gap: 10px; padding: 4px 12px 8px; border-top: 1px solid var(--line); }
+  .tickets-table td { padding: 0; border: 0; }
+  .tickets-table td.tickets-ticket { grid-column: 1 / -1; white-space: normal; }
+  .tickets-ticket a { display: flex; min-height: 44px; align-items: center; }
+  .tickets-title { white-space: normal; }
+  .tickets-model a, .tickets-pr a, .tickets-goal-link, .tickets-active a { display: inline-flex; min-height: 44px; align-items: center; }
+  .tickets-table td.tickets-state { grid-area: 2 / 1; }
+  .tickets-table td.tickets-age { grid-area: 2 / 2; }
+  .tickets-table td.tickets-pr { grid-area: 2 / 3; }
+  .tickets-table td.tickets-model { grid-area: 3 / 1 / 4 / -1; }
+}
+
+/* Goals page: smaller goals roll up into their parent's card (loom#609). */
+.goal-card .metric-missing { font-size: 18px; color: var(--muted); }
+.goal-children { display: grid; gap: 6px; margin: 0 0 14px; padding: 0; list-style: none; }
+.goal-children li > a { display: grid; gap: 2px; min-height: 44px; align-content: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--body-on-bg); }
+.goal-children li > a:hover { background: var(--raised); border-color: var(--line-strong); }
+.goal-child-title { font-size: 13.5px; line-height: 1.35; }
+.goal-children .machine-fact { color: var(--muted); font-size: 11px; }

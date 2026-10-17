@@ -77,7 +77,12 @@ _UPSERT = ("INSERT INTO transcripts (ticket, slot, model, outcome, started_at, f
 _LIST_ALL = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts ORDER BY started_at DESC LIMIT 100"
 _LIST_TICKET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts WHERE ticket=%s ORDER BY started_at DESC LIMIT 100"
 _ATTEMPTS = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts WHERE ticket=%s ORDER BY started_at ASC"
+# The newest run of every ticket: the Tickets page and the Floor show its model.
+_LATEST = ("SELECT DISTINCT ON (ticket) id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at "
+           "FROM transcripts ORDER BY ticket, started_at DESC")
 _GET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE id=%s"
+RETENTION_DAYS = 180
+_PURGE = "DELETE FROM transcripts WHERE started_at < now() - INTERVAL '%d days'" % RETENTION_DAYS  # noqa: S608 - RETENTION_DAYS is a fixed integer constant, not user input.
 
 
 class MemoryBackend:
@@ -103,6 +108,11 @@ class MemoryBackend:
         rows.sort(key=lambda r: (r["started_at"], r["id"]), reverse=query != "attempts")
         if query == "list":
             rows = rows[:100]
+        if query == "latest":
+            newest = {}
+            for r in rows:
+                newest.setdefault(r["ticket"], r)
+            rows = list(newest.values())
         return [{key: value for key, value in r.items() if key != "events"} for r in rows]
 
     def get(self, id_: int):
@@ -129,7 +139,9 @@ class PostgresBackend:
     def initialize(self):
         conn = self._connect()
         try:
-            conn.cursor().execute(_CREATE)
+            cur = conn.cursor()
+            cur.execute(_CREATE)
+            cur.execute(_PURGE)
             conn.commit()
         finally:
             conn.close()
@@ -138,6 +150,7 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
+            cur.execute(_PURGE)
             cur.execute(_UPSERT, (body["ticket"], body["slot"], body["model"], body["outcome"],
                                   body["started_at"], body["finished_at"], json.dumps(body["events"]),
                                   len(json.dumps(body, ensure_ascii=False).encode("utf-8"))))
@@ -151,9 +164,13 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(_LIST_TICKET if query == "list" and ticket is not None else
-                        _LIST_ALL if query == "list" else _ATTEMPTS,
-                        (ticket,) if query == "attempts" or ticket is not None else ())
+            cur.execute(_PURGE)
+            if query == "latest":
+                cur.execute(_LATEST, ())
+            else:
+                cur.execute(_LIST_TICKET if query == "list" and ticket is not None else
+                            _LIST_ALL if query == "list" else _ATTEMPTS,
+                            (ticket,) if query == "attempts" or ticket is not None else ())
             names = [column[0] for column in cur.description]
             rows = [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
             for row in rows:
@@ -167,6 +184,7 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
+            cur.execute(_PURGE)
             cur.execute(_GET, (id_,))
             row = cur.fetchone()
             if row is None:
@@ -229,3 +247,7 @@ class Store:
 
     def get(self, id_):
         return _plain(self.backend.get(id_))
+
+    def latest(self):
+        """{ticket: its newest run} over every ticket with a stored run."""
+        return {row["ticket"]: row for row in (_plain(r) for r in self.backend.read("latest"))}

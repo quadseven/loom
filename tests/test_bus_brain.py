@@ -122,6 +122,49 @@ class BrainTests(unittest.TestCase):
         brain._check_brief_difficulty(body, "agy", None)
         brain._check_brief_difficulty("Difficulty: hard\n\n" + body, None, None)
 
+    def test_a_ticket_must_parse_back_to_the_headers_the_tool_wrote(self):
+        # loom#486 filed with its own "Priority:" line and a blank before the
+        # tool's headers, and loom#506 with a pasted "Repo:" preamble: neither
+        # read as having a difficulty, so no lane claimed them for hours.
+        good = brain._ticket_body("## Why\nx\n", "medium", None, None, None, None, "P2")
+        brain._check_ticket_headers(good, {"Difficulty": "medium", "Priority": "P2"})
+        split = "Priority: P2\n\nDifficulty: medium\nPriority: P2\n\n## Why\nx\n"
+        with self.assertRaisesRegex(ValueError, "Difficulty header is not readable"):
+            brain._check_ticket_headers(split, {"Difficulty": "medium", "Priority": "P2"})
+        pasted = brain._ticket_body("# Brief: T1\n\nRepo: o/r\nBranch: b\n\n## Why\nx\n",
+                                    "medium", None, None, None, None, None)
+        with self.assertRaisesRegex(ValueError, "headers do not parse"):
+            brain._check_ticket_headers(pasted, {"Difficulty": "medium"})
+
+    def test_a_ticket_awaiting_live_evidence_does_not_hold_the_unproven_limit(self):
+        def ticket(*names):
+            return {"state": "open", "labels": [{"name": n} for n in ("loom:ticket",) + names]}
+        waiting = ticket("loom:shipped", brain.AWAITING_EVIDENCE)
+        self.assertFalse(brain._unproven(waiting))
+        self.assertTrue(brain._awaiting(waiting))
+        self.assertTrue(brain._unproven(ticket("loom:shipped")))
+        self.assertFalse(brain._awaiting(ticket("loom:shipped")))
+        # A merged ticket waits on a deploy, not a verifier: it never counts
+        # (2026-10-17: merged tickets pinned two goals over the limit).
+        self.assertFalse(brain._unproven(ticket("loom:merged")))
+        # Closed or verified work never counts either way.
+        self.assertFalse(brain._unproven(dict(waiting, state="closed")))
+        children = [ticket("loom:shipped")] * 3 + [waiting] * 20
+        brain._check_goal_unproven(children, 30)
+
+    def test_the_awaiting_label_cannot_switch_the_limit_off(self):
+        # The label comes from a lane's verify.json: past twice the limit,
+        # awaiting tickets hold the limit again.
+        def ticket(*names):
+            return {"state": "open", "labels": [{"name": n} for n in ("loom:ticket",) + names]}
+        waiting = ticket("loom:shipped", brain.AWAITING_EVIDENCE)
+        cap = brain.AWAITING_CAP_FACTOR * brain.unverified_limit()
+        held, excluded = brain._count_unproven([ticket("loom:shipped")] + [waiting] * (cap + 5))
+        self.assertEqual((held, excluded), (1 + 5, cap))
+        brain._check_goal_unproven([waiting] * cap, 30)
+        with self.assertRaisesRegex(ValueError, "without a proof"):
+            brain._check_goal_unproven([waiting] * (cap + brain.unverified_limit() + 1), 30)
+
     def test_prioritize_without_trusted_authors_names_the_setting(self):
         # A remote brain without LOOM_BRIEF_AUTHORS saw only "not a trusted
         # login" and could not tell what to fix.
@@ -269,14 +312,15 @@ class SensitiveResumeTests(unittest.TestCase):
                         {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
-            reply(200, []), reply(200, [])))
+            reply(200, []), reply(200, []), reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env={})
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
-        # Project repo: issues, pulls, one GraphQL request; lane repo: issues
-        # (no loom:lanes issue here, so no comments read). The fake has no
-        # replies left, so any extra call fails the test.
-        self.assertEqual(gh.requests, 4)
+        # Project repo: issues, pulls, one GraphQL request, the goal's
+        # unproven-work read; lane repo: issues (no loom:lanes issue here, so
+        # no comments read). The fake has no replies left, so any extra call
+        # fails the test.
+        self.assertEqual(gh.requests, 5)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -338,7 +382,7 @@ class SensitiveResumeTests(unittest.TestCase):
                          "labels": [{"name": "class:sensitive"}]}]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
-            reply(200, [])))
+            reply(200, []), reply(200, [])))
         lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
@@ -383,6 +427,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, []),
             reply(200, comments_with),
             reply(200, []))
         report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
@@ -399,6 +444,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, [pr]),
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, []),
             reply(200, comments_without),
             reply(200, []))
         report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
@@ -458,6 +504,7 @@ class SensitiveResumeTests(unittest.TestCase):
         gh = GitHub("t", transport=Fake(
             reply(200, goals), reply(200, []),
             reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
+            reply(200, []), reply(200, []),
             reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env={}, now=now, authors=["brain-bot"])
         self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
@@ -569,6 +616,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "g1": {"comments": {"nodes": []}},
                         "defaultBranchRef": {"name": "main"},
                         "merged": {"nodes": merged}}}}),
+                    reply(200, []),
                     reply(200, []))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
         self.assertIn("warning: work merges into side; set Trunk: side on the goal home", report)
@@ -581,6 +629,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "g1": {"comments": {"nodes": []}},
                         "defaultBranchRef": {"name": "main"},
                         "merged": {"nodes": merged}}}}),
+                    reply(200, []),
                     reply(200, []))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
         self.assertNotIn("warning: work merges into", report)
@@ -594,6 +643,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "g1": {"comments": {"nodes": []}},
                         "defaultBranchRef": {"name": "main"},
                         "merged": {"nodes": merged}}}}),
+                    reply(200, []),
                     reply(200, []))
         report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
         self.assertNotIn("warning: work merges into", report)
@@ -609,6 +659,7 @@ class SensitiveResumeTests(unittest.TestCase):
                                 "g1": {"comments": {"nodes": []}},
                                 "defaultBranchRef": {"name": "main"},
                                 "merged": {"nodes": merged}}}}),
+                            reply(200, []),
                             reply(200, []))
                 report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
                 if should_warn:
@@ -627,7 +678,11 @@ class SensitiveResumeTests(unittest.TestCase):
     def _ticketless_report(self, node, env=None):
         routes = {("GET", "/repos/%s/issues" % REPO): reply(200, []),
                   ("GET", "/repos/%s/pulls" % REPO): reply(200, [self._ticketless_pr()]),
-                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p6": node}}})}
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p6": node}}}),
+                  ("GET", "/repos/%s/commits/head1/check-runs" % REPO):
+                      reply(200, {"check_runs": [{"name": brain.review_check_name(),
+                                                  "status": "completed",
+                                                  "conclusion": "success"}]})}
         routes.update(lanes_routes(()))
         report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
                               env=env or {"LOOM_BRIEF_AUTHORS": "example-brain"})
@@ -743,7 +798,7 @@ class SensitiveResumeTests(unittest.TestCase):
             with open(path, "w") as fh:
                 fh.write(BODY)
             err = io.StringIO()
-            with unittest.mock.patch("bus.brain.token_from_env", return_value="t"), \
+            with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
                     unittest.mock.patch("bus.brain.GitHub") as client, \
                     contextlib.redirect_stderr(err):
                 client.return_value.requests = 0
@@ -973,6 +1028,39 @@ class SensitiveResumeTests(unittest.TestCase):
                                 env={"LOOM_MERGE_SETTLE_SECONDS": "0"})
                 self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_trusted_lane_author_can_merge_a_ticket_linked_non_loom_head(self):
+        pr, query = self._merge_replies({
+            "pr": {"head": {"ref": "feature/lane-work", "sha": "checked",
+                             "repo": {"full_name": REPO}},
+                   "user": {"login": "example-brain"}},
+            "details": {"headRefName": "feature/lane-work"}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
+                    reply(204), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                             env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        self.assertTrue(result["merged"])
+
+    def test_untrusted_author_cannot_merge_a_ticket_linked_non_loom_head(self):
+        pr, query = self._merge_replies({
+            "pr": {"head": {"ref": "feature/lane-work", "sha": "checked",
+                             "repo": {"full_name": REPO}},
+                   "user": {"login": "example-stranger"}},
+            "details": {"headRefName": "feature/lane-work"}})
+        fake = Fake(pr, query)
+        with self.assertRaisesRegex(ValueError, "not a loom branch"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_ticketless_status_blocks_when_review_check_has_not_passed(self):
+        pr = {"number": 8, "title": "Docs", "labels": [{"name": "class:docs"}],
+              "head": {"sha": "head1"}}
+        fake = Fake(reply(200, {"check_runs": []}))
+        line = brain._status_pr_line(GitHub("t", transport=fake), REPO, pr,
+                                     ready_node(), "grug-tribe", "Grug - Elder")
+        self.assertIn("blocked: review check has not passed on the head commit", line)
+
     def test_good_merge_uses_checked_sha_then_deletes_and_moves_ticket(self):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
@@ -1004,6 +1092,31 @@ class SensitiveResumeTests(unittest.TestCase):
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
                              env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertTrue(result["merged"])
+
+    def test_merge_heals_ticket_stuck_in_running_when_pr_is_open(self):
+        # A ticket in loom:running with an open PR should be moved to loom:pr
+        # instead of refusing the merge. This heals the label drift when a lane
+        # opens the PR but the label update never lands.
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:running"},
+                                             {"name": "lane:muse"}]}
+        healed = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                              {"name": "lane:muse"}]}
+        fake = Fake(pr, query,
+                    reply(200, issue),  # _validate_ticket_association reads ticket
+                    reply(200, healed),  # PUT labels returns healed issue
+                    # _refuse_pending_fix returns early with empty env (no authors)
+                    reply(200, {"merged": True}),
+                    reply(204),
+                    reply(200, healed), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+        # The label update must have been sent before the merge.
+        put_calls = [c for c in fake.calls if c[0] == "PUT" and "/labels" in c[1]]
+        self.assertTrue(put_calls, "expected a label PUT to heal the ticket")
+        sent = put_calls[0][2]["labels"]
+        self.assertIn("loom:pr", sent)
+        self.assertNotIn("loom:running", sent)
 
     def test_merge_refuses_an_unrelated_closed_or_non_ticket_issue_before_write(self):
         cases = [
@@ -1787,6 +1900,13 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("tried claude-sonnet-5-5", report)
         self.assertIn("next rung 2 gpt-6-sol", report)
 
+    def test_an_equivalent_move_records_the_model_that_ran(self):
+        claim_body = "Claimed for lane agy (body sha256 0123456789ab)"
+        bodies = [(brain.ESCALATE_MARKER + "\nRung: 3 claude-opus-5-5 anthropic", None),
+                  ("<!-- loom:equivalent gemini-4-argon-high -->\nmoved", None),
+                  (claim_body, None)]
+        self.assertEqual(brain._tried_models(None, bodies), ["gemini-4-argon-high"])
+
     def test_status_reads_at_most_the_capped_number_of_histories(self):
         older = dict(stuck_ticket("failed"), updated_at="2030-01-01T00:00:00Z")
         newer = dict(stuck_ticket("failed"), number=10, updated_at="2030-01-02T00:00:00Z")
@@ -1848,6 +1968,67 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
                          [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
+
+    def finished_pr_routes(self, green=True, review="success", resolved=True,
+                           author="trusted", fork=False):
+        """Two fix rounds on lane codex, and pull request #8 in the given state."""
+        issue = stuck_ticket("pr", body="Model: gpt-6-sol\n\n" + BODY)
+        history = [claim("2030-01-01T00:10:00Z", "codex"), fixc("2030-01-01T00:20:00Z"),
+                   claim("2030-01-01T00:25:00Z", "codex"), fixc("2030-01-01T00:30:00Z")]
+        routes = ticket_routes(issue, [], history)
+        details = {"headRefOid": "abc123", "mergeable": "MERGEABLE",
+                   "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                       "state": "SUCCESS" if green else "FAILURE"}}}]},
+                   "reviewThreads": {"nodes": [{"id": "T1", "isResolved": resolved,
+                                                "comments": {"nodes": []}}]}}
+        routes[("POST", "/graphql")] = reply(200, {"data": {"repository": {"pullRequest": details}}})
+        pr = fix_pr(user={"login": author})
+        if fork:
+            pr["head"] = dict(pr["head"], repo={"full_name": "someone-else/" + REPO.split("/")[1]})
+        routes[("GET", "/pulls/8")] = reply(200, pr)
+        routes[("GET", "/commits/abc123/check-runs")] = reply(200, {"check_runs": [
+            {"name": brain.review_check_name({}), "status": "completed", "conclusion": review}]})
+        return routes
+
+    def test_escalate_refuses_a_ticket_whose_pull_request_has_nothing_to_fix(self):
+        # 2026-10-16: two fix rounds escalated a pull request whose head was
+        # green, reviewed and threadless, and the same model ran it again.
+        fake = Routed(self.finished_pr_routes())
+        with unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
+            with self.assertRaises(ValueError) as caught:
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        said = str(caught.exception)
+        self.assertIn("pull request #8 has nothing to fix", said)
+        self.assertIn("head abc123 is green", said)
+        self.assertIn("the review check %s passed on it" % brain.review_check_name({}), said)
+        self.assertIn("no review thread is open", said)
+        self.assertEqual([c for c in fake.calls if c[0] in ("PUT", "PATCH")
+                          or (c[0] == "POST" and "/graphql" not in c[1])], [])
+
+    def test_escalate_still_sends_back_a_pull_request_with_something_to_fix(self):
+        # An outsider's pull request (a fork, or an author outside
+        # LOOM_BRIEF_AUTHORS) that merely matches the ticket by branch name is
+        # never "finished": it must not stop the ticket climbing the ladder.
+        cases = {"failing checks": {"green": False}, "review not passed": {"review": "failure"},
+                 "open thread": {"resolved": False}, "untrusted author": {"author": "stranger"}}
+        for name, state in cases.items():
+            with self.subTest(name), unittest.mock.patch.dict(
+                    os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
+                fake, outcome = self.run_escalate(self.finished_pr_routes(**state))
+                self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+                self.assertTrue(fake.sent("POST", "/issues/9/comments")[-1]["body"]
+                                .startswith("<!-- loom:escalate v1 -->"))
+
+    def test_a_fork_pull_request_is_never_reported_as_finished(self):
+        # fix() refuses a fork on its own; the point is that the finished-pull-
+        # request guard does not claim it, so no outsider can use a green fork
+        # to answer "land it instead" for a ticket.
+        fake = Routed(self.finished_pr_routes(fork=True))
+        with unittest.mock.patch.dict(
+                os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
+            with self.assertRaises(ValueError) as caught:
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertNotIn("nothing to fix", str(caught.exception))
 
     def test_escalate_refuses_a_ticket_that_is_not_repeatedly_stuck(self):
         issue = dict(stuck_ticket("failed"), created_at="2999-01-01T00:00:00Z")
@@ -2194,6 +2375,19 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
         self.assert_never_edited(routes)
 
+    def test_wayfinder_maps_and_decision_tickets_are_skipped(self):
+        # A wayfinder decision ticket is planning; triage must not turn it
+        # into lane work (2026-10-17).
+        routes = Routes([
+            item(3, labels=["wayfinder:map"], body="## Destination\nthree levels"),
+            item(4, labels=["wayfinder:research"], body="## Question\nwhich call sites"),
+            item(5, labels=["wayfinder:grilling"], body="## Question\napprove the list"),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
     def test_the_limit_holds_and_stops_reading_pages(self):
         routes = Routes([item(n, body="old issue") for n in range(10, 40)], page=10)
         lines = self.run_triage(routes, limit=12)
@@ -2469,7 +2663,7 @@ class OnboardTests(unittest.TestCase):
     def test_command_line_prints_the_lines(self):
         fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
         with unittest.mock.patch.object(brain, "GitHub", lambda token: GitHub(token, transport=fake)), \
-                unittest.mock.patch.object(brain, "token_from_env", lambda: "t"), \
+                unittest.mock.patch.object(brain, "auth_from_env", lambda: "t"), \
                 unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""}), \
                 unittest.mock.patch("sys.stdout") as out:
             self.assertEqual(brain.main(["onboard", REPO]), 0)

@@ -12,7 +12,7 @@ import urllib.request
 from typing import Callable
 from urllib.parse import quote, urlsplit
 
-from .github import GitHub, GitHubError, token_from_env
+from .github import GitHub, GitHubError, auth_from_env
 from .hunt_plan import problems
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -177,7 +177,7 @@ def main() -> int:
         with open(state, encoding="utf-8") as stream:
             if json.load(stream).get("revision") != revision:
                 raise ValueError("checkout is not the recorded deployment")
-        run(GitHub(token_from_env()), source, revision,
+        run(GitHub(auth_from_env()), source, revision,
             os.environ.get("LOOM_DEPLOY_CHECK", "unittest"), specs)
     except (GitHubError, KeyError, OSError, ValueError) as exc:
         print("pin: %s" % exc, file=sys.stderr)

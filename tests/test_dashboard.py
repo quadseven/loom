@@ -5,6 +5,7 @@ import http.client
 import re
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -97,7 +98,7 @@ class DashboardTest(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_backlog_bytes_order_start_here_and_health_inspectors(self):
+    def test_backlog_bytes_order_next_child_and_health_inspectors(self):
         fixture = {
             "generated_at": "today", "judged_by": "Cave", "repos": [], "totals": {},
             "epics": [
@@ -122,7 +123,7 @@ class DashboardTest(unittest.TestCase):
                 connection.request("GET", "/backlog")
                 body = connection.getresponse().read().decode()
                 self.assertLess(body.index("First next"), body.index("[odd] title"))
-                self.assertIn("First next", body[body.index("Start here"):])
+                self.assertIn("First next", body[body.index('<table class="epic-table">'):])
                 self.assertIn("Finished children, open epic", body)
                 self.assertIn("Children without parent link", body)
                 self.assertIn("Nonstandard titles", body)
@@ -182,6 +183,47 @@ class DashboardTest(unittest.TestCase):
         conditional.refresh()
         conditional.refresh()
         self.assertEqual(self.api_calls[-1]["etag"], '"snapshot-1"')
+
+    def test_a_budget_below_the_floor_is_forgotten_once_github_resets_the_window(self):
+        # A pass below the floor reads nothing, so nothing updated the number:
+        # the page said "stale ticket data" for a day with 4,265 requests left.
+        self.store.refresh()
+        self.store._last_remaining = 3
+        self.store.budget_floor = 20
+        self.store._reset_at = time.time() + 600
+        self.assertTrue(self.store._below_floor())
+        before = len(self.api_calls)
+        self.store.refresh()
+        self.assertEqual(len(self.api_calls), before)
+        self.assertTrue(self.get_json("/api/tickets")["stale"])
+        self.store._reset_at = time.time() - 1
+        self.store.budget_floor = 5
+        self.assertFalse(self.store._below_floor())
+        self.store.refresh()
+        self.assertGreater(len(self.api_calls), before)
+        self.assertFalse(self.get_json("/api/tickets")["stale"])
+
+    def raw_get(self, path):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, response.getheader("Content-Type"), response.read()
+        finally:
+            connection.close()
+
+    def test_the_dashboard_has_a_favicon_in_every_form_a_browser_asks_for(self):
+        status, kind, body = self.raw_get("/static/favicon.svg")
+        self.assertEqual((status, kind), (200, "image/svg+xml"))
+        self.assertIn(b"<svg", body)
+        for path in ("/favicon.ico", "/static/favicon-32.png", "/static/apple-touch-icon.png"):
+            status, kind, body = self.raw_get(path)
+            self.assertEqual((status, kind), (200, "image/png"), path)
+            self.assertTrue(body.startswith(b"\x89PNG\r\n\x1a\n"), path)
+        _, _, page = self.raw_get("/")
+        for link in (b'rel="icon" type="image/svg+xml" href="/static/favicon.svg"',
+                     b'rel="apple-touch-icon" href="/static/apple-touch-icon.png"'):
+            self.assertIn(link, page)
 
     def test_part_of_only_is_goal_and_indentation_is_allowed(self):
         from dashboard.github import ticket_record
@@ -467,6 +509,14 @@ class BacklogHelperTest(unittest.TestCase):
 
 
 class LanesAndImprovingTest(unittest.TestCase):
+    def test_lane_tier_text_reads_factory_tables(self):
+        from unittest.mock import patch
+        from bus import factory
+        from dashboard.views import render_lanes
+        with patch.dict(factory.TIERS, {"easy": ("test-lane",)}):
+            body = render_lanes({"lanes": [], "scoreboard": {}})
+        self.assertIn("Easy: test-lane", body)
+
     def test_pull_request_footer_and_models_scoreboard(self):
         from dashboard import views
         from dashboard.server import _lane_view_data

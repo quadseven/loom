@@ -19,6 +19,8 @@
 # A limit failure also holds this lane unavailable until the provider's reset
 # (else 60 minutes). The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
+# A commit that adds a file outside the brief's paths (bus/scope_check.py)
+# is refused before validation and push, and nothing is pushed.
 # A repo with a validation contract (.loom/validation.conf) is prepared
 # before the agent and checked again on its commit; a failing check parks
 # the brief and keeps the edits on a side branch instead of opening a PR.
@@ -178,51 +180,10 @@ hold_shared_credit() {
 
 utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 
-# What ended a failed run, from the tail of the agent's output. A provider
-# limit: a usage, rate or quota limit, or an HTTP 429 or 402 answer. A
-# transient fault: the network or the provider's servers. The patterns look
-# at the last lines only, so a ticket that is about rate limits does not
-# read as one.
-LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
-OUT_OF_CREDIT_RE='credit balance is too low|insufficient[ _](credit|balance|funds)|payment required|(http|status|code|error)[^0-9a-z]{0,3}402([^0-9]|$)'
-NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network error|fetch failed|connection (reset|refused|closed)|could not resolve host|overloaded|service unavailable|bad gateway|gateway timeout|internal server error|(http|status|code|error)[^0-9a-z]{0,3}(500|502|503|504|529)([^0-9]|$)'
-# When the provider says its limit lifts: an epoch after "limit reached|" or a
-# "reset" key, or a "retry after" / "try again in" / "resets in" duration.
-EPOCH_RE='(limit reached\||reset[a-z_-]*["'"'"': =]+)([0-9]{10})([^0-9]|$)'
-AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^a-z]|$)'
-LIMIT_WAIT=3600
-LIMIT_WAIT_MAX=86400
-
-# Sets FAIL_CLASS (limit, transient or work) for a run that ended with exit
-# status $1 and output $2, where $3 is "edited" when the agent changed the
-# tree. On limit also sets RETRY_AT. A crash before any edit, a timeout, a
-# signal or a network fault is transient; anything else is work.
-classify_failure() {
-  local status="$1" out="$2" edited="$3" now n
-  FAIL_CLASS=work RETRY_AT=""
-  now="$(date +%s)"
-  shopt -s nocasematch
-  if [[ "$out" =~ $LIMIT_RE ]]; then
-    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
-    if [[ "$out" =~ $OUT_OF_CREDIT_RE ]]; then
-      RETRY_AT=$((now + LIMIT_WAIT_MAX))
-    elif [[ "$out" =~ $EPOCH_RE ]]; then
-      RETRY_AT="${BASH_REMATCH[2]}"
-    elif [[ "$out" =~ $AFTER_RE ]]; then
-      n="${BASH_REMATCH[2]}"
-      case "${BASH_REMATCH[3]}" in h*) n=$((n * 3600)) ;; m*) n=$((n * 60)) ;; esac
-      RETRY_AT=$((now + n))
-    fi
-    [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
-    [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX))
-  elif [ "$status" -ne 0 ]; then
-    if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
-       [[ "$out" =~ $NET_RE ]]; then
-      FAIL_CLASS=transient
-    fi
-  fi
-  shopt -u nocasematch
-}
+# How a run's agent CLI is invoked (claude, codex) and how a failed run is
+# classed (classify_failure), shared with lanes/mac/brain.sh.
+# shellcheck source=lanes/agent_cli.sh
+. "$LOOM_ROOT/lanes/agent_cli.sh"
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
@@ -248,7 +209,7 @@ summary_note() {
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
@@ -289,6 +250,24 @@ EOF
     safe_git diff --cached --quiet && return 0
     safe_git commit -qm "Drop sandbox probe files: ${probes//$'\n'/, }" || return 1
   fi
+}
+
+# Sets STRAY_FILES to the files the agent's commits (BASE..HEAD) add outside
+# the brief: not named by it (as a path or a directory above one) and not
+# under a non-hidden top-level directory the base already tracks
+# (bus/scope_check.py). A fix round that merged the default branch passes
+# that branch, so files the merge brought in are never stray. Returns 1 when
+# the check could not run, so a broken check never reads as a clean one.
+check_scope() {
+  STRAY_FILES="$(timeout "$NET_TIMEOUT" env PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check "$TREE" "$BASE" HEAD "$1" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})"
+}
+
+# STRAY_FILES as one comma-separated line, at most ten names.
+stray_list() {
+  local n
+  n="$(printf '%s\n' "$STRAY_FILES" | sed '/^$/d' | wc -l | tr -d ' ')"
+  printf '%s\n' "$STRAY_FILES" | sed '/^$/d' | head -10 | paste -sd ',' - | sed 's/,/, /g'
+  [ "$n" -le 10 ] || printf ' and %s more' "$((n - 10))"
 }
 
 # The ## Intent section for the top of a new lane PR body: the change
@@ -819,17 +798,27 @@ safe_git() {
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
 load_contract() {
-  local rev="$BASE" mode line key val
+  local rev="$BASE" mode line key val canon
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK=""
   if [ -n "$FIX_PR" ] && ! { timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
        -c core.fsmonitor=false fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 &&
        rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
-    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"; return 1
+    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
+    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
+    return 1
   fi
   mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
   [ -n "$mode" ] || return 0
   HAS_CONTRACT=1
   [ "$mode" = 100644 ] || [ "$mode" = 100755 ] || { SETUP_REASON="$CONTRACT_FILE is not a regular file"; return 1; }
+  # bus/contract.py reads every contract form repos use and prints the
+  # key: value lines below; a form it cannot read is a factory incident:
+  # the runner's reader is behind the repos, not the ticket's work.
+  canon="$(safe_git cat-file blob "$rev:$CONTRACT_FILE" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.contract)" || {
+    SETUP_REASON="$CONTRACT_FILE ${canon:0:120}"
+    note_factory_incident contract "contract: $canon" SETUP_REASON
+    return 1
+  }
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -841,7 +830,7 @@ load_contract() {
       check) C_CHECK="$val" ;;
       *) SETUP_REASON="$CONTRACT_FILE has an unknown line '${line:0:40}'"; return 1 ;;
     esac
-  done < <(safe_git cat-file blob "$rev:$CONTRACT_FILE")
+  done <<< "$canon"
   [ -n "$C_CHECK" ] || { SETUP_REASON="$CONTRACT_FILE has no check: line"; return 1; }
   case "$C_SUBMODULES" in yes|no) ;; *) SETUP_REASON="$CONTRACT_FILE submodules: must be yes or no"; return 1 ;; esac
   [ -z "$C_INTERP" ] || [[ "$C_INTERP" =~ ^[A-Za-z0-9._+-]+$ ]] ||
@@ -878,6 +867,54 @@ record() {
     "$(date -u +%FT%TZ)" >> "$RECORD"
 }
 
+# A validation failure the repo did not cause is a factory incident, not a
+# [work] failure: the contract cannot be read, the environment cannot run
+# the check (exit 125/126/127), or the check is already red on the
+# unmodified base. The ticket keeps its rung: the brain holds it and
+# re-queues it when the incident closes. file_factory_incident files or
+# updates one incident issue on the factory repo and prints "factory
+# incident <owner>/<repo>#<number>". The record names the repo, the exact
+# failing line or command, and the exit code.
+FACTORY_REPO=quadseven/loom
+INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
+file_factory_incident() {  # kind, detail
+  local kind="$1" detail="$2" title body number existing
+  title="Factory incident: $REPO validation $kind"
+  body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
+    "$INCIDENT_MARKER" "$REPO" "$kind" "$TICKET" "$detail")"
+  existing="$(TITLE="$title" gh search issues --repo "$FACTORY_REPO" --state open \
+    --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
+    -- "$title" 2>>"$LOG" | head -1)"
+  if [ -n "$existing" ]; then
+    number="$existing"
+    gh issue comment --repo "$FACTORY_REPO" "$number" \
+      --body "Still failing on $TICKET: $detail" >>"$LOG" 2>&1 || true
+  else
+    number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
+      --body "$body" --label loom:factory 2>>"$LOG" || \
+      gh issue create --repo "$FACTORY_REPO" --title "$title" \
+      --body "$body" 2>>"$LOG")"
+    number="${number##*/}"
+    case "$number" in ''|*[!0-9]*) number="" ;; esac
+  fi
+  if [ -n "$number" ]; then
+    printf 'factory incident %s#%s' "$FACTORY_REPO" "$number"
+  else
+    printf 'factory incident filing failed'
+  fi
+}
+
+# File or update the factory incident for the current failure, append its
+# reference to the named reason variable, and park the brief as [factory]
+# so the ticket keeps its rung. (Assigns via printf -v, never in a
+# subshell, so PARK_CLASS survives.)
+note_factory_incident() {  # kind, detail, reason_var_name
+  local ref
+  ref="$(file_factory_incident "$1" "$2")"
+  PARK_CLASS=factory
+  printf -v "$3" '%s; %s' "${!3}" "$ref"
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -896,7 +933,12 @@ contract_run() {
     cd "$TREE" || exit 125
     keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" home="$CHECK_HOME"
     for v in $(compgen -e); do unset "$v"; done
-    export PATH="$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang"
+    # UV_MANAGED_PYTHON: uv uses only the Pythons it installs, never one
+    # found on PATH. A PATH interpreter it cannot run (an x86_64 Homebrew
+    # python3 on an arm64 host without Rosetta) made uv exit 2 before any
+    # test, so every muster lane run failed on the unmodified base
+    # (2026-10-16).
+    export PATH="$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < /dev/null
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
@@ -919,19 +961,27 @@ exclude_untracked() {
 
 # Before the agent: interpreter, submodules, setup, then the check on the
 # base (recorded, so a failure the base already had is told apart from one
-# the agent caused; it does not stop the run, since a ticket may exist to fix
-# it). Returns 1 with SETUP_REASON when the environment cannot be prepared.
+# the agent caused). A failure the repo did not cause -- the contract cannot
+# be read, the environment cannot run the check, or the check is already
+# red on the unmodified base -- is a factory incident, not a [work]
+# failure: the ticket keeps its rung. Returns 1 with SETUP_REASON when the
+# environment cannot be prepared.
 prepare_validation() {
   local rc interp="" subs="" changed what
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
-  if ! command -v sandbox-exec > /dev/null; then SETUP_REASON="sandbox-exec not available"
-  elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then SETUP_REASON="interpreter $C_INTERP is not on PATH"
+  if ! command -v sandbox-exec > /dev/null; then
+    SETUP_REASON="sandbox-exec not available"
+    note_factory_incident environment "sandbox-exec not available" SETUP_REASON
+  elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
+    SETUP_REASON="interpreter $C_INTERP is not on PATH"
+    note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
   elif [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
          -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
     SETUP_REASON="submodule checkout failed"
+    note_factory_incident environment "submodule checkout failed" SETUP_REASON
   fi
   if [ -n "$SETUP_REASON" ]; then record prepare "$what" 1 "$BASE" false "$SETUP_REASON"; return 1; fi
   [ -n "$interp" ] && interp="$interp $("$interp" --version 2>&1 | head -1)"
@@ -953,6 +1003,20 @@ prepare_validation() {
   changed="$(tracked_changes)"
   record baseline "$C_CHECK" "$BASELINE_EXIT" "$BASE" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
+  # A check that cannot run, or is already red, on the unmodified base is
+  # the factory's problem, not the ticket's: file the incident and stop
+  # before the agent burns a run it can never validate.
+  case "$BASELINE_EXIT" in
+    125|126|127)
+      SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
+      note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      return 1 ;;
+  esac
+  if [ "$BASELINE_EXIT" -ne 0 ]; then
+    SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
+    note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+    return 1
+  fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
   exclude_untracked
 }
@@ -969,7 +1033,12 @@ final_validation() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
-    125|126|127) VALIDATION_REASON="validation environment unavailable: the check exited $rc" ;;
+    125|126|127)
+      # The environment broke between the baseline and the final check;
+      # the agent's work is not the cause.
+      VALIDATION_REASON="validation environment unavailable: the check exited $rc"
+      note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
+      ;;
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
@@ -1155,6 +1224,7 @@ update_fix_branch() {
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
+  FIX_UPSTREAM="origin/$default"
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
@@ -1242,8 +1312,7 @@ run_agent() {
   AGENT_EXTRA_ENV=""
   is_api_lane && fresh_agent_home
   case "$LANE" in
-    codex) timeout "$AGENT_TIMEOUT" codex exec --sandbox workspace-write --model "$MODEL" "$brief_text" < /dev/null ;;
-    claude) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$brief_text" < /dev/null ;;
+    codex|claude) agent_cli "$LANE" lane "$brief_text" ;;
     openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
     opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
     zen) opencode_agent - "$brief_text" ;;
@@ -1549,13 +1618,14 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
-  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED=""
+  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
   # A verify run changes no code, so there is nothing to validate.
   if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
-    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run"; continue
+    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
+  FIX_UPSTREAM=""
   if [ -n "$FIX_PR" ]; then
     # BASE is taken first, so a clean merge alone counts as a change and an
     # out-of-date pull request is pushed up to date.
@@ -1726,12 +1796,22 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
   fi
+  # A commit that adds files outside the brief is refused before validation
+  # and push: nothing is pushed, and the reason names every stray file.
+  if [ "$COMMITTED" -eq 1 ]; then
+    if ! check_scope "$BRIEF" 2>> "$LOG"; then
+      park "$BRIEF" "could not check the committed files against the brief" transient; continue
+    fi
+    if [ -n "$STRAY_FILES" ]; then
+      park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
+    fi
+  fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.
   if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
-    park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF"; continue
+    park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.

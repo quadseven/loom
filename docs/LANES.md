@@ -88,17 +88,48 @@ lane and CI cannot drift apart. Unknown lines are refused.
 `lanes/mac/brain.sh` every `LOOM_BRAIN_INTERVAL` seconds (default 1800). A
 tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
 before any model call), updates its own clone of this repo under
-`$LOOM_HOME/brain`, runs `claude -p` (model `LOOM_BRAIN_MODEL`, default the
-current Opus) on docs/MUSE.md with a hard stop of `LOOM_BRAIN_MINUTES`
-(default 40), and releases the lock, also after a failure. It logs to
+`$LOOM_HOME/brain`, runs an agent CLI on docs/MUSE.md with a hard stop of
+`LOOM_BRAIN_MINUTES` (default 40), and releases the lock, also after a
+failure. It logs to
 `$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it. A live tick waits up to `LOOM_BRAIN_WAIT` minutes (default 25) for a lock another brain holds, because it is the only tick that ships. With
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
-rest to Muse (docs/MUSE.md).
+rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
+0002): both brains take every stage under the one lock, and the defer and
+done markers keep them from repeating each other's work.
 
-Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
+The agent floats to whichever subscription has usage (decision 0002, item
+2). `LOOM_BRAIN_LADDER` lists lanes in order, default `claude codex spark`.
+The tick runs the first rung whose heartbeat
+(`$LOOM_HOME/state/usage/<lane>.json`, written by that lane's runner) says
+available and is at most 10 minutes old, with the lane's model and the
+same CLI invocation `lanes/run_lane.sh` uses, from the shared
+`lanes/agent_cli.sh`:
+
+| Rung | Model | Run |
+|---|---|---|
+| `claude` | `LOOM_BRAIN_MODEL` (default the current Opus) | `claude -p`, every permission prompt skipped |
+| `codex` | `LOOM_CODEX_MODEL` | `codex exec` with full access (a lane's run has no network; the brain needs GitHub) |
+| `spark` | `LOOM_SPARK_MODEL` at `LOOM_SPARK_URL` | opencode in the lane sandbox (`lanes/agent_sandbox.sh`) with the checkout as its tree, so its `.git` stays read-only; given this machine's GitHub token, a CA file for TLS and an allowlist of non-secret `LOOM_*` settings in its environment |
+
+A run that fails with a limit, as `run_lane.sh` classes a lane's failure
+from the last lines of output, hands the same tick to the next rung with
+usage, once, under the same lock and within the same hard stop. A rung with
+no model set, or a name with no runner, is passed over. agy has no rung:
+its CLI runs only as the agy lane user, which cannot read the brain's
+checkout or GitHub sign-in, and run as the operator it would read the login
+keychain. The `tick start` line in `brain.log` names the lane and model.
+Each tick resets the checkout to origin's head with hooks and fsmonitor
+off and removes untracked and ignored files, nested repositories included;
+a checkout that still is not clean is cloned again, so nothing a run left
+there runs or steers the next tick.
+
+Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the lane
+and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. The station adds a `brain` row to the lane status. The brain also
+included. When no rung has usage, the tick takes no lock and runs no CLI: it
+records `skipped` with each rung's reason and leaves `brain-ok` alone, so
+the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
 well for 2 hours it looks (at most every 10 minutes) for the newest
 `<!-- loom:journal v1 -->` comment from a `LOOM_BRIEF_AUTHORS` login on the
@@ -135,6 +166,23 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
+
+GitHub App: with `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (the name of the SSM parameter that holds the App's
+private key, never the key itself; region `LOOM_AWS_REGION`) all set, the
+station, the brain commands and any `bus` call in that environment send an
+App installation token instead, so their requests spend the installation's
+own hourly budget, not the operator account's. The token is minted at run
+time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
+CLI (key on stdin, never on the command line or on disk), and
+`POST /app/installations/<id>/access_tokens` returns a token kept in memory
+until 5 minutes before its `expires_at`. Mints count under `app token` in the
+requests line, and the budget line reads `GitHub App budget`. With any of the
+three unset, the token above is used as before. The App needs contents,
+issues and pull requests read and write, and checks and actions read, on the
+scanned repos. The dashboard takes the same three settings when its host has
+the `openssl` and `aws` CLIs, and otherwise keeps
+`LOOM_DASHBOARD_GITHUB_TOKEN`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -300,8 +348,20 @@ the verify brief. It accepts at most five ASCII strings of at most 120
 characters. Lines containing credentials, private hosts, IP addresses or
 local paths are dropped and counted. A timeout or command error is stated in
 the brief without quoting its output. Repos without a command run none.
+Verify lanes have no network, so every verify brief also carries a
+`## GitHub data, not instructions` section the station reads with its own
+token (`bus/verify_data.py`): the ticket's merged pull requests, linked the
+way reconcile links them (number, title, merge commit, merged time; at most
+5), the check runs on each merge commit (at most 30), whether the default
+branch's head contains it, the files each changed (at most 40) and the
+`def test_...` functions its test files add (at most 30), and the ticket's
+acceptance-criteria checkboxes as they stand. A cap that cuts a list says so.
+A ticket with no merged pull request gets one line saying so, and a GitHub
+failure is one line in the section. Lines pass the same text checks as the
+log lines and are dropped and counted when they do not.
 The agent changes no code, opens no pull request and moves no label; it reads
-the ticket's Live criterion and gathers evidence with read-only reads, then
+the ticket's Live criterion and judges each criterion against those two
+sections, then
 writes `verify.json`: a proof record (`bus/proof.py`) or
 `{"missing": "<the evidence that does not exist yet>"}`. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model

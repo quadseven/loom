@@ -5,7 +5,7 @@ import os
 import re
 import signal
 import subprocess
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 from . import text
 
@@ -23,11 +23,17 @@ def needles(live: str) -> List[str]:
                               and all(32 <= ord(char) < 127 for char in value)))[:MAX_NEEDLES]
 
 
-def safe_line(line: str) -> bool:
-    """Only printable log data without private values may enter a brief."""
+def safe_line(line: str, known: Iterable[str] = ()) -> bool:
+    """Only printable log data without private values may enter a brief.
+    The known parts of the line (a checked commit SHA, a snake_case name)
+    skip only the long-token test; every other check reads the whole line."""
     if not line.isascii() or any(ord(char) < 32 or ord(char) == 127 for char in line):
         return False
-    if text.SECRET_RE.search(line) or text.PRIVATE_HOST_RE.search(line) or IP_RE.search(line):
+    bare = line
+    for part in known:
+        bare = bare.replace(part, " ")
+    if text.CREDENTIAL_RE.search(line) or text.SECRET_RE.search(bare) \
+            or text.PRIVATE_HOST_RE.search(line) or IP_RE.search(line):
         return False
     try:
         text.check(line)

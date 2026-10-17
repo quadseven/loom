@@ -83,7 +83,26 @@ time, and one log line per move. The pull request is the merged one whose
 `Refs` line or `loom/<number>` branch names the ticket. At most 20 move a
 pass, oldest merge first. A deploy that did not happen records nothing, so it
 ships nothing. Tickets of every other repo are never moved here; their goal
-home's ship rules decide.
+home's ship rules decide, unless they ship through a pin pull request (below).
+
+### Shipping through a pin pull request
+
+A repo that deploys through a pull request in a deployment repo (a digest
+pin whose comment line reads `# Published from <repo> <what shipped>, merge
+<sha>, ...`) ships at that pull request's merge. List each deployment repo in
+`LOOM_PIN_SHIP_REPOS` (space separated `OWNER/NAME`). Each pass, the station
+reads that repo's pull requests merged in the last 7 days; for every
+published-from line one adds, it resolves the named watched repo (`OWNER/NAME`
+as written, else the one watched repo of that name) and merge commit, and
+moves each open `loom:merged` ticket of that repo whose pull request's merge
+commit the published revision carries (the compare API) to `loom:shipped`.
+A ticket whose pull request a later merged pull request reverted (its body
+says `Reverts OWNER/NAME#N`, or its title is `Revert "<title>"`), when the
+revision carries that revert too, stays at `loom:merged`. The note names the
+pin pull request, its merge time and the source revision. The same limit of
+20 moves a pass applies; a pin pull request is read again each pass until all
+it carries has moved and an hour has passed since its merge, so a ticket
+reconciled just after the pin still ships.
 
 Set `LOOM_PIN_TARGETS` in the install environment to a private JSON array of
 `repo`, `path`, `revision_var`, and `sha256_var` objects (see `.env.example`).
@@ -155,6 +174,9 @@ keyword. The station checks those references and the conventional branch
 number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
+For a re-queued regression, a merged pull request from before the latest
+`loom:queued` or `loom:briefed` label does not move the ticket or supersede
+its newer open pull request. The current attempt still needs to merge.
 
 ### When a ticket may run
 
@@ -554,7 +576,8 @@ created through the API. Creating a ref that exists fails, so only one
 holder wins. The ref points at a commit whose message is
 `holder=<name> expires=<UTC time>`. A tick that finds the lock held and
 unexpired exits; one that finds it expired deletes it and tries once to
-create it. The tick deletes it when done. Hard limit: 15 minutes.
+create it. The tick deletes it when done. The lock lasts `--minutes`
+(default 15); Muse takes 30 for its 25-minute tick.
 `python3 -m bus lock <owner/name> --holder <name>` and `python3 -m bus unlock
 <owner/name> --holder <name>` do this (exit 0 on success, 1 when held by
 someone else).
@@ -719,6 +742,24 @@ ticket", one line per open pull request from a trusted author with no
 ticket, ending in `READY` or `blocked:` and every blocker exactly as a lane
 pull request's line, so a brain sees them and adopts them.
 
+The station adopts the rest (decision 0002, item 1). Each pass, for the
+oldest open pull request in a scanned repo that is not a draft, comes from
+a `LOOM_BRIEF_AUTHORS` login on a branch of the repo itself, and that no
+open ticket links (by a `Refs` line or a `loom/N` branch), it files one
+ticket under the repo's goal home: "Land or supersede #N", in the normal
+brief format with `Difficulty: medium`. The lane that takes it lands the
+change on a `loom/` branch and closes the original with a comment naming
+the new pull request, or closes the original as superseded with the reason.
+The station marks the original with a `loom:adopted` comment naming the
+ticket, so it is adopted once, and files at most one adoption ticket per
+repo a pass. It never closes a pull request itself. It reads a pull
+request's comments for the marker at most once, remembering the adopted ones
+in `state/station/adoptions.json`, and a repo whose brief was refused (its
+goal at the cap) is tried again 10 minutes later, not every pass. The station
+log says `adopted OWNER/NAME#N as ticket ...` for each one, and
+`adoption OWNER/NAME:` with the count of open pull requests no ticket links
+whenever it changes.
+
 ## Journal
 
 One comment per tick that changed something, on the goal's home issue:
@@ -756,8 +797,12 @@ with the `stage=brief` done line and the new ticket. A brief without
 `--holder`, on a goal with no standing brief defer, or refused, posts no
 journal and changes no marker; so does a `--regresses` brief, which is
 the `regression` stage. Only journals from `LOOM_BRIEF_AUTHORS` logins
-count. For each stage and item the newest line wins; `python3 -m bus.brain
-resume OWNER/NAME... --holder NAME` lists the defers still standing whose item is open and
+count. For each stage and item the newest line wins. Brief defers carry a
+stable key derived from their normalized note, so one goal can hold multiple
+independent brief handoffs. A written brief can name the one it finishes with
+`--resolves KEY`; a keyless done marker retires only legacy unkeyed brief
+defers. `python3 -m bus.brain resume OWNER/NAME... --holder NAME` lists the
+defers still standing whose item is open and
 unchanged, and refuses unless that holder holds the tick lock.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
@@ -772,6 +817,24 @@ ticket naming what evidence is missing.
 Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
+
+### Handoff packet
+
+Each pass the station keeps one comment on the Loom goal home (the status
+repo's one open goal home that is not a backlog), marked
+`<!-- loom:handoff v1 -->`. It posts it once and then edits it in place, and
+only when its text changed. It rebuilds the packet at most every 10 minutes,
+or at once when a brain tick on the lane machine just ended (`state/brain.json`
+changed), and reads again only the goal homes whose update time or comment
+count changed since the last build. It holds the last 5 ticks across the goal homes
+(holder, model from a `- Model:` journal line, done and deferred counts, one
+line decided from a `- Decided:` line or the first line of prose, and the
+items left open), a tick that holds the lock with no journal yet, the
+standing defers (the newest marker for a stage and item wins, as in
+`resume`), with each defer whose brain has not ticked in 2 hours marked open
+work for any brain, and the Rules section of docs/MUSE.md read from GitHub at
+the station checkout's commit. Journals from private repos count, but the
+packet names neither their repo nor their text.
 
 ### Report deadlines
 
