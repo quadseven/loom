@@ -2372,6 +2372,19 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
         self.assert_never_edited(routes)
 
+    def test_wayfinder_maps_and_decision_tickets_are_skipped(self):
+        # A wayfinder decision ticket is planning; triage must not turn it
+        # into lane work (2026-10-17).
+        routes = Routes([
+            item(3, labels=["wayfinder:map"], body="## Destination\nthree levels"),
+            item(4, labels=["wayfinder:research"], body="## Question\nwhich call sites"),
+            item(5, labels=["wayfinder:grilling"], body="## Question\napprove the list"),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
     def test_the_limit_holds_and_stops_reading_pages(self):
         routes = Routes([item(n, body="old issue") for n in range(10, 40)], page=10)
         lines = self.run_triage(routes, limit=12)

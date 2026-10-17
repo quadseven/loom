@@ -1389,6 +1389,9 @@ def _triage_skip(issue: Dict[str, Any]) -> Optional[str]:
     names = _labels(issue)
     if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
         return "already labelled"
+    if any(name.startswith("wayfinder:") for name in names):
+        # A wayfinder map or decision ticket is planning, not work for a lane.
+        return "wayfinder"
     if _is_epic(issue):
         return "epic"
     return None
