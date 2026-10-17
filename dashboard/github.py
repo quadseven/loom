@@ -360,7 +360,7 @@ class TicketStore:
         comment_errors = {}
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             results = list(pool.map(lambda repo: self._comments_for_repo(repo, since, trusted), self.repos))
-        for repo, (issues, reviews, error) in zip(self.repos, results):
+        for repo, (issues, reviews, error) in zip(self.repos, results, strict=True):
             issue_comments.extend(issues)
             review_comments.extend(reviews)
             if error:
