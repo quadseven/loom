@@ -4505,13 +4505,15 @@ class Station:
         return out
 
     def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
-        """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
-        search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
-        a refused sub-issue link leaves the Part of line as the only one."""
+        """Tickets naming the goal or one of its open epics without a sub-issue
+        link or its Part of line, read through the goal walk. The walk searches
+        Part of lines for a goal with an epic; a goal with none is searched
+        only once it holds SUB_ISSUES_MAX or more sub-issues, where a refused
+        sub-issue link leaves the Part of line as the only one."""
         total = int((goal.get("sub_issues_summary") or {}).get("total") or 0)
-        if total < invariants.SUB_ISSUES_MAX:
-            return 0
-        return len(brain.unassociated_tickets(self.gh, repo, int(goal["number"])))
+        walk = brain.goal_walk(self.gh, repo, int(goal["number"]),
+                               search=True if total >= invariants.SUB_ISSUES_MAX else None)
+        return len(walk.loose)
 
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
         """Goal homes with their unlinked tickets, and their journals and

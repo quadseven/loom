@@ -27,11 +27,19 @@ def reply(status=200, body=None):
 
 
 class Fake:
+    """Replies in order. The repo's epic list (read by every goal walk) is
+    answered empty apart from that order and kept in epic_reads, so a test
+    that is not about epics lists only the calls it is about."""
+
     def __init__(self, *replies):
         self.replies = list(replies)
         self.calls = []
+        self.epic_reads = []
 
     def __call__(self, method, url, headers, body):
+        if method == "GET" and "/issues?labels=epic&" in url:
+            self.epic_reads.append(url)
+            return reply(200, [])
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 
@@ -316,11 +324,12 @@ class SensitiveResumeTests(unittest.TestCase):
         report = brain.status(gh, [REPO], REPO, env={})
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
-        # Project repo: issues, pulls, one GraphQL request, the goal's
-        # unproven-work read; lane repo: issues (no loom:lanes issue here, so
-        # no comments read). The fake has no replies left, so any extra call
+        # Project repo: issues, pulls, one GraphQL request, the goal walk's
+        # sub-issue read (its epic list read is answered by the fake apart from
+        # the replies); lane repo: issues (no loom:lanes issue here, so no
+        # comments read). The fake has no replies left, so any extra call
         # fails the test.
-        self.assertEqual(gh.requests, 5)
+        self.assertEqual(gh.requests, 6)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -2281,6 +2290,9 @@ class Routes:
             return reply(200, goal())
         if "/issues/1/sub_issues" in path:
             return reply(200, self.goal_children)
+        if path.startswith("/repos/%s/issues?labels=epic&" % REPO):
+            return reply(200, [i for i in self.issues
+                               if "epic" in [n.lower() for n in brain._labels(i)]])
         if path.startswith("/repos/%s/issues?" % REPO):
             return self._issue_page(path)
         if path.startswith("/search/issues?") and self.search is not None:
@@ -2390,7 +2402,7 @@ class TriageTests(unittest.TestCase):
         lines = self.run_triage(routes, limit=12)
         self.assertEqual(sorted(routes.labelled()), list(range(10, 22)))
         self.assertEqual(len(lines), 12)
-        pages = [c for c in routes.calls if c[1].startswith("/repos/%s/issues?" % REPO)]
+        pages = [c for c in routes.calls if c[1].startswith("/repos/%s/issues?state=open" % REPO)]
         self.assertEqual(len(pages), 2)
         self.assertIn("sort=created&direction=asc", pages[0][1])
         self.assert_never_edited(routes)
@@ -2419,8 +2431,8 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(set(patches[0][2]), {"body"})
 
     def test_goal_children_past_the_sub_issue_limit_add_part_of_issues(self):
-        full = [item(n, state="closed") for n in range(100, 200)]
         ticket = ["loom:ticket"]
+        full = [item(n, state="closed", labels=ticket) for n in range(100, 200)]
         found = [item(7, body="## Why\nx\n\nPart of #1\n", labels=ticket),
                  item(8, body="Part of #10\n", labels=ticket),            # another goal
                  item(9, body="see Part of #1 inline", labels=ticket),    # not its own line
@@ -2685,6 +2697,8 @@ class GoalRepo:
         payload = json.loads(body) if body else None
         path = url.split("api.github.com")[1].split("?")[0][len("/repos/%s/issues" % REPO):]
         self.calls.append((method, path, payload))
+        if method == "GET" and "/issues?labels=epic&" in url:
+            return reply(200, [])     # no epics in this repo
         parts = path.strip("/").split("/")
         number = int(parts[0]) if parts[0] else None
         handler = getattr(self, "_%s_%s" % (method.lower(), parts[1] if len(parts) > 1 else "issue"))

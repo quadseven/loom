@@ -45,6 +45,9 @@ class FakeGH:
         self.calls = []
         self.writes = []
         self.search_items = []
+        # Sub-issues per (repo, number), and each repo's issues labelled epic.
+        self.sub_issues = {}
+        self.epics = {}
 
     def paginate(self, path):
         self.calls.append(("GET", path))
@@ -54,6 +57,12 @@ class FakeGH:
         m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:goal&", path)
         if m:
             return list(self.goal_issues.get(m.group(1), []))
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues\?", path)
+        if m:
+            return list(self.sub_issues.get((m.group(1), int(m.group(2))), []))
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=epic&state=all&", path)
+        if m:
+            return list(self.epics.get(m.group(1), []))
         m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:invariant&state=(all|open)", path)
         if m:
             return [i for i in self.issues.values()
@@ -267,6 +276,27 @@ class StationTest(StationBase):
         self.run_at(T0)
         self.assertEqual(self.gh.filed(), [])
         self.assertTrue(any(c[1].startswith("/search/issues?") for c in self.gh.calls))
+
+    def test_a_goal_with_an_epic_is_read_for_loose_tickets_below_the_sub_issue_cap(self):
+        # loom#636: the goal facts read the goal walk. A goal holding epics is
+        # never near GitHub's sub-issue cap, yet a ticket naming one of its
+        # epics inside a sentence is counted by nothing.
+        self.gh.epics[REPO] = [{"number": 50, "state": "open", "body": "Part of #%d" % GOAL,
+                                "labels": [{"name": "epic"}]}]
+        self.gh.search_items = [{"number": 7, "body": "work that is Part of #50 inline",
+                                 "labels": [{"name": "loom:ticket"}]},
+                                {"number": 8, "body": "## Why\nx\n\nPart of #50\n",
+                                 "labels": [{"name": "loom:ticket"}]}]
+        self.run_at(T0)
+        filed = self.gh.filed()
+        self.assertEqual(len(filed), 1, self.said)
+        self.assertIn("Goal home #30 has 1 tickets not linked to it", filed[0]["title"])
+
+    def test_a_goal_without_epics_below_the_sub_issue_cap_is_not_searched(self):
+        self.search_loose_ticket()
+        self.run_at(T0)
+        self.assertEqual(self.gh.filed(), [])
+        self.assertFalse(any(c[1].startswith("/search/issues?") for c in self.gh.calls))
 
     def test_breaches_wait_while_the_github_budget_is_low(self):
         self.unlinked_goal()

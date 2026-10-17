@@ -48,7 +48,8 @@ HELD_MAX = 2 * 3600
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
 # A goal home holding this many GitHub sub-issues is read for tickets that
-# name it without a Part of line (GitHub refuses a 101st sub-issue).
+# name it without a Part of line (GitHub refuses a 101st sub-issue); a goal
+# with an epic is read whatever its count (the goal walk, loom#636).
 SUB_ISSUES_MAX = 90
 PLAN_FAILED_AGE = 30 * 60
 # The station checks at most this often: goal homes and check runs are read
@@ -326,15 +327,16 @@ def lane_held(f: Facts) -> List[Breach]:
 
 
 def goal_full(f: Facts) -> List[Breach]:
-    """A goal home with tickets that mention it but are not linked to it: the
-    Part of line is the link, so a goal at GitHub's sub-issue cap is healthy."""
+    """A goal home with tickets that mention it or one of its open epics but
+    are linked to neither: the Part of line is the link, so a goal at GitHub's
+    sub-issue cap is healthy."""
     if f.goals is None:
         return []
     return [Breach("goal-full", goal.key,
                    "Goal home %s has %d tickets not linked to it" % (goal.label, count),
-                   ("%d loom:ticket issues say Part of the goal but are neither its sub-issues "
-                    "nor carry a Part of line of their own, so the goal does not count them"
-                    % count,),
+                   ("%d loom:ticket issues say Part of the goal or one of its epics but carry "
+                    "neither a sub-issue link nor a Part of line of their own, so the goal "
+                    "does not count them" % count,),
                    f.now)
             for goal, count in f.goals if count > 0]
 

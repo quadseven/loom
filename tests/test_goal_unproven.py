@@ -27,11 +27,19 @@ def reply(status=200, body=None):
 
 
 class Fake:
+    """Replies in order. The repo's epic list (read by every goal walk) is
+    answered empty apart from that order and kept in epic_reads, so a test
+    that is not about epics lists only the calls it is about."""
+
     def __init__(self, *replies):
         self.replies = list(replies)
         self.calls = []
+        self.epic_reads = []
 
     def __call__(self, method, url, headers, body):
+        if method == "GET" and "/issues?labels=epic&" in url:
+            self.epic_reads.append(url)
+            return reply(200, [])
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 

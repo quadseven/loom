@@ -516,10 +516,11 @@ returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
 - A lane held by a limit for over 2 hours while tickets of its tier are queued.
-- A goal home holding 90 or more sub-issues with a `loom:ticket` issue that says
-  `Part of #N` for it but is neither its sub-issue nor has that line on a line
-  of its own (a goal at the 100 sub-issue cap with every ticket linked by a
-  sub-issue or its line is healthy).
+- A goal home holding an epic, or 90 or more sub-issues, with a `loom:ticket`
+  issue that says `Part of #N` for it or one of its open epics but is neither
+  a sub-issue of it nor has that line on a line of its own (a goal at the 100
+  sub-issue cap with every ticket linked by a sub-issue or its line is
+  healthy).
 - An open lane pull request whose plan check failed more than 30 minutes ago.
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 

@@ -263,9 +263,21 @@ GitHub holds at most 100 sub-issues under one issue and refuses the next one
 (422). The sub-issue link is best effort everywhere: any refusal is logged,
 not raised, and the ticket is still queued. A ticket a goal refuses, from
 `brief` or triage, gets a
-`Part of #N` line at the end of its body instead, and a goal's tickets are
-its sub-issues plus, once it holds 100, the issues whose body has that line
-(one search). The backlog board reads parentage the same way.
+`Part of #N` line at the end of its body instead. The backlog board reads
+parentage the same way.
+
+Every count of a goal's tickets (the in-flight cap, the unproven-work limit,
+the regression slot, `status`, station standups and the invariant goal facts)
+reads one walk, `bus.brain.goal_walk` (decision 0003): the goal, then its
+epics, open and closed (its sub-issues labelled `epic`, plus `epic` issues
+whose own `Part of #N` line names it), then each epic's tickets (its
+sub-issues, plus `loom:ticket` issues whose `Part of` line names the epic).
+While tickets move under epics it also keeps the goal's direct `loom:ticket`
+sub-issues and `Part of #N` tickets, and counts each ticket once. Each list
+is read once per walk through the ETag cache. `Part of` lines are searched
+only for a goal with an epic or with 100 sub-issues, in one query per six
+numbers naming the goal and its open epics; a closed epic's tickets are its
+sub-issues.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
@@ -849,7 +861,9 @@ does not move the deadline: a parent's report never covers its child goals.
 valid report, a measurement (a journal or report with a `Measure:` line that
 is not none) and a completed action (a `Shipped:` line that is not none),
 and its report state: ok, due (2 hours past), or overdue (one more tick,
-30 minutes, past that). Due and overdue goals are listed under "Reports
+30 minutes, past that). Under each goal it prints the unproven work against
+the limit, the goal's open epics against the cap (`open epics n/6`), and each
+epic's tickets against the epic's limit (`tickets n/15`). Due and overdue goals are listed under "Reports
 owed before unlock"; the tick posts those reports before it unlocks. An
 overdue report is a missed deadline only: it is separate from a report the
 station could not forward and from a brain that stopped ticking, which the

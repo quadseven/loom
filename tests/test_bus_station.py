@@ -66,6 +66,9 @@ class FakeGitHub:
         self.page_reply = None
         self.goals = []
         self.sub_issues = {}
+        # Issues a Part of search finds (any query), and epic-labelled issues
+        # beyond self.issues, as the goal walk reads them.
+        self.search_items = []
         self.goal_error = False
         self.private = True
         self.threads = {}
@@ -177,6 +180,8 @@ class FakeGitHub:
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
             return reply(404, {"message": "Not Found"})
+        if method == "GET" and parts.path == "/search/issues":
+            return reply(200, {"items": self.search_items})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -259,6 +264,9 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
+        if "labels=epic&" in query:
+            return reply(200, [i for i in self.issues.values()
+                               if "epic" in self.names(i["number"])])
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
@@ -4204,6 +4212,39 @@ class ReportsTest(Base):
         body = self.fake.comments[40][-1]["body"]
         self.assertIn("Needs difficulty: #41 Needs a tier.", body)
         self.assertEqual(body.count("Needs difficulty:"), 1)
+
+    def test_station_standup_lists_the_tickets_of_the_goals_epics(self):
+        # loom#636: the standup reads the goal walk, so tickets under an epic
+        # (a sub-issue of the goal, or one its Part of line names) appear
+        # beside the goal's direct tickets.
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+
+        def task(number, title, body="## Why\nx"):
+            return {"number": number, "title": title, "state": "open", "body": body,
+                    "labels": [{"name": "loom:ticket"}, {"name": "loom:running"}]}
+        linked = {"number": 50, "title": "Linked epic", "state": "open", "body": "Part of #40",
+                  "labels": [{"name": "epic"}]}
+        self.fake.issues[60] = {"number": 60, "title": "Named epic", "state": "open",
+                                "body": "Part of #40", "labels": [{"name": "epic"}]}
+        self.fake.sub_issues[40] = [linked, task(41, "Direct task")]
+        self.fake.sub_issues[50] = [task(51, "First epic task"), task(52, "Second epic task")]
+        self.fake.sub_issues[60] = [task(61, "Third epic task")]
+        self.fake.search_items = [task(62, "Refused link task", "## Why\nx\n\nPart of #60")]
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        body = self.fake.comments[40][-1]["body"]
+        flight = body.split("In flight: ")[1].split("\n")[0]
+        for number, title in ((41, "Direct task"), (51, "First epic task"),
+                              (52, "Second epic task"), (61, "Third epic task"),
+                              (62, "Refused link task")):
+            self.assertIn("#%d %s" % (number, title), flight)
+        self.assertNotIn("Linked epic", body)
+        self.assertNotIn("Named epic", body)
+        self.assertIn("5 in flight", body.splitlines()[1])
 
     def report_aged(self, seconds):
         self.add_goal()
