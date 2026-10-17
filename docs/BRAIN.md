@@ -267,6 +267,16 @@ not raised, and the ticket is still queued. A ticket a goal refuses, from
 its sub-issues plus, once it holds 100, the issues whose body has that line
 (one search). The backlog board reads parentage the same way.
 
+Every goal count walks goal, epics and tickets (decision 0003): the goal's
+epics are its sub-issues labelled `epic` (and, once it holds 100, the repo's
+`epic` issues whose body says `Part of #N`, from one list read), open and
+closed; an epic's tickets are its sub-issues plus open `loom:ticket` issues
+whose `Part of` line names the epic. While tickets move under epics, the
+goal's own tickets still count. The in-flight cap, the unproven-work limit,
+the regression slot, station standups and the unlinked-ticket invariant all
+read that one walk, and `bus.brain status` prints the goal's open epics
+against 6 and each open epic's tickets against 15.
+
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
 a readable Difficulty line appear in the goal's next station standup as
