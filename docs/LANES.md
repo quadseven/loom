@@ -94,7 +94,9 @@ current Opus) on docs/MUSE.md with a hard stop of `LOOM_BRAIN_MINUTES`
 `$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it. A live tick waits up to `LOOM_BRAIN_WAIT` minutes (default 25) for a lock another brain holds, because it is the only tick that ships. With
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
-rest to Muse (docs/MUSE.md).
+rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
+0002): both brains take every stage under the one lock, and the defer and
+done markers keep them from repeating each other's work.
 
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock

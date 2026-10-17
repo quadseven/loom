@@ -1,4 +1,4 @@
-# 0002: A floating brain with its memory in Postgres, and no pull request outside a ticket
+# 0002: A floating brain with its memory in Postgres, both brains on every stage, and no pull request outside a ticket
 
 Status: accepted, 2026-10-17. Refs #30.
 
@@ -71,6 +71,15 @@ model last saw them.
    that packet. Brains that cannot reach the tailnet, such as the remote
    one, read the same text on GitHub. A dashboard that is down costs the
    packet its freshness, not the tick.
+
+4. **Both brains take every stage.** Until now, the lane machine's tick ran
+   with `LOOM_BRAIN_SCOPE=live` and took review, merge and brief only when no
+   other brain had journaled for 2 hours. Muse ticks every 30 to 60 minutes,
+   so a 40-minute tick on the strongest model did resume items only, while
+   Muse's 15-minute ticks merged about one pull request each and deferred
+   the rest. The lane machine now runs with `all`. The lock already keeps
+   the brains from acting at once, and the defer and done markers keep them
+   from repeating work.
 
 ## Consequences
 

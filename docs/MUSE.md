@@ -22,9 +22,11 @@ build run's log, or a configuration change) plus the gates the goal's rules
 name, and those gates are read from the goal's REST endpoints. Follow the
 goal's ship and roll document step by step; when a gate stays closed and
 the rules allow an operator exception, ask for it once with the evidence
-(`bus.brain human`), and act on the answer. The lane machine's tick
-(`LOOM_BRAIN_SCOPE=live`) keeps only reads that require direct cluster or
-database access and are not served by the evidence endpoint. Never write to
+(`bus.brain human`), and act on the answer. The lane machine's tick runs
+the full tick (`LOOM_BRAIN_SCOPE=all`, decision 0002): it takes every stage
+whenever it holds the lock, and it also does the reads that require direct
+cluster or database access and are not served by the evidence endpoint.
+Never write to
 a live system except through those pull requests. When a step needs a fact
 no API serves, write what is needed on the ticket and leave it; never claim
 a live result you did not read yourself.
