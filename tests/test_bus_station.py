@@ -4398,3 +4398,92 @@ class UnseenLiveEvidenceTest(unittest.TestCase):
     def test_non_live_criteria_are_not_judged(self):
         self.assertEqual(station.unseen_live_evidence(
             {"criteria": [{"criterion": "A test fails without it", "evidence": "it would fail"}]}), "")
+
+
+class UnprovenGateTest(unittest.TestCase):
+    """loom#483: a goal with too much unproven work gets no new build claim
+    from the station. Unproven = open loom:ticket at merged or shipped (a
+    verified ticket carries loom:verified instead, so it never counts)."""
+
+    GOAL = 40
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = os.path.join(self._tmp.name, "loom")
+        self.fake = FakeGitHub()
+        self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS))
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "codex.json"), "w") as fh:
+            json.dump({"lane": "codex", "at": int(time.time()), "available": True, "reason": ""}, fh)
+        self.fake.issues[self.GOAL] = {"number": self.GOAL, "title": "Goal", "state": "open",
+                                       "labels": [{"name": "loom:goal"}]}
+        self.fake.comments[self.GOAL] = []
+        self.fake.events[self.GOAL] = []
+
+    def gh(self):
+        return GitHub("token", transport=self.fake)
+
+    def child(self, number, state="shipped"):
+        issue = {"number": number, "title": "Done %d" % number, "state": "open",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}],
+                 "body": "Done.\n\nPart of #%d\n" % self.GOAL}
+        self.fake.issues[number] = issue
+        self.fake.comments[number] = []
+        self.fake.events[number] = []
+        return issue
+
+    def over_limit(self, count=16):
+        for n in range(101, 101 + count):
+            self.child(n)
+        self.fake.sub_issues[self.GOAL] = [self.fake.issues[n] for n in range(101, 101 + count)]
+
+    def brief(self, number, *extra_labels):
+        self.fake.add(number, state="briefed", lane="codex",
+                      body=BODY + "\nPart of #%d\n" % self.GOAL)
+        self.fake.issues[number]["labels"] += [{"name": label} for label in extra_labels]
+
+    def run_pass(self):
+        return station.run(self.settings, self.gh())
+
+    def test_a_goal_over_the_limit_gets_no_new_build_claim(self):
+        self.over_limit()
+        self.brief(7)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_regression_revert_and_urgent_tickets_still_go_over_the_limit(self):
+        for number, label in ((8, "loom:regression"), (9, "loom:revert"), (10, "loom:urgent")):
+            with self.subTest(label=label):
+                self.setUp()
+                self.over_limit()
+                self.brief(number, label)
+                self.assertEqual(self.run_pass(), 0)
+                self.assertIn("loom:running", self.fake.names(number))
+
+    def test_a_goal_at_the_limit_is_still_claimed(self):
+        self.over_limit(15)
+        self.brief(7)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_ticket_with_no_goal_is_never_gated(self):
+        self.over_limit()
+        self.fake.add(7, state="briefed", lane="codex", body=BODY)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_gated_lane_is_left_idle_for_verify_runs(self):
+        self.over_limit()
+        self.brief(7)
+        with mock.patch.object(station.Station, "_hand_verifies", autospec=True) as handed:
+            self.assertEqual(self.run_pass(), 0)
+        self.assertIn("codex", handed.call_args[0][1])
+
+    def test_ticket_goal_reads_the_part_of_line(self):
+        self.assertEqual(station._ticket_goal({"body": "x\n\nPart of #40\n"}), 40)
+        self.assertEqual(station._ticket_goal({"body": "x", "parent_issue_url":
+                             "https://api.github.com/repos/o/r/issues/41"}), 41)
+        self.assertIsNone(station._ticket_goal({"body": "x"}))

@@ -280,16 +280,25 @@ def _goals(state):
         title = info.get("title") or _short_ref(goal)
         report = info.get("report")
         measure = info.get("measure")
+        held, limit = info.get("unproven"), info.get("unproven_limit")
+        if isinstance(held, int) and isinstance(limit, int):
+            note = "unproven work %d/%d (merged or shipped with no standing proof)" % (held, limit)
+            if held > limit:
+                note += " - over limit: no new build tickets until the goal finishes its proof"
+            unproven_html = '<p class="machine-fact">%s</p>' % esc(note)
+        else:
+            unproven_html = ""
         cards.append(
             '<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
             '<div class="goal-metric"><div><div class="metric">%s</div><div class="machine-fact">%s%s</div></div>'
             '<div class="sparkline" aria-label="Last 7 days, one bar a day">%s</div></div>%s'
-            '<div class="chips">%s</div><p>%s</p><a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
+            '<div class="chips">%s</div>%s<p>%s</p><a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
                 esc(_short_ref(goal)), esc(str(title)), esc(str(info.get("metric", "-"))),
                 esc(str(info.get("unit") or "not looked: the goal has no snapshot data")),
                 esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else "",
                 spark, '<p class="machine-fact">measure: %s</p>' % esc(measure) if measure else "",
-                counts, esc(report) if report else "No report on this goal in the last two weeks.",
+                counts, unproven_html,
+                esc(report) if report else "No report on this goal in the last two weeks.",
                 quote(goal, safe=""), len(tickets)))
     body = '<p class="page-lede">Each goal home, measured by what reached a live proof.</p><div class="goal-grid">%s</div>' % (
         "".join(cards) or '<p class="empty-state">No goals with ticket data.</p>')
