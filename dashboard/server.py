@@ -365,14 +365,28 @@ def _issue_url(item):
     return item.get("html_url") or item.get("url") or "/tickets"
 
 
+def _child_counts(epic):
+    """(done, total) children of an epic. The Hunt agent view carries the
+    counts as `closed` and `total`; an older document lists `children`."""
+    total = epic.get("total")
+    if isinstance(total, int) and not isinstance(total, bool):
+        done = epic.get("closed")
+        done = done if isinstance(done, int) and not isinstance(done, bool) else 0
+        return max(0, min(done, total)), max(0, total)
+    children = [child for child in epic.get("children") or [] if isinstance(child, dict)]
+    done = sum(bool(child.get("closed")) or str(child.get("state", child.get("status", ""))).lower() == "closed"
+               for child in children)
+    return done, len(children)
+
+
 def _health_inspectors(document):
-    epics = document.get("epics") or []
+    epics = [epic for epic in document.get("epics") or [] if isinstance(epic, dict)]
     finished, unlinked, titles = [], [], []
     for epic in epics:
-        children = epic.get("children") or []
-        if children and all(str(child.get("state", "")).lower() == "closed" for child in children) and str(epic.get("state", "open")).lower() != "closed":
+        done, total = _child_counts(epic)
+        if total and done == total and str(epic.get("state", "open")).lower() != "closed":
             finished.append(epic)
-        for child in children:
+        for child in epic.get("children") or []:
             if not child.get("parent") and not child.get("parent_number") and not child.get("parent_url"):
                 unlinked.append(child)
         title = str(epic.get("title", ""))
@@ -394,64 +408,191 @@ def _backlog_filters(epics, parsed):
     out.append('</select></label> <button type="submit">Filter</button></form>')
     selected = [epic for epic in epics if (not repo_filter or epic.get("repo") == repo_filter)
                 and (not tier_filter or str(epic.get("tier", "")) == tier_filter)]
-    return out, selected
+    return out, selected, repo_filter
 
 
-def _render_epic(epic, states):
-    children = epic.get("children") or []
-    closed = sum(child.get("closed", False) or str(child.get("state", child.get("status", ""))).lower() == "closed" for child in children)
-    next_item = epic.get("next") or {}
-    criteria = next_item.get("criteria") or next_item.get("acceptance_criteria") or []
-    checked = sum(bool(item.get("checked")) if isinstance(item, dict) else str(item).lstrip().startswith(("[x]", "- [x]")) for item in criteria)
-    markings = epic.get("markings") or []
-    if not isinstance(markings, list):
-        markings = [markings]
-    out = ['<article class="card backlog-epic"><div class="label">%s</div><h2><a href="%s">%s</a></h2><p>%s | %s | %s</p><p>%s</p><p>Completeness: %d/%d | Next: %s (%d/%d criteria)</p><ul>' % (
-        html.escape(str(epic.get("tier", "Cave"))), html.escape(_issue_url(epic), quote=True), html.escape(_repo_number(epic)),
-        html.escape(str(epic.get("title", ""))), html.escape(str(epic.get("tier", ""))), html.escape(str(epic.get("score", ""))),
-        html.escape(str(epic.get("why", ""))), closed, len(children), html.escape(str(next_item.get("title") or next_item.get("number") or "None")), checked, len(criteria))]
-    if markings:
-        out.append('<p>%s</p>' % html.escape("Markings: " + ", ".join(str(marking) for marking in markings)))
-    for child in children:
-        key = "%s#%s" % (child.get("repo", epic.get("repo", "")), child.get("number", ""))
-        label = " | Loom: " + str(states[key]) if states.get(key) else ""
-        item = {**epic, **child}
-        out.append('<li><a href="%s">%s</a>%s</li>' % (html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item) or str(child.get("title", ""))), html.escape(label)))
-    out.append('</ul><p>Open children: %d</p></article>' % (len(children) - closed))
-    return "".join(out)
+# The ranked table shows this many epics before folding the rest into a
+# collapsed group, so the ranking fits two screens on a wide window.
+RANKED_SHOWN = 40
+EPIC_COLUMNS = ("Repo", "Epic", "Tier", "Score", "Children", "Next child", "Age")
 
 
-def _start_here(epics):
-    if not epics:
-        return ""
-    first = epics[0]
-    nxt = first.get("next") or {}
-    return '<section class="card start-here"><span class="label">Start here</span><h2>%s</h2><p><a href="%s">%s</a></p></section>' % (
-        html.escape(str(first.get("title", ""))), html.escape(_issue_url({**first, **nxt}), quote=True),
-        html.escape(str(nxt.get("title") or nxt.get("number") or "Next ticket")))
+def _short_repo(value):
+    """example-owner/app and app name the same repo: the backlog source keys
+    epics by the bare repo name, the ticket snapshot by OWNER/NAME."""
+    if isinstance(value, dict):
+        value = value.get("full_name") or value.get("name") or ""
+    return str(value or "").rsplit("/", 1)[-1]
 
 
-def _ticket_states(state):
-    return {"%s#%s" % (repo, row.get("number")): row.get("state")
-            for repo, rows in state.data.items() for row in rows or []}
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _score(epic):
+    try:
+        return float(epic.get("score"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _epic_age(epic):
+    """Time since the epic was last touched, or None when the source has no
+    date for it (the Hunt agent view carries none today)."""
+    from datetime import datetime, timezone
+    metrics = epic.get("metrics") if isinstance(epic.get("metrics"), dict) else {}
+    stamp = epic.get("updated_at") or epic.get("created_at")
+    if stamp:
+        try:
+            moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - moment).total_seconds() / 86400
+    elif isinstance(metrics.get("stale_days"), (int, float)):
+        days = float(metrics["stale_days"])
+    else:
+        return None
+    days = max(0.0, days)
+    return "%dh" % int(days * 24) if days < 1 else "%dd" % int(days)
+
+
+def _link_or_text(url, text, css=""):
+    cls = ' class="%s"' % css if css else ""
+    # The title attribute carries the full text where a narrow cell cuts it.
+    if url:
+        return '<a%s href="%s" title="%s">%s</a>' % (cls, html.escape(url, quote=True), html.escape(text, quote=True), html.escape(text))
+    return '<span%s title="%s">%s</span>' % (cls, html.escape(text, quote=True), html.escape(text))
+
+
+def _epic_row(epic):
+    esc = html.escape
+    done, total = _child_counts(epic)
+    left = total - done
+    percent = int(round(100 * done / total)) if total else 0
+    nxt = epic.get("next") if isinstance(epic.get("next"), dict) else {}
+    number = _int_or_none(nxt.get("number"))
+    if nxt:
+        label = ("#%d " % number if number is not None else "") + str(nxt.get("title") or "")
+        next_html = _link_or_text(nxt.get("html_url") or nxt.get("url"), label.strip() or "next ticket", "epic-next")
+    else:
+        next_html = '<span class="muted">no open child</span>'
+    score = _score(epic)
+    tier = epic.get("tier")
+    age = _epic_age(epic)
+    epic_number = _int_or_none(epic.get("number"))
+    title = str(epic.get("title") or "Untitled epic")
+    return ('<tr><td class="machine-fact">%s%s</td><td class="epic-title">%s</td>'
+            '<td class="machine-fact%s">%s</td><td class="machine-fact num">%s</td>'
+            '<td><span class="epic-bar" role="img" aria-label="%d of %d children done, %d open">'
+            '<i style="width:%d%%"></i></span><span class="machine-fact">%d open / %d done</span></td>'
+            '<td class="epic-next-cell">%s</td><td class="machine-fact%s">%s</td></tr>') % (
+        esc(_short_repo(epic.get("repo"))), "#%d" % epic_number if epic_number is not None else "",
+        _link_or_text(epic.get("html_url") or epic.get("url"), title),
+        "" if tier else " muted", esc(str(tier or "unjudged")),
+        esc("%.1f" % score if score is not None else "-"),
+        done, total, left, percent, left, done, next_html,
+        "" if age else " muted", esc(age or "-"))
+
+
+def _epic_table(epics, caption):
+    head = "".join('<th scope="col">%s</th>' % name for name in EPIC_COLUMNS)
+    return ('<table class="epic-table"><caption>%s</caption><thead><tr>%s</tr></thead><tbody>%s</tbody></table>' % (
+        html.escape(caption), head, "".join(_epic_row(epic) for epic in epics)))
+
+
+def _epic_members(epics):
+    """(bare repo, number) for every epic in the backlog and every child it
+    lists: the agent view lists open children and the next ticket, an older
+    document lists every child."""
+    members = set()
+    for epic in epics:
+        repo = _short_repo(epic.get("repo"))
+        members.add((repo, _int_or_none(epic.get("number"))))
+        nxt = epic.get("next") if isinstance(epic.get("next"), dict) else None
+        for child in list(epic.get("children") or []) + list(epic.get("open_children") or []) + ([nxt] if nxt else []):
+            if isinstance(child, dict):
+                members.add((_short_repo(child.get("repo") or repo), _int_or_none(child.get("number"))))
+    return members
+
+
+FINISHED_STATES = ("merged", "shipped", "verified", "closed-unmerged")
+
+
+def _outside_any_epic(rows, epics, repo_filter=""):
+    """Open tickets with no goal home (no Part of line) that no backlog epic
+    lists as a child: each one is work nobody has placed."""
+    members = _epic_members(epics)
+    found = [row for row in rows
+             if row.get("open", True) and row.get("state") not in FINISHED_STATES and not row.get("goal")
+             and (_short_repo(row.get("repo")), _int_or_none(row.get("number"))) not in members
+             and (not repo_filter or _short_repo(row.get("repo")) == _short_repo(repo_filter))]
+    return sorted(found, key=lambda row: (str(row.get("repo") or ""), _int_or_none(row.get("number")) or 0))
+
+
+def _outside_section(rows):
+    esc = html.escape
+    lede = ('<p class="backlog-note">Each open ticket below belongs to no epic and no goal home. Each is an incoherence '
+            'to fix: add a Part of line naming its epic, or close it. Read from the ticket snapshot, which holds '
+            'open loom:ticket issues only; open issues without that label are not checked here.</p>')
+    if rows:
+        items = "".join('<li><a href="%s"><span class="machine-fact">%s#%s</span> %s</a><span class="machine-fact state-%s">%s</span></li>' % (
+            esc(_ticket_href(row), quote=True), esc(_short_repo(row.get("repo"))), esc(str(row.get("number", ""))),
+            esc(str(row.get("title") or "Untitled ticket")), esc(str(row.get("state") or "queued"), quote=True),
+            esc(str(row.get("state") or "unlabeled"))) for row in rows)
+        body = '<ul class="backlog-outside">%s</ul>' % items
+    else:
+        body = '<p class="empty-state">Every open ticket is in an epic.</p>'
+    return ('<section class="section backlog-outside-section"><div class="section-head"><span class="label">Outside any epic</span>'
+            '<span class="machine-fact%s">%d</span></div>%s%s</section>') % (
+        " bad" if rows else "", len(rows), lede, body)
 
 
 def _render_inspectors(document):
-    out = []
-    for title, items in _health_inspectors(document):
-        out.append('<section class="card"><h2>%s</h2><ul>' % html.escape(title))
+    groups = _health_inspectors(document)
+    out = ['<details class="backlog-group"><summary>Bookkeeping checks (%d)</summary>' % sum(len(items) for _, items in groups)]
+    for title, items in groups:
+        out.append('<h2>%s (%d)</h2><ul>' % (html.escape(title), len(items)))
         for item in items:
             out.append('<li><a href="%s">%s</a></li>' % (html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item) or str(item.get("title", "")))))
-        out.append('</ul></section>')
+        out.append('</ul>')
+    out.append('</details>')
     return "".join(out)
 
 
 def _backlog_page(document, parsed, state):
-    all_epics = document.get("epics") or []
-    out, epics = _backlog_filters(all_epics, parsed)
-    out.append(_start_here(all_epics))
-    states = _ticket_states(state)
-    out.extend(_render_epic(epic, states) for epic in epics)
+    all_epics = [epic for epic in document.get("epics") or [] if isinstance(epic, dict)]
+    form, epics, repo_filter = _backlog_filters(all_epics, parsed)
+    empty = [epic for epic in epics if _child_counts(epic)[1] == 0]
+    ranked = [epic for epic in epics if _child_counts(epic)[1] > 0]
+    # Sorted by score, highest first; the source's own order breaks ties and
+    # an epic with no score sorts last.
+    ranked.sort(key=lambda epic: (_score(epic) is None, -(_score(epic) or 0.0)))
+    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter))]
+    dated = any(_epic_age(epic) for epic in ranked)
+    out.append('<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
+               '<span class="machine-fact">%d ranked</span></div>' % len(ranked))
+    out.append('<p class="backlog-note">One row per epic with children, ranked by Hunt\'s score.%s</p>' % (
+        "" if dated else " Age shows a dash: the backlog source carries no epic dates."))
+    out.extend(form)
+    if ranked:
+        out.append(_epic_table(ranked[:RANKED_SHOWN], "Epics ranked by score"))
+        rest = ranked[RANKED_SHOWN:]
+        if rest:
+            out.append('<details class="backlog-group"><summary>Ranks %d to %d (%d more)</summary>%s</details>' % (
+                RANKED_SHOWN + 1, len(ranked), len(rest), _epic_table(rest, "Epics ranked by score, continued")))
+    else:
+        out.append('<p class="empty-state">No epic with children matches this filter.</p>')
+    out.append('</section>')
+    if empty:
+        out.append('<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
+            len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
+                _link_or_text(epic.get("html_url") or epic.get("url"), str(epic.get("title") or "Untitled epic")),
+                html.escape(_repo_number(epic))) for epic in empty)))
     out.append(_render_inspectors(document))
     return page("Backlog", "backlog", "".join(out), status="Read only")
 

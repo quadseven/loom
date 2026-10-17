@@ -241,7 +241,14 @@ this tick"; a step with no note shows nothing there.
    Stop if the lock is held. The lock outlives the 25-minute tick, so no
    other brain takes it mid-tick.
    Then run `python3 -m bus.brain step lock --holder muse`.
-2. First run `python3 -m bus.brain step status --holder muse`. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+2. First run `python3 -m bus.brain step status --holder muse`. The first read
+   of every tick is the handoff packet: the comment marked
+   `<!-- loom:handoff v1 -->` on the Loom goal home, which the station
+   rebuilds each pass. It lists the last 5 ticks, the open defers, and the
+   Rules below with the commit they come from. Open defers of a brain no
+   longer ticking (the packet marks them open work for any brain) are
+   finished before new work, through `resume` as below.
+   Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
@@ -404,6 +411,9 @@ this tick"; a step with no note shows nothing there.
    and stays to its resume items, and `journal` refuses it. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
+   A `- Decided: <one line>` line and a `- Model: <model>` line give the
+   handoff packet its line for this tick; without them it shows the first
+   line of prose and "model unknown".
    A step of this tick that failed or ran degraded gets its own line,
    `- Step <name>: failed <why>` or `- Step <name>: degraded <why>`, with
    the step's name from the list above (lock, status, merge, verify, failed,
