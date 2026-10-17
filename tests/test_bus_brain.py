@@ -3321,6 +3321,15 @@ class EpicFilingTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, why):
                     brain.file_epic(gh, REPO, 1, title, body)
 
+    def test_finding_the_intake_epic_reads_its_tickets_once(self):
+        fake = GoalRepo()
+        gh = GitHub("t", transport=fake)
+        first = brain.intake_epic(gh, REPO, 1)
+        fake.calls.clear()
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), first)
+        reads = [c for c in fake.calls if c[0] == "GET" and c[1] == "/%d/sub_issues" % first]
+        self.assertEqual(len(reads), 1)
+
     def test_intake_files_under_the_intake_epic_and_opens_the_next_when_full(self):
         fake = GoalRepo()
         gh = GitHub("t", transport=fake)

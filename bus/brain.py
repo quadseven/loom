@@ -1147,9 +1147,8 @@ def intake_epic(gh: GitHub, repo: str, goal: int) -> int:
     for found, held in tree:
         if (found.get("state", "open") == "open"
                 and str(found.get("title") or "") == INTAKE_TITLE):
-            number = int(found["number"])
-            if len(_epic_tickets(gh, repo, number)) < EPIC_TICKET_CAP:
-                return number
+            if len(held) < EPIC_TICKET_CAP:  # goal_tree already read its tickets
+                return int(found["number"])
     made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
