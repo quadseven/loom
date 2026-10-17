@@ -252,7 +252,7 @@ skips pull requests, epics (an `epic` label or sub-issues), `needs-operator`
 asks and anything with a `loom:` label. A ready issue (Why, What,
 Acceptance criteria with checkboxes, Size and Out of scope, and a body the
 runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
-of goal N, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
+of goal N's intake epic, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
 for a later run. Any other issue gets `loom:triage` and one comment naming
 what is missing. Triage writes labels, sub-issue links and that comment
 only: it never closes or retitles an issue, and edits nothing but the one
@@ -276,6 +276,29 @@ goal's own tickets still count. The in-flight cap, the unproven-work limit,
 the regression slot, station standups and the unlinked-ticket invariant all
 read that one walk, and `bus.brain status` prints the goal's open epics
 against 6 and each open epic's tickets against 15.
+
+## Filing under an epic
+
+Every new ticket sits under an open epic (decision 0003).
+`python3 -m bus.brain brief OWNER/NAME --epic E ...` refuses without
+`--epic`, and refuses an epic that is closed, has no `epic` label, names no
+open `loom:goal` in its `Part of #N` line, or already holds 15 tickets. The
+ticket becomes the epic's sub-issue and its `Part of` line names the epic;
+its Trunk, the in-flight cap, the unproven-work limit and the brief done
+journal come from the epic's goal.
+
+`python3 -m bus.brain epic OWNER/NAME --goal N --title "Epic: SENTENCE"
+--file EPIC.md` files an epic: the `epic` label, a title of at most 72
+characters, a body with a done-when and a size line, and a `Part of #N`
+line; it becomes the goal's sub-issue when GitHub allows it. It refuses a
+goal's 7th open epic unless the goal home records a one-time exception on
+its own line, `Epic cap: N until YYYY-MM-DD`, which raises the cap to N
+until the end of that day.
+
+Triage, the rewriter, health intake, validation contracts and pull request
+adoption file under the goal's intake epic ("Epic: work that triage,
+rewrites and health intake find"), opened by `bus.brain onboard` and again
+whenever the open one holds 15 tickets.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
@@ -612,7 +635,7 @@ failed step is journalled and left for the next tick.
 ## Regression slot
 
 A cap meant to bound new work must not block the fix for something already
-shipped that got worse. `python3 -m bus.brain brief OWNER/NAME --goal N
+shipped that got worse. `python3 -m bus.brain brief OWNER/NAME --epic E
 --title T --file BRIEF.md --regresses M [--lane L]` admits a brief that
 fixes a measured regression of ticket M:
 
@@ -805,8 +828,8 @@ work), each an HTML comment:
 `python3 -m bus.brain defer` and `done` print them; the revision is the item
 when deferred (a pull request's head commit, an issue's state and comment
 count). A written brief records its own done marker: `python3 -m bus.brain
-brief OWNER/NAME --goal N ... --holder NAME`, after it files the ticket on a
-goal whose newest brief marker is a defer, posts a journal on that goal home
+brief OWNER/NAME --epic E ... --holder NAME`, after it files the ticket under
+an epic of a goal whose newest brief marker is a defer, posts a journal on that goal home
 with the `stage=brief` done line and the new ticket. A brief without
 `--holder`, on a goal with no standing brief defer, or refused, posts no
 journal and changes no marker; so does a `--regresses` brief, which is

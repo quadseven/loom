@@ -1012,6 +1012,159 @@ def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[
     return lines
 
 
+_PART_OF_ANY = re.compile(r"^Part of #(\d+)\s*$", re.M)
+_EPIC_CAP_RE = re.compile(r"^Epic cap:[ \t]*(\d+)[ \t]+until[ \t]+(\d{4}-\d{2}-\d{2})[ \t]*$", re.M)
+_DONE_WHEN_RE = re.compile(r"^(?:#+[ \t]*)?Done when\b", re.M | re.I)
+_SIZE_RE = re.compile(r"^(?:#+[ \t]*)?Size\b", re.M | re.I)
+EPIC_TITLE_PREFIX = "Epic: "
+EPIC_TITLE_MAX = 72
+INTAKE_TITLE = "Epic: work that triage, rewrites and health intake find"
+INTAKE_BODY = (
+    "Done when: this intake epic holds %d tickets, or every ticket in it is closed; "
+    "the next intake opens a new epic.\n\n"
+    "Size: at most %d tickets.\n\n"
+    "The station files the tickets that triage, the rewriter, health intake, "
+    "validation contracts and pull request adoption find under this goal here, so "
+    "every ticket sits under an open epic (decision 0003).\n")
+
+
+def _issue_goal(issue: Dict[str, Any]) -> Optional[int]:
+    """The issue an epic or ticket names as its parent: its Part of #N line,
+    else the parent of its sub-issue link."""
+    match = _PART_OF_ANY.search(str(issue.get("body") or ""))
+    if match:
+        return int(match.group(1))
+    match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
+    return int(match.group(1)) if match else None
+
+
+def _epic_tickets(gh: GitHub, repo: str, epic: int) -> List[Dict[str, Any]]:
+    """An epic's tickets: its sub-issues, plus open loom:ticket issues whose
+    Part of line names it."""
+    found = [c for c in gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, epic))
+             if isinstance(c, dict)]
+    seen = {int(c.get("number") or 0) for c in found}
+    for item in gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo):
+        if not isinstance(item, dict) or "pull_request" in item:
+            continue
+        number = int(item.get("number") or 0)
+        if number and number not in seen and _names_goal(item.get("body"), epic):
+            found.append(item)
+            seen.add(number)
+    return found
+
+
+def open_epic(gh: GitHub, repo: str, epic: int
+              ) -> Tuple[Dict[str, Any], int, Dict[str, Any]]:
+    """(the epic, its goal's number, the goal home) for an epic a ticket may
+    be filed under; ValueError naming why not: it is closed, lacks the epic
+    label, names no open loom:goal, or already holds EPIC_TICKET_CAP tickets."""
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic)).data or {}
+    except GitHubError as exc:
+        if exc.status == 404:
+            raise ValueError("#%d: no such epic" % epic) from None
+        raise
+    if "pull_request" in issue:
+        raise ValueError("#%d is a pull request, not an epic" % epic)
+    if not _epic_label(issue):
+        if "loom:goal" in _labels(issue):
+            raise ValueError("#%d is a goal home: file the ticket under one of its open epics "
+                             "(--epic N), or open one with bus.brain epic" % epic)
+        raise ValueError("#%d is not an epic: it has no epic label" % epic)
+    if issue.get("state") != "open":
+        raise ValueError("epic #%d is closed: file under an open epic" % epic)
+    goal = _issue_goal(issue)
+    if goal is None or goal == epic:
+        raise ValueError("epic #%d names no goal: it needs a Part of #N line" % epic)
+    try:
+        goal_issue = _goal_issue(gh, repo, goal)
+    except ValueError:
+        raise ValueError("epic #%d is under #%d, which is not an open loom:goal"
+                         % (epic, goal)) from None
+    held = len(_epic_tickets(gh, repo, epic))
+    if held >= EPIC_TICKET_CAP:
+        raise ValueError("epic #%d already holds %d tickets (cap %d): file under its next epic"
+                         % (epic, held, EPIC_TICKET_CAP))
+    return issue, goal, goal_issue
+
+
+def epic_cap_exception(goal_issue: Dict[str, Any], today: Optional[str] = None) -> Optional[int]:
+    """The one-time cap a goal home records as "Epic cap: N until YYYY-MM-DD",
+    while today is on or before that date; else None."""
+    match = _EPIC_CAP_RE.search(str(goal_issue.get("body") or ""))
+    if not match:
+        return None
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return int(match.group(1)) if today <= match.group(2) else None
+
+
+def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
+                     today: Optional[str] = None) -> None:
+    _, tree = goal_tree(gh, repo, goal)
+    count = sum(1 for e, _ in tree if e.get("state", "open") == "open")
+    cap = GOAL_EPIC_CAP
+    exception = epic_cap_exception(goal_issue, today)
+    if exception is not None and exception > cap:
+        cap = exception
+    if count >= cap:
+        raise ValueError("goal #%d already has %d open epics (cap %d): finish one first, or "
+                         "record a one-time exception on the goal home as "
+                         "\"Epic cap: N until YYYY-MM-DD\"" % (goal, count, cap))
+
+
+def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
+         today: Optional[str] = None) -> Dict[str, Any]:
+    """File an epic under an open goal: the epic label, a done-when, a size
+    line and a Part of #goal line, linked as the goal's sub-issue when GitHub
+    allows it. Refused at GOAL_EPIC_CAP open epics unless the goal home records
+    a one-time exception ("Epic cap: N until DATE"). Returns the issue."""
+    title = " ".join(title.split())
+    if not title.startswith(EPIC_TITLE_PREFIX) or len(title) > EPIC_TITLE_MAX \
+            or not title[len(EPIC_TITLE_PREFIX):].strip():
+        raise ValueError("an epic title is \"Epic: <sentence>\", at most %d characters"
+                         % EPIC_TITLE_MAX)
+    if not _DONE_WHEN_RE.search(body):
+        raise ValueError("an epic body needs a done-when (a \"Done when:\" line or heading)")
+    if not _SIZE_RE.search(body):
+        raise ValueError("an epic body needs a size line (\"Size: at most 15 tickets\")")
+    body = _with_part_of(body, goal)
+    _check_written_text(title + "\n" + body)
+    goal_issue = _goal_issue(gh, repo, goal)
+    _check_epic_room(gh, repo, goal, goal_issue, today)
+    made = gh.rest("POST", "/repos/%s/issues" % repo,
+                   {"title": title, "body": body, "labels": ["epic"]}).data or {}
+    if made.get("id") is not None:
+        _link_to_goal(gh, repo, goal, made)
+    return made
+
+
+def intake_epic(gh: GitHub, repo: str, goal: int) -> int:
+    """The goal's open intake epic with room for a ticket, opened (within the
+    epic cap) when there is none: where triage, rewrites, health intake,
+    validation contracts and adoption file their tickets."""
+    _, tree = goal_tree(gh, repo, goal)
+    for found, held in tree:
+        if (found.get("state", "open") == "open"
+                and str(found.get("title") or "") == INTAKE_TITLE):
+            number = int(found["number"])
+            if len(_epic_tickets(gh, repo, number)) < EPIC_TICKET_CAP:
+                return number
+    made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
+    if not made.get("number"):
+        raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
+    return int(made["number"])
+
+
+def brief_intake(gh: GitHub, repo: str, goal: int, title: str, body: str,
+                 *args: Any, **kwargs: Any) -> str:
+    """brief under the goal's intake epic (intake_epic): the filing path for
+    callers that know a goal but no epic. The epic is found (or opened) only
+    when a new ticket is filed, so a regression re-briefed in place opens
+    none."""
+    return brief(gh, repo, None, title, body, *args, intake_of=goal, **kwargs)
+
+
 def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
     """Add the issue as a sub-issue of the goal, best effort. False when GitHub
     refuses it (for example a goal already at its 100 sub-issue limit): the
@@ -1178,6 +1331,8 @@ def _regression_slot(children: List[Dict[str, Any]], cap: int) -> Optional[str]:
 
 def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
                  lane: Optional[str], extra: Sequence[str] = ()) -> Dict[str, Any]:
+    """File the ticket and link it as a sub-issue of goal (an epic, for every
+    brief), with a Part of line when GitHub refuses the link."""
     names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
     if lane:
         names.append("lane:" + lane)
@@ -1213,7 +1368,8 @@ def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
 
 def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
                       lane: Optional[str], model: Optional[str], full_body: str,
-                      regressed: int, issue: Optional[Dict[str, Any]] = None) -> str:
+                      regressed: int, issue: Optional[Dict[str, Any]] = None,
+                      epic: Optional[int] = None) -> str:
     """Admit a brief for a measured regression of a shipped ticket; see brief."""
     evidence = _regression_evidence(body, regressed)
     children = _goal_children(gh, repo, goal, issue)
@@ -1226,7 +1382,10 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if issue.get("state") == "open" and ours:
         made = _rebrief_regressed(gh, repo, issue, title, evidence, lane, model)
     else:
-        made = _file_ticket(gh, repo, goal, title, full_body, lane, [REGRESSION])
+        if epic is None:
+            epic = intake_epic(gh, repo, goal)
+        made = _file_ticket(gh, repo, epic, title, _with_part_of(full_body, epic),
+                            lane, [REGRESSION])
     if why is not None:
         note = ("%s\n#%s was admitted %s: it fixes a measured regression of shipped #%d. "
                 "Ordinary briefs wait until the goal is back under its cap.\n\nEvidence:\n%s"
@@ -1307,15 +1466,19 @@ def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
                          "(for example \"issue 12 of another repo\"), not as owner/name#N")
 
 
-def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
+def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           lane: Optional[str] = None, difficulty: Optional[str] = None,
           model: Optional[str] = None, base: Optional[str] = None,
           not_before: Optional[str] = None, refs: Optional[int] = None,
           regresses: Optional[int] = None, after: Optional[str] = None,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
-          resolves: Optional[str] = None) -> str:
-    """File a ticket under the goal. With refs, the ticket is a rewrite of that
+          resolves: Optional[str] = None, intake_of: Optional[int] = None) -> str:
+    """File a ticket under an open epic (decision 0003): it becomes the epic's
+    sub-issue and its Part of line names the epic. The epic must be open,
+    labelled epic, under an open loom:goal, and hold fewer than
+    EPIC_TICKET_CAP tickets (open_epic). Trunk, caps and the done journal
+    come from the epic's goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Rewritten from issue M." in words, and the
     original gets a comment naming the ticket and loom:rewritten in place of
     loom:triage. The original is never closed, retitled or edited. The line is
@@ -1361,9 +1524,13 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     _check_no_foreign_refs(gh, repo, title + "\n" + body)
     if refs is not None:
         _check_rewritable(gh, repo, refs)
-    goal_issue: Optional[Dict[str, Any]] = None
+    if epic is not None:
+        _, goal, goal_issue = open_epic(gh, repo, epic)
+    elif intake_of is not None:
+        goal, goal_issue = intake_of, _goal_issue(gh, repo, intake_of)
+    else:
+        raise ValueError("a brief files under an open epic: name one (--epic N)")
     if base is None:
-        goal_issue = _goal_issue(gh, repo, goal)
         base = goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority)
@@ -1372,12 +1539,14 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
                                       "Not before": not_before})
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
-                                 regresses, goal_issue)
+                                 regresses, goal_issue, epic)
     children = _goal_children(gh, repo, goal, goal_issue)
     _check_goal_capacity(children, goal)
     _check_goal_unproven(children, goal)
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
-    issue = _file_ticket(gh, repo, goal, title, full_body, lane)
+    if epic is None:
+        epic = intake_epic(gh, repo, goal)
+    issue = _file_ticket(gh, repo, epic, title, _with_part_of(full_body, epic), lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
                 {"body": "%s\nRewritten as ticket #%d, which refs this issue. This issue "
@@ -1528,9 +1697,10 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
     anything with a loom: label. A ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
     the goal, while the goal has room; the rest get loom:triage and one
-    comment naming what is missing. Only labels, sub-issue links and that
-    comment are written, plus a Part of line at the end of a ready issue's
-    body when GitHub refuses the sub-issue link: an issue is never closed or
+    comment naming what is missing. A ready issue goes under the goal's
+    intake epic (intake_epic). Only labels, sub-issue links, that comment and
+    an intake epic when one is needed are written, plus a Part of line at the
+    end of a ready issue's body when GitHub refuses the sub-issue link: an issue is never closed or
     retitled, and nothing else in it is edited.
     Returns one line per issue looked at.
     """
@@ -1542,6 +1712,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
     lines: List[str] = []
     done = 0
     comments = 0
+    intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
     for issue in _oldest_open_issues(gh, repo):
         if done >= limit:
             break
@@ -1555,15 +1726,21 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
                 continue
-            if not _link_to_goal(gh, repo, goal, issue):
-                # The goal is at GitHub's sub-issue limit (or refused it for
-                # another reason): the Part of line links it instead.
+            # Decision 0003: a ready issue goes under the goal's intake epic,
+            # opened when there is none and again when one fills up.
+            if intake is None or intake[1] >= EPIC_TICKET_CAP:
+                found = intake_epic(gh, repo, goal)
+                intake = (found, len(_epic_tickets(gh, repo, found)))
+            if not _link_to_goal(gh, repo, intake[0], issue):
+                # GitHub refused the sub-issue link: the Part of line links it
+                # instead.
                 gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                        {"body": _with_part_of(str(issue.get("body") or ""), goal)})
+                        {"body": _with_part_of(str(issue.get("body") or ""), intake[0])})
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:ticket", "loom:queued"]})
             in_flight += 1
-            lines.append("#%d queued under #%d" % (number, goal))
+            intake = (intake[0], intake[1] + 1)
+            lines.append("#%d queued under #%d" % (number, intake[0]))
         else:
             if comment_limit is None or comments < comment_limit:
                 comment = _triage_comment(missing)
@@ -1671,6 +1848,9 @@ def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
         made = gh.rest("POST", "/repos/%s/issues" % repo,
                        {"title": title, "body": body, "labels": ["loom:goal"]}).data or {}
         lines.append("backlog goal home: #%s, created" % made.get("number"))
+        home = [made] if made.get("number") else []
+    if home:
+        lines.append("intake epic: #%d" % intake_epic(gh, repo, int(home[0]["number"])))
     lines.append(_review_check_line(gh, repo, check))
     repos = env.get("LOOM_REPOS", "").replace(",", " ").split()
     if repo not in repos:
@@ -3192,7 +3372,8 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
+    ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
@@ -3231,12 +3412,20 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
+    if args.epic is None:
+        raise ValueError("brief files a ticket under an open epic: pass --epic N (a goal's "
+                         "epics are listed by bus.brain status; open one with bus.brain epic)")
     body = _read(args.file)
     _check_brief_difficulty(body, args.lane, args.difficulty)
-    print(brief(gh, _repo(args.repo), args.goal, args.title, body,
+    print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
                 resolves=args.resolves))
+
+
+def _cmd_epic(gh: GitHub, args: argparse.Namespace) -> None:
+    made = file_epic(gh, _repo(args.repo), args.goal, args.title, _read(args.file))
+    print(made.get("html_url", ""))
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:
@@ -3314,7 +3503,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "audit": _cmd_audit, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
-            "onboard": _cmd_onboard, "escalate": _cmd_escalate}
+            "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic}
 COMMANDS["step"] = _cmd_step
 
 

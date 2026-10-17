@@ -85,8 +85,8 @@ tickets first, then P0 to P3, then the oldest (docs/BRAIN.md).
 Per finding, on each read:
 
 - No open ticket carries the finding's marker
-  (`<!-- loom:health key=<sha1> -->`): it briefs one on the goal home through
-  `bus.brain brief`, with Difficulty medium, Size M, the quoted finding in
+  (`<!-- loom:health key=<sha1> -->`): it briefs one under the goal's intake
+  epic through `bus.brain brief`, with Difficulty medium, Size M, the quoted finding in
   Why, and the Live criterion "the finding is absent from the health endpoint for 24
   hours". At most 3 new tickets a pass, and never past the goal's cap
   (`LOOM_GOAL_CAP`).

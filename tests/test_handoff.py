@@ -340,6 +340,12 @@ class BriefDoneTests(unittest.TestCase):
             ("POST", "/repos/%s/issues" % REPO): ticket,
             ("POST", "/repos/%s/issues/1/sub_issues" % REPO): (201, {}),
             ("POST", "/repos/%s/issues/1/comments" % REPO): (201, {}),
+            # Epic #3 under goal #1: briefs file under an open epic.
+            ("GET", "/repos/%s/issues/3" % REPO): (200, {
+                "number": 3, "id": 103, "state": "open", "title": "Epic: the work",
+                "labels": [{"name": "epic"}], "body": "Done when: done.\n\nPart of #1\n"}),
+            ("GET", "/repos/%s/issues/3/sub_issues" % REPO): (200, []),
+            ("POST", "/repos/%s/issues/3/sub_issues" % REPO): (201, {}),
         })
         return routes
 
@@ -350,7 +356,7 @@ class BriefDoneTests(unittest.TestCase):
     def test_a_brief_under_a_standing_brief_defer_retires_it_in_resume(self):
         routes = self.routes(journal(10, "muse", BRIEF_DEFER))
         fake = Routes(routes)
-        url = brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF,
+        url = brain.brief(GitHub("t", transport=fake), REPO, 3, "Ticket", BRIEF,
                           holder="lane-machine", env=ENV)
         self.assertEqual("https://example.com/12", url)
         [posted] = self.journals_posted(fake)
@@ -379,13 +385,13 @@ class BriefDoneTests(unittest.TestCase):
         for name, journals in cases.items():
             with self.subTest(name):
                 fake = Routes(self.routes(*journals))
-                brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF,
+                brain.brief(GitHub("t", transport=fake), REPO, 3, "Ticket", BRIEF,
                             holder="lane-machine", env=ENV)
                 self.assertEqual([], self.journals_posted(fake))
                 self.assertIn(("POST", "/repos/%s/issues" % REPO), fake.calls)
         # Without a holder the brief reads no journals and writes none, as before.
         fake = Routes(self.routes(journal(10, "muse", BRIEF_DEFER)))
-        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF, env=ENV)
+        brain.brief(GitHub("t", transport=fake), REPO, 3, "Ticket", BRIEF, env=ENV)
         self.assertEqual([], self.journals_posted(fake))
         self.assertNotIn(("GET", "/repos/%s/issues/1/comments" % REPO), fake.calls)
 
@@ -401,7 +407,7 @@ class BriefDoneTests(unittest.TestCase):
                 fake = Routes(self.routes(journal(10, "muse", BRIEF_DEFER),
                                           **{k: v for k, v in case.items() if k == "ticket"}))
                 with self.assertRaises((ValueError, GitHubError)):
-                    brain.brief(GitHub("t", transport=fake), REPO, 1,
+                    brain.brief(GitHub("t", transport=fake), REPO, 3,
                                 case.get("title", "Ticket"), case.get("body", BRIEF),
                                 holder=case.get("holder", "lane-machine"), env=ENV)
                 self.assertEqual([], self.journals_posted(fake))
@@ -410,7 +416,7 @@ class BriefDoneTests(unittest.TestCase):
         routes = self.routes(journal(10, "muse", BRIEF_DEFER))
         routes[("POST", "/repos/%s/issues/1/comments" % REPO)] = (502, {"message": "Bad Gateway"})
         with self.assertRaises(GitHubError) as caught:
-            brain.brief(GitHub("t", transport=Routes(routes)), REPO, 1, "Ticket", BRIEF,
+            brain.brief(GitHub("t", transport=Routes(routes)), REPO, 3, "Ticket", BRIEF,
                         holder="lane-machine", env=ENV)
         self.assertIn("https://example.com/12", str(caught.exception))
         self.assertIn(handoff.done_marker("brief", (REPO, 1), "lane-machine"),
