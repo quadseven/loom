@@ -7,7 +7,7 @@ import sys
 from typing import List, Optional
 
 from . import journal, labels, lock, station
-from .github import GitHub, GitHubError, token_from_env
+from .github import GitHub, GitHubError, auth_from_env
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
@@ -80,7 +80,7 @@ def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None) -> int:
             return 2
     try:
         if gh is None:
-            gh = GitHub(token_from_env())
+            gh = GitHub(auth_from_env())
         try:
             return _run(args, gh)
         finally:

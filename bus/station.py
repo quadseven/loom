@@ -48,7 +48,7 @@ from . import transcripts
 from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, _OPENER, _next_link
+from .github import GitHub, GitHubError, _OPENER, _next_link, read_ssm
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -541,18 +541,6 @@ def _is_ancestor(commit: str, revision: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return out.returncode == 0
-
-
-def read_ssm(name: str, region: str) -> str:
-    """A SecureString parameter, read the way lanes/run_lane.sh reads keys.
-    The read is bounded by POST_TIMEOUT, so a hung call cannot stall a pass."""
-    out = subprocess.run(
-        ["aws", "ssm", "get-parameter", "--region", region, "--name", name,
-         "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
-        capture_output=True, text=True, timeout=POST_TIMEOUT)
-    if out.returncode != 0 or not out.stdout.strip():
-        raise OSError("could not read the parameter from SSM")
-    return out.stdout.strip()
 
 
 def post_webhook(url: str, payload: Dict[str, Any]) -> None:
@@ -5421,7 +5409,8 @@ class Station:
         rates = self._rates()
         if "core" in rates:
             remaining, limit, reset = rates["core"]
-            line += "; budget %d of %d left, resets %s" % (remaining, limit, self._utc(reset))
+            line += "; %sbudget %d of %d left, resets %s" % (
+                "GitHub App " if gh.auth == "app" else "", remaining, limit, self._utc(reset))
         _say(line)
         state = self._budget_state()
         state["rates"] = {r: list(v) for r, v in rates.items()}
@@ -5532,8 +5521,8 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
         if gh is None:
-            from .github import token_from_env
-            gh = GitHub(token_from_env())
+            from .github import auth_from_env
+            gh = GitHub(auth_from_env())
         if gh.cache_dir is None:
             # Every GET is conditional: a list re-read each pass costs a 304.
             gh.cache_dir = os.path.join(state, "station", "etags")
