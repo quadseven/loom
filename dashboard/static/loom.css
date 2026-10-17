@@ -156,12 +156,7 @@ button { color: inherit; font: inherit; }
 .backlog-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; }
 .backlog-filters label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .backlog-filters select, .backlog-filters button { min-height: 44px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
-.backlog-epic { margin-bottom: 12px; }
-.backlog-epic h2, .card h2 { font-size: 18px; }
-.backlog-epic ul { padding-left: 20px; }
-.backlog-epic li { padding: 4px 0; }
-.start-here { border-color: var(--accent); margin-bottom: 16px; }
-.start-here h2 { margin-bottom: 4px; }
+.card h2 { font-size: 18px; }
 blockquote { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--accent); white-space: pre-wrap; }
 footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .more-sheet .nav-row { min-height: 52px; }
@@ -468,3 +463,44 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .results-table th, .results-table td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--line, rgba(127,127,127,0.25)); min-height: 44px; }
 .results-table td { font-variant-numeric: tabular-nums; }
 .results-table td.not-looked { color: var(--muted, #888); font-style: normal; }
+
+/* Backlog page (loom#607): one dense epics table, the "Outside any epic"
+   list, and collapsed groups for empty epics, overflow ranks and checks. */
+.backlog-note { max-width: 760px; margin: 0 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.backlog-outside { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 2px 18px; margin: 0; padding: 0; list-style: none; }
+.backlog-outside li { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; padding: 5px 0; border-bottom: 1px solid var(--line); }
+.backlog-outside li > a { min-width: 0; overflow: hidden; color: var(--body); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.backlog-outside li > a:hover { color: var(--text); }
+.backlog-outside li > .machine-fact { flex: none; }
+.epic-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+.epic-table caption { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.epic-table th { padding: 6px 8px; border-bottom: 1px solid var(--line-strong); color: var(--dim-on-bg); font: 500 10.5px var(--font-mono); letter-spacing: .08em; text-align: left; text-transform: uppercase; }
+.epic-table td { padding: 5px 8px; border-bottom: 1px solid var(--line); overflow: hidden; color: var(--body); text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+.epic-table tbody tr:hover { background: var(--raised); }
+.epic-table th:nth-child(1) { width: 11%; }
+.epic-table th:nth-child(2) { width: 34%; }
+.epic-table th:nth-child(3) { width: 7%; }
+.epic-table th:nth-child(4) { width: 6%; }
+.epic-table th:nth-child(5) { width: 13%; }
+.epic-table th:nth-child(6) { width: 24%; }
+.epic-table th:nth-child(7) { width: 5%; }
+.epic-table td.num, .epic-table th:nth-child(4) { text-align: right; }
+.epic-table td a { color: var(--text); }
+.epic-table td a:hover { color: var(--accent-on-bg); }
+.epic-table .epic-next { color: var(--body); }
+.epic-bar { display: inline-block; width: 56px; height: 5px; margin-right: 8px; overflow: hidden; border-radius: 3px; background: var(--future); vertical-align: middle; }
+.epic-bar i { display: block; height: 100%; background: var(--good-on-bg); }
+.backlog-group { margin: 0 0 18px; }
+.backlog-group > summary { color: var(--muted); font: 12px var(--font-mono); cursor: pointer; }
+.backlog-group h2 { margin: 14px 0 6px; font-size: 14px; font-weight: 500; }
+.backlog-group ul { margin: 6px 0; padding-left: 20px; }
+.backlog-group li { padding: 2px 0; color: var(--body); }
+@media (max-width: 959px) {
+  .epic-table, .epic-table tbody, .epic-table tr, .epic-table td { display: block; width: auto; }
+  .epic-table thead { display: none; }
+  .epic-table tr { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .epic-table td { padding: 0; border: 0; white-space: normal; }
+  .epic-table td.epic-title, .epic-table td.epic-next-cell { grid-column: 1 / -1; }
+  .epic-table td a { display: inline-flex; min-height: 44px; align-items: center; }
+  .backlog-outside li { align-items: center; }
+}
