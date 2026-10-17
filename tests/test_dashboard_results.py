@@ -84,7 +84,7 @@ class ResultsPage(unittest.TestCase):
                                        "stale_reason": "GitHub's request budget ran low",
                                        "next_refresh_at": 2000}, now=3400)
         self.assertIn("Ticket data is 40 minutes old", notice)
-        self.assertIn("GitHub&#x27;s request budget ran low", notice)
+        self.assertIn("GitHub's request budget ran low", notice)
         self.assertIn("refreshes at", notice)
         self.assertIn("ET", notice)
 
