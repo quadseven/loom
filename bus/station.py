@@ -853,7 +853,7 @@ def _linked_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
                             str((pr.get("head") or {}).get("ref") or "")))
 
 
-def adoption_body(pr: int, goal: int) -> str:
+def adoption_body(pr: int) -> str:
     """The brief for an adoption ticket. It names the pull request in words
     and #N, never in a Refs line: the lane's own pull request carries the
     Refs line to this ticket."""
@@ -886,8 +886,7 @@ def adoption_body(pr: int, goal: int) -> str:
         "## Definition of done", "",
         "Pull request #%d is closed, and its change is merged through this ticket's pull "
         "request or recorded here as superseded." % pr, "",
-        ADOPTS_MARKER % pr, "",
-        brain.part_of_line(goal), ""])
+        ADOPTS_MARKER % pr, ""])
 
 
 def adoption_comment(repo: str, ticket: int) -> str:
@@ -1352,8 +1351,8 @@ class Station:
                           for issue in open_issues)
             if pending:
                 continue
-            brain.brief(self.gh, repo, int(goal["number"]), title, body,
-                        difficulty="medium")
+            brain.brief_intake(self.gh, repo, int(goal["number"]), title, body,
+                               difficulty="medium")
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -2365,8 +2364,8 @@ class Station:
             self._adoption_refused(repo, rec, "no goal home to file adoption tickets on")
             return
         try:
-            url = brain.brief(self.gh, repo, goal, self._adoption_title(repo, pr),
-                              adoption_body(number, goal), difficulty="medium")
+            url = brain.brief_intake(self.gh, repo, goal, self._adoption_title(repo, pr),
+                              adoption_body(number), difficulty="medium")
         except ValueError as err:
             # The goal is at its cap or holds too much unproven work: tried
             # again after ADOPT_RETRY.

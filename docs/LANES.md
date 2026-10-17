@@ -97,6 +97,12 @@ failure. It logs to
 rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
 0002): both brains take every stage under the one lock, and the defer and
 done markers keep them from repeating each other's work.
+Its prompt tells the brain to brief only under an open epic
+(`bus.brain brief --epic E`), to propose a new epic within the cap of 6 open
+epics per goal (`bus.brain epic`), to chart a wayfinder map for an epic whose
+route is unclear, to resolve research and task tickets alone, and to batch
+the questions only the operator can answer into one daily ask with
+recommended answers (docs/BRAIN.md, Filing under an epic).
 
 The agent floats to whichever subscription has usage (decision 0002, item
 2). `LOOM_BRAIN_LADDER` lists lanes in order, default `claude codex spark`.
