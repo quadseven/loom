@@ -167,6 +167,23 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
 
+GitHub App: with `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (the name of the SSM parameter that holds the App's
+private key, never the key itself; region `LOOM_AWS_REGION`) all set, the
+station, the brain commands and any `bus` call in that environment send an
+App installation token instead, so their requests spend the installation's
+own hourly budget, not the operator account's. The token is minted at run
+time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
+CLI (key on stdin, never on the command line or on disk), and
+`POST /app/installations/<id>/access_tokens` returns a token kept in memory
+until 5 minutes before its `expires_at`. Mints count under `app token` in the
+requests line, and the budget line reads `GitHub App budget`. With any of the
+three unset, the token above is used as before. The App needs contents,
+issues and pull requests read and write, and checks and actions read, on the
+scanned repos. The dashboard takes the same three settings when its host has
+the `openssl` and `aws` CLIs, and otherwise keeps
+`LOOM_DASHBOARD_GITHUB_TOKEN`.
+
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 It skips future `Not before:` times and tickets without a readable Difficulty.
@@ -313,6 +330,36 @@ comment link, so tapping the line expands it. The short name is a
 home title. A failed line is retried on the next pass; once the line is out,
 a failed thread is only logged, so the line is never posted twice. Every
 station post, through the webhook or the bot, suppresses link previews.
+
+### Two Looms on shared repos
+
+Two operators may each run a Loom against the same repos. Each Loom works
+only what is its own, and adding an operator is configuration:
+
+- An issue or pull request assigned to a GitHub login belongs to that login.
+  So does one carrying a `claim:<login>` label, which marks claims an
+  operator's own sessions make outside a Loom. A Loom acts only on ones with
+  no owner and on ones with an owner among its own logins
+  (`LOOM_BRIEF_AUTHORS`). Triage, rewrite, the factory's queue
+  routing and pull request pass, `bus.brain move`, the station's claim, pull
+  request adoption and the verify picker all skip one assigned to anyone
+  else. The station logs each skip once (`state/station/owned.json`).
+- When the station claims a ticket, it assigns the issue to its operator
+  login, the first `LOOM_BRIEF_AUTHORS` login that is not an app (`[bot]`),
+  before it relabels it, and adds `claim:<that login>` with the relabel
+  (creating the label in the repo once a pass if it is missing), so the other
+  Loom sees the claim before it acts and a label search lists every claim. A
+  refused assignment is logged and the claim goes on.
+- A goal home may name its operator with an `Operator: <login>` line in its
+  header, above the first heading (as `Trunk:` is written). A Loom works only
+  goal homes that name one of its own logins, or name none: a goal home with
+  no such line belongs to every `LOOM_BRIEF_AUTHORS` login, as before. The
+  station leaves another operator's goal home out of triage, rewrites,
+  adoption, reports, standups and invariants, and claims no ticket under it.
+
+Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
+other's login. A person working a ticket by hand claims it the same way:
+assign it to yourself and add `claim:<your login>` before any Loom briefs it.
 
 ### Verify runs
 

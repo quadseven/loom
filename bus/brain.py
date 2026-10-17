@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, _next_link, token_from_env
+from .github import GitHub, GitHubError, _next_link, auth_from_env
 from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
 from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -286,10 +286,13 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         if gh is not None and repo:
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
-            held, waiting = _goal_counts(gh, repo, int(issue["number"]), issue)
+            loose, tree = goal_tree(gh, repo, int(issue["number"]))
+            held, waiting = _count_unproven(_flatten(loose, tree))
             lines.append("  - unproven work %d/%d (shipped with no standing proof; "
                          "%d more await live evidence and do not count)"
                          % (held, limit, waiting))
+            if tree:
+                lines += epic_lines(tree)
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
@@ -878,11 +881,17 @@ def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
 
 def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
     """loom:ticket issues that say Part of #goal but are neither its sub-issues
-    nor carry the line on a line of its own, so goal_children does not count
-    them as the goal's. Search hits that only match loose words are left out."""
-    return [i for i in _part_of_hits(gh, repo, goal)
+    nor carry the line on a line of its own, nor sit under one of its epics, so
+    goal_children does not count them as the goal's. Search hits that only
+    match loose words are left out. The goal is walked only when a hit needs
+    it."""
+    hits = [i for i in _part_of_hits(gh, repo, goal)
             if _mentions_goal(i.get("body"), goal) and not _names_goal(i.get("body"), goal)
             and not _sub_issue_of(i, repo, goal)]
+    if not hits:
+        return hits
+    counted = {int(c.get("number") or 0) for c in goal_children(gh, repo, goal)}
+    return [i for i in hits if int(i.get("number") or 0) not in counted]
 
 
 def _goal_children(gh: GitHub, repo: str, goal: int,
@@ -895,10 +904,20 @@ def _goal_children(gh: GitHub, repo: str, goal: int,
     return goal_children(gh, repo, goal)
 
 
-def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+# Decision 0003: a goal holds at most GOAL_EPIC_CAP open epics, and an epic
+# holds at most EPIC_TICKET_CAP tickets.
+EPIC_TICKET_CAP = 15
+GOAL_EPIC_CAP = 6
+
+
+def _epic_label(issue: Dict[str, Any]) -> bool:
+    return "epic" in [name.lower() for name in _labels(issue)]
+
+
+def _direct_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
     """Sub-issues of the goal, then, once the goal holds GitHub's limit of
     sub-issues (the only way a ticket gets a Part of line instead), the Part
-    of #goal issues not already listed. Below the limit it costs no search."""
+    of #goal tickets not already listed. Below the limit it costs no search."""
     children = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal)))
     if len(children) < SUB_ISSUE_LIMIT:
         return children
@@ -909,6 +928,88 @@ def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
             children.append(item)
             seen.add(number)
     return children
+
+
+def _goal_epics(gh: GitHub, repo: str, goal: int,
+                direct: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The goal's epics, open and closed: its sub-issues labelled epic, and,
+    once the goal holds GitHub's limit of sub-issues, the repo's epics whose
+    body says Part of #goal (one conditional list read, no search)."""
+    epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
+    if len(direct) < SUB_ISSUE_LIMIT:
+        return epics
+    seen = {int(e.get("number") or 0) for e in epics}
+    for item in gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
+        number = int((item or {}).get("number") or 0) if isinstance(item, dict) else 0
+        if (number and number not in seen and number != goal and "pull_request" not in item
+                and _names_goal(item.get("body"), goal)):
+            epics.append(item)
+            seen.add(number)
+    return epics
+
+
+def goal_tree(gh: GitHub, repo: str, goal: int
+              ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
+    """(the goal's direct children that are not epics, [(epic, its tickets)]).
+
+    One walk for every reader (decision 0003): goal, then its epics, then each
+    epic's tickets, its sub-issues plus open loom:ticket issues whose Part of
+    line names the epic. While tickets move under epics, the goal's own
+    tickets (sub-issues and Part of #goal tickets) still count."""
+    direct = _direct_children(gh, repo, goal)
+    epics = _goal_epics(gh, repo, goal, direct)
+    epic_numbers = {int(e.get("number") or 0) for e in epics}
+    loose = [c for c in direct if isinstance(c, dict)
+             and int(c.get("number") or 0) not in epic_numbers]
+    if not epics:
+        return loose, []
+    open_tickets = [i for i in gh.paginate(
+        "/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
+        if isinstance(i, dict) and "pull_request" not in i]
+    tree = []
+    for epic in epics:
+        number = int(epic.get("number") or 0)
+        tickets_ = [c for c in gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                                           % (repo, number)) if isinstance(c, dict)]
+        seen = {int(c.get("number") or 0) for c in tickets_}
+        for item in open_tickets:
+            n = int(item.get("number") or 0)
+            if n and n not in seen and _names_goal(item.get("body"), number):
+                tickets_.append(item)
+                seen.add(n)
+        tree.append((epic, tickets_))
+    return loose, tree
+
+
+def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """Every ticket of the goal, each once: its direct children that are not
+    epics, then each epic's tickets (goal_tree). The epics themselves are not
+    listed: a count of tickets must not count an epic."""
+    return _flatten(*goal_tree(gh, repo, goal))
+
+
+def _flatten(loose: List[Dict[str, Any]],
+             tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+    children = list(loose)
+    seen = {int(c.get("number") or 0) for c in children}
+    for _, found in tree:
+        for item in found:
+            number = int(item.get("number") or 0)
+            if number and number not in seen:
+                children.append(item)
+                seen.add(number)
+    return children
+
+
+def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[str]:
+    """bus.brain status lines for a goal's epics: the open epics against
+    GOAL_EPIC_CAP, then each open epic's tickets against EPIC_TICKET_CAP."""
+    open_epics = [(e, t) for e, t in tree if e.get("state", "open") == "open"]
+    lines = ["  - open epics %d/%d" % (len(open_epics), GOAL_EPIC_CAP)]
+    for epic, found in open_epics:
+        lines.append("  - epic #%s %s - tickets %d/%d" % (
+            epic.get("number"), epic.get("title", ""), len(found), EPIC_TICKET_CAP))
+    return lines
 
 
 def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
@@ -1383,9 +1484,12 @@ def _is_epic(issue: Dict[str, Any]) -> bool:
             or int(summary.get("total") or 0) > 0)
 
 
-def _triage_skip(issue: Dict[str, Any]) -> Optional[str]:
+def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = ()) -> Optional[str]:
     if "pull_request" in issue:
         return "pull request"
+    if authors and tickets.owned_elsewhere(issue, authors):
+        # Another operator's Loom owns an issue assigned to them.
+        return "another operator's"
     names = _labels(issue)
     if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
         return "already labelled"
@@ -1434,6 +1538,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
         raise ValueError("limit is at least 1")
     in_flight = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
+    authors = trusted_authors()
     lines: List[str] = []
     done = 0
     comments = 0
@@ -1441,7 +1546,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
         if done >= limit:
             break
         number = int(issue["number"])
-        skip = _triage_skip(issue)
+        skip = _triage_skip(issue, authors)
         if skip:
             continue
         missing = missing_sections(issue.get("body"))
@@ -1807,6 +1912,11 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
+    authors = trusted_authors()
+    owner = tickets.owned_elsewhere(issue, authors) if authors else None
+    if owner is not None and state in ("queued", "briefed", "running"):
+        raise ValueError("#%d is assigned to %s, another operator's; leave it to their Loom"
+                         % (number, owner))
     if state == "queued" and lane in REMOTE_LANES:
         _check_remote_queue(gh, repo, number, issue, lane)
     if lane is not None and state == "briefed":
@@ -3212,7 +3322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gh: Optional[GitHub] = None
     try:
         args = parser().parse_args(argv)
-        gh = GitHub(token_from_env())
+        gh = GitHub(auth_from_env())
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:

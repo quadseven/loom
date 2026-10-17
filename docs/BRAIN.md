@@ -174,6 +174,9 @@ keyword. The station checks those references and the conventional branch
 number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
+For a re-queued regression, a merged pull request from before the latest
+`loom:queued` or `loom:briefed` label does not move the ticket or supersede
+its newer open pull request. The current attempt still needs to merge.
 
 ### When a ticket may run
 
@@ -263,6 +266,16 @@ not raised, and the ticket is still queued. A ticket a goal refuses, from
 `Part of #N` line at the end of its body instead, and a goal's tickets are
 its sub-issues plus, once it holds 100, the issues whose body has that line
 (one search). The backlog board reads parentage the same way.
+
+Every goal count walks goal, epics and tickets (decision 0003): the goal's
+epics are its sub-issues labelled `epic` (and, once it holds 100, the repo's
+`epic` issues whose body says `Part of #N`, from one list read), open and
+closed; an epic's tickets are its sub-issues plus open `loom:ticket` issues
+whose `Part of` line names the epic. While tickets move under epics, the
+goal's own tickets still count. The in-flight cap, the unproven-work limit,
+the regression slot, station standups and the unlinked-ticket invariant all
+read that one walk, and `bus.brain status` prints the goal's open epics
+against 6 and each open epic's tickets against 15.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
@@ -400,7 +413,11 @@ credentials, so the station takes a ticket only when all of these hold:
 - The repo owner is in `LOOM_REPO_OWNERS`, as for local briefs.
 
 A ticket that fails these is left alone and reported once in the station
-log; it is never claimed.
+log; it is never claimed. So is a ticket assigned to a login outside
+`LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
+another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
+shared repos"). A claim assigns the ticket to this Loom's operator login and
+labels it `claim:<that login>`.
 
 The brain applies the same rule to what it reads: issue bodies, comments and
 reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
@@ -738,6 +755,24 @@ adopted.
 ticket", one line per open pull request from a trusted author with no
 ticket, ending in `READY` or `blocked:` and every blocker exactly as a lane
 pull request's line, so a brain sees them and adopts them.
+
+The station adopts the rest (decision 0002, item 1). Each pass, for the
+oldest open pull request in a scanned repo that is not a draft, comes from
+a `LOOM_BRIEF_AUTHORS` login on a branch of the repo itself, and that no
+open ticket links (by a `Refs` line or a `loom/N` branch), it files one
+ticket under the repo's goal home: "Land or supersede #N", in the normal
+brief format with `Difficulty: medium`. The lane that takes it lands the
+change on a `loom/` branch and closes the original with a comment naming
+the new pull request, or closes the original as superseded with the reason.
+The station marks the original with a `loom:adopted` comment naming the
+ticket, so it is adopted once, and files at most one adoption ticket per
+repo a pass. It never closes a pull request itself. It reads a pull
+request's comments for the marker at most once, remembering the adopted ones
+in `state/station/adoptions.json`, and a repo whose brief was refused (its
+goal at the cap) is tried again 10 minutes later, not every pass. The station
+log says `adopted OWNER/NAME#N as ticket ...` for each one, and
+`adoption OWNER/NAME:` with the count of open pull requests no ticket links
+whenever it changes.
 
 ## Journal
 

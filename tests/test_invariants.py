@@ -61,6 +61,10 @@ class FakeGH:
         m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:ticket&state=open", path)
         if m:
             return []
+        # The goal walk (goal, epics, tickets) a loose Part of hit triggers.
+        if re.match(r"/repos/[^/]+/[^/]+/issues/\d+/sub_issues\?", path) \
+                or re.match(r"/repos/[^/]+/[^/]+/issues\?labels=epic&", path):
+            return []
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None):
