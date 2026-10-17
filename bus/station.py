@@ -955,6 +955,7 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        self._parents: Dict[Tuple[str, int], Dict[str, Any]] = {}
         # This pass's closed pull requests and default branches, per repo:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -1202,7 +1203,7 @@ class Station:
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
         # A claim for the goal succeeded, so the unproven-work gate no longer
         # holds it and its refusal tracking clears (loom#564).
-        goal = _ticket_goal(issue)
+        goal = self._goal_of(repo, issue)
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
@@ -1562,6 +1563,42 @@ class Station:
         used.add(target)
         _say("released runaway %s#%d from dead lane %s to lane %s" % (repo, number, lane, target))
 
+    def _parent(self, repo: str, number: int) -> Dict[str, Any]:
+        """An issue a ticket names as its parent, read once a pass; empty
+        when it cannot be read."""
+        key = (repo, number)
+        if key not in self._parents:
+            try:
+                data = self.gh.rest("GET", "/repos/%s/issues/%d" % key).data
+            except GitHubError:
+                data = None
+            self._parents[key] = data if isinstance(data, dict) else {}
+        return self._parents[key]
+
+    def _goal_of(self, repo: str, issue: Dict[str, Any]) -> Optional[int]:
+        """The goal a ticket belongs to (decision 0003: a goal holds epics, an
+        epic holds tickets). The issue the ticket names counts when it is an
+        open loom:goal; when it is an epic, the goal that epic names counts.
+        Anything else is no goal, never the parent's own number: a ticket
+        under an epic once handed the epic to the unproven-work check, which
+        raised and ended the pass."""
+        parent = _ticket_goal(issue)
+        if parent is None:
+            return None
+        data = self._parent(repo, parent)
+        names = _label_names(data)
+        if data.get("state") == "open" and "loom:goal" in names:
+            return parent
+        if "epic" not in [name.lower() for name in names]:
+            return None
+        goal = _ticket_goal(data)
+        if goal is None or goal == parent:
+            return None
+        home = self._parent(repo, goal)
+        if home.get("state") == "open" and "loom:goal" in _label_names(home):
+            return goal
+        return None
+
     def _unproven_gate(self, repo: str, issue: Dict[str, Any], limit: int,
                        counts: Dict[Tuple[str, int], int]) -> Optional[str]:
         """Why the station must not claim this build ticket, or None when the
@@ -1570,12 +1607,17 @@ class Station:
         names = set(_label_names(issue))
         if names & {REGRESSION, factory.REVERT_LABEL, URGENT}:
             return None
-        goal = _ticket_goal(issue)
+        goal = self._goal_of(repo, issue)
         if goal is None:
             return None
         key = (repo, goal)
         if key not in counts:
-            counts[key] = brain.goal_unproven(self.gh, repo, goal)
+            try:
+                counts[key] = brain.goal_unproven(self.gh, repo, goal)
+            except ValueError as err:
+                # One ticket with a bad goal is skipped this pass; it must
+                # never end the pass for every other ticket.
+                return "its goal #%d cannot be read: %s" % (goal, err)
         held = counts[key]
         if held <= limit:
             return None
@@ -1608,8 +1650,8 @@ class Station:
                          counts: Dict[Tuple[str, int], int]) -> None:
         """Remember the unproven-work gate's refusal of one briefed ticket,
         per goal, so an hour of refusals becomes an invariant (loom#564)."""
-        goal = _ticket_goal(issue)
-        if goal is None:
+        goal = self._goal_of(repo, issue)
+        if goal is None or (repo, goal) not in counts:
             return
         key = "%s#%d" % (repo, goal)
         hold = self._gate_holds.setdefault(
