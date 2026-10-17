@@ -111,6 +111,8 @@ fi
 # $FAKE_THREAD_ANSWER as an answer to thread PRRT_9 ($FAKE_AGENT=no-change),
 # exits non-zero ($FAKE_AGENT=fail), or prints $FAKE_OUT and exits
 # $FAKE_EXIT, editing a file first when $FAKE_EDIT is set ($FAKE_AGENT=say).
+# $FAKE_AGENT=stray also commits files no brief here names (a hook config,
+# a scratch file under .loom/, a top-level test script).
 # The file holds $FAKE_AGENT_TEXT (default "fixed"); $FAKE_AGENT_WEAKEN
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
@@ -167,6 +169,16 @@ if [ "${FAKE_AGENT:-commit}" = probes ]; then
   mkdir -p bin
   printf 'test bin in workspace\\n' > bin/test
   printf 'fixed\\n' > fix.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = stray ]; then
+  mkdir -p .agents .loom
+  printf '{"hooks": []}\n' > .agents/hooks.json
+  printf 'scratch\nmore\n' > .loom/test.txt
+  printf '#!/bin/sh\necho hook\n' > test_hook.sh
+  printf 'fixed\n' > fix.txt
   git add -A
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
   exit 0
@@ -406,7 +418,10 @@ class LaneRunnerTest(unittest.TestCase):
         seed = root / "seed"
         git("init", "-q", "-b", "main", str(seed))
         (seed / "README").write_text("seed\n")
-        git("add", "README", cwd=seed)
+        # The file the fake agents fix: an edit to a tracked file is always
+        # in the brief's scope, so a run's commit is never refused for it.
+        (seed / "fix.txt").write_text("todo\n")
+        git("add", "README", "fix.txt", cwd=seed)
         git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
             "commit", "-qm", "seed", cwd=seed)
         self.remote.parent.mkdir(parents=True)
@@ -508,13 +523,45 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_a_bin_file_the_diff_references_is_kept(self):
-        self.drop_brief()
+        self.drop_brief(text=BRIEF.replace("Make the thing work.",
+                                           "Add bin/tool and the run.sh that calls it."))
         result = self.run_lane(FAKE_AGENT="binref")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.pushed_files(), ["bin/tool", "fix.txt", "run.sh"])
         self.assertNotIn("dropped sandbox probe file", self.run_log())
         self.assertNotIn("Dropped sandbox probe files", self.body.read_text())
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_commit_adding_files_outside_the_brief_is_refused_and_nothing_pushed(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="stray")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("failed: [work] commit refused: it adds files outside the brief's "
+                      "paths: .agents/hooks.json, .loom/test.txt, test_hook.sh; nothing pushed",
+                      self.run_log())
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_files_the_brief_names_commit_and_push_normally(self):
+        self.drop_brief(text=BRIEF.replace(
+            "Make the thing work.",
+            "Make the thing work: add the hook in .agents/hooks.json, its script "
+            "test_hook.sh, and a fixture under .loom/."))
+        result = self.run_lane(FAKE_AGENT="stray")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(),
+                         [".agents/hooks.json", ".loom/test.txt", "fix.txt", "test_hook.sh"])
+        self.assertNotIn("commit refused", self.run_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_the_agent_is_told_new_files_go_only_where_the_ticket_points(self):
+        self.drop_brief()
+        self.run_lane()
+        self.assertIn("Add new files only where the ticket points", self.log.read_text())
 
     def test_agent_commit_is_pushed_and_opened_as_a_chief_ready_pr(self):
         self.drop_brief()
@@ -1248,6 +1295,18 @@ cat > /dev/null
         self.assertEqual(len(self.parents(after)), 2)
         self.assertIn(before, self.parents(after))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_that_adds_a_stray_file_beside_a_merge_is_refused(self):
+        # main.txt came in with the merge, so only the agent's file is named.
+        name, before = self.fix_brief()
+        self.advance_main("main.txt", "main moved\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "echo hook > test_hook.sh\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("commit refused: it adds files outside the brief's paths: "
+                      "test_hook.sh; nothing pushed", self.run_log(name + ".log"))
+        self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
 
     def test_a_conflict_goes_to_the_agent_and_the_runner_completes_the_merge(self):
         name, before = self.fix_brief()
