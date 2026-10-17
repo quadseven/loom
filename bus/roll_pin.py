@@ -297,10 +297,29 @@ def _update(gh: GitHub, goal: str, deploy: str, source: dict[str, Any],
     _post_build(gh, goal, deploy, pr, branch, revision, workflow)
 
 
-def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
-               authors: list[str], review_check: str) -> None:
+def _manual_pin_pull(gh: GitHub, goal: str, deploy: str,
+                     manifest: dict[str, Any]) -> dict[str, Any] | None:
+    paths = {pin["path"] for source in manifest["sources"] for pin in source["pins"]}
     pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % deploy).data or []
-    pr = next((p for p in pulls if (p.get("head") or {}).get("ref") == _branch(spec["goal"])), None)
+    for pr in pulls:
+        if (pr.get("head") or {}).get("ref") == _branch(goal):
+            continue
+        if not re.search(r"roll.*pin|pin.*roll", str(pr.get("title") or ""), re.I):
+            continue
+        if not re.search(r"family gate", str(pr.get("body") or ""), re.I):
+            continue
+        files = gh.paginate("/repos/%s/pulls/%d/files" % (deploy, int(pr["number"])))
+        changed = {file.get("filename") for file in files}
+        if changed and changed <= paths:
+            return pr
+    return None
+
+
+def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
+               authors: list[str], review_check: str,
+               manual: dict[str, Any] | None = None) -> None:
+    pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % deploy).data or []
+    pr = manual or next((p for p in pulls if (p.get("head") or {}).get("ref") == _branch(spec["goal"])), None)
     if pr is None:
         return
     gate = health.fetch(spec["gate_url"])
@@ -336,13 +355,16 @@ def run(gh: GitHub, documents: list[dict[str, str]],
     for spec in documents:
         text, _ = _content(gh, spec["repo"], spec["path"])
         manifest = _manifest(text)
+        deploy = manifest["deployment_repo"]
+        manual = _manual_pin_pull(gh, spec["goal"], deploy, manifest) if spec.get("gate_url") else None
         for source in manifest["sources"]:
             merged_sha = _latest_merge(gh, source["repo"])
             if merged_sha:
                 revision = _revision(gh, source, merged_sha)
-                _update(gh, spec["goal"], manifest["deployment_repo"], source,
-                        revision, manifest["build_workflow"])
-                _merged_build(gh, spec["goal"], manifest["deployment_repo"],
+                if manual is None:
+                    _update(gh, spec["goal"], deploy, source,
+                            revision, manifest["build_workflow"])
+                _merged_build(gh, spec["goal"], deploy,
                               revision, manifest["build_workflow"])
         if spec.get("gate_url"):
-            _poll_gate(gh, spec, manifest["deployment_repo"], authors or [], review_check)
+            _poll_gate(gh, spec, deploy, authors or [], review_check, manual)

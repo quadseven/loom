@@ -40,6 +40,8 @@ class FakeGitHub:
     def paginate(self, path):
         if path == "/repos/example-owner/project/issues/12/comments":
             return self.comments
+        if path == "/repos/%s/pulls/9/files" % DEPLOY:
+            return [{"filename": pin["path"]} for pin in PINS]
         raise AssertionError(path)
 
     def rest(self, method, path, body=None, ok=()):
@@ -232,6 +234,32 @@ class RollPinTest(unittest.TestCase):
         self.assertTrue(merge.call_args.kwargs["adopt"])
         self.assertEqual(merge.call_args.kwargs["env"]["LOOM_BRIEF_AUTHORS"], "example-bot")
         self.assertFalse(any("Family gate is open" in c["body"] for c in self.gh.comments))
+
+    def test_a_hand_made_roll_pin_is_alerted_when_the_family_gate_opens(self):
+        self.merge(FIRST)
+        self.specs[0]["gate_url"] = "https://example.com/family-gate"
+        self.gh.pulls = [{"number": 9, "title": "Roll source pin", "body": "Held for family gate",
+                          "head": {"ref": "manual-roll-pin", "sha": "c" * 40}}]
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": True}), \
+                mock.patch("bus.roll_pin.brain.merge", side_effect=ValueError("checks pending")) as merge:
+            Station(self.gh, Settings(home, [], [], [], roll_ship_docs=self.specs)).roll_source_pins()
+        merge.assert_called_once()
+        self.assertEqual(merge.call_args.args[1:3], (DEPLOY, 9))
+        self.assertTrue(any("Family gate is open" in c["body"] for c in self.gh.comments))
+
+    def test_a_hand_made_roll_pin_stays_held_while_the_family_gate_is_closed(self):
+        self.merge(FIRST)
+        self.specs[0]["gate_url"] = "https://example.com/family-gate"
+        self.gh.pulls = [{"number": 9, "title": "Roll source pin", "body": "Held for family gate",
+                          "head": {"ref": "manual-roll-pin", "sha": "c" * 40}}]
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": False}), \
+                mock.patch("bus.roll_pin.brain.merge") as merge:
+            Station(self.gh, Settings(home, [], [], [], roll_ship_docs=self.specs)).roll_source_pins()
+        merge.assert_not_called()
+        self.assertFalse(any("Family gate is open" in c["body"] for c in self.gh.comments))
+        self.assertFalse(any(path == "/repos/%s/pulls" % DEPLOY for _, path, _ in self.gh.writes))
 
 
 if __name__ == "__main__":
