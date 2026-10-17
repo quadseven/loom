@@ -1,5 +1,6 @@
 """Test the Finding class and related functions in bus.tickets."""
 import unittest
+from datetime import datetime, timezone
 
 from bus import tickets
 from bus.tickets import (Finding, after_holds, after_refs, dependency_state, parse,
@@ -414,3 +415,19 @@ class HardModelBriefTest(unittest.TestCase):
         self.assertEqual(head.count("Model:"), 1)
         self.assertIn("Model: gpt-6-luna", head)
         self.assertNotIn("Model:", self.head("Difficulty: hard\n\nWhy\n", "anthropic"))
+
+
+class RegressionRequeueTest(unittest.TestCase):
+    def test_datetime_merge_before_requeue_is_detected(self):
+        issue = ticket(5, "regression")
+        events = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                   "created_at": "2030-01-02T02:00:00Z"}]
+        merged_at = datetime(2030, 1, 2, 1, tzinfo=timezone.utc)
+        self.assertTrue(tickets.merged_before_regression_requeue(issue, merged_at, events))
+
+    def test_datetime_merge_after_requeue_is_current(self):
+        issue = ticket(5, "regression")
+        events = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                   "created_at": "2030-01-02T01:00:00Z"}]
+        merged_at = datetime(2030, 1, 2, 2, tzinfo=timezone.utc)
+        self.assertFalse(tickets.merged_before_regression_requeue(issue, merged_at, events))

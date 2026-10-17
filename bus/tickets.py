@@ -13,6 +13,7 @@ from __future__ import annotations
 import calendar
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from . import proof
@@ -27,6 +28,28 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 DEFAULT_PRIORITY = "P2"
 # Labels whose tickets go ahead of every priority: a fault to fix now.
 FIRST_LABELS = ("loom:urgent", "loom:regression", "loom:revert")
+
+
+def _utc_timestamp(value: Any) -> float:
+    parsed = (value if isinstance(value, datetime)
+              else datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def merged_before_regression_requeue(issue: Dict[str, Any], merged_at: Any,
+                                     events: Iterable[Dict[str, Any]]) -> bool:
+    """Whether a merged PR predates this regression ticket's latest re-queue."""
+    if not merged_at or "loom:regression" not in {
+            label.get("name") for label in issue.get("labels", [])}:
+        return False
+    requeues = [_utc_timestamp(event["created_at"]) for event in events
+                if isinstance(event, dict) and event.get("event") == "labeled"
+                and (event.get("label") or {}).get("name") in ("loom:queued", "loom:briefed")
+                and event.get("created_at")]
+    return bool(requeues) and max(requeues) > _utc_timestamp(merged_at)
+
 
 HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no

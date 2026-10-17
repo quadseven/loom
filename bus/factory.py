@@ -1190,14 +1190,23 @@ class Factory:
             closed.add(num)
 
     def _close_ticket_group(self, repo: str, item: Dict[str, Any],
-                            tickets: Dict[int, Dict[str, Any]],
+                            ticket_map: Dict[int, Dict[str, Any]],
                             prs: Sequence[Dict[str, Any]], closed: set) -> None:
         """Close the superseded lane pull requests of one ticket (item names it)."""
         ticket_number = int(item["number"])
-        ticket = tickets.get(ticket_number) or self._ticket(repo, ticket_number)
+        ticket = ticket_map.get(ticket_number) or self._ticket(repo, ticket_number)
         if ticket and _state(ticket) in ("merged", "shipped", "verified"):
             merged = self._merged_pull(repo, ticket_number)
             if merged is not None:
+                if "loom:regression" in _labels(ticket):
+                    old = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, merged)).data
+                    if not isinstance(old, dict) or not old.get("merged_at"):
+                        return
+                    events = self.gh.paginate("/repos/%s/issues/%d/events"
+                                              % (repo, ticket_number))
+                    if tickets.merged_before_regression_requeue(
+                            ticket, old.get("merged_at"), events):
+                        return
                 self._close_all_but(repo, prs, merged, closed)
         elif len(prs) > 1:
             newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
