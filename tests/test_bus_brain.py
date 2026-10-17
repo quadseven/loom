@@ -2774,7 +2774,7 @@ class GoalRepo:
         return reply(201, {})
 
     def _patch_issue(self, number, payload):
-        self.issues[number]["body"] = payload["body"]
+        self.issues[number].update(payload)
         return reply(200, self.issues[number])
 
     def _put_labels(self, number, payload):
@@ -3276,3 +3276,40 @@ class EpicFilingTests(unittest.TestCase):
         nxt = brain.intake_epic(gh, REPO, 1)
         self.assertNotEqual(nxt, first)
         self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+
+
+class CloseEpicTests(unittest.TestCase):
+    """loom#638: the brain closes a finished epic with a one-line note."""
+
+    def repo(self, *states):
+        fake = GoalRepo()
+        for i, state in enumerate(states):
+            fake.issues[80 + i] = item(80 + i, labels=["loom:ticket"], state=state)
+            fake.subs[EPIC].append(80 + i)
+        return fake
+
+    def test_a_finished_epic_closes_with_its_note(self):
+        fake = self.repo("closed", "closed")
+        brain.close_epic(GitHub("t", transport=fake), REPO, EPIC, "Done when holds: both shipped.")
+        self.assertEqual(fake.issues[EPIC]["state"], "closed")
+        self.assertEqual(fake.comments, [(EPIC, "Done when holds: both shipped.")])
+
+    def test_an_epic_with_an_open_ticket_or_no_note_is_refused(self):
+        for fake, note, why in ((self.repo("closed", "open"), "done", "still holds open tickets: #81"),
+                                (self.repo("closed"), " ", "one-line note"),
+                                (self.repo("closed"), "done", "is not an open epic")):
+            with self.subTest(why=why):
+                if why == "is not an open epic":
+                    fake.issues[EPIC]["labels"] = []
+                with self.assertRaisesRegex(ValueError, why):
+                    brain.close_epic(GitHub("t", transport=fake), REPO, EPIC, note)
+                self.assertEqual(fake.issues[EPIC]["state"], "open")
+                self.assertEqual(fake.comments, [])
+
+    def test_finished_epics_need_a_ticket_and_every_ticket_closed(self):
+        done = {"state": "closed"}
+        tree = [({"number": 1, "state": "open"}, [done, done]),
+                ({"number": 2, "state": "open"}, [done, {"state": "open"}]),
+                ({"number": 3, "state": "open"}, []),
+                ({"number": 4, "state": "closed"}, [done])]
+        self.assertEqual([e["number"] for e in brain.finished_epics(tree)], [1])

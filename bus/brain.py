@@ -1099,14 +1099,49 @@ def epic_cap_exception(goal_issue: Dict[str, Any], today: Optional[str] = None) 
     return int(match.group(1)) if today <= match.group(2) else None
 
 
+def goal_epic_cap(goal_issue: Dict[str, Any], today: Optional[str] = None) -> int:
+    """The goal's open epic cap: GOAL_EPIC_CAP, or the larger one-time
+    exception its home records while that holds."""
+    exception = epic_cap_exception(goal_issue, today)
+    return max(GOAL_EPIC_CAP, exception or 0)
+
+
+def finished_epics(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                   ) -> List[Dict[str, Any]]:
+    """The open epics of a goal_tree whose tickets are all closed (an epic
+    with no ticket yet is not finished): each is checked against its
+    done-when and closed, or gets the ticket it is missing."""
+    return [epic for epic, found in tree
+            if epic.get("state", "open") == "open" and found
+            and all(t.get("state") == "closed" for t in found)]
+
+
+def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
+    """Close a finished epic (its done-when holds) with a one-line note.
+    Refused for an issue that is not an open epic, or one with a ticket
+    still open: file or finish that ticket instead."""
+    note = " ".join(str(note or "").split())
+    if not note:
+        raise ValueError("a closed epic gets a one-line note saying how its done-when holds")
+    _check_written_text(note)
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    if issue.get("state") != "open" or not _epic_label(issue):
+        raise ValueError("#%d is not an open epic" % number)
+    found = _epic_tickets(gh, repo, number)
+    still = [t for t in found if t.get("state") != "closed"]
+    if still:
+        raise ValueError("epic #%d still holds open tickets: %s" % (
+            number, ", ".join("#%s" % t.get("number") for t in still[:5])))
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+    gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+            {"state": "closed", "state_reason": "completed"})
+
+
 def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
                      today: Optional[str] = None) -> None:
     _, tree = goal_tree(gh, repo, goal)
     count = sum(1 for e, _ in tree if e.get("state", "open") == "open")
-    cap = GOAL_EPIC_CAP
-    exception = epic_cap_exception(goal_issue, today)
-    if exception is not None and exception > cap:
-        cap = exception
+    cap = goal_epic_cap(goal_issue, today)
     if count >= cap:
         raise ValueError("goal #%d already has %d open epics (cap %d): finish one first, or "
                          "record a one-time exception on the goal home as "
@@ -3023,8 +3058,25 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     for repo, issue, found in goals:
         out += _goal_resume_lines(gh, repo, issue, found, latest)
     return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
+                      + _finished_epic_resume_lines(gh, [(r, i) for r, i, _ in goals])
                       + _verify_resume_lines(gh, repos, now)
                       + _audit_resume_lines(gh, repos, now, env))
+
+
+def _finished_epic_resume_lines(gh: GitHub, goals: Sequence[Tuple[str, Dict[str, Any]]]
+                                ) -> List[str]:
+    """Each goal's open epics whose tickets are all closed: the brain checks
+    the done-when and closes the epic, or files the ticket it is missing."""
+    out = ["", "## Finished epics (every ticket closed)"]
+    for repo, goal in goals:
+        _, tree = goal_tree(gh, repo, int(goal["number"]))
+        for epic in finished_epics(tree):
+            out.append("- resume close-epic %s#%s %s: check its done-when, then run "
+                       "python3 -m bus.brain close-epic %s#%s --note TEXT, or file the "
+                       "missing ticket under it" % (
+                           repo, epic["number"], _one_line(epic.get("title"), 120),
+                           repo, epic["number"]))
+    return out if len(out) > 2 else out + ["- none"]
 
 
 STUCK_STATES = ("failed", "briefed", "pr")
@@ -3373,6 +3425,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
+    ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
@@ -3426,6 +3479,11 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_epic(gh: GitHub, args: argparse.Namespace) -> None:
     made = file_epic(gh, _repo(args.repo), args.goal, args.title, _read(args.file))
     print(made.get("html_url", ""))
+
+
+def _cmd_close_epic(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.epic, "epic")
+    close_epic(gh, repo, number, args.note)
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:
@@ -3503,7 +3561,8 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "close": _cmd_close, "audit": _cmd_audit, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
-            "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic}
+            "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
+            "close-epic": _cmd_close_epic}
 COMMANDS["step"] = _cmd_step
 
 

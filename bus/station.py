@@ -4592,17 +4592,23 @@ class Station:
                         "idle": info.get("idle", 0) if self._num(info.get("idle")) else 0}
         return out
 
-    def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
-        """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
-        search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
-        a refused sub-issue link leaves the Part of line as the only one."""
-        total = int((goal.get("sub_issues_summary") or {}).get("total") or 0)
-        if total < invariants.SUB_ISSUES_MAX:
-            return 0
-        return len(brain.unassociated_tickets(self.gh, repo, int(goal["number"])))
+    def _goal_shape(self, repo: str, goal: Dict[str, Any]) -> invariants.GoalShape:
+        """The goal home's epics and the open tickets under none, from one
+        walk (brain.goal_tree)."""
+        number = int(goal["number"])
+        loose, tree = brain.goal_tree(self.gh, repo, number)
+        ref = lambda issue: self._invariant_ref(repo, int(issue["number"]))  # noqa: E731
+        outside = tuple(ref(i) for i in loose if i.get("state") == "open"
+                        and "loom:ticket" in _label_names(i))
+        epics = tuple(invariants.EpicShape(
+            ref(epic), epic.get("state", "open") == "open", len(found),
+            tuple(ref(t) for t in found if t.get("state") != "closed"))
+            for epic, found in tree)
+        return invariants.GoalShape(self._invariant_ref(repo, number),
+                                    brain.goal_epic_cap(goal), epics, outside)
 
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
-        """Goal homes with their unlinked tickets, and their journals and
+        """Goal homes with their epics and open tickets under none, and their journals and
         marker posts; a source that cannot be read stays None."""
         try:
             homes = self._goal_homes()
@@ -4610,8 +4616,7 @@ class Station:
             _say("invariants: could not read the goal homes: %s" % err)
             return
         try:
-            facts.goals = [(self._invariant_ref(repo, int(g["number"])), self._unassociated(repo, g))
-                           for repo, g in homes]
+            facts.shapes = [self._goal_shape(repo, g) for repo, g in homes]
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal tickets: %s" % err)
         try:
@@ -4917,12 +4922,14 @@ class Station:
                or (last is not None and self.now - last >= brain.REPORT_EVERY - STANDUP_LEAD))
         if not due:
             return
-        children = brain.goal_children(self.gh, repo, number)
+        loose, tree = brain.goal_tree(self.gh, repo, number)
+        children = brain._flatten(loose, tree)
         breaches = (self._open_breaches(repo, number)
                     if (repo, number) == self._invariant_goal() else None)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
                                           breaches,
-                                          gate_hold=self._gate_hold_for(repo, number))
+                                          gate_hold=self._gate_hold_for(repo, number),
+                                          finished=brain.finished_epics(tree))
         brain._check_written_text(body)
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                      {"body": body})
@@ -4952,7 +4959,8 @@ class Station:
 
     def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
                               breaches: Optional[List[Dict[str, Any]]] = None,
-                              gate_hold: Optional[Dict[str, Any]] = None) -> str:
+                              gate_hold: Optional[Dict[str, Any]] = None,
+                              finished: Optional[List[Dict[str, Any]]] = None) -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
         counts = [(len(groups[k]), word) for k, word in (
@@ -4977,7 +4985,10 @@ class Station:
             + ["",
             "### Still stuck", stuck, "",
             "### Next", "In flight: %s." % rows(groups["in_flight"]),
-            "Needs difficulty: %s." % rows(groups["needs_difficulty"]), "",
+            "Needs difficulty: %s." % rows(groups["needs_difficulty"])]
+            + (["Epics with every ticket closed (check the done-when, then close): %s."
+                % rows(finished)] if finished else [])
+            + ["",
             "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
             "Written by the station from ticket data, because no brain reported in time."])
 
