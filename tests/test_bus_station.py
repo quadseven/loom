@@ -4783,6 +4783,24 @@ class VerifyDispatchTest(Base):
         self.assertIn("- " + long_name, data)
         self.assertIn("4 lines failed the text checks and were dropped.", data)
 
+    def test_a_known_name_skips_the_token_test_only_on_its_own_line(self):
+        sha = "e" * 40
+        long_name = "test_a_merged_pr_delivers_the_ticket_while_a_duplicate_is_open"
+        # Too short to trip the long-token test alone; joined to the known
+        # name it forms one long run.
+        token = "Zq9XvB7mK2pL4nR8"
+        self.merged(77, sha)
+        self.fake.pulls[0]["title"] = "Add %s%s" % (long_name, token)
+        self.fake.check_runs[sha] = [{"name": long_name + token, "conclusion": "success"}]
+        self.fake.pull_files[77] = [{"filename": "tests/test_long.py",
+                                     "patch": "+    def %s(self):\n" % long_name}]
+        self.run_pass()
+        data = self.github_data()
+        self.assertNotIn(token, data)
+        self.assertNotIn("Pull request #77:", data)
+        self.assertIn("\n        - %s\n" % long_name, data)
+        self.assertIn("2 lines failed the text checks and were dropped.", data)
+
     def test_a_ticket_with_no_merged_pull_request_says_so_in_one_line(self):
         self.fake.pulls = [{"number": 70, "state": "closed", "merged_at": None,
                             "merge_commit_sha": "c" * 40, "body": "Refs %s#2\n" % REPO}]
