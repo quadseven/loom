@@ -304,6 +304,14 @@ standup names it under "Next", and `bus.brain resume` lists it as a
 `python3 -m bus.brain close-epic OWNER/NAME#N --note TEXT` (refused while a
 ticket under it is open), or files the ticket it is missing.
 
+Each goal also has a standing epic, "Epic: factory repairs for this goal",
+opened by the first repair that needs it: breach invariants (bus/invariants.py),
+revert, fix-forward and red-check tickets (bus/revert.py) file under it, in
+the repo's oldest goal home that is not a backlog (else its backlog home).
+It holds any number of tickets, does not count against the 6 open epics, and
+is never flagged as finished. The asks digest groups an ask that names an
+epic under that epic's goal.
+
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
 rewrites and health intake find"), opened by `bus.brain onboard` and again

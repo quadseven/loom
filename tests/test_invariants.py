@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import invariants, metrics, station  # noqa: E402
+from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
 from bus.invariants import Check, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
 
@@ -92,7 +92,14 @@ class FakeGH:
             return Response(201, {"number": number, "id": 9000 + number})
         if method == "GET" and path.startswith("/search/issues?"):
             return Response(200, {"items": self.search_items})
-        if method == "POST" and path.endswith("/sub_issues"):
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues", path)
+        if method == "POST" and m:
+            child = next((i for i in self.issues.values() if i.get("id") == body["sub_issue_id"]),
+                         None)
+            if child is not None:
+                self.subs.setdefault((m.group(1), int(m.group(2))), []).append(
+                    dict(child, labels=[x if isinstance(x, dict) else {"name": x}
+                                        for x in child.get("labels", [])]))
             return Response(201, {})
         m = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/(\d+)", path)
         if m and method == "GET":
@@ -343,6 +350,22 @@ class FilerTest(unittest.TestCase):
         return invariants.Breach("goal-full", "x/y#1", "Goal home #1 has 2 tickets not linked to it",
                                  tuple(evidence), at)
 
+    def test_a_breach_files_under_the_goals_repairs_epic(self):
+        self.gh.issues[GOAL] = {"number": GOAL, "id": 9000 + GOAL, "state": "open",
+                                "title": "Goal", "labels": [{"name": "loom:goal"}], "body": ""}
+        self.file(self.breach())
+        epics = [i for i in self.gh.issues.values() if i.get("title") == brain.REPAIRS_TITLE]
+        self.assertEqual(len(epics), 1)
+        epic = epics[0]["number"]
+        (filed,) = [i for i in self.gh.issues.values() if "loom:invariant" in i.get("labels", [])]
+        self.assertTrue(filed["body"].endswith("Part of #%d" % epic))
+        self.assertEqual([c["number"] for c in self.gh.subs[(REPO, epic)]], [filed["number"]])
+        self.assertIn(epic, [c["number"] for c in self.gh.subs[(REPO, GOAL)]])
+        # The next pass finds the same epic: none is opened twice.
+        self.file(invariants.Breach("goal-full", "x/y#2", "Another", ("line",), T0))
+        self.assertEqual(len([i for i in self.gh.issues.values()
+                              if i.get("title") == brain.REPAIRS_TITLE]), 1)
+
     def test_a_closed_issue_reopens_only_for_evidence_newer_than_the_close(self):
         self.file(self.breach())
         (number,) = self.gh.issues
@@ -532,3 +555,14 @@ class InvariantTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StandingEpicTest(unittest.TestCase):
+    def test_the_repairs_epic_is_exempt_from_both_caps(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epics = tuple(invariants.EpicShape(Ref("%s#%d" % (REPO, n), "#%d" % n), True, 1, ())
+                      for n in range(40, 46))
+        repairs = invariants.EpicShape(Ref("%s#50" % REPO, "#50"), True, 40, (), True)
+        f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, epics + (repairs,), ())])
+        self.assertEqual(invariants.epic_over_cap(f), [])
+        self.assertEqual(invariants.goal_epics_over_cap(f), [])

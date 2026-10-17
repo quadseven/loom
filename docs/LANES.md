@@ -567,8 +567,10 @@ returning breaches with evidence:
 - An open lane pull request whose plan check failed more than 30 minutes ago.
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 
-Each breach files one issue labelled `loom:triage` and `loom:invariant` on
-the invariant goal home (`LOOM_INVARIANT_GOAL`; empty means
+Each breach files one issue labelled `loom:triage` and `loom:invariant` under
+the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
+itself when that epic cannot be read) of the invariant goal home
+(`LOOM_INVARIANT_GOAL`; empty means
 `LOOM_METRICS_GOAL` when it is in the self repo, else the self repo's one
 goal home that is not a backlog), as a sub-issue and with a `Part of #N`
 line, carrying the evidence. A hidden marker holds a hash of the invariant
