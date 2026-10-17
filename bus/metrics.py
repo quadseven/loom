@@ -63,7 +63,28 @@ def summarize_waits(tickets: Sequence[tuple[str, Dict[str, float]]]) -> tuple[Li
     return rows, bottleneck
 
 
-def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float) -> tuple[List[Dict[str, Any]], str | None]:
+def entered_state(events: Sequence[Dict[str, Any]]) -> tuple[str, float] | None:
+    """The ticket's current lifecycle state and when its label was added, by
+    the same reading as ticket_waits, or None when no state label is on."""
+    current: tuple[str, float] | None = None
+    for event in sorted(events, key=lambda item: stamp(item.get("created_at"))):
+        label = (event.get("label") or {}).get("name")
+        state = label[5:] if isinstance(label, str) and label.startswith("loom:") else None
+        if state not in WAIT_STATES:
+            continue
+        if event.get("event") == "labeled":
+            current = (state, stamp(event.get("created_at")))
+        elif event.get("event") == "unlabeled" and current and current[0] == state:
+            current = None
+    return current
+
+
+def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float,
+                    entered: Dict[str, tuple[str, float]] | None = None) -> tuple[List[Dict[str, Any]], str | None]:
+    """Median and worst hours per state over the last week. With `entered`,
+    also fills it with each read ticket's current state and the time it
+    entered it ({"owner/name#N": (state, epoch seconds)}), from the same
+    events: the Tickets page shows that as the age in state."""
     tickets: List[tuple[str, Dict[str, float]]] = []
     since = datetime.fromtimestamp(now - WAIT_WINDOW, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     for repo in repos:
@@ -76,6 +97,10 @@ def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float) -> tuple[List[
             number = int(issue["number"])
             events = gh.paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
             tickets.append(("%s#%d" % (repo, number), ticket_waits(events, now)))
+            if entered is not None:
+                found = entered_state(events)
+                if found:
+                    entered["%s#%d" % (repo, number)] = found
     return summarize_waits(tickets)
 
 
