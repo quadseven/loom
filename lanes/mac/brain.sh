@@ -127,10 +127,18 @@ ladder_open() {
   return 1
 }
 
+# The settings the brain's commands read (bus.brain, bus journal), passed
+# to a sandboxed rung by name. An allowlist: nothing else of this
+# environment, a key or an SSM parameter name included, reaches the agent.
+BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_REPO_OWNERS LOOM_HOME
+  LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
+  LOOM_UNVERIFIED_LIMIT LOOM_MERGE_SETTLE_SECONDS)
+
 # The spark rung runs as the spark lane does: opencode inside the shared
-# sandbox, with an emptied environment and a scratch home. The brain needs
-# GitHub, so the sandboxed agent gets this machine's GitHub token and the
-# LOOM_* settings in its environment, never in argv.
+# sandbox, with an emptied environment and a scratch home. Its tree is the
+# brain's checkout, so the sandbox keeps that checkout's .git read-only. The
+# brain needs GitHub, so the agent gets this machine's GitHub token and the
+# settings above in its environment, never in argv.
 spark_brain() {
   local token kv
   token="${LOOM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
@@ -141,12 +149,15 @@ spark_brain() {
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
   LANE=spark SKILLS="" API_KEY="" SPARK_URL="$LOOM_SPARK_URL"
   NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
-  AGENT_EXTRA_ENV="GH_TOKEN=$token"$'\n'"GITHUB_TOKEN=$token"
-  while IFS= read -r kv; do
+  # The sandbox denies the keychain server, which TLS verification asks for
+  # the system roots; a CA file lets HTTPS clients verify without it.
+  AGENT_EXTRA_ENV="GH_TOKEN=$token"$'\n'"GITHUB_TOKEN=$token"$'\n'"LOOM_GITHUB_TOKEN=$token"$'\n'"SSL_CERT_FILE=/etc/ssl/cert.pem"
+  for kv in "${BRAIN_SETTINGS[@]}"; do
+    [ -n "${!kv:-}" ] || continue
     case "${!kv}" in *$'\n'*) continue ;; esac
     AGENT_EXTRA_ENV="$AGENT_EXTRA_ENV"$'\n'"$kv=${!kv}"
-  done < <(compgen -e | grep '^LOOM_' | grep -v '^LOOM_GITHUB_TOKEN$')
-  opencode_run - "${LOOM_SPARK_OPENCODE:-opencode}" "$1"
+  done
+  (cd "$WORK/loom" && opencode_run - "${LOOM_SPARK_OPENCODE:-opencode}" "$1")
 }
 
 run_rung() {
@@ -187,8 +198,14 @@ bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
 brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record lock step"
 
+# A rung may have changed the checkout (a hook, a config, an edited
+# docs/MUSE.md the next tick would follow). Each tick starts from origin's
+# head: fetched and reset with hooks and fsmonitor off, untracked files
+# removed, so nothing a run left there runs or steers the next tick.
+wgit() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$WORK/loom" "$@"; }
 if [ -d "$WORK/loom/.git" ]; then
-  git -C "$WORK/loom" pull -q --ff-only >> "$LOG" 2>&1 || { say "could not update $WORK/loom"; beat failed 1; exit 1; }
+  { wgit fetch -q && wgit reset -q --hard '@{u}' && wgit clean -qfdx; } >> "$LOG" 2>&1 ||
+    { say "could not update $WORK/loom"; beat failed 1; exit 1; }
 else
   git clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; beat failed 1; exit 1; }
 fi

@@ -49,6 +49,8 @@ FAKE_LOG=@LOG@
 printf 'opencode %s\\n' "$*" >> "$FAKE_LOG"
 printf 'opencode env GH_TOKEN=%s GITHUB_TOKEN=%s LOOM_REPOS=%s HOME=%s\\n' \\
   "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" "${LOOM_REPOS:-}" "$HOME" >> "$FAKE_LOG"
+printf 'opencode cwd %s\\n' "$PWD" >> "$FAKE_LOG"
+env | grep -E '^(LOOM_|SSL_CERT_FILE=)' | sed 's/^/opencode setting /' >> "$FAKE_LOG"
 exit "${FAKE_OPENCODE_EXIT:-0}"
 """
 
@@ -58,8 +60,10 @@ printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 exit 0
 """
 
-# Fake sandbox-exec: drops "-p PROFILE" and runs the command unsandboxed.
+# Fake sandbox-exec: saves the profile, drops "-p PROFILE" and runs the
+# command unsandboxed.
 FAKE_SANDBOX = """#!/usr/bin/env bash
+printf '%s\\n' "$2" > @PROFILE@
 shift 2
 exec "$@"
 """
@@ -94,7 +98,9 @@ class BrainTickTest(unittest.TestCase):
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         self.log = self.tmp / "calls.log"
-        fakes = [("python3", FAKE_PYTHON), ("gh", FAKE_GH), ("sandbox-exec", FAKE_SANDBOX),
+        self.profile = self.tmp / "profile.sb"
+        fakes = [("python3", FAKE_PYTHON), ("gh", FAKE_GH),
+                 ("sandbox-exec", FAKE_SANDBOX.replace("@PROFILE@", shlex.quote(str(self.profile)))),
                  ("opencode", FAKE_OPENCODE.replace("@LOG@", shlex.quote(str(self.log))))]
         fakes += [(n, FAKE_AGENT % {"name": n, "var": n.upper()}) for n in AGENTS]
         for name, body in fakes:
@@ -388,6 +394,62 @@ class BrainTickTest(unittest.TestCase):
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         last, _ = self.beat()
         self.assertEqual(("ok", "spark", "spark/coder"), (last["outcome"], last["lane"], last["model"]))
+
+    def spark_tick(self, **env):
+        self.usage("claude", False, "limit: provider limit reached")
+        self.usage("spark", True)
+        return self.tick(LOOM_SPARK_MODEL="spark/coder",
+                         LOOM_SPARK_URL="http://spark.invalid:8000/v1", **env)
+
+    def test_the_spark_rung_gets_only_the_allowlisted_settings(self):
+        # Found by the automated security review: a denylist forwarded every
+        # other LOOM_* variable, keys and SSM names included.
+        _, calls = self.spark_tick(LOOM_FOO_TOKEN="foo-secret-value",
+                                   LOOM_OPENCODE_GO_KEY_SSM="/example/key",
+                                   LOOM_BRIEF_AUTHORS="example-author")
+        settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
+        self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
+        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
+        # TLS inside the sandbox, which denies the keychain server.
+        self.assertIn("opencode setting SSL_CERT_FILE=/etc/ssl/cert.pem", settings)
+        self.assertFalse(any("foo-secret-value" in c or "LOOM_FOO_TOKEN" in c for c in calls))
+        self.assertFalse(any("LOOM_OPENCODE_GO_KEY_SSM" in c for c in settings))
+        self.assertFalse(any("LOOM_SPARK_URL" in c for c in settings))
+
+    def test_the_spark_sandbox_keeps_the_checkout_git_dir_read_only(self):
+        # Found by the automated security review: with the tree at the brain
+        # folder, the checkout's .git (one level down) was writable.
+        _, calls = self.spark_tick()
+        checkout = os.path.realpath(self.home / "brain" / "loom")
+        cwd = [os.path.realpath(c[len("opencode cwd "):]) for c in calls
+               if c.startswith("opencode cwd ")]
+        self.assertEqual([checkout], cwd)
+        profile = self.profile.read_text()
+        self.assertIn('(deny file-write* (subpath "%s/.git"))' % checkout, profile)
+
+    def test_the_refresh_runs_no_hook_and_drops_what_a_run_left(self):
+        self.tick()
+        checkout = self.home / "brain" / "loom"
+        marker = self.tmp / "hook-ran"
+        hooks = self.tmp / "planted-hooks"
+        hooks.mkdir()
+        for name in ("post-merge", "post-checkout", "reference-transaction", "fsmonitor"):
+            (hooks / name).write_text("#!/bin/sh\ntouch %s\n" % shlex.quote(str(marker)))
+            (hooks / name).chmod(0o755)
+        git("config", "core.hooksPath", str(hooks), cwd=checkout)
+        git("config", "core.fsmonitor", str(hooks / "fsmonitor"), cwd=checkout)
+        (checkout / "docs" / "MUSE.md").write_text("# planted instructions\n")
+        (checkout / "planted.txt").write_text("left by a run\n")
+        (self.root / "docs" / "MUSE.md").write_text("# Muse tick instructions\nnew\n")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qam", "change", cwd=self.root)
+        git("push", "-q", "origin", "main", cwd=self.root)
+        run, _ = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(marker.exists())
+        self.assertEqual("# Muse tick instructions\nnew\n", (checkout / "docs" / "MUSE.md").read_text())
+        self.assertFalse((checkout / "planted.txt").exists())
 
     def test_settings_override_model_holder_and_minutes(self):
         _, calls = self.tick(LOOM_BRAIN_MODEL="claude-sonnet-5-5",

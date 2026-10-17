@@ -110,7 +110,7 @@ same CLI invocation `lanes/run_lane.sh` uses, from the shared
 |---|---|---|
 | `claude` | `LOOM_BRAIN_MODEL` (default the current Opus) | `claude -p`, every permission prompt skipped |
 | `codex` | `LOOM_CODEX_MODEL` | `codex exec` with full access (a lane's run has no network; the brain needs GitHub) |
-| `spark` | `LOOM_SPARK_MODEL` at `LOOM_SPARK_URL` | opencode in the lane sandbox (`lanes/agent_sandbox.sh`), given this machine's GitHub token and the `LOOM_*` settings in its environment |
+| `spark` | `LOOM_SPARK_MODEL` at `LOOM_SPARK_URL` | opencode in the lane sandbox (`lanes/agent_sandbox.sh`) with the checkout as its tree, so its `.git` stays read-only; given this machine's GitHub token, a CA file for TLS and an allowlist of non-secret `LOOM_*` settings in its environment |
 
 A run that fails with a limit, as `run_lane.sh` classes a lane's failure
 from the last lines of output, hands the same tick to the next rung with
@@ -119,6 +119,9 @@ no model set, or a name with no runner, is passed over. agy has no rung:
 its CLI runs only as the agy lane user, which cannot read the brain's
 checkout or GitHub sign-in, and run as the operator it would read the login
 keychain. The `tick start` line in `brain.log` names the lane and model.
+Each tick resets the checkout to origin's head with hooks and fsmonitor
+off and removes untracked files, so nothing a run left there runs or steers
+the next tick.
 
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the lane
 and model that ran) and touches
