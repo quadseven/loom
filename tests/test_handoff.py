@@ -438,6 +438,12 @@ class HandoffPacketTests(unittest.TestCase):
         failed = next(line for line in text.splitlines() if line.startswith("- failed %s#9" % REPO))
         self.assertNotIn("Open work for any brain", failed)
 
+    def test_a_defer_whose_brain_never_ticked_is_open_work_for_any_brain(self):
+        text = packet([goal(journal(10, "muse", defer(PR, "pr-abc", holder="ghost")))])
+        self.assertIn("## Open defers (1, 1 from brains no longer ticking)", text)
+        self.assertIn("deferred by ghost at %s. Open work for any brain: ghost last "
+                      "ticked never, over 2 hours ago." % at(10), text)
+
     def test_a_done_marker_for_the_item_drops_the_standing_defer(self):
         before = goal(journal(180, "muse", defer(PR, "pr-abc")))
         self.assertIn("- merge %s#7, deferred by muse" % REPO, packet([before]))

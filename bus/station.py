@@ -5172,7 +5172,10 @@ class Station:
 
     def _shown(self, repo: str, home: str) -> bool:
         """Whether the packet on `home` may name the repo and quote its text:
-        its own repo, or a public one."""
+        its own repo, or a public one. A name that is not OWNER/NAME is never
+        shown, and is never asked about."""
+        if not isinstance(repo, str) or not tickets.REPO_RE.fullmatch(repo):
+            return False
         if repo == home:
             return True
         if repo not in self._publics:
@@ -5236,25 +5239,57 @@ class Station:
         if (isinstance(old, dict) and old.get("stamp") == stamp and stamp[0]
                 and isinstance(old.get("journals"), list)):
             return old
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        comments = [c for c in self.gh.paginate(
+            "/repos/%s/issues/%d/comments?per_page=100" % (repo, number)) if isinstance(c, dict)]
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("created_at"),
-              "login": (c.get("user") or {}).get("login")}
-             for c in comments if isinstance(c, dict)], self.s.authors)
-        allowed = {a.lower() for a in self.s.authors}
-        packets = [c for c in comments if isinstance(c, dict)
-                   and tickets._login(c.get("user")).lower() in allowed
-                   and str(c.get("body") or "").startswith(handoff.HANDOFF_MARKER)]
-        packet = ({"id": int(packets[0]["id"]), "body": str(packets[0].get("body") or "")}
-                  if packets else None)
+              "login": (c.get("user") or {}).get("login")} for c in comments], self.s.authors)
         return {"stamp": stamp, "journals": [handoff.compact(j) for j in found],
-                "packet": packet}
+                "packet": self._packet_comment(comments)}
+
+    def _packet_comment(self, comments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """{"id", "body"} of the first packet comment an allowed login posted
+        among `comments`, or None."""
+        allowed = {a.lower() for a in self.s.authors}
+        for c in comments:
+            body = str(c.get("body") or "")
+            if tickets._login(c.get("user")).lower() in allowed and body.startswith(
+                    handoff.HANDOFF_MARKER):
+                return {"id": int(c["id"]), "body": body}
+        return None
 
     def _brain_ended(self) -> Any:
         """The "at" of the lane machine's last brain tick (state/brain.json),
         or None: a new value means a tick just ended."""
         last = _read_json(os.path.join(self.s.home, "state", "brain.json"), None, strict=False)
         return last.get("at") if isinstance(last, dict) else None
+
+    def _handoff_due(self, saved: Dict[str, Any], ended: Any, authors: List[str]) -> bool:
+        """Whether the packet is due a rebuild: HANDOFF_EVERY seconds since the
+        last build, a brain tick that just ended, or new allowed logins."""
+        built = saved.get("built")
+        return not (self._num(built) and 0 <= self.now - built < HANDOFF_EVERY
+                    and saved.get("brain_at") == ended and saved.get("authors") == authors)
+
+    def _write_handoff(self, home: Tuple[str, int], entry: Dict[str, Any], body: str) -> None:
+        """Edit the kept packet comment to `body`, or post one when none is
+        kept or the kept one was deleted, and keep its id and text in
+        `entry`. Nothing is written when the text is the same."""
+        packet = entry.get("packet") if isinstance(entry.get("packet"), dict) else None
+        if packet is not None and packet.get("body") == body:
+            return
+        made = None
+        if packet is not None:
+            made = self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (home[0], int(packet["id"])),
+                                {"body": body}, ok=(404,))
+        if made is None or made.status == 404:
+            made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % home, {"body": body})
+            data = made.data if isinstance(made.data, dict) else {}
+            packet = {"id": int(data["id"])} if "id" in data else None
+        if packet is not None:
+            packet["body"] = body
+        entry["packet"] = packet
+        _say("handoff packet updated on %s#%d" % home)
 
     def publish_handoff(self) -> None:
         """Keep the handoff packet (handoff.packet) in one comment on the Loom
@@ -5267,45 +5302,26 @@ class Station:
         saved = saved if isinstance(saved, dict) else {}
         ended = self._brain_ended()
         authors = sorted({a.lower() for a in self.s.authors})
-        built = saved.get("built")
-        if (self._num(built) and 0 <= self.now - built < HANDOFF_EVERY
-                and saved.get("brain_at") == ended and saved.get("authors") == authors):
+        if not self._handoff_due(saved, ended, authors):
             return
         home = self._handoff_home()
         if home is None:
             return
-        repo, number = home
+        repo = home[0]
         homes = saved.get("homes") if isinstance(saved.get("homes"), dict) else {}
         if saved.get("authors") != authors:
             # The allowed logins changed: nothing kept under the old list
             # (journals or the packet comment) is trusted.
             homes = {}
         goals, unread, kept = self._handoff_goals(repo, homes)
-        record = brain.tick_step(self.gh, repo)
-        body = handoff.packet(goals, record, self._handoff_rules(repo),
+        body = handoff.packet(goals, brain.tick_step(self.gh, repo), self._handoff_rules(repo),
                               datetime.fromtimestamp(self.now, timezone.utc),
                               lambda r: self._shown(r, repo), unread)
         _text.check(body)
         key = "%s#%d" % home
-        entry = kept.get(key)
-        if entry is None:
-            entry = kept[key] = self._handoff_home_journals(
-                repo, {"number": number}, {})
-        packet = entry.get("packet") if isinstance(entry.get("packet"), dict) else None
-        if packet is None or packet.get("body") != body:
-            made = None
-            if packet is not None:
-                made = self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(packet["id"])),
-                                    {"body": body}, ok=(404,))
-            if made is None or made.status == 404:
-                # None kept, or the kept one was deleted: post a new one.
-                made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % home, {"body": body})
-                data = made.data if isinstance(made.data, dict) else {}
-                packet = {"id": int(data["id"])} if "id" in data else None
-            if packet is not None:
-                packet["body"] = body
-            entry["packet"] = packet
-            _say("handoff packet updated on %s#%d" % home)
+        if key not in kept:
+            kept[key] = self._handoff_home_journals(repo, {"number": home[1]}, {})
+        self._write_handoff(home, kept[key], body)
         _write_json(path, {"built": self.now, "brain_at": ended, "authors": authors,
                            "homes": kept})
 

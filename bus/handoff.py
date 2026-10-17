@@ -306,45 +306,64 @@ def _ref(repo: str, number: int, shown: bool) -> str:
     return "%s#%d" % (repo, number) if shown else "issue %d of a private repo" % number
 
 
+def _tick_line(goal: Goal, comment: Dict[str, Any]) -> Tuple[str, str, str]:
+    """(holder, time, packet line) for one journal."""
+    body, at = str(comment.get("body") or ""), str(comment.get("at") or "")
+    holder = journal_holder(comment) or "unnamed"
+    found = marks([comment])
+    left = ["%s %s" % (m.stage, _ref(m.item[0], m.item[1], goal.shown))
+            for m in found if m.kind == "defer"]
+    decided = decided_line(body) if goal.shown else ""
+    line = "- %s %s, model %s, on %s: %d done, %d deferred. Decided: %s. Left open: %s." % (
+        at, holder, journal_model(body) or "unknown", _ref(goal.repo, goal.number, goal.shown),
+        sum(1 for m in found if m.kind == "done"), len(left),
+        decided.rstrip(".") or "(private goal home, not quoted)", ", ".join(left) or "none")
+    return holder, at, line
+
+
+def _record_line(record: Dict[str, Any]) -> str:
+    """The packet line for a tick that holds the lock with no journal since
+    it started: in progress, or it ended without one. The step record is the
+    lock commit in the packet's own repo, so its last note is quoted."""
+    notes = record.get("notes") or []
+    newest = notes[-1] if notes else None
+    note = newest.get("text") if isinstance(newest, dict) else ""
+    text = "- %s %s, no journal yet: at step %s (%s/%d)" % (
+        record.get("started_at"), record.get("holder"), record.get("step") or "none",
+        record.get("step_index") or 0, len(record.get("steps") or ()))
+    if note:
+        text += ". Last note: %s" % quote(str(note))
+    return text + "."
+
+
 def _last_ticks(goals: Sequence[Goal], record: Optional[Dict[str, Any]]
                 ) -> Tuple[Dict[str, str], List[Tuple[str, str]]]:
-    """(each holder's newest tick time, the tick lines newest first). The
-    step record is the lock commit in the packet's own repo, so its last note
-    is quoted."""
+    """(each holder's newest tick time, the tick lines newest first)."""
     last: Dict[str, str] = {}
     lines: List[Tuple[str, str]] = []
     for goal in goals:
-        where = _ref(goal.repo, goal.number, goal.shown)
         for comment in goal.journals:
-            body, at = str(comment.get("body") or ""), str(comment.get("at") or "")
-            holder = journal_holder(comment) or "unnamed"
+            holder, at, line = _tick_line(goal, comment)
             last[holder] = max(last.get(holder, ""), at)
-            found = marks([comment])
-            left = ["%s %s" % (m.stage, _ref(m.item[0], m.item[1], goal.shown))
-                    for m in found if m.kind == "defer"]
-            decided = decided_line(body) if goal.shown else ""
-            lines.append((at, "- %s %s, model %s, on %s: %d done, %d deferred. Decided: %s. "
-                          "Left open: %s." % (
-                              at, holder, journal_model(body) or "unknown", where,
-                              sum(1 for m in found if m.kind == "done"), len(left),
-                              decided.rstrip(".") or "(private goal home, not quoted)",
-                              ", ".join(left) or "none")))
-    holder = str((record or {}).get("holder") or "")
-    started = str((record or {}).get("started_at") or "")
+            lines.append((at, line))
+    record = record or {}
+    holder, started = str(record.get("holder") or ""), str(record.get("started_at") or "")
     if holder and started and last.get(holder, "") < started:
-        # A tick holds the lock with no journal since it started: in progress,
-        # or it ended without one.
         last[holder] = started
-        notes = (record or {}).get("notes") or []
-        note = notes[-1].get("text") if notes and isinstance(notes[-1], dict) else ""
-        text = "- %s %s, no journal yet: at step %s (%s/%d)" % (
-            started, holder, record.get("step") or "none", record.get("step_index") or 0,
-            len(record.get("steps") or ()))
-        if note:
-            text += ". Last note: %s" % quote(str(note))
-        lines.append((started, text + "."))
+        lines.append((started, _record_line(record)))
     lines.sort(key=lambda pair: pair[0], reverse=True)
     return last, lines
+
+
+def _quiet_since(holder: str, last: Dict[str, str], now: datetime) -> bool:
+    """Whether a brain has not ticked within QUIET. A brain with no tick at
+    all counts as quiet; an unreadable time counts as fresh, as in
+    peer_journals."""
+    at = last.get(holder)
+    if not at:
+        return True
+    when = _parse(at)
+    return when is not None and when < now - QUIET
 
 
 def _open_defers(goals: Sequence[Goal]) -> List[Tuple[Mark, bool]]:
@@ -361,6 +380,31 @@ def _open_defers(goals: Sequence[Goal]) -> List[Tuple[Mark, bool]]:
                   key=lambda pair: pair[0].at)
 
 
+def _defer_lines(standing: Sequence[Tuple[Mark, bool]], last: Dict[str, str],
+                 now: datetime, public: Callable[[str], bool]) -> List[str]:
+    """The open defers section."""
+    stale = [pair for pair in standing if _quiet_since(pair[0].holder, last, now)]
+    out = ["## Open defers (%d, %d from brains no longer ticking)" % (len(standing), len(stale))]
+    for mark, shown in standing[:PACKET_DEFERS]:
+        named = bool(public(mark.item[0]))
+        line = "- %s %s, deferred by %s at %s" % (
+            mark.stage, _ref(mark.item[0], mark.item[1], named), mark.holder, mark.at)
+        if mark.note and shown and named:
+            line += ": %s" % quote(mark.note)
+        if (mark, shown) in stale:
+            seen = last.get(mark.holder)
+            line += ". Open work for any brain: %s last ticked %s, over %g hours ago" % (
+                mark.holder, ("at " + seen) if seen else "never", QUIET.total_seconds() / 3600)
+        out.append(line + ".")
+    if len(standing) > PACKET_DEFERS:
+        out.append("- and %d more; `resume` lists them all." % (len(standing) - PACKET_DEFERS))
+    if not standing:
+        out.append("- none")
+    out.append("`resume` still drops a defer whose item changed or closed since; "
+               "act on what it lists.")
+    return out
+
+
 def packet(goals: Sequence[Goal], record: Optional[Dict[str, Any]],
            rules: Tuple[str, List[str]], now: datetime, public: Callable[[str], bool],
            unread: int = 0) -> str:
@@ -375,28 +419,7 @@ def packet(goals: Sequence[Goal], record: Optional[Dict[str, Any]],
            "and done markers on the goal homes, and the tick step record.", "",
            "## Last %d ticks" % PACKET_TICKS]
     out += [line for _, line in ticks[:PACKET_TICKS]] or ["- none"]
-    standing = _open_defers(goals)
-    stale = [(m, s) for m, s in standing
-             if not last.get(m.holder) or (_parse(last[m.holder]) or now) < now - QUIET]
-    out += ["", "## Open defers (%d, %d from brains no longer ticking)" % (
-        len(standing), len(stale))]
-    for mark, shown in standing[:PACKET_DEFERS]:
-        named = bool(public(mark.item[0]))
-        line = "- %s %s, deferred by %s at %s" % (
-            mark.stage, _ref(mark.item[0], mark.item[1], named), mark.holder, mark.at)
-        if mark.note and shown and named:
-            line += ": %s" % quote(mark.note)
-        if (mark, shown) in stale:
-            line += (". Open work for any brain: %s last ticked %s, over %g hours ago" % (
-                mark.holder, ("at " + last[mark.holder]) if last.get(mark.holder) else "never",
-                QUIET.total_seconds() / 3600))
-        out.append(line + ".")
-    if len(standing) > PACKET_DEFERS:
-        out.append("- and %d more; `resume` lists them all." % (len(standing) - PACKET_DEFERS))
-    if not standing:
-        out.append("- none")
-    out.append("`resume` still drops a defer whose item changed or closed since; "
-               "act on what it lists.")
+    out += [""] + _defer_lines(_open_defers(goals), last, now, public)
     commit, lines = rules
     out += ["", "## Rules (docs/MUSE.md at %s)" % (commit or "an unknown commit")]
     out += lines or ["- not read this pass; read docs/MUSE.md, Rules."]

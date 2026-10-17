@@ -1162,6 +1162,7 @@ class HandoffFake:
         self.comments = []
         self.writes = []
         self.comment_reads = 0
+        self.rules_refs = []
         self.muse = base64.b64encode(b"# Muse\n\n## Rules\n\n- Write ASCII only.\n").decode()
 
     def touch(self, at):
@@ -1178,7 +1179,8 @@ class HandoffFake:
     def rest(self, method, path, data=None, ok=()):
         if method == "GET" and path.endswith("/git/ref/heads/loom-lock/brain"):
             return mock.Mock(status=404, data=None)
-        if method == "GET" and path == "/repos/%s/contents/docs/MUSE.md?ref=%s" % (REPO, "c" * 40):
+        if method == "GET" and path.startswith("/repos/%s/contents/docs/MUSE.md?ref=" % REPO):
+            self.rules_refs.append(path.rsplit("=", 1)[1])
             return mock.Mock(status=200, data={"content": self.muse})
         if method == "POST" and path == "/repos/%s/issues/30/comments" % REPO:
             self.writes.append((method, path))
@@ -1303,6 +1305,26 @@ class HandoffPacketTest(unittest.TestCase):
                                "at": "2030-01-01T11:00:00Z", "login": "stranger"}]}
         goals, _, _ = st._handoff_goals(REPO, {"%s#30" % REPO: entry})
         self.assertEqual([], goals[0].journals)
+
+    def test_a_name_that_is_not_owner_slash_name_is_never_shown_or_asked_about(self):
+        st = station.Station(self.gh, self.settings, now=self.now, head=lambda: "c" * 40)
+        for name in ("not-a-repo", "a/b/c", "", "owner/name with space", None):
+            with self.subTest(name=name):
+                # The fake refuses any other read, so a public check would raise.
+                self.assertFalse(st._shown(name, REPO))
+        self.assertTrue(st._shown(REPO, REPO))
+
+    def test_the_station_default_reads_the_rules_at_the_checkout_head(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            self.skipTest("not a git checkout")
+        st = station.Station(self.gh, self.settings, now=self.now)
+        self.assertIs(station._checkout_head, st.head)
+        st.publish_handoff()
+        self.assertEqual([head], self.gh.rules_refs)
+        self.assertIn("## Rules (docs/MUSE.md at %s)" % head, self.packets()[0]["body"])
 
     def test_a_marked_comment_from_a_stranger_is_not_the_packet(self):
         self.gh.comments.append({"id": 5, "user": {"login": "stranger"},
