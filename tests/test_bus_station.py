@@ -3422,6 +3422,23 @@ class ReportsTest(Base):
         self.assertNotIn("Merged long ago", body)
         self.assertEqual(body.splitlines()[1], "Nothing moved since the last report.")
 
+    def test_station_standup_still_stuck_names_a_goal_the_gate_is_holding(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        hold = {"repo": REPO, "goal": 30, "since": time.time() - 3700,
+                "count": 27, "limit": 15, "tickets": {"1": "Fix the gate",
+                                                     "2": "File the invariant"},
+                "idle": 4}
+        body = st._overdue_standup_body([], None, None, gate_hold=hold)
+        stuck = body.split("### Still stuck")[1].split("### Next")[0]
+        self.assertIn("goal #30", stuck)
+        self.assertIn("27", stuck)
+        self.assertIn("15", stuck)
+        self.assertIn("4", stuck)
+        plain = st._overdue_standup_body([], None, None)
+        self.assertNotIn("unproven-work gate", plain)
+        brain._check_written_text(body)
+
     def test_station_standup_says_nothing_in_flight_without_tickets(self):
         self.add_goal()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(

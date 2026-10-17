@@ -864,6 +864,10 @@ class Station:
         # last reported low for.
         self._budget: Optional[Dict[str, Any]] = None
         self._told_low = False
+        # This pass's unproven-work gate refusals, per goal (loom#564):
+        # goal key -> the count and limit the gate hit, the briefed tickets
+        # it holds, and the lanes it left idle.
+        self._gate_holds: Dict[str, Dict[str, Any]] = {}
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -1105,6 +1109,11 @@ class Station:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
                  % (repo, number, fix_comment_id if fix_comment_id is not None else "with unknown id"))
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
+        # A claim for the goal succeeded, so the unproven-work gate no longer
+        # holds it and its refusal tracking clears (loom#564).
+        goal = _ticket_goal(issue)
+        if goal is not None:
+            self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
 
     def _contents_text(self, repo: str, path: str) -> Optional[str]:
@@ -1336,11 +1345,20 @@ class Station:
     def claim_new(self) -> None:
         free = [lane for lane in LANES if lane not in REMOTE_LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
+        # This pass's unproven-work gate refusals (loom#564).
+        self._gate_holds = {}
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
             return
-        by_lane = self._apply_unproven_gate(self._claim_candidates(free))
+        cands = self._claim_candidates(free)
+        before = {lane: len(cands[lane]) for lane in free}
+        by_lane = self._apply_unproven_gate(cands)
+        # The lanes that had briefed tickets and the gate left with nothing:
+        # they sit idle while the gate holds the work (loom#564).
+        idle = [lane for lane in free if before[lane] and not by_lane[lane]]
+        for hold in self._gate_holds.values():
+            hold["idle"] = len(idle)
         for lane in free:
             self._claim_for_lane(lane, by_lane[lane], free)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
@@ -1372,7 +1390,9 @@ class Station:
                              ) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
         """Drop the build tickets the unproven-work limit blocks, counting each
         (repo, goal) once per pass. A lane left with nothing is handed to
-        _hand_verifies, so free slots run verify runs instead."""
+        _hand_verifies, so free slots run verify runs instead. The refusals
+        are recorded per goal: a goal refused for an hour gets its own
+        invariant (loom#564)."""
         limit = brain.unverified_limit()
         counts: Dict[Tuple[str, int], int] = {}
         gated = {lane: [] for lane in by_lane}
@@ -1382,9 +1402,25 @@ class Station:
                 if reason is None:
                     gated[lane].append((repo, issue))
                 else:
+                    self._record_gate_hold(repo, issue, limit, counts)
                     _say("not claiming %s#%s for lane %s: %s"
                          % (repo, issue.get("number"), lane, reason))
         return gated
+
+    def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
+                         counts: Dict[Tuple[str, int], int]) -> None:
+        """Remember the unproven-work gate's refusal of one briefed ticket,
+        per goal, so an hour of refusals becomes an invariant (loom#564)."""
+        goal = _ticket_goal(issue)
+        if goal is None:
+            return
+        key = "%s#%d" % (repo, goal)
+        hold = self._gate_holds.setdefault(
+            key, {"repo": repo, "goal": goal, "count": counts[(repo, goal)],
+                  "limit": limit, "tickets": {}, "idle": 0})
+        hold["count"] = counts[(repo, goal)]
+        hold["limit"] = limit
+        hold["tickets"][int(issue["number"])] = str(issue.get("title") or "")
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:
@@ -3814,6 +3850,28 @@ class Station:
         held = {k: v for k, v in held.items() if self._num(v)} if isinstance(held, dict) else {}
         return {lane: held.get(lane, self.now) for lane in self.limited_lanes()}
 
+    def _invariant_gate_held(self, held: Any) -> Dict[str, Dict[str, Any]]:
+        """The goals the unproven-work gate keeps refusing: kept from the last
+        pass while the gate keeps refusing them, now for a goal newly refused
+        (loom#564). The since time starts on the first refusal, so an hour of
+        refusals yields one invariant per goal. A claim for the goal, or a
+        pass the gate no longer refuses it, drops it and its invariant
+        clears."""
+        prior = held if isinstance(held, dict) else {}
+        out = {}
+        for key, info in self._gate_holds.items():
+            if not isinstance(info, dict):
+                continue
+            old = prior.get(key) if isinstance(prior.get(key), dict) else {}
+            since = old.get("since") if self._num(old.get("since")) else self.now
+            tickets = info.get("tickets")
+            out[key] = {"repo": info["repo"], "goal": info["goal"],
+                        "since": since, "count": info["count"],
+                        "limit": info["limit"],
+                        "tickets": tickets if isinstance(tickets, dict) else {},
+                        "idle": info.get("idle", 0) if self._num(info.get("idle")) else 0}
+        return out
+
     def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
         """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
         search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
@@ -3853,6 +3911,16 @@ class Station:
             except (GitHubError, OSError) as err:
                 _say("invariants: could not read %s: %s" % (name, err))
         facts.held = state["held"] = self._invariant_held(state.get("held"))
+        gate_held = self._invariant_gate_held(state.get("gate_held"))
+        state["gate_held"] = gate_held
+        facts.gate_held = {
+            key: invariants.GateHold(
+                goal=self._invariant_ref(info["repo"], info["goal"], noun="goal"),
+                since=info["since"], count=info["count"], limit=info["limit"],
+                tickets=tuple(self._invariant_ref(info["repo"], int(number))
+                              for number in sorted(info["tickets"], key=int)),
+                idle=info["idle"])
+            for key, info in gate_held.items()}
         self._invariant_goal_facts(facts)
         seen = state.get("brain_seen")
         newest = max([j.at for j in facts.journals or []] + ([seen] if self._num(seen) else []),
@@ -4133,7 +4201,8 @@ class Station:
         breaches = (self._open_breaches(repo, number)
                     if (repo, number) == self._invariant_goal() else None)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
-                                          breaches)
+                                          breaches,
+                                          gate_hold=self._gate_hold_for(repo, number))
         brain._check_written_text(body)
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                      {"body": body})
@@ -4146,8 +4215,24 @@ class Station:
                 if isinstance(i, dict) and "pull_request" not in i
                 and brain._names_goal(i.get("body"), goal)]
 
+    def _gate_hold_for(self, repo: str, goal: int) -> Optional[Dict[str, Any]]:
+        """The unproven-work gate's persisted hold on this goal home, if the
+        gate is still holding it (loom#564). Malformed state is ignored: the
+        standup must never break a pass on a state read."""
+        held = invariants.load(os.path.join(self.state, "invariants.json"),
+                               _say).get("gate_held")
+        if not isinstance(held, dict):
+            return None
+        info = held.get("%s#%d" % (repo, goal))
+        if not isinstance(info, dict) \
+                or not all(self._num(info.get(k)) for k in ("goal", "count", "limit", "idle")) \
+                or not isinstance(info.get("tickets"), dict):
+            return None
+        return info
+
     def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
-                              breaches: Optional[List[Dict[str, Any]]] = None) -> str:
+                              breaches: Optional[List[Dict[str, Any]]] = None,
+                              gate_hold: Optional[Dict[str, Any]] = None) -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
         counts = [(len(groups[k]), word) for k, word in (
@@ -4156,6 +4241,13 @@ class Station:
             ("asks", "waiting on you"))]
         summary = ", ".join("%d %s" % (n, word) for n, word in counts if n)
         first = ("%s since the last report." % summary) if summary else "Nothing moved since the last report."
+        stuck = "Past the stuck age in PR: %s." % rows(groups["aged_pr"])
+        if gate_hold is not None:
+            stuck += (" Held by the unproven-work gate: goal #%d -- %d tickets shipped "
+                      "without a proof (limit %d), %d briefed tickets waiting, "
+                      "%d lanes idle." % (gate_hold["goal"], gate_hold["count"],
+                                          gate_hold["limit"], len(gate_hold["tickets"]),
+                                          gate_hold["idle"]))
         return "\n".join([REPORT_MARKER, first,
             "", "### Going well", "Merged: %s. Verified: %s. Shipped: %s." %
             (rows(groups["merged"]), rows(groups["verified"]),
@@ -4163,8 +4255,7 @@ class Station:
             "### Not going well", "Failed: %s." % rows(groups["failed"])]
             + (["Invariants broken: %s." % rows(breaches)] if breaches is not None else [])
             + ["",
-            "### Still stuck", "Past the stuck age in PR: %s." %
-            rows(groups["aged_pr"]), "",
+            "### Still stuck", stuck, "",
             "### Next", "In flight: %s." % rows(groups["in_flight"]),
             "Needs difficulty: %s." % rows(groups["needs_difficulty"]), "",
             "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
