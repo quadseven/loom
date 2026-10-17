@@ -509,6 +509,14 @@ class BacklogHelperTest(unittest.TestCase):
 
 
 class LanesAndImprovingTest(unittest.TestCase):
+    def test_lane_tier_text_reads_factory_tables(self):
+        from unittest.mock import patch
+        from bus import factory
+        from dashboard.views import render_lanes
+        with patch.dict(factory.TIERS, {"easy": ("test-lane",)}):
+            body = render_lanes({"lanes": [], "scoreboard": {}})
+        self.assertIn("Easy: test-lane", body)
+
     def test_pull_request_footer_and_models_scoreboard(self):
         from dashboard import views
         from dashboard.server import _lane_view_data
