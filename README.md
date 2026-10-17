@@ -95,8 +95,13 @@ and write access to the deployment repository and goal home.
 
 For a roll held by a family gate, set `gate_url` on its
 `LOOM_ROLL_SHIP_DOCS` entry. Keep the real endpoint in the station's private
-environment. It must be HTTPS and return JSON with a boolean `open` field.
+environment. It must be HTTPS and return JSON with an `open` field set to a
+boolean or the number 0 or 1.
 While the source-pin pull request is open, each station pass reads the gate.
+A hand-made roll pin is eligible when its title names a roll pin, its body
+says it is held for the family gate, and it changes only pin paths in the
+ship document. While that pull request is open, the station does not create
+a second pin pull request for the same roll.
 A closed gate leaves the pull request held. At an open gate, the station uses
 the brain's ticketless merge checks, including a trusted author, successful
 checks, a passing review check on the head, and resolved threads. If those
