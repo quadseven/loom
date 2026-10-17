@@ -264,6 +264,9 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
+# Fewest characters a verifier's "missing evidence" may have to earn the
+# loom:awaiting-evidence label: a reason, not a word.
+MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
 # Lanes that spend Anthropic models never take a verify run; the free and
 # subscription lanes do (the claude lane spends the operator's subscription).
@@ -1521,6 +1524,7 @@ class Station:
 
     def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
         number = int(issue["number"])
+        self._clear_awaiting(repo, number)
         stamp = int(self.now)
         text = tickets.render_verify_brief(
             repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
@@ -1548,6 +1552,31 @@ class Station:
                       "%d hours." % (lane, why, VERIFY_INTERVAL // 3600))
         _say("verify of %s#%d left it shipped: %s" % (repo, number, why))
 
+    def _await_evidence(self, repo: str, number: int, missing: Any) -> None:
+        """Mark a ticket a verifier found waiting on live evidence, so it does
+        not hold the goal's unproven-work limit while the world catches up. It
+        stays shipped and is tried again after its cooldown, and the label is
+        cleared when that retry is handed out so each run re-earns it. The
+        reason is lane output: it must be a concrete sentence, not a bare word
+        (brain.AWAITING_CAP_FACTOR caps how many tickets a goal may exclude)."""
+        if not isinstance(missing, str) or len(missing.strip()) < MISSING_MIN:
+            _say("not labelling %s#%d: the missing evidence is not stated" % (repo, number))
+            return
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": [brain.AWAITING_EVIDENCE]})
+        except GitHubError as err:
+            _say("could not label %s#%d as awaiting evidence: %s" % (repo, number, err))
+
+    def _clear_awaiting(self, repo: str, number: int) -> None:
+        """Drop the awaiting-evidence label when the ticket is handed out to be
+        verified again, so the new run decides afresh."""
+        try:
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(brain.AWAITING_EVIDENCE, safe="")), ok=(404,))
+        except GitHubError as err:
+            _say("could not clear the awaiting label on %s#%d: %s" % (repo, number, err))
+
     def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
         """(the lane's verify.json, "") or (None, why it cannot be used)."""
         path = os.path.join(self.s.home, "logs", lane, name + ".verify.json")
@@ -1574,6 +1603,7 @@ class Station:
         elif set(result) == {"missing"}:
             self._verify_note(repo, number, lane, "Missing evidence: %s" % self._note_text(
                 result["missing"]))
+            self._await_evidence(repo, number, result["missing"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True

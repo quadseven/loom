@@ -30,6 +30,15 @@ DEFAULT_GOAL_CAP = 16
 # ticket carries loom:verified instead of loom:shipped (or loom:merged for a
 # docs proof), so it never counts here.
 UNPROVEN = ("loom:merged", "loom:shipped")
+# A verifier checked the ticket and found its live evidence has not happened
+# yet (the station adds the label). It waits on the world, not on a verifier,
+# so it does not hold the unproven-work limit: 54 of the 58 loom tickets
+# counted on 2026-10-17 were in that state, and the limit froze the goal.
+AWAITING_EVIDENCE = "loom:awaiting-evidence"
+# A goal excludes at most this many times its limit in awaiting tickets: the
+# label comes from a lane's verify.json, so a lane that always says "missing"
+# must not be able to switch the limit off.
+AWAITING_CAP_FACTOR = 2
 DEFAULT_UNVERIFIED_LIMIT = 15
 # A ticket admitted for a measured regression of a shipped one. Past the cap,
 # a goal admits one such ticket at a time (its regression slot).
@@ -270,9 +279,10 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         if gh is not None and repo:
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
-            held = _goal_unproven(gh, repo, int(issue["number"]), issue)
-            lines.append("  - unproven work %d/%d (merged or shipped with no standing proof)"
-                         % (held, limit))
+            held, waiting = _goal_counts(gh, repo, int(issue["number"]), issue)
+            lines.append("  - unproven work %d/%d (merged or shipped with no standing proof; "
+                         "%d more await live evidence and do not count)"
+                         % (held, limit, waiting))
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
@@ -933,14 +943,38 @@ def _unproven(issue: Dict[str, Any]) -> bool:
     counts."""
     names = _labels(issue)
     return (issue.get("state") == "open" and "loom:ticket" in names
+            and AWAITING_EVIDENCE not in names
             and any(state in names for state in UNPROVEN))
+
+
+def _awaiting(issue: Dict[str, Any]) -> bool:
+    """An open merged or shipped ticket a verifier checked and left waiting on
+    live evidence (loom:awaiting-evidence)."""
+    names = _labels(issue)
+    return (issue.get("state") == "open" and "loom:ticket" in names
+            and AWAITING_EVIDENCE in names and any(state in names for state in UNPROVEN))
+
+
+def _count_unproven(children: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """(tickets that hold the limit, awaiting tickets excluded from it). The
+    awaiting tickets past AWAITING_CAP_FACTOR times the limit hold it again."""
+    waiting = sum(1 for i in children if _awaiting(i))
+    excluded = min(waiting, AWAITING_CAP_FACTOR * unverified_limit())
+    return sum(1 for i in children if _unproven(i)) + (waiting - excluded), excluded
+
+
+def _goal_counts(gh: GitHub, repo: str, goal: int,
+                 issue: Optional[Dict[str, Any]] = None) -> Tuple[int, int]:
+    """(tickets that hold the limit, awaiting tickets excluded) among the
+    goal's tickets, from one read of its children."""
+    return _count_unproven(_goal_children(gh, repo, goal, issue))
 
 
 def _goal_unproven(gh: GitHub, repo: str, goal: int,
                    issue: Optional[Dict[str, Any]] = None) -> int:
     """The goal's unproven tickets; ValueError for anything that is not an
     open loom:goal issue."""
-    return sum(1 for i in _goal_children(gh, repo, goal, issue) if _unproven(i))
+    return _count_unproven(_goal_children(gh, repo, goal, issue))[0]
 
 
 def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
@@ -951,7 +985,7 @@ def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
 
 
 def _check_goal_unproven(children: List[Dict[str, Any]], goal: int) -> None:
-    count = sum(1 for i in children if _unproven(i))
+    count = _count_unproven(children)[0]
     limit = unverified_limit()
     if count > limit:
         raise ValueError("goal #%d has %d tickets at merged or shipped without a proof "

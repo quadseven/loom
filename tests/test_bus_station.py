@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -179,6 +179,12 @@ class FakeGitHub:
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
+        gone = re.match(r"issues/(\d+)/labels/(.+)$", rest)
+        if gone and method == "DELETE":
+            n = int(gone.group(1))
+            self.issues[n]["labels"] = [lab for lab in self.issues[n]["labels"]
+                                        if lab["name"] != unquote(gone.group(2))]
+            return reply(200, [])
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
@@ -4352,11 +4358,39 @@ class VerifyResultTest(Base):
 
     def test_a_missing_result_names_the_missing_evidence_in_one_note(self):
         self.result({"missing": "the deployed station log for 2026-10-16"})
+        # Handing the run out recorded the attempt, so the cooldown holds the
+        # ticket back from a second run in this pass.
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE),
+                   json.dumps({"%s#5" % REPO: time.time()}))
         self.run_pass()
+        # A verifier found the live evidence has not happened yet: the ticket is
+        # labelled so it stops holding the unproven-work limit (2026-10-17: 54 of
+        # 58 counted tickets were waiting on the world, and the goal was frozen).
+        self.assertIn("loom:awaiting-evidence", self.fake.names(5))
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(len(self.fake.comments[5]), 1)
         self.assertIn("the deployed station log for 2026-10-16", self.fake.comments[5][0]["body"])
+
+    def test_a_bare_word_of_missing_evidence_does_not_earn_the_label(self):
+        # The result is lane output: "missing" alone must not switch the limit off.
+        self.result({"missing": "later"})
+        self.run_pass()
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
+        self.assertEqual(len(self.fake.comments[5]), 1)
+
+    def test_a_retry_handed_out_drops_the_label_so_the_run_decides_afresh(self):
+        self.fake.issues[5]["labels"].append({"name": "loom:awaiting-evidence"})
+        # An idle slot with the cooldown over is handed the ticket again.
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time())._write_verify_brief(REPO, "codex", self.fake.issues[5])
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
+        self.assertIn("loom:shipped", self.fake.names(5))
+
+    def test_a_refused_proof_or_a_crashed_run_is_not_awaiting_evidence(self):
+        self.result(self.good(criteria=[]))
+        self.run_pass()
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
 
     def test_a_proof_holding_a_credential_is_refused_with_one_note(self):
         self.result(self.good(sources=["token=abcdef0123456789"]))
