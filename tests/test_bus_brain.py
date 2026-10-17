@@ -376,13 +376,13 @@ class SensitiveResumeTests(unittest.TestCase):
             os.makedirs(os.path.join(home, "state", "station"))
             with open(os.path.join(home, "state", "station", "health.json"), "w") as fh:
                 json.dump({"sources": {REPO + "#1": {"checked_at": "2030-01-01T00:00:00Z",
-                                                     "findings": [{"title": "Bags are full",
-                                                                   "area": "bags", "impact": 60.0,
+                                                     "findings": [{"title": "Search is slow",
+                                                                   "area": "search", "impact": 60.0,
                                                                    "priority": "P1"}]},
                                        REPO + "#2": {"error": "the answer is not JSON"}}}, fh)
             report = brain.status(gh, [REPO], REPO, env={"LOOM_HOME": home})
         self.assertIn("## Health findings\n- %s#1: 1 finding (checked 2030-01-01T00:00:00Z)\n"
-                      "  - P1 Bags are full (bags, impact 60)\n"
+                      "  - P1 Search is slow (search, impact 60)\n"
                       "- %s#2: not looked: the answer is not JSON" % (REPO, REPO), report)
         self.assertIn("## Priorities", report)
         report = brain.status(GitHub("t", transport=Fake(
