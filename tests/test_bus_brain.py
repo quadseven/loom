@@ -136,6 +136,20 @@ class BrainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "headers do not parse"):
             brain._check_ticket_headers(pasted, {"Difficulty": "medium"})
 
+    def test_a_ticket_awaiting_live_evidence_does_not_hold_the_unproven_limit(self):
+        def ticket(*names):
+            return {"state": "open", "labels": [{"name": n} for n in ("loom:ticket",) + names]}
+        waiting = ticket("loom:shipped", brain.AWAITING_EVIDENCE)
+        self.assertFalse(brain._unproven(waiting))
+        self.assertTrue(brain._awaiting(waiting))
+        for plain in (ticket("loom:shipped"), ticket("loom:merged")):
+            self.assertTrue(brain._unproven(plain))
+            self.assertFalse(brain._awaiting(plain))
+        # Closed or verified work never counts either way.
+        self.assertFalse(brain._unproven(dict(waiting, state="closed")))
+        children = [ticket("loom:shipped")] * 3 + [waiting] * 20
+        brain._check_goal_unproven(children, 30)
+
     def test_prioritize_without_trusted_authors_names_the_setting(self):
         # A remote brain without LOOM_BRIEF_AUTHORS saw only "not a trusted
         # login" and could not tell what to fix.

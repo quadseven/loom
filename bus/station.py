@@ -1548,6 +1548,16 @@ class Station:
                       "%d hours." % (lane, why, VERIFY_INTERVAL // 3600))
         _say("verify of %s#%d left it shipped: %s" % (repo, number, why))
 
+    def _await_evidence(self, repo: str, number: int) -> None:
+        """Mark a ticket a verifier found waiting on live evidence, so it does
+        not hold the goal's unproven-work limit while the world catches up. It
+        stays shipped and is tried again after its cooldown."""
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": [brain.AWAITING_EVIDENCE]})
+        except GitHubError as err:
+            _say("could not label %s#%d as awaiting evidence: %s" % (repo, number, err))
+
     def _read_verify(self, lane: str, name: str) -> Tuple[Optional[Dict[str, Any]], str]:
         """(the lane's verify.json, "") or (None, why it cannot be used)."""
         path = os.path.join(self.s.home, "logs", lane, name + ".verify.json")
@@ -1574,6 +1584,7 @@ class Station:
         elif set(result) == {"missing"}:
             self._verify_note(repo, number, lane, "Missing evidence: %s" % self._note_text(
                 result["missing"]))
+            self._await_evidence(repo, number)
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True

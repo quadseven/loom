@@ -4357,6 +4357,15 @@ class VerifyResultTest(Base):
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(len(self.fake.comments[5]), 1)
         self.assertIn("the deployed station log for 2026-10-16", self.fake.comments[5][0]["body"])
+        # A verifier found the live evidence has not happened yet: the ticket is
+        # labelled so it stops holding the unproven-work limit (2026-10-17: 54 of
+        # 58 counted tickets were waiting on the world, and the goal was frozen).
+        self.assertIn("loom:awaiting-evidence", self.fake.names(5))
+
+    def test_a_refused_proof_or_a_crashed_run_is_not_awaiting_evidence(self):
+        self.result(self.good(criteria=[]))
+        self.run_pass()
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
 
     def test_a_proof_holding_a_credential_is_refused_with_one_note(self):
         self.result(self.good(sources=["token=abcdef0123456789"]))
