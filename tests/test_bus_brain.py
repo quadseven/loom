@@ -1834,6 +1834,19 @@ TWICE = [event("labeled", "loom:failed", "2030-01-01T00:10:00Z"),
          event("labeled", "loom:failed", "2030-01-01T00:40:00Z")]
 
 
+def lane_models(**models):
+    """The lanes' configured model settings (LOOM_<LANE>_MODEL) for a test,
+    and no others."""
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith("LOOM_") and k.endswith("_MODEL"))}
+    env.update({"LOOM_%s_MODEL" % lane.upper(): model for lane, model in models.items()})
+    return unittest.mock.patch.dict(os.environ, env, clear=True)
+
+
+# The lane settings that match the ladder's first two rungs.
+LADDER_LANES = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-sol"}
+
+
 class EscalateTests(unittest.TestCase):
     def run_escalate(self, routes):
         fake = Routed(routes)
@@ -1933,7 +1946,7 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(fake.sent("PUT", "/issues/9/labels"),
                          [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
         note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
-        self.assertIn("rung 2 of 3", note)
+        self.assertIn("rung 2 of 4", note)
         self.assertIn("failed 2 times", note)
         self.assertIn("Rung: 2 gpt-6-sol codex", note)
 
@@ -2039,6 +2052,7 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("not repeatedly stuck", str(caught.exception))
         self.assertFalse([c for c in fake.calls if c[0] in ("PUT", "PATCH") or c[0] == "POST"])
 
+    @lane_models(**LADDER_LANES)
     def test_escalate_past_the_third_rung_adds_needs_brain(self):
         history = [claim("2030-01-01T00:11:00Z"), claim("2030-01-01T00:20:00Z", "codex"),
                    {"body": "<!-- loom:escalate v1 -->\nRung: 3 claude-opus-5-5 claude", "created_at": "2030-01-01T00:30:00Z"},
@@ -2049,6 +2063,7 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("needs-brain", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
         self.assertFalse(fake.sent("PATCH", "/issues/9"))
 
+    @lane_models(**LADDER_LANES)
     def test_escalating_after_every_rung_was_tried_flags_the_ticket_runaway(self):
         history = [claim("2030-01-01T00:11:00Z"), claim("2030-01-01T00:20:00Z", "codex"),
                    {"body": "<!-- loom:escalate v1 -->\nRung: 3 claude-opus-5-5 claude", "created_at": "2030-01-01T00:30:00Z"},
@@ -2061,6 +2076,7 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("Runaway: escalation after every rung was tried.", body)
         self.assertIn("held for brain review", body)
 
+    @lane_models(**LADDER_LANES)
     def test_escalate_tracks_the_rewritten_model_per_claim(self):
         # Sonnet claimed, escalated to codex and claimed again: the next rung is the last.
         history = [claim("2030-01-01T00:11:00Z"),
@@ -2070,15 +2086,58 @@ class EscalateTests(unittest.TestCase):
         _, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
 
-    def test_escalate_never_downgrades_below_a_recorded_rung(self):
+    def test_escalate_past_opus_takes_an_untried_strong_model_never_sonnet(self):
         history = [claim("2030-01-01T00:11:00Z"),
                    rung_marker(3), rung_claim()]
         issue = stuck_ticket("failed", body="Model: claude-opus-5-5\n\n" + BODY)
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-brain"}):
             fake, outcome = self.run_escalate(ticket_routes(issue, TWICE, history))
-        self.assertEqual(outcome, "needs-brain")
-        self.assertIn("needs-brain", fake.sent("PUT", "/issues/9/labels")[0]["labels"])
-        self.assertFalse(fake.sent("PATCH", "/issues/9"))
+        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
+        self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
+
+    def test_runs_on_a_lane_set_to_opus_are_recorded_as_opus_and_never_escalated_to_it(self):
+        # 2026-10-17: lane claude ran claude-opus-5-5 (its setting and its
+        # pull request's footer) and the brain recorded claude-sonnet-5-5.
+        bodies = [(claim("2030-01-01T00:11:00Z")["body"], None)] * 5
+        with lane_models(claude="claude-opus-5-5"):
+            self.assertEqual(brain._tried_models(None, bodies), ["claude-opus-5-5"])
+        with lane_models():
+            self.assertEqual(brain._tried_models(None, bodies, ("claude", "claude-opus-5-5")),
+                             ["claude-opus-5-5"])
+            self.assertEqual(brain._tried_models(None, bodies), [])
+        issue = stuck_ticket("failed", body=BODY)
+        history = [claim("2030-01-01T00:%02d:00Z" % m) for m in (11, 21, 31, 41, 51)]
+        footer = ("## Why\nx\n\n---\nLoom ticket example-owner.example-repo-9, lane claude, "
+                  "model claude-opus-5-5.\nRefs %s#9\n" % REPO)
+
+        def footer_routes(login, **kw):
+            routes = ticket_routes(issue, TWICE, history, **kw)
+            pr = dict(fix_pr(body=footer, user={"login": login}), number=8)
+            routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [pr])
+            return routes
+        with lane_models(), unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "trusted"}):
+            fake = Routed(footer_routes("trusted", free=("claude", "anthropic-2")))
+            with self.assertRaisesRegex(ValueError, "no untried rung has an available lane"):
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+            self.assertFalse(fake.sent("PATCH", "/issues/9"))
+            # A stranger's or a fork's pull request footer names nothing that
+            # ran, and neither does a footer naming a model Loom never runs.
+            _, outcome = self.run_escalate(footer_routes("stranger", free=("claude", "anthropic-2")))
+            self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+            routes = footer_routes("trusted", free=("claude", "anthropic-2"))
+            fork = dict(fix_pr(body=footer, user={"login": "trusted"}), number=8)
+            fork["head"] = dict(fork["head"], repo={"full_name": "someone-else/example-repo"})
+            routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [fork])
+            _, outcome = self.run_escalate(routes)
+            self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+            footer = footer.replace("claude-opus-5-5", "claude-opus-9-9")
+            _, outcome = self.run_escalate(footer_routes("trusted", free=("claude", "anthropic-2")))
+            self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        routes = ticket_routes(issue, TWICE, history)
+        routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [dict(fix_pr(body=footer), number=8)])
+        with lane_models(claude="claude-opus-5-5"):
+            _, outcome = self.run_escalate(routes)
+        self.assertEqual(outcome, "rung 2 gpt-6-sol on codex")
 
 
 
