@@ -3066,8 +3066,14 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                          % ", ".join(a.short for a in held))
     from . import factory  # factory imports this module
     found_pr = _open_pr(gh, repo, number)
-    # Its pull request's runner footer names the model its newest run used.
-    footer = factory.footer_run(found_pr.get("body")) if found_pr is not None else None
+    # Its pull request's runner footer names the model its newest run used,
+    # read only from a LOOM_BRIEF_AUTHORS login's pull request in this repo:
+    # anyone can open one that matches the ticket on a public repo.
+    footer = None
+    if found_pr is not None and _same_repo(repo, found_pr, {}) and str(
+            (found_pr.get("user") or {}).get("login") or "").lower() in {
+            a.lower() for a in trusted_authors()}:
+        footer = factory.footer_run(found_pr.get("body"))
     history = _history(gh, repo, issue, datetime.now(timezone.utc), footer=footer)
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")

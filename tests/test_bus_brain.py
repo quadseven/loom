@@ -2103,15 +2103,22 @@ class EscalateTests(unittest.TestCase):
             self.assertEqual(brain._tried_models(None, bodies), [])
         issue = stuck_ticket("failed", body=BODY)
         history = [claim("2030-01-01T00:%02d:00Z" % m) for m in (11, 21, 31, 41, 51)]
-        routes = ticket_routes(issue, TWICE, history, free=("claude", "anthropic-2"))
         footer = ("## Why\nx\n\n---\nLoom ticket example-owner.example-repo-9, lane claude, "
                   "model claude-opus-5-5.\nRefs %s#9\n" % REPO)
-        routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [dict(fix_pr(body=footer), number=8)])
-        with lane_models():
-            fake = Routed(routes)
+
+        def footer_routes(login, **kw):
+            routes = ticket_routes(issue, TWICE, history, **kw)
+            pr = dict(fix_pr(body=footer, user={"login": login}), number=8)
+            routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [pr])
+            return routes
+        with lane_models(), unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "trusted"}):
+            fake = Routed(footer_routes("trusted", free=("claude", "anthropic-2")))
             with self.assertRaisesRegex(ValueError, "no untried rung has an available lane"):
                 brain.escalate(GitHub("t", transport=fake), REPO, 9)
-        self.assertFalse(fake.sent("PATCH", "/issues/9"))
+            self.assertFalse(fake.sent("PATCH", "/issues/9"))
+            # A stranger's pull request footer names nothing that ran.
+            _, outcome = self.run_escalate(footer_routes("stranger", free=("claude", "anthropic-2")))
+            self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
         routes = ticket_routes(issue, TWICE, history)
         routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [dict(fix_pr(body=footer), number=8)])
         with lane_models(claude="claude-opus-5-5"):
