@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 import json
@@ -1211,7 +1212,8 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           not_before: Optional[str] = None, refs: Optional[int] = None,
           regresses: Optional[int] = None, after: Optional[str] = None,
           priority: Optional[str] = None, holder: Optional[str] = None,
-          env: Optional[Dict[str, str]] = None) -> str:
+          env: Optional[Dict[str, str]] = None,
+          resolves: Optional[str] = None) -> str:
     """File a ticket under the goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Rewritten from issue M." in words, and the
     original gets a comment naming the ticket and loom:rewritten in place of
@@ -1273,7 +1275,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     children = _goal_children(gh, repo, goal, goal_issue)
     _check_goal_capacity(children, goal)
     _check_goal_unproven(children, goal)
-    done = _brief_done_due(gh, repo, goal, holder, env)
+    done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
@@ -1289,16 +1291,26 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
 
 
 def _brief_done_due(gh: GitHub, repo: str, goal: int, holder: Optional[str],
-                    env: Optional[Dict[str, str]]) -> Optional[str]:
+                    env: Optional[Dict[str, str]],
+                    resolves: Optional[str] = None) -> Optional[str]:
     """The brief done line for the goal when its brief stage stands deferred
     on the goal home (the newest brief marker for it is a defer), else None.
     Read before the ticket is filed, so a refused brief records nothing."""
     if holder is None:
         return None
-    line = handoff.done_marker("brief", (repo, goal), holder)
     found = _goal_home_journals(gh, repo, goal, trusted_authors(env))
     standing = handoff.resume_items(handoff.marks(found))
-    return line if any(m.stage == "brief" and m.item == (repo, goal) for m in standing) else None
+    pending = [m for m in standing if m.stage == "brief" and m.item == (repo, goal)]
+    if resolves is not None:
+        if not re.fullmatch(r"[a-f0-9]{8}", resolves):
+            raise ValueError("--resolves must be an eight-character brief key")
+        if not any(m.key == resolves for m in pending):
+            return None
+        return handoff.done_marker("brief", (repo, goal), holder, key=resolves)
+    if len(pending) == 1:
+        return handoff.done_marker("brief", (repo, goal), holder, key=pending[0].key or None)
+    return handoff.done_marker("brief", (repo, goal), holder) if any(
+        not m.key for m in pending) else None
 
 
 def _journal_brief_done(gh: GitHub, repo: str, goal: int, holder: str, line: str,
@@ -2473,7 +2485,9 @@ def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str,
     rev = item_revision(gh, *item)
     if rev is None:
         raise ValueError("only an open item is deferred")
-    return handoff.defer_marker(stage, item, rev, holder, note=note)
+    key = (hashlib.sha256(" ".join(note.split()).encode("utf-8")).hexdigest()[:8]
+           if stage == "brief" and note else None)
+    return handoff.defer_marker(stage, item, rev, holder, note=note, key=key)
 
 
 def _lock_holder(gh: GitHub, lock_repo: str, holder: str, now: datetime) -> None:
@@ -2579,17 +2593,18 @@ def _goal_home_journals(gh: GitHub, repo: str, number: int,
 
 def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                        found: List[Dict[str, Any]],
-                       latest: Optional[Dict[Tuple[str, Tuple[str, int]], handoff.Mark]] = None
+    latest: Optional[Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]] = None
                        ) -> List[str]:
     found_marks = handoff.marks(found)
     items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
-    latest = latest or {(m.stage, m.item): m for m in found_marks}
+    latest = latest or {(m.stage, m.item, m.key if m.stage == "brief" else ""): m
+                        for m in found_marks}
     current = {m.item: item_revision(gh, *m.item) for m in items}
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
     for m in items:
-        newest = latest[(m.stage, m.item)]
+        newest = latest[(m.stage, m.item, m.key if m.stage == "brief" else "")]
         if newest.kind == "defer" and newest != m:
             continue
         if newest.kind == "done":
@@ -2703,10 +2718,10 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     now = now or datetime.now(timezone.utc)
     _lock_holder(gh, lock_repo, holder, now)
     goals = _goal_journals(gh, repos, trusted_authors(env))
-    latest: Dict[Tuple[str, Tuple[str, int]], handoff.Mark] = {}
+    latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
     for _, _, found in goals:
         for mark in handoff.marks(found):
-            key = (mark.stage, mark.item)
+            key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
             if key not in latest or mark.at >= latest[key].at:
                 latest[key] = mark
     out = ["# Resume for %s" % holder, "",
@@ -3059,7 +3074,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder")
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
@@ -3069,7 +3084,7 @@ def parser() -> argparse.ArgumentParser:
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note")
-    dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True)
+    dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
@@ -3102,7 +3117,8 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     _check_brief_difficulty(body, args.lane, args.difficulty)
     print(brief(gh, _repo(args.repo), args.goal, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
-                args.regresses, args.after, args.priority, args.holder))
+                args.regresses, args.after, args.priority, args.holder,
+                resolves=args.resolves))
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:
@@ -3167,7 +3183,8 @@ def _cmd_defer(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
-    print(handoff.done_marker(args.stage, _ref(args.item, "item"), args.holder))
+    print(handoff.done_marker(args.stage, _ref(args.item, "item"), args.holder,
+                              key=args.resolves))
 
 
 def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:

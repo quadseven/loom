@@ -69,6 +69,13 @@ class HandoffRuleTests(unittest.TestCase):
         self.assertEqual([], handoff.resume_items(marks))
         self.assertFalse(handoff.may_act("merge", PR, "muse", found, NOW, {PR: "pr-abc"}))
 
+    def test_legacy_brief_markers_without_keys_still_parse_and_pair(self):
+        old_defer = '<!-- loom:defer v1 stage=brief item=%s#1 rev=open holder=muse note="old note" -->' % REPO
+        old_done = '<!-- loom:done v1 stage=brief item=%s#1 holder=lane-machine -->' % REPO
+        found = handoff.journals([journal(20, "muse", old_defer),
+                                  journal(10, "lane-machine", old_done)], AUTHORS)
+        self.assertEqual([], handoff.resume_items(handoff.marks(found)))
+
     def test_a_changed_or_closed_item_retires_its_defer(self):
         found = handoff.journals([journal(30, "muse", defer(PR, "pr-abc"),
                                           defer(TICKET, "failed-c3", stage="failed"))], AUTHORS)
@@ -208,8 +215,9 @@ class ResumeCommandTests(unittest.TestCase):
         routes = self.routes()
         marker = brain.defer(GitHub("t", transport=Routes(routes)), "brief",
                              (REPO, 1), "muse", note="party-trip fix")
+        self.assertIn(" key=", marker)
         self.assertEqual(
-            '<!-- loom:defer v1 stage=brief item=%s#1 rev=open holder=muse note="party-trip fix" -->' % REPO,
+            '<!-- loom:defer v1 stage=brief item=%s#1 rev=open key=c7ec7cc4 holder=muse note="party-trip fix" -->' % REPO,
             marker)
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
@@ -220,7 +228,7 @@ class ResumeCommandTests(unittest.TestCase):
         self.assertIn("- resume brief %s#1: party-trip fix (deferred by muse at %s)" % (
             REPO, at(10)), out)
 
-        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine")
+        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine", key="c7ec7cc4")
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
             comment(journal(5, "lane-machine", done_line)),
@@ -229,6 +237,33 @@ class ResumeCommandTests(unittest.TestCase):
                                       "lane-machine", LOCK_REPO, NOW,
                                       {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
         self.assertNotIn("- resume brief", out_after_done)
+
+    def test_brief_defers_on_one_goal_resume_independently_by_key(self):
+        routes = self.routes()
+        first = handoff.defer_marker("brief", (REPO, 1), "open", "muse",
+                                     note="first problem", key="11111111")
+        second = handoff.defer_marker("brief", (REPO, 1), "open", "muse",
+                                      note="second problem", key="22222222")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(20, "muse", first)), comment(journal(10, "muse", second))])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW,
+                           {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        lines = [line for line in out.splitlines() if line.startswith("- resume brief")]
+        self.assertEqual(2, len(lines))
+        self.assertTrue(any("first problem" in line for line in lines))
+        self.assertTrue(any("second problem" in line for line in lines))
+
+        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine", key="11111111")
+        routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
+            comment(journal(20, "muse", first)), comment(journal(10, "muse", second)),
+            comment(journal(5, "lane-machine", done_line))])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW,
+                           {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        lines = [line for line in out.splitlines() if line.startswith("- resume brief")]
+        self.assertEqual(1, len(lines))
+        self.assertIn("second problem", lines[0])
 
     def test_brief_handoff_whose_goal_home_was_closed_is_dropped_from_resume(self):
         routes = self.routes(goal_state="closed")

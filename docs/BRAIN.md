@@ -775,8 +775,12 @@ with the `stage=brief` done line and the new ticket. A brief without
 `--holder`, on a goal with no standing brief defer, or refused, posts no
 journal and changes no marker; so does a `--regresses` brief, which is
 the `regression` stage. Only journals from `LOOM_BRIEF_AUTHORS` logins
-count. For each stage and item the newest line wins; `python3 -m bus.brain
-resume OWNER/NAME... --holder NAME` lists the defers still standing whose item is open and
+count. For each stage and item the newest line wins. Brief defers carry a
+stable key derived from their normalized note, so one goal can hold multiple
+independent brief handoffs. A written brief can name the one it finishes with
+`--resolves KEY`; a keyless done marker retires only legacy unkeyed brief
+defers. `python3 -m bus.brain resume OWNER/NAME... --holder NAME` lists the
+defers still standing whose item is open and
 unchanged, and refuses unless that holder holds the tick lock.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`

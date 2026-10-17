@@ -22,10 +22,11 @@ QUIET = timedelta(hours=2)
 _HOLDER = r"[A-Za-z0-9._-]+"
 _ITEM = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+"
 _REV = r"[A-Za-z0-9._:-]+"
+_KEY = r"[a-f0-9]{8}"
 _NOTE = r'(?:"([^"]*)"|([^\s>]+))'
 _MARK = re.compile(
-    r'<!-- loom:(defer|done) v1 stage=([a-z]+) item=(%s)(?: rev=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
-    % (_ITEM, _REV, _NOTE, _HOLDER, _NOTE))
+    r'<!-- loom:(defer|done) v1 stage=([a-z]+) item=(%s)(?: rev=(%s))?(?: key=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
+    % (_ITEM, _REV, _KEY, _NOTE, _HOLDER, _NOTE))
 _TICK = re.compile(r"^Tick \S+, (%s)\s*$" % _HOLDER, re.M)
 
 
@@ -37,6 +38,7 @@ class Mark(NamedTuple):
     holder: str
     at: str
     note: str = ""
+    key: str = ""
 
 
 def item_ref(item: Tuple[str, int]) -> str:
@@ -58,19 +60,27 @@ def _check(stage: str, holder: str, rev: Optional[str], note: Optional[str] = No
 
 
 def defer_marker(stage: str, item: Tuple[str, int], rev: str, holder: str,
-                 note: Optional[str] = None) -> str:
+                 note: Optional[str] = None, key: Optional[str] = None) -> str:
     """The line a brain puts in its journal for stage work it leaves undone.
     The revision is the item as the brain left it (bus.brain defer)."""
     _check(stage, holder, rev, note)
+    if key is not None and not re.fullmatch(_KEY, key):
+        raise ValueError("key must be eight lowercase hexadecimal characters")
     extra = (' note="%s"' % note) if note else ""
-    return "<!-- loom:defer v1 stage=%s item=%s rev=%s holder=%s%s -->" % (
-        stage, item_ref(item), rev, holder, extra)
+    keyed = (" key=%s" % key) if key else ""
+    return "<!-- loom:defer v1 stage=%s item=%s rev=%s%s holder=%s%s -->" % (
+        stage, item_ref(item), rev, keyed, holder, extra)
 
 
-def done_marker(stage: str, item: Tuple[str, int], holder: str) -> str:
+def done_marker(stage: str, item: Tuple[str, int], holder: str,
+                key: Optional[str] = None) -> str:
     """The line a brain puts in its journal for stage work it finished."""
     _check(stage, holder, None)
-    return "<!-- loom:done v1 stage=%s item=%s holder=%s -->" % (stage, item_ref(item), holder)
+    if key is not None and not re.fullmatch(_KEY, key):
+        raise ValueError("key must be eight lowercase hexadecimal characters")
+    keyed = (" key=%s" % key) if key else ""
+    return "<!-- loom:done v1 stage=%s item=%s%s holder=%s -->" % (
+        stage, item_ref(item), keyed, holder)
 
 
 def journals(comments: Iterable[Dict[str, Any]], authors: Sequence[str]) -> List[Dict[str, Any]]:
@@ -88,21 +98,24 @@ def marks(found: Iterable[Dict[str, Any]]) -> List[Mark]:
         for m in _MARK.finditer(str(comment.get("body") or "")):
             kind, stage, ref = m.group(1), m.group(2), m.group(3)
             rev = m.group(4) or ""
-            note = m.group(5) or m.group(6) or m.group(8) or m.group(9) or ""
-            holder = m.group(7)
+            key = m.group(5) or ""
+            note = m.group(6) or m.group(7) or m.group(9) or m.group(10) or ""
+            holder = m.group(8)
             if stage not in STAGES or (kind == "defer" and not rev):
                 continue
             repo, _, number = ref.partition("#")
-            out.append(Mark(kind, stage, (repo, int(number)), rev, holder, str(comment["at"]), note))
+            out.append(Mark(kind, stage, (repo, int(number)), rev, holder,
+                            str(comment["at"]), note, key))
     return out
 
 
 def resume_items(found: Sequence[Mark]) -> List[Mark]:
     """The defers no later marker replaced: for each stage and item, the newest
     marker wins, so a done marker, or a newer defer, retires an older defer."""
-    latest: Dict[Tuple[str, Tuple[str, int]], Mark] = {}
+    latest: Dict[Tuple[str, Tuple[str, int], str], Mark] = {}
     for mark in found:
-        latest[(mark.stage, mark.item)] = mark
+        identity = mark.key if mark.stage == "brief" else ""
+        latest[(mark.stage, mark.item, identity)] = mark
     return [m for m in latest.values() if m.kind == "defer"]
 
 
