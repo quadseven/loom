@@ -68,6 +68,71 @@ REDO_MARKER = "<!-- loom:redo %d -->"
 # must not be filed again if the label list lags behind it.
 BRIEFED_KEEP = 50
 
+# A revert pull request a person or the brain made by hand is seen for this
+# long after it merged; an older one the brain handles.
+HAND_REVERT_WINDOW = 7 * 86400
+# One marker per revert pull request on the ticket it undoes: the station
+# moves the ticket back once for each revert pull request.
+HAND_REVERT_MARKER = "<!-- loom:hand-revert %d -->"
+REVERT_TITLE_RE = re.compile(r'^Revert "')
+GIT_REVERT_RE = re.compile(r"\bgit revert (?:--no-edit )?([0-9a-f]{40})\b")
+REVERTS_NUM_RE = re.compile(r"\bReverts\s+(?:[\w.-]+/[\w.-]+)?#(\d+)\b")
+
+
+def is_hand_revert(pr: Dict[str, Any], now: float, default_branch: str) -> bool:
+    """A merged hand-made revert pull request: into the default branch
+    within HAND_REVERT_WINDOW, its title starting 'Revert "' or its body
+    running `git revert <sha>` (GitHub's revert button writes both)."""
+    if not isinstance(pr, dict) or not pr.get("merged_at"):
+        return False
+    if str((pr.get("base") or {}).get("ref") or "") != default_branch:
+        return False
+    if now - _ts(str(pr.get("merged_at") or "")) > HAND_REVERT_WINDOW:
+        return False
+    return bool(REVERT_TITLE_RE.match(str(pr.get("title") or ""))
+                or GIT_REVERT_RE.search(str(pr.get("body") or "")))
+
+
+def reverted_keys(pr: Dict[str, Any]) -> List[str]:
+    """How a hand-made revert names what it undoes: the commit shas from
+    `git revert` in its body, the pull request numbers from 'Reverts
+    <repo>#<n>' lines, and the title from 'Revert "<title>"'."""
+    body = str(pr.get("body") or "")
+    keys = ["sha:" + s for s in GIT_REVERT_RE.findall(body)]
+    keys += ["pr:" + n for n in REVERTS_NUM_RE.findall(body)]
+    title = str(pr.get("title") or "")
+    if REVERT_TITLE_RE.match(title):
+        keys.append("title:" + " ".join(title[len('Revert "'):].rstrip('"').split()))
+    return keys
+
+
+def undoes(hand: Dict[str, Any], pr: Dict[str, Any]) -> bool:
+    """The hand-made revert undoes the merged pull request: its body runs
+    git revert on the request's merge (or squash) commit, names it in a
+    'Reverts <repo>#<n>' line, or its title is 'Revert "<the request's
+    title>"'."""
+    keys = reverted_keys(hand)
+    if "sha:" + str(pr.get("merge_commit_sha") or "") in keys:
+        return True
+    if "pr:%d" % int(pr.get("number") or 0) in keys:
+        return True
+    return "title:" + " ".join(str(pr.get("title") or "").split()) in keys
+
+
+def why_section(body: str) -> str:
+    """The body's ## Why section, or ""."""
+    out: List[str] = []
+    inside = False
+    for line in (body or "").replace("\r", "").split("\n"):
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = line.strip() == "## Why"
+            continue
+        if inside:
+            out.append(line)
+    return "\n".join(out).strip()
+
 BODY = """Difficulty: %(difficulty)s
 
 ## Why
