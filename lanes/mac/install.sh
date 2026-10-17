@@ -246,10 +246,11 @@ echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bu
 # (default 1800), take the brain lock and run one docs/MUSE.md tick on the
 # first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
 # usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
-# LOOM_AWS_REGION, LOOM_BRAIN_* and the rungs' LOOM_CODEX_MODEL,
-# LOOM_SPARK_MODEL and LOOM_SPARK_URL from the installing environment; with
-# LOOM_REPOS empty it stays idle. LOOM_BRAIN=0 skips it and removes an
-# installed one.
+# LOOM_AWS_REGION, LOOM_BRAIN_*, the rungs' LOOM_CODEX_MODEL,
+# LOOM_SPARK_MODEL and LOOM_SPARK_URL, and LOOM_TRANSCRIPT_URL and
+# LOOM_TRANSCRIPT_TOKEN_SSM (for the handoff packet) from the installing
+# environment; with LOOM_REPOS empty it stays idle. LOOM_BRAIN=0 skips it and
+# removes an installed one.
 LABEL="com.loom.brain"
 PLIST="$AGENTS/$LABEL.plist"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true

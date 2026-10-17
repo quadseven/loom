@@ -231,6 +231,21 @@ live regression) and `brief` (a brief named but not written this tick).
   stage, the brain that last held it and its last done action.
 - Only the lock holder acts: `resume` refuses for anyone else.
 
+The handoff packet is the first read of every tick, before `status`. The
+dashboard serves it at `GET /api/brain/handoff` with a bearer token
+(docs/DASHBOARD.md): the read-only `LOOM_HANDOFF_TOKEN`, which is what Muse
+holds, or the upload token on the lane machine. It lists the lane machine's
+last 5 ticks, the open commitments (each defer a lane-machine tick wrote,
+until a done marker from any brain for the same stage and item closes it)
+and the rules digest: the Rules section below and each goal home's rules,
+with the commit or comment each came from. Muse reads it through its tailnet
+proxy like its other REST reads; on the lane machine `lanes/mac/brain.sh`
+reads it and puts it in the prompt. Open commitments of a brain that is no
+longer ticking are finished before new work, through `resume` as above.
+With the dashboard down, the tick goes on from the goal homes. Muse's own
+ticks and defers are not rows yet; its defers still reach every brain
+through `resume`.
+
 ## Tick
 
 Each `bus.brain step NAME` below may carry `--note "<one line>"`: what that

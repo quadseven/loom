@@ -14,7 +14,7 @@ _FIELDS = ("ticket", "slot", "model", "outcome", "started_at", "finished_at")
 EVENT_TEXT_MAX = 5000
 
 
-def _zoned_time(value: str) -> bool:
+def zoned_time(value: str) -> bool:
     try:
         datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
@@ -34,7 +34,7 @@ def validate(raw: Any) -> Dict[str, Any]:
     if not (_ISSUE.fullmatch(body["ticket"]) or _BRAIN.fullmatch(body["ticket"])):
         raise ValueError("invalid ticket")
     for key in ("started_at", "finished_at"):
-        if not _zoned_time(body[key]):
+        if not zoned_time(body[key]):
             raise ValueError("invalid " + key)
     events = body.get("events")
     if not isinstance(events, list):
@@ -114,19 +114,25 @@ class MemoryBackend:
         return None
 
 
+def connect(dbapi):
+    """A connection to the dashboard's database, configured by LOOM_DB_*;
+    the brain memory tables (dashboard/brain_memory.py) share it."""
+    config = {}
+    for key in ("LOOM_DB_HOST", "LOOM_DB_NAME", "LOOM_DB_USER", "LOOM_DB_PASSWORD"):
+        value = os.environ.get(key)
+        if not value:
+            raise dbapi.Error("Missing required database configuration: " + key)
+        config[key] = value
+    return dbapi.connect(host=config["LOOM_DB_HOST"], database=config["LOOM_DB_NAME"],
+                         user=config["LOOM_DB_USER"], password=config["LOOM_DB_PASSWORD"])
+
+
 class PostgresBackend:
     def __init__(self, module):
         self.dbapi = module
 
     def _connect(self):
-        config = {}
-        for key in ("LOOM_DB_HOST", "LOOM_DB_NAME", "LOOM_DB_USER", "LOOM_DB_PASSWORD"):
-            value = os.environ.get(key)
-            if not value:
-                raise self.dbapi.Error("Missing required database configuration: " + key)
-            config[key] = value
-        return self.dbapi.connect(host=config["LOOM_DB_HOST"], database=config["LOOM_DB_NAME"],
-                                  user=config["LOOM_DB_USER"], password=config["LOOM_DB_PASSWORD"])
+        return connect(self.dbapi)
 
     def initialize(self):
         conn = self._connect()
@@ -187,11 +193,17 @@ class PostgresBackend:
 
 
 def _backend():
+    return choose_backend(MemoryBackend, PostgresBackend)
+
+
+def choose_backend(memory, postgres):
+    """memory() when LOOM_TRANSCRIPTS_MEMORY=1, else postgres(the pg8000 DB-API
+    module) when the database is configured; RuntimeError otherwise."""
     if os.environ.get("LOOM_TRANSCRIPTS_MEMORY") == "1":
-        return MemoryBackend()
+        return memory()
     if os.environ.get("LOOM_DB_PASSWORD") and importlib.util.find_spec("pg8000") is not None:
         import pg8000.dbapi
-        return PostgresBackend(pg8000.dbapi)
+        return postgres(pg8000.dbapi)
     missing = [key for key in ("LOOM_DB_HOST", "LOOM_DB_NAME", "LOOM_DB_USER", "LOOM_DB_PASSWORD")
                if not os.environ.get(key)]
     if missing:
@@ -200,7 +212,7 @@ def _backend():
     raise RuntimeError("Transcript database requires the pg8000 package")
 
 
-def _plain(row):
+def plain(row):
     """A stored row with every datetime as an ISO time ending in Z: Postgres
     returns datetime objects for started_at and finished_at, which JSON cannot
     carry (the runs API answered 502 on 2026-10-15), while the memory store
@@ -228,11 +240,11 @@ class Store:
         self.backend.initialize()
 
     def list(self, ticket=None):
-        return [_plain(row) for row in self.backend.read("list", ticket)]
+        return [plain(row) for row in self.backend.read("list", ticket)]
 
     def attempts(self, ticket):
-        return [dict(_plain(row), attempt=i)
+        return [dict(plain(row), attempt=i)
                 for i, row in enumerate(self.backend.read("attempts", ticket), 1)]
 
     def get(self, id_):
-        return _plain(self.backend.get(id_))
+        return plain(self.backend.get(id_))

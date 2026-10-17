@@ -29,6 +29,7 @@ from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import audit
+from . import brain_memory
 from . import factory
 from . import evidence
 from . import handoff
@@ -256,6 +257,12 @@ TITLE_WORD_MIN = 4
 # likely down), so uploads cannot hold the station's lock for long.
 UPLOAD_TRIES = 5
 UPLOAD_PER_PASS = 10
+# Between brain ticks the station sends new done markers to the dashboard at
+# most this often (post_brain_memory), so a commitment another brain
+# finished closes without waiting for this machine's next tick.
+CLOSE_EVERY = 600
+# The rules digest's source for docs/MUSE.md's Rules section.
+MUSE_RULES = "docs/MUSE.md"
 
 SecretReader = Callable[[str, str], str]
 Poster = Callable[[str, Dict[str, Any]], None]
@@ -526,6 +533,27 @@ def _is_ancestor(commit: str, revision: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return out.returncode == 0
+
+
+def _muse_rules() -> Tuple[str, str]:
+    """(commit, Rules section) of docs/MUSE.md in this checkout, the one
+    lanes/mac/station.sh deploys: the commit is the last one that changed the
+    file. ("", "") when git or the file cannot say."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", root, "log", "-1", "--format=%H", "--", "docs/MUSE.md"],
+                             capture_output=True, text=True, timeout=30)
+        with open(os.path.join(root, "docs", "MUSE.md"), encoding="utf-8") as fh:
+            doc = fh.read()
+    except (OSError, subprocess.SubprocessError) as err:
+        _say("could not read docs/MUSE.md for the rules digest (%s)" % type(err).__name__)
+        return "", ""
+    commit = out.stdout.strip()
+    if out.returncode != 0 or not COMMIT_RE.fullmatch(commit):
+        _say("could not find the commit of docs/MUSE.md for the rules digest (git exit %d)"
+             % out.returncode)
+        return "", ""
+    return commit, brain_memory.rules_section(doc)
 
 
 def read_ssm(name: str, region: str) -> str:
@@ -4398,17 +4426,24 @@ class Station:
                                             self.claude_projects, self.codex_sessions,
                                             issue=self._field(text, "Issue"))
             runs.append(("%s/%s" % (lane, name), None, body))
+        last = self._finished_brain_tick()
+        if last is not None:
+            def brain_body() -> Dict[str, Any]:
+                return transcripts.brain_body(home, last["started"], last["at"], last["outcome"],
+                                              str(last.get("model") or ""), self.claude_projects)
+            runs.append(("brain", float(last["started"]), brain_body))
+        return runs
+
+    def _finished_brain_tick(self) -> Optional[Dict[str, Any]]:
+        """The last brain tick (state/brain.json) when it ran the agent and
+        ended: outcome ok or failed, with the numeric start brain.sh records
+        and its end; else None."""
         tick = self._brain()
         last = tick[0] if tick else {}
-        started, at = last.get("started"), last.get("at")
-        if (last.get("outcome") in ("ok", "failed")
-                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                        for v in (started, at))):
-            def brain_body() -> Dict[str, Any]:
-                return transcripts.brain_body(home, started, at, last["outcome"],
-                                              str(last.get("model") or ""), self.claude_projects)
-            runs.append(("brain", float(started), brain_body))
-        return runs
+        if last.get("outcome") in ("ok", "failed") and all(
+                self._num(last.get(k)) for k in ("started", "at")):
+            return last
+        return None
 
     @staticmethod
     def _uploaded(ledger: Dict[str, Any], key: str, tick: Optional[float]) -> Any:
@@ -4498,6 +4533,130 @@ class Station:
                 return
         if first:
             _write_json(path, ledger)
+
+    # -- brain memory ------------------------------------------------------
+    def post_brain_memory(self) -> None:
+        """Post the last brain tick on this machine to the dashboard's
+        brain_ticks once (bus/brain_memory.py), with its commitments, then
+        the rules digest's sources that changed. A failed post is tried on
+        the next pass, UPLOAD_TRIES times in all; the rules wait for a tick
+        that posted. Between ticks, every CLOSE_EVERY seconds, it sends the
+        done markers written since the last send. Uses the transcript upload
+        settings and token."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        path = os.path.join(self.state, "brain_memory.json")
+        ledger = _read_json(path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        last = self._finished_brain_tick()
+        tries = self._tick_tries(ledger, last)
+        closed_at = ledger.get("closed_at")
+        close_due = self._num(ledger.get("since")) and not (
+            self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
+        if tries is None and not close_due:
+            return
+        token = self._transcript_token()
+        if token is None:
+            return
+        homes = [(repo, issue, [c for c in self.gh.paginate(
+                    "/repos/%s/issues/%d/comments?per_page=100" % (repo, int(issue["number"])))
+                  if isinstance(c, dict)]) for repo, issue in self._goal_homes()]
+        found = handoff.journals(
+            [{"body": c.get("body"), "at": c.get("created_at"), "login": tickets._login(c.get("user"))}
+             for _, _, comments in homes for c in comments], self.s.authors)
+        if last is not None and tries is not None:
+            self._post_brain_tick(last, ledger, token, found, tries)
+            if ledger["tick"]["result"] == "sent":
+                self._post_brain_rules(ledger, token, homes)
+        else:
+            self._post_brain_closings(ledger, token, found)
+        _write_json(path, ledger)
+
+    def _tick_tries(self, ledger: Dict[str, Any], last: Optional[Dict[str, Any]]) -> Optional[int]:
+        """The failed posts of the last finished tick so far, or None when
+        there is none to post (none finished, or it is sent or given up)."""
+        if last is None:
+            return None
+        rec = ledger.get("tick") if isinstance(ledger.get("tick"), dict) else {}
+        tries = rec.get("result") if rec.get("started") == last["started"] else 0
+        return int(tries) if self._num(tries) else None
+
+    def _post_brain_tick(self, last: Dict[str, Any], ledger: Dict[str, Any], token: str,
+                         found: List[Dict[str, Any]], tries: int) -> None:
+        """Post the tick's row and record in the ledger "sent", "refused",
+        "gave up", or the failed tries so far. Sent, the done markers up to
+        the tick's end count as sent."""
+        record = (brain.tick_step(self.gh, self.s.status_repo)
+                  if tickets.REPO_RE.fullmatch(self.s.status_repo or "") else None)
+        since = ledger.get("since") if self._num(ledger.get("since")) else None
+        body = brain_memory.tick_body(last, record, found, brain_memory.holder_of(last), since=since)
+        when = self._utc(last["started"])
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, brain_memory.TICKS_PATH),
+                        token, body)
+            result: Any = "sent"
+            ledger["since"] = max(since or 0, last["at"] + brain_memory.GRACE)
+        except UploadRefused as err:
+            _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
+            result = "refused"
+        # Deliberately broad, as in upload_transcripts: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            result = tries + 1
+            if result >= UPLOAD_TRIES:
+                _say("gave up posting the brain tick of %s after %d tries (%s)"
+                     % (when, UPLOAD_TRIES, type(err).__name__))
+                result = "gave up"
+        ledger["tick"] = {"started": last["started"], "result": result}
+
+    def _post_brain_closings(self, ledger: Dict[str, Any], token: str,
+                             found: List[Dict[str, Any]]) -> None:
+        """Send the done markers written since the last send, so the
+        commitments they finish close; a failed send is tried CLOSE_EVERY
+        seconds later."""
+        ledger["closed_at"] = self.now
+        closings = brain_memory.closings(found, ledger["since"])
+        if not closings:
+            return
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url,
+                                                   brain_memory.COMMITMENTS_PATH),
+                        token, {"commitments": [c for _, c in closings]})
+        # Deliberately broad, as above: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not send the brain's done markers (%s); next in %d minutes"
+                 % (type(err).__name__, CLOSE_EVERY // 60))
+            return
+        ledger["since"] = closings[-1][0] + 1
+
+    def _post_brain_rules(self, ledger: Dict[str, Any], token: str,
+                          homes: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]) -> None:
+        """Load the rules whose text or source changed since they were last
+        loaded: docs/MUSE.md's Rules, keyed by commit, and each goal home's;
+        and retire the sources that no longer have any."""
+        commit, text = _muse_rules()
+        rules = [{"source": MUSE_RULES, "source_ref": commit, "text": text}] if commit and text else []
+        rules += [r for r in (brain_memory.goal_rules(repo, issue, comments, self.s.authors)
+                              for repo, issue, comments in homes) if r]
+        loaded = ledger.get("rules") if isinstance(ledger.get("rules"), dict) else {}
+        # A source that yields no rules now (a closed goal, a removed section)
+        # is retired with an empty text; docs/MUSE.md only when it was read.
+        current = {r["source"] for r in rules}
+        rules += [{"source": source, "source_ref": "removed", "text": ""} for source in loaded
+                  if source not in current and (source != MUSE_RULES or commit)]
+        changed = [r for r in rules if loaded.get(r["source"]) != brain_memory.digest(r)]
+        if not changed:
+            return
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, brain_memory.RULES_PATH),
+                        token, {"rules": changed})
+        # Deliberately broad, as above; the rules are loaded after the next tick.
+        except Exception as err:  # noqa: BLE001
+            _say("could not load the brain rules (%s); next tick" % type(err).__name__)
+            return
+        loaded = dict(loaded, **{r["source"]: brain_memory.digest(r) for r in changed})
+        ledger["rules"] = {source: d for source, d in loaded.items()
+                           if not any(r["source"] == source and not r["text"] for r in changed)}
 
     def post_overdue_standups(self) -> None:
         """Post a data-only report when an open goal has gone overdue."""
@@ -5254,7 +5413,8 @@ class Station:
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,
-                     self.watch_brain, self.upload_transcripts, self.relay_operator,
+                     self.watch_brain, self.upload_transcripts, self.post_brain_memory,
+                     self.relay_operator,
                      self.watch_default_branches, self.run_factory, self.check_invariants,
                      self.release_factory_held):
             if self._deferred():

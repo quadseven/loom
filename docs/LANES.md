@@ -124,8 +124,8 @@ off and removes untracked and ignored files, nested repositories included;
 a checkout that still is not clean is cloned again, so nothing a run left
 there runs or steers the next tick.
 
-Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the lane
-and model that ran) and touches
+Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the
+holder, lane and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
 included. When no rung has usage, the tick takes no lock and runs no CLI: it
 records `skipped` with each rung's reason and leaves `brain-ok` alone, so
@@ -436,6 +436,35 @@ agent; a skipped tick has none) and `at` (when it ended). It uploads as slot
 `brain` with its UTC start time as the ticket and `model` from the same
 file: the Claude Code sessions in the operator's `~/.claude/projects` for
 `$LOOM_HOME/brain` last written between `started` and `at`.
+
+The same finished tick is also posted once as a `brain_ticks` row to the
+dashboard's `/api/brain/ticks`, next to `LOOM_TRANSCRIPT_URL` and with the
+same token (bus/brain_memory.py, docs/DASHBOARD.md). The row takes its
+holder, lane, model, start, end and outcome from `state/brain.json`; what it
+decided from the step notes on the lock commit (when that holder started it
+within 15 minutes before the agent) and the `Shipped` lines of the journals
+the holder posted while the agent ran; what it left open from their defer
+markers and `Waiting` lines; and what it handed off from their `Briefed`
+lines. Its commitments are those defer markers, open and due 2 hours after
+each was written, and the done markers any brain wrote since the last ones
+sent (and from the tick's start), each closing the commitment for the same
+stage, item and brief key. Between ticks, at most every 10 minutes, the
+station sends the new done markers to `/api/brain/commitments`, so work
+another brain finished closes without waiting for this machine's next tick.
+After a tick posts, the station loads the rules digest's sources that
+changed: the Rules section of `docs/MUSE.md`, keyed by the commit that last
+changed it, and each goal home's rules, keyed by its newest rules comment
+from an allowed login (one opening with a "Rules" or "Loom rules" heading),
+else by a digest of the body's Rules section. A source that no longer has
+rules (a closed goal, a removed section) is retired; `docs/MUSE.md` only
+when it was read. The ledger `state/station/brain_memory.json` keeps the
+last tick's result, where the sent done markers end, and the loaded rules; a
+failed tick post is tried on the next pass, 5 times in all.
+
+Before the agent starts, `lanes/mac/brain.sh` reads the handoff packet with
+`python3 -m bus.brain_memory handoff` (the token from the same SSM
+parameter) and puts it in the prompt. With either setting empty, or the
+dashboard down, the tick runs without it.
 
 ## Log watch
 
