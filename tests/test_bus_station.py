@@ -962,12 +962,60 @@ class TriageTest(Base):
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
 
-    def test_a_non_backlog_goal_is_never_triaged(self):
+    def test_a_goal_without_backlog_home_is_triaged(self):
         self.fake.add_goal(31, title="Ship the thing")
         self.fake.add_open_issue(102, body="It is slow.")
         self.run_at()
-        self.assertEqual(len(self.triage_reads()), 0)
-        self.assertEqual(self.fake.names(102), [])
+        self.assertEqual(len(self.triage_reads()), 1)
+        self.assertIn("loom:triage", self.fake.names(102))
+
+    def test_a_goal_without_backlog_home_is_triaged_and_rewritten(self):
+        self.fake.add_goal(31, title="Ship the thing")
+        self.fake.add_open_issue(102, body=READY_BODY)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
+            st.triage_backlogs()
+        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT,
+                                       comment_limit=5)
+        self.assertIn("loom:queued", self.fake.names(102))
+        triage_json = os.path.join(self.home, "state", "station", "triage.json")
+        with open(triage_json) as fh:
+            self.assertIn("%s#31" % REPO, json.load(fh))
+        with mock.patch.object(st, "_rewrite_goal", return_value=0) as rewrite_goal:
+            st.s.rewrite_cmd = "agent"
+            st.rewrite_triaged()
+        self.assertEqual(rewrite_goal.call_args.args[0:3], ("%s#31" % REPO, REPO, 31))
+        rewrite_json = os.path.join(self.home, "state", "station", "rewrite.json")
+        with open(rewrite_json) as fh:
+            self.assertIn("%s#31" % REPO, json.load(fh))
+
+    def test_fallback_goal_waits_at_three_queued_and_caps_not_ready_comments(self):
+        self.fake.add_goal(31, title="Ship the thing")
+        for number in range(100, 106):
+            self.fake.add_open_issue(number, body="It is slow.", created="2030-01-%02dT00:00:00Z" % (number - 90))
+        self.fake.add(90, state="queued")
+        self.fake.add(91, state="queued")
+        self.fake.add(92, state="queued")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        original_paginate = st.gh.paginate
+        with mock.patch.object(st.gh, "paginate", side_effect=lambda path: (
+                [{}, {}, {}] if "labels=loom:queued" in path else original_paginate(path))):
+            st.triage_backlogs()
+        self.assertEqual([p for p in self.fake.paths("POST") if p.endswith("/comments")], [])
+        self.fake.issues[92]["labels"] = [{"name": "loom:ticket"}]
+        state_path = os.path.join(self.home, "state", "station", "triage.json")
+        with open(state_path) as fh:
+            state = json.load(fh)
+        state["_scanned"] = self.start - station.TRIAGE_INTERVAL - 1
+        with open(state_path, "w") as fh:
+            json.dump(state, fh)
+        with mock.patch.object(st.gh, "paginate", side_effect=lambda path: (
+                [] if "labels=loom:queued" in path else original_paginate(path))):
+            st.triage_backlogs()
+        comments = [p for p in self.fake.paths("POST") if p.endswith("/comments")]
+        self.assertEqual(len(comments), 5)
 
     def test_below_the_budget_floor_triage_is_deferred(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
