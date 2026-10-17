@@ -1383,9 +1383,12 @@ def _is_epic(issue: Dict[str, Any]) -> bool:
             or int(summary.get("total") or 0) > 0)
 
 
-def _triage_skip(issue: Dict[str, Any]) -> Optional[str]:
+def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = ()) -> Optional[str]:
     if "pull_request" in issue:
         return "pull request"
+    if authors and tickets.owned_elsewhere(issue, authors):
+        # Another operator's Loom owns an issue assigned to them.
+        return "another operator's"
     names = _labels(issue)
     if any(name.startswith("loom:") for name in names) or "needs-operator" in names:
         return "already labelled"
@@ -1434,6 +1437,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
         raise ValueError("limit is at least 1")
     in_flight = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
+    authors = trusted_authors()
     lines: List[str] = []
     done = 0
     comments = 0
@@ -1441,7 +1445,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
         if done >= limit:
             break
         number = int(issue["number"])
-        skip = _triage_skip(issue)
+        skip = _triage_skip(issue, authors)
         if skip:
             continue
         missing = missing_sections(issue.get("body"))
@@ -1807,6 +1811,11 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
+    authors = trusted_authors()
+    owner = tickets.owned_elsewhere(issue, authors) if authors else None
+    if owner is not None and state in ("queued", "briefed", "running"):
+        raise ValueError("#%d is assigned to %s, another operator's; leave it to their Loom"
+                         % (number, owner))
     if state == "queued" and lane in REMOTE_LANES:
         _check_remote_queue(gh, repo, number, issue, lane)
     if lane is not None and state == "briefed":
