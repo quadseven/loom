@@ -300,7 +300,7 @@ EOF
 # that branch, so files the merge brought in are never stray. Returns 1 when
 # the check could not run, so a broken check never reads as a clean one.
 check_scope() {
-  STRAY_FILES="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check "$TREE" "$BASE" HEAD "$1" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})"
+  STRAY_FILES="$(timeout "$NET_TIMEOUT" env PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check "$TREE" "$BASE" HEAD "$1" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})"
 }
 
 # STRAY_FILES as one comma-separated line, at most ten names.
