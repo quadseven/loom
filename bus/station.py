@@ -4875,9 +4875,12 @@ class Station:
     def roll_source_pins(self) -> None:
         if self.s.roll_ship_docs:
             try:
-                roll_pin.run(self.gh, self.s.roll_ship_docs)
+                roll_pin.run(self.gh, self.s.roll_ship_docs, self.s.authors,
+                             self.s.review_check)
             except ValueError as err:
                 raise GitHubError("invalid roll ship document or pin: %s" % err) from err
+            except health.NotLooked as err:
+                raise GitHubError("roll family gate could not be read: %s" % err) from err
 
     def run_pass(self) -> None:
         self.finish_claims()

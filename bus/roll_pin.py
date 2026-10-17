@@ -7,7 +7,9 @@ import json
 import re
 from typing import Any
 from urllib.parse import quote
+from urllib.parse import urlsplit
 
+from . import brain, health
 from .github import GitHub
 
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -29,6 +31,10 @@ def specs_from_env(raw: str) -> list[dict[str, str]]:
         if not sep or not REPO.fullmatch(goal_repo) or not number.isdigit() \
                 or not REPO.fullmatch(item["repo"]) or not _path(item["path"]):
             raise ValueError("invalid roll ship document")
+        gate_url = item.get("gate_url")
+        if gate_url is not None and (not isinstance(gate_url, str) or
+                urlsplit(gate_url).scheme != "https" or not urlsplit(gate_url).hostname):
+            raise ValueError("roll gate_url must be an https URL")
     return data
 
 
@@ -291,7 +297,42 @@ def _update(gh: GitHub, goal: str, deploy: str, source: dict[str, Any],
     _post_build(gh, goal, deploy, pr, branch, revision, workflow)
 
 
-def run(gh: GitHub, documents: list[dict[str, str]]) -> None:
+def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
+               authors: list[str], review_check: str) -> None:
+    pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % deploy).data or []
+    pr = next((p for p in pulls if (p.get("head") or {}).get("ref") == _branch(spec["goal"])), None)
+    if pr is None:
+        return
+    gate = health.fetch(spec["gate_url"])
+    if not isinstance(gate, dict) or type(gate.get("open")) is not bool:
+        raise ValueError("roll family gate must answer with a boolean open field")
+    if not gate["open"]:
+        return
+    env = {"LOOM_BRIEF_AUTHORS": " ".join(authors), "LOOM_REVIEW_CHECK": review_check}
+    try:
+        brain.merge(gh, deploy, int(pr["number"]), adopt=True, env=env)
+    except ValueError:
+        _gate_alert(gh, spec["goal"], deploy, pr)
+
+
+def _gate_alert(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any]) -> None:
+    repo, number = goal.split("#", 1)
+    sha = str((pr.get("head") or {}).get("sha") or "")
+    if not SHA.fullmatch(sha):
+        raise ValueError("roll pin pull request has no head SHA")
+    marker = "<!-- loom:roll-gate pr=%d sha=%s -->" % (int(pr["number"]), sha)
+    path = "/repos/%s/issues/%s/comments" % (repo, number)
+    comments = gh.paginate(path)
+    if any(marker in str(comment.get("body") or "") for comment in comments):
+        return
+    body = ("<!-- loom:journal v1 -->\n%s\nFamily gate is open; source-pin pull "
+            "request %s#%d needs a brain merge review. Its merge checks or review "
+            "rules did not pass." % (marker, deploy, int(pr["number"])))
+    gh.rest("POST", path, {"body": body})
+
+
+def run(gh: GitHub, documents: list[dict[str, str]],
+        authors: list[str] | None = None, review_check: str = "") -> None:
     for spec in documents:
         text, _ = _content(gh, spec["repo"], spec["path"])
         manifest = _manifest(text)
@@ -303,3 +344,5 @@ def run(gh: GitHub, documents: list[dict[str, str]]) -> None:
                         revision, manifest["build_workflow"])
                 _merged_build(gh, spec["goal"], manifest["deployment_repo"],
                               revision, manifest["build_workflow"])
+        if spec.get("gate_url"):
+            _poll_gate(gh, spec, manifest["deployment_repo"], authors or [], review_check)

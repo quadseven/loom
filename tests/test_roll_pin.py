@@ -2,6 +2,7 @@
 import base64
 import json
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 
@@ -36,6 +37,11 @@ class FakeGitHub:
         self.build_ready = True
         self.build_sha = "e" * 40
 
+    def paginate(self, path):
+        if path == "/repos/example-owner/project/issues/12/comments":
+            return self.comments
+        raise AssertionError(path)
+
     def rest(self, method, path, body=None, ok=()):
         self.writes.append((method, path, body)) if method != "GET" else None
         if path == "/repos/%s/contents/%s" % ("example-owner/project", DOC):
@@ -64,7 +70,7 @@ class FakeGitHub:
             value = self.branch[file] if "?ref=" in path else self.base[file]
             return self.answer({"content": self.encoded(value), "sha": "file-sha"})
         if path == "/repos/%s/pulls" % DEPLOY and method == "POST":
-            self.pulls = [{"number": 8, "head": {"ref": body["head"]},
+            self.pulls = [{"number": 8, "head": {"ref": body["head"], "sha": "e" * 40},
                            "html_url": "https://github.com/%s/pull/8" % DEPLOY}]
             return self.answer(self.pulls[0])
         if path == "/repos/%s/pulls/8" % DEPLOY and method == "PATCH":
@@ -184,6 +190,48 @@ class RollPinTest(unittest.TestCase):
                                            '"build_workflow": "build-image.yml"')
         roll_pin.run(self.gh, self.specs)
         self.assertEqual(len(self.gh.comments), 1)
+
+    def test_open_family_gate_alerts_for_a_held_roll_pin_without_a_brain_tick(self):
+        self.merge(FIRST)
+        self.specs[0]["gate_url"] = "https://example.com/family-gate"
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": True}), \
+                mock.patch("bus.roll_pin.brain.merge", side_effect=ValueError("checks are not successful")) as merge:
+            station = Station(self.gh, Settings(home, [], [], [], roll_ship_docs=self.specs))
+            station.roll_source_pins()
+            station.roll_source_pins()
+        merge.assert_called()
+        alerts = [comment["body"] for comment in self.gh.comments
+                  if "Family gate is open" in comment["body"]]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("needs a brain merge review", alerts[0])
+
+    def test_closed_family_gate_leaves_roll_pin_held_without_alert(self):
+        self.merge(FIRST)
+        self.specs[0]["gate_url"] = "https://example.com/family-gate"
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": False}), \
+                mock.patch("bus.roll_pin.brain.merge") as merge:
+            station = Station(self.gh, Settings(home, [], [], [], roll_ship_docs=self.specs))
+            station.roll_source_pins()
+        merge.assert_not_called()
+        self.assertEqual(len(self.gh.pulls), 1)
+        self.assertFalse(any("Family gate is open" in c["body"] for c in self.gh.comments))
+
+    def test_open_family_gate_merges_a_reviewed_roll_pin_without_a_brain_tick(self):
+        self.merge(FIRST)
+        self.specs[0]["gate_url"] = "https://example.com/family-gate"
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": True}), \
+                mock.patch("bus.roll_pin.brain.merge", return_value={"merged": True}) as merge:
+            station = Station(self.gh, Settings(home, [], ["example-bot"], [],
+                                                roll_ship_docs=self.specs))
+            station.roll_source_pins()
+        merge.assert_called_once()
+        self.assertEqual(merge.call_args.args[1:3], (DEPLOY, 8))
+        self.assertTrue(merge.call_args.kwargs["adopt"])
+        self.assertEqual(merge.call_args.kwargs["env"]["LOOM_BRIEF_AUTHORS"], "example-bot")
+        self.assertFalse(any("Family gate is open" in c["body"] for c in self.gh.comments))
 
 
 if __name__ == "__main__":
