@@ -159,89 +159,95 @@ def _sort_key(row: Dict[str, Any], entered: Dict[str, Sequence[Any]]):
             str(row.get("repo")), int(row.get("number") or 0))
 
 
+def _counter(label: str, count: int, href: str, current: bool, state: str = "", extra: str = "") -> str:
+    return '<a class="chip tickets-counter%s" href="%s"%s>%s <b>%d</b>%s</a>' % (
+        " " + state if state else "", html.escape(href, quote=True),
+        ' aria-current="true"' if current else "", html.escape(label), count, extra)
+
+
+def _counters(live, finished, pick, done) -> str:
+    """The state counters: in flight, each in-flight state, Done with its
+    counts, and in the Done view each done state. Each one filters the table."""
+    base = {"goal": pick["goal"], "model": pick["model"]}
+    out = [_counter("in flight", len(live), _href(**base), not done and not pick["state"])]
+    out += [_counter(name, count, _href(state=name, **base), pick["state"] == name, "state-" + name)
+            for name in IN_FLIGHT for count in [sum(row.get("state") == name for row in live)] if count]
+    done_counts = [(name, sum(row.get("state") == name for row in finished)) for name in DONE]
+    closed = sum(row.get("state") not in DONE for row in finished)
+    detail = ", ".join("%s %d" % pair for pair in done_counts + [("closed", closed)] if pair[1])
+    out.append(_counter("Done", len(finished), _href(done="1", **base), done and not pick["state"], "tickets-done",
+                        "<small>%s</small>" % html.escape(detail) if detail else ""))
+    if done:
+        out += [_counter(name, count, _href(state=name, **base), pick["state"] == name, "state-" + name)
+                for name, count in done_counts if count]
+    return '<div class="tickets-counters" role="group" aria-label="Filter by state">%s</div>' % "".join(out)
+
+
+def _filter_bar(rows, pick, short_ref) -> str:
+    """The model filter (#533) and, when any filter is on, what it shows."""
+    esc = html.escape
+    models: Dict[str, int] = {}
+    for row in rows:
+        if row.get("run_model"):
+            models[row["run_model"]] = models.get(row["run_model"], 0) + 1
+    chips = "".join('<a class="chip" href="%s"%s>%s %d</a>' % (
+        esc(_href(model=model, done=pick["done"]), quote=True),
+        ' aria-current="true"' if model == pick["model"] else "", esc(model), count)
+        for model, count in sorted(models.items()))
+    active = [text for key, text in (("state", "state %s" % pick["state"]),
+                                     ("goal", "goal %s" % short_ref(pick["goal"])),
+                                     ("model", "model %s" % pick["model"])) if pick[key]]
+    bar = []
+    if chips:
+        bar.append('<details class="tickets-models"><summary>Filter by the model the last run used</summary>'
+                   '<div class="chips">%s</div></details>' % chips)
+    if active:
+        bar.append('<p class="tickets-active machine-fact">Showing %s. <a href="/tickets">Clear filters</a></p>'
+                   % esc(", ".join(active)))
+    return '<div class="tickets-bar">%s</div>' % "".join(bar) if bar else ""
+
+
+TABLE_HEAD = ('<colgroup><col><col class="c-state"><col class="c-model"><col class="c-age"><col class="c-pr">'
+              '</colgroup><thead><tr><th scope="col">Ticket</th><th scope="col">State</th>'
+              '<th scope="col">Lane / model</th><th scope="col">In state</th><th scope="col">PR</th></tr></thead>')
+
+
+def _group(goal, members, *, goal_titles, entered, now, ticket_href, short_ref, linked) -> str:
+    """One goal home's collapsible table."""
+    esc = html.escape
+    members = sorted(members, key=lambda row: _sort_key(row, entered))
+    title = goal_titles.get(goal) if goal != NO_GOAL else "Tickets with no Part of line"
+    link = ('<a class="tickets-goal-link" href="%s">only this goal</a>' % esc(_href(goal=goal), quote=True)
+            if linked and goal != NO_GOAL else "")
+    return ('<details class="tickets-group" open><summary><span class="machine-fact">%s</span>'
+            '<span class="tickets-group-title">%s</span>%s<span class="machine-fact tickets-count">%d</span></summary>'
+            '<table class="tickets-table">%s<tbody>%s</tbody></table></details>') % (
+        esc(short_ref(goal) if goal != NO_GOAL else NO_GOAL), esc(str(title or "")), link, len(members),
+        TABLE_HEAD, "".join(_row_html(row, entered, now, ticket_href, short_ref) for row in members))
+
+
 def render(rows: Sequence[Dict[str, Any]], params: Dict[str, List[str]], *,
            goal_titles: Dict[str, Optional[str]], entered: Dict[str, Sequence[Any]], now: float,
            ticket_href, short_ref) -> str:
     """The page body. Filters are query parameters: state, goal, model and
     done=1 (merged, shipped, verified and closed tickets instead of the ones
     in flight)."""
-    esc = html.escape
     pick = {key: (params.get(key) or [""])[0] for key in ("state", "goal", "model", "done")}
     done = pick["done"] == "1" or pick["state"] in DONE
     scoped = [row for row in rows if (not pick["goal"] or row.get("goal") == pick["goal"])
               and (not pick["model"] or row.get("run_model") == pick["model"])]
     live = [row for row in scoped if not _is_done(row)]
     finished = [row for row in scoped if _is_done(row)]
-    base = {"goal": pick["goal"], "model": pick["model"]}
-
-    counters = ['<a class="chip tickets-counter" href="%s"%s>in flight <b>%d</b></a>' % (
-        esc(_href(**base), quote=True), ' aria-current="true"' if not done and not pick["state"] else "", len(live))]
-    for name in IN_FLIGHT:
-        count = sum(row.get("state") == name for row in live)
-        if count:
-            counters.append('<a class="chip tickets-counter state-%s" href="%s"%s>%s <b>%d</b></a>' % (
-                name, esc(_href(state=name, **base), quote=True),
-                ' aria-current="true"' if pick["state"] == name else "", name, count))
-    done_counts = [(name, sum(row.get("state") == name for row in finished)) for name in DONE]
-    closed = sum(row.get("state") not in DONE for row in finished)
-    detail = ", ".join("%s %d" % pair for pair in done_counts + [("closed", closed)] if pair[1])
-    counters.append('<a class="chip tickets-counter tickets-done" href="%s"%s>Done <b>%d</b>%s</a>' % (
-        esc(_href(done="1", **base), quote=True), ' aria-current="true"' if done and not pick["state"] else "",
-        len(finished), '<small>%s</small>' % esc(detail) if detail else ""))
-    if done:
-        for name, count in done_counts:
-            if count:
-                counters.append('<a class="chip tickets-counter state-%s" href="%s"%s>%s <b>%d</b></a>' % (
-                    name, esc(_href(state=name, **base), quote=True),
-                    ' aria-current="true"' if pick["state"] == name else "", name, count))
-
-    shown = finished if done else live
-    if pick["state"]:
-        shown = [row for row in shown if row.get("state") == pick["state"]]
-
-    models: Dict[str, int] = {}
-    for row in rows:
-        if row.get("run_model"):
-            models[row["run_model"]] = models.get(row["run_model"], 0) + 1
-    model_chips = "".join('<a class="chip" href="%s"%s>%s %d</a>' % (
-        esc(_href(model=model, done=pick["done"]), quote=True),
-        ' aria-current="true"' if model == pick["model"] else "", esc(model), count)
-        for model, count in sorted(models.items()))
-    active = [text for text in (
-        "state %s" % pick["state"] if pick["state"] else "", "goal %s" % short_ref(pick["goal"]) if pick["goal"] else "",
-        "model %s" % pick["model"] if pick["model"] else "") if text]
-    parts = ['<div class="tickets-counters" role="group" aria-label="Filter by state">%s</div>' % "".join(counters)]
-    bar = []
-    if model_chips:
-        bar.append('<details class="tickets-models"><summary>Filter by the model the last run used</summary>'
-                   '<div class="chips">%s</div></details>' % model_chips)
-    if active:
-        bar.append('<p class="tickets-active machine-fact">Showing %s. <a href="/tickets">Clear filters</a></p>'
-                   % esc(", ".join(active)))
-    if bar:
-        parts.append('<div class="tickets-bar">%s</div>' % "".join(bar))
+    shown = [row for row in (finished if done else live) if not pick["state"] or row.get("state") == pick["state"]]
+    parts = [_counters(live, finished, pick, done), _filter_bar(rows, pick, short_ref)]
     if not shown:
         parts.append('<div class="empty-state"><p>No tickets match these filters.</p>'
                      '<a class="chip" href="/tickets">Clear filters</a></div>')
         return '<section class="tickets-view">%s</section>' % "".join(parts)
-
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for row in shown:
         groups.setdefault(row.get("goal") or NO_GOAL, []).append(row)
-    order = sorted(groups, key=lambda goal: (goal == NO_GOAL, -len(groups[goal]), goal))
-    head = ('<thead><tr><th scope="col">Ticket</th><th scope="col">State</th><th scope="col">Lane / model</th>'
-            '<th scope="col">In state</th><th scope="col">PR</th></tr></thead>')
-    for goal in order:
-        members = sorted(groups[goal], key=lambda row: _sort_key(row, entered))
-        title = goal_titles.get(goal) if goal != NO_GOAL else "Tickets with no Part of line"
-        label = short_ref(goal) if goal != NO_GOAL else NO_GOAL
-        link = ('<a class="tickets-goal-link" href="%s">only this goal</a>' % esc(_href(goal=goal), quote=True)
-                if goal != NO_GOAL and not pick["goal"] else "")
-        parts.append(
-            '<details class="tickets-group" open><summary><span class="machine-fact">%s</span>'
-            '<span class="tickets-group-title">%s</span>%s<span class="machine-fact tickets-count">%d</span></summary>'
-            '<table class="tickets-table"><colgroup><col><col class="c-state"><col class="c-model">'
-            '<col class="c-age"><col class="c-pr"></colgroup>%s<tbody>%s</tbody></table></details>' % (
-                esc(label), esc(str(title or "")), link, len(members), head,
-                "".join(_row_html(row, entered, now, ticket_href, short_ref) for row in members)))
+    for goal in sorted(groups, key=lambda goal: (goal == NO_GOAL, -len(groups[goal]), goal)):
+        parts.append(_group(goal, groups[goal], goal_titles=goal_titles, entered=entered, now=now,
+                            ticket_href=ticket_href, short_ref=short_ref, linked=not pick["goal"]))
     return '<section class="tickets-view">%s</section>' % "".join(parts)
