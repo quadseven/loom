@@ -56,15 +56,22 @@ def issue_ref(comment: Dict[str, Any]) -> Optional[str]:
     return "%s#%s" % match.groups() if match else None
 
 
-def parent_of(repo: str, issue: Dict[str, Any]) -> Optional[str]:
+def parent_of(repo: str, issue: Dict[str, Any],
+              repos: Optional[Iterable[str]] = None) -> Optional[str]:
     """The goal a goal home rolls up into: its `Parent goal: OWNER/NAME#N`
     body line (a bare `#N` is in the same repo), else its GitHub sub-issue
-    parent (`parent_issue_url`). None for a top-level goal."""
+    parent (`parent_issue_url`). None for a top-level goal, and, with
+    `repos`, for a parent in any repo not listed there."""
+    parent = None
     match = _PARENT_LINE.search(str(issue.get("body") or ""))
     if match:
-        return "%s#%s" % (match.group(1) or repo, match.group(2))
-    match = _ISSUE_URL.search(str(issue.get("parent_issue_url") or ""))
-    return "%s#%s" % match.groups() if match else None
+        parent = "%s#%s" % (match.group(1) or repo, match.group(2))
+    else:
+        match = _ISSUE_URL.search(str(issue.get("parent_issue_url") or ""))
+        parent = "%s#%s" % match.groups() if match else None
+    if parent and repos is not None and parent.partition("#")[0] not in set(repos):
+        return None
+    return parent
 
 
 def rollup(goals: Iterable[str], parents: Dict[str, Optional[str]]) -> Dict[str, List[str]]:

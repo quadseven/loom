@@ -399,5 +399,75 @@ class StoreGoals(unittest.TestCase):
         self.assertIn("request budget is below its floor", self.store.response()["goal_context_error"])
 
 
+class GoalSourcesAreTrusted(unittest.TestCase):
+    """Only configured authors and configured repos shape the goal cards."""
+
+    def store(self, home_comments=(), goal_41_body="## Why\nx", extra_issues=None, env=None):
+        base = {key: "" for key in ("LOOM_IMPROVEMENT_HOMES", "LOOM_STATUS_REPO", "LOOM_METRICS_GOAL",
+                                    "LOOM_BRIEF_AUTHORS", "LOOM_BACKLOG_SOURCE")}
+        base.update(env or {})
+        patcher = unittest.mock.patch.dict(os.environ, base)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        from dashboard.github import TicketStore
+        stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tickets = [{"number": n, "title": "Ticket %d" % n, "state": "open", "created_at": stamp,
+                    "body": "Part of #%d\n\n## Why\nx" % goal,
+                    "labels": [{"name": "loom:ticket"}, {"name": "loom:running"}]}
+                   for n, goal in ((7, 30), (8, 41))]
+        issues = {"/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx"},
+                  "/repos/%s/issues/41" % REPO: {"number": 41, "title": "Smaller goal", "body": goal_41_body}}
+        issues.update(extra_issues or {})
+        gh = FakeGitHub({"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets,
+                         "/repos/%s/issues/30/comments" % REPO: list(home_comments)}, issues)
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+        store.refresh()
+        return store, gh
+
+    @staticmethod
+    def home_comment(cid, login, body, at):
+        return {"id": cid, "user": {"login": login}, "body": body, "created_at": at,
+                "issue_url": "https://api.github.com/repos/%s/issues/30" % REPO}
+
+    def test_a_report_shaped_comment_from_an_untrusted_login_does_not_change_the_last_report(self):
+        comments = [
+            self.home_comment(1, "station", "<!-- loom:report v1 -->\nReal standup.", "2026-10-17T10:00:00Z"),
+            self.home_comment(2, "stranger", "<!-- loom:report v1 -->\nForged standup.\n- Measure: forged",
+                              "2026-10-17T11:00:00Z"),
+            self.home_comment(3, "stranger", "<!-- loom:metrics v1 -->\n2026-10-17: 9/9 pass; streak 9",
+                              "2026-10-17T11:00:00Z")]
+        store, _ = self.store(comments, env={"LOOM_BRIEF_AUTHORS": "station",
+                                             "LOOM_IMPROVEMENT_HOMES": REPO + "#30",
+                                             "LOOM_METRICS_GOAL": REPO + "#30"})
+        card = store.response()["goal_context"][REPO + "#30"]
+        self.assertEqual(card["report"], "Real standup.")
+        self.assertEqual(card["report_time"], "2026-10-17T10:00:00Z")
+        self.assertIsNone(card["measure"])
+        self.assertNotEqual(card["metric"], "9/9")
+        self.assertNotIn("Forged standup.", server._goals(store))
+
+    def test_a_parent_line_naming_a_repo_outside_the_configured_list_is_ignored_and_never_read(self):
+        store, gh = self.store(goal_41_body="Parent goal: other-owner/elsewhere#5")
+        self.assertFalse([path for path in gh.calls if "other-owner/elsewhere" in path])
+        self.assertIsNone(store.response()["goal_context"][REPO + "#41"]["parent"])
+        self.assertEqual(len(cards(server._goals(store))), 2)
+
+    def test_a_parent_that_is_not_a_goal_home_is_ignored(self):
+        store, _ = self.store(goal_41_body="Parent goal: #50", extra_issues={
+            "/repos/%s/issues/50" % REPO: {"number": 50, "title": "Plain issue", "body": "", "labels": []}})
+        self.assertIsNone(store.response()["goal_context"][REPO + "#41"]["parent"])
+        self.assertEqual(len(cards(server._goals(store))), 2)
+
+    def test_a_parent_labelled_as_a_goal_home_is_followed(self):
+        store, _ = self.store(goal_41_body="Parent goal: #50", extra_issues={
+            "/repos/%s/issues/50" % REPO: {"number": 50, "title": "Big goal", "body": "",
+                                           "labels": [{"name": "loom:goal"}]}})
+        found = cards(server._goals(store))
+        self.assertEqual(len(found), 2)
+        big = next(card for card in found if "Big goal" in card)
+        self.assertIn("Smaller goal", big[big.index("goal-children"):])
+
+
 if __name__ == "__main__":
     unittest.main()

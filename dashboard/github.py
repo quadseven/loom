@@ -262,7 +262,15 @@ class TicketStore:
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
         rows = [row for found in data.get("tickets", {}).values() if found for row in found]
-        titles, parents = self._goal_info(rows)
+        configured = set(self.repos) | {repo for repo, _ in homes}
+        titles, parents = self._goal_info(rows, configured)
+        # The comment feed keeps only LOOM_BRIEF_AUTHORS logins when that is
+        # set; the goal-home reads get the same filter before they reach the
+        # goal cards, so a report-shaped comment from anyone else cannot set
+        # a goal's last report, measure or factory number.
+        trusted = {login.lower() for login in brain.trusted_authors()}
+        reports = [c for c in reports if _by_trusted(c, trusted)]
+        metric_comments = [c for c in metric_comments if _by_trusted(c, trusted)]
         # Reports on the goal homes read in full above count too: a goal home
         # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
         # comment feed failed this pass.
@@ -277,15 +285,23 @@ class TicketStore:
             parents=parents, unread=unread)
         data["goal_context_error"] = ""
 
-    def _goal_info(self, rows) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+    def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
         """Each goal home's title and the goal it rolls up into (a `Parent
         goal:` line or a sub-issue parent), read for every goal the tickets
         name and every parent above them. A goal home is read again after
         GOAL_INFO_TTL (a parent line can be added at any time; a conditional
         read of an unchanged issue costs no request budget); an unreadable
-        one stays None and is read again next pass."""
+        one stays None and is read again next pass.
+
+        A parent counts only in a repo the dashboard is configured for
+        (`configured`: LOOM_REPOS and the goal-home repos), and only when it is
+        itself a goal home: a goal the tickets name, or an issue labelled
+        loom:goal. Any other parent is never read, and the goal stays
+        top-level."""
+        configured = set(self.repos) if configured is None else set(configured)
         cache = self.__dict__.setdefault("_goal_info_cache", {})
-        pending = sorted({row["goal"] for row in rows if row.get("goal")})
+        named = {row["goal"] for row in rows if row.get("goal")}
+        pending = sorted(named)
         seen = set()
         now = time.time()
         while pending and len(seen) < GOAL_INFO_MAX:
@@ -295,15 +311,21 @@ class TicketStore:
             seen.add(goal)
             entry = cache.get(goal)
             if not entry or not entry.get("title") or now - entry.get("read_at", 0) >= GOAL_INFO_TTL:
-                entry = self._read_goal_home(goal, entry, now)
+                entry = self._read_goal_home(goal, entry, now, configured)
                 cache[goal] = entry
             if entry.get("parent") and entry["parent"] not in seen:
                 pending.append(entry["parent"])
+
+        def accepted(parent):
+            if not parent or parent.partition("#")[0] not in configured:
+                return None
+            return parent if parent in named or (cache.get(parent) or {}).get("is_goal") else None
+
         titles = {goal: entry.get("title") for goal, entry in cache.items()}
-        parents = {goal: entry.get("parent") for goal, entry in cache.items()}
+        parents = {goal: accepted(entry.get("parent")) for goal, entry in cache.items()}
         return titles, parents
 
-    def _read_goal_home(self, goal, entry, now):
+    def _read_goal_home(self, goal, entry, now, configured):
         repo, _, number = goal.partition("#")
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
@@ -311,9 +333,10 @@ class TicketStore:
             # Keep what an earlier read found; try again next pass.
             return dict(entry or {}, read_at=0)
         if not isinstance(issue, dict):
-            return {"title": None, "parent": None, "read_at": 0}
+            return {"title": None, "parent": None, "is_goal": False, "read_at": 0}
         return {"title": str(issue.get("title") or "") or None,
-                "parent": goals.parent_of(repo, issue), "read_at": now}
+                "parent": goals.parent_of(repo, issue, configured),
+                "is_goal": "loom:goal" in _label_names(issue), "read_at": now}
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
@@ -352,8 +375,7 @@ class TicketStore:
         issues, reviews = [], []
         try:
             found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and (
-                not trusted or str((c.get("user") or {}).get("login") or "").lower() in trusted)]
+            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
             found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
             reviews = [dict(c, repo=repo) for c in found if isinstance(c, dict)]
         except (GitHubError, OSError, ValueError) as exc:
@@ -520,6 +542,12 @@ class TicketStore:
                 "review_comments": snapshot.get("review_comments", []),
                 "hot_spots_error": snapshot.get("hot_spots_error", "the dashboard has not read its sources yet"),
                 "usage": usage_rows}
+
+
+def _by_trusted(comment: Dict[str, Any], trusted) -> bool:
+    """Whether a comment counts: any author when no LOOM_BRIEF_AUTHORS is set,
+    else only those logins (as the comment feed reads them)."""
+    return not trusted or str((comment.get("user") or {}).get("login") or "").lower() in trusted
 
 
 def journal_next(body: str) -> Optional[str]:
