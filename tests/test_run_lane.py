@@ -103,6 +103,21 @@ if [ "$1 $2" = "pr create" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY"; shift; done
   echo "https://github.com/example/repo/pull/7"
 fi
+# Fake factory incidents: `search issues` prints $FAKE_GH_SEARCH (default
+# empty: no open incident), `issue create` prints the new issue's URL,
+# `issue comment` succeeds silently.
+if [ "$1 $2" = "search issues" ]; then
+  printf '%s\n' "${FAKE_GH_SEARCH:-}"
+  exit 0
+fi
+if [ "$1 $2" = "issue create" ]; then
+  [ -z "${FAKE_GH_ISSUE_CREATE_FAIL:-}" ] || { echo "issue create blew up" >&2; exit 1; }
+  echo "https://github.com/quadseven/loom/issues/${FAKE_GH_ISSUE_NUMBER:-99}"
+  exit 0
+fi
+if [ "$1 $2" = "issue comment" ]; then
+  exit 0
+fi
 """
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
@@ -2964,6 +2979,88 @@ exit %d
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
         self.assertIn("setup failed: .loom/validation.conf has an unknown line 'python: 3.12'", self.lane_log())
+
+    def test_a_pipe_form_contract_line_is_not_an_unknown_line(self):
+        # infra-public's form: one "<kind> | <command>" line per command.
+        self.contract_repo(contract="lint | python3 check.py\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertNotIn("unknown line", self.lane_log())
+
+    def test_a_contract_the_parser_rejects_is_a_factory_incident_not_work(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+        # The incident names the repo and the exact failing line.
+        calls = self.log.read_text()
+        self.assertIn("gh issue create --repo quadseven/loom", calls)
+        self.assertIn("Repo: example/repo", calls)
+        self.assertIn("python: 3.12", calls)
+
+    def test_a_repeated_factory_incident_updates_the_open_issue(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        # The fake gh prints $FAKE_GH_SEARCH verbatim for `search issues`;
+        # real gh returns the open incident's number through the --jq filter.
+        result = self.run_contract_lane(FAKE_GH_SEARCH="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("factory incident quadseven/loom#7", self.lane_log())
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+        self.assertTrue(any(c.startswith("gh issue comment") for c in self.calls()))
+
+    def test_a_failed_incident_filing_still_parks_as_factory(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(FAKE_GH_ISSUE_CREATE_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertIn("factory incident filing failed", log)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_base_check_that_is_already_red_is_a_factory_incident(self):
+        contract = ("interpreter: loom-test-python\n"
+                    "check: loom-test-python -c 'import sys; sys.exit(2)'\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("base check exited 2", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+        calls = self.log.read_text()
+        self.assertIn("Repo: example/repo", calls)
+        self.assertIn("exit 2", calls)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_final_check_the_environment_cannot_run_is_a_factory_incident(self):
+        # The baseline passes; the check's binary is gone by the final run.
+        contract = ("interpreter: loom-test-python\n"
+                    "check: test ! -f fix.txt || loom-test-python-missing\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("validation environment unavailable: the check exited 127", log)
 
     def test_a_contract_command_with_a_control_or_non_ascii_byte_is_a_setup_failure(self):
         self.contract_repo(contract=CONTRACT + "setup: true\x1b[2K; echo hidden\n")
