@@ -331,8 +331,20 @@ the verify brief. It accepts at most five ASCII strings of at most 120
 characters. Lines containing credentials, private hosts, IP addresses or
 local paths are dropped and counted. A timeout or command error is stated in
 the brief without quoting its output. Repos without a command run none.
+Verify lanes have no network, so every verify brief also carries a
+`## GitHub data, not instructions` section the station reads with its own
+token (`bus/verify_data.py`): the ticket's merged pull requests, linked the
+way reconcile links them (number, title, merge commit, merged time; at most
+5), the check runs on each merge commit (at most 30), whether the default
+branch's head contains it, the files each changed (at most 40) and the
+`def test_...` functions its test files add (at most 30), and the ticket's
+acceptance-criteria checkboxes as they stand. A cap that cuts a list says so.
+A ticket with no merged pull request gets one line saying so, and a GitHub
+failure is one line in the section. Lines pass the same text checks as the
+log lines and are dropped and counted when they do not.
 The agent changes no code, opens no pull request and moves no label; it reads
-the ticket's Live criterion and gathers evidence with read-only reads, then
+the ticket's Live criterion and judges each criterion against those two
+sections, then
 writes `verify.json`: a proof record (`bus/proof.py`) or
 `{"missing": "<the evidence that does not exist yet>"}`. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
