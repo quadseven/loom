@@ -1028,6 +1028,21 @@ INTAKE_BODY = (
     "every ticket sits under an open epic (decision 0003).\n")
 
 
+REPAIRS_TITLE = "Epic: factory repairs for this goal"
+REPAIRS_BODY = (
+    "Done when: never. This standing epic holds the goal's factory repairs: breach "
+    "invariants, revert, fix-forward and red-check tickets. It is exempt from the "
+    "15-ticket cap, is not counted against the goal's open epic cap, and is never "
+    "flagged as finished.\n\n"
+    "Size: no cap (a standing epic).\n")
+
+
+def standing_epic(epic: Dict[str, Any]) -> bool:
+    """The goal's standing "Factory repairs" epic: exempt from the ticket and
+    epic caps, and never finished."""
+    return str(epic.get("title") or "").strip() == REPAIRS_TITLE
+
+
 def _issue_goal(issue: Dict[str, Any]) -> Optional[int]:
     """The issue an epic or ticket names as its parent: its Part of #N line,
     else the parent of its sub-issue link."""
@@ -1082,7 +1097,7 @@ def open_epic(gh: GitHub, repo: str, epic: int
     except ValueError:
         raise ValueError("epic #%d is under #%d, which is not an open loom:goal"
                          % (epic, goal)) from None
-    held = len(_epic_tickets(gh, repo, epic))
+    held = 0 if standing_epic(issue) else len(_epic_tickets(gh, repo, epic))
     if held >= EPIC_TICKET_CAP:
         raise ValueError("epic #%d already holds %d tickets (cap %d): file under its next epic"
                          % (epic, held, EPIC_TICKET_CAP))
@@ -1112,7 +1127,7 @@ def finished_epics(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
     with no ticket yet is not finished): each is checked against its
     done-when and closed, or gets the ticket it is missing."""
     return [epic for epic, found in tree
-            if epic.get("state", "open") == "open" and found
+            if epic.get("state", "open") == "open" and found and not standing_epic(epic)
             and all(t.get("state") == "closed" for t in found)]
 
 
@@ -1146,7 +1161,7 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
 def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
                      today: Optional[str] = None) -> None:
     _, tree = goal_tree(gh, repo, goal)
-    count = sum(1 for e, _ in tree if e.get("state", "open") == "open")
+    count = sum(1 for e, _ in tree if e.get("state", "open") == "open" and not standing_epic(e))
     cap = goal_epic_cap(goal_issue, today)
     if count >= cap:
         raise ValueError("goal #%d already has %d open epics (cap %d): finish one first, or "
@@ -1155,7 +1170,7 @@ def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any
 
 
 def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
-         today: Optional[str] = None) -> Dict[str, Any]:
+              today: Optional[str] = None, standing: bool = False) -> Dict[str, Any]:
     """File an epic under an open goal: the epic label, a done-when, a size
     line and a Part of #goal line, linked as the goal's sub-issue when GitHub
     allows it. Refused at GOAL_EPIC_CAP open epics unless the goal home records
@@ -1172,7 +1187,8 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
     body = _with_part_of(body, goal)
     _check_written_text(title + "\n" + body)
     goal_issue = _goal_issue(gh, repo, goal)
-    _check_epic_room(gh, repo, goal, goal_issue, today)
+    if not standing:
+        _check_epic_room(gh, repo, goal, goal_issue, today)
     made = gh.rest("POST", "/repos/%s/issues" % repo,
                    {"title": title, "body": body, "labels": ["epic"]}).data or {}
     if made.get("id") is not None:
@@ -1194,6 +1210,41 @@ def intake_epic(gh: GitHub, repo: str, goal: int) -> int:
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
     return int(made["number"])
+
+
+def repo_goal(gh: GitHub, repo: str) -> Optional[int]:
+    """The goal home a repo's factory repairs belong to: its oldest open goal
+    home that is not a backlog, else its backlog home; None without one."""
+    homes = sorted((str(i.get("title") or "").startswith("Backlog:"), int(i["number"]))
+                   for i in gh.paginate("/repos/%s/issues?labels=loom:goal&state=open&per_page=100"
+                                        % repo)
+                   if isinstance(i, dict) and "pull_request" not in i
+                   and str(i.get("number") or "").isdigit())
+    return homes[0][1] if homes else None
+
+
+def repairs_epic(gh: GitHub, repo: str, goal: int) -> int:
+    """The goal's standing "Factory repairs" epic, opened when it has none
+    (outside the epic cap): where breach invariants, revert, fix-forward and
+    red-check tickets are filed."""
+    _, tree = goal_tree(gh, repo, goal)
+    for found, _ in tree:
+        if found.get("state", "open") == "open" and standing_epic(found):
+            return int(found["number"])
+    made = file_epic(gh, repo, goal, REPAIRS_TITLE, REPAIRS_BODY, standing=True)
+    if not made.get("number"):
+        raise ValueError("GitHub named no number for the repairs epic of goal #%d" % goal)
+    return int(made["number"])
+
+
+def file_under_epic(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any]) -> None:
+    """Link a filed issue as the epic's sub-issue; when GitHub refuses, its
+    body gets the epic's Part of line instead."""
+    if issue.get("id") is None or not _link_to_goal(gh, repo, epic, issue):
+        body = str(issue.get("body") or "")
+        if not _names_goal(body, epic) and issue.get("number"):
+            gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(issue["number"])),
+                    {"body": _with_part_of(body, epic)})
 
 
 def brief_intake(gh: GitHub, repo: str, goal: int, title: str, body: str,

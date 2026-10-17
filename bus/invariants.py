@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
+from . import brain
 from . import text as _text
 from . import watch
 from .github import GitHubError
@@ -122,6 +123,9 @@ class EpicShape(NamedTuple):
     open: bool
     tickets: int
     open_tickets: Tuple[Ref, ...]
+    # The goal's standing "Factory repairs" epic: no ticket cap, and not
+    # counted against the goal's open epic cap.
+    standing: bool = False
 
 
 class GoalShape(NamedTuple):
@@ -375,7 +379,8 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                     "and more work goes into a next epic" % (
                         epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
                    f.now)
-            for shape in f.shapes for epic in shape.epics if epic.tickets > EPIC_TICKETS]
+            for shape in f.shapes for epic in shape.epics
+            if epic.tickets > EPIC_TICKETS and not epic.standing]
 
 
 def goal_epics_over_cap(f: Facts) -> List[Breach]:
@@ -385,7 +390,7 @@ def goal_epics_over_cap(f: Facts) -> List[Breach]:
         return []
     out = []
     for shape in f.shapes:
-        opened = [e.epic for e in shape.epics if e.open]
+        opened = [e.epic for e in shape.epics if e.open and not e.standing]
         if len(opened) > shape.cap:
             out.append(Breach("goal-epics-over-cap", shape.goal.key,
                               "Goal home %s has %d open epics (cap %d)"
@@ -545,6 +550,18 @@ class Filer:
     def _evidence(self, b: Breach) -> List[str]:
         return ["- " + _checked(line) for line in b.evidence]
 
+    def _home(self) -> int:
+        """Where breaches are filed: the goal's standing repairs epic, or the
+        goal home itself when the epic cannot be read or opened."""
+        if getattr(self, "_repairs", None) is None:
+            try:
+                self._repairs = brain.repairs_epic(self.gh, self.repo, self.goal)
+            except (GitHubError, ValueError, KeyError) as err:
+                self.say("invariants: filing under goal #%d, no repairs epic: %s"
+                         % (self.goal, err))
+                self._repairs = self.goal
+        return self._repairs
+
     def _body(self, b: Breach) -> str:
         return "\n".join(
             [MARKER % b.key,
@@ -553,7 +570,7 @@ class Filer:
             ["", "Invariant: `%s` (bus/invariants.py), checked every station pass. Filed "
                  "without a model: this says what broke, not why. Rewrite it as a ticket "
                  "that fixes the cause." % b.invariant,
-             "", "Part of #%d" % self.goal])
+             "", "Part of #%d" % self._home()])
 
     def _file(self, b: Breach) -> None:
         title = b.title
@@ -565,13 +582,13 @@ class Filer:
         number = int(made["number"])
         self.state[b.key] = number
         try:
-            self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, self.goal),
+            self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, self._home()),
                          {"sub_issue_id": made["id"]})
         except (GitHubError, KeyError) as err:
-            # A goal at GitHub's sub-issue limit refuses it; the Part of line
-            # still names the goal.
+            # A refused link (a goal at GitHub's sub-issue limit): the Part
+            # of line still names where it belongs.
             self.say("invariants: %s#%d is linked to #%d by its Part of line only: %s"
-                     % (self.repo, number, self.goal, err))
+                     % (self.repo, number, self._home(), err))
         self.say("invariants: filed %s#%d: %s" % (self.repo, number, title))
 
     def _reopen(self, b: Breach, number: int) -> None:

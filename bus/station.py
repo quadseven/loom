@@ -3769,10 +3769,17 @@ class Station:
         # _goal_issues keeps only objects with numeric issue numbers; a read
         # failure reaches _send_digest as GitHubError before any page is posted.
         goals = {int(g["number"]): g for g in self._goal_issues(repo)}
+        epic_goals: Optional[Dict[int, int]] = None
         groups: Dict[Optional[int], List[Dict[str, Any]]] = {}
         for issue in issues:
             refs = [int(n) for n in ASK_GOAL_REF_RE.findall(str(issue.get("body") or ""))]
             goal = next((n for n in refs if n in goals), None)
+            if goal is None and refs:
+                # An ask may name an epic: it goes under that epic's goal.
+                if epic_goals is None:
+                    epic_goals = self._epic_goals(repo)
+                goal = next((epic_goals[n] for n in refs
+                             if epic_goals.get(n) in goals), None)
             groups.setdefault(goal, []).append(issue)
         out = [DIGEST_MARKER, "Asks waiting for the operator on %s: %d in this repo."
                % (today, len(issues))]
@@ -3786,6 +3793,18 @@ class Station:
                                   " ".join(str(i.get("title") or "").split()).replace("@", "@\u200b"))
                     for i in groups[goal]]
         return "\n".join(out)
+
+    def _epic_goals(self, repo: str) -> Dict[int, int]:
+        """epic number -> the goal its Part of line or sub-issue parent names,
+        for the repo's epics (one conditional list read)."""
+        found: Dict[int, int] = {}
+        for item in self.gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
+            if isinstance(item, dict) and "pull_request" not in item \
+                    and str(item.get("number") or "").isdigit():
+                goal = brain._issue_goal(item)
+                if goal is not None:
+                    found[int(item["number"])] = goal
+        return found
 
     @staticmethod
     def _digest_head(plan: Dict[str, Any]) -> str:
@@ -4602,7 +4621,8 @@ class Station:
                         and "loom:ticket" in _label_names(i))
         epics = tuple(invariants.EpicShape(
             ref(epic), epic.get("state", "open") == "open", len(found),
-            tuple(ref(t) for t in found if t.get("state") != "closed"))
+            tuple(ref(t) for t in found if t.get("state") != "closed"),
+            brain.standing_epic(epic))
             for epic, found in tree)
         return invariants.GoalShape(self._invariant_ref(repo, number),
                                     brain.goal_epic_cap(goal), epics, outside)

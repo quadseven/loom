@@ -261,7 +261,39 @@ class Reverts:
         self._briefed: List[str] = []
         self._forwarded: Dict[str, float] = {}
         self._check_tickets: List[str] = []
+        # repo -> its goal's standing repairs epic (None: no goal, or unread).
+        self._repairs: Dict[str, Optional[int]] = {}
         self._load()
+
+    # -- where repairs are filed -----------------------------------------
+    def _repairs_epic(self, repo: str) -> Optional[int]:
+        """The repo goal's standing "Factory repairs" epic, read once a pass;
+        None when the repo has no goal home or it cannot be read, and the
+        ticket is then filed with no parent, as before."""
+        if repo not in self._repairs:
+            try:
+                goal = brain.repo_goal(self.gh, repo)
+                self._repairs[repo] = (brain.repairs_epic(self.gh, repo, goal)
+                                       if goal is not None else None)
+            except (GitHubError, ValueError, KeyError) as err:
+                _say("%s: no repairs epic for its repair tickets: %s" % (repo, err))
+                self._repairs[repo] = None
+        return self._repairs[repo]
+
+    def _file_repair(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """File a revert, fix-forward or red-check ticket under the goal's
+        repairs epic (its sub-issue, named by its Part of line)."""
+        epic = self._repairs_epic(repo)
+        if epic is not None:
+            payload = dict(payload, body=brain._with_part_of(str(payload["body"]), epic))
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, payload).data or {}
+        if epic is not None and isinstance(made, dict):
+            try:
+                brain.file_under_epic(self.gh, repo, epic, dict(made, body=payload["body"]))
+            except GitHubError as err:
+                _say("%s#%s: filed, but not linked under repairs epic #%d: %s"
+                     % (repo, made.get("number"), epic, err))
+        return made if isinstance(made, dict) else {}
 
     # -- the decision ledger ---------------------------------------------
     def _path(self) -> str:
@@ -506,10 +538,10 @@ class Reverts:
         title = "Fix main after merge %s: %s" % (sha[:12],
                  " ".join(str(pr.get("title") or "").split()))
         brain._check_written_text(title + "\n" + body)
-        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+        made = self._file_repair(repo, {
             "title": title, "body": body,
             "labels": ["loom:ticket", "loom:briefed", "lane:" + lane, CLASS_LABEL],
-        }).data or {}
+        })
         follow_up = int(made.get("number") or 0)
         self._forwarded["%s:%s" % (repo, sha)] = self.now
         note = "Fix-forward ticket #%d is briefed on lane %s for red merge %s." % (
@@ -561,8 +593,7 @@ class Reverts:
                 % (difficulty or "easy", _failing(names), sha[:12], branch))
         title = "Fix pre-existing red check: %s" % ", ".join(names)
         brain._check_written_text(title + "\n" + body)
-        self.gh.rest("POST", "/repos/%s/issues" % repo,
-                     {"title": title, "body": body, "labels": labels})
+        self._file_repair(repo, {"title": title, "body": body, "labels": labels})
         self._check_tickets.append(key)
         self._decide(repo, "%s is red at %s; %s already red before the merge; factory ticket filed"
                      % (branch, sha[:12], ", ".join(names)))
@@ -614,10 +645,10 @@ class Reverts:
         body = self._body(branch, sha, pr, names, red_since, difficulty, number)
         full_title = "Revert %s: %s" % (short, title)
         brain._check_written_text(full_title + "\n" + body)
-        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+        made = self._file_repair(repo, {
             "title": full_title, "body": body,
             "labels": ["loom:ticket", "loom:briefed", "lane:" + lane, REVERT_LABEL,
-                       CLASS_LABEL]}).data or {}
+                       CLASS_LABEL]})
         revert = int(made.get("number") or 0)
         self._briefed.append(sha)
         if self._factory is not None:

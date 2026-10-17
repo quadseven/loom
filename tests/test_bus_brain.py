@@ -3391,3 +3391,30 @@ class CloseEpicTests(unittest.TestCase):
                 ({"number": 3, "state": "open"}, []),
                 ({"number": 4, "state": "closed"}, [done])]
         self.assertEqual([e["number"] for e in brain.finished_epics(tree)], [1])
+
+
+class RepairsEpicTests(unittest.TestCase):
+    """loom#640: each goal has a standing "Factory repairs" epic, exempt from
+    the caps and never finished."""
+
+    def test_the_repairs_epic_is_opened_once_outside_the_epic_cap(self):
+        fake = GoalRepo()
+        for n in range(60, 65):  # with epic #2, the goal is at its cap of 6
+            fake.issues[n] = dict(item(n, body="Part of #1\n", labels=["epic"]),
+                                  title="Epic: number %d" % n)
+            fake.subs[1].append(n)
+        gh = GitHub("t", transport=fake)
+        epic = brain.repairs_epic(gh, REPO, 1)
+        self.assertEqual(fake.issues[epic]["title"], brain.REPAIRS_TITLE)
+        self.assertIn(epic, fake.subs[1])
+        self.assertEqual(brain.repairs_epic(gh, REPO, 1), epic)
+        # It does not count against the cap: the goal still has room for none.
+        with self.assertRaisesRegex(ValueError, "already has 6 open epics"):
+            brain.file_epic(gh, REPO, 1, "Epic: one more", "Done when: x\n\nSize: S\n")
+        # Past 15 tickets it still takes briefs, and it is never finished.
+        for n in range(80, 96):
+            fake.issues[n] = item(n, labels=["loom:ticket"], state="closed")
+            fake.subs.setdefault(epic, []).append(n)
+        brain.brief(gh, REPO, epic, "Repair", BODY, "codex")
+        tree = brain.goal_tree(gh, REPO, 1)[1]
+        self.assertNotIn(epic, [e["number"] for e in brain.finished_epics(tree)])

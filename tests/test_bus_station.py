@@ -289,6 +289,8 @@ class FakeGitHub:
             return reply(200, self.humans)
         if "loom:goal" in query:
             return self._get_goals()
+        if "labels=epic&" in query:
+            return reply(200, list(getattr(self, "epics", [])))
         if "loom:lanes" in query:
             return reply(200, self.lanes_issues)
         if "loom:digest" in query:
@@ -5662,6 +5664,24 @@ class UnprovenGateTest(unittest.TestCase):
         self.assertEqual(station._ticket_goal({"body": "x", "parent_issue_url":
                              "https://api.github.com/repos/o/r/issues/41"}), 41)
         self.assertIsNone(station._ticket_goal({"body": "x"}))
+
+
+class AskDigestEpicTest(Base):
+    """loom#640: an ask naming an epic is grouped under that epic's goal."""
+
+    def test_an_ask_naming_an_epic_goes_under_the_epics_goal(self):
+        self.fake.add_goal(30, title="Ship the factory")
+        self.fake.epics = [{"number": 50, "title": "Epic: the work", "state": "open",
+                            "labels": [{"name": "epic"}], "body": "Done when: x.\n\nPart of #30\n"}]
+        asks = [{"number": 7, "title": "Pick a name", "body": "Part of #50."},
+                {"number": 8, "title": "Loose ask", "body": "No parent."},
+                {"number": 9, "title": "Direct ask", "body": "Part of #30."}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        page = st._page_body(REPO, asks, "2030-01-01")
+        goal_part = page.split("## Ship the factory (#30)")[1].split("## Not filed")[0]
+        self.assertIn("- #7 Pick a name", goal_part)
+        self.assertIn("- #9 Direct ask", goal_part)
+        self.assertIn("- #8 Loose ask", page.split("## Not filed under a goal")[1])
 
 
 class TwoLoomsTest(Base):
