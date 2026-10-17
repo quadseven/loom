@@ -233,12 +233,14 @@ class FakeGitHub:
             self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
-            if data.get("title") == "Add the repository validation contract":
+            if (data.get("title") == "Add the repository validation contract"
+                    or data.get("title", "").startswith("Land or supersede #")):
                 number = max(self.issues.keys(), default=0) + 1
                 made = {"number": number, "id": 1000 + number, "title": data["title"],
                         "body": data["body"], "state": "open",
                         "labels": [{"name": label} for label in data["labels"]],
-                        "user": {"login": "alice-example"}}
+                        "user": {"login": "alice-example"},
+                        "html_url": "https://github.com/%s/issues/%d" % (REPO, number)}
                 self.issues[number] = made
                 self.events[number] = []
                 self.comments[number] = []
@@ -590,6 +592,167 @@ class ReconcilePullRequestTest(Base):
                             "head": {"ref": "fix/elsewhere"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
+
+
+class AdoptUntrackedPullRequestTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake.add_goal(30)
+
+    def pull(self, number, author="alice-example", head_repo=REPO, ref="fix/stray-files",
+             body="", draft=False, created="2030-01-01T00:00:00Z", title="Tidy the docs"):
+        self.fake.comments.setdefault(number, [])
+        pr = {"number": number, "state": "open", "title": title, "user": {"login": author},
+              "body": body, "draft": draft, "created_at": created,
+              "head": {"ref": ref, "repo": {"full_name": head_repo}},
+              "base": {"ref": "main", "repo": {"full_name": REPO}}}
+        self.fake.pulls.append(pr)
+        return pr
+
+    def adopt(self, now=None):
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=now).adopt_untracked_pulls()
+
+    def comment_reads(self, number):
+        return self.fake.paths("GET").count("/repos/%s/issues/%d/comments?per_page=100"
+                                            % (REPO, number))
+
+    def adoptions(self):
+        return [c for c in self.fake.created if c["title"].startswith("Land or supersede #")]
+
+    def markers(self, number):
+        return [c["body"] for c in self.fake.comments[number]
+                if station.ADOPTED_RE.search(c["body"])]
+
+    def test_an_untracked_pull_request_gets_one_ticket_and_one_marker(self):
+        self.fake.add_open_issue(5, title="A plain issue")
+        self.pull(99, body="Why it matters.\n\nRefs #5\n")
+        self.run_pass()
+        made = self.adoptions()
+        self.assertEqual([c["title"] for c in made], ["Land or supersede #99: Tidy the docs"])
+        self.assertEqual(made[0]["labels"], ["loom:ticket", "loom:queued"])
+        body = made[0]["body"]
+        self.assertTrue(body.startswith("Difficulty: medium\n\n## Why\n"))
+        for section in ("## What", "## Acceptance criteria", "## Size", "## Out of scope",
+                        "## Definition of done"):
+            self.assertIn(section, body)
+        self.assertRegex(body, r"(?m)^Part of #30$")
+        self.assertNotRegex(body, r"(?m)^Refs ")
+        ticket = max(self.fake.issues)
+        self.assertEqual(self.markers(99), [station.adoption_comment(REPO, ticket)])
+        self.assertIn("<!-- loom:adopted v1 ticket=%s#%d -->" % (REPO, ticket),
+                      self.markers(99)[0])
+        # The next pass scans the repo again (an idle repo waits IDLE_SCAN).
+        os.remove(os.path.join(self.home, "state", "station", "scans.json"))
+        pulls_read = self.fake.paths("GET").count("/repos/%s/pulls?state=open&per_page=100" % REPO)
+        self.run_pass()
+        self.assertGreater(self.fake.paths("GET").count(
+            "/repos/%s/pulls?state=open&per_page=100" % REPO), pulls_read)
+        self.assertEqual(len(self.adoptions()), 1)
+        self.assertEqual(len(self.markers(99)), 1)
+
+    def test_fork_untrusted_draft_and_linked_pull_requests_are_not_adopted(self):
+        self.fake.add(12, state="queued")
+        cases = (("fork", dict(head_repo="fork-owner/example-repo")),
+                 ("untrusted", dict(author="stranger")),
+                 ("draft", dict(draft=True)),
+                 ("full refs", dict(body="Refs %s#12" % REPO)),
+                 ("short refs", dict(body="Why.\n\nRefs #12\n")),
+                 ("loom branch", dict(ref="loom/12-fix-the-thing")))
+        for name, kwargs in cases:
+            with self.subTest(name):
+                self.fake.pulls = []
+                self.pull(99, **kwargs)
+                self.adopt()
+                self.assertEqual(self.adoptions(), [])
+                self.assertEqual(self.fake.comments[99], [])
+
+    def test_one_adoption_a_pass_per_repo_oldest_pull_request_first(self):
+        self.pull(98, created="2030-01-05T00:00:00Z", title="Newer")
+        self.pull(97, created="2030-01-02T00:00:00Z", title="Older")
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #97: Older"])
+        self.assertEqual(self.fake.comments[98], [])
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #97: Older", "Land or supersede #98: Newer"])
+        self.adopt()
+        self.assertEqual(len(self.adoptions()), 2)
+
+    def test_a_trusted_marker_comment_stops_adoption_and_an_untrusted_one_does_not(self):
+        marker = station.adoption_comment(REPO, 7)
+        self.pull(98, created="2030-01-01T00:00:00Z", title="Marked by a trusted author")
+        self.pull(99, created="2030-01-02T00:00:00Z", title="Marked by a stranger")
+        self.fake.comments[98] = [{"body": marker, "user": {"login": "bob-example"}}]
+        self.fake.comments[99] = [{"body": marker, "user": {"login": "stranger"}}]
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Marked by a stranger"])
+        self.assertEqual(len(self.fake.comments[98]), 1)
+
+    def test_an_adopted_pull_requests_comments_are_read_once(self):
+        self.pull(97, created="2030-01-01T00:00:00Z", title="Adopted before")
+        self.fake.comments[97] = [{"body": station.adoption_comment(REPO, 7),
+                                   "user": {"login": "alice-example"}}]
+        self.pull(98, created="2030-01-02T00:00:00Z", title="Untracked")
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #98: Untracked"])
+        self.assertEqual((self.comment_reads(97), self.comment_reads(98)), (1, 1))
+        self.adopt()
+        self.adopt()
+        self.assertEqual((self.comment_reads(97), self.comment_reads(98)), (1, 1))
+        self.assertEqual(len(self.adoptions()), 1)
+
+    def test_a_refused_brief_waits_before_reading_or_briefing_again(self):
+        self.pull(99)
+        start = time.time()
+        with mock.patch.object(brain, "brief",
+                               side_effect=ValueError("goal already has 8 tickets in flight")) as made, \
+                mock.patch("bus.station._say") as say:
+            self.adopt(now=start)
+            self.adopt(now=start + 60)
+            self.adopt(now=start + station.ADOPT_RETRY - 1)
+            self.assertEqual((made.call_count, self.comment_reads(99)), (1, 1))
+            self.adopt(now=start + station.ADOPT_RETRY + 1)
+            self.assertEqual((made.call_count, self.comment_reads(99)), (2, 2))
+        refused = [c.args[0] for c in say.call_args_list if "in flight" in c.args[0]]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(self.fake.comments[99], [])
+
+    def test_a_closing_keyword_in_the_title_files_the_ticket_without_it(self):
+        # Built here, so this file never holds a closing keyword next to an issue number.
+        self.pull(99, title="%s #3 for good" % "Fixes")
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()], ["Land or supersede #99"])
+
+    def test_a_repo_without_a_goal_home_files_nothing_and_logs_once(self):
+        self.fake.goals = []
+        del self.fake.issues[30]
+        self.pull(99)
+        with mock.patch("bus.station._say") as say:
+            self.adopt()
+            self.adopt()
+        refused = [c.args[0] for c in say.call_args_list if "no goal home" in c.args[0]]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(self.adoptions(), [])
+        self.assertEqual(self.fake.comments[99], [])
+
+    def test_a_failed_pulls_fetch_is_logged_and_the_pass_survives(self):
+        self.pull(99)
+
+        def transport(method, url, headers, body):
+            if "/pulls?" in url:
+                raise station.GitHubError("server error", 500)
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.adopt_untracked_pulls()
+        say.assert_called_once()
+        self.assertIn("could not adopt pull requests for %s" % REPO, say.call_args.args[0])
+        self.assertEqual(self.adoptions(), [])
 
 
 DEPLOYED = "d" * 40
