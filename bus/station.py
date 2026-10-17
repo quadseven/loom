@@ -78,7 +78,7 @@ TREE_KEEP = 3600
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
-STRONG_MODELS = frozenset(model for _, model in factory.LADDER)
+STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
 THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
                 ' pullRequest { number repository { nameWithOwner } }'
                 ' comments(first:1) { nodes { body author { __typename login } } } } } }')
@@ -3105,7 +3105,7 @@ class Station:
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
         self._comment(repo, number, factory.runaway_comment(
-            trigger, attempts, factory.issue_model(issue)))
+            trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments)))
         return True
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:

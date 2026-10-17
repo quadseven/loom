@@ -95,6 +95,16 @@ loom_env() {
   done
 }
 
+# Each lane's model settings (LOOM_<LANE>_MODEL and LOOM_<LANE>_MODELS), for
+# the station: its factory reads what a lane ran from them when a claim had
+# no Model: line and no runner footer names it (bus/brain.py _lane_model).
+model_env() {
+  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+    case "$k" in LOOM_BRAIN_MODEL) continue ;; LOOM_*_MODEL|LOOM_*_MODELS) ;; *) continue ;; esac
+    printf '    <key>%s</key><string>%s</string>\n' "$k" "$(xml "$v")"
+  done
+}
+
 for L in "${LANES[@]}"; do
   LABEL="com.loom.$L"
   if runner_busy "$LOOM_HOME/run/$L.lock"; then
@@ -235,6 +245,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_GITHUB_APP_ID</key><string>$(xml "${LOOM_GITHUB_APP_ID:-}")</string>
     <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
+$(model_env)
   </dict>
 </dict>
 </plist>

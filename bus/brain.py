@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, auth_from_env
 from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
-from .labels import ESCALATION, LANES, REMOTE_LANES, rung_lanes
+from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
@@ -2758,10 +2758,18 @@ def _when(stamp: Any) -> Optional[datetime]:
         return None
 
 
-def _lane_model(lane: str) -> Optional[str]:
-    """The model a lane runs when a ticket names none: its ladder rung's."""
-    family = "claude" if lane.startswith(("claude", "anthropic")) else lane.split("-2")[0]
-    return next((model for rung, model in ESCALATION if rung == family), None)
+def _lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The model a lane runs when a brief names none: its configured setting,
+    LOOM_<SLOT>_MODEL, else LOOM_<PROVIDER>_MODEL for a numbered slot
+    (lanes/run_lane.sh lane_setting); None when neither is set. Never a fixed
+    map: on 2026-10-17 lane claude ran claude-opus-5-5 (LOOM_CLAUDE_MODEL)
+    five times while the ladder recorded claude-sonnet-5-5."""
+    env = os.environ if env is None else env
+    for name in dict.fromkeys((lane, re.sub(r"-[0-9]+$", "", lane))):
+        value = str(env.get("LOOM_%s_MODEL" % name.upper().replace("-", "_")) or "").strip()
+        if value:
+            return value
+    return None
 
 
 class History:
@@ -2774,7 +2782,7 @@ class History:
         self.fixes = fixes
         self.tried = tried
         self.reasons = reasons
-        self.rung = rung  # the lowest untried rung, or None past the third
+        self.rung = rung  # the next rung (0-based in factory.CLIMB), or None past the ladder
         # The factory's rungs it ran on since its ladder last started, from
         # trusted rung markers (bus/factory.py tried_rungs).
         self.rungs = rungs or set()
@@ -2791,7 +2799,8 @@ class History:
             return "waiting on %s" % ", ".join(a.short for a in self.held)
         if self.rung is None:
             return "past the ladder, needs-brain"
-        return "next rung %d %s" % (self.rung + 1, ESCALATION[self.rung][1])
+        from .factory import CLIMB  # factory imports this module
+        return "next rung %d %s" % (self.rung + 1, CLIMB[self.rung][1])
 
 
 Labelled = List[Tuple[str, str, Optional[datetime]]]
@@ -2813,9 +2822,13 @@ def _first_model(issue: Dict[str, Any], bodies: List[Tuple[str, Optional[datetim
         return None
 
 
-def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datetime]]]) -> List[str]:
-    """The model in force at each claim, in order, without repeats. An
-    equivalent move (bus/factory.py EQUIVALENTS) sets the model it gave."""
+def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datetime]]],
+                  footer: Optional[Tuple[str, str]] = None) -> List[str]:
+    """The model each claim ran, in order, without repeats: the Model: line in
+    force (an escalation or an equivalent move, bus/factory.py EQUIVALENTS,
+    sets the one it gave), else the model the runner footer of the claim's
+    lane's pull request names (`footer`, (lane, model)), else the lane's
+    configured model (_lane_model), as bus/factory.py claim_models reads it."""
     from .factory import EQUIVALENT_RE  # factory imports this module
     tried: List[str] = []
     for body, _ in bodies:
@@ -2827,7 +2840,8 @@ def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datet
         elif equivalent:
             current = equivalent.group(1)
         elif claim:
-            model = current or _lane_model(claim.group(1))
+            lane = claim.group(1)
+            model = current or (footer[1] if footer and footer[0] == lane else _lane_model(lane))
             if model and model not in tried:
                 tried.append(model)
     return tried
@@ -2900,7 +2914,8 @@ def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
 
 def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
              authors: Sequence[str] = (),
-             held: Sequence[tickets.After] = ()) -> History:
+             held: Sequence[tickets.After] = (),
+             footer: Optional[Tuple[str, str]] = None) -> History:
     number = int(issue["number"])
     events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
@@ -2909,7 +2924,7 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
     fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
-    tried = _tried_models(_first_model(issue, bodies), bodies)
+    tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
     rungs = _trusted_rungs(comments, authors or trusted_authors())
     return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
@@ -2920,11 +2935,19 @@ def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
     return [at for body, at in bodies if at is not None and _CLAIM.fullmatch(body.strip())]
 
 
+def _done_rungs(tried: List[str], rungs: Optional[set] = None) -> set:
+    """The rungs of factory.CLIMB tried: from trusted rung markers, and each
+    whose model a claim ran."""
+    from .factory import CLIMB  # factory imports this module
+    return set(rungs or ()) | {n for n, (_, model) in enumerate(CLIMB, 1) if model in tried}
+
+
 def _lowest_untried(tried: List[str], rungs: Optional[set] = None) -> Optional[int]:
-    highest_reached = max(rungs or {0})
-    untried = [i for i, (_, model) in enumerate(ESCALATION)
-               if i + 1 > highest_reached and model not in tried]
-    return untried[0] if untried else None
+    """The next rung the ticket may climb to (bus/factory.py climb_rungs),
+    0-based, or None when none is left."""
+    from .factory import climb_rungs  # factory imports this module
+    left = climb_rungs(_done_rungs(tried, rungs), max(rungs or {0}))
+    return left[0] - 1 if left else None
 
 
 def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime,
@@ -2961,15 +2984,21 @@ def _available_lanes(gh: GitHub, lanes_repo: str) -> List[str]:
     return rows
 
 
-def _pr_for_ticket(gh: GitHub, repo: str, number: int) -> Optional[int]:
+def _open_pr(gh: GitHub, repo: str, number: int) -> Optional[Dict[str, Any]]:
+    """The ticket's open pull request, or None."""
     for pr in gh.paginate("/repos/%s/pulls?state=open" % repo):
         try:
             found = _ticket_association(repo, pr)
         except ValueError:
             continue
         if found == (repo, number):
-            return int(pr["number"])
+            return pr
     return None
+
+
+def _pr_for_ticket(gh: GitHub, repo: str, number: int) -> Optional[int]:
+    pr = _open_pr(gh, repo, number)
+    return int(pr["number"]) if pr is not None else None
 
 
 def _waiting_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> List[tickets.After]:
@@ -3035,14 +3064,34 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         raise ValueError("ticket is held by After: %s; it is not stuck, and the "
                          "ladder is for work a lane already tried"
                          % ", ".join(a.short for a in held))
-    history = _history(gh, repo, issue, datetime.now(timezone.utc))
+    from . import factory  # factory imports this module
+    found_pr = _open_pr(gh, repo, number)
+    # Its pull request's runner footer names the model its newest run used.
+    footer = factory.footer_run(found_pr.get("body")) if found_pr is not None else None
+    history = _history(gh, repo, issue, datetime.now(timezone.utc), footer=footer)
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
-    open_pr = _pr_for_ticket(gh, repo, number)
+    open_pr = int(found_pr["number"]) if found_pr is not None else None
     finished = _nothing_to_fix(gh, repo, open_pr) if open_pr is not None else None
     if finished:
         raise ValueError("ticket is not escalated: %s; land it instead" % finished)
-    if history.rung is None:
+    private: List[bool] = []
+
+    def rung_lanes(n: int) -> Tuple[str, ...]:
+        """The rung's lanes that take this repo: a public-only lane (agy)
+        never takes a private repo's work. Unreadable counts as private."""
+        lanes = factory.CLIMB[n - 1][0]
+        if any(lane in factory.PUBLIC_ONLY for lane in lanes):
+            if not private:
+                data = gh.rest("GET", "/repos/%s" % repo).data
+                private.append(not isinstance(data, dict) or data.get("private") is not False)
+            if private[0]:
+                lanes = tuple(lane for lane in lanes if lane not in factory.PUBLIC_ONLY)
+        return lanes
+
+    left = [n for n in factory.climb_rungs(_done_rungs(history.tried, history.rungs),
+                                           max(history.rungs or {0})) if rung_lanes(n)]
+    if not left:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                 {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
@@ -3052,20 +3101,18 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
     choice = None
-    for rung in range(history.rung, len(ESCALATION)):
-        if ESCALATION[rung][1] in history.tried:
-            continue
-        lane = next((x for x in rung_lanes(rung) if x in free), None)
+    for n in left:
+        lane = next((x for x in rung_lanes(n) if x in free), None)
         if lane:
-            choice = (rung, lane)
+            choice = (n - 1, lane)
             break
     if choice is None:
         raise ValueError("no untried rung has an available lane")
     rung, lane = choice
-    model = ESCALATION[rung][1]
+    model = factory.CLIMB[rung][1]
     reason = "; ".join(history.reasons)
     comment = "\n".join([ESCALATE_MARKER,
-                         "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(ESCALATION), model, lane),
+                         "Escalated to rung %d of %d: %s on lane %s." % (rung + 1, len(factory.CLIMB), model, lane),
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
                          "Rung: %d %s %s" % (rung + 1, model, lane)])
     _check_written_text(comment)

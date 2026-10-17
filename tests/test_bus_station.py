@@ -2574,6 +2574,25 @@ class RetryTest(Base):
         self.assertIn("| codex-2 | model-x | - |", table)
         self.assertIn("| codex | model-x | [work] agent made no commit", table)
 
+    def test_the_attempt_table_names_the_model_each_attempt_ran(self):
+        # No Model: line: each claim ran its lane's configured model, a slot's
+        # own setting first, never the issue's "unspecified" or a fixed map.
+        self.failed(body=PLAIN, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        times = [time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - s)) for s in (900, 600, 300)]
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane, "created_at": at,
+             "user": {"login": "alice-example"}}
+            for lane, at in zip(("codex", "codex-2", "codex-3"), times)]
+        env = {k: v for k, v in os.environ.items() if not re.fullmatch(r"LOOM_\w+_MODEL", k)}
+        env.update(LOOM_CODEX_MODEL="model-codex", LOOM_CODEX_2_MODEL="model-slot")
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.run_pass()
+        table = self.bodies()[-1]
+        self.assertIn("| %s | codex | model-codex |" % times[0], table)
+        self.assertIn("| %s | codex-2 | model-slot |" % times[1], table)
+        self.assertIn("| %s | codex-3 | model-codex |" % times[2], table)
+        self.assertNotIn("unspecified", table)
+
     def test_the_same_failure_reason_twice_in_a_row_flags_the_ticket(self):
         reason = "[work] could not commit the agent's changes"
         self.failed(body=BODY, reason=reason)
