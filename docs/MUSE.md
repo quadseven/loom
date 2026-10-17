@@ -128,7 +128,7 @@ below; where the steps leave room, this is how to spend it.
    again; say "unchanged" and move on.
 8. Every failure the brain finds by hand becomes a factory ticket (Improving
    Loom itself), so the factory catches it next time without the brain. File
-   it in the same tick with `bus.brain brief` on the Loom goal home, quoting
+   it in the same tick with `bus.brain brief` under an open epic of the Loom goal home, quoting
    the evidence; a journal line that names a factory problem without a ticket
    number is a rule broken, and the next tick files it before anything else.
 9. Failed tickets get a decision every tick. For each ticket at loom:failed,
@@ -370,7 +370,16 @@ this tick"; a step with no note shows nothing there.
    work not merged yet (`brief --after '#5, owner/name#7'` writes the line,
    and the station holds the ticket until each of them is merged),
    regressions first, with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --holder muse`.
+   `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --holder muse`.
+   Every ticket goes under an open epic of its goal (decision 0003): `brief`
+   refuses without `--epic`, and for a closed, unlabelled or full epic (15
+   tickets). `status` lists each goal's open epics. When no open epic fits
+   the work, propose a new one within the cap of 6 open epics per goal with
+   `python3 -m bus.brain epic OWNER/NAME --goal N --title "Epic: SENTENCE" --file EPIC.md`
+   (a done-when and a size line in the body). When an epic's route is
+   unclear, chart a wayfinder map for it before filing work; resolve its
+   research and task tickets alone, and batch the questions only the
+   operator can answer into one daily ask, each with a recommended answer.
    Give each brief `--priority P0` to `P3` by how much it costs the goal
    while it stays unfixed (without it the ticket is P2); the station and the
    factory take P0 first. Read the Priorities and Health findings sections
@@ -390,12 +399,12 @@ this tick"; a step with no note shows nothing there.
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal, the rest get `loom:triage` and one comment naming
+   ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
    what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left, and only rewrites `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
+   `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket refs it, the original gets
    `loom:rewritten` and stays open) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names

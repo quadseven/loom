@@ -237,7 +237,7 @@ class FakeGitHub:
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
             if (data.get("title") == "Add the repository validation contract"
-                    or data.get("title", "").startswith("Land or supersede #")):
+                    or data.get("title", "").startswith(("Land or supersede #", "Epic: "))):
                 number = max(self.issues.keys(), default=0) + 1
                 made = {"number": number, "id": 1000 + number, "title": data["title"],
                         "body": data["body"], "state": "open",
@@ -643,7 +643,14 @@ class AdoptUntrackedPullRequestTest(Base):
         for section in ("## What", "## Acceptance criteria", "## Size", "## Out of scope",
                         "## Definition of done"):
             self.assertIn(section, body)
-        self.assertRegex(body, r"(?m)^Part of #30$")
+        # Filed under the goal's intake epic, which the station opened.
+        intake = [c for c in self.fake.created if c["title"] == brain.INTAKE_TITLE]
+        self.assertEqual(len(intake), 1)
+        self.assertRegex(intake[0]["body"], r"(?m)^Part of #30$")
+        epic_number = next(n for n, i in self.fake.issues.items()
+                           if i.get("title") == brain.INTAKE_TITLE)
+        self.assertRegex(body, r"(?m)^Part of #%d$" % epic_number)
+        self.assertNotRegex(body, r"(?m)^Part of #30$")
         self.assertNotRegex(body, r"(?m)^Refs ")
         ticket = max(self.fake.issues)
         self.assertEqual(self.markers(99), [station.adoption_comment(REPO, ticket)])
@@ -1850,16 +1857,17 @@ class ValidationContractTest(Base):
         worker._goals = [(REPO, goal)]
         worker._contents_text = mock.Mock(return_value=None)
         worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": []})())
-        with mock.patch.object(brain, "brief") as file_ticket:
+        with mock.patch.object(brain, "brief_intake") as file_ticket:
             worker.file_validation_contracts()
         self.assertEqual(file_ticket.call_count, 1)
+        # Filed under the goal's intake epic (brief_intake finds it).
         self.assertEqual(file_ticket.call_args.args[2], 2)
         self.assertIn(".loom/validation.conf", file_ticket.call_args.args[4])
 
         worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": [
             {"number": 3, "title": "Add the repository validation contract"}
         ]})())
-        with mock.patch.object(brain, "brief") as file_ticket:
+        with mock.patch.object(brain, "brief_intake") as file_ticket:
             worker.file_validation_contracts()
         file_ticket.assert_not_called()
 

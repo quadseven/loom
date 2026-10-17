@@ -26,12 +26,25 @@ def reply(status=200, body=None):
     return status, {}, b"" if body is None else json.dumps(body).encode()
 
 
+EPIC = 2
+
+
 class Fake:
+    """Replies in order; the reads that resolve open epic #2 under goal #1
+    are answered apart and not recorded."""
+
     def __init__(self, *replies):
         self.replies = list(replies)
         self.calls = []
 
     def __call__(self, method, url, headers, body):
+        path = url.split("api.github.com")[-1]
+        if method == "GET" and path == "/repos/%s/issues/%d" % (REPO, EPIC):
+            return reply(200, {"number": EPIC, "state": "open", "labels": [{"name": "epic"}],
+                               "body": "Done when: done.\n\nPart of #1\n"})
+        if method == "GET" and (path.startswith("/repos/%s/issues/%d/sub_issues" % (REPO, EPIC))
+                                or path.startswith("/repos/%s/issues?labels=loom:ticket&" % REPO)):
+            return reply(200, [])
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 
@@ -56,7 +69,7 @@ class UnprovenLimitTests(unittest.TestCase):
             self.assertEqual(30, brain.unverified_limit({"LOOM_UNVERIFIED_LIMIT": bad}))
 
     def brief(self, fake, body=BODY, **kw):
-        return brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", body, "codex", **kw)
+        return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", body, "codex", **kw)
 
     def test_brief_refuses_a_goal_over_the_unproven_limit(self):
         children = [ticket(10 + n, "shipped") for n in range(31)]

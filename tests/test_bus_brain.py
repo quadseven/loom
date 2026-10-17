@@ -27,12 +27,37 @@ def reply(status=200, body=None):
     return status, {}, b"" if body is None else json.dumps(body).encode()
 
 
+# The open epic a brief files under (decision 0003): #2, under goal #1.
+EPIC = 2
+
+
+def epic_issue(body="Done when: done.\n\nSize: S\n\nPart of #1\n", **extra):
+    out = {"number": EPIC, "id": 100 + EPIC, "state": "open", "title": "Epic: the work",
+           "labels": [{"name": "epic"}], "body": body}
+    out.update(extra)
+    return out
+
+
 class Fake:
-    def __init__(self, *replies):
+    """Replies in order. The reads that resolve epic #2 (the epic, its
+    sub-issues and the open ticket list) are answered apart and not
+    recorded, so a brief's calls keep their places."""
+
+    def __init__(self, *replies, epic=None):
         self.replies = list(replies)
         self.calls = []
+        self.epic = epic_issue() if epic is None else epic
+        self.epic_tickets = []
 
     def __call__(self, method, url, headers, body):
+        path = url.split("api.github.com")[-1]
+        if method == "GET" and self.epic is not False:
+            if path == "/repos/%s/issues/%d" % (REPO, EPIC):
+                return reply(200, self.epic)
+            if path.startswith("/repos/%s/issues/%d/sub_issues" % (REPO, EPIC)):
+                return reply(200, self.epic_tickets)
+            if path.startswith("/repos/%s/issues?labels=loom:ticket&state=open" % REPO):
+                return reply(200, [])
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 
@@ -719,14 +744,14 @@ class SensitiveResumeTests(unittest.TestCase):
                 fake = Fake(goal_reply)
                 gh = GitHub("t", transport=fake)
                 with self.assertRaises(ValueError):
-                    brain.brief(gh, REPO, 1, "Ticket", text, lane)
+                    brain.brief(gh, REPO, EPIC, "Ticket", text, lane)
                 self.assertFalse(any(call[0] == "POST" for call in fake.calls))
 
     def test_a_public_repo_brief_refuses_another_repos_issue_reference(self):
         text = BODY.replace("why", "as in other-owner/other-repo#12")
         fake = Fake(reply(200, {"private": False}))
         with self.assertRaisesRegex(ValueError, "in words"):
-            brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", text, "codex")
         self.assertEqual([c[0] for c in fake.calls], ["GET"])
 
     def test_a_foreign_reference_files_nothing_when_the_repo_cannot_be_read(self):
@@ -734,14 +759,14 @@ class SensitiveResumeTests(unittest.TestCase):
         # A failed read ends the brief with the GitHubError main reports.
         fake = Fake(reply(404, {"message": "Not Found"}))
         with self.assertRaises(GitHubError):
-            brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", text, "codex")
         self.assertEqual([c[0] for c in fake.calls], ["GET"])
         # A read that does not say whether the repo is private refuses too.
         for data in ({}, None, {"private": None}):
             with self.subTest(data=data):
                 fake = Fake(reply(200, data))
                 with self.assertRaisesRegex(ValueError, "could not tell"):
-                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", text, "codex")
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", text, "codex")
                 self.assertEqual([c[0] for c in fake.calls], ["GET"])
 
     def test_a_brief_may_name_its_own_repos_issue_or_any_issue_in_a_private_repo(self):
@@ -749,11 +774,11 @@ class SensitiveResumeTests(unittest.TestCase):
                 reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
         own = BODY.replace("why", "as in %s#12" % REPO.upper())
         # Its own reference: the repo is not even read.
-        self.assertEqual(brain.brief(GitHub("t", transport=Fake(*made)), REPO, 1, "Ticket",
+        self.assertEqual(brain.brief(GitHub("t", transport=Fake(*made)), REPO, EPIC, "Ticket",
                                      own, "codex"), "https://example.com/ticket")
         foreign = BODY.replace("why", "as in other-owner/other-repo#12")
         fake = Fake(reply(200, {"private": True}), *made)
-        self.assertEqual(brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket",
+        self.assertEqual(brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket",
                                      foreign, "codex"), "https://example.com/ticket")
 
     def test_brief_refuses_header_values_the_runner_would_refuse(self):
@@ -763,13 +788,13 @@ class SensitiveResumeTests(unittest.TestCase):
             with self.subTest(**{k: repr(v) for k, v in kw.items()}):
                 fake = Fake(reply(200, goal()))
                 with self.assertRaises(ValueError):
-                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex", **kw)
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex", **kw)
                 self.assertEqual(fake.calls, [])
 
     def test_brief_with_a_priority_writes_the_priority_line(self):
         fake = Fake(reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
-        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex",
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
                     difficulty="medium", priority="P1")
         made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
         self.assertTrue(made["body"].startswith("Difficulty: medium\nPriority: P1\n\n"))
@@ -780,7 +805,7 @@ class SensitiveResumeTests(unittest.TestCase):
             with self.subTest(priority=bad):
                 fake = Fake(reply(200, goal()))
                 with self.assertRaisesRegex(ValueError, "priority"):
-                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY,
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY,
                                 "codex", priority=bad)
                 self.assertEqual(fake.calls, [])
 
@@ -789,7 +814,7 @@ class SensitiveResumeTests(unittest.TestCase):
             with self.subTest(after=repr(bad)):
                 fake = Fake(reply(200, goal()))
                 with self.assertRaisesRegex(ValueError, "After:"):
-                    brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY,
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY,
                                 "codex", after=bad)
                 self.assertEqual(fake.calls, [])
 
@@ -803,7 +828,7 @@ class SensitiveResumeTests(unittest.TestCase):
                     unittest.mock.patch("bus.brain.GitHub") as client, \
                     contextlib.redirect_stderr(err):
                 client.return_value.requests = 0
-                code = brain.main(["brief", REPO, "--goal", "1", "--title", "Ticket",
+                code = brain.main(["brief", REPO, "--epic", "2", "--title", "Ticket",
                                    "--file", path, "--lane", "codex", "--after", "5"])
         self.assertEqual(code, 1)
         self.assertIn("After:", err.getvalue())
@@ -812,7 +837,7 @@ class SensitiveResumeTests(unittest.TestCase):
         made = (reply(200, goal()), reply(200, []),
                 reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
         fake = Fake(*made)
-        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex",
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
                     after="#5, other-owner/other-repo#7")
         self.assertTrue(fake.calls[2][2]["body"].startswith("After: #5, other-owner/other-repo#7\n"))
 
@@ -826,14 +851,14 @@ class SensitiveResumeTests(unittest.TestCase):
         fake = Fake(reply(200, goal()), reply(200, children))
         gh = GitHub("t", transport=fake)
         with self.assertRaises(ValueError):
-            brain.brief(gh, REPO, 1, "Ticket", BODY, "codex")
+            brain.brief(gh, REPO, EPIC, "Ticket", BODY, "codex")
         self.assertFalse(any(c[0] == "POST" for c in fake.calls))
 
     def test_merged_and_shipped_tickets_hold_no_slot(self):
         children = self._children(*(["merged", "shipped"] * 6 + ["running"] * 15))
         fake = Fake(reply(200, goal()), reply(200, children),
                     reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
-        url = brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, "codex")
+        url = brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex")
         self.assertEqual(url, "https://example.com/ticket")
 
     def test_the_cap_comes_from_the_environment(self):
@@ -845,12 +870,12 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_good_brief_creates_ticket_and_subissue(self):
         fake = Fake(reply(200, goal()), reply(200, []), reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
         gh = GitHub("t", transport=fake)
-        url = brain.brief(gh, REPO, 1, "Ticket", BODY, "codex", "hard", "model-x", "main")
+        url = brain.brief(gh, REPO, EPIC, "Ticket", BODY, "codex", "hard", "model-x", "main")
         self.assertEqual(url, "https://example.com/ticket")
         payload = fake.calls[2][2]
         self.assertEqual(payload["labels"], ["loom:ticket", "loom:briefed", "lane:codex"])
         self.assertTrue(payload["body"].startswith("Difficulty: hard\nModel: model-x\nBase: main\n\n"))
-        self.assertEqual(fake.calls[3][1].split("api.github.com")[1], "/repos/%s/issues/1/sub_issues" % REPO)
+        self.assertEqual(fake.calls[3][1].split("api.github.com")[1], "/repos/%s/issues/2/sub_issues" % REPO)
         self.assertEqual(fake.calls[3][2], {"sub_issue_id": 202})
 
     def test_a_brief_the_goal_refuses_as_a_sub_issue_gets_a_part_of_line(self):
@@ -859,11 +884,12 @@ class SensitiveResumeTests(unittest.TestCase):
                     reply(422, {"message": "sub-issue limit reached"}), reply(200, {}))
         gh = GitHub("t", transport=fake)
         with redirect_stderr(io.StringIO()) as err:
-            url = brain.brief(gh, REPO, 1, "Ticket", BODY, "codex", "hard")
+            url = brain.brief(gh, REPO, EPIC, "Ticket", BODY, "codex", "hard")
         self.assertEqual(url, "https://example.com/ticket")
         method, path, payload = fake.calls[4]
         self.assertEqual((method, path.split("api.github.com")[1]), ("PATCH", "/repos/%s/issues/7" % REPO))
-        self.assertEqual(payload["body"], fake.calls[2][2]["body"].rstrip("\n") + "\n\nPart of #1\n")
+        self.assertEqual(payload["body"], fake.calls[2][2]["body"])
+        self.assertTrue(payload["body"].endswith("\n\nPart of #2\n"))
         self.assertIn("Part of line", err.getvalue())
 
     def test_a_brief_on_a_goal_at_the_cap_queues_with_a_part_of_line_whatever_the_refusal(self):
@@ -873,9 +899,9 @@ class SensitiveResumeTests(unittest.TestCase):
                         reply(status, {"message": "sub-issue limit reached"}), reply(200, {}))
             with redirect_stderr(io.StringIO()) as err:
                 url = brain.brief(GitHub("t", transport=fake),
-                                  REPO, 1, "Ticket", BODY, "codex", "hard")
+                                  REPO, EPIC, "Ticket", BODY, "codex", "hard")
             self.assertEqual(url, "https://example.com/ticket", status)
-            self.assertTrue(fake.calls[4][2]["body"].endswith("\n\nPart of #1\n"), status)
+            self.assertTrue(fake.calls[4][2]["body"].endswith("\n\nPart of #2\n"), status)
             self.assertIn("refused the sub-issue link", err.getvalue())
 
     def test_brief_uses_goal_trunk_as_default_base_and_explicit_base_wins(self):
@@ -883,13 +909,13 @@ class SensitiveResumeTests(unittest.TestCase):
         fake = Fake(reply(200, trunk_goal), reply(200, []),
                     reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
         gh = GitHub("t", transport=fake)
-        url = brain.brief(gh, REPO, 1, "Ticket", BODY, "codex")
+        url = brain.brief(gh, REPO, EPIC, "Ticket", BODY, "codex")
         self.assertEqual(url, "https://example.com/ticket")
         payload = fake.calls[2][2]
         self.assertTrue(payload["body"].startswith("Base: side\n\n"))
         fake2 = Fake(reply(200, trunk_goal), reply(200, []),
                      reply(201, {"id": 203, "html_url": "https://example.com/ticket2"}), reply(201, {}))
-        url2 = brain.brief(GitHub("t", transport=fake2), REPO, 1, "Ticket", BODY, "codex", base="explicit")
+        url2 = brain.brief(GitHub("t", transport=fake2), REPO, EPIC, "Ticket", BODY, "codex", base="explicit")
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
 
@@ -1402,7 +1428,7 @@ class SensitiveResumeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     brain.reply_to_review(GitHub("t", transport=Fake()), REPO, 8, 42, body)
                 with self.assertRaises(ValueError):
-                    brain.brief(GitHub("t", transport=Fake()), REPO, 1, body, BODY)
+                    brain.brief(GitHub("t", transport=Fake()), REPO, EPIC, body, BODY)
                 with self.assertRaises(ValueError):
                     brain.move(GitHub("t", transport=Fake()), REPO, 8, "queued", note=body)
 
@@ -2377,9 +2403,15 @@ class Routes:
                 for c in self.calls if c[0] == "POST" and c[1].endswith("/labels")}
 
 
+INTAKE = 3
+
+
 class TriageTests(unittest.TestCase):
     def run_triage(self, routes, limit=25):
-        return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
+        # The goal's intake epic is #3 (intake_epic has its own tests).
+        with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
+                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
+            return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
 
     def assert_never_edited(self, routes):
         # Only labels, sub-issue links and comments: no PATCH (close, retitle,
@@ -2392,10 +2424,10 @@ class TriageTests(unittest.TestCase):
         routes = Routes([item(5)])
         lines = self.run_triage(routes)
         self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
-        self.assertIn(("POST", "/repos/%s/issues/1/sub_issues" % REPO, {"sub_issue_id": 1005}),
+        self.assertIn(("POST", "/repos/%s/issues/3/sub_issues" % REPO, {"sub_issue_id": 1005}),
                       routes.calls)
         self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
-        self.assertEqual(lines, ["#5 queued under #1"])
+        self.assertEqual(lines, ["#5 queued under #3"])
         self.assert_never_edited(routes)
 
     def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
@@ -2478,7 +2510,7 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(patches[0][1], "/repos/%s/issues/5" % REPO)
         body = patches[0][2]["body"]
         self.assertTrue(body.startswith(item(5)["body"].rstrip("\n")))
-        self.assertTrue(body.endswith("\n\nPart of #1\n"))
+        self.assertTrue(body.endswith("\n\nPart of #3\n"))
         self.assertEqual(set(patches[0][2]), {"body"})
 
     def test_goal_children_past_the_sub_issue_limit_add_part_of_issues(self):
@@ -2555,10 +2587,11 @@ class HumanAndRefsTests(unittest.TestCase):
         fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t"}),
                     reply(201, {}), reply(201, {}), reply(200, []), reply(200, []))
-        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
         # Words, not "Refs #6": lanes copy the brief into their pull request,
         # and a linked original in no epic fails the plan check.
-        self.assertTrue(fake.calls[3][2]["body"].endswith("\n\nRewritten from issue 6.\n"))
+        self.assertTrue(fake.calls[3][2]["body"].endswith(
+            "\n\nRewritten from issue 6.\n\nPart of #2\n"))
         self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
         self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
@@ -2569,7 +2602,7 @@ class HumanAndRefsTests(unittest.TestCase):
         for issue in (item(6, labels=["loom:ticket"]), item(6, state="closed")):
             fake = Fake(reply(200, issue))
             with self.assertRaises(ValueError):
-                brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BODY, refs=6)
+                brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
             self.assertTrue(all(c[0] == "GET" for c in fake.calls))
 
 
@@ -2584,6 +2617,7 @@ class FakeRepo:
         self.runs = dict(runs or {})
         self.private = private
         self.calls = []
+        self.subs = {}
 
     def __call__(self, method, url, headers, body):
         payload = json.loads(body) if body else None
@@ -2600,12 +2634,23 @@ class FakeRepo:
             return reply(200, {"full_name": REPO, "private": self.private})
         if path.startswith("/labels?"):
             return reply(200, self.labels)
+        if path.startswith("/issues?labels=loom:ticket&"):
+            return reply(200, [i for i in self.issues
+                               if any(l["name"] == "loom:ticket" for l in i["labels"])])
         if path.startswith("/issues?"):
             self.assertIn_("labels=loom%3Agoal", path)
             return reply(200, [i for i in self.issues
                                if any(l["name"] == "loom:goal" for l in i["labels"])])
         if path.startswith("/pulls?"):
             return reply(200, self.prs)
+        sub = re.fullmatch(r"/issues/(\d+)/sub_issues\?.*", path)
+        if sub:
+            return reply(200, [i for i in self.issues
+                               if i["number"] in self.subs.get(int(sub.group(1)), [])])
+        one = re.fullmatch(r"/issues/(\d+)", path)
+        if one:
+            found = [i for i in self.issues if i["number"] == int(one.group(1))]
+            return reply(200, found[0]) if found else reply(404, {"message": "Not Found"})
         if "/check-runs?" in path:
             sha = path.split("/commits/")[1].split("/")[0]
             self.assertIn_("check_name=Grug%20-%20Elder", path)
@@ -2617,11 +2662,16 @@ class FakeRepo:
             self.labels.append(payload)
             return reply(201, payload)
         if path == "/issues":
-            issue = {"number": 100 + len(self.issues), "title": payload["title"],
-                     "body": payload["body"],
+            number = 100 + len(self.issues)
+            issue = {"number": number, "id": 1000 + number, "state": "open",
+                     "title": payload["title"], "body": payload["body"],
                      "labels": [{"name": n} for n in payload["labels"]]}
             self.issues.append(issue)
             return reply(201, issue)
+        sub = re.fullmatch(r"/issues/(\d+)/sub_issues", path)
+        if sub:
+            self.subs.setdefault(int(sub.group(1)), []).append(payload["sub_issue_id"] - 1000)
+            return reply(201, {})
         return None
 
     @staticmethod
@@ -2656,7 +2706,7 @@ class OnboardTests(unittest.TestCase):
                      "needs-operator", "lane:anthropic-7"):
             self.assertIn(name, made)
         posted = [c for c in fake.writes() if c[1].endswith("/issues")]
-        self.assertEqual(len(posted), 1)
+        self.assertEqual(len(posted), 2)
         issue = posted[0][2]
         self.assertEqual(issue["title"], "Backlog: every open issue in %s is worked "
                          "through Loom or handed to a person" % REPO)
@@ -2665,18 +2715,26 @@ class OnboardTests(unittest.TestCase):
                      "never closes an issue", "train on prompts"):
             self.assertIn(part, issue["body"])
         self.assertIn("backlog goal home: #100, created", lines)
+        # Onboarding opens the backlog goal's intake epic (decision 0003).
+        intake = posted[1][2]
+        self.assertEqual((intake["title"], intake["labels"]), (brain.INTAKE_TITLE, ["epic"]))
+        self.assertTrue(intake["body"].endswith("\n\nPart of #100\n"))
+        self.assertIn("intake epic: #101", lines)
+        self.assertEqual(fake.subs, {100: [101]})
 
         fake.calls = []
         again = self.run_onboard(fake)
         self.assertEqual(fake.writes(), [])
         self.assertIn("labels: no changes", again)
         self.assertIn("backlog goal home: #100, already open", again)
+        self.assertIn("intake epic: #101", again)
 
     def test_other_goal_homes_do_not_count_as_the_backlog_home(self):
         other = {"number": 3, "title": "Ship the thing", "labels": [{"name": "loom:goal"}]}
         fake = FakeRepo(issues=[other], prs=[pr(7, "abc")], runs={"abc": 1})
         self.run_onboard(fake)
-        self.assertEqual(len([c for c in fake.writes() if c[1].endswith("/issues")]), 1)
+        self.assertEqual(len([c for c in fake.writes() if c[1].endswith("/issues")
+                              and c[2]["labels"] == ["loom:goal"]]), 1)
 
     def test_warns_when_the_review_check_never_ran(self):
         fake = FakeRepo(prs=[pr(9, "s9"), pr(8, "s8")])
@@ -2736,13 +2794,14 @@ class GoalRepo:
     sub-issue links and comments written to it."""
 
     def __init__(self, tickets=()):
-        self.issues = {1: goal()}
-        self.children = []
+        # Epic #2 is the goal's sub-issue; briefs file under it.
+        self.issues = {1: goal(), EPIC: epic_issue()}
+        self.subs = {1: [EPIC], EPIC: []}
         self.comments = []
         self.calls = []
         for t in tickets:
             self.issues[t["number"]] = t
-            self.children.append(t["number"])
+            self.subs[1].append(t["number"])
 
     def __call__(self, method, url, headers, body):
         payload = json.loads(body) if body else None
@@ -2754,20 +2813,23 @@ class GoalRepo:
         return handler(number, payload)
 
     def _get_issue(self, number, payload):
+        if number is None:  # the open ticket list: every ticket here is a sub-issue
+            return reply(200, [])
         found = self.issues.get(number)
         return reply(200, found) if found else reply(404, {"message": "Not Found"})
 
     def _get_sub_issues(self, number, payload):
-        return reply(200, [self.issues[n] for n in self.children])
+        return reply(200, [self.issues[n] for n in self.subs.get(number, [])])
 
     def _post_issue(self, number, payload):
         made = 200 + len(self.issues)
         self.issues[made] = dict(item(made, payload["body"], payload["labels"]),
+                                 title=payload["title"],
                                  html_url="https://example.com/t/%d" % made)
         return reply(201, self.issues[made])
 
     def _post_sub_issues(self, number, payload):
-        self.children.append(payload["sub_issue_id"] - 1000)
+        self.subs.setdefault(number, []).append(payload["sub_issue_id"] - 1000)
         return reply(201, {})
 
     def _patch_issue(self, number, payload):
@@ -2802,7 +2864,7 @@ class RegressionSlotTests(unittest.TestCase):
         return GoalRepo(flying + list(extra))
 
     def brief(self, fake, body=BODY, **kw):
-        return brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", body, "codex", **kw)
+        return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", body, "codex", **kw)
 
     def test_a_full_goal_admits_one_shipped_regression_and_refuses_ordinary_work(self):
         fake = self.full_goal(item(5, labels=["loom:ticket", "loom:shipped", "lane:claude"],
@@ -2876,7 +2938,7 @@ class RegressionSlotTests(unittest.TestCase):
             self.brief(GoalRepo(), evidenced(5), regresses=5, refs=6)
 
     def test_the_command_line_takes_regresses(self):
-        args = brain.parser().parse_args(["brief", REPO, "--goal", "1", "--title", "T",
+        args = brain.parser().parse_args(["brief", REPO, "--epic", "2", "--title", "T",
                                           "--file", "b.md", "--regresses", "5"])
         self.assertEqual(args.regresses, 5)
 
@@ -3153,3 +3215,123 @@ class GoalWalksEpicsTest(unittest.TestCase):
         with unittest.mock.patch.object(brain, "_part_of_hits", return_value=loose):
             found = brain.unassociated_tickets(gh, REPO, 1)
         self.assertEqual([i["number"] for i in found], [30])
+
+
+EPIC_BODY = "Done when: the thing works.\n\nSize: at most 15 tickets.\n"
+
+
+class EpicFilingTests(unittest.TestCase):
+    """loom#637: every new ticket is filed under an open epic of at most 15
+    tickets, and a goal holds at most 6 open epics."""
+
+    def brief(self, fake, epic=EPIC, **kw):
+        return brain.brief(GitHub("t", transport=fake), REPO, epic, "Ticket", BODY, "codex", **kw)
+
+    def test_an_open_epic_gets_the_ticket_as_its_sub_issue_named_by_its_part_of_line(self):
+        fake = GoalRepo()
+        url = self.brief(fake)
+        (made,) = fake.created()
+        number = int(url.rsplit("/", 1)[1])
+        self.assertEqual(fake.subs[EPIC], [number])
+        self.assertNotIn(number, fake.subs[1])
+        self.assertTrue(made[2]["body"].endswith("\n\nPart of #%d\n" % EPIC))
+        self.assertNotIn("Part of #1", made[2]["body"])
+
+    def test_a_closed_unlabelled_full_or_goalless_epic_is_refused_with_the_reason(self):
+        cases = [
+            (dict(state="closed"), "epic #2 is closed"),
+            (dict(labels=[]), "#2 is not an epic"),
+            (dict(body="Done when: x.\n"), "epic #2 names no goal"),
+            (dict(body="Done when: x.\n\nPart of #9\n"), "#9, which is not an open loom:goal"),
+            (None, "already holds 15 tickets"),
+        ]
+        for change, why in cases:
+            with self.subTest(why=why):
+                fake = GoalRepo()
+                if change is None:
+                    for n in range(40, 55):
+                        fake.issues[n] = item(n, labels=["loom:ticket", "loom:merged"])
+                        fake.subs[EPIC].append(n)
+                else:
+                    fake.issues[EPIC].update(change)
+                with self.assertRaisesRegex(ValueError, why):
+                    self.brief(fake)
+                self.assertEqual(fake.created(), [])
+
+    def test_a_goal_home_is_refused_as_an_epic(self):
+        fake = GoalRepo()
+        with self.assertRaisesRegex(ValueError, "#1 is a goal home"):
+            self.brief(fake, epic=1)
+        self.assertEqual(fake.created(), [])
+
+    def test_the_command_line_refuses_a_brief_without_an_epic(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = os.path.join(home, "brief.md")
+            with open(path, "w") as fh:
+                fh.write(BODY)
+            err = io.StringIO()
+            with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
+                    unittest.mock.patch("bus.brain.GitHub") as client, \
+                    contextlib.redirect_stderr(err):
+                client.return_value.requests = 0
+                code = brain.main(["brief", REPO, "--goal", "1", "--title", "Ticket",
+                                   "--file", path, "--lane", "codex"])
+        self.assertEqual(code, 1)
+        self.assertIn("pass --epic N", err.getvalue())
+        client.return_value.rest.assert_not_called()
+
+    def epics(self, fake, count):
+        for n in range(60, 60 + count - 1):  # epic #2 is the first
+            fake.issues[n] = dict(item(n, body="Part of #1\n", labels=["epic"]),
+                                  title="Epic: number %d" % n)
+            fake.subs[1].append(n)
+
+    def test_the_epic_command_refuses_a_seventh_open_epic(self):
+        fake = GoalRepo()
+        self.epics(fake, 6)
+        with self.assertRaisesRegex(ValueError, "already has 6 open epics \\(cap 6\\)"):
+            brain.file_epic(GitHub("t", transport=fake), REPO, 1, "Epic: one more", EPIC_BODY)
+        self.assertEqual(fake.created(), [])
+        # A closed epic does not count.
+        fake.issues[60]["state"] = "closed"
+        made = brain.file_epic(GitHub("t", transport=fake), REPO, 1, "Epic: one more", EPIC_BODY)
+        self.assertEqual(made["labels"], [{"name": "epic"}])
+        self.assertTrue(made["body"].endswith("\n\nPart of #1\n"))
+        self.assertIn(made["number"], fake.subs[1])
+
+    def test_the_epic_command_allows_up_to_the_recorded_exception(self):
+        fake = GoalRepo()
+        fake.issues[1]["body"] = "## Rules\nEpic cap: 8 until 2030-01-31\n"
+        self.epics(fake, 7)
+        gh = GitHub("t", transport=fake)
+        brain.file_epic(gh, REPO, 1, "Epic: the eighth", EPIC_BODY, today="2030-01-31")
+        with self.assertRaisesRegex(ValueError, "already has 8 open epics \\(cap 8\\)"):
+            brain.file_epic(gh, REPO, 1, "Epic: the ninth", EPIC_BODY, today="2030-01-31")
+        # Past its date the exception no longer holds.
+        with self.assertRaisesRegex(ValueError, "cap 6"):
+            brain.file_epic(gh, REPO, 1, "Epic: late", EPIC_BODY, today="2030-02-01")
+
+    def test_the_epic_command_needs_its_title_done_when_and_size(self):
+        gh = GitHub("t", transport=GoalRepo())
+        for title, body, why in (("Ship it", EPIC_BODY, "Epic: <sentence>"),
+                                 ("Epic: " + "x" * 80, EPIC_BODY, "at most 72"),
+                                 ("Epic: ship it", "Size: S\n", "done-when"),
+                                 ("Epic: ship it", "Done when: x\n", "size line")):
+            with self.subTest(why=why):
+                with self.assertRaisesRegex(ValueError, why):
+                    brain.file_epic(gh, REPO, 1, title, body)
+
+    def test_intake_files_under_the_intake_epic_and_opens_the_next_when_full(self):
+        fake = GoalRepo()
+        gh = GitHub("t", transport=fake)
+        first = brain.intake_epic(gh, REPO, 1)
+        self.assertEqual(fake.issues[first]["title"], brain.INTAKE_TITLE)
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), first)  # found, not opened again
+        url = brain.brief_intake(gh, REPO, 1, "Ticket", BODY, "codex")
+        self.assertIn(int(url.rsplit("/", 1)[1]), fake.subs[first])
+        for n in range(70, 84):
+            fake.issues[n] = item(n, labels=["loom:ticket", "loom:merged"])
+            fake.subs[first].append(n)
+        nxt = brain.intake_epic(gh, REPO, 1)
+        self.assertNotEqual(nxt, first)
+        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
