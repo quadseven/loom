@@ -233,6 +233,58 @@ class RollPinTest(unittest.TestCase):
         self.assertEqual(merge.call_args.kwargs["env"]["LOOM_BRIEF_AUTHORS"], "example-bot")
         self.assertFalse(any("Family gate is open" in c["body"] for c in self.gh.comments))
 
+    def test_open_gate_alerts_for_a_hand_made_held_roll_pin_without_a_brain_tick(self):
+        self.gh.pulls = [{"number": 8, "title": "HOLD for window: dev roll 61 pin",
+                          "head": {"ref": "dev-roll61-pin", "sha": FIRST}}]
+        gates = [{"repo": DEPLOY, "goal": GOAL,
+                  "gate_url": "https://example.com/family-gate"}]
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": True}), \
+                mock.patch("bus.roll_pin.brain.merge", side_effect=ValueError("checks are not successful")) as merge:
+            station = Station(self.gh, Settings(home, [], [], [], roll_gates=gates))
+            station.poll_roll_gates()
+            station.poll_roll_gates()
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertIn("Family gate is open", self.gh.comments[0]["body"])
+
+    def test_closed_gate_leaves_a_hand_made_roll_pin_held_without_alert(self):
+        self.gh.pulls = [{"number": 8, "title": "HOLD for window: dev roll 61 pin",
+                          "head": {"ref": "dev-roll61-pin", "sha": FIRST}}]
+        gates = [{"repo": DEPLOY, "goal": GOAL,
+                  "gate_url": "https://example.com/family-gate"}]
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": False}), \
+                mock.patch("bus.roll_pin.brain.merge") as merge:
+            station = Station(self.gh, Settings(home, [], [], [], roll_gates=gates))
+            station.poll_roll_gates()
+        merge.assert_not_called()
+        self.assertEqual(self.gh.comments, [])
+
+    def test_open_gate_merges_a_reviewed_hand_made_roll_pin(self):
+        self.gh.pulls = [{"number": 8, "title": "HOLD for window: dev roll 61 pin",
+                          "head": {"ref": "dev-roll61-pin", "sha": FIRST}},
+                         {"number": 9, "title": "Unrelated deployment change",
+                          "head": {"ref": "other-change", "sha": SECOND}}]
+        gates = [{"repo": DEPLOY, "goal": GOAL,
+                  "gate_url": "https://example.com/family-gate"}]
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": True}), \
+                mock.patch("bus.roll_pin.brain.merge", return_value={"merged": True}) as merge:
+            station = Station(self.gh, Settings(home, [], ["example-bot"], [],
+                                                roll_gates=gates))
+            station.poll_roll_gates()
+        merge.assert_called_once()
+        self.assertEqual(merge.call_args.args[1:3], (DEPLOY, 8))
+        self.assertTrue(merge.call_args.kwargs["adopt"])
+        self.assertEqual(self.gh.comments, [])
+
+    def test_station_reads_hand_made_roll_gate_without_ship_documents(self):
+        gates = '[{"repo":"example-owner/deploy","goal":"example-owner/project#12","gate_url":"https://example.com/gate"}]'
+        settings = Settings.from_env({"LOOM_ROLL_GATES": gates})
+        self.assertEqual(settings.roll_ship_docs, [])
+        self.assertEqual(settings.roll_gates, json.loads(gates))
+
 
 if __name__ == "__main__":
     unittest.main()

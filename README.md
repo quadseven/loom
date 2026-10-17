@@ -103,3 +103,10 @@ checks, a passing review check on the head, and resolved threads. If those
 checks refuse the merge, it posts one journal alert per head commit on the
 goal home for the next brain tick. Add the station login to
 `LOOM_BRIEF_AUTHORS` so its roll pin pull requests qualify for the merge.
+
+For hand-made roll pin pull requests, set `LOOM_ROLL_GATES` independently of
+`LOOM_ROLL_SHIP_DOCS`. Each JSON entry names the deployment `repo`, the alert
+`goal`, and an HTTPS `gate_url` returning `{"open": true}` or `{"open": false}`.
+The station polls open pull requests whose titles start with `HOLD for window:`
+and contain `roll` followed by `pin`. It merges only when the brain's
+ticketless merge checks pass; otherwise it posts a journal alert to the goal.

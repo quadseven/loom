@@ -141,6 +141,13 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn('<key>LOOM_ROLL_SHIP_DOCS</key><string>%s</string>' % documents, plist)
 
+    def test_roll_gates_are_written_to_station_plist(self):
+        gates = '[{"repo":"example-owner/deploy","goal":"example-owner/project#12","gate_url":"https://example.com/gate"}]'
+        result = self.run_install(LOOM_ROLL_GATES=gates)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn('<key>LOOM_ROLL_GATES</key><string>%s</string>' % gates, plist)
+
     def test_pin_ship_repos_are_written_to_station_plist(self):
         result = self.run_install(LOOM_PIN_SHIP_REPOS="example-owner/deploy")
         self.assertEqual(result.returncode, 0, result.stderr)

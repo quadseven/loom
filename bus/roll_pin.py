@@ -17,6 +17,7 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 BLOCK = re.compile(r"(?ms)^```loom-roll-pins\s*\n(.*?)\n```\s*$")
 MARKER = "<!-- loom:roll-pin "
+HELD_ROLL_PIN = re.compile(r"^HOLD for window:.*\broll\b.*\bpin\b", re.I)
 
 
 def specs_from_env(raw: str) -> list[dict[str, str]]:
@@ -35,6 +36,23 @@ def specs_from_env(raw: str) -> list[dict[str, str]]:
         if gate_url is not None and (not isinstance(gate_url, str) or
                 urlsplit(gate_url).scheme != "https" or not urlsplit(gate_url).hostname):
             raise ValueError("roll gate_url must be an https URL")
+    return data
+
+
+def gate_specs_from_env(raw: str) -> list[dict[str, str]]:
+    data = json.loads(raw or "[]")
+    if not isinstance(data, list):
+        raise ValueError("LOOM_ROLL_GATES must be a JSON array")
+    for item in data:
+        if not isinstance(item, dict) or not all(isinstance(item.get(k), str)
+                for k in ("repo", "goal", "gate_url")):
+            raise ValueError("each roll gate needs repo, goal and gate_url")
+        goal_repo, sep, number = item["goal"].partition("#")
+        url = urlsplit(item["gate_url"])
+        if not REPO.fullmatch(item["repo"]) or not sep or \
+                not REPO.fullmatch(goal_repo) or not number.isdigit() or \
+                url.scheme != "https" or not url.hostname:
+            raise ValueError("invalid roll gate")
     return data
 
 
@@ -303,16 +321,39 @@ def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
     pr = next((p for p in pulls if (p.get("head") or {}).get("ref") == _branch(spec["goal"])), None)
     if pr is None:
         return
-    gate = health.fetch(spec["gate_url"])
+    if not _gate_is_open(spec["gate_url"]):
+        return
+    _merge_or_alert(gh, spec["goal"], deploy, pr, authors, review_check)
+
+
+def _gate_is_open(url: str) -> bool:
+    gate = health.fetch(url)
     if not isinstance(gate, dict) or type(gate.get("open")) is not bool:
         raise ValueError("roll family gate must answer with a boolean open field")
-    if not gate["open"]:
-        return
+    return gate["open"]
+
+
+def _merge_or_alert(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any],
+                    authors: list[str], review_check: str) -> None:
     env = {"LOOM_BRIEF_AUTHORS": " ".join(authors), "LOOM_REVIEW_CHECK": review_check}
     try:
         brain.merge(gh, deploy, int(pr["number"]), adopt=True, env=env)
     except ValueError:
-        _gate_alert(gh, spec["goal"], deploy, pr)
+        _gate_alert(gh, goal, deploy, pr)
+
+
+def poll_gates(gh: GitHub, gates: list[dict[str, str]], authors: list[str],
+               review_check: str) -> None:
+    for spec in gates:
+        repo = spec["repo"]
+        pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % repo).data or []
+        held = [pr for pr in pulls if HELD_ROLL_PIN.search(str(pr.get("title") or ""))]
+        if not held:
+            continue
+        if not _gate_is_open(spec["gate_url"]):
+            continue
+        for pr in held:
+            _merge_or_alert(gh, spec["goal"], repo, pr, authors, review_check)
 
 
 def _gate_alert(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any]) -> None:

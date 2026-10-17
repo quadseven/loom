@@ -369,6 +369,7 @@ class Settings:
                  health_every: int = health.EVERY,
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
+                 roll_gates: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = ()) -> None:
         self.home = home
         # Deployment repos whose merged pin pull requests ship the tickets
@@ -380,6 +381,7 @@ class Settings:
         self.health_every = health_every
         self.evidence_cmds = evidence_cmds or {}
         self.roll_ship_docs = roll_ship_docs or []
+        self.roll_gates = roll_gates or []
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
         self.report_digest = tuple(report_digest)
@@ -482,6 +484,7 @@ class Settings:
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
+                   roll_gates=roll_pin.gate_specs_from_env(env.get("LOOM_ROLL_GATES", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"))
 
 
@@ -5222,6 +5225,14 @@ class Station:
             except health.NotLooked as err:
                 raise GitHubError("roll family gate could not be read: %s" % err) from err
 
+    def poll_roll_gates(self) -> None:
+        if self.s.roll_gates:
+            try:
+                roll_pin.poll_gates(self.gh, self.s.roll_gates, self.s.authors,
+                                    self.s.review_check)
+            except health.NotLooked as err:
+                raise GitHubError("roll family gate could not be read: %s" % err) from err
+
     def run_pass(self) -> None:
         self.finish_claims()
         self.report_outcomes()
@@ -5246,7 +5257,7 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.unwind_reverts, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.roll_source_pins, self.poll_roll_gates, self.ship_deployed, self.ship_pins, self.unwind_reverts, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,
