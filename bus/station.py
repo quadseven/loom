@@ -2235,7 +2235,12 @@ class Station:
         for pr in open_prs:
             author = tickets._login(pr.get("user"))
             head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
-            if author not in trusted_authors or head_repo != repo:
+            if head_repo != repo:
+                continue
+            if author not in trusted_authors:
+                # A second contributor's pull request links only the
+                # trusted ticket that contributor owns (loom#688).
+                self._link_contributor_pr(repo, pr, author, tickets_by_number)
                 continue
             number = self._pr_ticket_number(repo, pr)
             if number is None:
@@ -2276,6 +2281,46 @@ class Station:
             if isinstance(pr, dict) and pr.get("state") == "closed":
                 pool = tickets_by_number if self._terminal_label(pr) == "loom:merged" else waiting
                 self._reconcile_pr_ticket(repo, pr, pool)
+
+    def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
+                            author: str) -> Optional[Dict[str, Any]]:
+        """The open loom:ticket a pull request names when its author owns it
+        (assigned, or labelled claim:<author>) and a trusted login filed it;
+        None otherwise. The ticket is read only for such a pull request."""
+        if not author or author in {a.lower() for a in self.s.authors}:
+            return None
+        number = self._pr_ticket_number(repo, pr)
+        if number is None:
+            return None
+        try:
+            ticket = self._issue(repo, number)
+        except GitHubError as err:
+            if err.status in (404, 410):
+                return None
+            raise
+        owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+        if ("pull_request" in ticket or ticket.get("state") != "open"
+                or "loom:ticket" not in _label_names(ticket) or author not in owners
+                or tickets._login(ticket.get("user")) not in {a.lower() for a in self.s.authors}
+                or not _linked_pr(ticket, repo, pr)):
+            return None
+        return ticket
+
+    def _link_contributor_pr(self, repo: str, pr: Dict[str, Any], author: str,
+                             found: Dict[int, Dict[str, Any]]) -> None:
+        """An open pull request by the contributor who owns its ticket moves
+        a queued ticket to loom:pr; it is never briefed or claimed. From
+        loom:pr, the closed pull request pass moves it to loom:merged when it
+        merges, as for a lane's pull request, and shipping follows."""
+        ticket = self._contributor_ticket(repo, pr, author)
+        if ticket is None or "loom:queued" not in _label_names(ticket):
+            return
+        number = int(ticket["number"])
+        kept = [n for n in _label_names(ticket) if n != "loom:queued"] + ["loom:pr"]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        ticket["labels"] = [{"name": n} for n in kept]
+        found[number] = ticket
+        self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
