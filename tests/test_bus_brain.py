@@ -1846,7 +1846,8 @@ class EscalateTests(unittest.TestCase):
                          [{"labels": ["loom:ticket", "loom:briefed", "lane:codex"]}])
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: gpt-6-sol\n\n" + BODY}])
 
-    def finished_pr_routes(self, green=True, review="success", resolved=True):
+    def finished_pr_routes(self, green=True, review="success", resolved=True,
+                           author="trusted", fork=False):
         """Two fix rounds on lane codex, and pull request #8 in the given state."""
         issue = stuck_ticket("pr", body="Model: gpt-6-sol\n\n" + BODY)
         history = [claim("2030-01-01T00:10:00Z", "codex"), fixc("2030-01-01T00:20:00Z"),
@@ -1858,6 +1859,10 @@ class EscalateTests(unittest.TestCase):
                    "reviewThreads": {"nodes": [{"id": "T1", "isResolved": resolved,
                                                 "comments": {"nodes": []}}]}}
         routes[("POST", "/graphql")] = reply(200, {"data": {"repository": {"pullRequest": details}}})
+        pr = fix_pr(user={"login": author})
+        if fork:
+            pr["head"] = dict(pr["head"], repo={"full_name": "someone-else/" + REPO.split("/")[1]})
+        routes[("GET", "/pulls/8")] = reply(200, pr)
         routes[("GET", "/commits/abc123/check-runs")] = reply(200, {"check_runs": [
             {"name": brain.review_check_name({}), "status": "completed", "conclusion": review}]})
         return routes
@@ -1866,7 +1871,7 @@ class EscalateTests(unittest.TestCase):
         # 2026-10-16: two fix rounds escalated a pull request whose head was
         # green, reviewed and threadless, and the same model ran it again.
         fake = Routed(self.finished_pr_routes())
-        with unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_CHECK": ""}):
+        with unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
             with self.assertRaises(ValueError) as caught:
                 brain.escalate(GitHub("t", transport=fake), REPO, 9)
         said = str(caught.exception)
@@ -1878,14 +1883,29 @@ class EscalateTests(unittest.TestCase):
                           or (c[0] == "POST" and "/graphql" not in c[1])], [])
 
     def test_escalate_still_sends_back_a_pull_request_with_something_to_fix(self):
+        # An outsider's pull request (a fork, or an author outside
+        # LOOM_BRIEF_AUTHORS) that merely matches the ticket by branch name is
+        # never "finished": it must not stop the ticket climbing the ladder.
         cases = {"failing checks": {"green": False}, "review not passed": {"review": "failure"},
-                 "open thread": {"resolved": False}}
+                 "open thread": {"resolved": False}, "untrusted author": {"author": "stranger"}}
         for name, state in cases.items():
-            with self.subTest(name), unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_CHECK": ""}):
+            with self.subTest(name), unittest.mock.patch.dict(
+                    os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
                 fake, outcome = self.run_escalate(self.finished_pr_routes(**state))
                 self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
                 self.assertTrue(fake.sent("POST", "/issues/9/comments")[-1]["body"]
                                 .startswith("<!-- loom:escalate v1 -->"))
+
+    def test_a_fork_pull_request_is_never_reported_as_finished(self):
+        # fix() refuses a fork on its own; the point is that the finished-pull-
+        # request guard does not claim it, so no outsider can use a green fork
+        # to answer "land it instead" for a ticket.
+        fake = Routed(self.finished_pr_routes(fork=True))
+        with unittest.mock.patch.dict(
+                os.environ, {"LOOM_REVIEW_CHECK": "", "LOOM_BRIEF_AUTHORS": "trusted"}):
+            with self.assertRaises(ValueError) as caught:
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertNotIn("nothing to fix", str(caught.exception))
 
     def test_escalate_refuses_a_ticket_that_is_not_repeatedly_stuck(self):
         issue = dict(stuck_ticket("failed"), created_at="2999-01-01T00:00:00Z")
