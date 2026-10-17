@@ -1619,10 +1619,8 @@ _HEADING = re.compile(r"##[ \t]+(.*?)[ \t#]*")
 _CHECKBOX = re.compile(r"[ \t]*[-*+][ \t]+\[[ xX]\][ \t]")
 
 
-def missing_sections(body: Optional[str]) -> List[str]:
-    """What an issue body lacks to be a ticket as it stands: the brief
-    sections by name, checkboxes under Acceptance criteria, and a body the
-    runner accepts. Empty when it is ready."""
+def _body_sections(body: Optional[str]) -> Dict[str, List[str]]:
+    """Each ## section of a body, by lower-case heading, with its lines."""
     found: Dict[str, List[str]] = {}
     current: Optional[str] = None
     for line in (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
@@ -1632,6 +1630,14 @@ def missing_sections(body: Optional[str]) -> List[str]:
             found.setdefault(current, [])
         elif current is not None:
             found[current].append(line)
+    return found
+
+
+def missing_sections(body: Optional[str]) -> List[str]:
+    """What an issue body lacks to be a ticket as it stands: the brief
+    sections by name, checkboxes under Acceptance criteria, and a body the
+    runner accepts. Empty when it is ready."""
+    found = _body_sections(body)
     names = [section[3:] for section in SECTIONS]
     present = {name: name.lower() in found for name in names}
     # A size counts as a ## Size section or an inline Size: line (#668).
