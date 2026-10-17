@@ -1094,6 +1094,27 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
 DIFFICULTIES = ("easy", "medium", "hard")
 
 
+def _check_ticket_headers(full_body: str, written: Dict[str, Optional[str]]) -> None:
+    """The ticket must parse back to every header the brief tool wrote. A body
+    file that opened with its own header lines, a blank line before them, or a
+    pasted "Repo:"/"Branch:" preamble made the parser stop early or refuse the
+    ticket, so no lane ever claimed it and it sat queued for up to 17 hours
+    (2026-10-16: loom#486, #506, #517 and #521 among them)."""
+    try:
+        headers, _ = parse_ticket(full_body)
+    except ValueError as err:
+        raise ValueError("the brief's headers do not parse (%s): start the body at its "
+                         "first '## ' section, the tool writes the headers" % err) from None
+    for key, value in written.items():
+        if not value:
+            continue
+        got = headers.get(key)
+        if got is None or got != (value.lower() if key == "Difficulty" else value):
+            raise ValueError("the brief's %s header is not readable in the ticket it would "
+                             "file: the body file repeats or precedes the headers the tool "
+                             "writes, so remove its own header lines" % key)
+
+
 def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional[str]) -> None:
     """A brief the station must place needs a difficulty tier. Without one the
     ticket gets no lane and waits for a brain to notice (2026-10-16: five
@@ -1201,6 +1222,9 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         base = goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority)
+    _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
+                                      "Model": model, "Base": base, "After": after,
+                                      "Not before": not_before})
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue)
