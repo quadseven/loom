@@ -1025,6 +1025,21 @@ class BudgetTest(Base):
         self.assertIn("app token 1", err)
         self.assertIn("GitHub App budget 4000 of 5000 left", err)
 
+    def test_a_refused_app_token_is_logged_with_its_reason_and_sends_nothing_else(self):
+        from bus.github import AppToken
+        self.settings.status_repo = REPO
+        sent = []
+
+        def refusing(method, url, headers_in, body):
+            sent.append((method, headers_in.get("Authorization", "")))
+            return 401, {}, json.dumps({"message": "Bad credentials"}).encode()
+        app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
+        _, err = self.passes(gh=GitHub(app, transport=refusing))
+        self.assertIn("could not mint the GitHub App installation token", err)
+        self.assertIn("(Bad credentials)", err)
+        # Every request was a mint: none went out with a personal token.
+        self.assertEqual({m for m, _ in sent}, {"POST"})
+
     def test_an_idle_repo_is_scanned_once_per_ten_minutes(self):
         start = time.time()
         self.passes(now=start)

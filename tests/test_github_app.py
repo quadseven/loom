@@ -202,20 +202,23 @@ class KeyNeverLeaksTests(unittest.TestCase):
         return "\n".join(texts + [out.getvalue(), err.getvalue(), logs.getvalue()])
 
     def test_the_key_never_appears_in_an_error_or_log_line(self):
-        def raising(exc):
-            def sign(data, key):
-                raise exc(key)
-            return sign
+        # The failures a key read or a signing is expected to have, each
+        # carrying the key in its text.
+        expected = (lambda: OSError("bad parameter " + KEY),
+                    lambda: subprocess.TimeoutExpired(["aws", KEY], 30, output=KEY.encode()),
+                    lambda: subprocess.CalledProcessError(1, ["openssl", KEY], stderr=KEY.encode()))
 
-        def reader_raises():
-            raise OSError("bad parameter " + KEY)
+        def raising(make):
+            def fail(*_):
+                raise make()
+            return fail
 
         cases = []
-        for exc in (ValueError, OSError, RuntimeError, GitHubError):
-            app = AppToken("123", "456", lambda: KEY, sign=raising(exc), clock=Clock())
+        for make in expected:
+            app = AppToken("123", "456", lambda: KEY, sign=raising(make), clock=Clock())
             cases.append(GitHub(app, transport=FakeGitHub(["t"])))
-        cases.append(GitHub(AppToken("123", "456", reader_raises, sign=fake_sign([])),
-                            transport=FakeGitHub(["t"])))
+            cases.append(GitHub(AppToken("123", "456", raising(make), sign=fake_sign([])),
+                                transport=FakeGitHub(["t"])))
         cases.append(app_client(["t"], Clock(), mint_status=401)[0])
         cases.append(app_client(["t"], Clock())[0])
         for gh in cases:
@@ -228,6 +231,30 @@ class KeyNeverLeaksTests(unittest.TestCase):
             text = self._capture(lambda: github.openssl_sign(b"data", KEY))
         self.assertIn("exit 1", text)
         self.assertNotIn(KEY_MARK, text)
+
+    def test_an_unexpected_error_in_the_key_read_or_signing_is_not_masked(self):
+        def broken_reader():
+            raise TypeError("reader bug")
+
+        def broken_signer(data, key):
+            raise AttributeError("signer bug")
+        gh = GitHub(AppToken("123", "456", broken_reader, sign=fake_sign([])),
+                    transport=FakeGitHub(["t"]))
+        with self.assertRaisesRegex(TypeError, "reader bug"):
+            gh.rest("GET", "/rate_limit")
+        gh = GitHub(AppToken("123", "456", lambda: KEY, sign=broken_signer),
+                    transport=FakeGitHub(["t"]))
+        with self.assertRaisesRegex(AttributeError, "signer bug"):
+            gh.rest("GET", "/rate_limit")
+
+    def test_a_refused_mint_names_githubs_reason_and_never_falls_back(self):
+        gh, fake, _ = app_client(["t"], Clock(), mint_status=401)
+        with self.assertRaises(GitHubError) as caught:
+            gh.rest("GET", "/rate_limit")
+        self.assertEqual(caught.exception.status, 401)
+        self.assertIn("-> 401 (Bad credentials)", str(caught.exception))
+        # Nothing was sent with any other token.
+        self.assertEqual([m for m, _, _ in fake.calls], ["POST"])
 
     def test_openssl_gets_the_key_on_stdin_never_on_argv_or_disk(self):
         seen = {}

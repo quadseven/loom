@@ -241,18 +241,22 @@ class AppToken:
                                      "iss": self.app_id},
                                     separators=(",", ":")).encode("utf-8"))
         signing_input = (header + "." + claims).encode("ascii")
-        # Errors are raised outside the except blocks, so no exception that
-        # could carry the key is chained to them as their context.
+        # Only the failures a key read or a signing can have are caught: the
+        # reader's OSError (SSM unreadable, aws missing) or SubprocessError
+        # (timeout), and the signer's SigningError, OSError or SubprocessError.
+        # They are reported by kind, since their text could carry the key, and
+        # raised outside the except blocks so none is chained as context. Any
+        # other exception is a bug and propagates as itself.
         failure = ""
         try:
             key = self._read_key()
-        except Exception as err:  # noqa: BLE001 - its text could carry the key
+        except (OSError, subprocess.SubprocessError) as err:
             failure = "could not read the GitHub App private key: %s" % type(err).__name__
         if failure:
             raise GitHubError(failure)
         try:
             signature = self._sign(signing_input, key)
-        except Exception as err:  # noqa: BLE001 - its text could carry the key
+        except (SigningError, OSError, subprocess.SubprocessError) as err:
             failure = "could not sign the GitHub App JWT: %s" % (
                 str(err) if isinstance(err, SigningError) else type(err).__name__)
         finally:
@@ -378,10 +382,17 @@ class GitHub:
         status, _, raw = self._transport_with_retry("POST", url, headers, None)
         with self._count_lock:
             self.kinds["app token"] = self.kinds.get("app token", 0) + 1
-        data = _json_or_none((raw or b"").decode("utf-8", "replace"))
+        text = (raw or b"").decode("utf-8", "replace")
+        data = _json_or_none(text)
         if status != 201 or not isinstance(data, dict):
+            # GitHub's own reason ("Bad credentials", "Integration not found")
+            # goes into the error the station logs; there is no fallback to
+            # the personal token, which would drain the shared budget unseen.
+            reason = data.get("message") if isinstance(data, dict) else None
             raise GitHubError("could not mint the GitHub App installation token: "
-                              "POST %s -> %d" % (path, status), status)
+                              "POST %s -> %d%s" % (path, status,
+                                                   " (%s)" % str(reason)[:200] if reason else ""),
+                              status, text)
         token = data.get("token")
         if not isinstance(token, str) or not token.strip():
             raise GitHubError("the installation token answer has no token", status)
