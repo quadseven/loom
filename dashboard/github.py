@@ -117,6 +117,50 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# What the views read from a pull request in the list (dashboard/results.py,
+# views.py, ticket_data.py and server.py) and from an issue or review comment
+# (hot_spots.py, goals.py, results.py, tickets_table.py). The list answers
+# embed the base and head repositories and the user in full: about 17 KB of
+# JSON per pull request. Kept whole, the 6,700 pull requests of 17 repos held
+# about 190 MiB and two weeks of comments about 150 MiB more, twice over while
+# a refresh built the next snapshot beside the one being served, and the
+# dashboard was killed at its 1 GiB memory limit every few refreshes
+# (2026-10-17).
+PULL_REQUEST_FIELDS = ("number", "title", "html_url", "state", "draft", "body",
+                       "created_at", "updated_at", "merged_at", "closed_at", "repo")
+COMMENT_FIELDS = ("id", "body", "created_at", "updated_at", "html_url",
+                  "issue_url", "pull_request_url", "path")
+
+
+def _user(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    return {"login": value.get("login"), "type": value.get("type")}
+
+
+def pull_request_record(pr: Dict[str, Any]) -> Dict[str, Any]:
+    """The fields of a pull request list item that the views read."""
+    out = {key: pr[key] for key in PULL_REQUEST_FIELDS if key in pr}
+    if isinstance(pr.get("user"), dict):
+        out["user"] = _user(pr["user"])
+    head, base = pr.get("head"), pr.get("base")
+    if isinstance(head, dict):
+        out["head"] = {"ref": head.get("ref"), "sha": head.get("sha")}
+    if isinstance(base, dict):
+        base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+        out["base"] = {"ref": base.get("ref"), "repo": {"full_name": base_repo.get("full_name")}}
+    return out
+
+
+def comment_record(comment: Dict[str, Any], repo: str) -> Dict[str, Any]:
+    """The fields of an issue or review comment that the views read."""
+    out = {key: comment[key] for key in COMMENT_FIELDS if key in comment}
+    if isinstance(comment.get("user"), dict):
+        out["user"] = _user(comment["user"])
+    out["repo"] = repo
+    return out
+
+
 class TicketStore:
     def __init__(self, repos: Optional[List[str]] = None, gh: Optional[GitHub] = None,
                  budget_floor: Optional[int] = None) -> None:
@@ -440,9 +484,9 @@ class TicketStore:
         issues, reviews = [], []
         try:
             found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
+            issues = [comment_record(c, repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
             found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
-            reviews = [dict(c, repo=repo) for c in found if isinstance(c, dict)]
+            reviews = [comment_record(c, repo) for c in found if isinstance(c, dict)]
         except (GitHubError, OSError, ValueError) as exc:
             return issues, reviews, "%s comments: %s" % (repo, self._error_reason(exc))
         return issues, reviews, ""
@@ -500,7 +544,7 @@ class TicketStore:
         try:
             items = self.gh.paginate_parallel("/repos/%s/pulls?state=all&per_page=100" % quote(repo, safe="/"),
                                               workers=READ_WORKERS)
-            prs.extend(item for item in items if isinstance(item, dict))
+            prs.extend(pull_request_record(item) for item in items if isinstance(item, dict))
         except (GitHubError, OSError, ValueError) as exc:
             errors.append("%s pull requests: %s" % (repo, self._error_reason(exc)))
 

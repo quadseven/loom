@@ -63,3 +63,7 @@ Backlog's "Outside any epic" lists open tickets with no epic.
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one
 repository, and startup logs the time taken for that snapshot.
+Each refresh keeps only the fields the pages read from each pull request and
+comment it lists (`PULL_REQUEST_FIELDS` and `COMMENT_FIELDS` in
+`dashboard/github.py`), not GitHub's whole answers with their embedded
+repositories and users, and the Ticket page keeps at most 64 tickets' details.
