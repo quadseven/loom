@@ -159,7 +159,10 @@ findings section.
 checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
 non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
 Out of scope), and files a Size written as a word (Small, Medium, Large) as
-its letter. Triage counts the same checks as missing sections. The runner
+its letter. Triage counts the same checks as missing sections. The size may
+be a `## Size` section or one line of its own, `Size: XS|S|M|L` (any case,
+optionally bold); triage, `brief`, the rewrite check, the runner and PR
+repair all read it through `hunt_plan.stated_size`. The runner
 writes the Size as the letter whatever the brief says, and logs any plan
 check its body still fails before it opens the pull request.
 
