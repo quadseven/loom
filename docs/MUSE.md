@@ -221,8 +221,10 @@ live regression) and `brief` (a brief named but not written this tick).
   from `python3 -m bus.brain done OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
   in your journal. A written brief records its own done marker: `brief
   --holder HOLDER` on a goal whose brief stage stands deferred posts a
-  journal on the goal home with the `stage=brief` done line and the new
-  ticket, so you do not paste that line. A refused brief records nothing.
+  journal on the goal home with the keyed `stage=brief` done line and the new
+  ticket, so you do not paste that line. Use `brief --resolves KEY` when more
+  than one brief defer is pending; the key is printed by `defer`. A refused
+  brief records nothing.
 - The newest marker for an item wins, and `resume` drops a defer whose
   item was closed or changed since (new commits, new comments, another
   state), so no brain repeats finished work. `status` shows, per goal and
