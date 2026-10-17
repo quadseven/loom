@@ -20,6 +20,14 @@ outcomes, and `LOOM_REVIEW_BOT` names the review bot whose findings are
 counted (default `grug-tribe`). `.env.example` lists the dashboard variables with placeholder
 values. Set `LOOM_UPLOAD_TOKEN` to the same private value for the dashboard
 and station so completed runs can upload to `POST /api/transcripts`.
+Keep the dashboard ingress tailnet-only; the bearer token authenticates
+uploads but does not replace the network boundary. The endpoint rejects
+uploads without that token. Transcripts live in the configured Postgres
+database in one row per ticket, lane slot, and start time, with events stored
+as JSONB. The store removes runs older than 180 days whenever it initializes,
+accepts an upload, or serves a transcript read. This bounds retained history
+during normal dashboard use; it does not depend on how lane runs generate
+their transcripts.
 
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one
