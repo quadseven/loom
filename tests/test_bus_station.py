@@ -254,6 +254,9 @@ class FakeGitHub:
         if "labels=loom:invariant" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:invariant" in self.names(i["number"])])
+        if "labels=loom%3Ashipped" in query or "labels=loom:shipped&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:shipped" in self.names(i["number"])])
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
@@ -526,6 +529,23 @@ class ShipDeployedTest(Base):
         self.assertNotIn("loom:shipped", self.fake.names(12))
         self.assertEqual(self.fake.comments[12], [])
         self.assertIn("loom:shipped", self.fake.names(13))
+
+    def test_a_ticket_whose_prs_are_all_hand_reverted_does_not_ship(self):
+        self.merged(12, 99)
+        rsha = "%040x" % 777
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T01:00:00Z",
+                                "merge_commit_sha": rsha, "title": 'Revert "Change"',
+                                "body": "git revert %s\n\n## Why\nIt broke the build.\n"
+                                        % ("%040x" % 99),
+                                "head": {"ref": "revert-101"}, "base": {"ref": "main"}})
+        self.carried.add(rsha)
+        self.record_deploy()
+        with mock.patch("bus.station._say") as say:
+            self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        say.assert_not_called()
 
     def test_without_a_successful_deploy_nothing_moves(self):
         self.merged(12, 99)
@@ -1210,9 +1230,10 @@ class CorruptStateTest(Base):
     def test_a_half_written_heartbeat_only_idles_that_lane(self):
         d = os.path.join(self.home, "state", "usage")
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
-        # Reconciliation, PR review polling, the goal scan and the invariant
-        # check's read of open pull requests (their plan checks) still run.
-        self.assertEqual(self.run_pass().requests, 5)
+        # Reconciliation, PR review polling, the goal scan, the hand-revert
+        # scan's merged and shipped lists, and the invariant check's read of
+        # open pull requests (their plan checks) still run.
+        self.assertEqual(self.run_pass().requests, 7)
 
 
 class TicketsTest(unittest.TestCase):
@@ -1561,9 +1582,10 @@ class ClaimTest(Base):
         gh = self.run_pass()
         # The loom:pr list for reconciliation and for PR reviews (this fake
         # sends no ETag for it), then the briefed list's 304; with no loom:pr
-        # ticket no pull request list is read.
-        self.assertEqual(len(self.fake.calls), first + 3)
-        self.assertEqual(gh.requests, 4)
+        # ticket no pull request list is read. The hand-revert scan adds the
+        # loom:merged and loom:shipped lists.
+        self.assertEqual(len(self.fake.calls), first + 5)
+        self.assertEqual(gh.requests, 6)
         self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
