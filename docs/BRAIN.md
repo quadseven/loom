@@ -797,6 +797,37 @@ Every 2 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
 
+### Handoff packet
+
+Each pass the station keeps one comment on the Loom goal home (the status
+repo's one open goal home that is not a backlog), marked
+`<!-- loom:handoff v1 -->`. It posts it once and then edits it in place, and
+only when its text changed. It rebuilds the packet at most every 10 minutes,
+or at once when a brain tick on the lane machine just ended (`state/brain.json`
+changed), and reads again only the goal homes whose update time or comment
+count changed since the last build. It holds the last 5 ticks across the goal homes
+(holder, model from a `- Model:` journal line, done and deferred counts, one
+line decided from a `- Decided:` line or the first line of prose, and the
+items left open), a tick that holds the lock with no journal yet, the
+standing defers (the newest marker for a stage and item wins, as in
+`resume`), with each defer whose brain has not ticked in 2 hours marked open
+work for any brain, and the Rules section of docs/MUSE.md read from GitHub at
+the station checkout's commit. Journals from private repos count, but the
+packet names neither their repo nor their text.
+
+When the dashboard's brain memory answers (`GET /api/brain/handoff` with the
+transcript upload token, docs/MUSE.md, Handing off stage work), the station
+renders the packet from it instead: the last 5 ticks posted to brain_ticks
+(holder, lane, model, start, end, outcome, and how many items each decided,
+left open and handed off), the open commitments (stage, item, the tick that
+opened it, due), each rules digest source with its commit or comment, and the
+same Rules section from GitHub. A row's text is not quoted there, since a row
+does not say which goal home it came from; `python3 -m bus.brain_memory
+handoff` prints it in full. A private repo's item or goal home is shown as
+"issue N of a private repo". When the dashboard is not set, does not answer,
+refuses the token, or holds no tick yet, the packet is built from the goal
+homes as above.
+
 ### Report deadlines
 
 Each goal owes its own report every 2 hours, counted from its newest valid

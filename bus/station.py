@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import calendar
 import base64
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import errno
 import fcntl
 import fnmatch
@@ -183,6 +183,9 @@ DEPLOYED_FILE = "deployed.json"
 SHIP_PER_PASS = 20
 SHIP_PAGES = 5
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+# The handoff packet is rebuilt at most this often, or sooner when a brain
+# tick on this machine just ended (publish_handoff).
+HANDOFF_EVERY = 600
 # Shipping through a pin pull request (LOOM_PIN_SHIP_REPOS): a merged pull
 # request in a deployment repo that adds a "# Published from <repo> ..., merge
 # <sha>" comment line deploys that revision of the source repo, so it ships
@@ -269,6 +272,8 @@ SecretReader = Callable[[str, str], str]
 Poster = Callable[[str, Dict[str, Any]], None]
 # (URL, bearer token, body) -> None; raises on any failure.
 Uploader = Callable[[str, str, Dict[str, Any]], None]
+# (URL, bearer token) -> the dashboard's handoff packet; OSError on any failure.
+Fetcher = Callable[[str, str], Dict[str, Any]]
 # A finished run: (ledger key, brain tick start or None, body builder).
 Run = Tuple[str, Optional[float], Callable[[], Dict[str, Any]]]
 # (method, path under the API, bot token, JSON body or None) -> parsed reply.
@@ -522,6 +527,17 @@ def _origin_repo() -> str:
         return ""
     m = REMOTE_RE.search(out.stdout.strip()) if out.returncode == 0 else None
     return m.group(1) if m else ""
+
+
+def _checkout_head() -> str:
+    """The commit this checkout is at, or "" when git cannot say."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
 
 
 def _is_ancestor(commit: str, revision: str) -> bool:
@@ -868,13 +884,17 @@ class Station:
                  post: Optional[Poster] = None,
                  discord: Optional[DiscordCall] = None,
                  upload: Optional[Uploader] = None,
-                 ancestor: Optional[Callable[[str, str], bool]] = None) -> None:
+                 ancestor: Optional[Callable[[str, str], bool]] = None,
+                 head: Optional[Callable[[], str]] = None,
+                 fetch: Optional[Fetcher] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
+        self.fetch = fetch or brain_memory.fetch_handoff
         self.ancestor = ancestor or _is_ancestor
+        self.head = head or _checkout_head
         # Where Claude Code and codex keep their sessions (the claude lane's
         # and the brain's transcripts, and codex rollouts).
         self.claude_projects = Path.home() / ".claude" / "projects"
@@ -5302,6 +5322,211 @@ class Station:
             line = "Loom metrics %s: %d/9 pass; streak %d/7." % (today, passed, streak)
             self._metrics_notice(today, "discord", line)
 
+    # -- handoff packet --------------------------------------------------
+    def _handoff_home(self) -> Optional[Tuple[str, int]]:
+        """(repo, number) of the Loom goal home: the status repo's one open
+        goal home that is not a backlog; None when there is not exactly one."""
+        repo = self.s.status_repo
+        if not repo or not tickets.REPO_RE.fullmatch(repo):
+            return None
+        homes = [i for i in self._goal_issues(repo)
+                 if not str(i.get("title") or "").startswith("Backlog:")]
+        return (repo, int(homes[0]["number"])) if len(homes) == 1 else None
+
+    def _shown(self, repo: str, home: str) -> bool:
+        """Whether the packet on `home` may name the repo and quote its text:
+        its own repo, or a public one. A name that is not OWNER/NAME is never
+        shown, and is never asked about."""
+        if not isinstance(repo, str) or not tickets.REPO_RE.fullmatch(repo):
+            return False
+        if repo == home:
+            return True
+        if repo not in self._publics:
+            self._publics[repo] = self._public(repo)
+        return self._publics[repo]
+
+    def _handoff_rules(self, home: str) -> Tuple[str, List[str]]:
+        """(commit, Rules lines) of docs/MUSE.md at this checkout's HEAD, read
+        from GitHub so the packet quotes only what is public there; no lines
+        when the commit is not on GitHub or the repo may not be quoted."""
+        commit = self.head()
+        repo = self.s.self_repo
+        if not COMMIT_RE.fullmatch(commit or "") or not tickets.REPO_RE.fullmatch(repo or ""):
+            return "", []
+        if not self._shown(repo, home):
+            return commit, []
+        # A commit GitHub does not have answers 404 (or 422): no rules then.
+        data = self.gh.rest("GET", "/repos/%s/contents/docs/MUSE.md?ref=%s" % (repo, commit),
+                            ok=(404, 422)).data
+        if not isinstance(data, dict) or not data.get("content"):
+            return commit, []
+        doc = base64.b64decode(data["content"]).decode("utf-8", "replace")
+        return commit, handoff.rules_section(doc)
+
+    def _handoff_goals(self, home: str, saved: Dict[str, Any]
+                       ) -> Tuple[List[handoff.Goal], int, Dict[str, Any]]:
+        """Every goal home's trusted journals (handoff.compact), the repos that
+        could not be read, and what to keep for the next build. A home whose
+        `updated_at` and comment count match the last build is not read
+        again: its kept journals serve. A repo that fails is counted and
+        skipped, so one unreadable repo does not freeze the packet."""
+        goals: List[handoff.Goal] = []
+        kept: Dict[str, Any] = {}
+        unread = 0
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                issues = self._goal_issues(repo)
+                read = [(int(i["number"]), self._handoff_home_journals(repo, i, saved))
+                        for i in issues]
+            except GitHubError as err:
+                _say("handoff packet: could not read the goal homes of %s: %s" % (repo, err))
+                unread += 1
+                continue
+            for number, entry in read:
+                kept["%s#%d" % (repo, number)] = entry
+                # Kept journals are filtered again: only allowed logins count.
+                goals.append(handoff.Goal(repo, number, self._shown(repo, home),
+                                          handoff.journals(entry["journals"], self.s.authors)))
+        return goals, unread, kept
+
+    def _handoff_home_journals(self, repo: str, issue: Dict[str, Any],
+                               saved: Dict[str, Any]) -> Dict[str, Any]:
+        """One goal home's kept entry: its updated_at, comment count and
+        compact journals, read again only when the first two changed. A
+        re-read also finds the packet comment when this is the Loom home."""
+        number = int(issue["number"])
+        stamp = [str(issue.get("updated_at") or ""), issue.get("comments")]
+        old = saved.get("%s#%d" % (repo, number))
+        if (isinstance(old, dict) and old.get("stamp") == stamp and stamp[0]
+                and isinstance(old.get("journals"), list)):
+            return old
+        comments = [c for c in self.gh.paginate(
+            "/repos/%s/issues/%d/comments?per_page=100" % (repo, number)) if isinstance(c, dict)]
+        found = handoff.journals(
+            [{"body": c.get("body"), "at": c.get("created_at"),
+              "login": (c.get("user") or {}).get("login")} for c in comments], self.s.authors)
+        return {"stamp": stamp, "journals": [handoff.compact(j) for j in found],
+                "packet": self._packet_comment(comments)}
+
+    def _packet_comment(self, comments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """{"id", "body"} of the first packet comment an allowed login posted
+        among `comments`, or None."""
+        allowed = {a.lower() for a in self.s.authors}
+        for c in comments:
+            body = str(c.get("body") or "")
+            if tickets._login(c.get("user")).lower() in allowed and body.startswith(
+                    handoff.HANDOFF_MARKER):
+                return {"id": int(c["id"]), "body": body}
+        return None
+
+    def _brain_ended(self) -> Any:
+        """The "at" of the lane machine's last brain tick (state/brain.json),
+        or None: a new value means a tick just ended."""
+        last = _read_json(os.path.join(self.s.home, "state", "brain.json"), None, strict=False)
+        return last.get("at") if isinstance(last, dict) else None
+
+    def _handoff_due(self, saved: Dict[str, Any], ended: Any, authors: List[str]) -> bool:
+        """Whether the packet is due a rebuild: HANDOFF_EVERY seconds since the
+        last build, a brain tick that just ended, or new allowed logins."""
+        built = saved.get("built")
+        return not (self._num(built) and 0 <= self.now - built < HANDOFF_EVERY
+                    and saved.get("brain_at") == ended and saved.get("authors") == authors)
+
+    def _write_handoff(self, home: Tuple[str, int], entry: Dict[str, Any], body: str) -> None:
+        """Edit the kept packet comment to `body`, or post one when none is
+        kept or the kept one was deleted, and keep its id and text in
+        `entry`. Nothing is written when the text is the same."""
+        packet = entry.get("packet") if isinstance(entry.get("packet"), dict) else None
+        if packet is not None and packet.get("body") == body:
+            return
+        made = None
+        if packet is not None:
+            made = self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (home[0], int(packet["id"])),
+                                {"body": body}, ok=(404,))
+        if made is None or made.status == 404:
+            made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % home, {"body": body})
+            data = made.data if isinstance(made.data, dict) else {}
+            packet = {"id": int(data["id"])} if "id" in data else None
+        if packet is not None:
+            packet["body"] = body
+        entry["packet"] = packet
+        _say("handoff packet updated on %s#%d" % home)
+
+    def _stored_handoff(self) -> Optional[Dict[str, Any]]:
+        """The dashboard's handoff packet (brain_memory.fetch_handoff), read
+        with the transcript upload settings and token, when it answers with
+        at least one tick; else None, logged, and the packet is built from
+        the goal homes."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return None
+        token = self._transcript_token()
+        if token is None:
+            _say("handoff packet: built from the goal homes, no dashboard token")
+            return None
+        try:
+            stored = self.fetch(brain_memory.dashboard_url(self.s.transcript_url,
+                                                           brain_memory.HANDOFF_PATH), token)
+        # fetch_handoff's errors never carry the URL or the token.
+        except OSError as err:
+            _say("handoff packet: built from the goal homes, the dashboard did not answer (%s)"
+                 % err)
+            return None
+        rows = [stored.get(key) for key in ("ticks", "commitments", "rules")]
+        if not (all(isinstance(r, list) and all(isinstance(x, dict) for x in r) for r in rows)
+                and rows[0]):
+            _say("handoff packet: built from the goal homes, the dashboard's packet holds no ticks")
+            return None
+        return stored
+
+    def _handoff_body(self, repo: str, homes: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """The packet text and the goal homes to keep for the next build:
+        from the dashboard's brain memory when it answers (handoff.
+        stored_packet), which reads no goal home and keeps the last build's,
+        else from the goal homes' journals (handoff.packet)."""
+        rules = self._handoff_rules(repo)
+        stored = self._stored_handoff()
+        if stored is not None:
+            return handoff.stored_packet(stored, rules, lambda r: self._shown(r, repo)), dict(homes)
+        goals, unread, kept = self._handoff_goals(repo, homes)
+        return handoff.packet(goals, brain.tick_step(self.gh, repo), rules,
+                              datetime.fromtimestamp(self.now, timezone.utc),
+                              lambda r: self._shown(r, repo), unread), kept
+
+    def publish_handoff(self) -> None:
+        """Keep the handoff packet in one comment on the Loom goal home,
+        marked HANDOFF_MARKER: posted once, then edited in place, and only
+        when its text changed. It is rendered from the dashboard's brain
+        memory, or built from the goal homes when the dashboard does not
+        answer (_handoff_body). It is rebuilt at most every HANDOFF_EVERY
+        seconds, or sooner when a brain tick just ended, so a pass does not
+        read every goal home's comments."""
+        path = os.path.join(self.state, "handoff.json")
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        ended = self._brain_ended()
+        authors = sorted({a.lower() for a in self.s.authors})
+        if not self._handoff_due(saved, ended, authors):
+            return
+        home = self._handoff_home()
+        if home is None:
+            return
+        repo = home[0]
+        homes = saved.get("homes") if isinstance(saved.get("homes"), dict) else {}
+        if saved.get("authors") != authors:
+            # The allowed logins changed: nothing kept under the old list
+            # (journals or the packet comment) is trusted.
+            homes = {}
+        body, kept = self._handoff_body(repo, homes)
+        _text.check(body)
+        key = "%s#%d" % home
+        if key not in kept:
+            kept[key] = self._handoff_home_journals(repo, {"number": home[1]}, {})
+        self._write_handoff(home, kept[key], body)
+        _write_json(path, {"built": self.now, "brain_at": ended, "authors": authors,
+                           "homes": kept})
+
     def prune_trees(self) -> None:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
         or running) and that have not changed for TREE_KEEP seconds. A
@@ -5448,8 +5673,9 @@ class Station:
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,
+                     # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
-                     self.relay_operator,
+                     self.publish_handoff, self.relay_operator,
                      self.watch_default_branches, self.run_factory, self.check_invariants,
                      self.release_factory_held):
             if self._deferred():

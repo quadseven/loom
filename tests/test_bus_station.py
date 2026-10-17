@@ -213,6 +213,8 @@ class FakeGitHub:
         files = re.match(r"pulls/(\d+)/files$", rest)
         if method == "GET" and files:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
+        if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
+            return reply(404, {"message": "Not Found"})
         raise AssertionError("unexpected call %s %s" % (method, path))
 
     def _post_page(self, data):
@@ -1148,6 +1150,290 @@ class TriageTest(Base):
             json.dump({"rates": {"core": [500, 5000, reset]}}, fh)
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
+
+
+class HandoffFake:
+    """The reads one handoff packet pass makes, and the comment writes."""
+
+    def __init__(self):
+        self.goal = {"number": 30, "title": "Loom goal", "state": "open",
+                     "labels": [{"name": "loom:goal"}], "comments": 0,
+                     "updated_at": "2030-01-01T00:00:00Z"}
+        self.comments = []
+        self.writes = []
+        self.comment_reads = 0
+        self.rules_refs = []
+        self.post_no_id = False
+        self.muse = base64.b64encode(b"# Muse\n\n## Rules\n\n- Write ASCII only.\n").decode()
+
+    def touch(self, at):
+        self.goal["comments"] = len(self.comments)
+        self.goal["updated_at"] = at
+
+    def journal(self, holder, at, *lines):
+        self.comments.append({"id": len(self.comments) + 1, "user": {"login": AUTHORS[0]},
+                              "created_at": at, "body": "\n".join(
+                                  [station.JOURNAL_MARKER, "Tick %s, %s" % (at, holder)]
+                                  + list(lines))})
+        self.touch(at)
+
+    def rest(self, method, path, data=None, ok=()):
+        if method == "GET" and path.endswith("/git/ref/heads/loom-lock/brain"):
+            return mock.Mock(status=404, data=None)
+        if method == "GET" and path.startswith("/repos/%s/contents/docs/MUSE.md?ref=" % REPO):
+            self.rules_refs.append(path.rsplit("=", 1)[1])
+            return mock.Mock(status=200, data={"content": self.muse})
+        if method == "POST" and path == "/repos/%s/issues/30/comments" % REPO:
+            self.writes.append((method, path))
+            self.comments.append({"id": 900 + len(self.writes), "user": {"login": AUTHORS[0]},
+                                  "created_at": "2030-01-01T00:00:00Z", "body": data["body"]})
+            self.touch("2030-01-01T12:00:%02dZ" % len(self.writes))
+            return mock.Mock(status=201, data={} if self.post_no_id else self.comments[-1])
+        if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO):
+            self.writes.append((method, path))
+            found = next(c for c in self.comments if c["id"] == int(path.rsplit("/", 1)[1]))
+            found["body"] = data["body"]
+            return mock.Mock(status=200, data=found)
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def paginate(self, path):
+        if path.startswith("/repos/%s/issues?labels=loom:goal" % REPO):
+            return [self.goal]
+        if path.startswith("/repos/%s/issues/30/comments" % REPO):
+            self.comment_reads += 1
+            return [dict(c) for c in self.comments]
+        raise AssertionError(path)
+
+
+class HandoffPacketTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = HandoffFake()
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(self.temp.name, [REPO], AUTHORS, OWNERS, status_repo=REPO)
+
+    def run_pass(self, minutes=0):
+        station.Station(self.gh, self.settings, now=self.now + 60 * minutes,
+                        head=lambda: "c" * 40).publish_handoff()
+
+    def tick_ended(self, at):
+        with open(os.path.join(self.temp.name, "state", "brain.json"), "w") as fh:
+            json.dump({"at": at, "outcome": "ok", "exit": 0}, fh)
+
+    def packets(self):
+        return [c for c in self.gh.comments if c["body"].startswith("<!-- loom:handoff v1 -->")]
+
+    def test_a_pass_posts_one_packet_and_later_passes_edit_it_in_place(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one",
+                        "<!-- loom:defer v1 stage=merge item=%s#7 rev=pr-abc holder=muse -->" % REPO)
+        self.run_pass()
+        self.assertEqual([("POST", "/repos/%s/issues/30/comments" % REPO)], self.gh.writes)
+        body = self.packets()[0]["body"]
+        self.assertIn("2030-01-01T11:00:00Z muse, model unknown, on %s#30: 0 done, 1 deferred. "
+                      "Decided: merged one." % REPO, body)
+        self.assertIn("- merge %s#7, deferred by muse at 2030-01-01T11:00:00Z." % REPO, body)
+        self.assertIn("## Rules (docs/MUSE.md at %s)\n- Write ASCII only." % ("c" * 40), body)
+        # Nothing changed: no write at all on a later pass.
+        self.run_pass(minutes=11)
+        self.assertEqual(1, len(self.gh.writes))
+        # A brain ticks: the same comment is edited, never a second one posted.
+        self.gh.journal("lane-machine", "2030-01-01T12:12:30Z", "- Decided: merged it",
+                        "<!-- loom:done v1 stage=merge item=%s#7 holder=lane-machine -->" % REPO)
+        self.tick_ended(self.now + 60 * 12)
+        self.run_pass(minutes=12)
+        self.assertEqual(("PATCH", "/repos/%s/issues/comments/901" % REPO), self.gh.writes[-1])
+        self.assertEqual(1, len(self.packets()))
+        self.assertEqual(1, sum(1 for method, _ in self.gh.writes if method == "POST"))
+        body = self.packets()[0]["body"]
+        self.assertIn("lane-machine, model unknown, on %s#30: 1 done, 0 deferred" % REPO, body)
+        self.assertIn("## Open defers (0, 0 from brains no longer ticking)\n- none", body)
+
+    def test_a_pass_within_ten_minutes_and_no_new_tick_reads_no_comments(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one")
+        self.run_pass()
+        reads = self.gh.comment_reads
+        self.gh.journal("muse", "2030-01-01T12:05:00Z", "- Decided: briefed two")
+        self.run_pass(minutes=9)
+        self.assertEqual(reads, self.gh.comment_reads)
+        self.assertNotIn("briefed two", self.packets()[0]["body"])
+
+    def test_a_brain_tick_that_just_ended_rebuilds_the_packet_at_once(self):
+        os.makedirs(os.path.join(self.temp.name, "state"), exist_ok=True)
+        self.tick_ended(self.now - 600)
+        self.run_pass()
+        self.gh.journal("lane-machine", "2030-01-01T12:01:00Z", "- Decided: briefed two")
+        self.tick_ended(self.now + 60)
+        self.run_pass(minutes=1)
+        self.assertIn("Decided: briefed two.", self.packets()[0]["body"])
+        self.assertEqual(1, len(self.packets()))
+
+    def test_an_unchanged_goal_home_is_not_read_again(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one",
+                        "<!-- loom:defer v1 stage=merge item=%s#7 rev=pr-abc holder=muse -->" % REPO)
+        self.run_pass()
+        # The post itself changed the home: the next build reads it once more.
+        self.run_pass(minutes=11)
+        reads = self.gh.comment_reads
+        # Two hours on, the defer turns into open work: a new text, no read.
+        self.run_pass(minutes=125)
+        self.assertEqual(reads, self.gh.comment_reads)
+        self.assertEqual(("PATCH", "/repos/%s/issues/comments/901" % REPO), self.gh.writes[-1])
+        self.assertIn("Open work for any brain: muse last ticked at 2030-01-01T11:00:00Z",
+                      self.packets()[0]["body"])
+
+    def test_a_kept_journal_by_a_login_no_longer_allowed_leaves_the_packet(self):
+        self.gh.comments.append({"id": 1, "user": {"login": AUTHORS[1]},
+                                 "created_at": "2030-01-01T11:00:00Z", "body": "\n".join(
+                                     [station.JOURNAL_MARKER, "Tick 2030-01-01T11:00:00Z, muse",
+                                      "- Decided: from the second author"])})
+        self.gh.touch("2030-01-01T11:00:00Z")
+        self.run_pass()
+        self.assertIn("from the second author", self.packets()[0]["body"])
+        # The post changed the home; this build reads it once more and keeps it.
+        self.run_pass(minutes=11)
+        reads = self.gh.comment_reads
+        self.settings.authors = [AUTHORS[0]]
+        self.run_pass(minutes=12)
+        self.assertEqual(reads + 1, self.gh.comment_reads)
+        self.assertNotIn("from the second author", self.packets()[0]["body"])
+        self.assertEqual(1, len(self.packets()))
+
+    def test_kept_journals_are_filtered_by_the_allowed_logins(self):
+        st = station.Station(self.gh, self.settings, now=self.now, head=lambda: "c" * 40)
+        entry = {"stamp": ["2030-01-01T00:00:00Z", 0], "packet": None,
+                 "journals": [{"body": "%s\nTick 2030-01-01T11:00:00Z, muse" % station.JOURNAL_MARKER,
+                               "at": "2030-01-01T11:00:00Z", "login": "stranger"}]}
+        goals, _, _ = st._handoff_goals(REPO, {"%s#30" % REPO: entry})
+        self.assertEqual([], goals[0].journals)
+
+    def test_a_name_that_is_not_owner_slash_name_is_never_shown_or_asked_about(self):
+        st = station.Station(self.gh, self.settings, now=self.now, head=lambda: "c" * 40)
+        for name in ("not-a-repo", "a/b/c", "", "owner/name with space", None):
+            with self.subTest(name=name):
+                # The fake refuses any other read, so a public check would raise.
+                self.assertFalse(st._shown(name, REPO))
+        self.assertTrue(st._shown(REPO, REPO))
+
+    def test_the_station_default_reads_the_rules_at_the_checkout_head(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        head = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            self.skipTest("not a git checkout")
+        st = station.Station(self.gh, self.settings, now=self.now)
+        self.assertIs(station._checkout_head, st.head)
+        st.publish_handoff()
+        self.assertEqual([head], self.gh.rules_refs)
+        self.assertIn("## Rules (docs/MUSE.md at %s)" % head, self.packets()[0]["body"])
+
+    def test_a_post_answered_without_an_id_never_leads_to_a_second_packet(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one")
+        self.gh.post_no_id = True
+        self.run_pass()
+        self.gh.post_no_id = False
+        self.gh.journal("lane-machine", "2030-01-01T12:12:00Z", "- Decided: briefed two")
+        self.run_pass(minutes=12)
+        # The post changed the home, so the next build reads it again and
+        # finds the packet it posted: an edit, not a second post.
+        self.assertEqual(["POST", "PATCH"], [method for method, _ in self.gh.writes])
+        self.assertEqual(1, len(self.packets()))
+        self.assertIn("briefed two", self.packets()[0]["body"])
+
+    def test_a_marked_comment_from_a_stranger_is_not_the_packet(self):
+        self.gh.comments.append({"id": 5, "user": {"login": "stranger"},
+                                 "created_at": "2030-01-01T00:00:00Z",
+                                 "body": "<!-- loom:handoff v1 -->\nfake"})
+        self.run_pass()
+        self.assertEqual([("POST", "/repos/%s/issues/30/comments" % REPO)], self.gh.writes)
+
+    def test_the_packet_waits_for_one_loom_goal_home(self):
+        self.gh.goal["title"] = "Backlog: every open issue"
+        self.run_pass()
+        self.assertEqual([], self.gh.writes)
+
+
+STORED_PACKET = {
+    "ticks": [{"id": 3, "holder": "lane-machine", "lane": "claude", "model": "opus",
+               "started": "2030-01-01T11:30:00Z", "ended": "2030-01-01T11:50:00Z",
+               "outcome": "ok", "decided": ["shipped one"],
+               "left_open": ["merge %s#7: waiting on CI" % REPO], "handed_off": []}],
+    "commitments": [{"id": 1, "tick_id": 3, "holder": "lane-machine", "item": "%s#7" % REPO,
+                     "stage": "merge", "key": "", "what": "merge: waiting on CI",
+                     "due": "2030-01-01T13:50:00Z", "state": "open"}],
+    "rules": [{"source": "docs/MUSE.md", "source_ref": "d" * 40, "text": "- Write ASCII only.",
+               "loaded_at": "2030-01-01T11:00:00Z"},
+              {"source": "%s#30" % REPO, "source_ref": "comment 12", "text": "## Rules\n- one",
+               "loaded_at": "2030-01-01T11:00:00Z"}]}
+
+
+class StoredHandoffPacketTest(unittest.TestCase):
+    """The packet pass reads the dashboard's brain memory when it answers, and
+    falls back to the goal-home journals when it does not."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = HandoffFake()
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(
+            self.temp.name, [REPO], AUTHORS, OWNERS, status_repo=REPO,
+            transcript_url="https://dashboard.example.com/api/transcripts",
+            transcript_token_ssm="/loom/upload-token")
+        self.fetched = []
+        self.answer = STORED_PACKET
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: from the goal home",
+                        "<!-- loom:defer v1 stage=merge item=%s#7 rev=pr-abc holder=muse -->" % REPO)
+
+    def fetch(self, url, token):
+        self.fetched.append((url, token))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+    def run_pass(self, minutes=0):
+        station.Station(self.gh, self.settings, now=self.now + 60 * minutes,
+                        head=lambda: "c" * 40, read_secret=lambda name, region: "tok",
+                        fetch=self.fetch).publish_handoff()
+
+    def packets(self):
+        return [c for c in self.gh.comments if c["body"].startswith(station.handoff.HANDOFF_MARKER)]
+
+    def test_the_packet_renders_from_the_endpoint_when_it_answers(self):
+        self.run_pass()
+        self.assertEqual([("https://dashboard.example.com/api/brain/handoff", "tok")], self.fetched)
+        body = self.packets()[0]["body"]
+        self.assertIn("## Last 5 ticks\n- 2030-01-01T11:30:00Z lane-machine on claude, model opus, "
+                      "ended 2030-01-01T11:50:00Z: ok. 1 decided, 1 left open, 0 handed off.", body)
+        self.assertIn("## Open commitments (1)\n- merge %s#7, from lane-machine's tick 3, "
+                      "due 2030-01-01T13:50:00Z." % REPO, body)
+        self.assertIn("## Rules digest\n- docs/MUSE.md at %s\n- %s#30 at comment 12"
+                      % ("d" * 40, REPO), body)
+        self.assertIn("## Rules (docs/MUSE.md at %s)\n- Write ASCII only." % ("c" * 40), body)
+        self.assertNotIn("from the goal home", body)
+
+    def test_the_packet_falls_back_to_the_goal_homes_when_the_endpoint_does_not_answer(self):
+        for answer in (OSError("the handoff read answered 401"),
+                       OSError("the handoff read failed to connect"),
+                       {"ticks": [], "commitments": [], "rules": []},
+                       {"ticks": "not a list"}):
+            with self.subTest(answer=answer):
+                self.answer = answer
+                self.gh.comments = [c for c in self.gh.comments
+                                    if not c["body"].startswith(station.handoff.HANDOFF_MARKER)]
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as out:
+                    self.run_pass(minutes=len(self.fetched) * 11)
+                body = self.packets()[0]["body"]
+                self.assertIn("Decided: from the goal home.", body)
+                self.assertIn("## Open defers (1, 0 from brains no longer ticking)", body)
+                self.assertNotIn("## Open commitments", body)
+                self.assertIn("handoff packet: built from the goal homes", out.getvalue())
+
+    def test_no_dashboard_settings_build_from_the_goal_homes_without_a_fetch(self):
+        self.settings.transcript_url = ""
+        self.run_pass()
+        self.assertEqual([], self.fetched)
+        self.assertIn("Decided: from the goal home.", self.packets()[0]["body"])
 
 
 class ReviewFake:
