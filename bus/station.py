@@ -130,6 +130,8 @@ MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
+# The last line of a quiet standup the station edits in place.
+QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
 # Reports come every 2 hours, so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
@@ -4998,14 +5000,36 @@ class Station:
         children = brain._flatten(loose, tree)
         breaches = (self._open_breaches(repo, number)
                     if (repo, number) == self._invariant_goal() else None)
+        hold = self._gate_hold_for(repo, number)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
-                                          breaches,
-                                          gate_hold=self._gate_hold_for(repo, number),
+                                          breaches, gate_hold=hold,
                                           finished=brain.finished_epics(tree))
         brain._check_written_text(body)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": body})
+        quiet = hold is None and body == self._overdue_standup_body(
+            [], None, None if breaches is None else [])
+        previous = self._last_quiet_report(comments, authors, body) if quiet else None
+        if previous is not None:
+            # Every new comment emails the goal's author; a quiet goal edits
+            # its last quiet report instead, which notifies no one.
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, previous),
+                         {"body": body + "\n" + QUIET_STAMP % now.strftime("%Y-%m-%dT%H:%MZ")})
+        else:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                         {"body": body})
         state[key] = self.now
+
+    @staticmethod
+    def _last_quiet_report(comments: List[Any], authors: List[str], quiet: str) -> Optional[int]:
+        """The id of the goal's latest report by `authors` when it is this same
+        quiet report (its stamp line aside), else None."""
+        reports = [c for c in comments if isinstance(c, dict)
+                   and tickets._login(c.get("user")).lower() in authors
+                   and str(c.get("body") or "").startswith(REPORT_MARKER)]
+        if not reports or not isinstance(reports[-1].get("id"), int):
+            return None
+        lines = str(reports[-1].get("body") or "").splitlines()
+        kept = [line for line in lines if not line.startswith(QUIET_STAMP.split("%")[0])]
+        return reports[-1]["id"] if "\n".join(kept) == quiet else None
 
     def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
         """The open loom:invariant issues filed on the goal home."""

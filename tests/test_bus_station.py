@@ -4289,6 +4289,34 @@ class ReportsTest(Base):
         self.assertNotIn("Merged long ago", body)
         self.assertEqual(body.splitlines()[1], "Nothing moved since the last report.")
 
+    def test_a_quiet_standup_edits_the_last_quiet_report_instead_of_posting(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        quiet = st._overdue_standup_body([], None)
+        self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
+        self.fake.comments[40][0]["created_at"] = old
+        st.post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 1)  # nothing posted, so no email
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertTrue(self.fake.edits[0].startswith(quiet + "\n"))
+        self.assertNotIn("2026-01-01T00:00Z", self.fake.edits[0])
+
+    def test_a_standup_after_a_report_that_was_not_quiet_is_posted(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 5, station.REPORT_MARKER + "\n1 merged since the last report.")
+        self.fake.comments[40][0]["created_at"] = old
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 2)
+        self.assertEqual(self.fake.comments[40][-1]["body"].splitlines()[1],
+                         "Nothing moved since the last report.")
+        self.assertEqual(self.fake.edits, [])
+
     def test_station_standup_still_stuck_names_a_goal_the_gate_is_holding(self):
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
