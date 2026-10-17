@@ -5316,6 +5316,44 @@ class UnprovenGateTest(unittest.TestCase):
             self.assertEqual(self.run_pass(), 0)
         self.assertIn("codex", handed.call_args[0][1])
 
+    def epic(self, number, goal=None):
+        self.fake.issues[number] = {"number": number, "title": "Epic: a part of the goal",
+                                    "state": "open", "labels": [{"name": "epic"}],
+                                    "body": "Done when: it works.\n\nPart of #%d\n" % (goal or self.GOAL)}
+        self.fake.comments[number] = []
+        self.fake.events[number] = []
+
+    def brief_under(self, number, parent):
+        self.fake.add(number, state="briefed", lane="codex", body=BODY)
+        self.fake.issues[number]["parent_issue_url"] = (
+            "https://api.github.com/repos/%s/issues/%d" % (REPO, parent))
+
+    def test_a_ticket_under_an_epic_is_gated_by_the_epics_goal(self):
+        # 2026-10-17: a ticket under an epic handed the epic's number to the
+        # unproven-work check, which raised and ended every station pass.
+        self.over_limit()
+        self.epic(50)
+        self.brief_under(7, 50)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_a_ticket_under_an_epic_of_a_goal_under_the_limit_is_claimed(self):
+        self.epic(50)
+        self.brief_under(7, 50)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_ticket_under_a_plain_issue_is_not_gated_and_the_pass_completes(self):
+        self.over_limit()
+        self.fake.issues[60] = {"number": 60, "title": "A note", "state": "open",
+                                "labels": [], "body": "Just a note."}
+        self.fake.comments[60] = []
+        self.fake.events[60] = []
+        self.brief_under(7, 60)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
     def test_ticket_goal_reads_the_part_of_line(self):
         self.assertEqual(station._ticket_goal({"body": "x\n\nPart of #40\n"}), 40)
         self.assertEqual(station._ticket_goal({"body": "x", "parent_issue_url":
