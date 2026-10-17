@@ -380,6 +380,10 @@ this tick"; a step with no note shows nothing there.
    unclear, chart a wayfinder map for it before filing work; resolve its
    research and task tickets alone, and batch the questions only the
    operator can answer into one daily ask, each with a recommended answer.
+   For each `close-epic` item resume lists (every ticket of the epic is
+   closed), check the epic's done-when and close it with
+   `python3 -m bus.brain close-epic OWNER/NAME#N --note TEXT`, or file the
+   ticket it is missing.
    Give each brief `--priority P0` to `P3` by how much it costs the goal
    while it stays unfixed (without it the ticket is P2); the station and the
    factory take P0 first. Read the Priorities and Health findings sections

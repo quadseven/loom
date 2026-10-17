@@ -546,7 +546,8 @@ Each station pass runs `bus/invariants.py`, at most every 5 minutes, on what
 the station already reads: the journals and marker comments trusted logins
 posted on every goal home in the last day, the lane runs that ended in the
 last day (`briefs/<lane>/done` and `failed`, timed by their logs), the lanes
-held by a limit, queued tickets, sub-issue counts, the review bot's plan
+held by a limit, queued tickets, each goal home's epics and tickets (one walk
+through goal, epics and tickets), the review bot's plan
 check on open lane pull requests (`LOOM_PLAN_CHECK`, default
 `Grug - Chief`) and remote heartbeats. Each invariant is one function
 returning breaches with evidence:
@@ -558,10 +559,11 @@ returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
 - A lane held by a limit for over 2 hours while tickets of its tier are queued.
-- A goal home holding 90 or more sub-issues with a `loom:ticket` issue that says
-  `Part of #N` for it but is neither its sub-issue nor has that line on a line
-  of its own (a goal at the 100 sub-issue cap with every ticket linked by a
-  sub-issue or its line is healthy).
+- The epic shape (decision 0003): a goal home with open `loom:ticket` issues
+  under no epic (one breach per goal), an epic holding more than 15 tickets,
+  a goal with more open epics than its cap (6, or the goal home's
+  `Epic cap: N until DATE` exception), and a closed epic that still holds
+  open tickets. These replaced the goal home sub-issue count check.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 

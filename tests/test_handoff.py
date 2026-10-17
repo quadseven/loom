@@ -124,6 +124,9 @@ class Routes:
             self.posted.append((path, json.loads(body) if body else None))
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
+        if (method == "GET" and path.endswith("/sub_issues")
+                and (method, path) not in self.routes):
+            return 200, {}, b"[]"  # a goal with no epics or tickets linked
         if (method, path) not in self.routes:
             raise AssertionError("unexpected call %s %s" % (method, path))
         status, data = self.routes[(method, path)]
@@ -160,6 +163,27 @@ class ResumeCommandTests(unittest.TestCase):
                        "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]}),
         })
         return routes
+
+    def test_an_epic_whose_tickets_are_all_closed_is_a_brain_item(self):
+        routes = self.routes()
+        epic = {"number": 20, "title": "Epic: the work", "state": "open",
+                "labels": [{"name": "epic"}], "body": "Done when: x.\n\nPart of #1\n"}
+        busy = dict(epic, number=21, title="Epic: still going")
+        empty = dict(epic, number=22, title="Epic: just opened")
+        closed = lambda n: {"number": n, "state": "closed",  # noqa: E731
+                            "labels": [{"name": "loom:ticket"}]}
+        routes[("GET", "/repos/%s/issues/1/sub_issues" % REPO)] = (200, [epic, busy, empty])
+        routes[("GET", "/repos/%s/issues/20/sub_issues" % REPO)] = (200, [closed(30), closed(31)])
+        routes[("GET", "/repos/%s/issues/21/sub_issues" % REPO)] = (
+            200, [closed(32), {"number": 33, "state": "open", "labels": [{"name": "loom:ticket"}]}])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW, {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        section = out.split("## Finished epics (every ticket closed)")[1].split("\n## ")[0]
+        self.assertIn("- resume close-epic %s#20 Epic: the work: check its done-when" % REPO,
+                      section)
+        self.assertIn("bus.brain close-epic %s#20 --note TEXT" % REPO, section)
+        self.assertNotIn("#21", section)
+        self.assertNotIn("#22", section)
 
     def test_the_lock_holder_gets_the_merge_and_failed_ticket(self):
         out = brain.resume(GitHub("t", transport=Routes(self.routes())), [REPO],

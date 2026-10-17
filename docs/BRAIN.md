@@ -298,6 +298,12 @@ goal's 7th open epic unless the goal home records a one-time exception on
 its own line, `Epic cap: N until YYYY-MM-DD`, which raises the cap to N
 until the end of that day.
 
+An open epic whose tickets are all closed is finished: the station's
+standup names it under "Next", and `bus.brain resume` lists it as a
+`close-epic` item. The brain checks its done-when and closes it with
+`python3 -m bus.brain close-epic OWNER/NAME#N --note TEXT` (refused while a
+ticket under it is open), or files the ticket it is missing.
+
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
 rewrites and health intake find"), opened by `bus.brain onboard` and again

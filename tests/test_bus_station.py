@@ -4202,6 +4202,28 @@ class ReportsTest(Base):
         self.assertNotIn("#50 Epic", body)
         self.assertIn("3 in flight", body.splitlines()[1])
 
+    def test_station_standup_flags_an_epic_whose_tickets_are_all_closed(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        epic = lambda n, title: {"number": n, "title": title, "state": "open",  # noqa: E731
+                                 "labels": [{"name": "epic"}]}
+        done = lambda n: {"number": n, "title": "Done %d" % n, "state": "closed",  # noqa: E731
+                          "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]}
+        self.fake.sub_issues[40] = [epic(50, "Epic: all done"), epic(60, "Epic: still going")]
+        self.fake.sub_issues[50] = [done(51), done(52)]
+        self.fake.sub_issues[60] = [done(61), {"number": 62, "title": "Open", "state": "open",
+                                               "labels": [{"name": "loom:ticket"},
+                                                          {"name": "loom:pr"}]}]
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+        body = self.fake.comments[40][-1]["body"]
+        self.assertIn("Epics with every ticket closed (check the done-when, then close): "
+                      "#50 Epic: all done.", body)
+        self.assertNotIn("#60 Epic", body)
+
     def test_station_standup_lists_only_what_changed_since_the_last_report(self):
         self.add_goal()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
