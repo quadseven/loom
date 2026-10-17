@@ -2165,6 +2165,27 @@ class FactoryIncidentTest(Base):
             self.run_pass()
         self.assertIn("loom:queued", self.fake.names(12))
 
+    def test_a_failed_ticket_read_says_so_and_keeps_the_hold(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        for path in ("/repos/%s/issues/12" % REPO, "/repos/%s/issues/12/comments" % REPO):
+            def transport(method, url, headers, body, path=path):
+                if method == "GET" and urlsplit(url).path == path:
+                    raise station.GitHubError("boom", 502)
+                return self.fake(method, url, headers, body)
+            runner = station.Station(GitHub("token", transport=transport), self.settings)
+            with mock.patch.object(station, "FACTORY_REPO", REPO), \
+                    mock.patch("bus.station._say") as say:
+                runner.release_factory_held()
+            said = [c.args[0] for c in say.call_args_list]
+            self.assertIn("factory release: could not read %s#12: boom" % REPO, said)
+            self.assertIn("loom:running", self.fake.names(12))
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertIn("loom:queued", self.fake.names(12))
+
 
 class PruneTest(Base):
     def tree(self, name, age):
