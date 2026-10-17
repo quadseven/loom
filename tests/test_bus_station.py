@@ -4762,6 +4762,27 @@ class VerifyDispatchTest(Base):
         self.assertIn("Merge commit: %s" % sha, data)
         self.assertIn("5 lines failed the text checks and were dropped.", data)
 
+    def test_only_station_extracted_names_skip_the_long_token_test(self):
+        sha = "c" * 40
+        uuid = "123e4567-e89b-42d3-a456-426614174000"
+        hex_dash = "deadbeef-cafebabe-0123abcd-4567ef01-89ab"
+        lowercase_key = "alpha-bravo-charlie-delta-echo-foxtrot"
+        long_name = "test_a_merged_pr_delivers_the_ticket_while_a_duplicate_is_open"
+        self.merged(77, sha)
+        self.fake.pulls[0]["title"] = "Ship %s" % uuid
+        self.fake.check_runs[sha] = [{"name": hex_dash, "conclusion": "success"},
+                                     {"name": lowercase_key, "conclusion": "success"}]
+        self.fake.pull_files[77] = [{"filename": "docs/%s.md" % uuid},
+                                    {"filename": "tests/test_long.py",
+                                     "patch": "+    def %s(self):\n" % long_name}]
+        self.run_pass()
+        data = self.github_data()
+        for absent in (uuid, hex_dash, lowercase_key):
+            self.assertNotIn(absent, data)
+        self.assertIn("- tests/test_long.py", data)
+        self.assertIn("- " + long_name, data)
+        self.assertIn("4 lines failed the text checks and were dropped.", data)
+
     def test_a_ticket_with_no_merged_pull_request_says_so_in_one_line(self):
         self.fake.pulls = [{"number": 70, "state": "closed", "merged_at": None,
                             "merge_commit_sha": "c" * 40, "body": "Refs %s#2\n" % REPO}]

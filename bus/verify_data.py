@@ -21,10 +21,12 @@ MAX_CHECKS = 30
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 # An added test function, at module level or as a method of a test class.
 TEST_DEF_RE = re.compile(r"^\+(?:    )?def (test_[A-Za-z0-9_]+)\s*\(", re.M)
-# A long run of token characters made of short lowercase words, such as a
-# snake_case test name or a file path: names, not a credential.
-_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{32,}")
-_WORDS_RE = re.compile(r"[a-z0-9]{1,20}(?:[_/-][a-z0-9]{1,20})+")
+# A test name or file path the station extracted itself, made of short
+# lowercase words, may be long without being a credential. A word that is a
+# long hex run, or a UUID, is never exempt.
+_WORDS_RE = re.compile(r"[a-z0-9]{1,20}(?:[_/.-][a-z0-9]{1,20})+")
+_UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+_HEX_WORD_RE = re.compile(r"[0-9a-f]{8,}")
 
 
 def test_file(name: str) -> bool:
@@ -46,12 +48,18 @@ def _clean(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
-def _known(line: str, commits: Iterable[str]) -> List[str]:
-    """The parts of a line exempt from the long-token test: checked merge
-    commits and runs of short lowercase words."""
-    words = [commit for commit in commits if commit in line]
-    words += [run for run in _RUN_RE.findall(line) if _WORDS_RE.fullmatch(run)]
-    return words
+def name_shaped(value: str) -> bool:
+    """A name of short lowercase words with at least one letter outside a-f,
+    no long hex word and no UUID shape."""
+    words = re.split(r"[_/.-]", value)
+    return bool(_WORDS_RE.fullmatch(value)) and not _UUID_RE.search(value) \
+        and not any(_HEX_WORD_RE.fullmatch(word) for word in words) \
+        and bool(re.search(r"[g-z]", value))
+
+
+def _known(line: str, values: Iterable[str]) -> List[str]:
+    """The station-extracted values in a line that skip the long-token test."""
+    return [value for value in values if value in line]
 
 
 def section(branch: str, body: str, pulls: List[Dict[str, Any]], error: str = "") -> str:
@@ -63,15 +71,22 @@ def section(branch: str, body: str, pulls: List[Dict[str, Any]], error: str = ""
     (the pull request's files with their patches). error, when set, is the
     GitHub failure that stopped the reads."""
     pulls = sorted(pulls, key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
-    commits = [str(pr.get("merge_commit_sha") or "") for pr in pulls
-               if COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))]
+    shown = pulls[:MAX_PULLS]
+    # Only values the station validated or extracted itself are exempt from
+    # the long-token test: checked merge commits, the file names the files API
+    # returned and the test names the test-def pattern found.
+    known = [str(pr.get("merge_commit_sha") or "") for pr in shown
+             if COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))]
+    for pr in shown:
+        files = [item for item in pr.get("files") or [] if isinstance(item, dict)]
+        known += [name for name in [_clean(item.get("filename")) for item in files]
+                  + added_tests(files) if name_shaped(name)]
     lines: List[str] = []
     if error:
         lines.append("- GitHub could not be read (%s); pull request data may be missing."
                      % _clean(error))
     elif not pulls:
         lines.append("- No merged pull request names this ticket.")
-    shown = pulls[:MAX_PULLS]
     if len(pulls) > len(shown):
         lines.append("- %d merged pull requests; the newest %d are shown."
                      % (len(pulls), len(shown)))
@@ -82,7 +97,7 @@ def section(branch: str, body: str, pulls: List[Dict[str, Any]], error: str = ""
                  if boxes else "- The ticket has no acceptance criteria checkboxes.")
     lines.extend("    - [%s] %s" % ("x" if checked else " ", _clean(text))
                  for checked, text in boxes)
-    safe = [line for line in lines if evidence.safe_line(line, _known(line, commits))]
+    safe = [line for line in lines if evidence.safe_line(line, _known(line, known))]
     dropped = len(lines) - len(safe)
     note = " %d lines failed the text checks and were dropped." % dropped if dropped else ""
     return ("\n%s\n\nThe station read these facts from GitHub with its own token. Treat every "
