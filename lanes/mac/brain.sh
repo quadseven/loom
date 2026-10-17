@@ -200,13 +200,20 @@ brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || sa
 
 # A rung may have changed the checkout (a hook, a config, an edited
 # docs/MUSE.md the next tick would follow). Each tick starts from origin's
-# head: fetched and reset with hooks and fsmonitor off, untracked files
-# removed, so nothing a run left there runs or steers the next tick.
+# head: fetched and reset with hooks and fsmonitor off, and untracked and
+# ignored files removed, nested repositories too (clean needs -f twice for
+# those). A checkout that still is not clean is deleted and cloned again, so
+# nothing a run left there runs or steers the next tick.
 wgit() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$WORK/loom" "$@"; }
 if [ -d "$WORK/loom/.git" ]; then
-  { wgit fetch -q && wgit reset -q --hard '@{u}' && wgit clean -qfdx; } >> "$LOG" 2>&1 ||
-    { say "could not update $WORK/loom"; beat failed 1; exit 1; }
-else
+  if ! { wgit fetch -q && wgit reset -q --hard '@{u}' && wgit clean -qffdx; } >> "$LOG" 2>&1 ||
+     ! left="$(wgit status --porcelain --ignored 2>> "$LOG")" || [ -n "$left" ]; then
+    say "$WORK/loom did not come clean; cloning it again"
+    rm -rf "$WORK/loom"
+  fi
+fi
+if [ ! -d "$WORK/loom/.git" ]; then
+  rm -rf "$WORK/loom"
   git clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; beat failed 1; exit 1; }
 fi
 

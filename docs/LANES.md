@@ -120,8 +120,9 @@ its CLI runs only as the agy lane user, which cannot read the brain's
 checkout or GitHub sign-in, and run as the operator it would read the login
 keychain. The `tick start` line in `brain.log` names the lane and model.
 Each tick resets the checkout to origin's head with hooks and fsmonitor
-off and removes untracked files, so nothing a run left there runs or steers
-the next tick.
+off and removes untracked and ignored files, nested repositories included;
+a checkout that still is not clean is cloned again, so nothing a run left
+there runs or steers the next tick.
 
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the lane
 and model that ran) and touches

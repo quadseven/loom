@@ -451,6 +451,32 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual("# Muse tick instructions\nnew\n", (checkout / "docs" / "MUSE.md").read_text())
         self.assertFalse((checkout / "planted.txt").exists())
 
+    def test_the_refresh_removes_a_nested_repository(self):
+        # Found by the automated security review: clean -fdx keeps an
+        # untracked nested repository, so a run could leave files for later.
+        self.tick()
+        nested = self.home / "brain" / "loom" / "planted"
+        nested.mkdir()
+        git("init", "-q", cwd=nested)
+        (nested / "notes.md").write_text("kept across ticks\n")
+        run, _ = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(nested.exists())
+
+    def test_a_checkout_that_will_not_reset_is_cloned_again(self):
+        self.tick()
+        checkout = self.home / "brain" / "loom"
+        git("branch", "--unset-upstream", cwd=checkout)
+        (checkout / "planted.txt").write_text("left by a run\n")
+        run, calls = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertFalse((checkout / "planted.txt").exists())
+        self.assertTrue((checkout / "docs" / "MUSE.md").exists())
+        self.assertIn("did not come clean; cloning it again",
+                      (self.home / "logs" / "brain.log").read_text())
+        # The calls log spans both ticks: the second one ran its agent too.
+        self.assertEqual(2, len(self.agent_calls(calls, "claude")))
+
     def test_settings_override_model_holder_and_minutes(self):
         _, calls = self.tick(LOOM_BRAIN_MODEL="claude-sonnet-5-5",
                              LOOM_BRAIN_HOLDER="night", LOOM_BRAIN_MINUTES="20")
