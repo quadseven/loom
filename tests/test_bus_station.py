@@ -2147,6 +2147,24 @@ class FactoryIncidentTest(Base):
         self.assertIn("loom:running", self.fake.names(12))
         self.assertFalse(any("back in the queue" in b for b in self.bodies()))
 
+    def test_a_failed_incident_read_says_so_and_keeps_the_hold(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO), \
+                mock.patch.object(station.Station, "_closed_incidents",
+                                  side_effect=station.GitHubError("boom", 502)), \
+                mock.patch("bus.station._say") as say:
+            self.run_pass()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertIn("factory release: could not read the closed incidents: boom", said)
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertFalse(any("back in the queue" in b for b in self.bodies()))
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertIn("loom:queued", self.fake.names(12))
+
 
 class PruneTest(Base):
     def tree(self, name, age):

@@ -2097,11 +2097,16 @@ class Station:
         """Re-queue tickets a factory incident held once that incident is
         closed: they kept their rung and need no re-brief. A claim newer
         than the incident's close means the lane picked the ticket back up
-        itself, so the release leaves it alone."""
+        itself, so the release leaves it alone. A failed read of the
+        incidents releases nothing this pass; the holds wait for the next."""
         held = self._held_tickets()
         if not held:
             return
-        closed_incidents = self._closed_incidents()
+        try:
+            closed_incidents = self._closed_incidents()
+        except GitHubError as err:
+            _say("factory release: could not read the closed incidents: %s" % err)
+            return
         for key, info in list(held.items()):
             self._release_held(key, info, closed_incidents)
 
