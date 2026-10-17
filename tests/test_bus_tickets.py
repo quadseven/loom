@@ -391,3 +391,26 @@ class LandedStateWins(unittest.TestCase):
         self.assertEqual(tickets.ticket_state(self._issue("loom:ready")), "ready")
         self.assertEqual(tickets.ticket_state(self._issue("custom")), "")
 
+
+
+class HardModelBriefTest(unittest.TestCase):
+    """A hard ticket with no Model: line runs its lane's strongest model."""
+
+    def head(self, body, lane):
+        issue = {"number": 9, "title": "T", "body": body}
+        return render_brief(REPO, issue, lane).split("# T9")[0]
+
+    def test_a_hard_ticket_on_codex_renders_gpt_6_sol(self):
+        self.assertIn("\nModel: gpt-6-sol\n", self.head("Difficulty: hard\n\nWhy\n", "codex"))
+        self.assertIn("\nModel: gpt-6-sol\n", self.head("Difficulty: hard\n\nWhy\n", "codex-2"))
+        self.assertIn("\nModel: gemini-4-argon-high\n",
+                      self.head("Difficulty: hard\n\nWhy\n", "agy"))
+
+    def test_a_medium_ticket_keeps_the_lane_default(self):
+        self.assertNotIn("Model:", self.head("Difficulty: medium\n\nWhy\n", "codex"))
+
+    def test_a_pinned_model_or_a_lane_without_a_hard_model_is_kept(self):
+        head = self.head("Model: gpt-6-luna\nDifficulty: hard\n\nWhy\n", "codex")
+        self.assertEqual(head.count("Model:"), 1)
+        self.assertIn("Model: gpt-6-luna", head)
+        self.assertNotIn("Model:", self.head("Difficulty: hard\n\nWhy\n", "anthropic"))

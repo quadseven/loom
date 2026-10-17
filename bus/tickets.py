@@ -410,6 +410,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             out.append("Finding-%s: %s" % (f.id, summary))
     out += ["%s: %s" % (k, v) for k, v in headers.items()
             if k not in ("Not before", "After", "Priority")]
+    if "Model" not in headers and headers.get("Difficulty") == "hard":
+        # A hard ticket runs the lane's strongest model, not its default.
+        from .factory import HARD_MODELS  # factory imports this module
+        if lane in HARD_MODELS:
+            out.append("Model: %s" % HARD_MODELS[lane])
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
     if not has_contract and ci_checks:

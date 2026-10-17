@@ -469,6 +469,13 @@ on hard work):
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.
 
+A hard ticket with no `Model:` line runs its lane's strongest model, not the
+lane default: gpt-6-sol on codex and gemini-4-argon-high on agy (the table
+`HARD_MODELS` next to `TIERS` in bus/factory.py). A ticket pinned to
+claude-opus-5-5 on a public repo goes to agy with gemini-4-argon-high when
+every Anthropic lane is at a limit or down, never when they are merely busy
+(the table `EQUIVALENTS`), and its claim records Argon as the model it ran.
+
 When no lane of a ticket's tier is up (every one at a limit or down), the
 factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
 its lane) fall back to the next harder tier's free lanes, then the easier

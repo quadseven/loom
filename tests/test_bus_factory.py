@@ -1005,6 +1005,45 @@ class Queued(Base):
         self.assign(available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
 
+    OPUS = "Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n"
+    OUT = factory.ANTHROPIC + ("claude",)
+
+    def test_opus_pin_goes_to_agy_with_argon_when_every_anthropic_lane_is_out(self):
+        self.gh.private = False
+        self.queued(7, body=self.OPUS)
+        self.gh.comments[7] = [{"body": factory.RUNG_MARKER % 3, "user": ME}]
+        self.assign(limited=self.OUT)
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "agy", "gemini-4-argon-high"))
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("equivalent: Gemini 4 Argon high, index 53, while every Anthropic "
+                      "lane is out", note)
+        # The claim after the move ran Argon, and the opus rung stays untried.
+        comments = self.gh.comments[7] + [CLAIM]
+        self.assertEqual(factory.ran_models(self.gh.issues[7], comments),
+                         {"gemini-4-argon-high"})
+        self.assertEqual(factory.tried_rungs(comments), set())
+
+    def test_opus_pin_on_a_private_repo_waits_when_every_anthropic_lane_is_out(self):
+        self.gh.private = True
+        self.queued(7, body=self.OPUS)
+        self.assign(limited=self.OUT)
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-opus-5-5"))
+
+    def test_opus_pin_waits_when_anthropic_lanes_are_only_busy(self):
+        self.gh.private = False
+        for n, lane in enumerate(self.OUT, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.gh.ticket(30, "briefed", lane="agy")
+        self.queued(7, body=self.OPUS)
+        self.assign()
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-opus-5-5"))
+        self.gh.issues[30]["labels"][1] = {"name": "loom:merged"}
+        self.assign()
+        self.assertEqual((self.lane(7), self.model(7)), ("agy", "claude-opus-5-5"))
+
     def test_future_not_before_stays_queued(self):
         self.queued(7, body="Not before: 2099-01-01T00:00:00Z\nDifficulty: medium\n\n## Why\nx\n")
         self.assign(available=["codex"])
