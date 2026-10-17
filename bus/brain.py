@@ -1144,7 +1144,7 @@ def intake_epic(gh: GitHub, repo: str, goal: int) -> int:
     epic cap) when there is none: where triage, rewrites, health intake,
     validation contracts and adoption file their tickets."""
     _, tree = goal_tree(gh, repo, goal)
-    for found, held in tree:
+    for found, _ in tree:
         if (found.get("state", "open") == "open"
                 and str(found.get("title") or "") == INTAKE_TITLE):
             number = int(found["number"])
