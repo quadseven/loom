@@ -50,6 +50,9 @@ def page(title: str, active: str, body: str, *, status: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <title>{title_text} - Loom</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
   <link rel="stylesheet" href="/static/loom.css">
   <script src="/static/loom.js" defer></script>
 </head>
