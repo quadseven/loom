@@ -247,6 +247,10 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .backlog-ask { margin: 6px 0; color: var(--body); font-size: 13px; }
 .usage-card { margin: 10px 0; }
 .usage-card p { margin: 8px 0 0; color: var(--body); overflow-wrap: anywhere; }
+.lane-usage { width: 100%; border-collapse: collapse; font-size: 13px; }
+.lane-usage th, .lane-usage td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; }
+.lane-usage th:first-child { width: 10rem; font-family: var(--font-mono); }
+.lane-usage td { color: var(--body); overflow-wrap: anywhere; }
 .usage-track { height: 10px; margin-top: 12px; border-radius: 8px; background: var(--raised); overflow: hidden; }
 .usage-track span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .share-track span, .quota span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }

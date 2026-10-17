@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import html
 import re
+import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
+
+from bus import factory
 
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
@@ -466,9 +470,64 @@ def _tier_card(tier, models):
     return '<section class="card tier-card"><h3 class="label">%s</h3>%s</section>' % (esc(tier.title()), "".join(rows))
 
 
+def _dashboard_zone():
+    name = os.environ.get("LOOM_DASHBOARD_TZ", "").strip()
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return timezone.utc
+
+
+def _local_time(stamp):
+    moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    if moment.tzinfo is None:
+        raise ValueError("timezone required")
+    local = moment.astimezone(_dashboard_zone())
+    return local.strftime("%Y-%m-%d %H:%M ") + (local.tzname() or "UTC")
+
+
+def _factory_tier_text():
+    tiers = "; ".join("%s: %s" % (name.title(), ", ".join(lanes))
+                       for name, lanes in factory.TIERS.items())
+    ladder = "; ".join("%s: %s" % (", ".join(lanes), model)
+                        for lanes, model in factory.LADDER)
+    return "Factory tiers: %s. Model ladder: %s." % (tiers, ladder)
+
+
+def render_lane_usage(rows):
+    """Render one compact state row for every configured factory lane."""
+    esc = html.escape
+    names = set(lane for lanes in factory.TIERS.values() for lane in lanes)
+    names.update(lane for lanes, _ in factory.LADDER for lane in lanes)
+    holds = {}
+    for row in rows:
+        if isinstance(row.get("holds"), dict):
+            holds.update(row["holds"])
+    parts = ['<table class="lane-usage"><thead><tr><th>Lane</th><th>State</th></tr></thead><tbody>']
+    for lane in sorted(names):
+        reason = str(holds.get(lane) or "")
+        if not reason:
+            state = "available"
+        elif any(word in reason.lower() for word in ("endpoint", "503", "unreachable", "down")):
+            state = "endpoint down: " + reason
+        else:
+            state = re.sub(r"^limit:\s*", "", reason)
+            match = re.search(r";\s*(?:lane waits|unavailable) until (\S+)", state)
+            if match:
+                try:
+                    state = state[:match.start()] + " until " + _local_time(match.group(1).rstrip(";"))
+                except ValueError:
+                    state = state[:match.start()] + " until " + match.group(1)
+        parts.append("<tr><th>%s</th><td>%s</td></tr>" % (esc(lane), esc(state)))
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
 def render_lanes(data):
-    parts = ['<p class="page-lede">Easy work on free lanes and spark, medium on codex and opencode-go, '
-             'hard on Anthropic credit. At most half of runs on Anthropic.</p><section><h2 class="label">Anthropic share of runs</h2>']
+    parts = ['<p class="page-lede">%s At most half of runs on Anthropic.</p><section><h2 class="label">Anthropic share of runs</h2>' %
+             html.escape(_factory_tier_text())]
     share = data.get("anthropic_share")
     if share is None:
         parts.append('<p class="empty-state">Share is missing: no lane run totals were available.</p>')
@@ -516,7 +575,7 @@ def render_usage_row(row, now=None):
             reset_at = datetime.fromisoformat(reset.replace("Z", "+00:00")).astimezone(timezone.utc)
             seconds = int((reset_at - now).total_seconds())
             relative = "in %dh" % (seconds // 3600) if seconds >= 3600 else "in %dm" % max(0, seconds // 60)
-            absolute = reset_at.strftime("%Y-%m-%d %H:%M UTC")
+            absolute = _local_time(reset)
             parts.append('<p>Resets at %s (%s)</p>' % (esc(absolute), esc(relative)))
         except ValueError:
             parts.append('<p>Reset time unavailable.</p>')

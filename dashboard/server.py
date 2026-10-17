@@ -957,7 +957,9 @@ def _dispatch_usage(handler, state):
     now = datetime.now(timezone.utc)
     rows.sort(key=lambda row: (row.get("used_pct") is None,
                                -(float(row["used_pct"]) if row.get("used_pct") is not None else 0)))
-    body = ['<p class="empty-state">Usage limits have not been uploaded yet.</p>'] if not rows else []
+    body = ['<section><h2 class="label">Lane status</h2>%s</section>' % views.render_lane_usage(rows)]
+    if not rows:
+        body.append('<p class="empty-state">Usage limits have not been uploaded yet.</p>')
     for row in rows:
         body.append(views.render_usage_row(row, now))
     return handler.send_page(page("Usage", "usage", "".join(body), status="Live"))
@@ -1079,8 +1081,15 @@ def _hold_reason(lane, rows):
     if not reason:
         return "held: the lane machine sent no reason"
     reason = re.sub(r"^limit:\s*", "", reason)
-    return re.sub(r";\s*(?:lane waits|unavailable) until (\d{4}-\d\d-\d\d)T(\d\d:\d\d)(?::\d\d)?Z",
-                  r" until \1 \2 UTC", reason)
+    match = re.search(r";\s*(?:lane waits|unavailable) until (\S+)", reason)
+    if not match:
+        return reason
+    stamp = match.group(1).rstrip(";")
+    try:
+        local = views._local_time(stamp)
+    except ValueError:
+        return reason
+    return reason[:match.start()] + " until " + local
 
 
 def _lane_view_data(payload, tickets, state=None):
