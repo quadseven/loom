@@ -629,7 +629,7 @@ def _dispatch_get(handler, state):
         return _dispatch_ticket_api(handler, state, parsed)
     if path in ("/backlog", "/backlog.json", "/needs-you"):
         return _dispatch_backlog(handler, state, path, parsed)
-    if path in ("/static/loom.css", "/static/loom.js"):
+    if path in STATIC_ASSETS:
         return _dispatch_static(handler, path)
     if path in ("/improving", "/lanes"):
         return _send_dashboard_view(handler, state, path)
@@ -702,9 +702,21 @@ def _dispatch_backlog(handler, state, path, parsed):
     return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
 
 
+# Served path -> (file under static/, content type). Browsers ask for
+# /favicon.ico whatever the page head says, so it serves the 32 px PNG.
+STATIC_ASSETS = {
+    "/static/loom.css": ("loom.css", "text/css; charset=utf-8"),
+    "/static/loom.js": ("loom.js", "text/javascript; charset=utf-8"),
+    "/static/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/static/favicon-32.png": ("favicon-32.png", "image/png"),
+    "/static/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+    "/favicon.ico": ("favicon-32.png", "image/png"),
+}
+
+
 def _dispatch_static(handler, path):
-    asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
-    content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
+    name, content_type = STATIC_ASSETS[path]
+    asset = Path(__file__).parent / "static" / name
     return handler.send_bytes(200, asset.read_bytes(), content_type)
 
 

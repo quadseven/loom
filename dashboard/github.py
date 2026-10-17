@@ -111,6 +111,7 @@ class TicketStore:
         self._stop = threading.Event()
         self._refresh_thread: Optional[threading.Thread] = None
         self._last_remaining: Optional[int] = None
+        self._reset_at = 0
         self.waits = {}
         self.waits_error = "waits have not been looked up yet"
         self._waits_refreshed_at = 0.0
@@ -150,7 +151,14 @@ class TicketStore:
             self._refresh_thread.join(timeout=2)
 
     def _below_floor(self) -> bool:
-        return self._last_remaining is not None and self._last_remaining < self.budget_floor
+        """Whether the last reading was under the floor and GitHub has not yet
+        restored the window. A pass below the floor reads nothing, so nothing
+        updates the reading: without the reset time the dashboard stayed on
+        "stale ticket data" for a day after the budget came back (2026-10-16:
+        4,265 requests left, still latched)."""
+        if self._last_remaining is None or self._last_remaining >= self.budget_floor:
+            return False
+        return not (self._reset_at and time.time() >= self._reset_at)
 
     @staticmethod
     def _error_reason(exc: Exception) -> str:
@@ -363,9 +371,10 @@ class TicketStore:
         return prs, errors
 
     def _note_budget(self) -> None:
-        remaining = self.gh.rate.get("core", (None, 0, 0))[0]
+        remaining, _, reset = self.gh.rate.get("core", (None, 0, 0))
         if isinstance(remaining, int):
             self._last_remaining = remaining
+            self._reset_at = reset if isinstance(reset, int) else 0
 
     def _read_repos(self, data: Dict[str, Any], errors: Dict[str, str]) -> bool:
         """Read each repo into data/errors; return True if the budget floor stopped the pass."""
