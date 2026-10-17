@@ -388,6 +388,43 @@ class Base(unittest.TestCase):
 
 
 class ReconcilePullRequestTest(Base):
+    def test_trusted_same_repo_open_pr_promotes_queued_ticket(self):
+        self.fake.add(12, state="queued")
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix", "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        self.assertIn("pull request #99", self.fake.comments[12][-1]["body"])
+
+    def test_untrusted_or_fork_pr_does_not_promote_ticket(self):
+        for author, head_repo in (("stranger", REPO), ("alice-example", "fork-owner/example-repo")):
+            with self.subTest(author=author, head_repo=head_repo):
+                self.fake.add(12, state="queued")
+                self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": author},
+                                    "body": "Refs %s#12" % REPO,
+                                    "head": {"ref": "loom/12-fix",
+                                             "repo": {"full_name": head_repo}}}]
+                station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+                self.assertIn("loom:queued", self.fake.names(12))
+                self.assertNotIn("loom:pr", self.fake.names(12))
+
+    def test_briefed_ticket_promotes_but_running_ticket_is_untouched(self):
+        pr = {"number": 99, "state": "open", "user": {"login": "alice-example"},
+              "body": "Refs %s#12" % REPO,
+              "head": {"ref": "loom/12-fix", "repo": {"full_name": REPO}}}
+        self.fake.add(12, state="briefed")
+        self.fake.pulls = [pr]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.fake.add(13, state="running")
+        pr["body"] = "Refs %s#13" % REPO
+        pr["head"]["ref"] = "loom/13-fix"
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:running", self.fake.names(13))
+        self.assertNotIn("loom:pr", self.fake.names(13))
+
     def test_merged_pr_repairs_failed_ticket_label_once(self):
         self.fake.add(12, state="pr")
         # The /pulls list endpoint returns merged_at but omits merged.
@@ -1621,12 +1658,11 @@ class ClaimTest(Base):
         self.run_pass()
         first = len(self.fake.calls)
         gh = self.run_pass()
-        # The loom:pr list for reconciliation and for PR reviews (this fake
-        # sends no ETag for it), then the briefed list's 304; with no loom:pr
-        # ticket no pull request list is read. The hand-revert scan adds the
-        # loom:merged and loom:shipped lists.
-        self.assertEqual(len(self.fake.calls), first + 5)
-        self.assertEqual(gh.requests, 6)
+        # Reconciliation reads open PRs to discover linked queued tickets,
+        # even when the repo has no loom:pr ticket. PR review and hand-revert
+        # scans add their usual reads.
+        self.assertEqual(len(self.fake.calls), first + 6)
+        self.assertEqual(gh.requests, 7)
         self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 

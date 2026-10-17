@@ -1997,8 +1997,6 @@ class Station:
     def _reconcile_repo(self, repo: str) -> None:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
-        if not tickets_by_number:
-            return
         # Only a closed pull request changes a ticket. Those PRs are the most
         # recently updated closed ones, so one page of them is read, never the
         # repo's whole PR history. A merged one delivers the ticket even while
@@ -2007,6 +2005,43 @@ class Station:
         # unmerged one only counts for a ticket with no open PR left.
         open_prs = [p for p in self._open_pulls(repo)
                     if isinstance(p, dict) and p.get("state", "open") == "open"]
+        trusted_authors = {name.lower() for name in self.s.authors}
+        for pr in open_prs:
+            author = tickets._login(pr.get("user"))
+            head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
+            if author not in trusted_authors or head_repo != repo:
+                continue
+            number = self._pr_ticket_number(repo, pr)
+            if number is None:
+                continue
+            ticket = tickets_by_number.get(number)
+            if ticket is None:
+                try:
+                    ticket = self._issue(repo, number)
+                except GitHubError as err:
+                    if err.status == 404:
+                        continue
+                    raise
+                if "pull_request" in ticket or "loom:ticket" not in _label_names(ticket):
+                    continue
+                tickets_by_number[number] = ticket
+            labels = _label_names(ticket)
+            if not set(labels).intersection(("loom:queued", "loom:briefed")):
+                continue
+            if not _linked_pr(ticket, repo, pr):
+                continue
+            trusted, _ = self._check_trust(repo, ticket)
+            if not trusted:
+                continue
+            number = int(ticket["number"])
+            kept = [name for name in labels if name not in ("loom:queued", "loom:briefed")]
+            kept.append("loom:pr")
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+            ticket["labels"] = [{"name": name} for name in kept]
+            self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
+        if not tickets_by_number:
+            return
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
         closed = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
