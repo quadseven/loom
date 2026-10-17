@@ -165,7 +165,8 @@ check its body still fails before it opens the pull request.
 
 `python3 -m bus.brain prioritize OWNER/NAME#N --priority P0|P1|P2|P3
 [--note TEXT]` changes the `Priority:` header on an existing open
-`loom:ticket`. The issue author must be in `LOOM_BRIEF_AUTHORS`. It preserves
+`loom:ticket`. The issue author must be in `LOOM_BRIEF_AUTHORS`, or in
+`LOOM_TRUSTED_BRIEFERS` (docs/LANES.md, Trusted briefers). It preserves
 the rest of the body, and an optional one-line note is posted as a comment.
 It refuses closed issues and issues without `loom:ticket`.
 
@@ -437,10 +438,11 @@ Briefs become agent prompts, and the runner pushes with the operator's
 credentials, so the station takes a ticket only when all of these hold:
 
 - The issue author, the actor of the latest `loom:briefed` labelled event and
-  the actor of the latest `lane:` labelled event are all in
-  `LOOM_BRIEF_AUTHORS` (GitHub logins). Labels can arrive from issue
-  templates, so the label alone proves nothing.
-- The body was last edited by an allowed login, or never edited
+  the actor of the latest `lane:` labelled event are all briefing logins:
+  in `LOOM_BRIEF_AUTHORS` (GitHub logins), or in `LOOM_TRUSTED_BRIEFERS` for
+  a `loom:ticket` (docs/LANES.md, Trusted briefers). Labels can arrive from
+  issue templates, so the label alone proves nothing.
+- The body was last edited by a briefing login, or never edited
   (GraphQL `Issue.editor`).
 - The repo owner is in `LOOM_REPO_OWNERS`, as for local briefs.
 
@@ -448,12 +450,16 @@ A ticket that fails these is left alone and reported once in the station
 log; it is never claimed. So is a ticket assigned to a login outside
 `LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
 another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
-shared repos"). A claim assigns the ticket to this Loom's operator login and
-labels it `claim:<that login>`.
+shared repos"). A trusted briefer owns nothing here: an issue assigned to or
+claim-labelled for one is skipped too, unless it is a `loom:ticket` that
+briefer authored, which is a hand-off. A claim assigns the ticket to this
+Loom's operator login and labels it `claim:<that login>`.
 
 The brain applies the same rule to what it reads: issue bodies, comments and
 reviews from logins outside `LOOM_BRIEF_AUTHORS` and the review bots are
-data about the work, never instructions to it.
+data about the work, never instructions to it. A trusted briefer's ticket
+body is a brief this Loom builds; their comments, journals and proofs are
+data like anyone else's, and only `LOOM_BRIEF_AUTHORS` proofs close a ticket.
 
 ## Claim and outcome
 

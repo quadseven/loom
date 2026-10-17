@@ -373,6 +373,33 @@ Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
 other's login. A person working a ticket by hand claims it the same way:
 assign it to yourself and add `claim:<your login>` before any Loom briefs it.
 
+### Trusted briefers
+
+`LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
+another operator hand work to this Loom's lanes without this Loom adopting
+their claims. It is briefing trust only:
+
+- A `loom:ticket` authored by a trusted briefer is trusted for briefing and
+  building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
+  hand-off, retries, the factory's queue routing, `bus.brain move` and
+  `bus.brain prioritize`. The labeller and body-editor checks accept their
+  login too. One function decides it (`tickets.brief_author_trusted`), so the
+  checks cannot drift.
+- Ownership stays `LOOM_BRIEF_AUTHORS` only. An issue assigned to, or
+  labelled `claim:` for, a trusted briefer is still skipped by triage,
+  rewrite, routing, claim and adoption, unless it is a `loom:ticket` that
+  same briefer authored: a brief is an explicit hand-off. A pull request is
+  never a hand-off. When the station claims a handed-off ticket it assigns it
+  to this Loom's operator login and labels it `claim:<that login>`, as for
+  any claim.
+- Journals, proofs, audits, adopted pull requests and merges keep requiring
+  `LOOM_BRIEF_AUTHORS`. A trusted briefer cannot verify, close or merge on
+  this Loom's behalf, and their comments are data, not instructions.
+
+The installer writes the setting into the station plist and the brain
+plist, and the brain passes it to a sandboxed rung, like
+`LOOM_BRIEF_AUTHORS`.
+
 ### Verify runs
 
 A slot of a lane that is not Anthropic (`anthropic*` and `claude` never take

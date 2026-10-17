@@ -147,6 +147,14 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_PIN_SHIP_REPOS</key><string>example-owner/deploy</string>", plist)
 
+    def test_trusted_briefers_are_written_to_station_and_brain_plists(self):
+        result = self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        entry = "<key>LOOM_TRUSTED_BRIEFERS</key><string>dana-example</string>"
+        self.assertIn(entry, (agents / "com.loom.station.plist").read_text())
+        self.assertIn(entry, (agents / "com.loom.brain.plist").read_text())
+
     def test_lane_model_settings_are_written_to_station_plist(self):
         # The factory reads what a lane ran from its setting (bus/brain.py
         # _lane_model) when no Model: line or runner footer names the model.

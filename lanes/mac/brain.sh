@@ -130,7 +130,8 @@ ladder_open() {
 # The settings the brain's commands read (bus.brain, bus journal), passed
 # to a sandboxed rung by name. An allowlist: nothing else of this
 # environment, a key or an SSM parameter name included, reaches the agent.
-BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_REPO_OWNERS LOOM_HOME
+BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
+  LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
   LOOM_UNVERIFIED_LIMIT LOOM_MERGE_SETTLE_SECONDS)
 

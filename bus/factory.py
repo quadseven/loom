@@ -912,6 +912,7 @@ def agy_takes_header(issue: Dict[str, Any], rung_only: bool = False) -> bool:
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
+                 briefers: Sequence[str] = (),
                  review_check: str = DEFAULT_REVIEW_CHECK,
                  review_bot: str = DEFAULT_REVIEW_BOT,
                  merge: Callable[..., Any] = brain.merge,
@@ -925,6 +926,9 @@ class Factory:
         self.repos = list(repos)
         self.now = now
         self.trusted = {t.lower() for t in trusted}
+        # LOOM_TRUSTED_BRIEFERS: their loom:ticket briefs are tickets here;
+        # their comments and pull requests are not trusted.
+        self.briefers = {b.lower() for b in briefers}
         self.review_check = review_check
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
@@ -954,6 +958,13 @@ class Factory:
         return (bool(login) and login in self.trusted
                 and tickets.owned_elsewhere(item, self.trusted) is None)
 
+    def _trusted_ticket(self, item: Dict[str, Any]) -> bool:
+        """A ticket a briefing login filed (tickets.brief_author_trusted),
+        not assigned to another operator; a trusted briefer's own loom:ticket
+        is a hand-off, whoever it is assigned to among them."""
+        return (tickets.brief_author_trusted(item, self.trusted, self.briefers)
+                and tickets.owned_elsewhere(item, self.trusted, self.briefers) is None)
+
     def _dependency(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
         """The ticket an After: line names, read once a pass; None when it
         cannot be read, which keeps the hold."""
@@ -971,13 +982,13 @@ class Factory:
         """A trusted ticket issue, read once a pass; None when it cannot be
         read or a stranger opened it."""
         data = self._dependency(repo, number)
-        return data if data is not None and self._trusted(data) else None
+        return data if data is not None and self._trusted_ticket(data) else None
 
     def _tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         data = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return {int(i["number"]): i for i in data
                 if isinstance(i, dict) and "pull_request" not in i and "number" in i
-                and self._trusted(i)}
+                and self._trusted_ticket(i)}
 
     def _comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
         """The ticket's comments from trusted logins only."""
