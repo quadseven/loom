@@ -51,6 +51,14 @@ no model. The age in state comes from the hourly label-event read.
 bigger one through a `Parent goal: OWNER/NAME#N` line in its body or its
 GitHub sub-issue parent, and then shows as a row inside that card. A pass
 below the budget floor keeps the goal cards of the last pass that read them.
+Each ticket record carries `epic` and `goal` (decision 0003): the issue its
+`Part of` line or sub-issue parent names is its epic when that issue is
+labelled `epic`, and the epic's own `Part of` line or sub-issue parent is the
+goal; a ticket naming a goal home directly has no epic. Each goal card lists
+its open epics against 6, each with its tickets against 15 and a link to
+`/tickets?epic=OWNER/NAME#N`, and its closed epics collapsed. Only epics the
+tickets name are listed. The ticket header reads "epic Y / goal X", and the
+Backlog's "Outside any epic" lists open tickets with no epic.
 
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one

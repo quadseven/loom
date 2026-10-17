@@ -100,20 +100,24 @@ class OutsideAnyEpic(unittest.TestCase):
         self.assertIn("Epics by score", body)
         return body[body.index("Outside any epic"):body.index("Epics by score")]
 
-    def test_an_open_ticket_with_no_epic_and_no_goal_home_is_listed(self):
+    def test_an_open_ticket_with_no_epic_is_listed_and_one_under_an_epic_is_not(self):
+        # loom#639: the record's epic decides, so a ticket that names only its
+        # goal home (no epic) is outside any epic too (decision 0003).
         document = {"epics": [epic(10, 5.0, open_children=(12,), next_child={"number": 13, "title": "next"})]}
         rows = [self.ticket(11),
                 self.ticket(12),
                 self.ticket(13),
                 self.ticket(14, goal=REPO + "#30"),
                 self.ticket(15, state="merged"),
-                self.ticket(16, open=False, state="failed")]
+                self.ticket(16, open=False, state="failed"),
+                self.ticket(17, goal=REPO + "#30", epic=REPO + "#40")]
         section = self.section(render(document, rows))
         self.assertIn('href="/t/example-owner/app/11"', section)
-        self.assertIn("Ticket 11", section)
-        for number in (12, 13, 14, 15, 16):
+        for number in (11, 14):
+            self.assertIn("Ticket %d" % number, section)
+        for number in (12, 13, 15, 16, 17):
             self.assertNotIn("Ticket %d" % number, section)
-        self.assertIn('<span class="machine-fact bad">1</span>', section)
+        self.assertIn('<span class="machine-fact bad">2</span>', section)
         self.assertIn("incoherence", section)
         self.assertIn("open loom:ticket issues only", section)
 
@@ -123,7 +127,8 @@ class OutsideAnyEpic(unittest.TestCase):
 
     def test_every_open_ticket_in_an_epic_reads_as_the_empty_state(self):
         document = {"epics": [epic(10, 5.0, open_children=(11,))]}
-        section = self.section(render(document, [self.ticket(11), self.ticket(12, goal=REPO + "#30")]))
+        section = self.section(render(document, [self.ticket(11), self.ticket(
+            12, goal=REPO + "#30", epic=REPO + "#40")]))
         self.assertIn('<p class="empty-state">Every open ticket is in an epic.</p>', section)
 
     def test_the_repo_filter_narrows_the_outside_list(self):

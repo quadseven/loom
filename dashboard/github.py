@@ -85,13 +85,20 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     goal = None
     if goal_match:
         goal = (goal_match.group(1) or repo) + "#" + goal_match.group(2)
+    else:
+        # No Part of line: the sub-issue parent names the epic (or goal).
+        goal = goals.issue_parent(issue)
     return {
         "repo": repo, "number": issue.get("number"), "title": issue.get("title"),
         "refs": re.findall(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)", body),
         "html_url": issue.get("html_url"),
         "state": next((name[5:] for name in names if name in labels.LABELS and name.startswith("loom:")
                         and name not in ("loom:ticket", "loom:goal", "loom:runaway")), None),
+        # The issue the ticket names: an epic or, before tickets moved under
+        # epics, a goal. TicketStore._assign_epics moves an epic here to
+        # "epic" and puts the epic's goal in "goal" (decision 0003).
         "goal": goal,
+        "epic": None,
         # Tickets are read with state=all; a closed one is history, never work.
         "open": issue.get("state", "open") != "closed",
         "closed_at": issue.get("closed_at"),
@@ -303,6 +310,7 @@ class TicketStore:
         rows = [row for found in data.get("tickets", {}).values() if found for row in found]
         configured = set(self.repos) | {repo for repo, _ in homes}
         titles, parents = self._goal_info(rows, configured)
+        epics = self._assign_epics(rows)
         # Reports on the goal homes read in full above count too: a goal home
         # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
         # comment feed failed this pass.
@@ -314,7 +322,7 @@ class TicketStore:
         data["goal_context"] = goals.goal_context(
             rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
             os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
-            parents=parents, unread=unread)
+            parents=parents, unread=unread, epics=epics)
         data["goal_context_error"] = ""
 
     def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
@@ -347,6 +355,8 @@ class TicketStore:
                 cache[goal] = entry
             if entry.get("parent") and entry["parent"] not in seen:
                 pending.append(entry["parent"])
+            if entry.get("is_epic") and entry.get("epic_goal") and entry["epic_goal"] not in seen:
+                pending.append(entry["epic_goal"])
 
         def accepted(parent):
             if not parent or parent.partition("#")[0] not in configured:
@@ -354,8 +364,27 @@ class TicketStore:
             return parent if parent in named or (cache.get(parent) or {}).get("is_goal") else None
 
         titles = {goal: entry.get("title") for goal, entry in cache.items()}
-        parents = {goal: accepted(entry.get("parent")) for goal, entry in cache.items()}
+        # An epic is not a smaller goal: it never rolls up as one.
+        parents = {goal: None if entry.get("is_epic") else accepted(entry.get("parent"))
+                   for goal, entry in cache.items()}
         return titles, parents
+
+    def _assign_epics(self, rows) -> Dict[str, Dict[str, Any]]:
+        """Move each ticket whose named issue is an epic (labelled epic) to
+        `epic`, with the epic's goal in `goal`, from the goal-home reads
+        _goal_info just made (no request of its own). Returns each epic the
+        tickets name: its title, whether it is open, and its goal."""
+        cache = self.__dict__.get("_goal_info_cache") or {}
+        epics: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            named = row.get("epic") or row.get("goal")
+            entry = cache.get(named) if named else None
+            if not entry or not entry.get("is_epic"):
+                continue
+            row["epic"], row["goal"] = named, entry.get("epic_goal")
+            epics[named] = {"title": entry.get("title"), "open": entry.get("open", True),
+                            "goal": entry.get("epic_goal")}
+        return epics
 
     def _read_goal_home(self, goal, entry, now, configured):
         repo, _, number = goal.partition("#")
@@ -366,9 +395,13 @@ class TicketStore:
             return dict(entry or {}, read_at=0)
         if not isinstance(issue, dict):
             return {"title": None, "parent": None, "is_goal": False, "read_at": 0}
+        names = [name.lower() for name in _label_names(issue)]
+        is_epic = "epic" in names and "loom:goal" not in names
         return {"title": str(issue.get("title") or "") or None,
                 "parent": goals.parent_of(repo, issue, configured),
-                "is_goal": "loom:goal" in _label_names(issue), "read_at": now}
+                "is_goal": "loom:goal" in names, "is_epic": is_epic,
+                "epic_goal": goals.epic_goal_of(repo, issue, configured) if is_epic else None,
+                "open": issue.get("state", "open") != "closed", "read_at": now}
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
