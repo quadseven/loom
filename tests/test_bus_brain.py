@@ -1897,6 +1897,13 @@ class EscalateTests(unittest.TestCase):
         self.assertIn("tried claude-sonnet-5-5", report)
         self.assertIn("next rung 2 gpt-6-sol", report)
 
+    def test_an_equivalent_move_records_the_model_that_ran(self):
+        claim_body = "Claimed for lane agy (body sha256 0123456789ab)"
+        bodies = [(brain.ESCALATE_MARKER + "\nRung: 3 claude-opus-5-5 anthropic", None),
+                  ("<!-- loom:equivalent gemini-4-argon-high -->\nmoved", None),
+                  (claim_body, None)]
+        self.assertEqual(brain._tried_models(None, bodies), ["gemini-4-argon-high"])
+
     def test_status_reads_at_most_the_capped_number_of_histories(self):
         older = dict(stuck_ticket("failed"), updated_at="2030-01-01T00:00:00Z")
         newer = dict(stuck_ticket("failed"), number=10, updated_at="2030-01-02T00:00:00Z")

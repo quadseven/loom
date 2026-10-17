@@ -2796,13 +2796,18 @@ def _first_model(issue: Dict[str, Any], bodies: List[Tuple[str, Optional[datetim
 
 
 def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datetime]]]) -> List[str]:
-    """The model in force at each claim, in order, without repeats."""
+    """The model in force at each claim, in order, without repeats. An
+    equivalent move (bus/factory.py EQUIVALENTS) sets the model it gave."""
+    from .factory import EQUIVALENT_RE  # factory imports this module
     tried: List[str] = []
     for body, _ in bodies:
         rung = _RUNG_LINE.search(body) if body.startswith(ESCALATE_MARKER) else None
         claim = _CLAIM.fullmatch(body.strip())
+        equivalent = EQUIVALENT_RE.search(body)
         if rung:
             current = rung.group(2)
+        elif equivalent:
+            current = equivalent.group(1)
         elif claim:
             model = current or _lane_model(claim.group(1))
             if model and model not in tried:
