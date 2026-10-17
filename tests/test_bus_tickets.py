@@ -300,6 +300,25 @@ class AfterLineTest(unittest.TestCase):
         self.assertEqual(dependency_state(None), "unreadable")
 
 
+class DifficultyHeaderTest(unittest.TestCase):
+    """A hand-edited "Difficulty: Medium", or the same header written twice,
+    left tickets with no readable tier, so no lane ever claimed them
+    (2026-10-16)."""
+
+    def test_difficulty_is_read_in_any_case(self):
+        from bus.factory import difficulty_of
+        self.assertEqual(parse("Difficulty: Medium\n\nbody")[0], {"Difficulty": "medium"})
+        self.assertEqual(difficulty_of({"body": "Priority: P1\nDifficulty: HARD\n\n## Why\nx"}), "hard")
+
+    def test_the_same_header_twice_is_one_header(self):
+        self.assertEqual(parse("Difficulty: hard\nDifficulty: hard\n\nbody")[0], {"Difficulty": "hard"})
+
+    def test_two_different_values_or_an_unknown_tier_are_still_refused(self):
+        for bad in ("Difficulty: hard\nDifficulty: easy\n\nbody", "Difficulty: extreme\n\nbody"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse(bad)
+
+
 class PriorityTest(unittest.TestCase):
     """Priority: P0 to P3 orders every queue after the FIRST labels."""
 

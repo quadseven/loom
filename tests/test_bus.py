@@ -436,8 +436,30 @@ class JournalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             journal.post(gh, REPO, 7, "hello")
         self.assertEqual(gh.requests, 0)
-        journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nx")
+        journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx")
         self.assertTrue(t.calls[0][1].endswith("/repos/%s/issues/7/comments" % REPO))
+
+    def test_a_journal_without_its_tick_line_is_refused_unless_a_holder_adds_it(self):
+        # No brain's journal carried a Tick line on 2026-10-16, so each read its
+        # own last tick as a peer's and stayed to resume items for hours.
+        gh = GitHub("tok", transport=Scripted())
+        with self.assertRaisesRegex(ValueError, "Tick <UTC time>, <holder>"):
+            journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nLane machine tick 12:00Z.")
+        with self.assertRaisesRegex(ValueError, "names muse, not lane-machine"):
+            journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx",
+                         "lane-machine")
+        self.assertEqual(gh.requests, 0)
+        text = journal.with_tick(journal.JOURNAL_MARKER + "\n\nLane machine tick.", "lane-machine", NOW)
+        self.assertEqual(text.splitlines()[:3], [journal.JOURNAL_MARKER,
+                                                 "Tick 2030-01-01T12:00:00Z, lane-machine",
+                                                 "Lane machine tick."])
+
+    def test_a_stamped_journal_is_the_holders_own_not_a_peers(self):
+        from bus import handoff
+        body = journal.with_tick(journal.JOURNAL_MARKER + "\nbody", "lane-machine", NOW)
+        found = [{"body": body, "at": "2030-01-01T12:00:00Z"}]
+        self.assertEqual(handoff.peer_journals(found, "lane-machine", NOW), [])
+        self.assertEqual(len(handoff.peer_journals(found, "muse", NOW)), 1)
 
     def test_post_accepts_a_reply_to_an_operator_note(self):
         t = Scripted(reply(201, {}))
@@ -480,6 +502,19 @@ class CliTests(unittest.TestCase):
             code, err = self.run_cli(["journal", REPO + "#5", "--file", path], t)
         self.assertEqual(code, 0)
         self.assertIn("requests: 1", err)
+
+    def test_journal_command_holder_adds_the_tick_line(self):
+        t = Scripted(reply(201, {}))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "j.md")
+            with open(path, "w") as fh:
+                fh.write(journal.JOURNAL_MARKER + "\nMoved: nothing.\n")
+            code, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
+                                    "--holder", "lane-machine"], t)
+        self.assertEqual(code, 0)
+        posted = json.loads(t.calls[0][3])["body"].splitlines()
+        self.assertRegex(posted[1], r"^Tick \S+Z, lane-machine$")
+        self.assertEqual(posted[2], "Moved: nothing.")
 
 
 if __name__ == "__main__":

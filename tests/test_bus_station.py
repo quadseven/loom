@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import base64
 import contextlib
 import fcntl
 import io
@@ -153,13 +154,21 @@ class FakeGitHub:
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
         path = parts.path + ("?" + parts.query if parts.query else "")
-        self.calls.append((method, path))
+        internal_validation_read = (parts.path.startswith("/repos/%s/contents/" % REPO)
+                                    or "labels=loom:ticket" in parts.query
+                                    or "labels=loom:goal" in parts.query)
+        if not internal_validation_read:
+            self.calls.append((method, path))
         data = json.loads(body) if body else None
         if method == "POST" and parts.path == "/graphql":
             return self._graphql(data)
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private,
                                "default_branch": "main"})
+        if method == "GET" and parts.path.startswith("/repos/%s/contents/" % REPO):
+            if parts.path.endswith("/.github/workflows"):
+                return reply(200, [])
+            return reply(404, {"message": "Not Found"})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -195,6 +204,17 @@ class FakeGitHub:
             self.digest_issues = [{"number": 900, "labels": [{"name": "loom:digest"}]}]
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
+            if data.get("title") == "Add the repository validation contract":
+                number = max(self.issues.keys(), default=0) + 1
+                made = {"number": number, "id": 1000 + number, "title": data["title"],
+                        "body": data["body"], "state": "open",
+                        "labels": [{"name": label} for label in data["labels"]],
+                        "user": {"login": "alice-example"}}
+                self.issues[number] = made
+                self.events[number] = []
+                self.comments[number] = []
+                self.created.append(data)
+                return reply(201, made)
             self.created.append(data)
             self.lanes_issues = [{"number": 1, "labels": [{"name": "loom:lanes"}]}]
             return reply(201, {"number": 1})
@@ -562,6 +582,209 @@ class ShipDeployedTest(Base):
         sha = head.stdout.strip()
         self.assertTrue(station._is_ancestor(sha, sha))
         self.assertFalse(station._is_ancestor("0" * 40, sha))
+
+
+DEPLOY = "example-owner/deploy"
+PUBLISHED = "e" * 40
+PIN_MERGED = "2030-01-03T12:00:00Z"
+PIN_MERGED_AT = calendar.timegm((2030, 1, 3, 12, 0, 0))
+
+
+class ShipPinTest(Base):
+    """A merged pin pull request in a deployment repo ships the merged
+    tickets of the source revision its published-from comment names."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.pin_ship_repos = [DEPLOY]
+        self.carried = set()
+        self.pins = []
+        self.files = {}
+        self.reads = []
+
+    def merged(self, number, pr, merged_at="2030-01-02T00:00:00Z", carried=True,
+               title="Fix the thing", body=None):
+        self.fake.add(number, state="merged", title=title)
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": title,
+                                "body": "Refs %s#%d" % (REPO, number) if body is None else body,
+                                "head": {"ref": "loom/%d-fix" % number}})
+        if carried:
+            self.carried.add(sha)
+        return sha
+
+    def revert(self, pr, of, title, carried=True, merged_at="2030-01-02T06:00:00Z"):
+        """A merged pull request GitHub's revert button opened for pull request of."""
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": 'Revert "%s"' % title,
+                                "body": "Reverts %s#%d" % (REPO, of),
+                                "head": {"ref": "revert-%d" % of}})
+        if carried:
+            self.carried.add(sha)
+
+    def pin(self, number=7, merged_at=PIN_MERGED, revision=PUBLISHED, name="example-repo"):
+        self.pins.append({"number": number, "state": "closed", "merged_at": merged_at,
+                          "merge_commit_sha": "f" * 40, "head": {"ref": "pin"}})
+        patch = ("@@ -4,3 +4,3 @@ images:\n"
+                 "-  # Published from %s #98, merge %s, build run 1.\n"
+                 "+  # Published from %s #99, merge %s, build run 2.\n"
+                 "   - name: registry.example/example-repo\n"
+                 % (name, "a" * 10, name, revision[:10]))
+        self.files[number] = [{"filename": "deploy/kustomization.yaml", "patch": patch}]
+
+    def transport(self, method, url, headers, body):
+        parts = urlsplit(url)
+        path = parts.path
+        if path.startswith("/repos/%s/" % DEPLOY):
+            self.reads.append(path)
+            if path == "/repos/%s/pulls" % DEPLOY:
+                return reply(200, self.pins)
+            files = re.match(r"/repos/%s/pulls/(\d+)/files$" % DEPLOY, path)
+            if files:
+                return reply(200, self.files.get(int(files.group(1)), []))
+            raise AssertionError("unexpected call %s %s" % (method, url))
+        commit = re.match(r"/repos/%s/commits/([0-9a-f]+)$" % REPO, path)
+        if commit:
+            if PUBLISHED.startswith(commit.group(1)):
+                return reply(200, {"sha": PUBLISHED})
+            return reply(404, {"message": "Not Found"})
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO, path)
+        if compare:
+            base, head = compare.groups()
+            status = "ahead" if head == PUBLISHED and base in self.carried else "diverged"
+            return reply(200, {"status": "identical" if base == head else status})
+        return self.fake(method, url, headers, body)
+
+    def ship(self, now=PIN_MERGED_AT + 600):
+        gh = GitHub("token", transport=self.transport)
+        station.Station(gh, self.settings, now=now).ship_pins()
+
+    def test_a_merged_pin_ships_the_tickets_its_source_revision_carries(self):
+        self.merged(12, 99)
+        self.merged(13, 100, carried=False)
+        self.pin()
+        with mock.patch("bus.station._say") as say:
+            self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertIn("loom:merged", self.fake.names(13))
+        self.assertNotIn("loom:shipped", self.fake.names(13))
+        self.assertEqual(self.fake.comments[13], [])
+        say.assert_called_once_with("shipped %s#12: pin %s#7 carries #99" % (REPO, DEPLOY))
+
+    def test_the_note_names_the_pin_pull_request_the_revision_and_the_merge_time(self):
+        self.merged(12, 99)
+        self.pin()
+        self.ship()
+        note = self.fake.comments[12][-1]["body"]
+        self.assertIn("%s#7" % DEPLOY, note)
+        self.assertIn(PUBLISHED[:12], note)
+        self.assertIn("2030-01-03 12:00:00Z", note)
+        self.assertIn("#99", note)
+
+    def test_a_ticket_a_carried_revert_undid_stays_merged(self):
+        self.merged(12, 99)
+        self.revert(101, of=99, title="Fix the thing")
+        self.merged(14, 102, title="Fix another thing")
+        self.revert(103, of=102, title="Fix another thing", carried=False)
+        self.pin()
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+        # A revert the published revision does not carry undoes nothing yet.
+        self.assertIn("loom:shipped", self.fake.names(14))
+
+    def test_a_revert_named_only_by_its_title_also_holds_the_ticket(self):
+        self.merged(12, 99, title="Fix the thing")
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T06:00:00Z",
+                                "merge_commit_sha": "%040x" % 101,
+                                "title": 'Revert "Fix the thing"', "body": "",
+                                "head": {"ref": "undo"}})
+        self.carried.add("%040x" % 101)
+        self.pin()
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_merged_pull_request_that_publishes_nothing_moves_nothing(self):
+        self.merged(12, 99)
+        self.pins.append({"number": 8, "state": "closed", "merged_at": PIN_MERGED})
+        self.files[8] = [{"filename": "README.md", "patch": "+# Published notes\n"}]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_an_unwatched_source_or_unknown_commit_moves_nothing(self):
+        self.merged(12, 99)
+        self.pin(number=7, name="other-repo")
+        self.pin(number=8, revision="0" * 40)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_an_old_or_unmerged_pull_request_is_never_read(self):
+        self.merged(12, 99)
+        self.pin(number=7, merged_at="2029-12-01T00:00:00Z")
+        self.pins.append({"number": 8, "state": "closed", "merged_at": None})
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.reads, ["/repos/%s/pulls" % DEPLOY])
+
+    def test_a_settled_pin_is_read_once_and_a_fresh_one_until_it_settles(self):
+        self.merged(12, 99)
+        self.pin()
+        files = "/repos/%s/pulls/7/files" % DEPLOY
+        self.ship(now=PIN_MERGED_AT + 600)
+        self.assertIn("loom:shipped", self.fake.names(12))
+        # Within the settle time a ticket reconciled late still ships.
+        self.merged(13, 100)
+        self.ship(now=PIN_MERGED_AT + 1200)
+        self.assertIn("loom:shipped", self.fake.names(13))
+        self.ship(now=PIN_MERGED_AT + station.PIN_SHIP_SETTLE + 1)
+        self.ship(now=PIN_MERGED_AT + station.PIN_SHIP_SETTLE + 60)
+        self.assertEqual(self.reads.count(files), 3)
+
+    def test_at_most_twenty_move_a_pass_and_the_pin_is_read_again(self):
+        for n in range(22):
+            self.merged(100 + n, 500 + n, merged_at="2030-01-02T00:%02d:00Z" % n)
+        self.pin()
+        self.ship(now=PIN_MERGED_AT + 2 * station.PIN_SHIP_SETTLE)
+        left = [n for n in range(100, 122) if "loom:merged" in self.fake.names(n)]
+        self.assertEqual(left, [120, 121])
+        self.ship(now=PIN_MERGED_AT + 2 * station.PIN_SHIP_SETTLE + 60)
+        self.assertTrue(all("loom:shipped" in self.fake.names(n) for n in range(100, 122)))
+
+    def test_without_deployment_repos_nothing_is_read(self):
+        self.settings.pin_ship_repos = []
+        self.merged(12, 99)
+        self.pin()
+        self.ship()
+        self.assertEqual(self.reads, [])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_pass_ships_merged_pins(self):
+        self.merged(12, 99)
+        self.pin()
+        gh = GitHub("token", transport=self.transport)
+        self.assertEqual(station.run(self.settings, gh, now=PIN_MERGED_AT + 600), 0)
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_deployment_repos_come_from_the_environment(self):
+        env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
+               "LOOM_PIN_SHIP_REPOS": DEPLOY + " example-owner/second"}
+        self.assertEqual(station.Settings.from_env(env).pin_ship_repos,
+                         [DEPLOY, "example-owner/second"])
+
+    def test_the_published_from_line_is_read_from_added_lines_only(self):
+        patch = ("-  # Published from example-repo #1, merge 1111111111, build run 1.\n"
+                 "+  # Published from example-repo #857 and #858, merge 67151ececc, build run 3.\n"
+                 "+# Published from example-owner/example-repo, merge abcdef1234.\n")
+        self.assertEqual([m.groups() for m in station.PUBLISHED_RE.finditer(patch)],
+                         [("example-repo", "67151ececc"),
+                          ("example-owner/example-repo", "abcdef1234")])
 
 
 class BudgetTest(Base):
@@ -969,6 +1192,66 @@ class TicketsTest(unittest.TestCase):
             "# T12: Fix the thing\n\n"
             "## Why\nBecause.\n\n## What\nDo it.\nBase is fine\n"))
 
+    def test_contractless_brief_lists_pr_workflow_commands_and_contract_brief_does_not(self):
+        issue = {"number": 12, "title": "Fix the thing", "body": BODY}
+        checks = [(".github/workflows/test.yml, step Lint", "ruff check ."),
+                  (".github/workflows/test.yml, step Tests", "python -m unittest")]
+        text = tickets.render_brief(REPO, issue, "codex", ci_checks=checks,
+                                    has_contract=False)
+        self.assertIn("## Checks CI runs", text)
+        self.assertIn("`ruff check .` (from .github/workflows/test.yml, step Lint)", text)
+        self.assertIn("`python -m unittest` (from .github/workflows/test.yml, step Tests)", text)
+        contracted = tickets.render_brief(REPO, issue, "codex", ci_checks=checks,
+                                          has_contract=True)
+        self.assertNotIn("Checks CI runs", contracted)
+
+
+class ValidationContractTest(Base):
+    def test_reads_run_lines_only_from_pull_request_workflows(self):
+        worker = station.Station(GitHub("token", transport=self.fake), self.settings)
+        contents = {
+            "/repos/%s/contents/.loom/validation.conf" % REPO: None,
+            "/repos/%s/contents/.github/workflows" % REPO: [
+                {"path": ".github/workflows/test.yml"},
+                {"path": ".github/workflows/nightly.yml"}],
+            "/repos/%s/contents/.github/workflows/test.yml" % REPO:
+                "name: Test\non:\n  pull_request:\njobs:\n  test:\n    steps:\n"
+                "      - name: Unit tests\n        run: python -m unittest\n",
+            "/repos/%s/contents/.github/workflows/nightly.yml" % REPO:
+                "name: Nightly\non:\n  schedule:\n    - cron: '0 0 * * *'\njobs:\n"
+                "  test:\n    steps:\n      - run: ignored\n",
+        }
+        def response(method, path, **kwargs):
+            data = contents[path]
+            if isinstance(data, str):
+                data = {"content": base64.b64encode(data.encode()).decode()}
+            return type("Response", (), {"data": data})()
+        worker.gh.rest = mock.Mock(side_effect=response)
+        has_contract, checks = worker._validation_checks(REPO)
+        self.assertFalse(has_contract)
+        self.assertEqual(checks, [(".github/workflows/test.yml, step Unit tests",
+                                  "python -m unittest")])
+
+    def test_missing_contract_files_one_ticket_and_skips_an_open_duplicate(self):
+        goal = {"number": 2, "title": "Backlog: reusable repository work"}
+        self.gh = GitHub("token", transport=self.fake)
+        worker = station.Station(self.gh, self.settings)
+        worker._goals = [(REPO, goal)]
+        worker._contents_text = mock.Mock(return_value=None)
+        worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": []})())
+        with mock.patch.object(brain, "brief") as file_ticket:
+            worker.file_validation_contracts()
+        self.assertEqual(file_ticket.call_count, 1)
+        self.assertEqual(file_ticket.call_args.args[2], 2)
+        self.assertIn(".loom/validation.conf", file_ticket.call_args.args[4])
+
+        worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": [
+            {"number": 3, "title": "Add the repository validation contract"}
+        ]})())
+        with mock.patch.object(brain, "brief") as file_ticket:
+            worker.file_validation_contracts()
+        file_ticket.assert_not_called()
+
 
 class TrustTest(unittest.TestCase):
     def setUp(self):
@@ -1215,7 +1498,7 @@ class ClaimTest(Base):
         # sends no ETag for it), then the briefed list's 304; with no loom:pr
         # ticket no pull request list is read.
         self.assertEqual(len(self.fake.calls), first + 3)
-        self.assertEqual(gh.requests, 3)
+        self.assertEqual(gh.requests, 4)
         self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
@@ -1587,10 +1870,10 @@ class RetryTest(Base):
         self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
 
     def test_a_ticket_body_that_does_not_parse_is_not_retried(self):
-        # Model: given twice, so no lane's eligibility can be judged.
+        # Model: given twice with two values, so no lane's eligibility can be judged.
         self.heartbeat("anthropic")
         self.failed(body=BODY)
-        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-sonnet-5-5\n\nWork."
+        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-opus-5-5\n\nWork."
         self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
         self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
@@ -1672,6 +1955,66 @@ class RetryTest(Base):
         self.assertEqual(self.bodies()[-1],
                          "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
         self.assertEqual(self.listing("codex-2"), [])
+
+    def test_three_recent_attempts_with_no_earlier_failure_flag_the_ticket(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane, "created_at": at, "user": {"login": "alice-example"}}
+            for lane in ("codex", "codex-2", "codex")]
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        table = self.bodies()[-1]
+        self.assertIn("Runaway: three attempts within six hours.", table)
+        self.assertEqual(table.count("\n| %s |" % at), 3)
+        self.assertIn("| codex-2 | model-x | - |", table)
+        self.assertIn("| codex | model-x | [work] agent made no commit", table)
+
+    def test_the_same_failure_reason_twice_in_a_row_flags_the_ticket(self):
+        reason = "[work] could not commit the agent's changes"
+        self.failed(body=BODY, reason=reason)
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 3600))
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Lane codex failed: " + reason, "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": now, "user": {"login": "alice-example"}}]
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        table = self.bodies()[-1]
+        self.assertIn("Runaway: repeated failure reason.", table)
+        self.assertIn("| %s | codex | model-x | %s |" % (old, reason), table)
+        self.assertIn("| %s | codex-2 | model-x | %s |" % (now, reason), table)
+
+    def test_a_strangers_comments_do_not_flag_the_ticket(self):
+        reason = "[work] could not commit the agent's changes"
+        self.failed(body=BODY, reason=reason)
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 3600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": old},
+            {"body": "Lane codex failed: " + reason, "created_at": old},
+            {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": old}]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_a_different_failure_reason_does_not_flag_the_ticket(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 8 * 3600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Lane codex failed: [work] could not commit the agent's changes", "created_at": old, "user": {"login": "alice-example"}},
+            {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": old, "user": {"login": "alice-example"}}]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_a_runaway_ticket_is_not_claimed(self):
+        self.fake.add(12)
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(self.fake.comments[12], [])
+        self.assertNotIn("loom:running", self.fake.names(12))
 
     def test_a_reason_without_a_class_is_a_work_failure(self):
         self.heartbeat("codex-2")
@@ -1871,6 +2214,48 @@ class AnswerTest(Base):
         self.thread()
         self.finish({"PRRT_abcd1": "Fixes #12 already."})
         self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def answered(self, answers, title="Settle the review findings left from PR #99"):
+        """A run with no pull request that the runner reported answered."""
+        body = BODY.replace("Model: model-x", "Model: claude-opus-5-5")
+        self.fake.add(12, title=title, state="answered", body=body)
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex"))
+        for tid, text in answers.items():
+            self.write(self.inbox("codex", "answers", name, tid + ".md"), text)
+        self.write(os.path.join(self.home, "logs", "codex", name + ".answered"), "")
+        self.run_pass()
+        return name
+
+    def test_an_answered_runs_thread_answers_go_on_the_pull_request_the_ticket_names(self):
+        self.thread()
+        name = self.answered({"PRRT_abcd1": "The finding no longer holds: a.py:2 guards it."})
+        self.assertEqual([t for t, _ in self.fake.replies], ["PRRT_abcd1"])
+        self.assertIn("> The finding no longer holds", self.fake.replies[0][1])
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+        # The runner already labelled and commented; no pull request is looked for.
+        self.assertIn("loom:answered", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+        self.assertFalse(any("/pulls?head=" in path for path in self.fake.paths("GET")))
+
+    def test_an_answered_line_the_agent_printed_in_the_log_is_not_an_answer(self):
+        self.fake.add(12, state="running")
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex"))
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                   "[2030-01-01T00:01:00Z] %s done, answered: nothing to change\n" % name)
+        self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
+        self.run_pass()
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_an_answered_run_answers_no_thread_on_a_pull_request_it_does_not_name(self):
+        self.thread(pr=98)
+        name = self.answered({"PRRT_abcd1": "Does not apply."})
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+        self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
 
 
 class RefusalTest(Base):

@@ -44,6 +44,7 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 REPORT_EVERY = 2 * 3600
 REPORT_GRACE = 30 * 60
 TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
+RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
@@ -304,6 +305,13 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
     return lines
 
 
+def runaway_lines(tickets: List[Dict[str, Any]]) -> List[str]:
+    """List held runaway tickets for immediate brain review."""
+    rows = [i for i in tickets if RUNAWAY in _labels(i)]
+    return ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
+                                      for i in rows] or ["- none"])
+
+
 HELD_HEADING = "### Held tickets"
 
 
@@ -403,6 +411,18 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
 
 def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
+
+
+def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
+                    node: Optional[Dict[str, Any]], bot: str, check: str) -> str:
+    line = _pr_line(pr, node, bot)
+    if not line.endswith(" - READY") or change_class.class_of(pr) != "sensitive":
+        return line
+    sha = str((pr.get("head") or {}).get("sha") or "")
+    if sha and _review_check_passed(gh, repo, sha, check):
+        return line
+    return (line.removesuffix("READY")
+            + "blocked: review check has not passed on the head commit")
 
 
 def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
@@ -508,12 +528,12 @@ def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optiona
 
 def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                         data: Dict[str, Any], bot: str,
-                        authors: Sequence[str] = ()) -> List[str]:
+                        authors: Sequence[str] = (), check: str = "Grug - Elder") -> List[str]:
     """The pull request lines for status: heading, merge readiness for each
     loom pull request, and the pending brain fix mark when one waits."""
     lines = ["### Pull requests"]
     for pr in prs:
-        line = _pr_line(pr, data["prs"].get(int(pr["number"])), bot)
+        line = _status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
         try:
             ticket = _ticket_association(repo, pr)
         except ValueError:
@@ -536,7 +556,8 @@ def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
 
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
-                  into: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> List[str]:
+                  into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+                  check: str = "Grug - Elder") -> List[str]:
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section."""
     issues = _issues(gh, repo)
@@ -561,13 +582,15 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors, gh, repo) + [""]
+    lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
-    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or ())
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check)
     lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
-    lines += [_pr_line(pr, data["prs"].get(int(pr["number"])), bot) for pr in adoptable]
+    lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
+              for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
     lines += ["", INVARIANTS_HEADING]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
@@ -662,7 +685,12 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     found: Dict[str, List[Dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
-            lambda repo: _repo_section(gh, repo, now, bot, authors, found), repos))
+            lambda repo: _repo_section(gh, repo, now, bot, authors, found,
+                                       review_check_name(env)), repos))
+    runaway = [(repo, issue) for repo, items in found.items() for issue in items
+               if RUNAWAY in _labels(issue)]
+    out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
+        repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
     out += [""] + _health_lines(env)
     for section in sections:
@@ -793,10 +821,9 @@ def _with_part_of(body: str, goal: int) -> str:
     return body.rstrip("\n") + "\n\n" + part_of_line(goal) + "\n"
 
 
-def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """loom:ticket issues in the repo whose body has a Part of #goal line
-    (search, then the label and the exact line checked here: the search
-    also matches loose words)."""
+def _part_of_hits(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo that the Part of #goal search finds
+    (the search also matches loose words, so the line is not yet checked)."""
     q = quote('repo:%s is:issue label:loom:ticket in:body "%s"' % (repo, part_of_line(goal)))
     url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
     found: List[Dict[str, Any]] = []
@@ -811,10 +838,32 @@ def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
         # someone who may write.
         found.extend(item for item in data.get("items") or []
                      if isinstance(item, dict) and "pull_request" not in item
-                     and "loom:ticket" in _labels(item)
-                     and _names_goal(item.get("body"), goal))
+                     and "loom:ticket" in _labels(item))
         url = _next_link(resp.headers.get("link", ""))
     return found
+
+
+def _part_of_issues(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues in the repo whose body has a Part of #goal line."""
+    return [i for i in _part_of_hits(gh, repo, goal) if _names_goal(i.get("body"), goal)]
+
+
+def _mentions_goal(body: Any, goal: int) -> bool:
+    """Part of #goal anywhere in the body, inside a sentence too."""
+    return bool(re.search(r"\bPart of #%d(?!\d)" % goal, str(body or ""), re.I))
+
+
+def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
+    return str(issue.get("parent_issue_url") or "").endswith("/repos/%s/issues/%d" % (repo, goal))
+
+
+def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+    """loom:ticket issues that say Part of #goal but are neither its sub-issues
+    nor carry the line on a line of its own, so goal_children does not count
+    them as the goal's. Search hits that only match loose words are left out."""
+    return [i for i in _part_of_hits(gh, repo, goal)
+            if _mentions_goal(i.get("body"), goal) and not _names_goal(i.get("body"), goal)
+            and not _sub_issue_of(i, repo, goal)]
 
 
 def _goal_children(gh: GitHub, repo: str, goal: int,
@@ -844,15 +893,16 @@ def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
 
 
 def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any]) -> bool:
-    """Add the issue as a sub-issue of the goal. False when GitHub refuses it
-    (422, for example a goal already at its 100 sub-issue limit): the Part of
-    line is then the only link, which goal_children reads."""
+    """Add the issue as a sub-issue of the goal, best effort. False when GitHub
+    refuses it (for example a goal already at its 100 sub-issue limit): the
+    refusal is logged and the Part of line is then the only link, which
+    goal_children reads."""
     try:
         gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (repo, goal),
                 {"sub_issue_id": issue["id"]})
     except GitHubError as exc:
-        if exc.status != 422:
-            raise
+        print("#%s: GitHub refused the sub-issue link to goal #%d (%s)"
+              % (issue.get("number"), goal, exc), file=sys.stderr)
         return False
     return True
 
@@ -1041,6 +1091,25 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
     return str(made.get("html_url", ""))
 
 
+DIFFICULTIES = ("easy", "medium", "hard")
+
+
+def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional[str]) -> None:
+    """A brief the station must place needs a difficulty tier. Without one the
+    ticket gets no lane and waits for a brain to notice (2026-10-16: five
+    factory tickets briefed without --difficulty sat queued up to 17 hours).
+    A brief with --lane is claimed by that lane, so it needs none."""
+    if lane or difficulty:
+        return
+    try:
+        found = tickets.parse(body)[0].get("Difficulty", "")
+    except ValueError:
+        found = ""
+    if not found:
+        raise ValueError("a brief without --lane needs --difficulty easy, medium or hard "
+                         "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
+
+
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None) -> str:
@@ -1078,7 +1147,8 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
           model: Optional[str] = None, base: Optional[str] = None,
           not_before: Optional[str] = None, refs: Optional[int] = None,
           regresses: Optional[int] = None, after: Optional[str] = None,
-          priority: Optional[str] = None) -> str:
+          priority: Optional[str] = None, holder: Optional[str] = None,
+          env: Optional[Dict[str, str]] = None) -> str:
     """File a ticket under the goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Rewritten from issue M." in words, and the
     original gets a comment naming the ticket and loom:rewritten in place of
@@ -1103,6 +1173,10 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
 
     With priority (P0 to P3), the ticket carries a "Priority:" line; lanes
     take P0 first and a ticket without one counts as P2.
+
+    With holder, a brief filed while the goal's brief stage stands deferred
+    records its own done marker: a journal on the goal home with the line
+    from handoff.done_marker, so resume stops listing the finished brief.
 
     When the goal home names a Trunk branch and no explicit --base is given,
     the ticket uses that branch as its base."""
@@ -1133,6 +1207,7 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
     children = _goal_children(gh, repo, goal, goal_issue)
     _check_goal_capacity(children, goal)
     _check_goal_unproven(children, goal)
+    done = _brief_done_due(gh, repo, goal, holder, env)
     issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
@@ -1141,7 +1216,36 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         _remove_label(gh, repo, refs, "loom:triage")
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
-    return str(issue.get("html_url", ""))
+    url = str(issue.get("html_url", ""))
+    if done:
+        _journal_brief_done(gh, repo, goal, str(holder), done, url)
+    return url
+
+
+def _brief_done_due(gh: GitHub, repo: str, goal: int, holder: Optional[str],
+                    env: Optional[Dict[str, str]]) -> Optional[str]:
+    """The brief done line for the goal when its brief stage stands deferred
+    on the goal home (the newest brief marker for it is a defer), else None.
+    Read before the ticket is filed, so a refused brief records nothing."""
+    if holder is None:
+        return None
+    line = handoff.done_marker("brief", (repo, goal), holder)
+    found = _goal_home_journals(gh, repo, goal, trusted_authors(env))
+    standing = handoff.resume_items(handoff.marks(found))
+    return line if any(m.stage == "brief" and m.item == (repo, goal) for m in standing) else None
+
+
+def _journal_brief_done(gh: GitHub, repo: str, goal: int, holder: str, line: str,
+                        url: str) -> None:
+    """Post the brief's done line in a journal on the goal home. The ticket is
+    filed by then, so a failed post says which one and the line to journal."""
+    body = "\n".join([JOURNAL_MARKER, "Tick %s, %s" % (_iso(datetime.now(timezone.utc)), holder),
+                      "- Briefed: %s" % url, line])
+    try:
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, goal), {"body": body})
+    except GitHubError as exc:
+        raise GitHubError("filed %s, but its brief done marker was not posted (%s); put this "
+                          "line in your journal: %s" % (url, exc, line), exc.status, exc.body) from exc
 
 
 def _open_issue(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
@@ -1440,17 +1544,22 @@ def _with_model(body: str, model: str) -> str:
 
 def _with_priority(body: str, priority: str) -> str:
     """Set Priority in the leading headers without changing the remaining text."""
+    return _with_header(body, "Priority", priority)
+
+
+def _with_header(body: str, key: str, value: str) -> str:
+    """Set one leading header line without changing the remaining text."""
     lines = body.splitlines(keepends=True)
     header = 0
     while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip("\r\n").rstrip()):
         header += 1
     for index in range(header):
-        if lines[index].startswith("Priority:"):
+        if lines[index].startswith(key + ":"):
             ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
-            lines[index] = "Priority: " + priority + ending
+            lines[index] = "%s: %s%s" % (key, value, ending)
             return "".join(lines)
     newline = "\r\n" if "\r\n" in body else "\n"
-    lines.insert(header, "Priority: " + priority + newline)
+    lines.insert(header, "%s: %s%s" % (key, value, newline))
     if header == 0 and body and not body.startswith(("\n", "\r")):
         lines.insert(1, newline)
     return "".join(lines)
@@ -1466,18 +1575,28 @@ def _prioritize_write(gh: GitHub, repo: str, number: int, method: str,
                           exc.status, exc.body) from exc
 
 
-def _prioritize_body(issue: Dict[str, Any], priority: str,
-                     env: Optional[Dict[str, str]]) -> str:
+def _prioritize_body(issue: Dict[str, Any], priority: Optional[str],
+                     env: Optional[Dict[str, str]],
+                     difficulty: Optional[str] = None) -> str:
     """Validate that the issue is an open ticket by a trusted author."""
     if issue.get("state") != "open":
         raise ValueError("cannot prioritize a closed issue")
     if "loom:ticket" not in _labels(issue):
         raise ValueError("only a loom:ticket can be prioritized")
     authors = {author.lower() for author in trusted_authors(env)}
+    if not authors:
+        # A brain without the setting refused every ticket as untrusted and
+        # could not tell why (a remote brain, 2026-10-16).
+        raise ValueError("LOOM_BRIEF_AUTHORS is empty: set it to the login(s) that brief "
+                         "tickets (docs/MUSE.md)")
     login = str((issue.get("user") or {}).get("login") or "").lower()
     if not login or login not in authors:
         raise ValueError("ticket author is not a trusted login")
-    updated = _with_priority(str(issue.get("body") or ""), priority)
+    updated = str(issue.get("body") or "")
+    if priority is not None:
+        updated = _with_priority(updated, priority)
+    if difficulty is not None:
+        updated = _with_header(updated, "Difficulty", difficulty)
     _check_written_text(updated)
     return updated
 
@@ -1493,19 +1612,27 @@ def _write_priority(gh: GitHub, repo: str, number: int, body: str,
                           {"body": note}, "note comment")
 
 
-def prioritize(gh: GitHub, repo: str, number: int, priority: str,
+def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                note: Optional[str] = None,
-               env: Optional[Dict[str, str]] = None) -> None:
-    """Rank an open ticket, requiring its author to be trusted."""
-    if priority not in tickets.PRIORITIES:
+               env: Optional[Dict[str, str]] = None,
+               difficulty: Optional[str] = None) -> None:
+    """Rank an open ticket, or set its Difficulty, requiring its author to be
+    trusted. A queued ticket with no Difficulty line gets no lane, and before
+    this a brain could only fix one by hand-editing the body (2026-10-16: five
+    factory tickets sat queued up to 17 hours)."""
+    if priority is None and difficulty is None:
+        raise ValueError("give a priority, a difficulty, or both")
+    if priority is not None and priority not in tickets.PRIORITIES:
         raise ValueError("priority must be one of %s" % ", ".join(tickets.PRIORITIES))
+    if difficulty is not None and difficulty not in DIFFICULTIES:
+        raise ValueError("difficulty must be one of %s" % ", ".join(DIFFICULTIES))
     if note is not None:
         _check_written_text(note)
         if "\n" in note or "\r" in note:
             raise ValueError("priority note must be one line")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     body = str(issue.get("body") or "")
-    updated = _prioritize_body(issue, priority, env)
+    updated = _prioritize_body(issue, priority, env, difficulty)
     if updated != body:
         _write_priority(gh, repo, number, updated, note)
     elif note is not None:
@@ -1825,9 +1952,10 @@ def _ticketless(repo: str, pr: Dict[str, Any]) -> bool:
         return False
 
 
-def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str) -> bool:
-    """The named review check ran and passed on this head commit. The
-    operator's rule is that every change is reviewed before it lands, and a
+def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str,
+                         allow_neutral: bool = False) -> bool:
+    """The named review check completed on this head with an allowed conclusion.
+    The operator's rule is that every change is reviewed before it lands, and a
     green rollup alone does not prove the review check ever ran. Every page:
     a commit in a repo with a CI matrix has more runs than one page holds."""
     try:
@@ -1839,10 +1967,11 @@ def _review_check_passed(gh: GitHub, repo: str, sha: str, check: str) -> bool:
             runs = data["check_runs"]
             for run in runs:
                 if not isinstance(run, dict):
-                    return False
+                    continue
                 if run.get("name") == check:
+                    conclusions = ("success", "neutral") if allow_neutral else ("success",)
                     return (run.get("status") == "completed"
-                            and run.get("conclusion") == "success")
+                            and run.get("conclusion") in conclusions)
             if len(runs) < 100:
                 return False
     except GitHubError:
@@ -1872,7 +2001,9 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
     for ok, reason in rules:
         if not ok:
             raise ValueError(reason)
-    if not sha or not _review_check_passed(gh, repo, sha, review_check_name(env)):
+    if not sha or not _review_check_passed(
+            gh, repo, sha, review_check_name(env),
+            allow_neutral=change_class.class_of(pr) != "sensitive"):
         raise ValueError("the review check has not passed on the head commit")
 
 
@@ -2349,22 +2480,39 @@ def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
         for issue in _issues(gh, repo):
             if "loom:goal" not in _labels(issue):
                 continue
-            comments = gh.paginate("/repos/%s/issues/%s/comments" % (repo, issue["number"]))
-            goals.append((repo, issue, handoff.journals(
-                [{"body": c.get("body"), "at": c.get("created_at"),
-                  "login": (c.get("user") or {}).get("login")} for c in comments], authors)))
+            goals.append((repo, issue, _goal_home_journals(gh, repo, int(issue["number"]),
+                                                           authors)))
     return goals
 
 
+def _goal_home_journals(gh: GitHub, repo: str, number: int,
+                        authors: Sequence[str]) -> List[Dict[str, Any]]:
+    """The journals on one goal home from `authors`, oldest first."""
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    return handoff.journals(
+        [{"body": c.get("body"), "at": c.get("created_at"),
+          "login": (c.get("user") or {}).get("login")} for c in comments], authors)
+
+
 def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
-                       found: List[Dict[str, Any]]) -> List[str]:
+                       found: List[Dict[str, Any]],
+                       latest: Optional[Dict[Tuple[str, Tuple[str, int]], handoff.Mark]] = None
+                       ) -> List[str]:
     found_marks = handoff.marks(found)
     items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
+    latest = latest or {(m.stage, m.item): m for m in found_marks}
     current = {m.item: item_revision(gh, *m.item) for m in items}
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
     for m in items:
+        newest = latest[(m.stage, m.item)]
+        if newest.kind == "defer" and newest != m:
+            continue
+        if newest.kind == "done":
+            out.append("- dropped %s %s: finished or closed since the defer" % (
+                m.stage, handoff.item_ref(m.item)))
+            continue
         if m in alive:
             item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
             out.append("- resume %s %s (deferred by %s at %s)" % (
@@ -2472,11 +2620,17 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     now = now or datetime.now(timezone.utc)
     _lock_holder(gh, lock_repo, holder, now)
     goals = _goal_journals(gh, repos, trusted_authors(env))
+    latest: Dict[Tuple[str, Tuple[str, int]], handoff.Mark] = {}
+    for _, _, found in goals:
+        for mark in handoff.marks(found):
+            key = (mark.stage, mark.item)
+            if key not in latest or mark.at >= latest[key].at:
+                latest[key] = mark
     out = ["# Resume for %s" % holder, "",
            _freshness_line(handoff.peer_journals(
                [j for _, _, found in goals for j in found], holder, now))]
     for repo, issue, found in goals:
-        out += _goal_resume_lines(gh, repo, issue, found)
+        out += _goal_resume_lines(gh, repo, issue, found, latest)
     return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
                       + _verify_resume_lines(gh, repos, now)
                       + _audit_resume_lines(gh, repos, now, env))
@@ -2651,16 +2805,19 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
     tried = _tried_models(_first_model(issue, bodies), bodies)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
-    return History(failed, fixes, tried, reasons, _lowest_untried(tried),
-                   _trusted_rungs(comments, authors), held)
+    rungs = _trusted_rungs(comments, authors or trusted_authors())
+    return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
+                   rungs, held)
 
 
 def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
     return [at for body, at in bodies if at is not None and _CLAIM.fullmatch(body.strip())]
 
 
-def _lowest_untried(tried: List[str]) -> Optional[int]:
-    untried = [i for i, (_, model) in enumerate(ESCALATION) if model not in tried]
+def _lowest_untried(tried: List[str], rungs: Optional[set] = None) -> Optional[int]:
+    highest_reached = max(rungs or {0})
+    untried = [i for i, (_, model) in enumerate(ESCALATION)
+               if i + 1 > highest_reached and model not in tried]
     return untried[0] if untried else None
 
 
@@ -2724,13 +2881,33 @@ def _waiting_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> List[tickets.A
     return tickets.after_holds(repo, headers, lookup)[0]
 
 
+def _nothing_to_fix(gh: GitHub, repo: str, pr: int) -> Optional[str]:
+    """The finished state of an open pull request, or None while it still has
+    something to fix: its head is green, the review check passed on that
+    head, no review thread is open and it does not conflict. Fix rounds alone
+    escalated such a pull request on 2026-10-16, and a fourth run of the same
+    model changed nothing before the brain merged the head it already had."""
+    details = _pr_graphql(gh, repo, pr)
+    sha = str(details.get("headRefOid") or "")
+    check = review_check_name()
+    if (not sha or details.get("mergeable") == "CONFLICTING" or not _checks_green(details)
+            or not _threads_resolved(details) or not _review_check_passed(gh, repo, sha, check)):
+        return None
+    return ("pull request #%d has nothing to fix (head %s is green, the review check "
+            "%s passed on it, and no review thread is open)" % (pr, sha[:12], check))
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
-    ladder whose lane is available, and return a one-line outcome."""
+    ladder whose lane is available, and return a one-line outcome. A ticket
+    whose open pull request has nothing to fix is refused: fix rounds that
+    already landed a green, reviewed head are not a stuck ticket."""
     _check_written_text(notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
+    if RUNAWAY in names:
+        raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
     held = _waiting_for(gh, repo, issue)
@@ -2743,12 +2920,17 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     history = _history(gh, repo, issue, datetime.now(timezone.utc))
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
+    open_pr = _pr_for_ticket(gh, repo, number)
+    finished = _nothing_to_fix(gh, repo, open_pr) if open_pr is not None else None
+    if finished:
+        raise ValueError("ticket is not escalated: %s; land it instead" % finished)
     if history.rung is None:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                {"labels": sorted(set(names) | {"needs-brain"})})
+                {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
-                "Past the model ladder (tried %s); %s. Needs the brain to rewrite the brief "
-                "smaller or ask the operator." % (", ".join(history.tried), "; ".join(history.reasons))})
+                "Runaway: escalation after every rung was tried. Past the model ladder "
+                "(tried %s); %s. The ticket is held for brain review." % (
+                    ", ".join(history.tried), "; ".join(history.reasons))})
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
     choice = None
@@ -2769,7 +2951,7 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
                          "Rung: %d %s %s" % (rung + 1, model, lane)])
     _check_written_text(comment)
-    pr = _pr_for_ticket(gh, repo, number) if "loom:pr" in names else None
+    pr = open_pr if "loom:pr" in names else None
     if pr is not None:
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:
@@ -2782,11 +2964,11 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom")
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=("easy", "medium", "hard")); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES)
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--goal", type=int, required=True); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder")
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
-    pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES, required=True); pr.add_argument("--note")
+    pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
@@ -2821,9 +3003,11 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
-    print(brief(gh, _repo(args.repo), args.goal, args.title, _read(args.file),
+    body = _read(args.file)
+    _check_brief_difficulty(body, args.lane, args.difficulty)
+    print(brief(gh, _repo(args.repo), args.goal, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
-                args.regresses, args.after, args.priority))
+                args.regresses, args.after, args.priority, args.holder))
 
 
 def _cmd_triage(gh: GitHub, args: argparse.Namespace) -> None:
@@ -2844,7 +3028,7 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
-    prioritize(gh, repo, number, args.priority, args.note)
+    prioritize(gh, repo, number, args.priority, args.note, difficulty=args.difficulty)
 
 
 def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:

@@ -415,17 +415,28 @@ class PullRequests(Base):
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.moved, [(5, "failed", None)])
 
-    def test_a_rung_skipped_while_busy_is_still_tried_later(self):
-        # Spilled straight to rung 3 while rungs 1 and 2 were busy: stuck
-        # again, it goes to rung 1, not past the end of the ladder.
+    def test_a_move_to_a_lower_rung_than_one_reached_flags_the_ticket_runaway(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 3, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
-        self.assertEqual(self.moved, [])
-        self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
-        self.assertEqual(factory.tried_rungs(self.gh.comments[5]), {3})  # rung 1 is not claimed yet
+        self.assertEqual((self.fixed, self.moved), ([], []))
+        self.assertIn("loom:runaway", [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertEqual(self.model(5), None)
+        note = self.gh.comments[5][-1]["body"]
+        self.assertIn("Runaway: ladder move from rung 3 down to rung 1.", note)
+        self.assertIn("| Time | Lane | Model | Reason |", note)
+        self.assertNotIn("loom:rung", note)
+
+    def test_a_runaway_ticket_is_not_climbed_or_given_up_on(self):
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.issues[5]["labels"].append({"name": "loom:runaway"})
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual((self.fixed, self.moved), ([], []))
+        self.assertEqual(len(self.gh.comments[5]), len(ALL_RUNGS) + 1)
 
     def test_a_ticket_that_failed_on_a_ladder_model_does_not_get_it_again(self):
         self.gh.ticket(6, "failed", lane="claude",
@@ -1034,7 +1045,9 @@ class Queued(Base):
                                     "(tier medium, fallback: no medium lane is up)" % REPO)
         self.queued(8)
         self.assign(limited=factory.TIERS["medium"])
-        self.assertEqual(self.lane(8), "spark")
+        # The Sparks are medium lanes too, so the easy fallback is the next
+        # easy lane that is not.
+        self.assertEqual(self.lane(8), "openrouter")
 
 
 class Tickets(Base):
@@ -1063,6 +1076,48 @@ class Tickets(Base):
         self.assertEqual([f[:2] for f in self.fixed], [(60, (REPO, 6))])
         self.assertIn({"name": "loom:pr"}, self.fixed[0][2])
         self.assertNotIn({"name": "loom:failed"}, self.fixed[0][2])
+
+    def no_reason_failure(self, number):
+        return {"body": "Lane zai failed: [work] agent made no commit and wrote no reason "
+                        "on loom/%d-x" % number, "user": ME}
+
+    # Its claim on lane zai, which runs no ladder model: a claim on lane claude
+    # would count rung 1 as tried (factory.ran_rungs).
+    ZAI_CLAIM = {"body": "Claimed for lane zai (body sha256 0123456789ab)", "user": ME}
+
+    def test_a_first_no_reason_no_commit_failure_climbs(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.comments[6] += [self.ZAI_CLAIM, self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude")])
+
+    def test_a_second_no_reason_no_commit_failure_is_held_for_the_brain(self):
+        self.gh.ticket(6, "failed", lane="claude")
+        self.gh.comments[6] += [CLAIM, self.no_reason_failure(6),
+                                {"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertIn({"name": "needs-brain"}, self.gh.issues[6]["labels"])
+        self.assertIn("does not climb", self.gh.comments[6][-1]["body"])
+        self.assertNotIn("loom:rung", self.gh.comments[6][-1]["body"])
+        posted = len(self.gh.comments[6])
+        self.go()  # once: the next pass says nothing more
+        self.assertEqual((self.moved, len(self.gh.comments[6])), ([], posted))
+
+    def test_a_no_reason_failure_after_a_ladder_restart_climbs_again(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.comments[6] += [self.no_reason_failure(6), {"body": factory.RUNG_MARKER % 0, "user": ME},
+                                self.ZAI_CLAIM, self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude")])
+
+    def test_a_stranger_cannot_hold_a_ticket_with_a_no_reason_comment(self):
+        self.gh.ticket(6, "failed", lane="zai")
+        forged = dict(self.no_reason_failure(6), user=STRANGER)
+        self.gh.comments[6] += [forged, self.ZAI_CLAIM, self.no_reason_failure(6)]
+        self.go()
+        self.assertEqual(self.moved, [(6, "briefed", "claude")])
 
     def test_a_failed_ticket_past_the_last_rung_is_left_alone(self):
         self.gh.ticket(6, "failed")
@@ -1175,7 +1230,7 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.model(7), self.model(8)), (None, None))
 
-    def limited_easy(self, busy=(), available=None, limited=("spark", "spark-2")):
+    def limited_easy(self, busy=(), available=None, limited=factory.SPARKS):
         """An easy ticket briefed on spark at a limit (both local coder slots
         by default), with a ticket waiting on each lane in `busy`."""
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
@@ -1209,7 +1264,7 @@ class Tickets(Base):
         self.assertIn("opencode-go-4", factory.PUBLIC_ONLY)
 
     def test_a_private_easy_ticket_goes_to_spark_2_when_spark_is_busy(self):
-        self.assertEqual(factory.lanes_of("easy", True)[:2], ("spark", "spark-2"))
+        self.assertEqual(factory.lanes_of("easy", True)[:4], factory.SPARKS)
         self.gh.private = True
         self.limited_easy(limited=("spark",))
         self.assertEqual(self.lane(7), "spark-2")
@@ -1255,6 +1310,14 @@ class Tickets(Base):
         for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"), 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])
+        # Next come the Sparks, and an anthropic slot only once they are busy.
+        self.assertEqual(self.lane(7), "spark")
+        self.setUp()
+        self.gh.ticket(7, "briefed", lane="codex", body=body)
+        busy = ("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + factory.SPARKS
+        for n, lane in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.go(limited=["codex"])
         self.assertEqual(self.lane(7), "anthropic")
 
     def limited_medium(self, busy=()):
@@ -1278,11 +1341,11 @@ class Tickets(Base):
 
     def test_with_claude_busy_a_medium_ticket_falls_back_to_a_free_easy_lane(self):
         self.limited_medium(busy=("claude",))
-        self.assertEqual(self.lane(7), "spark")
+        self.assertEqual(self.lane(7), "openrouter")
         self.assertIn("fallback: no medium lane is up", self.gh.comments[7][-1]["body"])
 
     def test_a_private_ticket_never_falls_back_to_a_public_only_lane(self):
-        busy = ("claude", "spark", "spark-2", "openrouter", "workersai")
+        busy = ("claude",) + factory.SPARKS + ("openrouter", "workersai")
         self.limited_medium(busy=busy)
         self.assertEqual(self.lane(7), "codex")  # waits; zen, zai and agy are public only
         self.setUp()
@@ -1309,6 +1372,20 @@ class Tickets(Base):
         self.go(limited=["claude"])
         self.assertEqual((self.lane(7), self.model(7)), ("anthropic", "claude-opus-5-5"))
 
+    def test_a_model_agy_lacks_does_not_move_to_agy_at_a_limit(self):
+        self.gh.private = False
+        body = "Model: gpt-6-sol\nDifficulty: easy\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="spark", body=body)
+        self.go(limited=["spark"], available=["agy"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", "gpt-6-sol"))
+
+    def test_a_stalled_ticket_with_a_model_agy_lacks_does_not_move_to_agy(self):
+        self.gh.private = False
+        body = "Model: gpt-6-sol\nDifficulty: easy\n\n## Why\nx\n"
+        self.stalled(7, lane="spark", body=body)
+        self.go(available=["agy"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", "gpt-6-sol"))
+
     def test_a_ticket_on_a_lane_that_is_not_limited_waits_as_before(self):
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
@@ -1327,6 +1404,50 @@ class Tickets(Base):
         self.assertEqual(lanes.count("claude"), factory.RUNG_BUSY)
         moved = [n for n in range(1, 6) if self.lane(n) != "claude"]
         self.assertTrue(all(self.model(n) == "gpt-6-sol" for n in moved))
+
+    def escalated_after_sol(self, number, state):
+        """A ticket whose first attempts ran on gpt-6-sol (its Model: line, two
+        codex claims, no rung marker) and that the brain escalated to rung 1."""
+        self.gh.ticket(number, state, lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        sol_claim = {"body": "Claimed for lane codex (body sha256 0123456789ab)", "user": ME}
+        self.gh.comments[number] += [sol_claim, sol_claim, {
+            "body": "<!-- loom:escalate v1 -->\nEscalated to rung 1 of 3: claude-sonnet-5-5 "
+                    "on lane claude.\nReason: 2 fix rounds (attempts 2, tried gpt-6-sol).\n"
+                    "Rung: 1 claude-sonnet-5-5 claude", "user": ME}]
+
+    def test_a_ticket_that_ran_on_sol_is_never_spread_back_to_sol(self):
+        # 2026-10-16: three attempts on gpt-6-sol with no rung marker, escalated
+        # to rung 1, then spread off the busy claude lane to gpt-6-sol again.
+        for n in range(1, 4):
+            self.gh.ticket(n, "briefed", lane="claude")
+        self.escalated_after_sol(7, "briefed")
+        self.go()
+        self.assertNotIn(self.lane(7), ("codex", "codex-2"))
+        self.assertNotEqual(self.model(7), "gpt-6-sol")
+        self.assertIn((self.lane(7), self.model(7)),
+                      [("claude", "claude-sonnet-5-5")]
+                      + [(lane, "claude-opus-5-5") for lane in factory.ANTHROPIC])
+        self.go(limited=factory.ANTHROPIC)  # rung 3 full: it waits on its rung
+        self.assertNotEqual(self.model(7), "gpt-6-sol")
+
+    def test_a_ticket_that_ran_on_sol_climbs_past_sol_when_it_fails(self):
+        self.escalated_after_sol(7, "failed")
+        self.gh.comments[7].append(CLAIM)  # it ran on rung 1 and failed there
+        self.go()
+        self.assertEqual(self.model(7), "claude-opus-5-5")
+        self.assertIn("rung 3", self.gh.comments[7][-1]["body"])
+
+    def test_ran_models_reads_claims_the_model_line_and_markers(self):
+        sol = {"body": "Claimed for lane codex (body sha256 0123456789ab)"}
+        opus = {"body": "Model: claude-opus-5-5\n\n## Why\nx\n"}
+        self.assertEqual(factory.ran_models(opus, [CLAIM]), {"claude-opus-5-5"})
+        self.assertEqual(factory.ran_rungs({"body": "x"}, [sol, CLAIM]), {1, 2})
+        marked = [sol, {"body": factory.RUNG_MARKER % 3}, CLAIM]
+        self.assertEqual(factory.ran_models(opus, marked), {"gpt-6-sol", "claude-opus-5-5"})
+        # A rung 0 marker starts the ladder again; an unclaimed ticket ran on nothing.
+        self.assertEqual(factory.ran_models(opus, [sol, {"body": factory.RUNG_MARKER % 0}]), set())
+        self.assertEqual(factory.ran_models(opus, []), set())
 
     def test_a_first_brief_is_never_spread(self):
         for n in range(1, 6):

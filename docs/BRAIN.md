@@ -45,9 +45,9 @@ that talks to GitHub about tickets.
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | The station handed it to that lane's runner. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
-| `loom:answered` | The runner posted a diagnosis answer; the brain reviews it, then closes/verifies the ticket or briefs it again. |
+| `loom:answered` | The runner posted a diagnosis answer, or a run's reason that its work is already done or no longer applies; the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
-| `needs-brain` | The automatic fix round limit was reached; review this ticket in full. |
+| `needs-brain` | The automatic fix round limit was reached, or a ticket failed a second time with no commit and no reason; review this ticket in full. |
 | `loom:failed` | The runner gave up and the station did not retry it; the ticket has the reason. The brain re-briefs (new lane or sharper brief) or closes it. |
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
@@ -83,7 +83,26 @@ time, and one log line per move. The pull request is the merged one whose
 `Refs` line or `loom/<number>` branch names the ticket. At most 20 move a
 pass, oldest merge first. A deploy that did not happen records nothing, so it
 ships nothing. Tickets of every other repo are never moved here; their goal
-home's ship rules decide.
+home's ship rules decide, unless they ship through a pin pull request (below).
+
+### Shipping through a pin pull request
+
+A repo that deploys through a pull request in a deployment repo (a digest
+pin whose comment line reads `# Published from <repo> <what shipped>, merge
+<sha>, ...`) ships at that pull request's merge. List each deployment repo in
+`LOOM_PIN_SHIP_REPOS` (space separated `OWNER/NAME`). Each pass, the station
+reads that repo's pull requests merged in the last 7 days; for every
+published-from line one adds, it resolves the named watched repo (`OWNER/NAME`
+as written, else the one watched repo of that name) and merge commit, and
+moves each open `loom:merged` ticket of that repo whose pull request's merge
+commit the published revision carries (the compare API) to `loom:shipped`.
+A ticket whose pull request a later merged pull request reverted (its body
+says `Reverts OWNER/NAME#N`, or its title is `Revert "<title>"`), when the
+revision carries that revert too, stays at `loom:merged`. The note names the
+pin pull request, its merge time and the source revision. The same limit of
+20 moves a pass applies; a pin pull request is read again each pass until all
+it carries has moved and an hour has passed since its merge, so a ticket
+reconciled just after the pin still ships.
 
 Set `LOOM_PIN_TARGETS` in the install environment to a private JSON array of
 `repo`, `path`, `revision_var`, and `sha256_var` objects (see `.env.example`).
@@ -238,7 +257,9 @@ line below, because an automated pass over old issues over-calls work as
 done.
 
 GitHub holds at most 100 sub-issues under one issue and refuses the next one
-(422). A ticket a goal refuses that way, from `brief` or triage, gets a
+(422). The sub-issue link is best effort everywhere: any refusal is logged,
+not raised, and the ticket is still queued. A ticket a goal refuses, from
+`brief` or triage, gets a
 `Part of #N` line at the end of its body instead, and a goal's tickets are
 its sub-issues plus, once it holds 100, the issues whose body has that line
 (one search). The backlog board reads parentage the same way.
@@ -261,22 +282,27 @@ has the endpoint contract and the rules.
 The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
-`lanes/rewrite_agent.sh <key-ssm> <provider/model>` is one: it reads the
-provider key from the SSM parameter `<key-ssm>` and runs `opencode run` on the
-model in the opencode lanes' sandbox (`lanes/agent_sandbox.sh`), with an empty
-scratch home and working directory and every opencode tool denied, and prints
-only the agent's final text. The station runs from the checkout, so for
+`lanes/rewrite_agent.sh <key-ssm|-> <provider/model[,provider/model...]>`
+runs each entry in the shared agent sandbox (`lanes/agent_sandbox.sh`) until
+one returns final text. OpenCode entries read the provider key from SSM and
+deny every tool. `codex/<model>` uses the local Codex subscription login in a
+scratch home with read-only tools; `claude/<model>` uses
+`LOOM_REWRITE_CLAUDE_TOKEN_SSM` from the install environment to read an OAuth
+token at run time, with tools disabled.
+Use `-` instead of `<key-ssm>` for subscription-only lists. All entries get an
+empty working directory, and the command prints only the final text. For
 example:
 
 ```sh
 LOOM_REWRITE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/deepseek-v4.1-flash"
-LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh <key-ssm> opencode-go/kimi-k2.7-code"
+LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/gpt-6-sol,claude/claude-opus-5-5"
 ```
 
 `<key-ssm>` is the parameter the opencode-go lanes read
-(`LOOM_OPENCODE_GO_KEY_SSM`). The private command's model must come from a
-provider that does not train on prompts: never a public-only one (docs/LANES.md,
-"Public repos only"), such as a Muse Spark Contributor model. The prompt
+(`LOOM_OPENCODE_GO_KEY_SSM`). The installer defaults the private command to
+`codex/$LOOM_CODEX_MODEL` when a Codex model is configured. Private commands
+using this wrapper accept only codex, claude, anthropic, or non-contributor
+opencode-go entries. The prompt
 holds the issue (title, body, labels, last 10 comments) and the ticket format
 above. The answer is one of:
 
@@ -430,8 +456,24 @@ When the runner finishes, the station finds the brief in `done/` or
 - Done: for code work, label `loom:pr` and comment with the pull request link;
   for `Deliverable: answer`, keep `loom:answered` and the runner's answer
   comment for the brain to review.
+- Answered: a run that committed nothing, whose agent said in
+  `.loom/summary.md` that the work is already done or no longer applies
+  ("nothing to change", "no longer holds", "already fixed", ...) or answered
+  a thread in `.loom-answers/`, is an answer, not a failure. The runner posts
+  that reason on the ticket and labels it `loom:answered`; the station posts
+  each thread answer on the pull request the ticket names (as a settle
+  findings ticket names the pull request its findings were left on),
+  resolving it by the fix round rules. The brain reviews it like any answer:
+  a settle findings ticket whose threads are all answered or resolved is
+  verified with that note as its evidence, or closed as not planned when no
+  pull request is left.
 - Failed: label `loom:failed`, comment with the reason from the runner's
   log line, with local paths removed.
+  A run that committed nothing and gave no reason fails with `agent made no
+  commit and wrote no reason`. The factory climbs the model ladder once for
+  it; at the second such failure since the ladder last started it does not
+  climb again but leaves the ticket failed with `needs-brain` and one
+  comment saying why.
 - Limited (a reason starting `limit:` after its class, the spark lane's
   guard refusing work for a while): not a failure, and not one of the
   automatic retries below. Label `loom:briefed` again (`loom:pr` for a fix
@@ -643,11 +685,11 @@ A lane pull request is merge-ready if and only if all four hold:
 `python3 -m bus.brain status` prints this per pull request: `READY`, or
 `blocked:` and every blocker that applies, for example `blocked: checks
 failure, grug changes_requested, 3 unresolved threads`. It is computed by
-`bus.brain.merge_ready` from the one GraphQL read status already makes and
-nothing else, so two runs over the same pull request state print the same
-verdict. A tick takes that line as given instead of re-reading the review
-list. `bus.brain merge` keeps its own checks; this signal does not change
-what it accepts.
+`bus.brain.merge_ready` from the one GraphQL read status already makes.
+For a sensitive pull request that would otherwise be READY, status
+also checks the named review run on the head and blocks it unless that run
+completed with `success`. A tick takes that line as given instead of
+re-reading the review list. `bus.brain merge` keeps its own checks.
 
 ## Merge by change class
 
@@ -682,9 +724,9 @@ ticketless pull request when all of these hold:
 - it is not a draft, and it has no ticket (a linked ticket is refused:
   merge that without `--adopt`);
 - its head commit's check rollup is `SUCCESS`;
-- the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) ran and
-  passed on the head commit, because every change is reviewed before it
-  lands;
+- the review check (`LOOM_REVIEW_CHECK`, else `Grug - Elder`) completed
+  with `success` or `neutral` on the head commit. A sensitive-class pull
+  request still requires `success`;
 - every review thread is resolved.
 
 It pins the head SHA in the squash merge, deletes the branch only after
@@ -726,9 +768,15 @@ work), each an HTML comment:
 
 `python3 -m bus.brain defer` and `done` print them; the revision is the item
 when deferred (a pull request's head commit, an issue's state and comment
-count). Only journals from `LOOM_BRIEF_AUTHORS` logins count. For each stage
-and item the newest line wins; `python3 -m bus.brain resume OWNER/NAME...
---holder NAME` lists the defers still standing whose item is open and
+count). A written brief records its own done marker: `python3 -m bus.brain
+brief OWNER/NAME --goal N ... --holder NAME`, after it files the ticket on a
+goal whose newest brief marker is a defer, posts a journal on that goal home
+with the `stage=brief` done line and the new ticket. A brief without
+`--holder`, on a goal with no standing brief defer, or refused, posts no
+journal and changes no marker; so does a `--regresses` brief, which is
+the `regression` stage. Only journals from `LOOM_BRIEF_AUTHORS` logins
+count. For each stage and item the newest line wins; `python3 -m bus.brain
+resume OWNER/NAME... --holder NAME` lists the defers still standing whose item is open and
 unchanged, and refuses unless that holder holds the tick lock.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`

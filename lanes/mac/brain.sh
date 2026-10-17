@@ -119,7 +119,8 @@ each review thread, then run bus.brain merge with its ticket when ready. Do \
 not wait for that brain's next tick. Review, merge, brief and answer asks beyond \
 those items only when resume says all GitHub stages are open to you (no other \
 brain journaled in the last 2 hours). Defer and done markers go in your \
-journal as MUSE.md says. A brief named but not written this tick is deferred \
+journal as MUSE.md says; post each journal with python3 -m bus journal \
+OWNER/NAME#N --file FILE --holder $HOLDER so it carries your Tick line. A brief named but not written this tick is deferred \
 with the brief stage, never only in journal prose."
 fi
 

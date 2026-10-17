@@ -19,7 +19,12 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          "anthropic-7", "anthropic-8", "codex-2", "opencode-go-2", "opencode-go-3",
          "opencode-go-4",
          # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
-         "spark-2"]
+         "spark-2",
+         # Two more local coder slots, one per Spark box (LOOM_SPARK_3_URL,
+         # LOOM_SPARK_4_URL): each box served three requests at once on
+         # 2026-10-16, so a second slot runs beside the first instead of
+         # queueing (operator: use the Sparks much more).
+         "spark-3", "spark-4"]
 LANES = LANES + SLOTS
 # Remote lanes pull ticket work from GitHub and have no local station inbox.
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
@@ -66,6 +71,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:lanes": {"color": "ededed", "description": "The issue holding lane status"},
     "loom:digest": {"color": "ededed", "description": "The issue holding the daily asks digest"},
     "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
+    "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},

@@ -456,7 +456,10 @@ returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
 - A lane held by a limit for over 2 hours while tickets of its tier are queued.
-- A goal home at 90 or more sub-issues.
+- A goal home holding 90 or more sub-issues with a `loom:ticket` issue that says
+  `Part of #N` for it but is neither its sub-issue nor has that line on a line
+  of its own (a goal at the 100 sub-issue cap with every ticket linked by a
+  sub-issue or its line is healthy).
 - An open lane pull request whose plan check failed more than 30 minutes ago.
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 
@@ -713,7 +716,10 @@ lookup leaves the brief for the next pass. The rule covers:
   directly with the brief in print mode and `--mode accept-edits` (never
   wrapped in another agent). Its catalog includes Gemini, Claude and GPT-OSS
   models (`gemini-*`, `claude-*`, `gpt-oss-*`); default
-  `gemini-3.8-flash-high`.
+  `gemini-3.8-flash-high`. A bare model in the brief gets
+  `LOOM_AGY_EFFORT` (`high` by default); a model with `-low`, `-medium`, or
+  `-high` keeps its suffix. A model outside the catalog is refused as a
+  transient lane mismatch before agy starts.
 - agy keeps its sign-in in the macOS keychain. A sandboxed agent that can
   reach the keychain server could ask for any of the operator's keychain
   entries, so the agent runs as a dedicated standard macOS user (default

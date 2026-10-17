@@ -115,11 +115,37 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_REWRITE_OPENCODE</key><string>%s/.opencode/bin/opencode</string>"
                       % self.home, plist)
 
+    def test_private_rewrite_defaults_to_the_codex_subscription(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_REWRITE_PRIVATE_CMD</key><string>lanes/rewrite_agent.sh - codex/codex-test</string>", plist)
+
+    def test_private_rewrite_keeps_an_explicit_command(self):
+        command = "lanes/rewrite_agent.sh - claude/claude-test"
+        result = self.run_install(LOOM_REWRITE_PRIVATE_CMD=command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_REWRITE_PRIVATE_CMD</key><string>%s</string>" % command, plist)
+
     def test_pin_targets_are_written_to_station_plist(self):
         result = self.run_install(LOOM_PIN_TARGETS='[{"repo":"example-owner/deploy"}]')
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn('<key>LOOM_PIN_TARGETS</key><string>[{"repo":"example-owner/deploy"}]</string>', plist)
+
+    def test_roll_ship_documents_are_written_to_station_plist(self):
+        documents = '[{"goal":"example-owner/project#12","repo":"example-owner/project","path":"docs/ship.md"}]'
+        result = self.run_install(LOOM_ROLL_SHIP_DOCS=documents)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn('<key>LOOM_ROLL_SHIP_DOCS</key><string>%s</string>' % documents, plist)
+
+    def test_pin_ship_repos_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_PIN_SHIP_REPOS="example-owner/deploy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_PIN_SHIP_REPOS</key><string>example-owner/deploy</string>", plist)
 
     def test_a_bad_station_interval_installs_nothing(self):
         for bad in ("soon", "30"):

@@ -65,7 +65,11 @@ Neither needs a model:
   2026-10-13 were the bot's own "Fixed in" threads).
 - A round where the lane made no change and explained why waits for the
   review it asked for, up to REVIEW_GRACE, before the round is judged.
-- A failed ticket climbs the ladder. A ticket left briefed for BRIEFED_STALL
+- A failed ticket climbs the ladder, but only once for a run that committed
+  nothing and wrote no reason (lanes/run_lane.sh NO_REASON): at the second
+  such failure it is left failed with needs-brain for the brain, since a
+  stronger model made no commit either for five tickets on 2026-10-13.
+  A ticket left briefed for BRIEFED_STALL
   with no lane claiming it does not: it never ran, so it moves to the
   least-loaded other lane of its tier (a ladder ticket, of its rung), writing
   no rung marker.
@@ -148,15 +152,24 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # this table). A limit is not a failure, so the move stays in the tier and
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
+SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 TIERS: Dict[str, Tuple[str, ...]] = {
-    # The operator's priority (2026-10-14): Muse and agy first on public
-    # repos, so their allowances are spent before the rest. Both are public
-    # only, so a private repo's ticket still starts at spark or codex.
-    "easy": ("muse", "agy", "spark", "spark-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-             "openrouter", "workersai", "zen", "zai"),
+    # The operator's priorities: Muse and agy first on public repos, so their
+    # allowances are spent before the rest (2026-10-14); then the Sparks,
+    # much more (2026-10-16): four local slots on the operator's own
+    # hardware, free, and open to private repos. Tiers follow the Artificial
+    # Analysis Intelligence Index (the operator's yardstick).
+    "easy": ("muse", "agy") + SPARKS + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                                         "openrouter", "workersai", "zen", "zai"),
+    # The Sparks run Qwen3.8 27B since 2026-10-16 (Intelligence Index 26 to
+    # 34, beside Kimi K2.7 Code's 26 here), so they take medium work too.
     "medium": ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3",
-               "opencode-go-4") + ANTHROPIC,
-    "hard": ANTHROPIC + ("claude", "codex", "codex-2"),
+               "opencode-go-4") + SPARKS + ANTHROPIC,
+    # agy runs Gemini 4 Argon on the operator's Google plan since 2026-10-15:
+    # Artificial Analysis Intelligence Index 53 at high effort, beside Claude
+    # Opus 5.5 high (54) and GPT-6.1 Sol high (50), so it takes hard work on
+    # public repos (agy stays public only).
+    "hard": ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
 }
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
 # takes a free lane of these tiers instead, in order: the next harder tier,
@@ -182,6 +195,12 @@ CLAIM_RE = re.compile(r"^Claimed for lane ")
 STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+# bus/station.py's note on a failed run, and the runner's reason when a run
+# committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
+FAILED_RE = re.compile(r"^Lane \S+ failed: ")
+CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
+RUNAWAY = "loom:runaway"
+NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
                  ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved path'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
@@ -426,6 +445,115 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     return tried
 
 
+def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
+    """Whether a comment sets the ticket's model, and the model it sets: a
+    factory rung marker gives its rung's model (rung 0 restarts the ladder
+    and sets none), a brain escalation its `Rung:` line's model."""
+    found = [int(m.group(1)) for m in RUNG_RE.finditer(body)]
+    if found:
+        rung = found[-1]
+        return True, LADDER[rung - 1][1] if 1 <= rung <= len(LADDER) else None
+    line = brain._RUNG_LINE.search(body) if body.startswith(brain.ESCALATE_MARKER) else None
+    return (True, line.group(2)) if line else (False, None)
+
+
+def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set:
+    """The models the ticket was claimed on since its ladder last started
+    (the newest rung 0 marker). A rung marker or a brain escalation sets the
+    model for the claims after it. A claim before the first such comment ran
+    on the body's Model: line when none rewrote it since; once one did, and
+    on a body with no Model: line, a claim ran on its lane's own rung model
+    (bus/brain.py _lane_model). On 2026-10-16 a ticket's three attempts on
+    gpt-6-sol carried no rung marker, and the factory moved it back to
+    gpt-6-sol for a fourth."""
+    match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
+    body_model = match.group(1) if match else None
+    bodies = [str(c.get("body") or "") for c in comments]
+    marks = [i for i, body in enumerate(bodies) if _mark_model(body)[0]]
+    current = body_model if not marks else None
+    ran: set = set()
+    for i, body in enumerate(bodies):
+        sets, model = _mark_model(body)
+        if sets:
+            if [m.group(1) for m in RUNG_RE.finditer(body)][-1:] == ["0"]:
+                ran = set()  # a rung 0 marker starts the ladder again
+            current = (body_model or model) if i == marks[-1] else model
+            continue
+        claim = CLAIMED_RE.fullmatch(body.strip())
+        if claim:
+            ran |= {current or brain._lane_model(claim.group(1))} - {None}
+    return ran
+
+
+def ran_rungs(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set:
+    """The rungs whose model the ticket already ran on (ran_models), with or
+    without a rung marker: the ladder never gives a ticket a model that
+    already failed it (docs/MUSE.md, Repeatedly stuck work)."""
+    models = ran_models(issue, comments)
+    return {n for n, (_, model) in enumerate(LADDER, 1) if model in models}
+
+
+def reached_rung(comments: Sequence[Dict[str, Any]]) -> int:
+    """The highest rung the ticket has run on since its ladder last started, 0
+    when none."""
+    return max(tried_rungs(comments), default=0)
+
+
+def issue_model(issue: Dict[str, Any]) -> str:
+    match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
+    return match.group(1) if match else "unspecified"
+
+
+def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
+    """Each claim as (epoch, time, lane, reason it failed), oldest first, from
+    the claim and "Lane X failed:" comments. An attempt takes the failure that
+    followed it, or "" when none was recorded; with `current` given, the last
+    attempt is the one being reported and takes that reason."""
+    found: List[List[Any]] = []
+    for comment in comments:
+        body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
+        claim = CLAIMED_RE.fullmatch(body)
+        at = _ts(comment.get("created_at")) if claim else 0.0
+        if claim and at:
+            found.append([int(at), str(comment["created_at"]), claim.group(1), ""])
+        failure = FAILED_RE.match(body)
+        if failure and found and not found[-1][3]:
+            found[-1][3] = body[failure.end():]
+    if found and current:
+        found[-1][3] = current
+    return [(a[0], a[1], a[2], a[3]) for a in found]
+
+
+def _cell(text: str) -> str:
+    """A reason as one table cell: its first line, with pipes escaped."""
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    return first.replace("|", "\\|") or "-"
+
+
+def runaway_comment(trigger: str, rows: Sequence[Tuple[int, str, str, str]], model: str) -> str:
+    """The comment a flagged ticket carries: why, and its attempt table."""
+    lines = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s |" % (stamp, lane, model, _cell(reason))
+              for _, stamp, lane, reason in rows]
+    return "\n".join(lines)
+
+
+def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
+    """Did the ticket's newest failure commit nothing and give no reason, as
+    an earlier one did since its ladder last started (the newest rung 0
+    marker)? The ladder already climbed for that reason once, and a stronger
+    model did not help: five tickets climbed 4 to 6 times on it on
+    2026-10-13."""
+    seen: List[bool] = []
+    for c in comments:
+        body = str(c.get("body") or "")
+        if any(m.group(1) == "0" for m in RUNG_RE.finditer(body)):
+            seen = []
+        if FAILED_RE.match(body):
+            seen.append(NO_REASON in body)
+    return bool(seen) and seen[-1] and sum(seen) >= 2
+
+
 def current_rung(issue: Dict[str, Any]) -> int:
     """The rung whose model and lane the ticket runs on now, 0 when none: a
     brief can start on a ladder model, and failing there tries that rung."""
@@ -594,6 +722,18 @@ def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
     return lanes_of(difficulty_of(issue), private)
 
 
+def agy_takes_header(issue: Dict[str, Any], rung_only: bool = False) -> bool:
+    """Whether agy can take the ticket's Model: header when it is kept."""
+    match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+    if not match:
+        return True
+    model = match.group(1)
+    if rung_only and model not in (rung_model for _, rung_model in LADDER):
+        return True
+    from .station import lane_takes_model
+    return lane_takes_model("agy", model)
+
+
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
@@ -689,14 +829,17 @@ class Factory:
         fallback saying so. (None, "") when it should wait."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
+        agy_ok = agy_takes_header(issue, rung_only=True)
         own = [x for x in lanes_of(difficulty, private)
-               if x != old and (allow_remote or x not in REMOTE_LANES)]
+               if x != old and (allow_remote or x not in REMOTE_LANES)
+               and (x != "agy" or agy_ok)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._up(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
             fallback_lanes = [x for x in lanes_of(tier, private)
-                              if x != old and (allow_remote or x not in REMOTE_LANES)]
+                              if x != old and (allow_remote or x not in REMOTE_LANES)
+                              and (x != "agy" or agy_ok)]
             lane = next((x for x in fallback_lanes if self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
@@ -833,9 +976,14 @@ class Factory:
         a rung marker. The rung it ran on counts as tried when it failed
         there. Returns the lane, or None once every rung was tried."""
         number = int(issue["number"])
-        tried = tried_rungs(comments)
+        if RUNAWAY in _labels(issue):
+            return None  # held until a brain clears the label
+        climbed = tried_rungs(comments)
         if failed_here:
-            tried |= {current_rung(issue)} - {0}
+            climbed |= {current_rung(issue)} - {0}
+        # A rung whose model the ticket ran on before the ladder counts as
+        # tried, but only the ladder's own climbs make a lower rung a move down.
+        tried = climbed | ran_rungs(issue, comments)
         available_lanes = {lane for lanes, _ in LADDER for lane in lanes
                            if lane not in self.limited
                            and (self.available is None or lane in self.available)}
@@ -843,6 +991,10 @@ class Factory:
                     if any(lane in available_lanes for lane in lanes)}
         rung = next_rung(tried | ({skip} - {0}), self.load, eligible)
         if not rung:
+            return None
+        if rung < max(climbed, default=0):
+            self._flag_runaway(repo, issue, comments, "ladder move from rung %d down to rung %d"
+                               % (max(climbed), rung))
             return None
         lanes, model = LADDER[rung - 1]
         lanes = tuple(lane for lane in lanes if lane in available_lanes)
@@ -861,8 +1013,22 @@ class Factory:
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
+    def _flag_runaway(self, repo: str, issue: Dict[str, Any],
+                      comments: Sequence[Dict[str, Any]], trigger: str) -> None:
+        """Hold a ticket for the brain: the runaway label and its attempt table."""
+        number = int(issue["number"])
+        kept = _labels(issue) + [RUNAWAY]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": x} for x in kept]
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+            "body": runaway_comment(trigger, attempts(comments), issue_model(issue))})
+        self.actions += 1
+        _say("%s#%d is a runaway (%s); held for the brain" % (repo, number, trigger))
+
     def _give_up(self, repo: str, issue: Dict[str, Any], why: str) -> None:
         number = int(issue["number"])
+        if RUNAWAY in _labels(issue):
+            return
         if _state(issue) != "failed":
             self.move(self.gh, repo, number, "failed",
                       note="The factory tried every rung of the model ladder (%s). "
@@ -1162,6 +1328,9 @@ class Factory:
                prs: Dict[int, Dict[str, Any]]) -> None:
         number = int(issue["number"])
         comments = self._comments(repo, number)
+        if repeated_no_reason(comments):
+            self._hold_no_reason(repo, issue)
+            return
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue))
         if lane is None:
             return  # left for the brain; _give_up said so once
@@ -1175,6 +1344,26 @@ class Factory:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))
+
+    def _hold_no_reason(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Leave a ticket failed for the brain instead of climbing a second
+        time for a run that committed nothing and said nothing, once
+        (needs-brain says it was reported)."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        number = int(issue["number"])
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body":
+            "Lane %s made no commit and wrote no reason, as a run on this ticket did "
+            "before. The factory climbed the model ladder once for that and does not "
+            "climb a second time for the same reason: the brain reads the run logs and "
+            "rewrites the brief, closes the ticket, or escalates it once more with its "
+            "reason." % _lane(issue)})
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names + ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d failed again with no commit and no reason; left for the brain"
+             % (repo, number))
 
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
@@ -1247,7 +1436,8 @@ class Factory:
         its rung, or of its difficulty tier. Never up the ladder."""
         old = _lane(issue)
         pool = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
-        return [x for x in pool if x != old and self._up(x)]
+        return [x for x in pool if x != old and self._up(x)
+                and (x != "agy" or agy_takes_header(issue))]
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
@@ -1298,7 +1488,7 @@ class Factory:
         if not here or self.load.get(old, 0) <= RUNG_BUSY:
             return False
         comments = self._comments(repo, int(issue["number"]))
-        tried = tried_rungs(comments) | {here}
+        tried = tried_rungs(comments) | ran_rungs(issue, comments) | {here}
         if not any(min(self.load.get(lane, 0) for lane in LADDER[n - 1][0]) < RUNG_BUSY
                    for n in range(1, len(LADDER) + 1) if n not in tried):
             return False

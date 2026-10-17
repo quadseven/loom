@@ -72,8 +72,24 @@ printf '%s\\n' "$FAKE_SECRET"
 
 FAKE_SANDBOX = """#!/usr/bin/env bash
 [ "$1" = -p ] || exit 2
+printf '%s\n' "$2" >> @SANDBOX_LOG@
 shift 2
 exec "$@"
+"""
+
+FAKE_LANE = """#!/usr/bin/env bash
+log=@LANE_LOG@
+printf '%s|%s|%s|%s\n' "$(basename "$0")" "$*" "$HOME" "$PWD" >> "$log"
+cat > "$log.prompt"
+if [ "$(basename "$0")" = codex ] && grep -q 'MODE=fail-codex' "$log.prompt"; then exit 3; fi
+if [ "$(basename "$0")" = claude ]; then
+  case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in *$'\nINJECTED=present') intact=yes ;; *) intact=no ;; esac
+  printf 'token-intact=%s injected=%s\n' "$intact" "${INJECTED:-absent}" > "$log.env"
+fi
+case "$(basename "$0")" in
+  codex) printf '%s\n' '{"type":"thread.started"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"action\\":\\"skip\\",\\"reason\\":\\"fake\\"}"}}' ;;
+  claude) printf '%s\n' '{"type":"result","result":"{\\"action\\":\\"skip\\",\\"reason\\":\\"fake\\"}"}' ;;
+esac
 """
 
 
@@ -89,9 +105,13 @@ class RewriteAgentTest(unittest.TestCase):
         self.log = root / "calls.log"
         self.log.touch()
         self.agent_log = root / "agent.log"
+        self.lane_log = root / "lane.log"
+        self.sandbox_log = root / "sandbox.log"
         self.write_fake_opencode("1.18.4")
         self.write_tool(self.bin / "aws", FAKE_AWS)
-        self.write_tool(self.bin / "sandbox-exec", FAKE_SANDBOX)
+        self.write_tool(self.bin / "sandbox-exec", FAKE_SANDBOX.replace("@SANDBOX_LOG@", str(self.sandbox_log)))
+        for lane in ("codex", "claude"):
+            self.write_tool(self.bin / lane, FAKE_LANE.replace("@LANE_LOG@", str(self.lane_log)))
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -106,20 +126,61 @@ class RewriteAgentTest(unittest.TestCase):
                         .replace("@VERSION@", version))
 
     def run_wrapper(self, prompt="Rewrite issue 7 into a ticket.", args=("loom/test/key", MODEL),
-                    secret=KEY):
+                    secret=KEY, env_overrides=None):
         env = {
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
             "FAKE_LOG": str(self.log),
             "FAKE_SECRET_NAME": "loom/test/key",
             "FAKE_SECRET": secret,
+            "LANE_LOG": str(self.lane_log),
+            "SANDBOX_LOG": str(self.sandbox_log),
         }
+        if env_overrides:
+            env.update(env_overrides)
         return subprocess.run(["bash", str(WRAPPER), *args], input=prompt, env=env,
                               capture_output=True, text=True, timeout=60)
 
     def agent(self):
         lines = self.agent_log.read_text().splitlines() if self.agent_log.exists() else []
         return dict(line.split("=", 1) for line in lines if "=" in line)
+
+    def test_lane_clis_use_the_sandbox_and_print_only_final_text(self):
+        for lane in ("codex", "claude"):
+            with self.subTest(lane=lane):
+                self.lane_log.write_text("")
+                result = self.run_wrapper("Rewrite this", args=("-", lane + "/test-model"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, '{"action":"skip","reason":"fake"}\n')
+                self.assertIn(lane, self.lane_log.read_text())
+                argv = self.lane_log.read_text().split("|", 2)[1]
+                if lane == "codex":
+                    self.assertIn("--sandbox read-only", argv)
+                    self.assertIn("--json", argv)
+                else:
+                    self.assertIn("--tools  --strict-mcp-config", argv)
+                self.assertEqual(Path(str(self.lane_log) + ".prompt").read_text(), "Rewrite this")
+                self.assertIn('(deny file-read* file-write*', self.sandbox_log.read_text())
+                self.assertIn('run/rewrite.', self.lane_log.read_text())
+                self.assertIn('home/work', self.lane_log.read_text())
+                self.assertNotIn('aws ssm', self.log.read_text())
+
+    def test_failed_lane_falls_back_to_next_entry(self):
+        result = self.run_wrapper("MODE=fail-codex", args=("-", "codex/test-model,claude/test-model"),
+                                  secret="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"action":"skip","reason":"fake"}\n')
+        self.assertEqual([line.split("|", 1)[0] for line in self.lane_log.read_text().splitlines()],
+                         ["codex", "claude"])
+
+    def test_claude_token_cannot_add_another_environment_variable(self):
+        result = self.run_wrapper(
+            args=("-", "claude/test-model"), secret="placeholder\nINJECTED=present",
+            env_overrides={"LOOM_REWRITE_CLAUDE_TOKEN_SSM": "loom/test/key"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("token-intact=yes injected=absent",
+                      Path(str(self.lane_log) + ".env").read_text())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_prompt_reaches_the_agent_on_stdin_and_only_the_final_text_is_printed(self):

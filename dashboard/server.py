@@ -183,6 +183,7 @@ def _priorities_card(rows):
 
 def _floor(state):
     rows = _all_tickets(state)
+    runaway = [row for row in rows if "loom:runaway" in (row.get("labels") or []) and row.get("open", True)]
     conveyor, bottleneck = _conveyor(state, rows)
     order = {name: index for index, name in enumerate(MOVING_ORDER)}
     moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
@@ -202,6 +203,9 @@ def _floor(state):
         '<span class="bottleneck-note">%s is the bottleneck</span>' % esc(bottleneck) if bottleneck else "")
     parts = ['<section class="standup">%s</section>' % standup,
              '<section class="section">%s<div class="conveyor">%s</div></section>' % (head, conveyor)]
+    runaway_rows = "".join(_ticket_row(row) for row in runaway)
+    parts.append('<section class="section runaway-tickets"><div class="section-head"><span class="label">Runaway tickets</span></div>%s</section>' % (
+        runaway_rows or '<p class="empty-state">None held for review.</p>'))
     parts.append('<div class="floor-columns"><section class="section"><div class="section-head"><span class="label">Moving now</span>'
                  '<a href="/tickets">all tickets &rarr;</a></div><div class="ticket-list">%s</div></section>' % (
                      "".join(_ticket_row(row) for row in moving[:24]) or '<p class="empty-state">Nothing is moving right now.</p>'))
@@ -509,13 +513,18 @@ def _ticket_page(state, parsed):
     params = parse_qs(parsed.query)
     rows = _all_tickets(state)
     filtered = [row for row in rows if (not params.get("state") or row.get("state") == params["state"][0])
-                and (not params.get("goal") or row.get("goal") == params["goal"][0])]
+                and (not params.get("goal") or row.get("goal") == params["goal"][0])
+                and (not params.get("model") or row.get("model") == params["model"][0])]
     state_chips = ''.join('<a class="chip" href="/tickets?state=%s">%s %d</a>' % (
         name, name, sum(row.get("state") == name for row in rows)) for name in STATES
         if any(row.get("state") == name for row in rows))
     goals = sorted({row["goal"] for row in rows if row.get("goal")})
     goal_chips = ''.join('<a class="chip" href="/tickets?goal=%s">%s</a>' % (quote(goal, safe=""), html.escape(goal)) for goal in goals)
-    body = '<div class="chips">%s %s</div>' % (state_chips, goal_chips)
+    models = sorted({row["model"] for row in rows if row.get("model")})
+    model_chips = ''.join('<a class="chip" href="/tickets?model=%s">%s %d</a>' % (
+        quote(model, safe=""), html.escape(model),
+        sum(row.get("model") == model for row in rows)) for model in models)
+    body = '<div class="chips">%s %s %s</div>' % (state_chips, goal_chips, model_chips)
     if filtered:
         body += '<div class="ticket-grid">%s</div>' % ''.join(_ticket_row(row) for row in filtered)
     else:

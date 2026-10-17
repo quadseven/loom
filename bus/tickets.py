@@ -108,7 +108,17 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
         if not m:
             break
         key, value = m.group(1), m.group(2).strip()
+        if key == "Difficulty":
+            # A hand-edited "Difficulty: Medium" failed the check, so the
+            # ticket read as having no tier and no lane ever claimed it
+            # (2026-10-16).
+            value = value.lower()
         if key in headers:
+            if headers[key] == value:
+                # The same line twice (a brief whose file repeated the header
+                # the brief tool also writes) says one thing; keep it.
+                i += 1
+                continue
             raise ValueError("%s: given twice" % key)
         _check_header(key, value)
         headers[key] = value
@@ -377,7 +387,9 @@ ANSWER_NOTE = (
 
 
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
-                  fix: Optional[Fix] = None) -> str:
+                  fix: Optional[Fix] = None,
+                  ci_checks: Optional[List[Tuple[str, str]]] = None,
+                  has_contract: bool = True) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -400,6 +412,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             if k not in ("Not before", "After", "Priority")]
     out += ["", "# T%d: %s" % (number, title), ""]
     text = "\n".join(out) + "\n"
+    if not has_contract and ci_checks:
+        text += "## Checks CI runs\n\nRun these checks before opening the pull request:\n\n"
+        for source, command in ci_checks:
+            text += "- `%s` (from %s)\n" % (command, source)
+        text += "\n"
     if body:
         text += body + "\n"
     if fix:
