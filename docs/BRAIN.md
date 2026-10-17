@@ -453,7 +453,13 @@ credentials, so the station takes a ticket only when all of these hold:
 - The repo owner is in `LOOM_REPO_OWNERS`, as for local briefs.
 
 A ticket that fails these is left alone and reported once in the station
-log; it is never claimed. So is a ticket assigned to a login outside
+log; it is never claimed. A ticket a second contributor works by hand (assigned to them, or
+labelled `claim:<login>`) still follows its pull request: an open pull
+request by that owner, on a branch of the repo, whose `Refs` line names a
+ticket a trusted login filed, moves it from `loom:queued` to `loom:pr`, and
+from there the closed pull request pass moves it to `loom:merged` on merge
+and shipping follows. It is never briefed or claimed this way, and a pull
+request by anyone who does not own the ticket moves nothing. So is a ticket assigned to a login outside
 `LOOM_BRIEF_AUTHORS` or labelled `claim:<login>` for one, or one under a goal home whose `Operator:` line names
 another login: another operator's Loom owns it (docs/LANES.md, "Two Looms on
 shared repos"). A claim assigns the ticket to this Loom's operator login and

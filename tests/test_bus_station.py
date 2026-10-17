@@ -427,6 +427,52 @@ class ReconcilePullRequestTest(Base):
         self.assertNotIn("loom:queued", self.fake.names(12))
         self.assertIn("pull request #99", self.fake.comments[12][-1]["body"])
 
+    def contributor_pr(self, author="dana-example", state="open", merged_at=None):
+        pr = {"number": 99, "state": state, "user": {"login": author},
+              "body": "Why.\n\nRefs #12\n",
+              "head": {"ref": "dana/12-fix", "repo": {"full_name": REPO}}}
+        if merged_at:
+            pr["merged_at"] = merged_at
+        return pr
+
+    def test_a_contributor_owned_ticket_moves_to_pr_then_merged(self):
+        # loom#688: a ticket a second contributor claimed (assigned, or a
+        # claim:<login> label) follows that contributor's pull request.
+        for claim in ("assignee", "label"):
+            with self.subTest(claim=claim):
+                self.fake.add(12, state="queued")
+                if claim == "assignee":
+                    self.fake.issues[12]["assignees"] = [{"login": "dana-example"}]
+                else:
+                    self.fake.issues[12]["labels"].append({"name": "claim:dana-example"})
+                self.fake.pulls = [self.contributor_pr()]
+                runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+                runner.reconcile_pull_requests()
+                self.assertIn("loom:pr", self.fake.names(12))
+                self.assertNotIn("loom:queued", self.fake.names(12))
+                self.fake.pulls = [self.contributor_pr(state="closed",
+                                                       merged_at="2030-01-02T00:00:00Z")]
+                station.Station(GitHub("token", transport=self.fake),
+                                self.settings).reconcile_pull_requests()
+                self.assertIn("loom:merged", self.fake.names(12))
+                self.assertNotIn("loom:pr", self.fake.names(12))
+
+    def test_a_pull_request_by_someone_who_does_not_own_the_ticket_moves_nothing(self):
+        self.fake.add(12, state="queued")
+        self.fake.issues[12]["assignees"] = [{"login": "dana-example"}]
+        for author in ("stranger", "erin-example"):
+            self.fake.pulls = [self.contributor_pr(author=author)]
+            station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+            self.assertIn("loom:queued", self.fake.names(12))
+        # A ticket a stranger filed is not trusted, even for its owner.
+        self.fake.add(13, state="queued", author="stranger")
+        self.fake.issues[13]["assignees"] = [{"login": "dana-example"}]
+        pr = self.contributor_pr()
+        pr["body"] = "Refs #13\n"
+        self.fake.pulls = [pr]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:queued", self.fake.names(13))
+
     def test_untrusted_or_fork_pr_does_not_promote_ticket(self):
         for author, head_repo in (("stranger", REPO), ("alice-example", "fork-owner/example-repo")):
             with self.subTest(author=author, head_repo=head_repo):
