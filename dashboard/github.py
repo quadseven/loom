@@ -246,6 +246,14 @@ class TicketStore:
             errors.extend(found_errors)
         if status_home and tickets.REPO_RE.fullmatch(status_home):
             self._read_lane_status(status_home, lanes, errors)
+        # The comment feed keeps only LOOM_BRIEF_AUTHORS logins when that is
+        # set; the goal-home reads get the same filter here, before any view
+        # reads them (Floor standup and next move, Improving, Lanes, Goals),
+        # so a marker-shaped comment from anyone else counts nowhere.
+        trusted = {login.lower() for login in brain.trusted_authors()}
+        journals, reports, metric_comments, lanes = (
+            [c for c in found if _by_trusted(c, trusted)]
+            for found in (journals, reports, metric_comments, lanes))
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             pull_results = list(pool.map(self._pull_requests_for_repo, self.repos))
         for found, repo_errors in pull_results:
@@ -264,13 +272,6 @@ class TicketStore:
         rows = [row for found in data.get("tickets", {}).values() if found for row in found]
         configured = set(self.repos) | {repo for repo, _ in homes}
         titles, parents = self._goal_info(rows, configured)
-        # The comment feed keeps only LOOM_BRIEF_AUTHORS logins when that is
-        # set; the goal-home reads get the same filter before they reach the
-        # goal cards, so a report-shaped comment from anyone else cannot set
-        # a goal's last report, measure or factory number.
-        trusted = {login.lower() for login in brain.trusted_authors()}
-        reports = [c for c in reports if _by_trusted(c, trusted)]
-        metric_comments = [c for c in metric_comments if _by_trusted(c, trusted)]
         # Reports on the goal homes read in full above count too: a goal home
         # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
         # comment feed failed this pass.

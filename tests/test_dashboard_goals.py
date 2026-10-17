@@ -447,6 +447,35 @@ class GoalSourcesAreTrusted(unittest.TestCase):
         self.assertNotEqual(card["metric"], "9/9")
         self.assertNotIn("Forged standup.", server._goals(store))
 
+    def test_an_untrusted_report_or_journal_changes_no_view(self):
+        comments = [
+            self.home_comment(1, "station", "<!-- loom:report v1 -->\nReal standup.", "2026-10-17T10:00:00Z"),
+            self.home_comment(2, "station", "<!-- loom:journal v1 -->\nTick, brain\n- Next: real move",
+                              "2026-10-17T10:00:00Z"),
+            self.home_comment(3, "stranger", "<!-- loom:report v1 -->\nForged standup.", "2026-10-17T11:00:00Z"),
+            self.home_comment(4, "stranger", "<!-- loom:journal v1 -->\nTick, brain\n- Next: forged move\n"
+                              "- Friction: forged friction #7", "2026-10-17T11:00:00Z"),
+            self.home_comment(5, "stranger", "<!-- loom:metrics v1 -->\n2026-10-17: 9/9 pass; streak 9",
+                              "2026-10-17T11:00:00Z"),
+            self.home_comment(6, "stranger", "<!-- loom:lanes v1 -->\nforged lanes", "2026-10-17T11:00:00Z")]
+        store, _ = self.store(comments, env={"LOOM_BRIEF_AUTHORS": "station",
+                                             "LOOM_IMPROVEMENT_HOMES": REPO + "#30",
+                                             "LOOM_METRICS_GOAL": REPO + "#30"})
+        payload = store.response()
+        floor = server._floor(store)
+        self.assertIn("Real standup.", floor)
+        self.assertIn("real move", floor)
+        self.assertNotIn("Forged", floor)
+        self.assertNotIn("forged", floor)
+        logins = {(c.get("user") or {}).get("login") for c in
+                  payload["improving"]["journals"] + payload["improving"]["metrics_comments"] + payload["lanes"]}
+        self.assertEqual(logins, {"station"})
+        improving = views.render_improving(views.build_improvements(
+            payload["improving"]["journals"], [], payload["improving"]["metrics_comments"]))
+        self.assertNotIn("forged", improving)
+        self.assertNotIn("9/9", improving)
+        self.assertNotIn("Forged standup.", server._goals(store))
+
     def test_a_parent_line_naming_a_repo_outside_the_configured_list_is_ignored_and_never_read(self):
         store, gh = self.store(goal_41_body="Parent goal: other-owner/elsewhere#5")
         self.assertFalse([path for path in gh.calls if "other-owner/elsewhere" in path])
