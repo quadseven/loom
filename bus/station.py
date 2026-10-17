@@ -868,6 +868,10 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        # This pass's closed pull requests and default branches, per repo:
+        # the hand-revert scan reads the same pages as the ship checks.
+        self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._branch_cache: Dict[str, str] = {}
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -1907,6 +1911,149 @@ class Station:
             except (GitHubError, OSError) as err:
                 _say("could not reconcile pull requests for %s: %s" % (repo, err))
 
+    # -- hand-made reverts -----------------------------------------------
+    def _closed_pulls(self, repo: str) -> List[Dict[str, Any]]:
+        """Every merged pull request on the newest SHIP_PAGES closed-PR
+        pages, cached for the pass. Unlike _merged_pulls this never stops
+        early: a ticket is only fully reverted when none of its pull
+        requests survives."""
+        if repo not in self._closed_cache:
+            pulls: List[Dict[str, Any]] = []
+            url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
+                                  "&direction=desc&per_page=100" % repo)
+            for _ in range(SHIP_PAGES):
+                resp = self.gh.rest("GET", url)
+                for pr in resp.data if isinstance(resp.data, list) else []:
+                    if isinstance(pr, dict) and pr.get("merged_at") \
+                            and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
+                        pulls.append(pr)
+                url = _next_link(resp.headers.get("link", ""))
+                if not url:
+                    break
+            self._closed_cache[repo] = pulls
+        return self._closed_cache[repo]
+
+    def _default_branch(self, repo: str) -> str:
+        """The repo's default branch, cached for the pass."""
+        if repo not in self._branch_cache:
+            data = self.gh.rest("GET", "/repos/%s" % repo).data or {}
+            self._branch_cache[repo] = str(data.get("default_branch") or "")
+        return self._branch_cache[repo]
+
+    def _hand_reverts(self, repo: str, pulls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """The hand-made revert pull requests among `pulls`, newest first."""
+        branch = self._default_branch(repo)
+        if not branch:
+            return []
+        return [pr for pr in pulls if revert.is_hand_revert(pr, self.now, branch)]
+
+    def _ticket_pulls(self, repo: str, wanted: set) -> Dict[int, List[Dict[str, Any]]]:
+        """Every merged pull request of each wanted ticket."""
+        groups: Dict[int, List[Dict[str, Any]]] = {}
+        for pr in self._closed_pulls(repo):
+            number = self._pr_ticket_number(repo, pr)
+            if number in wanted:
+                groups.setdefault(number, []).append(pr)
+        return groups
+
+    def _undone_by(self, pr: Dict[str, Any], hands: List[Dict[str, Any]],
+                   revision: str,
+                   carries: Callable[[str, str], bool]) -> Optional[Dict[str, Any]]:
+        """The hand-made revert that undid the merged pull request on the
+        default branch and that `revision` carries, or None."""
+        for hand in hands:
+            if revert.undoes(hand, pr) \
+                    and carries(str(hand.get("merge_commit_sha") or ""), revision):
+                return hand
+        return None
+
+    def _all_reverted(self, prs: List[Dict[str, Any]], hands: List[Dict[str, Any]],
+                      revision: str,
+                      carries: Callable[[str, str], bool]) -> bool:
+        """Every one of the ticket's merged pull requests was undone by a
+        hand-made revert the revision carries."""
+        return bool(prs) and bool(hands) and all(
+            self._undone_by(pr, hands, revision, carries) is not None for pr in prs)
+
+    def unwind_reverts(self) -> None:
+        """Move each open merged or shipped ticket without a proof whose
+        every merged pull request a hand-made revert undid on the default
+        branch back to loom:briefed on its lane, once per revert pull
+        request, so the next attempt starts from the review findings."""
+        allowed = {a.lower() for a in self.s.authors}
+        for repo in [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]:
+            try:
+                self._unwind_repo(repo, allowed)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("unwind_reverts %s failed: %s" % (repo, err))
+
+    def _unwind_repo(self, repo: str, allowed: set) -> None:
+        landed: Dict[int, Dict[str, Any]] = {}
+        for label in ("loom:merged", "loom:shipped"):
+            data = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                    % (repo, label))
+            for issue in data:
+                names = _label_names(issue)
+                if isinstance(issue, dict) and "pull_request" not in issue \
+                        and "loom:ticket" in names and label in names \
+                        and "loom:verified" not in names:
+                    landed[int(issue["number"])] = issue
+        if not landed:
+            return
+        pulls = self._closed_pulls(repo)
+        hands = self._hand_reverts(repo, pulls)
+        if not hands:
+            return
+        groups = self._ticket_pulls(repo, set(landed))
+        for number in sorted(landed):
+            prs = groups.get(number, [])
+            if self._all_undone(prs, hands):
+                self._unwind_ticket(repo, landed[number], prs, hands, allowed)
+
+    def _match(self, pr: Dict[str, Any],
+               hands: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The hand-made revert that undid the merged pull request, or None."""
+        return next((hand for hand in hands if revert.undoes(hand, pr)), None)
+
+    def _all_undone(self, prs: List[Dict[str, Any]],
+                    hands: List[Dict[str, Any]]) -> bool:
+        """Every one of the ticket's merged pull requests was undone by a
+        hand-made revert on the default branch."""
+        return bool(prs) and all(self._match(pr, hands) is not None for pr in prs)
+
+    def _unwind_ticket(self, repo: str, issue: Dict[str, Any],
+                       prs: List[Dict[str, Any]], hands: List[Dict[str, Any]],
+                       allowed: set) -> None:
+        number = int(issue["number"])
+        lane = factory._lane(issue)
+        if not lane:
+            _say("%s#%d is fully reverted but has no lane; left for the brain" % (repo, number))
+            return
+        undone = {int(hand["number"]): hand for pr in prs
+                  for hand in [self._match(pr, hands)] if hand is not None}
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        seen = {m.group(1) for c in comments if isinstance(c, dict)
+                and str((c.get("user") or {}).get("login") or "").lower() in allowed
+                for m in [re.search(r"loom:hand-revert (\d+)", str(c.get("body") or ""))]
+                if m}
+        fresh = {n: hand for n, hand in undone.items() if str(n) not in seen}
+        if not fresh:
+            return
+        markers = "\n".join(revert.HAND_REVERT_MARKER % n for n in sorted(fresh))
+        names = ", ".join("#%d" % n for n in sorted(fresh))
+        whys = []
+        for n in sorted(fresh):
+            why = revert.why_section(str(fresh[n].get("body") or ""))
+            quoted = "\n".join(brain._quoted(why)) if why else "    (no Why section)"
+            whys.append("Pull request #%d's Why:\n%s" % (n, quoted))
+        note = ("%s\nA hand-made revert pull request undid every merged pull request of "
+                "this ticket on the default branch (%s), so it goes back to lane %s to "
+                "redo the change.\n\n%s" % (markers, names, lane, "\n\n".join(whys)))
+        brain._check_written_text(note)
+        brain.move(self.gh, repo, number, "briefed", lane=lane, note=note)
+        _say("%s: hand reverts %s undid #%d; moved back to lane %s"
+             % (repo, names, number, lane))
+
     # -- shipping at deploy ----------------------------------------------
     def _deployed(self) -> Optional[Tuple[str, float]]:
         """The revision lanes/mac/station.sh last deployed and when, or None
@@ -1959,9 +2106,14 @@ class Station:
         merged = self._merged_tickets(repo)
         if not merged:
             return
+        latest = self._merged_pulls(repo, merged)
+        groups = self._ticket_pulls(repo, set(latest))
+        hands = self._hand_reverts(repo, self._closed_pulls(repo))
         carried = sorted((str(pr["merged_at"]), number, pr)
-                         for number, pr in self._merged_pulls(repo, merged).items()
-                         if self.ancestor(str(pr["merge_commit_sha"]), revision))
+                         for number, pr in latest.items()
+                         if self.ancestor(str(pr["merge_commit_sha"]), revision)
+                         and not self._all_reverted(groups.get(number) or [pr], hands,
+                                                    revision, self.ancestor))
         for _, number, pr in carried[:SHIP_PER_PASS]:
             self._ship_one(repo, number, pr,
                            "the station deployed revision %s at %s" % (
@@ -2087,9 +2239,13 @@ class Station:
             return True
         seen: List[Dict[str, Any]] = []
         pulls = self._merged_pulls(source, merged, seen)
+        groups = self._ticket_pulls(source, set(pulls))
+        hands = self._hand_reverts(source, self._closed_pulls(source))
         carried = sorted((str(pr["merged_at"]), number, pr) for number, pr in pulls.items()
                          if self._carries(source, str(pr["merge_commit_sha"]), revision)
-                         and not self._reverted(source, pr, seen, revision))
+                         and not self._reverted(source, pr, seen, revision)
+                         and not self._all_reverted(groups.get(number) or [pr], hands,
+                                                    revision, self._carries))
         how = "pin pull request %s#%d merged at %s, publishing %s revision %s" % (
             deploy, int(pin["number"]), str(pin["merged_at"]).replace("T", " "),
             source, revision[:12])
@@ -4938,7 +5094,7 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.unwind_reverts, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,
