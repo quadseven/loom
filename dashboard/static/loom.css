@@ -96,7 +96,9 @@ button { color: inherit; font: inherit; }
 .status-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--good); }
 .theme-toggle, .icon-button { min-width: 44px; min-height: 44px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); cursor: pointer; }
 .theme-toggle { align-self: flex-start; padding: 0 12px; }
-.page-content { width: min(100%, 1320px); min-height: 100vh; margin-left: 232px; padding: 24px clamp(16px, 3.5vw, 40px) 120px; }
+/* The content fills the window beside the fixed nav: a 1320px cap left a
+   third of a widescreen empty (2026-10-17). Prose keeps its own max-width. */
+.page-content { min-width: 0; min-height: 100vh; margin-left: 232px; padding: 24px clamp(16px, 3.5vw, 40px) 120px; }
 .page-title { margin: 0 0 24px; font-size: clamp(24px, 3vw, 34px); font-weight: 600; letter-spacing: -.02em; }
 .mobile-topbar, .mobile-tabs { display: none; }
 .ticket-row, .card { border: 1px solid var(--line); border-radius: 10px; background: var(--row); padding: 12px 14px; }
