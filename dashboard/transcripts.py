@@ -79,7 +79,7 @@ _LIST_TICKET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at
 _ATTEMPTS = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts WHERE ticket=%s ORDER BY started_at ASC"
 _GET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE id=%s"
 RETENTION_DAYS = 180
-_PURGE = "DELETE FROM transcripts WHERE started_at < now() - INTERVAL '%d days'" % RETENTION_DAYS
+_PURGE = "DELETE FROM transcripts WHERE started_at < now() - INTERVAL '%d days'" % RETENTION_DAYS  # noqa: S608 - RETENTION_DAYS is a fixed integer constant, not user input.
 
 
 class MemoryBackend:
