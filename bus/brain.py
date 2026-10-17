@@ -2881,13 +2881,25 @@ def _waiting_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> List[tickets.A
     return tickets.after_holds(repo, headers, lookup)[0]
 
 
-def _nothing_to_fix(gh: GitHub, repo: str, pr: int) -> Optional[str]:
+def _nothing_to_fix(gh: GitHub, repo: str, pr: int,
+                    env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """The finished state of an open pull request, or None while it still has
     something to fix: its head is green, the review check passed on that
     head, no review thread is open and it does not conflict. Fix rounds alone
     escalated such a pull request on 2026-10-16, and a fourth run of the same
-    model changed nothing before the brain merged the head it already had."""
+    model changed nothing before the brain merged the head it already had.
+
+    Only a pull request in this repo by a LOOM_BRIEF_AUTHORS login counts: the
+    ticket is matched to its pull request by branch name or a Refs line, which
+    anyone can write on a public repo, so an outsider's green pull request must
+    never stop a stuck ticket from climbing the ladder."""
+    data = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr)).data
+    data = data if isinstance(data, dict) else {}
     details = _pr_graphql(gh, repo, pr)
+    author = str((data.get("user") or {}).get("login") or "").lower()
+    if (not _same_repo(repo, data, details)
+            or author not in {a.lower() for a in trusted_authors(env)}):
+        return None
     sha = str(details.get("headRefOid") or "")
     check = review_check_name()
     if (not sha or details.get("mergeable") == "CONFLICTING" or not _checks_green(details)
