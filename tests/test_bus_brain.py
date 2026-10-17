@@ -122,6 +122,20 @@ class BrainTests(unittest.TestCase):
         brain._check_brief_difficulty(body, "agy", None)
         brain._check_brief_difficulty("Difficulty: hard\n\n" + body, None, None)
 
+    def test_a_ticket_must_parse_back_to_the_headers_the_tool_wrote(self):
+        # loom#486 filed with its own "Priority:" line and a blank before the
+        # tool's headers, and loom#506 with a pasted "Repo:" preamble: neither
+        # read as having a difficulty, so no lane claimed them for hours.
+        good = brain._ticket_body("## Why\nx\n", "medium", None, None, None, None, "P2")
+        brain._check_ticket_headers(good, {"Difficulty": "medium", "Priority": "P2"})
+        split = "Priority: P2\n\nDifficulty: medium\nPriority: P2\n\n## Why\nx\n"
+        with self.assertRaisesRegex(ValueError, "Difficulty header is not readable"):
+            brain._check_ticket_headers(split, {"Difficulty": "medium", "Priority": "P2"})
+        pasted = brain._ticket_body("# Brief: T1\n\nRepo: o/r\nBranch: b\n\n## Why\nx\n",
+                                    "medium", None, None, None, None, None)
+        with self.assertRaisesRegex(ValueError, "headers do not parse"):
+            brain._check_ticket_headers(pasted, {"Difficulty": "medium"})
+
     def test_prioritize_without_trusted_authors_names_the_setting(self):
         # A remote brain without LOOM_BRIEF_AUTHORS saw only "not a trusted
         # login" and could not tell what to fix.
