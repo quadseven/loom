@@ -1399,7 +1399,8 @@ def _triage_comment(missing: List[str]) -> str:
             % (TRIAGE_MARKER, ", ".join(missing)))
 
 
-def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
+def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
+          comment_limit: Optional[int] = None) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
@@ -1418,6 +1419,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     cap = goal_cap()
     lines: List[str] = []
     done = 0
+    comments = 0
     for issue in _oldest_open_issues(gh, repo):
         if done >= limit:
             break
@@ -1441,9 +1443,11 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             in_flight += 1
             lines.append("#%d queued under #%d" % (number, goal))
         else:
-            comment = _triage_comment(missing)
-            _check_written_text(comment)
-            gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+            if comment_limit is None or comments < comment_limit:
+                comment = _triage_comment(missing)
+                _check_written_text(comment)
+                gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+                comments += 1
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:triage"]})
             lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))

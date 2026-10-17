@@ -3756,7 +3756,7 @@ class Station:
         if not self._backlog_scan_due(state):
             goals: Dict[str, Tuple[str, int, Any]] = {}
             for key, last in state.items():
-                if key == "_scanned":
+                if key.startswith("_"):
                     continue
                 repo, num = key.rsplit("#", 1)
                 goals[key] = (repo, int(num), last)
@@ -3768,14 +3768,30 @@ class Station:
             return None
         goals = {}
         keep = {"_scanned"}
+        fallback = []
+        repos_with_backlog = set()
         for repo, goal in homes:
             title = str(goal.get("title") or "")
             if not title.startswith("Backlog:"):
+                continue
+            repos_with_backlog.add(repo)
+            number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            keep.add(key)
+            goals[key] = (repo, number, state.get(key))
+        for repo, goal in homes:
+            if repo in repos_with_backlog or str(goal.get("title") or "").startswith("Backlog:"):
                 continue
             number = int(goal["number"])
             key = "%s#%d" % (repo, number)
             keep.add(key)
             goals[key] = (repo, number, state.get(key))
+            fallback.append(key)
+        if fallback:
+            keep.add("_fallback")
+            state["_fallback"] = fallback
+        else:
+            state.pop("_fallback", None)
         for stale in [k for k in state if k not in keep]:
             del state[stale]
         state["_scanned"] = self.now
@@ -3807,11 +3823,25 @@ class Station:
         goals = self._backlog_goals(state)
         if goals is None:
             return
+        fallback = set(state.get("_fallback", []))
         for key, (repo, number, last) in goals.items():
             if self._triage_recent(last):
                 continue
             try:
-                self._run_triage(key, repo, number)
+                if key in fallback:
+                    queued = self.gh.paginate(
+                        "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
+                    if len(queued if isinstance(queued, list) else []) >= 3:
+                        continue
+                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT,
+                                         comment_limit=5)
+                    counts = (sum(" queued under #" in line for line in lines),
+                              sum(" loom:triage" in line for line in lines),
+                              sum(" held:" in line for line in lines))
+                    _say("triage %s: %d queued, %d triage, %d held (goal home)" %
+                         (key, *counts))
+                else:
+                    self._run_triage(key, repo, number)
             except (GitHubError, OSError, ValueError) as err:
                 _say("triage %s failed: %s" % (key, err))
                 continue
@@ -3825,6 +3855,8 @@ class Station:
         state = _read_json(os.path.join(self.state, "triage.json"), {}, strict=False)
         goals = []
         for key in state if isinstance(state, dict) else []:
+            if key.startswith("_"):
+                continue
             repo, _, num = key.rpartition("#")
             if repo and num.isdigit():
                 goals.append((key, repo, int(num)))
