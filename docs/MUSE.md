@@ -580,3 +580,9 @@ say-so alone:
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
 - Never retry a failed step in the same tick. Stop at 15 minutes.
+- Never open a pull request for an issue that is not a Loom ticket. To get
+  code written, brief a ticket and let a lane take it. The station lands,
+  sends back and reconciles only pull requests linked to a ticket, so a pull
+  request outside one sits with no owner
+  (docs/decisions/0002-floating-brain-and-brain-memory.md). The remote pull
+  lane is the one way Muse writes code, and `bus.lane pr` links its ticket.
