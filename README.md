@@ -92,3 +92,14 @@ deployment repository exposes a build run for the pull request's head commit,
 the station comments with the run link on the goal home. The repository
 configuration must give the station token read access to the ship document
 and write access to the deployment repository and goal home.
+
+For a roll held by a family gate, set `gate_url` on its
+`LOOM_ROLL_SHIP_DOCS` entry. Keep the real endpoint in the station's private
+environment. It must be HTTPS and return JSON with a boolean `open` field.
+While the source-pin pull request is open, each station pass reads the gate.
+A closed gate leaves the pull request held. At an open gate, the station uses
+the brain's ticketless merge checks, including a trusted author, successful
+checks, a passing review check on the head, and resolved threads. If those
+checks refuse the merge, it posts one journal alert per head commit on the
+goal home for the next brain tick. Add the station login to
+`LOOM_BRIEF_AUTHORS` so its roll pin pull requests qualify for the merge.
