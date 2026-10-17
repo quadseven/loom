@@ -1000,19 +1000,29 @@ def goal_walk(gh: GitHub, repo: str, goal: int,
     if search:
         homes = [(goal, direct)] + [(_number(e), found) for e, found in walked
                                     if e.get("state") == "open"]
-        hits = _part_of_hits(gh, repo, [n for n, _ in homes])
-        for item in hits:
-            named = next((found for n, found in homes if _names_goal(item.get("body"), n)), None)
-            if named is not None:
-                if all(_number(t) != _number(item) for t in named):
-                    named.append(item)
-            elif any(_mentions_goal(item.get("body"), n) and not _sub_issue_of(item, repo, n)
-                     for n, _ in homes):
-                loose.append(item)
+        loose = _sort_part_of_hits(gh, repo, homes)
     walk = GoalWalk(goal, walked, direct, [])
     counted = {_number(t) for t in walk.tickets}
     walk.loose = [i for i in loose if _number(i) not in counted]
     return walk
+
+
+def _sort_part_of_hits(gh: GitHub, repo: str,
+                       homes: List[Tuple[int, List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+    """Search the Part of lines naming each home (the goal, its open epics)
+    and add each hit to the ticket list of the home its own line names, once.
+    Returns the hits that name a home only inside a sentence and are not its
+    sub-issue."""
+    loose: List[Dict[str, Any]] = []
+    for item in _part_of_hits(gh, repo, [n for n, _ in homes]):
+        body = item.get("body")
+        named = next((found for n, found in homes if _names_goal(body, n)), None)
+        if named is not None:
+            if all(_number(t) != _number(item) for t in named):
+                named.append(item)
+        elif any(_mentions_goal(body, n) and not _sub_issue_of(item, repo, n) for n, _ in homes):
+            loose.append(item)
+    return loose
 
 
 def unassociated_tickets(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
