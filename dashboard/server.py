@@ -9,6 +9,7 @@ import hmac
 import ssl
 import statistics
 import socket
+import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -25,6 +26,7 @@ from . import usage as usage_store
 from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
+from . import tickets_table
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
@@ -42,7 +44,36 @@ def _all_tickets(state):
             model = models.get("%s#%s" % (row.get("repo"), row.get("number")))
             if model:
                 row["model"] = model
+    footer_runs = payload.get("footer_runs")
+    if footer_runs is None:
+        footer_runs = views.footer_runs(payload.get("pull_requests", []))
+    tickets_table.resolve_models(rows, footer_runs=footer_runs, latest=_latest_runs(state),
+                                 comments=payload.get("issue_comments") or [])
     return rows
+
+
+LATEST_RUNS_TTL = 60
+
+
+def _latest_runs(state):
+    """{ticket: its newest stored run} from the transcript store, read at
+    most once a minute; empty when the store is not configured or fails, so
+    the model falls back to the pull request footer and claim comments."""
+    cached = getattr(state, "_latest_runs", None)
+    if cached and time.monotonic() - cached[0] < LATEST_RUNS_TTL:
+        return cached[1]
+    store = _transcript_store(state)
+    latest = {}
+    if store is not None and hasattr(store, "latest"):
+        try:
+            latest = store.latest()
+        except (RuntimeError, *transcript_store.storage_errors()):
+            latest = {}
+    try:
+        state._latest_runs = (time.monotonic(), latest)
+    except AttributeError:
+        pass
+    return latest
 
 
 def _ticket_href(row):
@@ -59,7 +90,8 @@ def _ticket_row(row):
     flag = ("attempt %s / " % html.escape(str(attempt)) if isinstance(attempt, int) and attempt > 1 else "")
     flag += html.escape(str(current or "unlabeled"))
     identifier = "%s#%s" % (row.get("repo", ""), row.get("number", ""))
-    lane_model = "%s / %s" % (row.get("lane") or "unassigned", row.get("model") or "model unknown")
+    lane_model = "%s / %s" % (row.get("lane") or "unassigned",
+                              row.get("model_text") or row.get("model") or tickets_table.NOT_RUN)
     return ('<a class="ticket-row" href="%s"><div class="ticket-top machine-fact"><span>%s</span>'
             '<span class="state-%s">%s</span></div><div class="ticket-title">%s</div>'
             '<div class="ticket-bottom"><div class="progress" aria-label="Ticket progress">%s</div>'
@@ -651,25 +683,13 @@ def _number(value):
 
 
 def _ticket_page(state, parsed):
-    params = parse_qs(parsed.query)
     rows = _all_tickets(state)
-    filtered = [row for row in rows if (not params.get("state") or row.get("state") == params["state"][0])
-                and (not params.get("goal") or row.get("goal") == params["goal"][0])
-                and (not params.get("model") or row.get("model") == params["model"][0])]
-    state_chips = ''.join('<a class="chip" href="/tickets?state=%s">%s %d</a>' % (
-        name, name, sum(row.get("state") == name for row in rows)) for name in STATES
-        if any(row.get("state") == name for row in rows))
-    goals = sorted({row["goal"] for row in rows if row.get("goal")})
-    goal_chips = ''.join('<a class="chip" href="/tickets?goal=%s">%s</a>' % (quote(goal, safe=""), html.escape(goal)) for goal in goals)
-    models = sorted({row["model"] for row in rows if row.get("model")})
-    model_chips = ''.join('<a class="chip" href="/tickets?model=%s">%s %d</a>' % (
-        quote(model, safe=""), html.escape(model),
-        sum(row.get("model") == model for row in rows)) for model in models)
-    body = '<div class="chips">%s %s %s</div>' % (state_chips, goal_chips, model_chips)
-    if filtered:
-        body += '<div class="ticket-grid">%s</div>' % ''.join(_ticket_row(row) for row in filtered)
-    else:
-        body += '<div class="empty-state"><p>No tickets match these filters.</p><a class="chip" href="/tickets">Clear filters</a></div>'
+    payload = state.response()
+    goal_data = payload.get("goal_context") or {}
+    titles = {goal: (info or {}).get("title") for goal, info in goal_data.items()} if isinstance(goal_data, dict) else {}
+    body = tickets_table.render(rows, parse_qs(parsed.query), goal_titles=titles,
+                                entered=payload.get("state_entered") or {}, now=time.time(),
+                                ticket_href=_ticket_href, short_ref=_short_ref)
     return page("Tickets", "tickets", body, status="snapshot")
 
 
@@ -921,7 +941,8 @@ def _dispatch_basic(handler, state, path):
 
 # The raw sources the views read in-process, served as counts: whole pull
 # requests and two weeks of comments made /api/tickets 164 MB (2026-10-15).
-RAW_SOURCES = ("pull_requests", "issue_comments", "review_comments", "footer_models")
+RAW_SOURCES = ("pull_requests", "issue_comments", "review_comments", "footer_models", "footer_runs",
+               "state_entered")
 
 
 def _api_tickets(payload):

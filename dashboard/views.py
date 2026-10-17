@@ -208,6 +208,23 @@ def footer_models(prs):
     return {key: model for key, (_, model) in newest.items()}
 
 
+def footer_runs(prs):
+    """Each ticket's newest lane pull request footer as {"owner/name#N":
+    (opened_at, model, pull request number, pull request URL)}. The runner
+    writes the footer when it opens the pull request and never rewrites it
+    on a fix push, so the opening time dates the run that model made."""
+    newest = {}
+    for pr in prs:
+        parsed = footer(pr.get("body"))
+        if not parsed:
+            continue
+        key = "%s#%s" % (parsed[0], parsed[1])
+        when = str(pr.get("created_at") or pr.get("updated_at") or "")
+        if key not in newest or when >= newest[key][0]:
+            newest[key] = (when, parsed[3], pr.get("number"), pr.get("html_url"))
+    return newest
+
+
 def build_scoreboard(pull_requests):
     """Count lane PRs by footer model and difficulty tier."""
     tiers = {}

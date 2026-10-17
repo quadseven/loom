@@ -505,23 +505,37 @@ def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set
     (bus/brain.py _lane_model). On 2026-10-16 a ticket's three attempts on
     gpt-6-sol carried no rung marker, and the factory moved it back to
     gpt-6-sol for a fourth."""
+    ran: set = set()
+    for comment, model in claim_models(issue, comments):
+        if comment is None:
+            ran = set()  # a rung 0 marker starts the ladder again
+        else:
+            ran |= {model} - {None}
+    return ran
+
+
+def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> List[Tuple[Optional[Dict[str, Any]], Optional[str]]]:
+    """Each claim comment, oldest first, as (comment, the model it ran on or
+    None when nothing names one), by the rules in ran_models; a rung 0 marker
+    appears as (None, None), where the ladder starts again. The dashboard
+    reads the newest claim's model as the model the ticket's last run used."""
     match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
     body_model = match.group(1) if match else None
     bodies = [str(c.get("body") or "") for c in comments]
     marks = [i for i, body in enumerate(bodies) if _mark_model(body)[0]]
     current = body_model if not marks else None
-    ran: set = set()
+    out: List[Tuple[Optional[Dict[str, Any]], Optional[str]]] = []
     for i, body in enumerate(bodies):
         sets, model = _mark_model(body)
         if sets:
             if [m.group(1) for m in RUNG_RE.finditer(body)][-1:] == ["0"]:
-                ran = set()  # a rung 0 marker starts the ladder again
+                out.append((None, None))
             current = (body_model or model) if i == marks[-1] else model
             continue
         claim = CLAIMED_RE.fullmatch(body.strip())
         if claim:
-            ran |= {current or brain._lane_model(claim.group(1))} - {None}
-    return ran
+            out.append((comments[i], current or brain._lane_model(claim.group(1))))
+    return out
 
 
 def ran_rungs(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set:

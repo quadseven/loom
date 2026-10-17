@@ -29,6 +29,14 @@ accepts an upload, or serves a transcript read. This bounds retained history
 during normal dashboard use; it does not depend on how lane runs generate
 their transcripts.
 
+`/tickets` lists the tickets in flight in one table per goal home; `?done=1`
+lists merged, shipped, verified and closed ones, and `state`, `goal` and
+`model` filter it. Its model column is the model of the newest run among
+three records: the stored transcript, the lane pull request footer, and the
+station's claim comment (whose model follows the ladder rules). It says "not
+run yet" when none exists and "model not recorded" when the newest run names
+no model. The age in state comes from the hourly label-event read.
+
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one
 repository, and startup logs the time taken for that snapshot.
