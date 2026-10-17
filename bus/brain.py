@@ -29,7 +29,12 @@ DEFAULT_GOAL_CAP = 16
 # Merged and shipped tickets that still wait on a live check. A verified
 # ticket carries loom:verified instead of loom:shipped (or loom:merged for a
 # docs proof), so it never counts here.
-UNPROVEN = ("loom:merged", "loom:shipped")
+# Verification debt: shipped tickets with no standing proof. A merged ticket
+# is waiting on a deploy, not on a verifier, and in a repo with no ship step
+# it never leaves merged; counting it pinned goals over the limit and kept
+# the factory from starting any build work (2026-10-17: the loom goal at
+# 27/15 and another goal at 41/15 while all four GPU slots sat idle).
+UNPROVEN = ("loom:shipped",)
 # A verifier checked the ticket and found its live evidence has not happened
 # yet (the station adds the label). It waits on the world, not on a verifier,
 # so it does not hold the unproven-work limit: 54 of the 58 loom tickets
@@ -39,7 +44,8 @@ AWAITING_EVIDENCE = "loom:awaiting-evidence"
 # label comes from a lane's verify.json, so a lane that always says "missing"
 # must not be able to switch the limit off.
 AWAITING_CAP_FACTOR = 2
-DEFAULT_UNVERIFIED_LIMIT = 15
+# Raised 15 -> 30 on 2026-10-17: 15 held the factory still on most days.
+DEFAULT_UNVERIFIED_LIMIT = 30
 # A ticket admitted for a measured regression of a shipped one. Past the cap,
 # a goal admits one such ticket at a time (its regression slot).
 REGRESSION = "loom:regression"
@@ -280,7 +286,7 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
             held, waiting = _goal_counts(gh, repo, int(issue["number"]), issue)
-            lines.append("  - unproven work %d/%d (merged or shipped with no standing proof; "
+            lines.append("  - unproven work %d/%d (shipped with no standing proof; "
                          "%d more await live evidence and do not count)"
                          % (held, limit, waiting))
             if held > limit:
@@ -938,7 +944,7 @@ def _check_goal_capacity(children: List[Dict[str, Any]], goal: int) -> None:
 
 
 def _unproven(issue: Dict[str, Any]) -> bool:
-    """An open loom:ticket at merged or shipped: unproven work still waiting on
+    """An open loom:ticket at shipped: unproven work still waiting on
     a live check. A verified ticket carries loom:verified instead, so it never
     counts."""
     names = _labels(issue)
@@ -948,7 +954,7 @@ def _unproven(issue: Dict[str, Any]) -> bool:
 
 
 def _awaiting(issue: Dict[str, Any]) -> bool:
-    """An open merged or shipped ticket a verifier checked and left waiting on
+    """An open shipped ticket a verifier checked and left waiting on
     live evidence (loom:awaiting-evidence)."""
     names = _labels(issue)
     return (issue.get("state") == "open" and "loom:ticket" in names
@@ -978,7 +984,7 @@ def _goal_unproven(gh: GitHub, repo: str, goal: int,
 
 
 def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
-    """The goal's tickets at merged or shipped: unproven work still waiting on
+    """The goal's tickets at shipped: unproven work still waiting on
     a live check. A verified ticket carries loom:verified instead, so it
     never counts; a failed audit moves a ticket back to shipped, so it does."""
     return _goal_unproven(gh, repo, goal)
@@ -988,7 +994,7 @@ def _check_goal_unproven(children: List[Dict[str, Any]], goal: int) -> None:
     count = _count_unproven(children)[0]
     limit = unverified_limit()
     if count > limit:
-        raise ValueError("goal #%d has %d tickets at merged or shipped without a proof "
+        raise ValueError("goal #%d has %d tickets shipped without a proof "
                          "(limit %d); verify them before briefing more build work; only a "
                          "measured regression of a shipped ticket passes it (--regresses)"
                          % (goal, count, limit))
