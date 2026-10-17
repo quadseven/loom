@@ -229,6 +229,41 @@ section() {
   awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
+# When a brief declares Allowed paths, every path in the branch change must
+# match one entry. An entry names a file or a directory subtree.
+refuse_out_of_scope_paths() {
+  local brief="$1" head="$2" path allowed matched changed_files
+  local allowed_file
+  allowed_file="$(mktemp)" || { echo "could not check allowed paths"; return 1; }
+  section "Allowed paths" "$brief" > "$allowed_file"
+  [ -s "$allowed_file" ] || { rm -f "$allowed_file"; return 0; }
+  if ! changed_files="$(safe_git diff --name-only "$BASE" "$head")"; then
+    rm -f "$allowed_file"
+    echo "could not read changed paths for allowed paths check"
+    return 1
+  fi
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    matched=0
+    while IFS= read -r allowed; do
+      allowed="${allowed#- }"
+      [ -n "$allowed" ] || continue
+      if [[ "$path" == "$allowed" || "$path" == "$allowed/"* ]]; then
+        matched=1
+        break
+      fi
+    done < "$allowed_file"
+    if [ "$matched" -eq 0 ]; then
+      echo "refused commit: $path is outside allowed paths"
+      rm -f "$allowed_file"
+      return 1
+    fi
+  done <<EOF
+$changed_files
+EOF
+  rm -f "$allowed_file"
+}
+
 # Chief's format: ## Intent (the change class), ## Why, ## Summary,
 # ## Acceptance criteria, Size:, ## Out of scope.
 INTENT_CLASS=""
@@ -1734,6 +1769,11 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
+  fi
+  if ! SCOPE_REASON="$(refuse_out_of_scope_paths "$BRIEF" "$BRANCH_HEAD")"; then
+    echo "[$(date -u +%FT%TZ)] $TICKET $SCOPE_REASON" >> "$LOG"
+    park "$BRIEF" "$SCOPE_REASON"
+    continue
   fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.

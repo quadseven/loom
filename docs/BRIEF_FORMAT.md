@@ -42,6 +42,13 @@ The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that
 branch, and opens the pull request. Lanes never merge pull requests.
 
+An optional `## Allowed paths` section limits which files the lane may commit.
+List one repository-relative file or directory per line; a directory allows
+files beneath it. When the section is present and non-empty, the runner checks
+the full branch change before pushing and parks the brief with the offending
+path if any changed file is outside the list. Briefs without this section
+retain the existing unrestricted path behavior.
+
 ```markdown
 # Brief: T0001-<slug>
 
@@ -58,6 +65,10 @@ Deliverable: answer (optional; the station also writes verify; any other value p
 
 ## What
 <what to change>
+
+## Allowed paths (optional)
+src/example.py
+tests/
 
 ## Acceptance criteria
 - [ ] <observable result>

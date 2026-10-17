@@ -180,6 +180,13 @@ if [ "${FAKE_AGENT:-commit}" = binref ]; then
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = stray ]; then
+  printf 'fixed\n' > fix.txt
+  printf 'stray\n' > stray.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
 printf '%s\\n' "${FAKE_AGENT_TEXT:-fixed}" > fix.txt
 if [ "${FAKE_AGENT:-commit}" = edit ]; then exit 0; fi
 if [ "${FAKE_AGENT:-commit}" = detached ]; then git checkout -q --detach HEAD; fi
@@ -515,6 +522,26 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertNotIn("dropped sandbox probe file", self.run_log())
         self.assertNotIn("Dropped sandbox probe files", self.body.read_text())
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_commit_outside_the_briefs_allowed_paths_is_refused_before_push(self):
+        brief = BRIEF.replace("## Ticket", "## Allowed paths\nfix.txt\n\n## Ticket")
+        self.drop_brief(text=brief)
+        result = self.run_lane(FAKE_AGENT="stray")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        refs = subprocess.run(["git", "ls-remote", str(self.remote),
+                               "refs/heads/loom/T042-fix-the-thing"],
+                              capture_output=True, text=True, check=True)
+        self.assertEqual(refs.stdout, "")
+        self.assertIn("refused commit: stray.txt is outside allowed paths", self.run_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_a_commit_with_only_brief_allowed_paths_is_pushed(self):
+        brief = BRIEF.replace("## Ticket", "## Allowed paths\nfix.txt\n\n## Ticket")
+        self.drop_brief(text=brief)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_agent_commit_is_pushed_and_opened_as_a_chief_ready_pr(self):
         self.drop_brief()
