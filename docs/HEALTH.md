@@ -15,13 +15,13 @@ order, instead of waiting for someone to notice and file them.
   "checked_at": "2026-10-15T13:30:00Z",
   "findings": [
     {
-      "key": "stuck-quest:member-7:the-quest",
-      "title": "Member 7 cannot finish the class quest",
-      "area": "quests",
+      "key": "stuck-checkout:member-7:the-cart",
+      "title": "Member 7 cannot finish checkout",
+      "area": "checkout",
       "affected": 1,
       "hours": 27.8,
       "impact": 27.8,
-      "evidence": "asked for help 16 times; the last party did not reach the objective",
+      "evidence": "asked for help 16 times; the last attempt did not reach the payment step",
       "since": "2026-10-14T09:40:00Z"
     }
   ]
@@ -32,7 +32,7 @@ order, instead of waiting for someone to notice and file them.
 |---|---|---|
 | `key` | `[A-Za-z0-9:._ -]{1,120}` | Stable id of one problem: the same problem has the same key on every read. Loom stores and shows only its sha1. |
 | `title` | ASCII, one line, at most 90 characters | What is wrong, in plain words. |
-| `area` | `[a-z-]{1,20}` | The part of the project (quests, dungeons, bags, ...). |
+| `area` | `[a-z-]{1,20}` | The part of the project (checkout, search, billing, ...). |
 | `affected` | number, 0 to 10000000 | How many things it hits now (members, runs, items). |
 | `hours` | number, 0 to 10000000 | How long it has lasted, in hours. |
 | `impact` | optional number, 0 to 10000000 | The project's own loss measure; without it, `affected x hours`. |

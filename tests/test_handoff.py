@@ -209,15 +209,15 @@ class ResumeCommandTests(unittest.TestCase):
             brain.defer(GitHub("t", transport=Routes(self.routes())), "failed", PR, "muse")
         with self.assertRaises(ValueError):
             brain.defer(GitHub("t", transport=Routes(self.routes())), "brief", TICKET, "muse",
-                        note="party-trip fix")
+                        note="checkout fix")
 
     def test_defer_brief_writes_marker_listed_by_resume_and_dropped_by_done(self):
         routes = self.routes()
         marker = brain.defer(GitHub("t", transport=Routes(routes)), "brief",
-                             (REPO, 1), "muse", note="party-trip fix")
+                             (REPO, 1), "muse", note="checkout fix")
         self.assertIn(" key=", marker)
         self.assertEqual(
-            '<!-- loom:defer v1 stage=brief item=%s#1 rev=open key=c7ec7cc4 holder=muse note="party-trip fix" -->' % REPO,
+            '<!-- loom:defer v1 stage=brief item=%s#1 rev=open key=345c819b holder=muse note="checkout fix" -->' % REPO,
             marker)
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
@@ -225,10 +225,10 @@ class ResumeCommandTests(unittest.TestCase):
         out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
                            "lane-machine", LOCK_REPO, NOW,
                            {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
-        self.assertIn("- resume brief %s#1: party-trip fix (deferred by muse at %s)" % (
+        self.assertIn("- resume brief %s#1: checkout fix (deferred by muse at %s)" % (
             REPO, at(10)), out)
 
-        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine", key="c7ec7cc4")
+        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine", key="345c819b")
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
             comment(journal(5, "lane-machine", done_line)),
@@ -268,7 +268,7 @@ class ResumeCommandTests(unittest.TestCase):
     def test_brief_handoff_whose_goal_home_was_closed_is_dropped_from_resume(self):
         routes = self.routes(goal_state="closed")
         marker = handoff.defer_marker("brief", (REPO, 1), "open", "muse",
-                                     note="party-trip fix")
+                                     note="checkout fix")
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
         ])
@@ -323,7 +323,7 @@ class ResumeCommandTests(unittest.TestCase):
 BRIEF = ("## Why\nwhy: the page query is slow for every visitor.\n## What\nwhat\n"
          "## Acceptance criteria\n- [ ] done\n- [ ] tested\n- [ ] live\n## Size\nS\n"
          "## Out of scope\n- none")
-BRIEF_DEFER = handoff.defer_marker("brief", (REPO, 1), "open", "muse", note="party-trip fix")
+BRIEF_DEFER = handoff.defer_marker("brief", (REPO, 1), "open", "muse", note="checkout fix")
 ENV = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
 
 

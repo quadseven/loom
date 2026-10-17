@@ -15,9 +15,9 @@ URL = "https://health.example.test/api/health"
 NOW = 1_900_000_000.0
 
 
-def finding(key="bags-full:Ana", title="Ana carries full bags", affected=3, hours=20.0,
-            evidence="3 members have 0 free slots; 41 loot rolls were passed", **extra):
-    item = {"key": key, "title": title, "area": "bags", "affected": affected,
+def finding(key="slow-search:Ana", title="Ana waits on slow search", affected=3, hours=20.0,
+            evidence="3 members waited over 5 seconds; 41 searches timed out", **extra):
+    item = {"key": key, "title": title, "area": "search", "affected": affected,
             "hours": hours, "evidence": evidence, "since": "2030-01-01T00:00:00Z"}
     item.update(extra)
     return item
@@ -100,12 +100,12 @@ class Intake(Base):
         self.assertEqual(len(self.briefs), 1)
         made = self.briefs[0]
         self.assertEqual((made["goal"], made["title"], made["difficulty"], made["priority"]),
-                         (1, "Health: Ana carries full bags", "medium", "P1"))
+                         (1, "Health: Ana waits on slow search", "medium", "P1"))
         digest = sha()
         self.assertIn(health.MARKER % digest, made["body"])
         self.assertIn("Live: the finding is absent from the health endpoint for 24 hours",
                       made["body"])
-        self.assertIn("evidence: 3 members have 0 free slots", made["body"])
+        self.assertIn("evidence: 3 members waited over 5 seconds", made["body"])
         # The ticket is open on the next pass: nothing is filed again.
         self.run_once(NOW + 900)
         self.assertEqual(len(self.briefs), 1)
@@ -114,7 +114,7 @@ class Intake(Base):
     def test_one_ticket_with_two_markers_owns_both_findings(self):
         # One cause, two findings (the same problem in two places): a
         # ticket carrying both markers absorbs both, and nothing is filed.
-        second = finding(key="bags:Bo", title="Bo carries full bags")
+        second = finding(key="search:Bo", title="Bo waits on slow search")
         self.doc["findings"] = [finding(), second]
         self.gh.open.append({"number": 100, "labels": [{"name": "loom:ticket"}], "body":
                              "Priority: P1\n\n## Why\nx\n\n%s\n%s"
@@ -202,7 +202,7 @@ class Intake(Base):
         bad = [[], {"findings": "x"}, {"findings": [finding(affected="3")]},
                {"findings": [finding(), finding()]},
                {"findings": [finding(key="a/b")]}, {"findings": [finding(key="k" * 121)]},
-               {"findings": [finding(key="")]}, {"findings": [finding(area="Bags")]},
+               {"findings": [finding(key="")]}, {"findings": [finding(area="Search")]},
                {"findings": [finding(area="b" * 21)]}, {"findings": [finding(hours=-1)]},
                {"findings": [finding(hours=float("nan"))]}, {"findings": [finding(affected=True)]},
                {"findings": [finding(affected=2e7)]}, {"findings": [finding(since="yesterday")]},
@@ -430,8 +430,8 @@ class Regression(Base):
         evidence = "\n".join(brain._regression_evidence(body, 100))
         self.assertIn("still reported 30 hours after the ticket shipped", evidence)
         self.assertIn("impact 60 (P1)", evidence)
-        self.assertIn("```text\ntitle: Ana carries full bags\n"
-                      "evidence: 3 members have 0 free slots", evidence)
+        self.assertIn("```text\ntitle: Ana waits on slow search\n"
+                      "evidence: 3 members waited over 5 seconds", evidence)
         self.assertIn("untrusted data", evidence)
         # The brief passes the checks brain brief applies before it files.
         brain._check_brief_args(brief["title"], body, None, None, None)
@@ -545,10 +545,10 @@ class RegressionThroughBrain(unittest.TestCase):
         names = sorted(x["name"] for x in ticket["labels"])
         self.assertEqual(names, ["loom:queued", "loom:regression", "loom:ticket"])
         body = ticket["body"]
-        self.assertIn("## Regression\n\nHealth regression: Ana carries full bags\n\n"
+        self.assertIn("## Regression\n\nHealth regression: Ana waits on slow search\n\n"
                       "Regresses #100\nThe health finding this ticket fixes is still "
                       "reported 26 hours after the ticket shipped", body)
-        self.assertIn("evidence: 3 members have 0 free slots", body)
+        self.assertIn("evidence: 3 members waited over 5 seconds", body)
         tickets.parse(body)
         # Back in a build state: the next pass leaves it to that work.
         health.Intake(repo, state, NOW + 900, "2030-01-02T00:15:00Z", said.append,
@@ -558,7 +558,7 @@ class RegressionThroughBrain(unittest.TestCase):
     def test_a_second_finding_on_the_ticket_keeps_the_re_briefed_body(self):
         # Two findings, one ticket: the lower one's Priority edit in the same
         # pass writes the body as re-briefed, not as it was read before.
-        first, second = finding(), finding(key="bags:Bo", title="Bo carries full bags",
+        first, second = finding(), finding(key="search:Bo", title="Bo waits on slow search",
                                            affected=1, hours=2.0)
         fs = [health._finding(first)[0], health._finding(second)[0]]
         ticket = {"number": 100, "state": "open", "html_url": "https://example.test/t/100",
