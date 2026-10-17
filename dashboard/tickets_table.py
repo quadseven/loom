@@ -84,8 +84,8 @@ def resolve_models(rows: Sequence[Dict[str, Any]], *, footer_runs: Dict[str, Seq
         when, model = last_run(row, transcript=latest.get(key), footer=footer, comments=claims.get(key, ()))
         if when is None and row.get("state") in RAN_STATES:
             # It ran before the records the dashboard keeps: the run used the
-            # model its body names, else its lane's ladder model, as a claim
-            # does (bus/factory.py claim_models).
+            # model its body names, else its lane's configured model, as a
+            # claim does (bus/factory.py claim_models).
             when = 0.0
             model = _model(row.get("model")) or (brain._lane_model(row["lane"]) if row.get("lane") else None)
         row["run_model"] = model

@@ -547,11 +547,19 @@ it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
 2. the codex lane (or codex-2) with `gpt-6-sol`;
-3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot;
+4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
+   agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
 
-A rung counts as tried once the ticket was claimed on its model, read from
-the ticket's `Model:` line before the ladder started as well as from the
-ladder's own moves. A green, reviewed pull request is not escalated: a ticket
+A rung counts as tried once the ticket was claimed on its model. The model a
+claim ran is what ran: the `Model:` line in force (the ticket's own before the
+ladder started, then the ladder's moves), else the model the runner footer of
+its lane's pull request names (`lane <lane>, model <model>`), else the lane's
+configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
+Once a ticket ran on Opus or past it, it climbs only to the untried strong
+models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
+lane of its next rung is up, it waits with no comment; the factory says it
+tried every rung only once every rung with a lane for its repo was tried. A green, reviewed pull request is not escalated: a ticket
 whose open pull request has nothing to fix (its head is green, the review
 check passed on that head, and no review thread is open) is landed, whatever
 its fix rounds.
