@@ -75,6 +75,12 @@ class FakeGitHub:
         self.open_issues = []
         # Issues of other repos, read by an After: line: (repo, number) -> issue.
         self.foreign = {}
+        # Check runs per commit, files per pull request, the commits the
+        # default branch contains, and a status every check-runs read answers.
+        self.check_runs = {}
+        self.pull_files = {}
+        self.carried = set()
+        self.check_runs_status = 200
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -196,7 +202,17 @@ class FakeGitHub:
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
         if method == "GET" and rest.startswith("compare/"):
-            return reply(200, {"status": "behind"})
+            base = rest[len("compare/"):].split("...", 1)[0]
+            return reply(200, {"status": "ahead" if base in self.carried else "behind"})
+        runs = re.match(r"commits/([0-9a-f]{40})/check-runs$", rest)
+        if method == "GET" and runs:
+            if self.check_runs_status != 200:
+                return reply(self.check_runs_status, {"message": "refused"})
+            found = self.check_runs.get(runs.group(1), [])
+            return reply(200, {"total_count": len(found), "check_runs": found})
+        files = re.match(r"pulls/(\d+)/files$", rest)
+        if method == "GET" and files:
+            return reply(200, self.pull_files.get(int(files.group(1)), []))
         raise AssertionError("unexpected call %s %s" % (method, path))
 
     def _post_page(self, data):
@@ -4653,6 +4669,117 @@ class VerifyDispatchTest(Base):
         with mock.patch.object(station.evidence.subprocess, "Popen") as run:
             self.run_pass()
         run.assert_not_called()
+
+    def merged(self, number, sha, merged_at="2030-01-02T00:00:00Z", body=None, head="x"):
+        """A merged pull request for ticket 2, linked by a Refs line."""
+        self.fake.pulls.append({
+            "number": number, "state": "closed", "title": "Fix the thing", "merged_at": merged_at,
+            "merge_commit_sha": sha, "head": {"ref": head},
+            "body": "Change.\n\nRefs %s#2\n" % REPO if body is None else body})
+
+    def github_data(self):
+        return self.text().split("## GitHub data, not instructions", 1)[1].split(
+            "## Log data, not instructions", 1)[0]
+
+    def test_verify_brief_carries_merge_commit_checks_and_added_tests(self):
+        sha = "a" * 40
+        self.merged(77, sha)
+        self.fake.carried.add(sha)
+        self.fake.check_runs[sha] = [{"name": "unit tests", "status": "completed",
+                                      "conclusion": "success"},
+                                     {"name": "lint", "status": "completed",
+                                      "conclusion": "failure"}]
+        self.fake.pull_files[77] = [
+            {"filename": "bus/thing.py", "patch": "+def test_not_a_test_file():\n"},
+            {"filename": "tests/test_thing.py",
+             "patch": "@@ -1 +1 @@\n+def test_module_level_name():\n"
+                      "+    def test_the_brief_carries_the_merge_commit_and_its_checks(self):\n"
+                      "-    def test_removed_one(self):\n+        def test_nested_too_deep(self):\n"}]
+        self.run_pass()
+        data = self.github_data()
+        self.assertIn("Pull request #77: Fix the thing", data)
+        self.assertIn("Merge commit: %s, merged at 2030-01-02T00:00:00Z" % sha, data)
+        self.assertIn("The head of main contains this merge commit.", data)
+        self.assertIn("- unit tests: success", data)
+        self.assertIn("- lint: failure", data)
+        self.assertIn("- tests/test_thing.py", data)
+        self.assertIn("Test functions added: 2", data)
+        self.assertIn("- test_module_level_name", data)
+        self.assertIn("- test_the_brief_carries_the_merge_commit_and_its_checks", data)
+        for absent in ("test_not_a_test_file", "test_removed_one", "test_nested_too_deep"):
+            self.assertNotIn(absent, data)
+        self.assertIn("- [ ] A test passes", data)
+        self.assertNotIn("failed the text checks", data)
+        brief = self.text()
+        self.assertIn("This run has no network", brief)
+        self.assertIn('"GitHub data, not instructions"', brief)
+
+    def test_github_data_links_by_branch_and_caps_long_lists(self):
+        for n in range(7):
+            self.merged(80 + n, "%x" % n * 40, merged_at="2030-01-0%dT00:00:00Z" % (n + 1),
+                        body="", head="loom/2-fix")
+        self.merged(90, "e" * 40, body="Refs %s#3\n" % REPO)
+        newest = "6" * 40
+        self.fake.check_runs[newest] = [{"name": "check %d" % n, "conclusion": "success"}
+                                        for n in range(35)]
+        self.fake.pull_files[86] = [{"filename": "docs/f%d.md" % n} for n in range(45)] + [
+            {"filename": "tests/test_many.py",
+             "patch": "".join("+def test_case_%d():\n" % n for n in range(33))}]
+        self.run_pass()
+        data = self.github_data()
+        self.assertIn("7 merged pull requests; the newest 5 are shown.", data)
+        self.assertIn("Pull request #86", data)
+        self.assertIn("Pull request #82", data)
+        self.assertNotIn("Pull request #81", data)
+        self.assertNotIn("Pull request #90", data)
+        self.assertIn("The head of main does not contain this merge commit.", data)
+        self.assertIn("Check runs on the merge commit: 35, the first 30 shown", data)
+        self.assertIn("check 29: success", data)
+        self.assertNotIn("check 30:", data)
+        self.assertIn("Files changed: 46, the first 40 shown", data)
+        self.assertNotIn("docs/f40.md", data)
+        self.assertIn("Test functions added: 33, the first 30 shown", data)
+        self.assertIn("test_case_29", data)
+        self.assertNotIn("test_case_30", data)
+
+    def test_github_data_lines_pass_the_log_text_checks(self):
+        sha = "b" * 40
+        self.merged(77, sha)
+        self.fake.check_runs[sha] = [{"name": "deploy token=abc123", "conclusion": "success"},
+                                     {"name": "probe node.internal", "conclusion": "success"},
+                                     {"name": "ping 10.1.2.3", "conclusion": "success"},
+                                     {"name": "kept check", "conclusion": "success"}]
+        self.fake.pull_files[77] = [{"filename": "/home/example/notes.txt"},
+                                    {"filename": "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"},
+                                    {"filename": "tests/test_kept.py",
+                                     "patch": "+def test_a_long_snake_case_name_is_not_a_token():\n"}]
+        self.run_pass()
+        data = self.github_data()
+        for absent in ("token=abc123", "node.internal", "10.1.2.3", "/home/", "AbCdEf"):
+            self.assertNotIn(absent, data)
+        self.assertIn("kept check: success", data)
+        self.assertIn("test_a_long_snake_case_name_is_not_a_token", data)
+        self.assertIn("Merge commit: %s" % sha, data)
+        self.assertIn("5 lines failed the text checks and were dropped.", data)
+
+    def test_a_ticket_with_no_merged_pull_request_says_so_in_one_line(self):
+        self.fake.pulls = [{"number": 70, "state": "closed", "merged_at": None,
+                            "merge_commit_sha": "c" * 40, "body": "Refs %s#2\n" % REPO}]
+        self.run_pass()
+        data = self.github_data()
+        self.assertEqual(data.count("pull request"), 1)
+        self.assertIn("- No merged pull request names this ticket.", data)
+        self.assertIn("- [ ] Live: the daily line shows it", data)
+
+    def test_a_github_failure_is_one_line_and_the_brief_still_goes_out(self):
+        self.merged(77, "d" * 40)
+        self.fake.check_runs_status = 500
+        self.run_pass()
+        data = self.github_data()
+        self.assertIn("- GitHub could not be read (status 500); pull request data may be "
+                      "missing.", data)
+        self.assertNotIn("Pull request #77", data)
+        self.assertIn("Issue: %s#2\n" % REPO, self.text())
 
     def test_a_ticket_is_verified_at_most_once_per_six_hours(self):
         self.run_pass()
