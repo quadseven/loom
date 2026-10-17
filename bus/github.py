@@ -29,6 +29,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from . import proof
+
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
 # A read that failed on the wire is tried again after these pauses (seconds).
@@ -41,9 +43,21 @@ APP_JWT_BACKDATE = 60
 APP_JWT_LIFETIME = 540
 APP_SETTINGS = ("LOOM_GITHUB_APP_ID", "LOOM_GITHUB_APP_INSTALLATION_ID",
                 "LOOM_GITHUB_APP_KEY_SSM")
+# The App's private key as a mounted file (a Kubernetes secret), in place of
+# the parameter-store setting; it wins when both are set.
+APP_KEY_FILE = "LOOM_GITHUB_APP_KEY_FILE"
 
 Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
                      Tuple[int, Dict[str, str], bytes]]
+
+# A PATCH to one of these that sets state=closed is an issue close; every
+# programmatic close in the factory funnels through GitHub.rest, so this is
+# the choke point the close-completeness gate watches.
+_ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/[0-9]+$")
+
+# Labels that let an issue close as completed with unchecked boxes, mirroring
+# the close-completeness guard's escape hatches.
+_FORCE_CLOSE_LABELS = ("force-close", "wontfix")
 
 
 class GitHubError(Exception):
@@ -148,6 +162,12 @@ def read_ssm(name: str, region: str) -> str:
     return out.stdout.strip()
 
 
+def read_key_file(path: str) -> str:
+    """The App's private key from a mounted file, read at each mint."""
+    with open(path, encoding="ascii") as fh:
+        return fh.read()
+
+
 def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
@@ -217,16 +237,26 @@ class AppToken:
         self._token: Optional[str] = None
         self._expires = 0.0
         self.minted = 0
+        # Where the key is read from: "ssm" (the aws CLI) or "file".
+        self.key_source = "ssm"
+        self.key_file = ""
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None,
                  read_key: Optional[Callable[[str, str], str]] = None
                  ) -> Optional["AppToken"]:
-        """The App token the settings name, or None when any is unset."""
+        """The App token the settings name, or None when any is unset. The
+        key comes from LOOM_GITHUB_APP_KEY_FILE when that is set, else from
+        LOOM_GITHUB_APP_KEY_SSM."""
         env = os.environ if env is None else env
         app_id, installation_id, key_ssm = (env.get(n, "").strip() for n in APP_SETTINGS)
-        if not (app_id and installation_id and key_ssm):
+        key_file = env.get(APP_KEY_FILE, "").strip()
+        if not (app_id and installation_id and (key_ssm or key_file)):
             return None
+        if key_file:
+            app = cls(app_id, installation_id, lambda: read_key_file(key_file))
+            app.key_source, app.key_file = "file", key_file
+            return app
         region = env.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
         reader = read_key or read_ssm
         return cls(app_id, installation_id, lambda: reader(key_ssm, region))
@@ -329,6 +359,7 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
         # the cache does, when there is one.
@@ -346,6 +377,41 @@ class GitHub:
         if method == "GET" and not etag:
             self._keep_answer(url, status, data, resp_headers)
         return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
+        """Refuse a PATCH that would close an issue as completed while its
+        acceptance criteria are unchecked.
+
+        The brain's close() already refuses this, but a close that bypasses it
+        -- the conducted#209 close five seconds after its PR merged is the
+        shape -- used to land anyway and get reopened by the close-completeness
+        guard seconds later. Every programmatic close passes through rest(),
+        so refusing here makes the bad close impossible instead of merely
+        caught. Closes as not_planned, force-close/wontfix labels, pull
+        requests, and issues with no criteria at all are left alone, matching
+        the guard's own escape hatches.
+        """
+        if method != "PATCH" or not _ISSUE_PATH.match(path):
+            return
+        if not isinstance(body, dict) or body.get("state") != "closed":
+            return
+        if body.get("state_reason", "completed") != "completed":
+            return
+        # Re-entering rest() for the verification GET is safe: the
+        # method != "PATCH" check above stops any recursion.
+        issue = self.rest("GET", path).data or {}
+        if "pull_request" in issue:
+            return
+        labels = [str(label.get("name") or "").lower()
+                  for label in issue.get("labels") or []]
+        if any(name in labels for name in _FORCE_CLOSE_LABELS):
+            return
+        unchecked = [text for checked, text in
+                     proof.criteria(str(issue.get("body") or "")) if not checked]
+        if unchecked:
+            raise ValueError(
+                "refusing to close %s as completed with unchecked acceptance "
+                "criterion: %s" % (path, unchecked[0]))
 
     def _request(self, body: Any,
                  if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
@@ -627,8 +693,9 @@ def _link(header: str, relation: str) -> Optional[str]:
 
 def auth_from_env(env: Optional[Dict[str, str]] = None) -> Auth:
     """The GitHub App installation token when LOOM_GITHUB_APP_ID,
-    LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM are all set,
-    else the personal token token_from_env finds."""
+    LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM (or
+    LOOM_GITHUB_APP_KEY_FILE) are all set, else the personal token
+    token_from_env finds."""
     app = AppToken.from_env(env)
     return app if app is not None else token_from_env()
 

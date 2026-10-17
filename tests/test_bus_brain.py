@@ -1702,7 +1702,10 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(proof.read(body)["contract"], proof.contract(TICKET_BODY))
 
     def _close(self, issue, comments, env=ENV):
-        fake = Fake(reply(200, issue), reply(200, comments), reply(200, {}))
+        # Replies: the issue, its comments, the issue again for the
+        # transport-layer close-completeness gate, then the close PATCH.
+        fake = Fake(reply(200, issue), reply(200, comments), reply(200, issue),
+                    reply(200, {}))
         brain.close(GitHub("t", transport=fake), REPO, 9, env=env)
         return fake
 

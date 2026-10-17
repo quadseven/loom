@@ -18,6 +18,12 @@ from .hunt_plan import problems
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 VAR = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# The part of Loom a pin target deploys: a merge that changes nothing under
+# it opens no pin pull request. A target may name its own with "watch".
+DEFAULT_WATCH = "dashboard/"
+# GitHub's compare lists at most this many files; a full list may hide more.
+COMPARE_FILES_MAX = 300
+PIN_LABEL = "pin-bump"
 
 
 def targets(value: str) -> list[dict[str, str]]:
@@ -33,6 +39,10 @@ def targets(value: str) -> list[dict[str, str]]:
                 or ".." in item["path"].split("/") or not VAR.fullmatch(item["revision_var"]) \
                 or not VAR.fullmatch(item["sha256_var"]):
             raise ValueError("invalid pin target")
+        watch = item.get("watch", DEFAULT_WATCH)
+        if not isinstance(watch, str) or not watch or watch.startswith("/") \
+                or ".." in watch.split("/"):
+            raise ValueError("a pin target's watch must be a relative path prefix")
     return data
 
 
@@ -76,10 +86,38 @@ def replace(text: str, name: str, new: str) -> str:
                   text, count=1, flags=re.M)
 
 
-def merged_titles(gh: GitHub, source: str, old: str, revision: str) -> list[str]:
+def compare(gh: GitHub, source: str, old: str, revision: str) -> dict:
+    """GitHub's comparison of the pinned revision with the new one; empty
+    when the pin names no commit to compare with."""
+    if not SHA.fullmatch(old):
+        return {}
+    data = gh.rest("GET", "/repos/%s/compare/%s...%s" % (source, old, revision)).data
+    return data if isinstance(data, dict) else {}
+
+
+def touches(compared: dict, watch: str) -> bool:
+    """Whether the comparison changes a file under the watched prefix. A
+    comparison that cannot say (no file list, or GitHub's full list of
+    COMPARE_FILES_MAX that may hide more) counts as a change."""
+    files = compared.get("files")
+    if not isinstance(files, list) or len(files) >= COMPARE_FILES_MAX:
+        return True
+    prefix = watch if watch.endswith("/") else watch + "/"
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        for name in (item.get("filename"), item.get("previous_filename")):
+            if isinstance(name, str) and (name.startswith(prefix) or name == watch.rstrip("/")):
+                return True
+    return False
+
+
+def merged_titles(gh: GitHub, source: str, old: str, revision: str,
+                  compared: dict | None = None) -> list[str]:
     if not SHA.fullmatch(old):
         return []
-    compared = gh.rest("GET", "/repos/%s/compare/%s...%s" % (source, old, revision)).data or {}
+    if compared is None:
+        compared = compare(gh, source, old, revision)
     titles = []
     for commit in compared.get("commits", []):
         sha = commit["sha"]
@@ -88,16 +126,18 @@ def merged_titles(gh: GitHub, source: str, old: str, revision: str) -> list[str]
     return titles
 
 
-def body(source: str, revision: str, titles: list[str]) -> str:
+def body(source: str, revision: str, titles: list[str], digest: str = "") -> str:
     lines = "\n".join("- %s" % title for title in titles) or "- No merged pull request title was returned."
+    checksum = (" (sha256 `%s`, the same from two downloads)" % digest) if digest else ""
     result = ("## Why\nThe dashboard deployment needs a reviewed pin for the latest "
-              "green Loom revision.\n\n## Summary\nUpdate the Loom revision and verified "
-              "tarball checksum.\n\n## Merged Loom pull requests\n%s\n\n"
+              "green Loom revision that changes the dashboard.\n\n## Summary\nUpdate the "
+              "Loom revision to `%s` and its verified tarball checksum%s.\n\n"
+              "## Merged Loom pull requests\n%s\n\n"
               "## Acceptance criteria\n- [ ] The pin names revision `%s`.\n"
               "- [ ] The tarball checksum matches two independent downloads.\n"
               "- [ ] The dashboard deployment is reviewed before merge.\n\n"
               "Size: S\n\n## Out of scope\n- Merging or deploying this pull request.\n"
-              % (lines, revision))
+              % (revision, checksum, lines, revision))
     if problems(result):
         raise ValueError("generated pin pull request body fails the Hunt Plan")
     return result
@@ -118,11 +158,17 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
     current_text, file_sha = content(gh, repo, path, branch) if exists else (old_text, "")
     if value(current_text, spec["revision_var"]) == revision and (active or old_text == current_text):
         return
+    watch = spec.get("watch", DEFAULT_WATCH)
+    compared = compare(gh, source, old, revision)
+    if compared and not touches(compared, watch):
+        log("pin: %s: nothing under %s changed since %s; no pin pull request"
+            % (repo, watch, old[:12]))
+        return
     digest = get_digest()
     updated = replace(replace(current_text, spec["revision_var"], revision),
                       spec["sha256_var"], digest)
     title = "Pin Loom dashboard to %s" % revision[:12]
-    plan = body(source, revision, merged_titles(gh, source, old, revision))
+    plan = body(source, revision, merged_titles(gh, source, old, revision, compared), digest)
     if not exists:
         head = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, quote(base, safe=""))).data
         gh.rest("POST", "/repos/%s/git/refs" % repo,
@@ -136,9 +182,15 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
                 {"title": title, "body": plan})
         log("pin: updated pull request for %s" % repo)
     else:
-        gh.rest("POST", "/repos/%s/pulls" % repo,
-                {"title": title, "head": branch, "base": base, "body": plan})
+        made = gh.rest("POST", "/repos/%s/pulls" % repo,
+                       {"title": title, "head": branch, "base": base, "body": plan}).data or {}
         log("pin: opened pull request for %s" % repo)
+        if made.get("number"):
+            try:
+                gh.rest("POST", "/repos/%s/issues/%s/labels" % (repo, made["number"]),
+                        {"labels": [PIN_LABEL]})
+            except GitHubError as exc:
+                log("pin: could not label the pull request for %s: %s" % (repo, exc))
 
 
 def run(gh: GitHub, source: str, revision: str, check: str,

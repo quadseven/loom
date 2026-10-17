@@ -107,10 +107,13 @@ reconciled just after the pin still ships.
 Set `LOOM_PIN_TARGETS` in the install environment to a private JSON array of
 `repo`, `path`, `revision_var`, and `sha256_var` objects (see `.env.example`).
 The station copies it into its plist. After deploying a green Loom revision,
-each station pass checks the target's pin file, downloads the Loom tarball
+each station pass checks the target's pin file. When the revisions between
+the pinned one and the new one change a file under the target's `watch`
+path prefix (optional, default `dashboard/`), it downloads the Loom tarball
 twice, and opens or updates one pull request per target with the new revision
-and matching SHA-256. It lists merged Loom pull request titles in a Hunt Plan
-body. A person or normal review automation must review and merge that pull
+and matching SHA-256, labelled `pin-bump`; a merge that changes nothing there
+opens none, and two downloads that differ open none. It lists merged Loom pull
+request titles in a Hunt Plan body that names the revision and the SHA-256. A person or normal review automation must review and merge that pull
 request; the station never merges it. The station needs GitHub write access to
 the target repository. If pinning fails, the next station pass retries.
 
