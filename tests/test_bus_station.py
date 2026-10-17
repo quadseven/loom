@@ -1279,6 +1279,31 @@ class HandoffPacketTest(unittest.TestCase):
         self.assertIn("Open work for any brain: muse last ticked at 2030-01-01T11:00:00Z",
                       self.packets()[0]["body"])
 
+    def test_a_kept_journal_by_a_login_no_longer_allowed_leaves_the_packet(self):
+        self.gh.comments.append({"id": 1, "user": {"login": AUTHORS[1]},
+                                 "created_at": "2030-01-01T11:00:00Z", "body": "\n".join(
+                                     [station.JOURNAL_MARKER, "Tick 2030-01-01T11:00:00Z, muse",
+                                      "- Decided: from the second author"])})
+        self.gh.touch("2030-01-01T11:00:00Z")
+        self.run_pass()
+        self.assertIn("from the second author", self.packets()[0]["body"])
+        # The post changed the home; this build reads it once more and keeps it.
+        self.run_pass(minutes=11)
+        reads = self.gh.comment_reads
+        self.settings.authors = [AUTHORS[0]]
+        self.run_pass(minutes=12)
+        self.assertEqual(reads + 1, self.gh.comment_reads)
+        self.assertNotIn("from the second author", self.packets()[0]["body"])
+        self.assertEqual(1, len(self.packets()))
+
+    def test_kept_journals_are_filtered_by_the_allowed_logins(self):
+        st = station.Station(self.gh, self.settings, now=self.now, head=lambda: "c" * 40)
+        entry = {"stamp": ["2030-01-01T00:00:00Z", 0], "packet": None,
+                 "journals": [{"body": "%s\nTick 2030-01-01T11:00:00Z, muse" % station.JOURNAL_MARKER,
+                               "at": "2030-01-01T11:00:00Z", "login": "stranger"}]}
+        goals, _, _ = st._handoff_goals(REPO, {"%s#30" % REPO: entry})
+        self.assertEqual([], goals[0].journals)
+
     def test_a_marked_comment_from_a_stranger_is_not_the_packet(self):
         self.gh.comments.append({"id": 5, "user": {"login": "stranger"},
                                  "created_at": "2030-01-01T00:00:00Z",

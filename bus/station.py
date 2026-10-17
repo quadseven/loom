@@ -5220,8 +5220,9 @@ class Station:
                 continue
             for number, entry in read:
                 kept["%s#%d" % (repo, number)] = entry
+                # Kept journals are filtered again: only allowed logins count.
                 goals.append(handoff.Goal(repo, number, self._shown(repo, home),
-                                          list(entry["journals"])))
+                                          handoff.journals(entry["journals"], self.s.authors)))
         return goals, unread, kept
 
     def _handoff_home_journals(self, repo: str, issue: Dict[str, Any],
@@ -5265,15 +5266,20 @@ class Station:
         saved = _read_json(path, {}, strict=False)
         saved = saved if isinstance(saved, dict) else {}
         ended = self._brain_ended()
+        authors = sorted({a.lower() for a in self.s.authors})
         built = saved.get("built")
         if (self._num(built) and 0 <= self.now - built < HANDOFF_EVERY
-                and saved.get("brain_at") == ended):
+                and saved.get("brain_at") == ended and saved.get("authors") == authors):
             return
         home = self._handoff_home()
         if home is None:
             return
         repo, number = home
         homes = saved.get("homes") if isinstance(saved.get("homes"), dict) else {}
+        if saved.get("authors") != authors:
+            # The allowed logins changed: nothing kept under the old list
+            # (journals or the packet comment) is trusted.
+            homes = {}
         goals, unread, kept = self._handoff_goals(repo, homes)
         record = brain.tick_step(self.gh, repo)
         body = handoff.packet(goals, record, self._handoff_rules(repo),
@@ -5300,7 +5306,8 @@ class Station:
                 packet["body"] = body
             entry["packet"] = packet
             _say("handoff packet updated on %s#%d" % home)
-        _write_json(path, {"built": self.now, "brain_at": ended, "homes": kept})
+        _write_json(path, {"built": self.now, "brain_at": ended, "authors": authors,
+                           "homes": kept})
 
     def prune_trees(self) -> None:
         """Remove lane trees whose brief is no longer in a lane inbox (waiting
