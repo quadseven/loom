@@ -573,7 +573,8 @@ created through the API. Creating a ref that exists fails, so only one
 holder wins. The ref points at a commit whose message is
 `holder=<name> expires=<UTC time>`. A tick that finds the lock held and
 unexpired exits; one that finds it expired deletes it and tries once to
-create it. The tick deletes it when done. Hard limit: 15 minutes.
+create it. The tick deletes it when done. The lock lasts `--minutes`
+(default 15); Muse takes 30 for its 25-minute tick.
 `python3 -m bus lock <owner/name> --holder <name>` and `python3 -m bus unlock
 <owner/name> --holder <name>` do this (exit 0 on success, 1 when held by
 someone else).

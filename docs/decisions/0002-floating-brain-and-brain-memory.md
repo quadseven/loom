@@ -65,21 +65,25 @@ model last saw them.
 
    The station writes the tick and commitment rows from each tick's journal
    and step records, through an authenticated dashboard endpoint, as it
-   already does for transcripts. It renders a handoff packet (the last 5
-   ticks, open commitments, rules digest and its commit) into one comment
-   on the Loom goal home each pass. Every brain starts its tick by reading
-   that packet. Brains that cannot reach the tailnet, such as the remote
-   one, read the same text on GitHub. A dashboard that is down costs the
-   packet its freshness, not the tick.
+   already does for transcripts. The dashboard serves a handoff packet (the
+   last 5 ticks, open commitments, and the rules digest with its commit)
+   over the tailnet. Every brain reads it at the start of its tick, Muse
+   through its tailnet proxy like its other REST reads. The station also
+   renders the packet into one comment on the Loom goal home each pass, so a
+   dashboard that is down costs the packet its freshness, not the tick. The
+   comment comes first: until the tables exist, the station builds it from
+   the brains' journals and step records on GitHub.
 
 4. **Both brains take every stage.** Until now, the lane machine's tick ran
    with `LOOM_BRAIN_SCOPE=live` and took review, merge and brief only when no
    other brain had journaled for 2 hours. Muse ticks every 30 to 60 minutes,
    so a 40-minute tick on the strongest model did resume items only, while
-   Muse's 15-minute ticks merged about one pull request each and deferred
-   the rest. The lane machine now runs with `all`. The lock already keeps
-   the brains from acting at once, and the defer and done markers keep them
-   from repeating work.
+   Muse's 15-minute ticks merged about one pull request each, because its
+   rules said to merge the oldest ready one and defer the rest. The lane
+   machine now runs with `all`. Muse merges every ready pull request its
+   merge quarter reaches, and its tick stops at 25 minutes instead of 15.
+   The lock already keeps the brains from acting at once, and the defer and
+   done markers keep them from repeating work.
 
 ## Consequences
 

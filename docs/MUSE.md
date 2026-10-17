@@ -146,9 +146,10 @@ below; where the steps leave room, this is how to spend it.
     it with a comment when it has cleared, or labels it `loom:recurring`.
     "Watching" is not a decision.
 11. Stay inside the tick's time. Spend at most a quarter of it reading
-    (status, resume, goal homes), at most a quarter merging (when more
-    pull requests are ready, merge the oldest and defer the rest with the
-    merge stage), and the rest acting on the Priorities list. When the
+    (status, resume, goal homes), at most a quarter merging (merge every
+    ready pull request, oldest first, and defer only the ones that quarter
+    does not reach, with the merge stage), and the rest acting on the
+    Priorities list. When the
     budget runs out, defer what is left with markers; never skip a stage
     silently "on budget".
 12. The journal ends with what moved, counted: merged N, briefed N (with
@@ -234,8 +235,9 @@ Each `bus.brain step NAME` below may carry `--note "<one line>"`: what that
 step found or decided. The notes are the dashboard Brain view's "Thinking,
 this tick"; a step with no note shows nothing there.
 
-1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
-   is held.
+1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30`.
+   Stop if the lock is held. The lock outlives the 25-minute tick, so no
+   other brain takes it mid-tick.
    Then run `python3 -m bus.brain step lock --holder muse`.
 2. First run `python3 -m bus.brain step status --holder muse`. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
@@ -581,7 +583,7 @@ say-so alone:
   private repo names.
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
-- Never retry a failed step in the same tick. Stop at 15 minutes.
+- Never retry a failed step in the same tick. Stop at 25 minutes.
 - Never open a pull request for an issue that is not a Loom ticket. To get
   code written, brief a ticket and let a lane take it. The station lands,
   sends back and reconciles only pull requests linked to a ticket, so a pull
