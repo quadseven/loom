@@ -2996,10 +2996,6 @@ def _open_pr(gh: GitHub, repo: str, number: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _pr_for_ticket(gh: GitHub, repo: str, number: int) -> Optional[int]:
-    pr = _open_pr(gh, repo, number)
-    return int(pr["number"]) if pr is not None else None
-
 
 def _waiting_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> List[tickets.After]:
     """The After: tickets of this one that are not merged yet, each read from
