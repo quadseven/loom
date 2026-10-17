@@ -141,6 +141,12 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn('<key>LOOM_ROLL_SHIP_DOCS</key><string>%s</string>' % documents, plist)
 
+    def test_pin_ship_repos_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_PIN_SHIP_REPOS="example-owner/deploy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_PIN_SHIP_REPOS</key><string>example-owner/deploy</string>", plist)
+
     def test_a_bad_station_interval_installs_nothing(self):
         for bad in ("soon", "30"):
             with self.subTest(bad=bad):

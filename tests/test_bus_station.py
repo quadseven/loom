@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -56,6 +56,7 @@ class FakeGitHub:
         self.created = []
         self.edits = []
         self.posts = []
+        self.factory_incidents = []
         self.asks = []
         self.humans = []
         self.digest_issues = []
@@ -173,12 +174,21 @@ class FakeGitHub:
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
             return reply(200, found) if found else reply(404, {"message": "Not Found"})
+        if (method == "GET" and parts.path == "/repos/%s/issues" % station.FACTORY_REPO
+                and ("labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query)):
+            return reply(200, self.factory_incidents)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
             return self._post_page(data)
         if rest == "issues" or re.match(r"issues/comments/\d+$", rest) \
                 or (rest == "issues/1/comments" and self.lanes_issues):
             return self._issues_and_status(method, rest, parts.query, headers, data)
+        gone = re.match(r"issues/(\d+)/labels/(.+)$", rest)
+        if gone and method == "DELETE":
+            n = int(gone.group(1))
+            self.issues[n]["labels"] = [lab for lab in self.issues[n]["labels"]
+                                        if lab["name"] != unquote(gone.group(2))]
+            return reply(200, [])
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
@@ -582,6 +592,209 @@ class ShipDeployedTest(Base):
         sha = head.stdout.strip()
         self.assertTrue(station._is_ancestor(sha, sha))
         self.assertFalse(station._is_ancestor("0" * 40, sha))
+
+
+DEPLOY = "example-owner/deploy"
+PUBLISHED = "e" * 40
+PIN_MERGED = "2030-01-03T12:00:00Z"
+PIN_MERGED_AT = calendar.timegm((2030, 1, 3, 12, 0, 0))
+
+
+class ShipPinTest(Base):
+    """A merged pin pull request in a deployment repo ships the merged
+    tickets of the source revision its published-from comment names."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.pin_ship_repos = [DEPLOY]
+        self.carried = set()
+        self.pins = []
+        self.files = {}
+        self.reads = []
+
+    def merged(self, number, pr, merged_at="2030-01-02T00:00:00Z", carried=True,
+               title="Fix the thing", body=None):
+        self.fake.add(number, state="merged", title=title)
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": title,
+                                "body": "Refs %s#%d" % (REPO, number) if body is None else body,
+                                "head": {"ref": "loom/%d-fix" % number}})
+        if carried:
+            self.carried.add(sha)
+        return sha
+
+    def revert(self, pr, of, title, carried=True, merged_at="2030-01-02T06:00:00Z"):
+        """A merged pull request GitHub's revert button opened for pull request of."""
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": 'Revert "%s"' % title,
+                                "body": "Reverts %s#%d" % (REPO, of),
+                                "head": {"ref": "revert-%d" % of}})
+        if carried:
+            self.carried.add(sha)
+
+    def pin(self, number=7, merged_at=PIN_MERGED, revision=PUBLISHED, name="example-repo"):
+        self.pins.append({"number": number, "state": "closed", "merged_at": merged_at,
+                          "merge_commit_sha": "f" * 40, "head": {"ref": "pin"}})
+        patch = ("@@ -4,3 +4,3 @@ images:\n"
+                 "-  # Published from %s #98, merge %s, build run 1.\n"
+                 "+  # Published from %s #99, merge %s, build run 2.\n"
+                 "   - name: registry.example/example-repo\n"
+                 % (name, "a" * 10, name, revision[:10]))
+        self.files[number] = [{"filename": "deploy/kustomization.yaml", "patch": patch}]
+
+    def transport(self, method, url, headers, body):
+        parts = urlsplit(url)
+        path = parts.path
+        if path.startswith("/repos/%s/" % DEPLOY):
+            self.reads.append(path)
+            if path == "/repos/%s/pulls" % DEPLOY:
+                return reply(200, self.pins)
+            files = re.match(r"/repos/%s/pulls/(\d+)/files$" % DEPLOY, path)
+            if files:
+                return reply(200, self.files.get(int(files.group(1)), []))
+            raise AssertionError("unexpected call %s %s" % (method, url))
+        commit = re.match(r"/repos/%s/commits/([0-9a-f]+)$" % REPO, path)
+        if commit:
+            if PUBLISHED.startswith(commit.group(1)):
+                return reply(200, {"sha": PUBLISHED})
+            return reply(404, {"message": "Not Found"})
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO, path)
+        if compare:
+            base, head = compare.groups()
+            status = "ahead" if head == PUBLISHED and base in self.carried else "diverged"
+            return reply(200, {"status": "identical" if base == head else status})
+        return self.fake(method, url, headers, body)
+
+    def ship(self, now=PIN_MERGED_AT + 600):
+        gh = GitHub("token", transport=self.transport)
+        station.Station(gh, self.settings, now=now).ship_pins()
+
+    def test_a_merged_pin_ships_the_tickets_its_source_revision_carries(self):
+        self.merged(12, 99)
+        self.merged(13, 100, carried=False)
+        self.pin()
+        with mock.patch("bus.station._say") as say:
+            self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertIn("loom:merged", self.fake.names(13))
+        self.assertNotIn("loom:shipped", self.fake.names(13))
+        self.assertEqual(self.fake.comments[13], [])
+        say.assert_called_once_with("shipped %s#12: pin %s#7 carries #99" % (REPO, DEPLOY))
+
+    def test_the_note_names_the_pin_pull_request_the_revision_and_the_merge_time(self):
+        self.merged(12, 99)
+        self.pin()
+        self.ship()
+        note = self.fake.comments[12][-1]["body"]
+        self.assertIn("%s#7" % DEPLOY, note)
+        self.assertIn(PUBLISHED[:12], note)
+        self.assertIn("2030-01-03 12:00:00Z", note)
+        self.assertIn("#99", note)
+
+    def test_a_ticket_a_carried_revert_undid_stays_merged(self):
+        self.merged(12, 99)
+        self.revert(101, of=99, title="Fix the thing")
+        self.merged(14, 102, title="Fix another thing")
+        self.revert(103, of=102, title="Fix another thing", carried=False)
+        self.pin()
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+        # A revert the published revision does not carry undoes nothing yet.
+        self.assertIn("loom:shipped", self.fake.names(14))
+
+    def test_a_revert_named_only_by_its_title_also_holds_the_ticket(self):
+        self.merged(12, 99, title="Fix the thing")
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T06:00:00Z",
+                                "merge_commit_sha": "%040x" % 101,
+                                "title": 'Revert "Fix the thing"', "body": "",
+                                "head": {"ref": "undo"}})
+        self.carried.add("%040x" % 101)
+        self.pin()
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_merged_pull_request_that_publishes_nothing_moves_nothing(self):
+        self.merged(12, 99)
+        self.pins.append({"number": 8, "state": "closed", "merged_at": PIN_MERGED})
+        self.files[8] = [{"filename": "README.md", "patch": "+# Published notes\n"}]
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_an_unwatched_source_or_unknown_commit_moves_nothing(self):
+        self.merged(12, 99)
+        self.pin(number=7, name="other-repo")
+        self.pin(number=8, revision="0" * 40)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_an_old_or_unmerged_pull_request_is_never_read(self):
+        self.merged(12, 99)
+        self.pin(number=7, merged_at="2029-12-01T00:00:00Z")
+        self.pins.append({"number": 8, "state": "closed", "merged_at": None})
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.reads, ["/repos/%s/pulls" % DEPLOY])
+
+    def test_a_settled_pin_is_read_once_and_a_fresh_one_until_it_settles(self):
+        self.merged(12, 99)
+        self.pin()
+        files = "/repos/%s/pulls/7/files" % DEPLOY
+        self.ship(now=PIN_MERGED_AT + 600)
+        self.assertIn("loom:shipped", self.fake.names(12))
+        # Within the settle time a ticket reconciled late still ships.
+        self.merged(13, 100)
+        self.ship(now=PIN_MERGED_AT + 1200)
+        self.assertIn("loom:shipped", self.fake.names(13))
+        self.ship(now=PIN_MERGED_AT + station.PIN_SHIP_SETTLE + 1)
+        self.ship(now=PIN_MERGED_AT + station.PIN_SHIP_SETTLE + 60)
+        self.assertEqual(self.reads.count(files), 3)
+
+    def test_at_most_twenty_move_a_pass_and_the_pin_is_read_again(self):
+        for n in range(22):
+            self.merged(100 + n, 500 + n, merged_at="2030-01-02T00:%02d:00Z" % n)
+        self.pin()
+        self.ship(now=PIN_MERGED_AT + 2 * station.PIN_SHIP_SETTLE)
+        left = [n for n in range(100, 122) if "loom:merged" in self.fake.names(n)]
+        self.assertEqual(left, [120, 121])
+        self.ship(now=PIN_MERGED_AT + 2 * station.PIN_SHIP_SETTLE + 60)
+        self.assertTrue(all("loom:shipped" in self.fake.names(n) for n in range(100, 122)))
+
+    def test_without_deployment_repos_nothing_is_read(self):
+        self.settings.pin_ship_repos = []
+        self.merged(12, 99)
+        self.pin()
+        self.ship()
+        self.assertEqual(self.reads, [])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_pass_ships_merged_pins(self):
+        self.merged(12, 99)
+        self.pin()
+        gh = GitHub("token", transport=self.transport)
+        self.assertEqual(station.run(self.settings, gh, now=PIN_MERGED_AT + 600), 0)
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_deployment_repos_come_from_the_environment(self):
+        env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
+               "LOOM_PIN_SHIP_REPOS": DEPLOY + " example-owner/second"}
+        self.assertEqual(station.Settings.from_env(env).pin_ship_repos,
+                         [DEPLOY, "example-owner/second"])
+
+    def test_the_published_from_line_is_read_from_added_lines_only(self):
+        patch = ("-  # Published from example-repo #1, merge 1111111111, build run 1.\n"
+                 "+  # Published from example-repo #857 and #858, merge 67151ececc, build run 3.\n"
+                 "+# Published from example-owner/example-repo, merge abcdef1234.\n")
+        self.assertEqual([m.groups() for m in station.PUBLISHED_RE.finditer(patch)],
+                         [("example-repo", "67151ececc"),
+                          ("example-owner/example-repo", "abcdef1234")])
 
 
 class BudgetTest(Base):
@@ -1667,10 +1880,10 @@ class RetryTest(Base):
         self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
 
     def test_a_ticket_body_that_does_not_parse_is_not_retried(self):
-        # Model: given twice, so no lane's eligibility can be judged.
+        # Model: given twice with two values, so no lane's eligibility can be judged.
         self.heartbeat("anthropic")
         self.failed(body=BODY)
-        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-sonnet-5-5\n\nWork."
+        self.fake.issues[12]["body"] = "Model: claude-sonnet-5-5\nModel: claude-opus-5-5\n\nWork."
         self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
         self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
@@ -1851,6 +2064,88 @@ class RetryTest(Base):
         self.assertTrue(station.needs_public_repo("agy", ""))
         self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
         self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
+
+
+class FactoryIncidentTest(Base):
+    """A [factory] brief is not a work failure: the ticket stays running on
+    its lane and keeps its rung, and a closed incident re-queues it."""
+
+    def failed(self, lane="muse", number=12, attempt=1, reason=None):
+        reason = reason or ("[factory] setup failed: validation environment unavailable: "
+                            "the check exited 127 on the unmodified base; "
+                            "factory incident %s#99" % REPO)
+        self.fake.add(number, lane=lane, body=PLAIN, state="running")
+        for _ in range(attempt):
+            self.fake.comments[number].append(
+                {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
+        name = tickets.ticket_name(REPO, number, attempt)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[number], lane, attempt, None))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: %s\n" % (name, lane, name, reason))
+        return name
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def incident(self, closed_at="2030-01-01T00:10:00Z"):
+        self.fake.factory_incidents = [{
+            "number": 99,
+            "title": "Factory incident: %s validation environment" % REPO,
+            "state": "closed", "closed_at": closed_at,
+            "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: environment\n"
+                     "Ticket: %s#12\n\ncheck: make check (exit 127)\n" % (REPO, REPO)),
+            "labels": [{"name": "loom:factory"}]}]
+
+    def test_factory_is_a_failure_class_not_work(self):
+        self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
+        self.assertEqual(station.failure_class("[work] agent made no commit"), "work")
+
+    def test_a_factory_failure_holds_the_ticket_and_keeps_its_rung(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "lane:muse", "loom:running"})
+        self.assertFalse(any(b.startswith("Automatic retry") for b in self.bodies()))
+        hold = [b for b in self.bodies() if "held" in b]
+        self.assertEqual(len(hold), 1)
+        self.assertIn("keeps its rung", hold[0])
+        self.assertIn("factory incident %s#99" % REPO, hold[0])
+
+    def test_factory_failures_never_flag_runaway(self):
+        self.heartbeat("muse")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.failed(attempt=3)
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane muse (body sha256 0123456789ab)",
+             "created_at": at, "user": {"login": "alice-example"}}
+            for _ in range(3)]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+
+    def test_a_closed_factory_incident_requeues_its_ticket(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertTrue(any("back in the queue" in b for b in self.bodies()))
+
+    def test_a_claim_newer_than_the_incident_close_blocks_the_requeue(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident(closed_at="2030-01-01T00:10:00Z")
+        self.fake.comments[12].append(
+            {"body": "Claimed for lane muse (body sha256 0123456789ab)",
+             "created_at": "2030-01-01T00:20:00Z", "user": {"login": "alice-example"}})
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertFalse(any("back in the queue" in b for b in self.bodies()))
 
 
 class PruneTest(Base):
@@ -4149,11 +4444,39 @@ class VerifyResultTest(Base):
 
     def test_a_missing_result_names_the_missing_evidence_in_one_note(self):
         self.result({"missing": "the deployed station log for 2026-10-16"})
+        # Handing the run out recorded the attempt, so the cooldown holds the
+        # ticket back from a second run in this pass.
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE),
+                   json.dumps({"%s#5" % REPO: time.time()}))
         self.run_pass()
+        # A verifier found the live evidence has not happened yet: the ticket is
+        # labelled so it stops holding the unproven-work limit (2026-10-17: 54 of
+        # 58 counted tickets were waiting on the world, and the goal was frozen).
+        self.assertIn("loom:awaiting-evidence", self.fake.names(5))
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(len(self.fake.comments[5]), 1)
         self.assertIn("the deployed station log for 2026-10-16", self.fake.comments[5][0]["body"])
+
+    def test_a_bare_word_of_missing_evidence_does_not_earn_the_label(self):
+        # The result is lane output: "missing" alone must not switch the limit off.
+        self.result({"missing": "later"})
+        self.run_pass()
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
+        self.assertEqual(len(self.fake.comments[5]), 1)
+
+    def test_a_retry_handed_out_drops_the_label_so_the_run_decides_afresh(self):
+        self.fake.issues[5]["labels"].append({"name": "loom:awaiting-evidence"})
+        # An idle slot with the cooldown over is handed the ticket again.
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time())._write_verify_brief(REPO, "codex", self.fake.issues[5])
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
+        self.assertIn("loom:shipped", self.fake.names(5))
+
+    def test_a_refused_proof_or_a_crashed_run_is_not_awaiting_evidence(self):
+        self.result(self.good(criteria=[]))
+        self.run_pass()
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
 
     def test_a_proof_holding_a_credential_is_refused_with_one_note(self):
         self.result(self.good(sources=["token=abcdef0123456789"]))
@@ -4195,3 +4518,92 @@ class UnseenLiveEvidenceTest(unittest.TestCase):
     def test_non_live_criteria_are_not_judged(self):
         self.assertEqual(station.unseen_live_evidence(
             {"criteria": [{"criterion": "A test fails without it", "evidence": "it would fail"}]}), "")
+
+
+class UnprovenGateTest(unittest.TestCase):
+    """loom#483: a goal with too much unproven work gets no new build claim
+    from the station. Unproven = open loom:ticket at merged or shipped (a
+    verified ticket carries loom:verified instead, so it never counts)."""
+
+    GOAL = 40
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = os.path.join(self._tmp.name, "loom")
+        self.fake = FakeGitHub()
+        self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS))
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "codex.json"), "w") as fh:
+            json.dump({"lane": "codex", "at": int(time.time()), "available": True, "reason": ""}, fh)
+        self.fake.issues[self.GOAL] = {"number": self.GOAL, "title": "Goal", "state": "open",
+                                       "labels": [{"name": "loom:goal"}]}
+        self.fake.comments[self.GOAL] = []
+        self.fake.events[self.GOAL] = []
+
+    def gh(self):
+        return GitHub("token", transport=self.fake)
+
+    def child(self, number, state="shipped"):
+        issue = {"number": number, "title": "Done %d" % number, "state": "open",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}],
+                 "body": "Done.\n\nPart of #%d\n" % self.GOAL}
+        self.fake.issues[number] = issue
+        self.fake.comments[number] = []
+        self.fake.events[number] = []
+        return issue
+
+    def over_limit(self, count=16):
+        for n in range(101, 101 + count):
+            self.child(n)
+        self.fake.sub_issues[self.GOAL] = [self.fake.issues[n] for n in range(101, 101 + count)]
+
+    def brief(self, number, *extra_labels):
+        self.fake.add(number, state="briefed", lane="codex",
+                      body=BODY + "\nPart of #%d\n" % self.GOAL)
+        self.fake.issues[number]["labels"] += [{"name": label} for label in extra_labels]
+
+    def run_pass(self):
+        return station.run(self.settings, self.gh())
+
+    def test_a_goal_over_the_limit_gets_no_new_build_claim(self):
+        self.over_limit()
+        self.brief(7)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_regression_revert_and_urgent_tickets_still_go_over_the_limit(self):
+        for number, label in ((8, "loom:regression"), (9, "loom:revert"), (10, "loom:urgent")):
+            with self.subTest(label=label):
+                self.setUp()
+                self.over_limit()
+                self.brief(number, label)
+                self.assertEqual(self.run_pass(), 0)
+                self.assertIn("loom:running", self.fake.names(number))
+
+    def test_a_goal_at_the_limit_is_still_claimed(self):
+        self.over_limit(15)
+        self.brief(7)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_ticket_with_no_goal_is_never_gated(self):
+        self.over_limit()
+        self.fake.add(7, state="briefed", lane="codex", body=BODY)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_gated_lane_is_left_idle_for_verify_runs(self):
+        self.over_limit()
+        self.brief(7)
+        with mock.patch.object(station.Station, "_hand_verifies", autospec=True) as handed:
+            self.assertEqual(self.run_pass(), 0)
+        self.assertIn("codex", handed.call_args[0][1])
+
+    def test_ticket_goal_reads_the_part_of_line(self):
+        self.assertEqual(station._ticket_goal({"body": "x\n\nPart of #40\n"}), 40)
+        self.assertEqual(station._ticket_goal({"body": "x", "parent_issue_url":
+                             "https://api.github.com/repos/o/r/issues/41"}), 41)
+        self.assertIsNone(station._ticket_goal({"body": "x"}))

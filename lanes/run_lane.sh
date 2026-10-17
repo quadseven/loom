@@ -19,6 +19,8 @@
 # A limit failure also holds this lane unavailable until the provider's reset
 # (else 60 minutes). The agent edits (and
 # may commit); this runner commits what is left, pushes, and opens the PR.
+# A commit that adds a file outside the brief's paths (bus/scope_check.py)
+# is refused before validation and push, and nothing is pushed.
 # A repo with a validation contract (.loom/validation.conf) is prepared
 # before the agent and checked again on its commit; a failing check parks
 # the brief and keeps the edits on a side branch instead of opening a PR.
@@ -248,7 +250,7 @@ summary_note() {
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
@@ -289,6 +291,24 @@ EOF
     safe_git diff --cached --quiet && return 0
     safe_git commit -qm "Drop sandbox probe files: ${probes//$'\n'/, }" || return 1
   fi
+}
+
+# Sets STRAY_FILES to the files the agent's commits (BASE..HEAD) add outside
+# the brief: not named by it (as a path or a directory above one) and not
+# under a non-hidden top-level directory the base already tracks
+# (bus/scope_check.py). A fix round that merged the default branch passes
+# that branch, so files the merge brought in are never stray. Returns 1 when
+# the check could not run, so a broken check never reads as a clean one.
+check_scope() {
+  STRAY_FILES="$(timeout "$NET_TIMEOUT" env PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scope_check "$TREE" "$BASE" HEAD "$1" ${FIX_UPSTREAM:+"$FIX_UPSTREAM"})"
+}
+
+# STRAY_FILES as one comma-separated line, at most ten names.
+stray_list() {
+  local n
+  n="$(printf '%s\n' "$STRAY_FILES" | sed '/^$/d' | wc -l | tr -d ' ')"
+  printf '%s\n' "$STRAY_FILES" | sed '/^$/d' | head -10 | paste -sd ',' - | sed 's/,/, /g'
+  [ "$n" -le 10 ] || printf ' and %s more' "$((n - 10))"
 }
 
 # The ## Intent section for the top of a new lane PR body: the change
@@ -1245,6 +1265,7 @@ update_fix_branch() {
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
+  FIX_UPSTREAM="origin/$default"
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
@@ -1646,6 +1667,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
+  FIX_UPSTREAM=""
   if [ -n "$FIX_PR" ]; then
     # BASE is taken first, so a clean merge alone counts as a change and an
     # out-of-date pull request is pushed up to date.
@@ -1815,6 +1837,16 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
+  fi
+  # A commit that adds files outside the brief is refused before validation
+  # and push: nothing is pushed, and the reason names every stray file.
+  if [ "$COMMITTED" -eq 1 ]; then
+    if ! check_scope "$BRIEF" 2>> "$LOG"; then
+      park "$BRIEF" "could not check the committed files against the brief" transient; continue
+    fi
+    if [ -n "$STRAY_FILES" ]; then
+      park "$BRIEF" "commit refused: it adds files outside the brief's paths: $(stray_list); nothing pushed"; continue
+    fi
   fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.

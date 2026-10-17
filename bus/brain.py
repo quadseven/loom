@@ -26,6 +26,20 @@ STATES = ("queued", "briefed", "running", "pr", "answered", "failed", "merged", 
 # so they never count against a goal's cap.
 IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 DEFAULT_GOAL_CAP = 16
+# Merged and shipped tickets that still wait on a live check. A verified
+# ticket carries loom:verified instead of loom:shipped (or loom:merged for a
+# docs proof), so it never counts here.
+UNPROVEN = ("loom:merged", "loom:shipped")
+# A verifier checked the ticket and found its live evidence has not happened
+# yet (the station adds the label). It waits on the world, not on a verifier,
+# so it does not hold the unproven-work limit: 54 of the 58 loom tickets
+# counted on 2026-10-17 were in that state, and the limit froze the goal.
+AWAITING_EVIDENCE = "loom:awaiting-evidence"
+# A goal excludes at most this many times its limit in awaiting tickets: the
+# label comes from a lane's verify.json, so a lane that always says "missing"
+# must not be able to switch the limit off.
+AWAITING_CAP_FACTOR = 2
+DEFAULT_UNVERIFIED_LIMIT = 15
 # A ticket admitted for a measured regression of a shipped one. Past the cap,
 # a goal admits one such ticket at a time (its regression slot).
 REGRESSION = "loom:regression"
@@ -248,9 +262,11 @@ def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
 
 
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
-                authors: Optional[Sequence[str]] = None) -> List[str]:
+                authors: Optional[Sequence[str]] = None, gh: Optional[GitHub] = None,
+                repo: str = "") -> List[str]:
     lines = ["### Goals"]
     owed = []
+    limit = unverified_limit()
     for issue in goals:
         node = data["goals"].get(int(issue["number"])) or {}
         led = goal_ledger(issue, node, now, authors)
@@ -260,6 +276,16 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                          led.get("journal", "none"), led.get("report", "none"),
                          led.get("measure", "none"), led.get("action", "none"),
                          led["state"], led["due"] or "unknown"))
+        if gh is not None and repo:
+            # loom#483: each goal's unproven count against the limit, beside
+            # the brain's own ledger, so the operator sees why new work waits.
+            held, waiting = _goal_counts(gh, repo, int(issue["number"]), issue)
+            lines.append("  - unproven work %d/%d (merged or shipped with no standing proof; "
+                         "%d more await live evidence and do not count)"
+                         % (held, limit, waiting))
+            if held > limit:
+                lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
+                             "brain files no ordinary brief for this goal until it is back under")
         if led["state"] != "ok":
             owed.append("- #%s report %s since %s" % (
                 issue["number"], led["state"].upper(), led["due"] or "an unknown time"))
@@ -565,7 +591,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     warn = _trunk_warning(goals, data)
     if warn:
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
-    lines += _goal_lines(goals, data, now, authors) + [""]
+    lines += _goal_lines(goals, data, now, authors, gh, repo) + [""]
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
@@ -764,6 +790,13 @@ def goal_cap(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_GOAL_CAP
 
 
+def unverified_limit(env: Optional[Dict[str, str]] = None) -> int:
+    """Unproven tickets per goal before new build work waits: LOOM_UNVERIFIED_LIMIT,
+    a whole number of at least 1, else DEFAULT_UNVERIFIED_LIMIT."""
+    raw = (os.environ if env is None else env).get("LOOM_UNVERIFIED_LIMIT", "")
+    return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_UNVERIFIED_LIMIT
+
+
 def _goal_issue(gh: GitHub, repo: str, goal: int) -> Dict[str, Any]:
     """An open loom:goal issue; ValueError for anything else."""
     try:
@@ -896,13 +929,69 @@ def _goal_in_flight(gh: GitHub, repo: str, goal: int,
     return sum(1 for i in _goal_children(gh, repo, goal, issue) if _in_flight(i))
 
 
-def _check_goal_capacity(gh: GitHub, repo: str, goal: int,
-                         issue: Optional[Dict[str, Any]] = None) -> None:
-    count = _goal_in_flight(gh, repo, goal, issue)
+def _check_goal_capacity(children: List[Dict[str, Any]], goal: int) -> None:
+    count = sum(1 for i in children if _in_flight(i))
     cap = goal_cap()
     if count >= cap:
         raise ValueError("goal already has %d tickets in flight (cap %d); only a measured "
                          "regression of a shipped ticket passes it (--regresses)" % (count, cap))
+
+
+def _unproven(issue: Dict[str, Any]) -> bool:
+    """An open loom:ticket at merged or shipped: unproven work still waiting on
+    a live check. A verified ticket carries loom:verified instead, so it never
+    counts."""
+    names = _labels(issue)
+    return (issue.get("state") == "open" and "loom:ticket" in names
+            and AWAITING_EVIDENCE not in names
+            and any(state in names for state in UNPROVEN))
+
+
+def _awaiting(issue: Dict[str, Any]) -> bool:
+    """An open merged or shipped ticket a verifier checked and left waiting on
+    live evidence (loom:awaiting-evidence)."""
+    names = _labels(issue)
+    return (issue.get("state") == "open" and "loom:ticket" in names
+            and AWAITING_EVIDENCE in names and any(state in names for state in UNPROVEN))
+
+
+def _count_unproven(children: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """(tickets that hold the limit, awaiting tickets excluded from it). The
+    awaiting tickets past AWAITING_CAP_FACTOR times the limit hold it again."""
+    waiting = sum(1 for i in children if _awaiting(i))
+    excluded = min(waiting, AWAITING_CAP_FACTOR * unverified_limit())
+    return sum(1 for i in children if _unproven(i)) + (waiting - excluded), excluded
+
+
+def _goal_counts(gh: GitHub, repo: str, goal: int,
+                 issue: Optional[Dict[str, Any]] = None) -> Tuple[int, int]:
+    """(tickets that hold the limit, awaiting tickets excluded) among the
+    goal's tickets, from one read of its children."""
+    return _count_unproven(_goal_children(gh, repo, goal, issue))
+
+
+def _goal_unproven(gh: GitHub, repo: str, goal: int,
+                   issue: Optional[Dict[str, Any]] = None) -> int:
+    """The goal's unproven tickets; ValueError for anything that is not an
+    open loom:goal issue."""
+    return _count_unproven(_goal_children(gh, repo, goal, issue))[0]
+
+
+def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
+    """The goal's tickets at merged or shipped: unproven work still waiting on
+    a live check. A verified ticket carries loom:verified instead, so it
+    never counts; a failed audit moves a ticket back to shipped, so it does."""
+    return _goal_unproven(gh, repo, goal)
+
+
+def _check_goal_unproven(children: List[Dict[str, Any]], goal: int) -> None:
+    count = _count_unproven(children)[0]
+    limit = unverified_limit()
+    if count > limit:
+        raise ValueError("goal #%d has %d tickets at merged or shipped without a proof "
+                         "(limit %d); verify them before briefing more build work; only a "
+                         "measured regression of a shipped ticket passes it (--regresses)"
+                         % (goal, count, limit))
 
 
 def _lines(text: str) -> List[str]:
@@ -1039,6 +1128,27 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
 DIFFICULTIES = ("easy", "medium", "hard")
 
 
+def _check_ticket_headers(full_body: str, written: Dict[str, Optional[str]]) -> None:
+    """The ticket must parse back to every header the brief tool wrote. A body
+    file that opened with its own header lines, a blank line before them, or a
+    pasted "Repo:"/"Branch:" preamble made the parser stop early or refuse the
+    ticket, so no lane ever claimed it and it sat queued for up to 17 hours
+    (2026-10-16: loom#486, #506, #517 and #521 among them)."""
+    try:
+        headers, _ = parse_ticket(full_body)
+    except ValueError as err:
+        raise ValueError("the brief's headers do not parse (%s): start the body at its "
+                         "first '## ' section, the tool writes the headers" % err) from None
+    for key, value in written.items():
+        if not value:
+            continue
+        got = headers.get(key)
+        if got is None or got != (value.lower() if key == "Difficulty" else value):
+            raise ValueError("the brief's %s header is not readable in the ticket it would "
+                             "file: the body file repeats or precedes the headers the tool "
+                             "writes, so remove its own header lines" % key)
+
+
 def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional[str]) -> None:
     """A brief the station must place needs a difficulty tier. Without one the
     ticket gets no lane and waits for a brain to notice (2026-10-16: five
@@ -1146,10 +1256,15 @@ def brief(gh: GitHub, repo: str, goal: int, title: str, body: str,
         base = goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority)
+    _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
+                                      "Model": model, "Base": base, "After": after,
+                                      "Not before": not_before})
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue)
-    _check_goal_capacity(gh, repo, goal, goal_issue)
+    children = _goal_children(gh, repo, goal, goal_issue)
+    _check_goal_capacity(children, goal)
+    _check_goal_unproven(children, goal)
     done = _brief_done_due(gh, repo, goal, holder, env)
     issue = _file_ticket(gh, repo, goal, title, full_body, lane)
     if refs is not None:
@@ -2199,7 +2314,15 @@ def _validate_ticket_association(gh: GitHub, repo: str, number: int,
     if issue.get("state") != "open" or "loom:ticket" not in names:
         raise ValueError("ticket is not an open loom:ticket")
     if "loom:" + expected_state not in names:
-        raise ValueError("ticket is not loom:" + expected_state)
+        # Self-heal: a ticket with an open PR that never left loom:running
+        # (lane crashed after opening the PR, or opened it without bus.lane pr)
+        # is moved to loom:pr instead of blocking the merge forever.
+        if expected_state == "pr" and bool({"loom:running", "loom:briefed"} & set(names)):
+            healed = [n for n in names if n not in ("loom:running", "loom:briefed", "loom:queued")]
+            healed.append("loom:pr")
+            gh.rest("PUT", "/repos/%s/issues/%d/labels" % association, {"labels": healed})
+        else:
+            raise ValueError("ticket is not loom:" + expected_state)
     return association
 
 
@@ -2824,10 +2947,40 @@ def _waiting_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> List[tickets.A
     return tickets.after_holds(repo, headers, lookup)[0]
 
 
+def _nothing_to_fix(gh: GitHub, repo: str, pr: int,
+                    env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The finished state of an open pull request, or None while it still has
+    something to fix: its head is green, the review check passed on that
+    head, no review thread is open and it does not conflict. Fix rounds alone
+    escalated such a pull request on 2026-10-16, and a fourth run of the same
+    model changed nothing before the brain merged the head it already had.
+
+    Only a pull request in this repo by a LOOM_BRIEF_AUTHORS login counts: the
+    ticket is matched to its pull request by branch name or a Refs line, which
+    anyone can write on a public repo, so an outsider's green pull request must
+    never stop a stuck ticket from climbing the ladder."""
+    data = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr)).data
+    data = data if isinstance(data, dict) else {}
+    details = _pr_graphql(gh, repo, pr)
+    author = str((data.get("user") or {}).get("login") or "").lower()
+    if (not _same_repo(repo, data, details)
+            or author not in {a.lower() for a in trusted_authors(env)}):
+        return None
+    sha = str(details.get("headRefOid") or "")
+    check = review_check_name()
+    if (not sha or details.get("mergeable") == "CONFLICTING" or not _checks_green(details)
+            or not _threads_resolved(details) or not _review_check_passed(gh, repo, sha, check)):
+        return None
+    return ("pull request #%d has nothing to fix (head %s is green, the review check "
+            "%s passed on it, and no review thread is open)" % (pr, sha[:12], check))
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
-    ladder whose lane is available, and return a one-line outcome."""
+    ladder whose lane is available, and return a one-line outcome. A ticket
+    whose open pull request has nothing to fix is refused: fix rounds that
+    already landed a green, reviewed head are not a stuck ticket."""
     _check_written_text(notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
@@ -2845,6 +2998,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     history = _history(gh, repo, issue, datetime.now(timezone.utc))
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
+    open_pr = _pr_for_ticket(gh, repo, number)
+    finished = _nothing_to_fix(gh, repo, open_pr) if open_pr is not None else None
+    if finished:
+        raise ValueError("ticket is not escalated: %s; land it instead" % finished)
     if history.rung is None:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                 {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
@@ -2872,7 +3029,7 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                          "Reason: %s (attempts %d, tried %s)." % (reason, history.attempts, ", ".join(history.tried) or "none"),
                          "Rung: %d %s %s" % (rung + 1, model, lane)])
     _check_written_text(comment)
-    pr = _pr_for_ticket(gh, repo, number) if "loom:pr" in names else None
+    pr = open_pr if "loom:pr" in names else None
     if pr is not None:
         fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
     else:

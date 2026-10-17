@@ -511,6 +511,13 @@ it, and never a free lane:
 2. the codex lane (or codex-2) with `gpt-6-sol`;
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
+A rung counts as tried once the ticket was claimed on its model, read from
+the ticket's `Model:` line before the ladder started as well as from the
+ladder's own moves. A green, reviewed pull request is not escalated: a ticket
+whose open pull request has nothing to fix (its head is green, the review
+check passed on that head, and no review thread is open) is landed, whatever
+its fix rounds.
+
 The factory applies this ladder on its own (bus/factory.py, recorded as
 `<!-- loom:rung N -->` comments). For work the factory cannot see, such as a
 ticket with no pull request that is stuck in running, do not hand-edit the
@@ -521,7 +528,8 @@ factory has not already moved, in the same tick, whatever the time budget: it
 picks the lowest untried rung whose lane is free, rewrites the ticket's
 `Model:` line, swaps the lane label, comments the rung and the reason, and
 sends an open pull request back as a fix brief (`--file NOTES.md` adds your
-own notes to that brief). It refuses a ticket that is not repeatedly stuck.
+own notes to that brief). It refuses a ticket that is not repeatedly stuck,
+and one whose open pull request has nothing to fix.
 Past the third rung it adds `needs-brain` instead: rewrite the brief smaller,
 or ask the operator with one exact ask when only the operator can unblock it.
 `status` reads the history of at most 20 tickets per repo, the least recently

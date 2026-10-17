@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -38,8 +39,14 @@ class FakeGitHub:
         self.open = []
         self.closed = {}
         self.writes = []
+        self.events = {}
+        self.event_reads = []
 
     def paginate(self, path):
+        if path.endswith("/events"):
+            number = int(path.split("/")[-2])
+            self.event_reads.append(number)
+            return list(self.events.get(number, []))
         assert path == "/repos/%s/issues?state=open&labels=loom:ticket" % REPO, path
         return list(self.open)
 
@@ -58,11 +65,15 @@ class Base(unittest.TestCase):
         self.briefs = []
         self.doc = {"checked_at": "2030-01-02T00:00:00Z", "findings": [finding()]}
 
-    def brief(self, gh, repo, goal, title, body, difficulty=None, priority=None):
-        number = 100 + len(self.briefs)
+    def brief(self, gh, repo, goal, title, body, difficulty=None, priority=None,
+              regresses=None):
+        number = regresses or 100 + len(self.briefs)
         self.briefs.append({"repo": repo, "goal": goal, "title": title, "body": body,
-                            "difficulty": difficulty, "priority": priority})
-        self.gh.open.append({"number": number, "body": body, "labels": [{"name": "loom:ticket"}]})
+                            "difficulty": difficulty, "priority": priority,
+                            "regresses": regresses})
+        if regresses is None:
+            self.gh.open.append({"number": number, "body": body,
+                                 "labels": [{"name": "loom:ticket"}]})
         return "https://github.com/%s/issues/%d" % (repo, number)
 
     def read(self, url):
@@ -377,3 +388,188 @@ class StationStep(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def stamp(when):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+
+
+def labelled(name, when):
+    return {"event": "labeled", "label": {"name": name}, "created_at": stamp(when)}
+
+
+class Regression(Base):
+    """A finding that outlives its ticket's ship re-briefs the ticket as a
+    regression (loom#484)."""
+
+    def shipped_ticket(self, number=100, state="loom:shipped", shipped=NOW - 30 * 3600):
+        digest = sha()
+        issue = self.open_ticket(number, digest)
+        issue["labels"].append({"name": state})
+        self.gh.events[number] = [labelled("loom:pr", shipped - 7200),
+                                  labelled("loom:merged", shipped - 3600),
+                                  labelled("loom:shipped", shipped)]
+        # The usual update has nothing to do: same band, same numbers.
+        self.state = {"keys": {REPO + "#1": {digest: {"ticket": number, "band": "P1",
+                                                      "posted": [3.0, finding()["evidence"]],
+                                                      "commented": NOW}}}}
+        return issue
+
+    def regressions(self):
+        return [b for b in self.briefs if b["regresses"] is not None]
+
+    def test_a_finding_24_hours_past_the_ship_re_briefs_the_ticket_once_per_48_hours(self):
+        self.shipped_ticket(shipped=NOW - 30 * 3600)
+        self.run_once()
+        made = self.regressions()
+        self.assertEqual(len(made), 1)
+        brief = made[0]
+        self.assertEqual((brief["goal"], brief["regresses"], brief["priority"]), (1, 100, "P1"))
+        body = brief["body"]
+        self.assertTrue(body.startswith("Regresses #100\n"))
+        evidence = "\n".join(brain._regression_evidence(body, 100))
+        self.assertIn("still reported 30 hours after the ticket shipped", evidence)
+        self.assertIn("impact 60 (P1)", evidence)
+        self.assertIn("```text\ntitle: Ana carries full bags\n"
+                      "evidence: 3 members have 0 free slots", evidence)
+        self.assertIn("untrusted data", evidence)
+        # The brief passes the checks brain brief applies before it files.
+        brain._check_brief_args(brief["title"], body, None, None, None)
+        self.assertEqual(body, body.encode("ascii").decode("ascii"))
+        self.assertTrue(any("re-briefed as a regression" in s for s in self.said))
+        # Still shipped and still reported: nothing more inside 48 hours.
+        self.run_once(NOW + 900)
+        self.run_once(NOW + health.REGRESS_EVERY - 60)
+        self.assertEqual(len(self.regressions()), 1)
+        self.run_once(NOW + health.REGRESS_EVERY + 60)
+        self.assertEqual(len(self.regressions()), 2)
+
+    def test_the_clock_starts_at_the_ship_not_the_merge(self):
+        self.shipped_ticket(shipped=NOW - 23 * 3600)
+        self.run_once()
+        self.assertEqual(self.regressions(), [])
+        self.run_once(NOW + 2 * 3600)
+        self.assertEqual(len(self.regressions()), 1)
+        # The ship time was read from the events once, then kept.
+        self.assertEqual(self.gh.event_reads, [100])
+
+    def test_a_verified_ticket_regresses_too(self):
+        self.shipped_ticket(state="loom:verified")
+        self.run_once()
+        self.assertEqual(len(self.regressions()), 1)
+
+    def test_a_ticket_in_a_build_state_gets_only_the_usual_update(self):
+        for state in ("loom:queued", "loom:running", "loom:pr", "loom:merged"):
+            with self.subTest(state=state):
+                self.setUp()
+                issue = self.shipped_ticket()
+                issue["labels"] = [{"name": "loom:ticket"}, {"name": state}]
+                self.doc["findings"] = [finding(affected=4)]
+                self.run_once(NOW + health.EVIDENCE_EVERY)
+                self.assertEqual(self.briefs, [])
+                self.assertEqual(self.gh.event_reads, [])
+                self.assertEqual([(m, p) for m, p, _ in self.gh.writes],
+                                 [("POST", "/repos/%s/issues/100/comments" % REPO)])
+
+    def test_a_finding_absent_after_the_ship_files_nothing(self):
+        self.shipped_ticket()
+        self.doc["findings"] = []
+        self.run_once()
+        self.run_once(NOW + health.REGRESS_EVERY)
+        self.assertEqual(self.briefs, [])
+        self.assertEqual(len(self.gh.writes), 1)
+        self.assertIn("finding absent since", self.gh.writes[0][2]["body"])
+
+    def test_a_refused_regression_is_logged_once_and_tried_again(self):
+        self.shipped_ticket()
+        calls = []
+
+        def held(*args, **kwargs):
+            calls.append(kwargs)
+            raise ValueError("the goal's regression slot is held by #7")
+        self.brief = held
+        self.run_once()
+        self.run_once(NOW + 900)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len([s for s in self.said if "regression slot is held" in s]), 1)
+
+
+class RegressionThroughBrain(unittest.TestCase):
+    """The intake's regression brief through the real brain brief: the
+    shipped ticket itself goes back to the queue with loom:regression."""
+
+    class Repo:
+        def __init__(self, ticket):
+            self.issues = {1: {"number": 1, "state": "open", "body": "goal",
+                               "labels": [{"name": "loom:goal"}]},
+                           100: ticket}
+            self.events = {100: [labelled("loom:shipped", NOW - 26 * 3600)]}
+            self.comments = []
+
+        def paginate(self, path):
+            if path.endswith("/events"):
+                return self.events[int(path.split("/")[-2])]
+            if "/sub_issues" in path:
+                return json.loads(json.dumps([self.issues[100]]))
+            # Copies, as GitHub answers: a write never reaches a list read before it.
+            return json.loads(json.dumps([i for i in self.issues.values()
+                                          if i["number"] != 1 and i["state"] == "open"]))
+
+        def rest(self, method, path, data=None, ok=()):
+            number = int(path.split("/issues/")[1].split("/")[0])
+            issue = self.issues[number]
+            if method == "PATCH":
+                issue["body"] = data["body"]
+            elif method == "PUT":
+                issue["labels"] = [{"name": n} for n in data["labels"]]
+            elif method == "POST" and path.endswith("/comments"):
+                self.comments.append((number, data["body"]))
+            elif method != "GET":
+                raise AssertionError((method, path))
+            reply = Reply(json.loads(json.dumps(issue)))
+            reply.status = 200
+            return reply
+
+    def test_the_shipped_ticket_is_re_briefed_with_the_evidence(self):
+        f = health._finding(finding())[0]
+        ticket = {"number": 100, "state": "open", "html_url": "https://example.test/t/100",
+                  "body": "Difficulty: medium\nPriority: P1\n\n" + health.ticket_body(f),
+                  "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+        repo = self.Repo(ticket)
+        state = {}
+        said = []
+        doc = {"checked_at": "2030-01-02T00:00:00Z", "findings": [finding()]}
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "16"}):
+            health.Intake(repo, state, NOW, "2030-01-02T00:00:00Z", said.append,
+                          read=lambda url: doc).run([health.Source(REPO, 1, URL)])
+        names = sorted(x["name"] for x in ticket["labels"])
+        self.assertEqual(names, ["loom:queued", "loom:regression", "loom:ticket"])
+        body = ticket["body"]
+        self.assertIn("## Regression\n\nHealth regression: Ana carries full bags\n\n"
+                      "Regresses #100\nThe health finding this ticket fixes is still "
+                      "reported 26 hours after the ticket shipped", body)
+        self.assertIn("evidence: 3 members have 0 free slots", body)
+        tickets.parse(body)
+        # Back in a build state: the next pass leaves it to that work.
+        health.Intake(repo, state, NOW + 900, "2030-01-02T00:15:00Z", said.append,
+                      read=lambda url: doc).run([health.Source(REPO, 1, URL)])
+        self.assertEqual(ticket["body"], body)
+
+    def test_a_second_finding_on_the_ticket_keeps_the_re_briefed_body(self):
+        # Two findings, one ticket: the lower one's Priority edit in the same
+        # pass writes the body as re-briefed, not as it was read before.
+        first, second = finding(), finding(key="bags:Bo", title="Bo carries full bags",
+                                           affected=1, hours=2.0)
+        fs = [health._finding(first)[0], health._finding(second)[0]]
+        ticket = {"number": 100, "state": "open", "html_url": "https://example.test/t/100",
+                  "body": "Difficulty: medium\nPriority: P1\n\n" + health.ticket_body(fs[0])
+                  + "\n" + health.MARKER % fs[1].digest + "\n",
+                  "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+        repo = self.Repo(ticket)
+        doc = {"checked_at": "2030-01-02T00:00:00Z", "findings": [first, second]}
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "16"}):
+            health.Intake(repo, {}, NOW, "2030-01-02T00:00:00Z", lambda line: None,
+                          read=lambda url: doc).run([health.Source(REPO, 1, URL)])
+        self.assertIn("Regresses #100", ticket["body"])
+        self.assertNotEqual(tickets.priority_of(ticket), "P1")
+        self.assertEqual(ticket["body"].count("## Regression"), 1)
