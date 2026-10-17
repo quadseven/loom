@@ -37,8 +37,9 @@ def repos_from_env() -> List[str]:
 
 def app_from_env(env: Optional[Dict[str, str]] = None) -> Optional[AppToken]:
     """The GitHub App installation token when the App settings are present
-    and this host can mint one (the openssl and aws CLIs sign the JWT and
-    read the key); else None, and the dashboard keeps its own token."""
+    and this host can mint one (openssl signs the JWT; the key is a readable
+    LOOM_GITHUB_APP_KEY_FILE, or the aws CLI reads it from the parameter
+    store); else None, and the dashboard keeps its own token."""
     try:
         app = AppToken.from_env(env)
     except GitHubError as exc:
@@ -46,7 +47,17 @@ def app_from_env(env: Optional[Dict[str, str]] = None) -> Optional[AppToken]:
         return None
     if app is None:
         return None
-    missing = [tool for tool in ("openssl", "aws") if shutil.which(tool) is None]
+    if app.key_source == "file":
+        try:
+            with open(app.key_file, "rb"):
+                pass
+        except OSError as exc:
+            # The file's name only: never its contents.
+            LOG.warning("GitHub App settings ignored: key file %s is unreadable (%s)",
+                        app.key_file, type(exc).__name__)
+            return None
+    tools = ("openssl",) if app.key_source == "file" else ("openssl", "aws")
+    missing = [tool for tool in tools if shutil.which(tool) is None]
     if missing:
         LOG.warning("GitHub App settings ignored: %s not installed", " and ".join(missing))
         return None
