@@ -3,6 +3,7 @@ and a fake aws on PATH, and the real sandbox-exec, as the station runs it."""
 
 import json
 import re
+import os
 import subprocess
 import tempfile
 import unittest
@@ -165,6 +166,11 @@ class RewriteAgentTest(unittest.TestCase):
                 self.assertIn('run/rewrite.', self.lane_log.read_text())
                 self.assertIn('home/work', self.lane_log.read_text())
                 self.assertNotIn('aws ssm', self.log.read_text())
+
+    def test_the_wrapper_is_executable_as_the_station_runs_it(self):
+        # LOOM_REWRITE_CMD names the script as the command itself, so a lost
+        # execute bit fails every rewrite with PermissionError (2026-10-17).
+        self.assertTrue(os.access(WRAPPER, os.X_OK), "%s lost its execute bit" % WRAPPER)
 
     def test_codex_verifies_tls_from_the_system_bundle_with_the_keychain_denied(self):
         result = self.run_wrapper("Rewrite this", args=("-", "codex/test-model"))
