@@ -1002,9 +1002,9 @@ exclude_untracked() {
 
 # Before the agent: interpreter, submodules, setup, then the check on the
 # base (recorded, so a failure the base already had is told apart from one
-# the agent caused). A failure the repo did not cause — the contract cannot
+# the agent caused). A failure the repo did not cause -- the contract cannot
 # be read, the environment cannot run the check, or the check is already
-# red on the unmodified base — is a factory incident, not a [work]
+# red on the unmodified base -- is a factory incident, not a [work]
 # failure: the ticket keeps its rung. Returns 1 with SETUP_REASON when the
 # environment cannot be prepared.
 prepare_validation() {
