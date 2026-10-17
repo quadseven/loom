@@ -471,6 +471,47 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("loom:closed-unmerged", self.fake.names(12))
         self.assertNotIn("loom:merged", self.fake.names(12))
 
+    def test_same_repo_short_refs_links_the_merged_pr(self):
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Why it matters.\n\nRefs #12\n",
+                            "head": {"ref": "fix/stray-files"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+
+    def test_a_merged_pr_delivers_the_ticket_while_a_duplicate_is_open(self):
+        # A hand-made PR merged the ticket's change while a lane's PR for the
+        # same ticket was still taking fix rounds.
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 98, "state": "open", "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing-r2"}},
+                           {"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs #12", "head": {"ref": "fix/stray-files"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:pr", self.fake.names(12))
+
+    def test_a_closed_unmerged_pr_leaves_a_ticket_with_an_open_pr_alone(self):
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 98, "state": "open", "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing-r2"}},
+                           {"number": 97, "state": "closed", "merged_at": None,
+                            "body": "Refs %s#12" % REPO, "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:closed-unmerged", self.fake.names(12))
+
+    def test_a_refs_line_for_another_repo_does_not_link(self):
+        self.fake.add(12, state="pr")
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs other-owner/other-repo#12",
+                            "head": {"ref": "fix/elsewhere"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+
 
 DEPLOYED = "d" * 40
 DEPLOYED_AT = calendar.timegm((2030, 1, 3, 12, 0, 0))

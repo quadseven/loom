@@ -818,10 +818,16 @@ def _fix_round_limit() -> int:
         return FIX_ROUNDS_DEFAULT
 
 
+def _refs_numbers(repo: str, body: str) -> List[int]:
+    """The ticket numbers a pull request body names with a `Refs` line, in
+    the full `Refs OWNER/NAME#N` form or the same-repo `Refs #N` form."""
+    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)[ \t]*$" % re.escape(repo),
+                                       body, re.M)]
+
+
 def _linked_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
     number = int(issue.get("number", 0))
-    return bool(re.search(r"^Refs %s#%d[ \t]*$" % (re.escape(repo), number),
-                          str(pr.get("body") or ""), re.M)
+    return bool(number in _refs_numbers(repo, str(pr.get("body") or ""))
                 or re.match(r"loom/%d(?:-|$)" % number,
                             str((pr.get("head") or {}).get("ref") or "")))
 
@@ -1951,12 +1957,12 @@ class Station:
 
     @staticmethod
     def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
-        body = str(pr.get("body") or "")
-        ref = re.search(r"^Refs %s#([0-9]+)[ \t]*$" % re.escape(repo), body, re.M)
+        refs = _refs_numbers(repo, str(pr.get("body") or ""))
+        if refs:
+            return refs[0]
         head = str((pr.get("head") or {}).get("ref") or "")
         branch = re.match(r"loom/([0-9]+)(?:-|$)", head)
-        match = ref or branch
-        return int(match.group(1)) if match else None
+        return int(branch.group(1)) if branch else None
 
     @staticmethod
     def _terminal_label(pr: dict) -> Optional[str]:
@@ -1993,20 +1999,22 @@ class Station:
                              if "loom:ticket" in _label_names(i)}
         if not tickets_by_number:
             return
-        # Only a closed pull request changes a ticket, and only a ticket with
-        # no open one: those PRs are the most recently updated closed ones,
-        # so one page of them is read, never the repo's whole PR history.
+        # Only a closed pull request changes a ticket. Those PRs are the most
+        # recently updated closed ones, so one page of them is read, never the
+        # repo's whole PR history. A merged one delivers the ticket even while
+        # a second PR for it is still open (a duplicate lane run would
+        # otherwise keep taking fix rounds on work already on main); a closed
+        # unmerged one only counts for a ticket with no open PR left.
         open_prs = [p for p in self._open_pulls(repo)
                     if isinstance(p, dict) and p.get("state", "open") == "open"]
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
-        if not waiting:
-            return
         closed = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
                               "&direction=desc&per_page=100" % repo).data
         for pr in closed if isinstance(closed, list) else []:
             if isinstance(pr, dict) and pr.get("state") == "closed":
-                self._reconcile_pr_ticket(repo, pr, waiting)
+                pool = tickets_by_number if self._terminal_label(pr) == "loom:merged" else waiting
+                self._reconcile_pr_ticket(repo, pr, pool)
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
