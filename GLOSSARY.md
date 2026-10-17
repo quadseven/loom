@@ -9,12 +9,20 @@ A durable outcome the operator wants, defined by a home issue in the project's o
 _Avoid_: project, mission, objective
 
 **Goal home**:
-The issue in a project repo that states a goal, its success condition and its rules.
+The issue in a project repo that states a goal, its success condition and its rules; its children are the goal's epics.
 _Avoid_: goal file, GOAL.md
 
+**Epic**:
+A finite chunk of work under a goal: an issue labelled `epic` with a done-when, holding at most 15 tickets, closed when its done-when holds. A goal's children are epics, and a goal has at most 6 open at once.
+_Avoid_: milestone, project, initiative
+
 **Ticket**:
-One scoped unit of work toward a goal, an issue in the project's repo with Why, What, Acceptance criteria, Size and Out of scope.
+One scoped unit of work in an epic, an issue in the project's repo with Why, What, Acceptance criteria, Size and Out of scope.
 _Avoid_: task, job, story
+
+**Map**:
+A wayfinder map: one issue labelled `wayfinder:map` that plans an unclear piece of work as decision tickets, resolved one at a time until the way is clear and the work can be filed as tickets.
+_Avoid_: roadmap, plan, spec
 
 **Ticket state**:
 Where a ticket stands, carried by the one state label on it: queued, briefed, running, pr, failed, shipped or verified.
