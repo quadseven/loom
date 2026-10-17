@@ -560,3 +560,11 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .tickets-table td.tickets-pr { grid-area: 2 / 3; }
   .tickets-table td.tickets-model { grid-area: 3 / 1 / 4 / -1; }
 }
+
+/* Goals page: smaller goals roll up into their parent's card (loom#609). */
+.goal-card .metric-missing { font-size: 18px; color: var(--muted); }
+.goal-children { display: grid; gap: 6px; margin: 0 0 14px; padding: 0; list-style: none; }
+.goal-children li > a { display: grid; gap: 2px; min-height: 44px; align-content: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--body-on-bg); }
+.goal-children li > a:hover { background: var(--raised); border-color: var(--line-strong); }
+.goal-child-title { font-size: 13.5px; line-height: 1.35; }
+.goal-children .machine-fact { color: var(--muted); font-size: 11px; }

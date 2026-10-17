@@ -11,7 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
 from bus import brain, labels, tickets
@@ -22,6 +22,10 @@ from . import goals, views
 
 
 READ_WORKERS = 8
+# A goal home's title and parent are read again this often (seconds), and at
+# most this many goal homes are read in one pass when following parents up.
+GOAL_INFO_TTL = 3600
+GOAL_INFO_MAX = 200
 LOG = logging.getLogger(__name__)
 
 
@@ -101,7 +105,9 @@ class TicketStore:
         self._snapshot = {"tickets": {repo: None for repo in self.repos}, "errors": {},
                           "stale": False, "ready": False,
                           "improving": {"journals": [], "metrics_comments": []},
-                          "lanes": [], "pull_requests": [], "dashboard_errors": []}
+                          "lanes": [], "pull_requests": [], "dashboard_errors": [],
+                          "goal_context": {},
+                          "goal_context_error": "the dashboard has not read its sources yet"}
         self.operator_items = []
         self.human_counts = {}
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
@@ -217,6 +223,14 @@ class TicketStore:
                          "brain_step": None, "brain_step_error": skipped,
                          "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
                          "dashboard_errors": [skipped]})
+            # The goal cards keep the last pass that read them. Dropping them
+            # here left every Goals card at "-" with "No report on this goal
+            # in the last two weeks" whenever the budget dipped (2026-10-17).
+            previous = self._snapshot.get("goal_context")
+            data["goal_context"] = previous or {}
+            data["goal_context_error"] = self._snapshot.get("goal_context_error", "") if previous else (
+                "goal comments were not read: the GitHub request budget is below its floor"
+                " and no earlier pass read them")
             return
 
         journals, reports, metric_comments, prs, lanes = [], [], [], [], []
@@ -248,24 +262,58 @@ class TicketStore:
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
         rows = [row for found in data.get("tickets", {}).values() if found for row in found]
+        titles, parents = self._goal_info(rows)
+        # Reports on the goal homes read in full above count too: a goal home
+        # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
+        # comment feed failed this pass.
+        unread = dict(data.get("comment_errors") or {})
+        for repo in {str(row.get("goal") or "").partition("#")[0] for row in rows if row.get("goal")}:
+            if repo not in self.repos and (repo, None) not in homes:
+                unread.setdefault(repo, "%s comments: the repo is not in LOOM_REPOS, so its comments"
+                                        " are not read" % repo)
         data["goal_context"] = goals.goal_context(
-            rows, data.get("issue_comments", []), self._goal_titles(rows), metric_comments,
-            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc))
+            rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
+            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
+            parents=parents, unread=unread)
+        data["goal_context_error"] = ""
 
-    def _goal_titles(self, rows) -> Dict[str, Optional[str]]:
-        """Each goal issue's title, read once per process (titles rarely
-        change); an unreadable goal stays None and is read again next pass."""
-        cache = self.__dict__.setdefault("_titles", {})
-        for goal in {row["goal"] for row in rows if row.get("goal")}:
-            if cache.get(goal):
+    def _goal_info(self, rows) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+        """Each goal home's title and the goal it rolls up into (a `Parent
+        goal:` line or a sub-issue parent), read for every goal the tickets
+        name and every parent above them. A goal home is read again after
+        GOAL_INFO_TTL (a parent line can be added at any time; a conditional
+        read of an unchanged issue costs no request budget); an unreadable
+        one stays None and is read again next pass."""
+        cache = self.__dict__.setdefault("_goal_info_cache", {})
+        pending = sorted({row["goal"] for row in rows if row.get("goal")})
+        seen = set()
+        now = time.time()
+        while pending and len(seen) < GOAL_INFO_MAX:
+            goal = pending.pop(0)
+            if goal in seen:
                 continue
-            repo, _, number = goal.partition("#")
-            try:
-                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
-                cache[goal] = str(issue.get("title") or "") or None if isinstance(issue, dict) else None
-            except (GitHubError, OSError, ValueError):
-                cache[goal] = None
-        return dict(cache)
+            seen.add(goal)
+            entry = cache.get(goal)
+            if not entry or not entry.get("title") or now - entry.get("read_at", 0) >= GOAL_INFO_TTL:
+                entry = self._read_goal_home(goal, entry, now)
+                cache[goal] = entry
+            if entry.get("parent") and entry["parent"] not in seen:
+                pending.append(entry["parent"])
+        titles = {goal: entry.get("title") for goal, entry in cache.items()}
+        parents = {goal: entry.get("parent") for goal, entry in cache.items()}
+        return titles, parents
+
+    def _read_goal_home(self, goal, entry, now):
+        repo, _, number = goal.partition("#")
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
+        except (GitHubError, OSError, ValueError):
+            # Keep what an earlier read found; try again next pass.
+            return dict(entry or {}, read_at=0)
+        if not isinstance(issue, dict):
+            return {"title": None, "parent": None, "read_at": 0}
+        return {"title": str(issue.get("title") or "") or None,
+                "parent": goals.parent_of(repo, issue), "read_at": now}
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
@@ -285,14 +333,17 @@ class TicketStore:
         since = (day - 2 * HOT_SPOT_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
         trusted = {login.lower() for login in brain.trusted_authors()}
         issue_comments, review_comments, errors = [], [], []
+        comment_errors = {}
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             results = list(pool.map(lambda repo: self._comments_for_repo(repo, since, trusted), self.repos))
-        for issues, reviews, error in results:
+        for repo, (issues, reviews, error) in zip(self.repos, results):
             issue_comments.extend(issues)
             review_comments.extend(reviews)
             if error:
                 errors.append(error)
+                comment_errors[repo] = error
         data["issue_comments"], data["review_comments"] = issue_comments, review_comments
+        data["comment_errors"] = comment_errors
         data["hot_spots_error"] = "; ".join(errors) if errors else (
             "" if self.repos else "LOOM_REPOS is not set")
 
@@ -460,6 +511,7 @@ class TicketStore:
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),
                 "goal_context": snapshot.get("goal_context", {}),
+                "goal_context_error": snapshot.get("goal_context_error", ""),
                 "operator_items": list(self.operator_items),
                 "dashboard_errors": snapshot.get("dashboard_errors", []),
                 "brain_step": snapshot.get("brain_step"),
