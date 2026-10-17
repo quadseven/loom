@@ -3374,6 +3374,16 @@ class CloseEpicTests(unittest.TestCase):
                 self.assertEqual(fake.issues[EPIC]["state"], "open")
                 self.assertEqual(fake.comments, [])
 
+    def test_a_vanished_epic_is_refused_as_not_an_open_epic(self):
+        fake = self.repo("closed")
+        with self.assertRaisesRegex(ValueError, "#99 is not an open epic"):
+            brain.close_epic(GitHub("t", transport=fake), REPO, 99, "done")
+        gone = self.repo("closed")
+        gone._get_sub_issues = lambda number, payload: reply(404, {"message": "Not Found"})
+        with self.assertRaisesRegex(ValueError, "#2 is not an open epic"):
+            brain.close_epic(GitHub("t", transport=gone), REPO, EPIC, "done")
+        self.assertEqual(gone.issues[EPIC]["state"], "open")
+
     def test_finished_epics_need_a_ticket_and_every_ticket_closed(self):
         done = {"state": "closed"}
         tree = [({"number": 1, "state": "open"}, [done, done]),

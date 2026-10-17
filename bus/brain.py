@@ -1124,10 +1124,16 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
     if not note:
         raise ValueError("a closed epic gets a one-line note saying how its done-when holds")
     _check_written_text(note)
-    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
-    if issue.get("state") != "open" or not _epic_label(issue):
-        raise ValueError("#%d is not an open epic" % number)
-    found = _epic_tickets(gh, repo, number)
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+        if issue.get("state") != "open" or not _epic_label(issue):
+            raise ValueError("#%d is not an open epic" % number)
+        found = _epic_tickets(gh, repo, number)
+    except GitHubError as err:
+        # Gone between the resume item and the close (deleted or moved).
+        if err.status in (404, 410):
+            raise ValueError("#%d is not an open epic" % number) from None
+        raise
     still = [t for t in found if t.get("state") != "closed"]
     if still:
         raise ValueError("epic #%d still holds open tickets: %s" % (
