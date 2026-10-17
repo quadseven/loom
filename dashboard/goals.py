@@ -23,7 +23,7 @@ from bus import brain
 # verified ticket carries loom:verified instead, so it never counts; a
 # failed audit moves a ticket back to shipped, so it does. The snapshot rows
 # already carry each ticket's state, so the Floor needs no comment reads.
-UNPROVEN_STATES = ("merged", "shipped")
+UNPROVEN_STATES = ("shipped",)  # same as bus.brain.UNPROVEN: verification debt only
 
 REPORT_MARKER = "<!-- loom:report v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"

@@ -142,9 +142,11 @@ class BrainTests(unittest.TestCase):
         waiting = ticket("loom:shipped", brain.AWAITING_EVIDENCE)
         self.assertFalse(brain._unproven(waiting))
         self.assertTrue(brain._awaiting(waiting))
-        for plain in (ticket("loom:shipped"), ticket("loom:merged")):
-            self.assertTrue(brain._unproven(plain))
-            self.assertFalse(brain._awaiting(plain))
+        self.assertTrue(brain._unproven(ticket("loom:shipped")))
+        self.assertFalse(brain._awaiting(ticket("loom:shipped")))
+        # A merged ticket waits on a deploy, not a verifier: it never counts
+        # (2026-10-17: merged tickets pinned two goals over the limit).
+        self.assertFalse(brain._unproven(ticket("loom:merged")))
         # Closed or verified work never counts either way.
         self.assertFalse(brain._unproven(dict(waiting, state="closed")))
         children = [ticket("loom:shipped")] * 3 + [waiting] * 20
