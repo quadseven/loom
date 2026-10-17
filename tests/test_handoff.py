@@ -491,6 +491,18 @@ class HandoffPacketTests(unittest.TestCase):
         found = [goal(journal(30, "muse", defer(PR, "pr-abc")))]
         self.assertEqual(packet(found), packet(found, now=NOW + timedelta(minutes=30)))
 
+    def test_a_compact_journal_gives_the_same_packet(self):
+        entries = [journal(200, "muse", "Some long prose " * 40, "- Model: model-x",
+                           defer(PR, "pr-abc")),
+                   journal(30, "lane-machine", done(PR), "## Heading", "First line here."),
+                   journal(10, "lane-machine", "- Decided: briefed one", defer(TICKET, "c3",
+                                                                              stage="failed"))]
+        full = goal(*entries)
+        small = handoff.Goal(full.repo, full.number, full.shown,
+                             [handoff.compact(j) for j in full.journals])
+        self.assertEqual(packet([full]), packet([small]))
+        self.assertLess(len(small.journals[0]["body"]), len(full.journals[0]["body"]))
+
     def test_rules_section_reads_to_the_next_heading(self):
         doc = "# Doc\n\n## Tick\n1. Lock.\n\n## Rules\n\n- One.\n  more.\n- Two.\n\n## After\nx\n"
         self.assertEqual(["- One.", "  more.", "- Two."], handoff.rules_section(doc))

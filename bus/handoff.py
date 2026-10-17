@@ -257,6 +257,21 @@ def decided_line(body: str) -> str:
     return ""
 
 
+def compact(comment: Dict[str, Any]) -> Dict[str, Any]:
+    """A journal cut down to what the packet reads from it (the Tick line,
+    the decided line, the model line and every handoff marker), so the
+    station can keep it between passes. The packet reads the same from it
+    as from the whole journal."""
+    body = str(comment.get("body") or "")
+    tick = _TICK.search(body)
+    decided, model = decided_line(body), journal_model(body)
+    lines = [JOURNAL_MARKER] + ([tick.group(0).strip()] if tick else [])
+    lines += ["- Decided: %s" % decided] if decided else []
+    lines += ["- Model: %s" % model] if model else []
+    lines += [m.group(0) for m in _MARK.finditer(body)]
+    return {"body": "\n".join(lines), "at": comment.get("at"), "login": comment.get("login")}
+
+
 def rules_section(doc: str) -> List[str]:
     """The lines of the `## Rules` section of docs/MUSE.md, without the
     heading and trailing blank lines; [] when there is none."""

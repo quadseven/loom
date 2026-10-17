@@ -802,7 +802,10 @@ flight, blocked, next.
 Each pass the station keeps one comment on the Loom goal home (the status
 repo's one open goal home that is not a backlog), marked
 `<!-- loom:handoff v1 -->`. It posts it once and then edits it in place, and
-only when its text changed. It holds the last 5 ticks across the goal homes
+only when its text changed. It rebuilds the packet at most every 10 minutes,
+or at once when a brain tick on the lane machine just ended (`state/brain.json`
+changed), and reads again only the goal homes whose update time or comment
+count changed since the last build. It holds the last 5 ticks across the goal homes
 (holder, model from a `- Model:` journal line, done and deferred counts, one
 line decided from a `- Decided:` line or the first line of prose, and the
 items left open), a tick that holds the lock with no journal yet, the

@@ -1157,16 +1157,23 @@ class HandoffFake:
 
     def __init__(self):
         self.goal = {"number": 30, "title": "Loom goal", "state": "open",
-                     "labels": [{"name": "loom:goal"}]}
+                     "labels": [{"name": "loom:goal"}], "comments": 0,
+                     "updated_at": "2030-01-01T00:00:00Z"}
         self.comments = []
         self.writes = []
+        self.comment_reads = 0
         self.muse = base64.b64encode(b"# Muse\n\n## Rules\n\n- Write ASCII only.\n").decode()
+
+    def touch(self, at):
+        self.goal["comments"] = len(self.comments)
+        self.goal["updated_at"] = at
 
     def journal(self, holder, at, *lines):
         self.comments.append({"id": len(self.comments) + 1, "user": {"login": AUTHORS[0]},
                               "created_at": at, "body": "\n".join(
                                   [station.JOURNAL_MARKER, "Tick %s, %s" % (at, holder)]
                                   + list(lines))})
+        self.touch(at)
 
     def rest(self, method, path, data=None, ok=()):
         if method == "GET" and path.endswith("/git/ref/heads/loom-lock/brain"):
@@ -1177,6 +1184,7 @@ class HandoffFake:
             self.writes.append((method, path))
             self.comments.append({"id": 900 + len(self.writes), "user": {"login": AUTHORS[0]},
                                   "created_at": "2030-01-01T00:00:00Z", "body": data["body"]})
+            self.touch("2030-01-01T12:00:%02dZ" % len(self.writes))
             return mock.Mock(status=201, data=self.comments[-1])
         if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO):
             self.writes.append((method, path))
@@ -1189,6 +1197,7 @@ class HandoffFake:
         if path.startswith("/repos/%s/issues?labels=loom:goal" % REPO):
             return [self.goal]
         if path.startswith("/repos/%s/issues/30/comments" % REPO):
+            self.comment_reads += 1
             return [dict(c) for c in self.comments]
         raise AssertionError(path)
 
@@ -1205,6 +1214,10 @@ class HandoffPacketTest(unittest.TestCase):
         station.Station(self.gh, self.settings, now=self.now + 60 * minutes,
                         head=lambda: "c" * 40).publish_handoff()
 
+    def tick_ended(self, at):
+        with open(os.path.join(self.temp.name, "state", "brain.json"), "w") as fh:
+            json.dump({"at": at, "outcome": "ok", "exit": 0}, fh)
+
     def packets(self):
         return [c for c in self.gh.comments if c["body"].startswith("<!-- loom:handoff v1 -->")]
 
@@ -1218,19 +1231,53 @@ class HandoffPacketTest(unittest.TestCase):
                       "Decided: merged one." % REPO, body)
         self.assertIn("- merge %s#7, deferred by muse at 2030-01-01T11:00:00Z." % REPO, body)
         self.assertIn("## Rules (docs/MUSE.md at %s)\n- Write ASCII only." % ("c" * 40), body)
-        # Nothing changed: no write at all on the next pass.
-        self.run_pass(minutes=1)
+        # Nothing changed: no write at all on a later pass.
+        self.run_pass(minutes=11)
         self.assertEqual(1, len(self.gh.writes))
         # A brain ticks: the same comment is edited, never a second one posted.
-        self.gh.journal("lane-machine", "2030-01-01T12:01:30Z", "- Decided: merged it",
+        self.gh.journal("lane-machine", "2030-01-01T12:12:30Z", "- Decided: merged it",
                         "<!-- loom:done v1 stage=merge item=%s#7 holder=lane-machine -->" % REPO)
-        self.run_pass(minutes=2)
+        self.tick_ended(self.now + 60 * 12)
+        self.run_pass(minutes=12)
         self.assertEqual(("PATCH", "/repos/%s/issues/comments/901" % REPO), self.gh.writes[-1])
         self.assertEqual(1, len(self.packets()))
         self.assertEqual(1, sum(1 for method, _ in self.gh.writes if method == "POST"))
         body = self.packets()[0]["body"]
         self.assertIn("lane-machine, model unknown, on %s#30: 1 done, 0 deferred" % REPO, body)
         self.assertIn("## Open defers (0, 0 from brains no longer ticking)\n- none", body)
+
+    def test_a_pass_within_ten_minutes_and_no_new_tick_reads_no_comments(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one")
+        self.run_pass()
+        reads = self.gh.comment_reads
+        self.gh.journal("muse", "2030-01-01T12:05:00Z", "- Decided: briefed two")
+        self.run_pass(minutes=9)
+        self.assertEqual(reads, self.gh.comment_reads)
+        self.assertNotIn("briefed two", self.packets()[0]["body"])
+
+    def test_a_brain_tick_that_just_ended_rebuilds_the_packet_at_once(self):
+        os.makedirs(os.path.join(self.temp.name, "state"), exist_ok=True)
+        self.tick_ended(self.now - 600)
+        self.run_pass()
+        self.gh.journal("lane-machine", "2030-01-01T12:01:00Z", "- Decided: briefed two")
+        self.tick_ended(self.now + 60)
+        self.run_pass(minutes=1)
+        self.assertIn("Decided: briefed two.", self.packets()[0]["body"])
+        self.assertEqual(1, len(self.packets()))
+
+    def test_an_unchanged_goal_home_is_not_read_again(self):
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: merged one",
+                        "<!-- loom:defer v1 stage=merge item=%s#7 rev=pr-abc holder=muse -->" % REPO)
+        self.run_pass()
+        # The post itself changed the home: the next build reads it once more.
+        self.run_pass(minutes=11)
+        reads = self.gh.comment_reads
+        # Two hours on, the defer turns into open work: a new text, no read.
+        self.run_pass(minutes=125)
+        self.assertEqual(reads, self.gh.comment_reads)
+        self.assertEqual(("PATCH", "/repos/%s/issues/comments/901" % REPO), self.gh.writes[-1])
+        self.assertIn("Open work for any brain: muse last ticked at 2030-01-01T11:00:00Z",
+                      self.packets()[0]["body"])
 
     def test_a_marked_comment_from_a_stranger_is_not_the_packet(self):
         self.gh.comments.append({"id": 5, "user": {"login": "stranger"},
