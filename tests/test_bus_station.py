@@ -3801,10 +3801,12 @@ class BrainTest(Base):
         self.settings.status_repo = REPO
         self.sent = []
 
-    def tick(self, outcome="ok", code=0, ok_age=None):
+    def tick(self, outcome="ok", code=0, ok_age=None, reason=None):
         state = os.path.join(self.home, "state")
-        self.write(os.path.join(state, "brain.json"),
-                   json.dumps({"at": int(time.time()), "outcome": outcome, "exit": code}))
+        last = {"at": int(time.time()), "outcome": outcome, "exit": code}
+        if reason is not None:
+            last["reason"] = reason
+        self.write(os.path.join(state, "brain.json"), json.dumps(last))
         if ok_age is not None:
             ok = os.path.join(state, "brain-ok")
             self.write(ok, "")
@@ -3895,6 +3897,16 @@ class BrainTest(Base):
         self.go()
         self.assertEqual(len(self.sent), 1)
         self.assertIn("has not finished a tick yet", self.sent[0])
+
+    def test_a_tick_skipped_with_no_lane_says_why_it_ran_nothing(self):
+        # brain.sh touches no brain-ok when no rung has usage, so the skip
+        # goes stale and the alert carries its reason.
+        self.tick(outcome="skipped", ok_age=3 * 3600,
+                  reason="no brain lane has usage: claude: unavailable; codex: no usage heartbeat")
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("skipped (exit 0) because no brain lane has usage: claude: unavailable; "
+                      "codex: no usage heartbeat. Its log", self.sent[0])
 
     def test_a_skip_for_a_held_lock_counts_as_alive(self):
         self.tick(outcome="skipped", ok_age=0)

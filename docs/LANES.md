@@ -88,9 +88,9 @@ lane and CI cannot drift apart. Unknown lines are refused.
 `lanes/mac/brain.sh` every `LOOM_BRAIN_INTERVAL` seconds (default 1800). A
 tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
 before any model call), updates its own clone of this repo under
-`$LOOM_HOME/brain`, runs `claude -p` (model `LOOM_BRAIN_MODEL`, default the
-current Opus) on docs/MUSE.md with a hard stop of `LOOM_BRAIN_MINUTES`
-(default 40), and releases the lock, also after a failure. It logs to
+`$LOOM_HOME/brain`, runs an agent CLI on docs/MUSE.md with a hard stop of
+`LOOM_BRAIN_MINUTES` (default 40), and releases the lock, also after a
+failure. It logs to
 `$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it. A live tick waits up to `LOOM_BRAIN_WAIT` minutes (default 25) for a lock another brain holds, because it is the only tick that ships. With
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
@@ -98,9 +98,34 @@ rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
 0002): both brains take every stage under the one lock, and the defer and
 done markers keep them from repeating each other's work.
 
-Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
+The agent floats to whichever subscription has usage (decision 0002, item
+2). `LOOM_BRAIN_LADDER` lists lanes in order, default `claude codex spark`.
+The tick runs the first rung whose heartbeat
+(`$LOOM_HOME/state/usage/<lane>.json`, written by that lane's runner) says
+available and is at most 10 minutes old, with the lane's model and the
+same CLI invocation `lanes/run_lane.sh` uses, from the shared
+`lanes/agent_cli.sh`:
+
+| Rung | Model | Run |
+|---|---|---|
+| `claude` | `LOOM_BRAIN_MODEL` (default the current Opus) | `claude -p`, every permission prompt skipped |
+| `codex` | `LOOM_CODEX_MODEL` | `codex exec` with full access (a lane's run has no network; the brain needs GitHub) |
+| `spark` | `LOOM_SPARK_MODEL` at `LOOM_SPARK_URL` | opencode in the lane sandbox (`lanes/agent_sandbox.sh`), given this machine's GitHub token and the `LOOM_*` settings in its environment |
+
+A run that fails with a limit, as `run_lane.sh` classes a lane's failure
+from the last lines of output, hands the same tick to the next rung with
+usage, once, under the same lock and within the same hard stop. A rung with
+no model set, or a name with no runner, is passed over. agy has no rung:
+its CLI runs only as the agy lane user, which cannot read the brain's
+checkout or GitHub sign-in, and run as the operator it would read the login
+keychain. The `tick start` line in `brain.log` names the lane and model.
+
+Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the lane
+and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. The station adds a `brain` row to the lane status. The brain also
+included. When no rung has usage, the tick takes no lock and runs no CLI: it
+records `skipped` with each rung's reason and leaves `brain-ok` alone, so
+the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
 well for 2 hours it looks (at most every 10 minutes) for the newest
 `<!-- loom:journal v1 -->` comment from a `LOOM_BRIEF_AUTHORS` login on the

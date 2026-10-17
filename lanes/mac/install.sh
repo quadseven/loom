@@ -243,9 +243,11 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bus station; idle unless LOOM_REPOS is set)"
 
 # The brain tick (lanes/mac/brain.sh): every LOOM_BRAIN_INTERVAL seconds
-# (default 1800), take the brain lock and run one docs/MUSE.md tick with the
-# claude CLI. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
-# LOOM_AWS_REGION and LOOM_BRAIN_* from the installing environment; with
+# (default 1800), take the brain lock and run one docs/MUSE.md tick on the
+# first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
+# usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
+# LOOM_AWS_REGION, LOOM_BRAIN_* and the rungs' LOOM_CODEX_MODEL,
+# LOOM_SPARK_MODEL and LOOM_SPARK_URL from the installing environment; with
 # LOOM_REPOS empty it stays idle. LOOM_BRAIN=0 skips it and removes an
 # installed one.
 LABEL="com.loom.brain"
@@ -273,7 +275,7 @@ else
   <key>StandardErrorPath</key><string>$X_LOOM/logs/brain-service.log</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$X_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>$X_HOME/.local/bin:$X_HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
 $(loom_env)

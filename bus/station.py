@@ -4668,11 +4668,15 @@ class Station:
         outcome = outcome if outcome in BRAIN_OUTCOMES else "unknown"
         code = code if isinstance(code, int) and not isinstance(code, bool) else "?"
         since = ("since " + self._utc(ok_at)) if ok_at is not None else "yet"
+        # A tick that ran no agent says why (no brain lane has usage).
+        reason = last.get("reason")
+        why = (" because %s" % " ".join(reason.split())[:300]
+               if isinstance(reason, str) and reason.strip() else "")
         seen = ("Newest journal: %s on %s." % (self._utc(journal["at"]), journal["goal"])
                 if journal else "No journal from an allowed author in the last day.")
         return ("Urgent: the Loom brain has not finished a tick %s, so no goal is "
-                "moving. %s Last tick on the lane machine: %s, %s (exit %s). Its log "
-                "is brain.log there." % (since, seen, when, outcome, code))
+                "moving. %s Last tick on the lane machine: %s, %s (exit %s)%s. Its log "
+                "is brain.log there." % (since, seen, when, outcome, code, why))
 
     @staticmethod
     def _epoch(stamp: str) -> Optional[float]:
