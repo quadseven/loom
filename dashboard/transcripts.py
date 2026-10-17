@@ -78,6 +78,8 @@ _LIST_ALL = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, b
 _LIST_TICKET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts WHERE ticket=%s ORDER BY started_at DESC LIMIT 100"
 _ATTEMPTS = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at FROM transcripts WHERE ticket=%s ORDER BY started_at ASC"
 _GET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE id=%s"
+RETENTION_DAYS = 180
+_PURGE = "DELETE FROM transcripts WHERE started_at < now() - INTERVAL '%d days'" % RETENTION_DAYS  # noqa: S608 - RETENTION_DAYS is a fixed integer constant, not user input.
 
 
 class MemoryBackend:
@@ -129,7 +131,9 @@ class PostgresBackend:
     def initialize(self):
         conn = self._connect()
         try:
-            conn.cursor().execute(_CREATE)
+            cur = conn.cursor()
+            cur.execute(_CREATE)
+            cur.execute(_PURGE)
             conn.commit()
         finally:
             conn.close()
@@ -138,6 +142,7 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
+            cur.execute(_PURGE)
             cur.execute(_UPSERT, (body["ticket"], body["slot"], body["model"], body["outcome"],
                                   body["started_at"], body["finished_at"], json.dumps(body["events"]),
                                   len(json.dumps(body, ensure_ascii=False).encode("utf-8"))))
@@ -151,6 +156,7 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
+            cur.execute(_PURGE)
             cur.execute(_LIST_TICKET if query == "list" and ticket is not None else
                         _LIST_ALL if query == "list" else _ATTEMPTS,
                         (ticket,) if query == "attempts" or ticket is not None else ())
@@ -167,6 +173,7 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
+            cur.execute(_PURGE)
             cur.execute(_GET, (id_,))
             row = cur.fetchone()
             if row is None:
