@@ -203,6 +203,14 @@ NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
 CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
+# The comments that assign the ticket to a lane: a brief. Claims after the
+# newest of these ran on the lane the ticket was last briefed to (loom#565).
+BRIEF_RES = (
+    re.compile(r"^The station gave this queued ticket lane ([a-z0-9-]+) \(tier [a-z]+\)\.$"),
+    re.compile(r"the factory moved this ticket to lane ([a-z0-9-]+),"),
+    re.compile(r"moved from lane [a-z0-9-]+ to lane ([a-z0-9-]+)\."),
+    re.compile(r"the factory moved this ticket up the model ladder to rung \d+, \S+ on lane ([a-z0-9-]+)\."),
+)
 RUNAWAY = "loom:runaway"
 NO_REASON = "agent made no commit and wrote no reason"
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
@@ -508,14 +516,18 @@ def issue_model(issue: Dict[str, Any]) -> str:
     return match.group(1) if match else "unspecified"
 
 
-def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
-    """Each claim as (epoch, time, lane, reason it failed), oldest first, from
+def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[Any]]:
+    """Each claim as [epoch, time, lane, reason it failed], oldest first, from
     the claim and "Lane X failed:" comments. An attempt takes the failure that
-    followed it, or "" when none was recorded; with `current` given, the last
-    attempt is the one being reported and takes that reason."""
+    followed it, or "" when none was recorded. With `reset_at` given, a
+    comment it matches starts a new segment: only the last segment's claims
+    are returned."""
     found: List[List[Any]] = []
     for comment in comments:
         body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
+        if reset_at is not None and reset_at(body):
+            found = []
+            continue
         claim = CLAIMED_RE.fullmatch(body)
         at = _ts(comment.get("created_at")) if claim else 0.0
         if claim and at:
@@ -523,9 +535,37 @@ def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str,
         failure = FAILED_RE.match(body)
         if failure and found and not found[-1][3]:
             found[-1][3] = body[failure.end():]
+    return found
+
+
+def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
+    """Each claim as (epoch, time, lane, reason it failed), oldest first, from
+    the claim and "Lane X failed:" comments. An attempt takes the failure that
+    followed it, or "" when none was recorded; with `current` given, the last
+    attempt is the one being reported and takes that reason."""
+    found = _attempt_rows(comments)
     if found and current:
         found[-1][3] = current
     return [(a[0], a[1], a[2], a[3]) for a in found]
+
+
+def _is_brief(body: str) -> bool:
+    """Whether the comment assigns the ticket to a lane: a brief."""
+    return any(rx.search(body) for rx in BRIEF_RES)
+
+
+def attempts_since_brief(comments: Sequence[Any]) -> List[Tuple[int, str, str, str]]:
+    """The attempts after the ticket's last brief (its last lane assignment),
+    oldest first, each with the failure that followed it. A ticket briefed
+    with no assignment comment keeps every claim."""
+    return [(a[0], a[1], a[2], a[3]) for a in _attempt_rows(comments, reset_at=_is_brief)]
+
+
+def dead_lane(comments: Sequence[Any]) -> Optional[str]:
+    """The one lane every attempt since the ticket's last brief ran on, or
+    None when the attempts spread across lanes or there are none (loom#565)."""
+    lanes = {lane for _, _, lane, _ in attempts_since_brief(comments)}
+    return next(iter(lanes)) if len(lanes) == 1 else None
 
 
 def _cell(text: str) -> str:
