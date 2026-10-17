@@ -1756,10 +1756,11 @@ def _is_epic(issue: Dict[str, Any]) -> bool:
             or int(summary.get("total") or 0) > 0)
 
 
-def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = ()) -> Optional[str]:
+def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
+                 briefers: Sequence[str] = ()) -> Optional[str]:
     if "pull_request" in issue:
         return "pull request"
-    if authors and tickets.owned_elsewhere(issue, authors):
+    if authors and tickets.owned_elsewhere(issue, authors, briefers):
         # Another operator's Loom owns an issue assigned to them.
         return "another operator's"
     names = _labels(issue)
@@ -1812,6 +1813,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
     in_flight = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
     authors = trusted_authors()
+    briefers = trusted_briefers()
     lines: List[str] = []
     done = 0
     comments = 0
@@ -1820,7 +1822,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
         if done >= limit:
             break
         number = int(issue["number"])
-        skip = _triage_skip(issue, authors)
+        skip = _triage_skip(issue, authors, briefers)
         if skip:
             continue
         missing = missing_sections(issue.get("body"))
@@ -2056,14 +2058,13 @@ def _prioritize_body(issue: Dict[str, Any], priority: Optional[str],
         raise ValueError("cannot prioritize a closed issue")
     if "loom:ticket" not in _labels(issue):
         raise ValueError("only a loom:ticket can be prioritized")
-    authors = {author.lower() for author in trusted_authors(env)}
+    authors = trusted_authors(env)
     if not authors:
         # A brain without the setting refused every ticket as untrusted and
         # could not tell why (a remote brain, 2026-10-16).
         raise ValueError("LOOM_BRIEF_AUTHORS is empty: set it to the login(s) that brief "
                          "tickets (docs/MUSE.md)")
-    login = str((issue.get("user") or {}).get("login") or "").lower()
-    if not login or login not in authors:
+    if not tickets.brief_author_trusted(issue, authors, trusted_briefers(env)):
         raise ValueError("ticket author is not a trusted login")
     updated = str(issue.get("body") or "")
     if priority is not None:
@@ -2195,8 +2196,7 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
-    authors = trusted_authors()
-    owner = tickets.owned_elsewhere(issue, authors) if authors else None
+    owner = owned_elsewhere(issue)
     if owner is not None and state in ("queued", "briefed", "running"):
         raise ValueError("#%d is assigned to %s, another operator's; leave it to their Loom"
                          % (number, owner))
@@ -2511,8 +2511,28 @@ def _thread_for_comment(details: Dict[str, Any], comment_id: int) -> str:
 
 
 def trusted_authors(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """LOOM_BRIEF_AUTHORS: this Loom's own logins. Their briefs, journals,
+    proofs and pull requests are trusted, and what they own is this Loom's."""
     raw = (os.environ if env is None else env).get("LOOM_BRIEF_AUTHORS", "")
     return raw.replace(",", " ").split()
+
+
+def trusted_briefers(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """LOOM_TRUSTED_BRIEFERS: another operator's logins whose loom:ticket
+    briefs this Loom builds like its own (tickets.brief_author_trusted). They
+    own nothing here, and their journals, proofs and merges are not trusted."""
+    raw = (os.environ if env is None else env).get("LOOM_TRUSTED_BRIEFERS", "")
+    return raw.replace(",", " ").split()
+
+
+def owned_elsewhere(issue: Dict[str, Any],
+                    env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The other operator's login that owns the issue, read from the
+    environment's settings; None with no LOOM_BRIEF_AUTHORS set."""
+    authors = trusted_authors(env)
+    if not authors:
+        return None
+    return tickets.owned_elsewhere(issue, authors, trusted_briefers(env))
 
 
 def _check_proven(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],

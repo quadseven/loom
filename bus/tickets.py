@@ -539,6 +539,10 @@ def _latest_label_actor(events: Iterable[Dict[str, Any]], match) -> Optional[str
     return actor
 
 
+# The settings that name a briefing login, as a refusal names them.
+_BRIEFING = "LOOM_BRIEF_AUTHORS or LOOM_TRUSTED_BRIEFERS"
+
+
 def _labeller_problem(events: List[Dict[str, Any]], allowed: set) -> Optional[str]:
     """Why the latest loom:briefed or lane: labeller is not trusted, if so."""
     for label, what, match in (
@@ -548,23 +552,55 @@ def _labeller_problem(events: List[Dict[str, Any]], allowed: set) -> Optional[st
         if actor is None:
             return "no %s labelled event found" % label
         if actor not in allowed:
-            return "%s was applied by %s, not in LOOM_BRIEF_AUTHORS" % (what, actor or "unknown")
+            return "%s was applied by %s, not in %s" % (what, actor or "unknown", _BRIEFING)
     return None
+
+
+def briefing_logins(authors: Iterable[str], briefers: Iterable[str] = ()) -> List[str]:
+    """The lower-case logins whose briefs this Loom builds: its own
+    LOOM_BRIEF_AUTHORS, then LOOM_TRUSTED_BRIEFERS (docs/LANES.md, "Trusted
+    briefers"), each once. Briefing trust only: ownership, journals, proofs,
+    adoption and merges read LOOM_BRIEF_AUTHORS alone."""
+    found: List[str] = []
+    for login in list(authors) + list(briefers):
+        login = login.lower()
+        if login and login not in found:
+            found.append(login)
+    return found
+
+
+def _is_ticket(issue: Dict[str, Any]) -> bool:
+    return "pull_request" not in issue and "loom:ticket" in _names(issue)
+
+
+def brief_author_trusted(issue: Dict[str, Any], authors: Iterable[str],
+                         briefers: Iterable[str] = ()) -> bool:
+    """Whether the issue's author may brief this Loom: a LOOM_BRIEF_AUTHORS
+    login, or a LOOM_TRUSTED_BRIEFERS login on a loom:ticket (a brief is the
+    hand-off). Every briefing trust check asks this, so they cannot drift."""
+    author = _login(issue.get("user"))
+    if not author:
+        return False
+    if author in {a.lower() for a in authors}:
+        return True
+    return author in {b.lower() for b in briefers} and _is_ticket(issue)
 
 
 def trusted(issue: Dict[str, Any], events: List[Dict[str, Any]],
             editor_login: Optional[str], authors: Iterable[str],
-            owners: Iterable[str]) -> Tuple[bool, str]:
-    """Every rule in docs/BRAIN.md "Trust"; the reason says which one failed."""
-    allowed = {a.lower() for a in authors}
-    author = _login(issue.get("user"))
-    if not author or author not in allowed:
-        return False, "issue author %s is not in LOOM_BRIEF_AUTHORS" % (author or "unknown")
+            owners: Iterable[str], briefers: Iterable[str] = ()) -> Tuple[bool, str]:
+    """Every rule in docs/BRAIN.md "Trust"; the reason says which one failed.
+    A briefing login is a LOOM_BRIEF_AUTHORS or LOOM_TRUSTED_BRIEFERS one."""
+    authors, briefers = list(authors), list(briefers)
+    allowed = set(briefing_logins(authors, briefers))
+    if not brief_author_trusted(issue, authors, briefers):
+        author = _login(issue.get("user"))
+        return False, "issue author %s is not in %s" % (author or "unknown", _BRIEFING)
     problem = _labeller_problem(events, allowed)
     if problem:
         return False, problem
     if editor_login is not None and editor_login.lower() not in allowed:
-        return False, "body last edited by %s, not in LOOM_BRIEF_AUTHORS" % editor_login
+        return False, "body last edited by %s, not in %s" % (editor_login, _BRIEFING)
     owner = issue_owner(issue).lower()
     if not owner or owner not in {o.lower() for o in owners}:
         return False, "repo owner %s is not in LOOM_REPO_OWNERS" % (owner or "unknown")
@@ -597,18 +633,25 @@ def claimed_by(issue: Dict[str, Any]) -> List[str]:
     return [login for login in found if login]
 
 
-def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str]) -> Optional[str]:
+def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
+                    briefers: Iterable[str] = ()) -> Optional[str]:
     """The login that owns an issue when it is another operator's, else None.
 
     An issue assigned to a login, or carrying a claim:<login> label, belongs
     to that login (docs/LANES.md, "Two Looms on shared repos"). A Loom acts
     only on issues with no owner and on issues with at least one owner among
     its own operator logins (LOOM_BRIEF_AUTHORS); anything else is left
-    alone."""
+    alone. A trusted briefer (LOOM_TRUSTED_BRIEFERS) owns nothing for this
+    Loom, except that a loom:ticket they authored is handed to it even when
+    they assigned or claim-labelled it to themselves."""
     logins = assignees(issue) + claimed_by(issue)
     if not logins:
         return None
     allowed = {a.lower() for a in authors}
+    author = _login(issue.get("user"))
+    if (author and author not in allowed
+            and brief_author_trusted(issue, (), briefers)):
+        allowed.add(author)
     if any(login in allowed for login in logins):
         return None
     return logins[0]

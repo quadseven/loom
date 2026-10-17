@@ -1757,7 +1757,7 @@ class Helpers(unittest.TestCase):
 
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
-                         no_test_repos=(), available=None):
+                         no_test_repos=(), available=None, briefers=()):
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 

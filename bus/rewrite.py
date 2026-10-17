@@ -205,9 +205,8 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     one assigned to another operator (docs/LANES.md, Two Looms)."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
-    authors = brain.trusted_authors()
     return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-            and not (authors and tickets.owned_elsewhere(i, authors))]
+            and not brain.owned_elsewhere(i)]
 
 
 def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,

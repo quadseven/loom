@@ -391,7 +391,8 @@ class Settings:
                  health_every: int = health.EVERY,
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
-                 pin_ship_repos: Sequence[str] = ()) -> None:
+                 pin_ship_repos: Sequence[str] = (),
+                 briefers: Sequence[str] = ()) -> None:
         self.home = home
         # Deployment repos whose merged pin pull requests ship the tickets
         # of the source revision they publish (ship_pins).
@@ -407,6 +408,10 @@ class Settings:
         self.report_digest = tuple(report_digest)
         self.repos = repos
         self.authors = authors
+        # LOOM_TRUSTED_BRIEFERS: another operator's logins whose loom:ticket
+        # briefs this Loom builds (tickets.brief_author_trusted). Ownership,
+        # journals, proofs, adoption and merges read authors alone.
+        self.briefers = list(briefers)
         self.owners = owners
         self.status_repo = status_repo
         self.webhook_ssm = webhook_ssm
@@ -504,7 +509,8 @@ class Settings:
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
-                   pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"))
+                   pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
+                   briefers=words("LOOM_TRUSTED_BRIEFERS"))
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -987,7 +993,8 @@ class Station:
         number = int(issue["number"])
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
         editor = self._editor(repo, number)
-        return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners)
+        return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
+                               self.s.briefers)
 
     def _poll(self, repo: str) -> List[Dict[str, Any]]:
         # A conditional read (bus/github.py keeps the last answer): an
@@ -1111,8 +1118,9 @@ class Station:
 
     def _owned_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
         """True when the issue or pull request is assigned to a login outside
-        LOOM_BRIEF_AUTHORS: another operator's Loom owns it."""
-        owner = tickets.owned_elsewhere(issue, self.s.authors)
+        LOOM_BRIEF_AUTHORS: another operator's Loom owns it. A trusted
+        briefer's own loom:ticket is a hand-off, not theirs."""
+        owner = tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)
         if owner is None:
             return False
         self._note_owned("%s#%s" % (repo, issue.get("number")),
@@ -1774,11 +1782,10 @@ class Station:
 
     # -- verify runs ------------------------------------------------------
     def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open tickets filed by a trusted author."""
-        allowed = {a.lower() for a in self.s.authors}
+        """The repo's open tickets filed by a briefing login."""
         found = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-                and tickets._login(i.get("user")) in allowed
+                and tickets.brief_author_trusted(i, self.s.authors, self.s.briefers)
                 and not self._owned_elsewhere(repo, i)]
 
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]]) -> set:
@@ -4778,7 +4785,6 @@ class Station:
 
     def _invariant_queued(self) -> List[Tuple[invariants.Ref, Tuple[str, ...]]]:
         """Each trusted queued ticket and the lanes of its difficulty tier."""
-        authors = {a.lower() for a in self.s.authors}
         out = []
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
@@ -4786,7 +4792,8 @@ class Station:
             for issue in self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo):
                 if (not isinstance(issue, dict) or "pull_request" in issue
                         or "loom:queued" not in _label_names(issue)
-                        or tickets._login(issue.get("user")).lower() not in authors):
+                        or not tickets.brief_author_trusted(issue, self.s.authors,
+                                                            self.s.briefers)):
                     continue
                 ref = self._invariant_ref(repo, int(issue["number"]))
                 if repo not in self._publics:
@@ -5470,6 +5477,7 @@ class Station:
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                               briefers=self.s.briefers,
                                review_check=self.s.review_check,
                                review_bot=self.s.review_bot,
                                limited=self.limited_lanes(),

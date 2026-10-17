@@ -149,7 +149,9 @@ done
 # turns briefed ticket issues into local briefs and reports outcomes
 # (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
-# with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
+# with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default empty)
+# names another operator's logins whose loom:ticket briefs it builds without
+# adopting their claims (docs/LANES.md, Trusted briefers). It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
 # LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
 # default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
@@ -212,6 +214,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REWRITE_OPENCODE</key><string>$(xml "${LOOM_REWRITE_OPENCODE:-$HOME/.opencode/bin/opencode}")</string>
     <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
+    <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
     <key>LOOM_SELF_REPO</key><string>$(xml "${LOOM_SELF_REPO:-}")</string>
@@ -263,6 +266,7 @@ echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bu
 # (default 1800), take the brain lock and run one docs/MUSE.md tick on the
 # first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
 # usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
+# LOOM_TRUSTED_BRIEFERS,
 # LOOM_AWS_REGION, LOOM_BRAIN_* and the rungs' LOOM_CODEX_MODEL,
 # LOOM_SPARK_MODEL and LOOM_SPARK_URL from the installing environment; with
 # LOOM_REPOS empty it stays idle. LOOM_BRAIN=0 skips it and removes an
