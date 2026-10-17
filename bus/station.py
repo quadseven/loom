@@ -42,6 +42,7 @@ from . import roll_pin
 from . import revert
 from . import spend
 from . import usage
+from . import verify_data
 from . import text as _text
 from . import tickets
 from . import transcripts
@@ -1721,11 +1722,45 @@ class Station:
         stamp = int(self.now)
         text = tickets.render_verify_brief(
             repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+        text += self._verify_github_data(repo, issue)
         text += evidence.section(self.s.evidence_cmds, repo,
                                  brain.live_criterion(issue.get("body"), limit=None))
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
+
+    def _verify_github_data(self, repo: str, issue: Dict[str, Any]) -> str:
+        """The verify brief's GitHub section: the lane has no network, so the
+        station reads the ticket's merged pull requests, linked the way
+        reconcile links them, with their checks, files and added tests. A
+        GitHub failure is one line in the section, never a lost brief."""
+        branch, pulls, error = "", [], ""
+        read: List[Dict[str, Any]] = []
+        try:
+            branch = self._default_branch(repo)
+            linked = sorted((dict(pr) for pr in self._closed_pulls(repo)
+                             if _linked_pr(issue, repo, pr)),
+                            key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
+            # Only the pull requests the section shows are read in full.
+            for pr in linked[:verify_data.MAX_PULLS]:
+                sha = str(pr["merge_commit_sha"])
+                runs = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                                    % (repo, sha)).data
+                pr["check_runs"] = (runs.get("check_runs") if isinstance(runs, dict) else []) or []
+                pr["on_branch"] = self._carries(repo, sha, quote(branch, safe="/")) \
+                    if branch else None
+                pr["files"] = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
+                                           % (repo, int(pr["number"]))).data or []
+                read.append(pr)
+            pulls = read + linked[verify_data.MAX_PULLS:]
+        except (GitHubError, OSError, ValueError) as err:
+            # Only fully read pull requests are shown after a failure.
+            pulls = read
+            error = "status %d" % err.status if isinstance(err, GitHubError) and err.status \
+                else type(err).__name__
+            _say("could not read GitHub data for the verify brief of %s#%s: %s"
+                 % (repo, issue.get("number"), error))
+        return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
 
     @staticmethod
     def _note_text(raw: Any) -> str:
