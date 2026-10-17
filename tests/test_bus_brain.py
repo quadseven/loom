@@ -2116,8 +2116,18 @@ class EscalateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no untried rung has an available lane"):
                 brain.escalate(GitHub("t", transport=fake), REPO, 9)
             self.assertFalse(fake.sent("PATCH", "/issues/9"))
-            # A stranger's pull request footer names nothing that ran.
+            # A stranger's or a fork's pull request footer names nothing that
+            # ran, and neither does a footer naming a model Loom never runs.
             _, outcome = self.run_escalate(footer_routes("stranger", free=("claude", "anthropic-2")))
+            self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+            routes = footer_routes("trusted", free=("claude", "anthropic-2"))
+            fork = dict(fix_pr(body=footer, user={"login": "trusted"}), number=8)
+            fork["head"] = dict(fork["head"], repo={"full_name": "someone-else/example-repo"})
+            routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [fork])
+            _, outcome = self.run_escalate(routes)
+            self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+            footer = footer.replace("claude-opus-5-5", "claude-opus-9-9")
+            _, outcome = self.run_escalate(footer_routes("trusted", free=("claude", "anthropic-2")))
             self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
         routes = ticket_routes(issue, TWICE, history)
         routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [dict(fix_pr(body=footer), number=8)])

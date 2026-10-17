@@ -496,6 +496,28 @@ class PullRequests(Base):
                 self.go()
                 self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
 
+    def test_a_fork_or_stranger_footer_or_an_unknown_model_never_steers_the_ladder(self):
+        opus = footer("claude", "claude-opus-5-5")
+        self.assertEqual(factory.footer_run(opus, env={}), ("claude", "claude-opus-5-5"))
+        self.assertIsNone(factory.footer_run(footer("claude", "claude-opus-9-9"), env={}))
+        self.assertEqual(factory.footer_run(footer("spark", "spark/local-1"),
+                                            env={"LOOM_SPARK_MODEL": "spark/local-1"}),
+                         ("spark", "spark/local-1"))
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+        own = {"user": ME, "body": opus, "head": {"repo": {"full_name": REPO}}}
+        self.assertEqual(f._footer(REPO, own), ("claude", "claude-opus-5-5"))
+        self.assertIsNone(f._footer(REPO, dict(own, user=STRANGER)))
+        self.assertIsNone(f._footer(REPO, dict(own, head={"repo": {"full_name": "someone-else/fork"}})))
+        # Ignored, the claims name no model, and the climb starts at rung 1.
+        for name, body, head in (("unknown model", footer("claude", "claude-opus-9-9"), REPO),
+                                 ("fork", opus, "someone-else/fork")):
+            with self.subTest(name), lane_models():
+                self.setUp()
+                self.opus_runs(body)
+                self.gh.pulls[50]["head"]["repo"] = {"full_name": head}
+                self.go(limited=("codex", "codex-2"))
+                self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
+
     def test_with_no_lane_up_for_the_next_rung_the_ticket_waits_and_nothing_is_posted(self):
         # 2026-10-17: no codex lane was free for rung 2, and the factory said it
         # tried every rung and moved the ticket to failed.

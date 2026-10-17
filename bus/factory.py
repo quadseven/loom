@@ -526,11 +526,31 @@ def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
     return (True, line.group(2)) if line else (False, None)
 
 
-def footer_run(body: Any) -> Optional[Tuple[str, str]]:
+def known_models(env: Optional[Dict[str, str]] = None) -> set:
+    """The model names Loom configures: every CLIMB, HARD_MODELS and
+    EQUIVALENTS model, and each lane's LOOM_<LANE>_MODEL or LOOM_<LANE>_MODELS
+    setting (an agy setting also with its effort suffix, as run_lane.sh adds
+    it)."""
+    env = os.environ if env is None else env
+    found = {model for _, model in CLIMB} | set(HARD_MODELS.values())
+    found |= {model for _, model, _ in EQUIVALENTS.values()}
+    for key, value in env.items():
+        if re.fullmatch(r"LOOM_[A-Z0-9_]+_MODELS?", key) and key != "LOOM_BRAIN_MODEL":
+            for model in str(value).split():
+                found |= {model} | {"%s-%s" % (model, e) for e in ("low", "medium", "high")}
+    return found
+
+
+def footer_run(body: Any, env: Optional[Dict[str, str]] = None) -> Optional[Tuple[str, str]]:
     """(lane, model) from the runner's footer on a lane pull request body,
-    the newest run on it, or None when the body has no footer."""
+    the newest run on it, or None when the body has no footer or names a
+    model Loom does not configure (known_models): a footer is text in a pull
+    request body, so an unknown name never steers the ladder. Callers read it
+    only from a trusted author's pull request in the ticket's own repo."""
     found = RUN_FOOTER_RE.findall(str(body or ""))
-    return (found[-1][0], found[-1][1]) if found else None
+    if not found or found[-1][1] not in known_models(env):
+        return None
+    return found[-1][0], found[-1][1]
 
 
 def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
@@ -1204,7 +1224,7 @@ class Factory:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
         if stuck(comments, open_threads, checks_failing, age, self.now, no_test):
-            footer = footer_run(pr.get("body"))
+            footer = self._footer(repo, pr)
             if self._climb(repo, issue, comments, why, footer=footer) is None:
                 if RUNAWAY in _labels(issue):
                     return
@@ -1232,6 +1252,15 @@ class Factory:
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
     # -- the three kinds of stuck ----------------------------------------
+    def _footer(self, repo: str, pr: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+        """The runner footer's (lane, model) of a trusted author's pull request
+        whose head is in `repo`, else None: anyone can open a pull request
+        that names a ticket, and its footer must never steer the ladder."""
+        if (pr is None or not self._trusted(pr)
+                or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo):
+            return None
+        return footer_run(pr.get("body"))
+
     def _is_lane_pr(self, pr: Dict[str, Any]) -> bool:
         """A trusted, non-draft pull request on a loom/ branch."""
         if pr.get("draft") or not self._trusted(pr):
@@ -1513,7 +1542,7 @@ class Factory:
             return
         pr = prs.get(number)
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue),
-                           footer=footer_run(pr.get("body")) if pr is not None else None)
+                           footer=self._footer(repo, pr))
         if lane is None:
             return  # it stays failed: for a free lane, or for the brain
         if pr is not None:

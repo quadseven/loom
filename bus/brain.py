@@ -3067,8 +3067,9 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     from . import factory  # factory imports this module
     found_pr = _open_pr(gh, repo, number)
     # Its pull request's runner footer names the model its newest run used,
-    # read only from a LOOM_BRIEF_AUTHORS login's pull request in this repo:
-    # anyone can open one that matches the ticket on a public repo.
+    # read only from a LOOM_BRIEF_AUTHORS login's pull request whose head and
+    # base are in this repo (anyone can open one that matches the ticket on a
+    # public repo), and only when it names a known model (factory.footer_run).
     footer = None
     if found_pr is not None and _same_repo(repo, found_pr, {}) and str(
             (found_pr.get("user") or {}).get("login") or "").lower() in {
