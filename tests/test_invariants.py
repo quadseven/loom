@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
-from bus.invariants import Check, Facts, Journal, Posted, Ref, Run  # noqa: E402
+from bus.invariants import Check, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"
@@ -444,6 +444,31 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(invariants.check(Facts(T0), said.append), [])
         self.assertEqual(invariants.check(Facts(T0), said.append, (broken,)), [])
         self.assertIn("broken raised KeyError", said[0])
+
+    def test_a_goal_the_gate_refused_for_59_minutes_is_not_a_breach(self):
+        hold = GateHold(Ref("%s#%d" % (REPO, GOAL), "#30"), T0 - 59 * 60,
+                        27, 15, (Ref("%s#1" % REPO, "#1"),), 2)
+        self.assertEqual(invariants.gate_hold(Facts(T0, gate_held={"k": hold})), [])
+        self.assertEqual(invariants.gate_hold(Facts(T0)), [])
+
+    def test_a_goal_the_gate_refused_for_61_minutes_names_goal_count_limit_held_and_idle(self):
+        hold = GateHold(Ref("%s#%d" % (REPO, GOAL), "#30"), T0 - 61 * 60,
+                        27, 15, (Ref("%s#1" % REPO, "#1"), Ref("%s#2" % REPO, "#2")), 4)
+        (b,) = invariants.gate_hold(Facts(T0, gate_held={"k": hold}))
+        text = b.title + " " + " ".join(b.evidence)
+        self.assertIn("#30", text)
+        self.assertIn("27", text)
+        self.assertIn("15", text)
+        self.assertIn("#1", text)
+        self.assertIn("#2", text)
+        self.assertIn("4", text)
+
+    def test_a_goal_no_longer_held_clears_the_invariant(self):
+        hold = GateHold(Ref("%s#%d" % (REPO, GOAL), "#30"), T0 - 61 * 60,
+                        27, 15, (Ref("%s#1" % REPO, "#1"),), 2)
+        self.assertEqual(len(invariants.gate_hold(Facts(T0, gate_held={"k": hold}))), 1)
+        # A claim for the goal succeeded, so the station no longer holds it.
+        self.assertEqual(invariants.gate_hold(Facts(T0, gate_held={})), [])
 
 
 if __name__ == "__main__":
