@@ -548,6 +548,30 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("loom:merged", self.fake.names(12))
         self.assertNotIn("loom:pr", self.fake.names(12))
 
+    def test_old_merge_does_not_deliver_a_requeued_regression(self):
+        self.fake.add(12, state="pr")
+        self.fake.issues[12]["labels"].append({"name": "loom:regression"})
+        self.fake.events[12].append({"event": "labeled", "label": {"name": "loom:briefed"},
+                                     "created_at": "2030-01-03T00:00:00Z"})
+        self.fake.pulls = [{"number": 98, "state": "open", "body": "Refs #12",
+                            "head": {"ref": "loom/12-fix-r2"}},
+                           {"number": 97, "state": "closed",
+                            "merged_at": "2030-01-02T00:00:00Z", "body": "Refs #12",
+                            "head": {"ref": "loom/12-fix"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
+    def test_merge_after_regression_requeue_delivers_ticket(self):
+        self.fake.add(12, state="pr")
+        self.fake.issues[12]["labels"].append({"name": "loom:regression"})
+        self.fake.events[12].append({"event": "labeled", "label": {"name": "loom:briefed"},
+                                     "created_at": "2030-01-02T00:00:00Z"})
+        self.fake.pulls = [{"number": 99, "state": "closed",
+                            "merged_at": "2030-01-03T00:00:00Z", "body": "Refs #12"}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+
     def test_a_closed_unmerged_pr_leaves_a_ticket_with_an_open_pr_alone(self):
         self.fake.add(12, state="pr")
         self.fake.pulls = [{"number": 98, "state": "open", "body": "Refs %s#12" % REPO,

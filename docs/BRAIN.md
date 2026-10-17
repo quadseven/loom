@@ -174,6 +174,9 @@ keyword. The station checks those references and the conventional branch
 number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
+For a re-queued regression, a merged pull request from before the latest
+`loom:queued` or `loom:briefed` label does not move the ticket or supersede
+its newer open pull request. The current attempt still needs to merge.
 
 ### When a ticket may run
 

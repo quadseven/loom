@@ -2036,6 +2036,10 @@ class Station:
         target = self._terminal_label(pr)
         if target is None or target in labels:
             return
+        if target == "loom:merged" and "loom:regression" in labels:
+            events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+            if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
+                return
         state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
                        "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
@@ -2052,8 +2056,9 @@ class Station:
         # recently updated closed ones, so one page of them is read, never the
         # repo's whole PR history. A merged one delivers the ticket even while
         # a second PR for it is still open (a duplicate lane run would
-        # otherwise keep taking fix rounds on work already on main); a closed
-        # unmerged one only counts for a ticket with no open PR left.
+        # otherwise keep taking fix rounds on work already on main). A merge
+        # before a regression re-queue cannot deliver its newer attempt. A
+        # closed unmerged PR only counts with no open PR left.
         open_prs = [p for p in self._open_pulls(repo)
                     if isinstance(p, dict) and p.get("state", "open") == "open"]
         trusted_authors = {name.lower() for name in self.s.authors}

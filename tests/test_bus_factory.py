@@ -559,6 +559,27 @@ class PullRequests(Base):
         self.assertEqual(self.gh.comments[50][-1]["body"], "Superseded by #51.")
         self.assertEqual(self.merged, [])
 
+    def test_old_merge_does_not_supersede_regression_pull_request(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["labels"].append({"name": "loom:regression"})
+        self.gh.events[5].append({"event": "labeled", "label": {"name": "loom:briefed"},
+                                  "created_at": iso(60)})
+        self.gh.pull(51, 5, state="closed", merged_at=iso(120), merged=True)
+        self.gh.pull(50, 5, created=30, updated=30, branch="loom/5-some-title-r2")
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+
+    def test_merge_after_regression_requeue_supersedes_duplicate(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["labels"].append({"name": "loom:regression"})
+        self.gh.events[5].append({"event": "labeled", "label": {"name": "loom:briefed"},
+                                  "created_at": iso(120)})
+        self.gh.pull(51, 5, state="closed", merged_at=iso(60), merged=True)
+        self.gh.pull(50, 5, created=30, updated=30, branch="loom/5-some-title-r2")
+        self.go()
+        self.assertEqual(self.closed, [(50, "Superseded by #51.")])
+
     def test_lane_pull_request_closed_when_its_closed_ticket_shipped_elsewhere(self):
         self.gh.ticket(5, "shipped")
         self.gh.issues[5]["state"] = "closed"
