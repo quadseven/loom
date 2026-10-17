@@ -4,6 +4,7 @@ import calendar
 import base64
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -21,7 +22,7 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, proof, spend, station, tickets  # noqa: E402
+from bus import audit, brain, factory, proof, spend, station, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -247,6 +248,12 @@ class FakeGitHub:
         if "labels=loom%3Amerged" in query or "labels=loom:merged&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:merged" in self.names(i["number"])])
+        if "labels=loom:runaway" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:runaway" in self.names(i["number"])])
+        if "labels=loom:invariant" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:invariant" in self.names(i["number"])])
         if "labels=loom%3Ashipped" in query or "labels=loom:shipped&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:shipped" in self.names(i["number"])])
@@ -2134,6 +2141,128 @@ class RetryTest(Base):
         self.assertTrue(station.needs_public_repo("agy", ""))
         self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
         self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
+
+
+class DeadLaneRunawayTest(Base):
+    """A runaway held because one dead lane kept failing it (loom#565): every
+    attempt since its last brief ran on a lane with an open runs-and-none-done
+    invariant. The station releases the hold and briefs the ticket to a free
+    lane of its tier, naming the lane fault; this is not a failure, so the
+    ladder does not move."""
+    MEDIUM = "Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def setUp(self):
+        super().setUp()
+        self.fake.add_goal(40)
+        self.settings.invariant_goal = "%s#40" % REPO
+
+    def key(self, lane):
+        return "lane-no-success/%s" % hashlib.sha256(lane.encode()).hexdigest()[:12]
+
+    def file_invariant(self, lane, number=50):
+        self.fake.issues[number] = {
+            "number": number,
+            "title": "Lane %s: 7 runs in 24 hours and none done" % lane,
+            "body": "<!-- loom:invariant v1 key=%s -->\n"
+                    "The station found one of the factory's own invariants broken.\n"
+                    "\nPart of #40\n" % self.key(lane),
+            "state": "open", "user": {"login": "alice-example"},
+            "created_at": "2030-01-01T00:00:00Z",
+            "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}],
+        }
+        self.fake.comments[number] = []
+
+    def hold(self, lane="codex-2", claims=("codex-2", "codex-2"), brief=True, number=12):
+        self.fake.add(number, lane=lane, body=self.MEDIUM, state="briefed")
+        self.fake.issues[number]["labels"].append({"name": "loom:runaway"})
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+        comments = []
+        if brief:
+            comments.append({
+                "body": "The station gave this queued ticket lane %s (tier medium)." % lane,
+                "created_at": at, "user": {"login": "alice-example"}})
+        for claimed in claims:
+            comments.append({
+                "body": "Claimed for lane %s (body sha256 0123456789ab)" % claimed,
+                "created_at": at, "user": {"login": "alice-example"}})
+        comments.append({"body": "Runaway: three attempts within six hours.",
+                         "created_at": at, "user": {"login": "alice-example"}})
+        self.fake.comments[number] = comments
+
+    def test_a_runaway_on_one_dead_lane_is_rebriefed_to_a_free_lane_of_its_tier(self):
+        self.file_invariant("codex-2")
+        self.hold(lane="codex-2")
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertNotIn("loom:runaway", names)
+        self.assertNotIn("lane:codex-2", names)
+        self.assertIn("lane:codex", names)
+        bodies = self.bodies()
+        released = [b for b in bodies if b.startswith("<!-- loom:runaway-dead-lane v1")]
+        self.assertEqual(len(released), 1)
+        self.assertIn("Runaway hold released", released[0])
+        self.assertIn("codex-2", released[0])
+        self.assertIn("codex", released[0])
+        self.assertFalse(any(b.startswith("Lane ") and "failed:" in b for b in bodies))
+
+    def test_a_runaway_with_attempts_on_two_lanes_keeps_its_hold(self):
+        self.file_invariant("codex-2")
+        self.hold(lane="codex-2", claims=("codex-2", "codex"), brief=False)
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertEqual(
+            [b for b in self.bodies() if b.startswith("<!-- loom:runaway-dead-lane v1")], [])
+
+    def test_a_runaway_on_a_dead_lane_with_no_free_lane_stays_held_and_says_why(self):
+        self.file_invariant("codex-2")
+        self.hold(lane="codex-2")
+        self.heartbeat("codex", available=False)
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertIn("loom:runaway", names)
+        self.assertIn("lane:codex-2", names)
+        bodies = self.bodies()
+        held = [b for b in bodies if b.startswith("<!-- loom:runaway-dead-lane v1")]
+        self.assertEqual(len(held), 1)
+        self.assertIn("no lane of its difficulty tier is free", held[0])
+        self.assertIn("codex-2", held[0])
+        # The next pass does not comment again.
+        self.run_pass()
+        self.assertEqual(
+            len([b for b in self.bodies() if b.startswith("<!-- loom:runaway-dead-lane v1")]), 1)
+
+    def test_attempts_before_the_last_brief_do_not_count(self):
+        # Two earlier claims on another lane, then a re-brief and two claims
+        # on the dead lane: only the claims since the last brief count.
+        self.file_invariant("codex-2")
+        self.fake.add(12, lane="codex-2", body=self.MEDIUM, state="briefed")
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        self.fake.comments[12] = [
+            dict({"body": "The station gave this queued ticket lane spark (tier medium)."}, **who),
+            dict({"body": "Claimed for lane spark (body sha256 0123456789ab)"}, **who),
+            dict({"body": "Claimed for lane spark (body sha256 0123456789ab)"}, **who),
+            dict({"body": "Not a failure (lane spark is at a limit): the factory moved this "
+                           "ticket to lane codex-2, in its difficulty tier."}, **who),
+            dict({"body": "Claimed for lane codex-2 (body sha256 0123456789ab)"}, **who),
+            dict({"body": "Claimed for lane codex-2 (body sha256 0123456789ab)"}, **who),
+            dict({"body": "Runaway: three attempts within six hours."}, **who),
+        ]
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertNotIn("loom:runaway", names)
+        self.assertIn("lane:codex", names)
+
+    def test_no_open_invariant_for_the_lane_keeps_the_hold(self):
+        self.hold(lane="codex-2")
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertEqual(
+            [b for b in self.bodies() if b.startswith("<!-- loom:runaway-dead-lane v1")], [])
 
 
 class FactoryIncidentTest(Base):

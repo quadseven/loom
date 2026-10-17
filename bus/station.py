@@ -56,6 +56,9 @@ HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
+# The marker on the comment the station posts when it reviews a runaway hold
+# caused by one dead lane (loom#565): the release, or why the hold stays.
+DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
@@ -1351,6 +1354,9 @@ class Station:
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         # This pass's unproven-work gate refusals (loom#564).
         self._gate_holds = {}
+        # A runaway held because one dead lane kept failing it goes back to a
+        # free lane of its tier on its own (loom#565), before claims.
+        self._release_dead_lane_runaways(free)
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
@@ -1368,6 +1374,109 @@ class Station:
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in free))
         self._hand_verifies([lane for lane in free if not by_lane[lane]])
+
+    # -- dead-lane runaway release (loom#565) ------------------------------
+    def _open_lane_no_success(self) -> Dict[str, Tuple[int, str]]:
+        """Lane -> (issue number, title) for each open runs-and-none-done
+        invariant filed on the invariant goal home."""
+        goal = self._invariant_goal()
+        if goal is None:
+            return {}
+        repo, goal_no = goal
+        found: Dict[str, Tuple[int, str]] = {}
+        for issue in self._open_breaches(repo, goal_no):
+            match = invariants.MARKER_RE.search(str(issue.get("body") or ""))
+            if not match:
+                continue
+            key = match.group(1)
+            if not key.startswith("lane-no-success/"):
+                continue
+            # The breach key hashes the lane name; the title names it.
+            title = str(issue.get("title") or "")
+            lane = re.search(r"^Lane ([a-z0-9-]+):", title)
+            if lane and key == "lane-no-success/%s" % hashlib.sha256(
+                    lane.group(1).encode()).hexdigest()[:12]:
+                found[lane.group(1)] = (int(issue["number"]), title)
+        return found
+
+    def _release_dead_lane_runaways(self, free: List[str]) -> None:
+        """Release runaway holds caused by one dead lane: every attempt since
+        the ticket's last brief ran on a lane with an open runs-and-none-done
+        invariant. The hold is released and the ticket briefed to a free lane
+        of its difficulty tier, with a comment naming the lane fault. This is
+        not a failure: no rung marker, no ladder move, no failure recorded.
+        With no free lane in its tier the ticket stays held and the comment
+        says why. A runaway whose attempts spread across lanes keeps its hold
+        for the brain, as before."""
+        runaways: List[Tuple[str, Dict[str, Any]]] = []
+        # The per-repo runaway listing only runs when a lane is actually
+        # dead: with no open runs-and-none-done invariant there is nothing
+        # to release.
+        dead = self._open_lane_no_success()
+        if not dead:
+            return
+        for repo in self.scan_repos():
+            try:
+                found = self.gh.paginate("/repos/%s/issues?labels=%s&state=open"
+                                         % (repo, RUNAWAY))
+            except GitHubError as err:
+                _say("could not list runaway tickets in %s: %s" % (repo, err))
+                continue
+            runaways += [(repo, i) for i in found
+                         if isinstance(i, dict) and "pull_request" not in i]
+        if not runaways:
+            return
+        used = set()
+        for repo, issue in runaways:
+            try:
+                self._release_one_runaway(repo, issue, free, dead, used)
+            except (GitHubError, OSError) as err:
+                _say("could not review runaway %s#%s: %s" % (repo, issue.get("number"), err))
+
+    def _release_one_runaway(self, repo: str, issue: Dict[str, Any], free: List[str],
+                             dead: Dict[str, Tuple[int, str]], used: Set[str]) -> None:
+        number = int(issue["number"])
+        names = _label_names(issue)
+        if "loom:pr" in names:
+            # A runaway held on an open pull request stays with the brain:
+            # re-briefing it would orphan the fix-round machinery.
+            return
+        comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                    if isinstance(c, dict)]
+        lane = factory.dead_lane(comments)
+        if lane is None or lane not in dead:
+            return
+        inv_number, inv_title = dead[lane]
+        marker = DEAD_LANE_MARKER % lane
+        if any(str(c.get("body") or "").startswith(marker) for c in comments):
+            return
+        if repo not in self._publics:
+            self._publics[repo] = self._public(repo)
+        tier = factory.tier_lanes(issue, not self._publics[repo])
+        target = next((x for x in tier if x in free and x not in used), None)
+        if target is None:
+            self._comment(repo, number,
+                          "%s\nRunaway hold reviewed: every attempt since the last brief ran "
+                          "on lane %s, which has an open runs-and-none-done invariant "
+                          "(#%d); but no lane of its difficulty tier is free, so the hold "
+                          "stays." % (marker, lane, inv_number))
+            _say("%s#%d stays held: its dead lane %s has no free tier lane"
+                 % (repo, number, lane))
+            return
+        names = [n for n in names
+                 if n != RUNAWAY and n != RUNNING and not n.startswith("lane:")]
+        if BRIEFED not in names:
+            names.append(BRIEFED)
+        names.append("lane:" + target)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
+        issue["labels"] = [{"name": n} for n in names]
+        self._comment(repo, number,
+                      "%s\nRunaway hold released: every attempt since the last brief ran on "
+                      "lane %s, which has an open runs-and-none-done invariant (#%d: %s). "
+                      "This is not a failure: the ticket is briefed to lane %s, in its "
+                      "difficulty tier." % (marker, lane, inv_number, inv_title, target))
+        used.add(target)
+        _say("released runaway %s#%d from dead lane %s to lane %s" % (repo, number, lane, target))
 
     def _unproven_gate(self, repo: str, issue: Dict[str, Any], limit: int,
                        counts: Dict[Tuple[str, int], int]) -> Optional[str]:

@@ -1604,5 +1604,48 @@ class Helpers(unittest.TestCase):
                 self.assertEqual(make_factory.return_value.assign_queued.call_count, 2)
 
 
+class DeadLane(unittest.TestCase):
+    def comments(self, *bodies):
+        at = "2026-10-17T05:00:00Z"
+        return [{"body": b, "created_at": at} for b in bodies]
+
+    def test_claims_after_the_last_brief_are_the_attempts(self):
+        comments = self.comments(
+            "The station gave this queued ticket lane spark (tier medium).",
+            "Claimed for lane spark (body sha256 0123456789ab)",
+            "Not a failure (lane spark is at a limit): the factory moved this "
+            "ticket to lane codex-2, in its difficulty tier.",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)",
+            "Runaway: three attempts within six hours.")
+        self.assertEqual(factory.attempts_since_brief(comments),
+                         [(a[0], a[1], "codex-2", "") for a in
+                          factory.attempts(comments)[-2:]])
+        self.assertEqual(factory.dead_lane(comments), "codex-2")
+
+    def test_attempts_on_two_lanes_are_not_one_dead_lane(self):
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)")
+        self.assertIsNone(factory.dead_lane(comments))
+
+    def test_no_claims_is_not_one_dead_lane(self):
+        self.assertIsNone(factory.dead_lane(self.comments("Runaway: three attempts.")))
+
+    def test_a_retry_and_a_ladder_move_are_briefs(self):
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+            "codex-2. Lane codex failed: [transient] agent exited 1",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)")
+        self.assertEqual(factory.dead_lane(comments), "codex-2")
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "<!-- loom:rung 2 -->\nRepeatedly stuck (x): the factory moved this ticket "
+            "up the model ladder to rung 2, gpt-6-sol on lane codex.",
+            "Claimed for lane codex (body sha256 0123456789ab)")
+        self.assertEqual(factory.dead_lane(comments), "codex")
+
+
 if __name__ == "__main__":
     unittest.main()
