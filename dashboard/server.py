@@ -9,6 +9,9 @@ import hmac
 import ssl
 import statistics
 import socket
+import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -47,6 +50,17 @@ def _all_tickets(state):
 
 def _ticket_href(row):
     return "/t/%s/%d" % (quote(str(row.get("repo") or ""), safe="/"), int(row.get("number") or 0))
+
+
+def _stale_notice(payload, now=None):
+    refreshed = payload.get("ticket_refreshed_at")
+    age_minutes = max(0, int(((time.time() if now is None else now) - refreshed) // 60)) if refreshed else 0
+    reason = html.escape(payload.get("stale_reason") or "GitHub could not refresh ticket data")
+    next_refresh = payload.get("next_refresh_at")
+    when = (datetime.fromtimestamp(next_refresh, timezone.utc).astimezone(
+        ZoneInfo("America/New_York")).strftime("%H:%M ET") if next_refresh else "after GitHub can be reached")
+    return ('<p class="stale-note">Ticket data is %d minutes old: %s; it refreshes at %s.</p>'
+            % (age_minutes, reason, html.escape(when)))
 
 
 def _ticket_row(row):
@@ -612,7 +626,9 @@ def _handler_for(state):
             document = body if body.lstrip().lower().startswith("<!doctype html>") else (
                 "<!doctype html><meta charset=utf-8><title>Loom</title>" + body)
             if state.stale:
-                document = document.replace('<main class="page-content">', '<main class="page-content"><p class="stale-note">Showing stale ticket data.</p>')
+                payload = state.response()
+                notice = _stale_notice(payload)
+                document = document.replace('<main class="page-content">', '<main class="page-content">' + notice)
             self.send_bytes(code, document.encode("utf-8"), "text/html; charset=utf-8")
 
         def send_text(self, code, value):

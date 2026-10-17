@@ -166,6 +166,23 @@ class DashboardTest(unittest.TestCase):
             connection.close()
         self.assertEqual(len(self.api_calls), before)
 
+    def test_stale_banner_names_age_reason_and_next_refresh(self):
+        self.store._snapshot.update({"stale": True, "ticket_refreshed_at": time.time() - 2400,
+                                     "stale_reason": "GitHub's request budget ran low",
+                                     "next_refresh_at": time.time() + 600})
+        _, _, body = self.raw_get("/")
+        page = body.decode()
+        self.assertRegex(page, r"Ticket data is 40 minutes old: GitHub's request budget ran low")
+        self.assertIn("refreshes at", page)
+        self.assertIn("ET", page)
+
+    def test_no_page_uses_internal_budget_wording(self):
+        for path in ("/", "/results", "/brain", "/hot-spots"):
+            _, _, body = self.raw_get(path)
+            page = body.decode().lower()
+            self.assertNotIn("optional view sources", page)
+            self.assertNotIn("below its floor", page)
+
     def test_conditional_request_and_budget_floor_stale_response(self):
         self.store.refresh()
         self.store.budget_floor = 20
