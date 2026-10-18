@@ -384,7 +384,16 @@ class GitHub:
             if changed:
                 self.issue_writes.add((changed.group(1), int(changed.group(2))))
             elif re.match(r"^/repos/[^/]+/[^/]+/issues/comments/\d+$", path):
-                self.comment_edits = True
+                # An edited comment's answer names its issue: mark that one
+                # changed. Only an edit that names none spoils every cached read;
+                # the station edits a comment every pass (loom#722).
+                owner = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$",
+                                  str((data or {}).get("issue_url") or "")
+                                  if isinstance(data, dict) else "")
+                if owner:
+                    self.issue_writes.add((owner.group(1), int(owner.group(2))))
+                else:
+                    self.comment_edits = True
         return Response(status, data, resp_headers.get("etag"), resp_headers)
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
