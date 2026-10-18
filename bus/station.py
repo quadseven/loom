@@ -839,6 +839,17 @@ def lane_takes_model(lane: str, model: str) -> bool:
     return any(fnmatch.fnmatchcase(model, p) for p in LANE_MODELS.get(lane, []))
 
 
+def brief_model(lane: str, headers: Dict[str, str]) -> str:
+    """The model a brief for this lane runs when the runner must keep it: the
+    ticket's Model: line, else a hard ticket's HARD_MODELS model (as
+    tickets.render_brief writes it); "" when the lane picks its own."""
+    if headers.get("Model"):
+        return headers["Model"]
+    if headers.get("Difficulty") == "hard":
+        return factory.HARD_MODELS.get(lane, "")
+    return ""
+
+
 def model_lanes(model: str) -> List[str]:
     """Compatible lanes, with the model ladder's lanes first when applicable."""
     rung = next((lanes for lanes, rung_model in factory.LADDER if rung_model == model), ())
@@ -1704,6 +1715,34 @@ class Station:
                 out.append(lane)
         return out
 
+    def model_limits(self) -> Dict[str, Dict[str, float]]:
+        """Lane -> {model: epoch its limit lifts}, from each fresh heartbeat's
+        limited_models (lanes/run_lane.sh write_beat). A lane with a model
+        ladder stays available while one model is limited, and a brief
+        pinned to that model is parked at once, so these are the claims that
+        cannot run there before the reset."""
+        out: Dict[str, Dict[str, float]] = {}
+        for lane in LANES:
+            if lane in REMOTE_LANES:
+                continue
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            if not isinstance(beat, dict) or not isinstance(beat.get("limited_models"), dict):
+                continue
+            at = beat.get("at")
+            if isinstance(at, bool) or not isinstance(at, (int, float)) or not beat_fresh(at, self.now):
+                continue
+            held = {str(model): float(until) for model, until in beat["limited_models"].items()
+                    if isinstance(until, (int, float)) and not isinstance(until, bool)
+                    and until > self.now}
+            if held:
+                out[lane] = held
+        return out
+
+    def model_limited(self, lane: str, model: str) -> Optional[float]:
+        """When the lane's limit on this model lifts, or None when it has none."""
+        return self.model_limits().get(lane, {}).get(model) if model else None
+
     def _inbox_empty(self, lane: str) -> bool:
         try:
             names = os.listdir(self.inbox(lane))
@@ -2453,7 +2492,23 @@ class Station:
             lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
             if lane is None:
                 return False
+        if self._model_waits(repo, issue, lane, headers):
+            return False
         return self._claim(repo, lane, fresh)
+
+    def _model_waits(self, repo: str, issue: Dict[str, Any], lane: str,
+                     headers: Dict[str, str]) -> bool:
+        """The lane is up, but not for this ticket's model until its limit
+        lifts: a claim now is parked at once, and was re-claimed every pass
+        (24 claims in 90 minutes). It waits briefed; the factory moves it to
+        a lane that serves it, or it waits for the reset."""
+        model = brief_model(lane, headers)
+        until = self.model_limited(lane, model)
+        if until is None:
+            return False
+        _say("%s#%s waits: model %s is limited on lane %s until %s"
+             % (repo, issue["number"], model, lane, self._utc(until)))
+        return True
 
     def _route_model_claim(self, repo: str, issue: Dict[str, Any], lane: str,
                            model: str, free: List[str]) -> Optional[str]:
@@ -3632,6 +3687,13 @@ class Station:
             note = self._retry(repo, number, lane, klass, reason)
             if not note:
                 return True
+            if klass == "limit":
+                # A limit is not a failure even with no other lane to retry
+                # on: loom:failed made the factory climb the ladder for it (a
+                # provider limit put a ticket on rung 4 on 2026-10-18). It
+                # waits briefed for a lane that serves it (loom#572, #271).
+                self._limited(repo, number, False, lane, reason)
+                return True
             note = ". Not retried: %s." % note
         self._relabel(repo, number, "loom:failed")
         self._comment(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
@@ -3723,6 +3785,8 @@ class Station:
         busy = None
         for cand in dict.fromkeys(order):
             if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public):
+                continue
+            if self.model_limited(cand, brief_model(cand, headers)) is not None:
                 continue
             if self._inbox_empty(cand):
                 return cand
@@ -6213,6 +6277,7 @@ class Station:
                                review_check=self.s.review_check,
                                review_bot=self.s.review_bot,
                                limited=self.limited_lanes(),
+                               model_limits=self.model_limits(),
                                no_test_repos=self.s.no_test_repos,
                                available=[x for x in LANES if self._heartbeat_ok(x)],
                                held=list(self._held_tickets()))

@@ -153,16 +153,34 @@ lane_setting() {
 # only to lanes with a fresh, available heartbeat. An optional third argument
 # is the epoch time a provider limit lifts; until then every pass stays
 # unavailable without reading the key or taking a brief.
+# A lane with a model ladder (LOOM_<SLOT>_MODELS) stays available while one
+# model is limited, so the beat also names each model limited now and the
+# epoch it lifts ("limited_models"). The station reads it so a ticket pinned
+# to that model is not claimed for this lane again before the reset: a pinned
+# model's limit parked the same ticket here every pass, 24 claims in 90
+# minutes, while the beat said available.
 BEAT="$LOOM_HOME/state/usage/$SLOT.json"
 write_beat() {
-  local slot="$1" reason retry=""
+  local slot="$1" reason retry="" models
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
   reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
   [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
+  models="$(limited_models_json "$slot")"
   mkdir -p "$LOOM_HOME/state/usage"
-  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s}\n' \
-    "$slot" "$(date +%s)" "$2" "$reason" "$retry" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
+  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s, "limited_models": {%s}}\n' \
+    "$slot" "$(date +%s)" "$2" "$reason" "$retry" "$models" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
     mv "$LOOM_HOME/state/usage/$slot.json.tmp" "$LOOM_HOME/state/usage/$slot.json"
+}
+# The slot's model limits that have not lifted, as JSON object members
+# ("model": epoch, ...), from its MODEL_LIMIT_FILE rows; only names a model
+# line may carry.
+limited_models_json() {
+  local file="$LOOM_HOME/state/usage/$1.models"
+  [ -f "$file" ] || return 0
+  awk -v now="$(date +%s)" '
+    $1 ~ /^[A-Za-z0-9._:][A-Za-z0-9._:\/@-]*$/ && $2 ~ /^[0-9]+$/ && $2 + 0 > now + 0 {
+      printf "%s\"%s\": %s", (n++ ? ", " : ""), $1, $2
+    }' "$file"
 }
 heartbeat() { write_beat "$SLOT" "$@"; }
 
@@ -1667,6 +1685,9 @@ for BRIEF in "$INBOX"/*.md; do
       fi
     fi
   elif [ -n "$CONFIGURED_MODELS" ] && [ -n "$PINNED_MODEL" ]; then
+    # Not a lane-wide hold: the lane still serves its other models. The
+    # heartbeat's limited_models carries this limit, so the station does not
+    # claim the ticket here again before it lifts (write_beat).
     if PINNED_UNTIL="$(model_limit_until "$PINNED_MODEL")"; then
       park "$BRIEF" "limit: requested model $PINNED_MODEL limited until $(utc "$PINNED_UNTIL")" limit
       continue

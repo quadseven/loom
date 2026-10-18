@@ -201,7 +201,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
 
-    def go(self, limited=(), no_test_repos=(), available=None):
+    def go(self, limited=(), no_test_repos=(), available=None, model_limits=None):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
@@ -219,7 +219,7 @@ class Base(unittest.TestCase):
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
                             merge=merge, fix=fix, move=move, close=close,
                             limited=limited, no_test_repos=no_test_repos,
-                            available=available)
+                            available=available, model_limits=model_limits)
         f.run()
         return f
 
@@ -450,6 +450,18 @@ class PullRequests(Base):
         self.assertEqual(self.moved, [])
         self.assertEqual((self.lane(5), self.model(5)), ("agy", "gemini-4-argon-high"))
         self.assertIn(factory.RUNG_MARKER % 4, self.gh.comments[5][-1]["body"])
+
+    def test_a_rung_whose_model_is_limited_on_its_lanes_is_not_climbed_to(self):
+        # On 2026-10-18 a ticket climbed to rung 4 while agy's limit on
+        # gemini-4-argon-high had a day left; every claim there was parked.
+        self.gh.private = False
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.go(model_limits={"agy": {"gemini-4-argon-high": NOW + 3600}})
+        self.assertEqual(self.moved, [])
+        self.assertNotEqual(self.lane(5), "agy")
+        self.assertFalse([c for c in self.gh.comments[5] if factory.RUNG_MARKER % 4 in c["body"]])
 
     def test_the_give_up_note_names_the_models_the_ticket_ran_on(self):
         notes = []
@@ -1594,6 +1606,22 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "spark")
         self.assertIn("in its difficulty tier", self.gh.comments[7][-1]["body"])
 
+    def test_a_ticket_whose_model_is_limited_on_its_lane_moves_within_its_tier(self):
+        self.gh.private = False
+        body = "Model: claude-sonnet-5-5\nDifficulty: hard\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="agy", body=body)
+        self.go(model_limits={"agy": {"claude-sonnet-5-5": NOW + 3600}})
+        self.assertNotEqual(self.lane(7), "agy")
+        self.assertIn(self.lane(7), factory.TIERS["hard"])
+        self.assertIn("Not a failure (lane agy is at a limit)", self.gh.comments[7][-1]["body"])
+
+    def test_a_rung_ticket_whose_model_is_limited_on_its_only_lane_waits(self):
+        self.gh.private = False
+        body = "Model: gemini-4-argon-high\nDifficulty: hard\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="agy", body=body)
+        self.go(model_limits={"agy": {"gemini-4-argon-high": NOW + 3600}})
+        self.assertEqual((self.lane(7), self.model(7)), ("agy", "gemini-4-argon-high"))
+
     def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
         body = "Model: claude-opus-5-5\nDifficulty: easy\n\n## Why\nx\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
@@ -1806,7 +1834,8 @@ class Helpers(unittest.TestCase):
 
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
-                         no_test_repos=(), available=None, briefers=(), held=()):
+                         no_test_repos=(), available=None, briefers=(), held=(),
+                         model_limits=None):
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 
