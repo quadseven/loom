@@ -177,6 +177,9 @@ done
 # LOOM_ROLL_SHIP_DOCS (goal ship documents for module source pins), and
 # LOOM_PIN_SHIP_REPOS (deployment repos whose merged pin pull requests ship
 # the tickets they deploy, docs/BRAIN.md), and
+# LOOM_SHIP_ON_MERGE and LOOM_SHIP_WORKFLOWS (repos whose merged tickets ship
+# at merge, and OWNER/NAME=WORKFLOW_FILE repos that ship when their deploy
+# workflow succeeds on the merge commit, docs/BRAIN.md), and
 # LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
 # verify briefs, docs/LANES.md Verify runs), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
@@ -221,6 +224,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_PIN_TARGETS</key><string>$(xml "${LOOM_PIN_TARGETS:-}")</string>
     <key>LOOM_ROLL_SHIP_DOCS</key><string>$(xml "${LOOM_ROLL_SHIP_DOCS:-}")</string>
     <key>LOOM_PIN_SHIP_REPOS</key><string>$(xml "${LOOM_PIN_SHIP_REPOS:-}")</string>
+    <key>LOOM_SHIP_ON_MERGE</key><string>$(xml "${LOOM_SHIP_ON_MERGE:-}")</string>
+    <key>LOOM_SHIP_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_WORKFLOWS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>

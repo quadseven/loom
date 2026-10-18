@@ -1057,6 +1057,115 @@ class ShipDeployedTest(Base):
         self.assertFalse(station._is_ancestor("0" * 40, sha))
 
 
+class ShipRuleTest(Base):
+    """A repo nothing deploys ships at merge (LOOM_SHIP_ON_MERGE); a repo
+    with its own deploy workflow ships when that workflow succeeds on the
+    merge commit (LOOM_SHIP_WORKFLOWS)."""
+
+    WORKFLOW = "deploy.yml"
+
+    def setUp(self):
+        super().setUp()
+        self.runs = []
+        self.carried = set()
+        self.compares = []
+
+    def merged(self, number, pr, merged_at="2030-01-02T00:00:00Z"):
+        self.fake.add(number, state="merged")
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": merged_at,
+                                "merge_commit_sha": sha, "title": "Fix the thing",
+                                "body": "Refs %s#%d" % (REPO, number),
+                                "head": {"ref": "loom/%d-fix" % number}})
+        return sha
+
+    def deploy_run(self, sha, conclusion="success", branch="main",
+            created="2030-01-02T01:00:00Z", ident=1):
+        self.runs.append({"id": ident, "head_sha": sha, "status": "completed",
+                          "conclusion": conclusion, "head_branch": branch,
+                          "created_at": created})
+
+    def transport(self, method, url, headers, body):
+        parts = urlsplit(url)
+        if parts.path == "/repos/%s/actions/workflows/%s/runs" % (REPO, self.WORKFLOW):
+            # The station asks for successful runs; GitHub filters them.
+            return reply(200, {"workflow_runs": [r for r in self.runs
+                                                 if r["conclusion"] == "success"]})
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO,
+                           parts.path)
+        if compare:
+            self.compares.append(compare.groups())
+            base, head = compare.groups()
+            return reply(200, {"status": "ahead" if (base, head) in self.carried
+                               else "diverged"})
+        if method == "GET" and parts.path == "/repos/%s" % REPO:
+            return reply(200, {"full_name": REPO, "default_branch": "main"})
+        return self.fake(method, url, headers, body)
+
+    def ship(self):
+        gh = GitHub("token", transport=self.transport)
+        st = station.Station(gh, self.settings)
+        st.ship_merged()
+        st.ship_workflows()
+
+    def test_a_ship_on_merge_repo_ships_its_merged_tickets(self):
+        self.settings.ship_on_merge = [REPO]
+        self.merged(12, 99)
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
+    def test_an_unlisted_repo_does_not_ship_on_merge(self):
+        self.merged(12, 99)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_workflow_repo_ships_on_a_successful_run_at_the_merge_commit(self):
+        self.settings.ship_workflows = {REPO: self.WORKFLOW}
+        sha = self.merged(12, 99)
+        self.deploy_run(sha)
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_failed_run_or_another_commit_does_not_ship(self):
+        self.settings.ship_workflows = {REPO: self.WORKFLOW}
+        sha = self.merged(12, 99)
+        self.merged(13, 100)
+        self.deploy_run(sha, conclusion="failure", ident=1)
+        self.deploy_run("f" * 40, ident=2)
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertIn("loom:merged", self.fake.names(13))
+
+    def test_a_merge_the_newest_deploy_carries_ships(self):
+        # A merge outside the workflow's path filter starts no run of its
+        # own; it ships with the next deploy whose revision carries it.
+        self.settings.ship_workflows = {REPO: self.WORKFLOW}
+        sha = self.merged(12, 99)
+        self.deploy_run("f" * 40, created="2030-01-02T03:00:00Z")
+        self.carried.add((sha, "f" * 40))
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
+    def test_a_deploy_older_than_the_merge_is_not_asked(self):
+        self.settings.ship_workflows = {REPO: self.WORKFLOW}
+        self.merged(12, 99, merged_at="2030-01-02T05:00:00Z")
+        self.deploy_run("f" * 40, created="2030-01-02T03:00:00Z")
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.compares, [])
+
+    def test_ship_rules_come_from_the_environment(self):
+        env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
+               "LOOM_SHIP_ON_MERGE": REPO + " example-owner/second",
+               "LOOM_SHIP_WORKFLOWS": "%s=deploy.k8s.yml not-a-pair example-owner/x=run.sh" % REPO}
+        with mock.patch("bus.station._say"):
+            settings = station.Settings.from_env(env)
+        self.assertEqual(settings.ship_on_merge, [REPO, "example-owner/second"])
+        self.assertEqual(settings.ship_workflows, {REPO: "deploy.k8s.yml"})
+
+
 DEPLOY = "example-owner/deploy"
 PUBLISHED = "e" * 40
 PIN_MERGED = "2030-01-03T12:00:00Z"
