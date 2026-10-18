@@ -393,6 +393,21 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(sent), 2)
 
 
+
+class VisibilityCadenceTest(unittest.TestCase):
+    def test_the_visibility_target_follows_the_report_cadence(self):
+        # 2026-10-18: the operator moved reports to every 6 hours; a 2-hour
+        # target would fail every goal from then on.
+        def number(hours):
+            total = metrics.Totals()
+            total.goals = 1
+            total.report_ages = {"example-owner/example-repo#1": hours * 3600}
+            return metrics.visibility_number(total)
+        self.assertTrue(number(5).passed)
+        self.assertFalse(number(7).passed)
+        self.assertIn("<=6h", number(5).target)
+
+
 if __name__ == "__main__":
     unittest.main()
 

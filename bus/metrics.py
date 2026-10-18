@@ -633,10 +633,14 @@ def autonomy_number(total: Totals) -> Number:
 
 
 def visibility_number(total: Totals) -> Number:
+    """Each goal home's newest report is no older than the report cadence
+    (brain.REPORT_EVERY: 6 hours since the operator chose it on 2026-10-18)."""
+    from .brain import REPORT_EVERY
     max_age = max(total.report_ages.values(), default=float("inf"))
     return Number("Visibility", "%s" % ", ".join("%s %.1fh" % (r, age / 3600)
                                                 for r, age in total.report_ages.items()),
-                  "each goal report <=2h", bool(total.goals) and max_age <= 7200)
+                  "each goal report <=%gh" % (REPORT_EVERY / 3600),
+                  bool(total.goals) and max_age <= REPORT_EVERY)
 
 
 def self_repair_number(total: Totals) -> Number:
