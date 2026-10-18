@@ -216,6 +216,7 @@ PACKET_DEFERS = 30
 LINE_MAX = 160
 _MODEL_LINE = re.compile(r"^(?:- )?Model: *([A-Za-z0-9._:/-]+)\s*$", re.M)
 _DECIDED_LINE = re.compile(r"^(?:- )?Decided: *(\S.*?)\s*$", re.M)
+_ITEM_REF = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)")
 
 
 def quote(value: str, limit: int = LINE_MAX) -> str:
@@ -421,10 +422,84 @@ def packet(goals: Sequence[Goal], record: Optional[Dict[str, Any]],
            "## Last %d ticks" % PACKET_TICKS]
     out += [line for _, line in ticks[:PACKET_TICKS]] or ["- none"]
     out += [""] + _defer_lines(_open_defers(goals), last, now, public)
-    commit, lines = rules
-    out += ["", "## Rules (docs/MUSE.md at %s)" % (commit or "an unknown commit")]
-    out += lines or ["- not read this pass; read docs/MUSE.md, Rules."]
+    out += _rules_lines(rules)
     if unread:
         out += ["", "Not read this pass: %d repo(s); their ticks and defers are missing "
                 "above." % unread]
     return "\n".join(out)
+
+
+def _rules_lines(rules: Tuple[str, List[str]]) -> List[str]:
+    """The Rules section: docs/MUSE.md's Rules as read from GitHub."""
+    commit, lines = rules
+    return (["", "## Rules (docs/MUSE.md at %s)" % (commit or "an unknown commit")]
+            + (lines or ["- not read this pass; read docs/MUSE.md, Rules."]))
+
+
+def _stored_ref(ref: Any, public: Callable[[str], bool]) -> str:
+    """A stored OWNER/NAME#N as the packet may show it."""
+    m = _ITEM_REF.fullmatch(str(ref or ""))
+    if not m:
+        return "an item not shown"
+    return _ref(m.group(1), int(m.group(2)), bool(public(m.group(1))))
+
+
+def _count(values: Any) -> int:
+    return len(values) if isinstance(values, list) else 0
+
+
+def _stored_tick_line(tick: Dict[str, Any]) -> str:
+    """One stored tick. Its lists are counted, not quoted: a row does not
+    say which goal home their text came from, so it may be private."""
+    return "- %s %s on %s, model %s, ended %s: %s. %d decided, %d left open, %d handed off." % (
+        quote(str(tick.get("started"))), quote(str(tick.get("holder"))),
+        quote(str(tick.get("lane"))), quote(str(tick.get("model"))),
+        quote(str(tick.get("ended"))), quote(str(tick.get("outcome"))),
+        _count(tick.get("decided")), _count(tick.get("left_open")),
+        _count(tick.get("handed_off")))
+
+
+def _commitment_lines(commitments: Sequence[Dict[str, Any]],
+                      public: Callable[[str], bool]) -> List[str]:
+    """The open commitments section; each one's note is left out, as above."""
+    out = ["## Open commitments (%d)" % len(commitments)]
+    for c in commitments[:PACKET_DEFERS]:
+        stage = c.get("stage") if c.get("stage") in STAGES else "work"
+        out.append("- %s %s, from %s's tick %s, due %s." % (
+            stage, _stored_ref(c.get("item"), public), quote(str(c.get("holder"))),
+            quote(str(c.get("tick_id"))), quote(str(c.get("due") or "none"))))
+    if len(commitments) > PACKET_DEFERS:
+        out.append("- and %d more; `resume` lists them all." % (len(commitments) - PACKET_DEFERS))
+    if not commitments:
+        out.append("- none")
+    return out
+
+
+def _digest_line(rule: Dict[str, Any], public: Callable[[str], bool]) -> str:
+    """One rules digest source and the commit or comment it was loaded from;
+    a private goal home's is neither named nor keyed."""
+    source = str(rule.get("source") or "")
+    m = _ITEM_REF.fullmatch(source)
+    if m and not public(m.group(1)):
+        return "- " + _ref(m.group(1), int(m.group(2)), False)
+    return "- %s at %s" % (quote(source), quote(str(rule.get("source_ref"))))
+
+
+def stored_packet(stored: Dict[str, Any], rules: Tuple[str, List[str]],
+                  public: Callable[[str], bool]) -> str:
+    """The handoff packet text from the dashboard's brain memory
+    (bus/brain_memory.fetch_handoff: lists of ticks, open commitments and
+    rules): the last ticks, the open commitments, the rules digest's sources,
+    and docs/MUSE.md's Rules as read from GitHub. `public(repo)` says
+    whether an item's repo may be named; the rows' free text is not quoted,
+    so `python3 -m bus.brain_memory handoff` reads it in full."""
+    out = [HANDOFF_MARKER,
+           "Brain handoff packet. Every brain reads it first in its tick (docs/MUSE.md, "
+           "Tick). The station rebuilds it each pass from the dashboard's brain memory; "
+           "`python3 -m bus.brain_memory handoff` prints it in full.", "",
+           "## Last %d ticks" % PACKET_TICKS]
+    out += [_stored_tick_line(t) for t in stored["ticks"][:PACKET_TICKS]] or ["- none"]
+    out += [""] + _commitment_lines(stored["commitments"], public)
+    out += ["", "## Rules digest"]
+    out += [_digest_line(r, public) for r in stored["rules"]] or ["- none"]
+    return "\n".join(out + _rules_lines(rules))

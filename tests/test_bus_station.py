@@ -1689,6 +1689,89 @@ class HandoffPacketTest(unittest.TestCase):
         self.assertEqual([], self.gh.writes)
 
 
+STORED_PACKET = {
+    "ticks": [{"id": 3, "holder": "lane-machine", "lane": "claude", "model": "opus",
+               "started": "2030-01-01T11:30:00Z", "ended": "2030-01-01T11:50:00Z",
+               "outcome": "ok", "decided": ["shipped one"],
+               "left_open": ["merge %s#7: waiting on CI" % REPO], "handed_off": []}],
+    "commitments": [{"id": 1, "tick_id": 3, "holder": "lane-machine", "item": "%s#7" % REPO,
+                     "stage": "merge", "key": "", "what": "merge: waiting on CI",
+                     "due": "2030-01-01T13:50:00Z", "state": "open"}],
+    "rules": [{"source": "docs/MUSE.md", "source_ref": "d" * 40, "text": "- Write ASCII only.",
+               "loaded_at": "2030-01-01T11:00:00Z"},
+              {"source": "%s#30" % REPO, "source_ref": "comment 12", "text": "## Rules\n- one",
+               "loaded_at": "2030-01-01T11:00:00Z"}]}
+
+
+class StoredHandoffPacketTest(unittest.TestCase):
+    """The packet pass reads the dashboard's brain memory when it answers, and
+    falls back to the goal-home journals when it does not."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = HandoffFake()
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(
+            self.temp.name, [REPO], AUTHORS, OWNERS, status_repo=REPO,
+            transcript_url="https://dashboard.example.com/api/transcripts",
+            transcript_token_ssm="/loom/upload-token")
+        self.fetched = []
+        self.answer = STORED_PACKET
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: from the goal home",
+                        "<!-- loom:defer v1 stage=merge item=%s#7 rev=pr-abc holder=muse -->" % REPO)
+
+    def fetch(self, url, token):
+        self.fetched.append((url, token))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+    def run_pass(self, minutes=0):
+        station.Station(self.gh, self.settings, now=self.now + 60 * minutes,
+                        head=lambda: "c" * 40, read_secret=lambda name, region: "tok",
+                        fetch=self.fetch).publish_handoff()
+
+    def packets(self):
+        return [c for c in self.gh.comments if c["body"].startswith(station.handoff.HANDOFF_MARKER)]
+
+    def test_the_packet_renders_from_the_endpoint_when_it_answers(self):
+        self.run_pass()
+        self.assertEqual([("https://dashboard.example.com/api/brain/handoff", "tok")], self.fetched)
+        body = self.packets()[0]["body"]
+        self.assertIn("## Last 5 ticks\n- 2030-01-01T11:30:00Z lane-machine on claude, model opus, "
+                      "ended 2030-01-01T11:50:00Z: ok. 1 decided, 1 left open, 0 handed off.", body)
+        self.assertIn("## Open commitments (1)\n- merge %s#7, from lane-machine's tick 3, "
+                      "due 2030-01-01T13:50:00Z." % REPO, body)
+        self.assertIn("## Rules digest\n- docs/MUSE.md at %s\n- %s#30 at comment 12"
+                      % ("d" * 40, REPO), body)
+        self.assertIn("## Rules (docs/MUSE.md at %s)\n- Write ASCII only." % ("c" * 40), body)
+        self.assertNotIn("from the goal home", body)
+
+    def test_the_packet_falls_back_to_the_goal_homes_when_the_endpoint_does_not_answer(self):
+        for answer in (OSError("the handoff read answered 401"),
+                       OSError("the handoff read failed to connect"),
+                       {"ticks": [], "commitments": [], "rules": []},
+                       {"ticks": "not a list"}):
+            with self.subTest(answer=answer):
+                self.answer = answer
+                self.gh.comments = [c for c in self.gh.comments
+                                    if not c["body"].startswith(station.handoff.HANDOFF_MARKER)]
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as out:
+                    self.run_pass(minutes=len(self.fetched) * 11)
+                body = self.packets()[0]["body"]
+                self.assertIn("Decided: from the goal home.", body)
+                self.assertIn("## Open defers (1, 0 from brains no longer ticking)", body)
+                self.assertNotIn("## Open commitments", body)
+                self.assertIn("handoff packet: built from the goal homes", out.getvalue())
+
+    def test_no_dashboard_settings_build_from_the_goal_homes_without_a_fetch(self):
+        self.settings.transcript_url = ""
+        self.run_pass()
+        self.assertEqual([], self.fetched)
+        self.assertIn("Decided: from the goal home.", self.packets()[0]["body"])
+
+
 class ReviewFake:
     def __init__(self):
         self.api = "https://api.github.com"
@@ -2998,6 +3081,59 @@ class DeadLaneRunawayTest(Base):
         self.assertIn("loom:runaway", self.fake.names(12))
         self.assertEqual(
             [b for b in self.bodies() if b.startswith("<!-- loom:runaway-dead-lane v1")], [])
+
+
+class ExpiredKeyTest(Base):
+    """An [auth] brief is the provider refusing the key, not the lane's work:
+    the ticket goes back where it was, no retry is spent on it, and however
+    many keys expire it never flags runaway (loom#744)."""
+
+    REASON = "[auth] agent exited 1: API key expired: renew /prod/loom/opencode-go/key"
+
+    def failed(self, lane="opencode-go", number=12, attempt=1, reason=None):
+        reason = reason or self.REASON
+        self.fake.add(number, lane=lane, body=PLAIN, state="running")
+        for _ in range(attempt):
+            self.fake.comments[number].append(
+                {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
+        name = tickets.ticket_name(REPO, number, attempt)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[number], lane, attempt, None))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: %s\n" % (name, lane, name, reason))
+        return name
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def test_auth_is_a_failure_class_not_work(self):
+        self.assertEqual(station.failure_class(self.REASON), "auth")
+
+    def test_an_expired_key_is_not_a_failure_and_spends_no_retry(self):
+        self.failed()
+        self.run_pass()
+        # Back to briefed, where the factory moves it to a lane whose key works.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:opencode-go", "loom:briefed"])
+        self.assertFalse(any(b.startswith("Automatic retry") for b in self.bodies()))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        said = self.bodies()[-1]
+        # The parameter itself is scrubbed here as any path is; the exact one is
+        # in the lane heartbeat and in the ask the runner files.
+        self.assertIn("could not authenticate (agent exited 1: API key expired:", said)
+        self.assertIn("not a failure", said)
+
+    def test_expired_key_failures_never_flag_runaway_or_spend_an_attempt(self):
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.failed(attempt=3)
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane,
+             "created_at": at, "user": {"login": "alice-example"}}
+            for lane in ("opencode-go", "opencode-go-2", "opencode-go-3")]
+        before = factory.attempts(self.fake.comments[12])
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertEqual(factory.attempts(self.fake.comments[12]), before)
 
 
 class FactoryIncidentTest(Base):
@@ -5666,6 +5802,41 @@ class VerifyResultTest(Base):
                              "evidence": "daily line seen at 2026-10-15T14:11Z"}]}
         out.update(changes)
         return out
+
+    def verify_failed(self, reason, name=None, now=None):
+        name = name or self.name
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                   "[t] %s start, lane codex\n[t] %s failed: %s\n" % (name, name, reason))
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=now or time.time())
+        st._report_verify("codex", "failed", REPO, 5, name)
+        return st
+
+    def verify_runs(self):
+        with open(os.path.join(self.home, "state", "station", station.VERIFY_FILE)) as fh:
+            return json.load(fh)
+
+    def test_a_transient_verify_failure_makes_its_ticket_due_again_now(self):
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE),
+                   json.dumps({"%s#5" % REPO: time.time() - 60}))
+        self.verify_failed("[transient] agent exited 1")
+        self.assertNotIn("%s#5" % REPO, self.verify_runs())
+
+    def test_a_verify_run_that_failed_on_the_work_keeps_its_cooldown(self):
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE),
+                   json.dumps({"%s#5" % REPO: time.time() - 60}))
+        self.verify_failed("[work] no verify.json written")
+        self.assertIn("%s#5" % REPO, self.verify_runs())
+
+    def test_two_transient_verify_failures_in_a_row_hold_the_lane_for_an_hour(self):
+        now = time.time()
+        self.verify_failed("[transient] agent exited 1", name="a-verify-1", now=now)
+        st = self.verify_failed("[transient] agent exited 124", name="a-verify-2", now=now)
+        self.assertTrue(st._verify_lane_held("codex"))
+        self.assertFalse(st._verify_lane_held("zen"))
+        later = station.Station(GitHub("token", transport=self.fake), self.settings,
+                                now=now + station.VERIFY_LANE_HOLD + 1)
+        self.assertFalse(later._verify_lane_held("codex"))
 
     def test_a_valid_proof_ticks_the_criteria_and_verifies_through_proof_py(self):
         self.result(self.good())

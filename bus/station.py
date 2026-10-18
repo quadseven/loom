@@ -29,6 +29,7 @@ from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import audit
+from . import brain_memory
 from . import factory
 from . import evidence
 from . import handoff
@@ -229,7 +230,9 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # factory broke (a contract the runner cannot read, a check it cannot run,
 # a base check already red), so the ticket stays running on its lane and
 # keeps its rung, and the brain re-queues it when the incident closes.
-CLASS_RE = re.compile(r"^\[(limit|transient|work|factory)\] ")
+# An [auth] one is the operator's key, which no lane can renew: it is not a
+# failure, not an attempt spent and never a runaway.
+CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Where the runner files its validation incidents (lanes/run_lane.sh
@@ -284,11 +287,19 @@ TITLE_WORD_MIN = 4
 # likely down), so uploads cannot hold the station's lock for long.
 UPLOAD_TRIES = 5
 UPLOAD_PER_PASS = 10
+# Between brain ticks the station sends new done markers to the dashboard at
+# most this often (post_brain_memory), so a commitment another brain
+# finished closes without waiting for this machine's next tick.
+CLOSE_EVERY = 600
+# The rules digest's source for docs/MUSE.md's Rules section.
+MUSE_RULES = "docs/MUSE.md"
 
 SecretReader = Callable[[str, str], str]
 Poster = Callable[[str, Dict[str, Any]], None]
 # (URL, bearer token, body) -> None; raises on any failure.
 Uploader = Callable[[str, str, Dict[str, Any]], None]
+# (URL, bearer token) -> the dashboard's handoff packet; OSError on any failure.
+Fetcher = Callable[[str, str], Dict[str, Any]]
 # A finished run: (ledger key, brain tick start or None, body builder).
 Run = Tuple[str, Optional[float], Callable[[], Dict[str, Any]]]
 # (method, path under the API, bot token, JSON body or None) -> parsed reply.
@@ -310,6 +321,10 @@ VERIFY_INTERVAL = 6 * 3600
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+# Per-lane transient verify failures and the holds they earn (loom#714).
+VERIFY_LANES_FILE = "verify-lanes.json"
+VERIFY_STRIKES = 2
+VERIFY_LANE_HOLD = 3600
 # Lanes that spend Anthropic models never take a verify run; the free and
 # subscription lanes do (the claude lane spends the operator's subscription).
 VERIFY_SKIP = ("anthropic", "claude")
@@ -574,6 +589,27 @@ def _is_ancestor(commit: str, revision: str) -> bool:
     return out.returncode == 0
 
 
+def _muse_rules() -> Tuple[str, str]:
+    """(commit, Rules section) of docs/MUSE.md in this checkout, the one
+    lanes/mac/station.sh deploys: the commit is the last one that changed the
+    file. ("", "") when git or the file cannot say."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", root, "log", "-1", "--format=%H", "--", "docs/MUSE.md"],
+                             capture_output=True, text=True, timeout=30)
+        with open(os.path.join(root, "docs", "MUSE.md"), encoding="utf-8") as fh:
+            doc = fh.read()
+    except (OSError, subprocess.SubprocessError) as err:
+        _say("could not read docs/MUSE.md for the rules digest (%s)" % type(err).__name__)
+        return "", ""
+    commit = out.stdout.strip()
+    if out.returncode != 0 or not COMMIT_RE.fullmatch(commit):
+        _say("could not find the commit of docs/MUSE.md for the rules digest (git exit %d)"
+             % out.returncode)
+        return "", ""
+    return commit, brain_memory.rules_section(doc)
+
+
 def post_webhook(url: str, payload: Dict[str, Any]) -> None:
     """POST JSON to the webhook. Errors never carry the URL (it is a secret)."""
     if not url.startswith("https://"):
@@ -786,7 +822,7 @@ def provider(lane: str) -> str:
 
 
 # Failure classes that did no work on the ticket (loom#572).
-NOT_WORK = ("factory", "transient", "limit")
+NOT_WORK = ("factory", "transient", "limit", "auth")
 
 
 def failure_class(reason: str) -> str:
@@ -931,12 +967,14 @@ class Station:
                  discord: Optional[DiscordCall] = None,
                  upload: Optional[Uploader] = None,
                  ancestor: Optional[Callable[[str, str], bool]] = None,
-                 head: Optional[Callable[[], str]] = None) -> None:
+                 head: Optional[Callable[[], str]] = None,
+                 fetch: Optional[Fetcher] = None) -> None:
         self.gh = gh
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
+        self.fetch = fetch or brain_memory.fetch_handoff
         self.ancestor = ancestor or _is_ancestor
         self.head = head or _checkout_head
         # Where Claude Code and codex keep their sessions (the claude lane's
@@ -1956,7 +1994,7 @@ class Station:
             _say("could not list tickets to verify: %s" % err)
             return
         for lane in lanes:
-            if lane in held:
+            if lane in held or self._verify_lane_held(lane):
                 continue
             for repo, issue in list(pool):
                 if needs_public_repo(lane, "") and not self._public(repo):
@@ -2074,8 +2112,22 @@ class Station:
         """Apply a finished verify run. A failed run changes nothing: the
         ticket is due again once its cooldown is over."""
         if kind == "failed":
+            klass = failure_class(self._failure_reason(lane, name))
+            if klass in ("transient", "limit"):
+                # The run never looked at the ticket: it costs the ticket no
+                # cooldown, and a lane failing this way twice sits out an hour
+                # (loom#714).
+                self._forget_verify_attempt(repo, number)
+                held = klass == "transient" and self._verify_strike(lane)
+                _say("verify run %s failed [%s]; %s#%d is due again now%s"
+                     % (name, klass, repo, number,
+                        "; lane %s takes no verify run for an hour after %d transient "
+                        "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
+                return True
+            self._verify_clear(lane)
             _say("verify run %s failed; %s#%d stays shipped" % (name, repo, number))
             return True
+        self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
         if result is None:
             self._verify_note(repo, number, lane, why)
@@ -2086,6 +2138,45 @@ class Station:
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True
+
+    def _forget_verify_attempt(self, repo: str, number: int) -> None:
+        path = os.path.join(self.state, VERIFY_FILE)
+        attempts = _read_json(path, {}, strict=False)
+        if isinstance(attempts, dict) and attempts.pop("%s#%d" % (repo, number), None) is not None:
+            _write_json(path, attempts)
+
+    def _verify_lanes(self) -> Dict[str, Any]:
+        data = _read_json(os.path.join(self.state, VERIFY_LANES_FILE), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    def _verify_strike(self, lane: str) -> bool:
+        """Count one transient verify failure for the lane; True when it now
+        sits out VERIFY_LANE_HOLD seconds."""
+        data = self._verify_lanes()
+        entry = data.get(lane) if isinstance(data.get(lane), dict) else {}
+        strikes = int(entry.get("strikes", 0) or 0) + 1
+        held = strikes >= VERIFY_STRIKES
+        data[lane] = {"strikes": 0 if held else strikes,
+                      "until": self.now + VERIFY_LANE_HOLD if held else entry.get("until", 0)}
+        _write_json(os.path.join(self.state, VERIFY_LANES_FILE), data)
+        return held
+
+    def _verify_clear(self, lane: str) -> None:
+        """A verify run that reached the ticket ends the lane's strike run."""
+        data = self._verify_lanes()
+        entry = data.get(lane)
+        if isinstance(entry, dict) and entry.get("strikes"):
+            entry["strikes"] = 0
+            _write_json(os.path.join(self.state, VERIFY_LANES_FILE), data)
+
+    def _verify_lane_held(self, lane: str) -> bool:
+        entry = self._verify_lanes().get(lane)
+        until = float(entry.get("until", 0) or 0) if isinstance(entry, dict) else 0.0
+        if until > self.now:
+            _say("lane %s takes no verify run until %s: %d transient verify failures in a row"
+                 % (lane, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(until)), VERIFY_STRIKES))
+            return True
+        return False
 
     def _verify_model(self, lane: str, name: str) -> str:
         """The model the verify run used, as the runner recorded it next to
@@ -3290,6 +3381,12 @@ class Station:
                           "queue when the factory incident closes." % (lane, bare))
             _say("held %s#%d for the factory: %s" % (repo, number, reason))
             return True
+        if klass == "auth":
+            # The provider refused the key: no attempt of any lane can renew
+            # it, so the ticket costs nothing and goes to a lane that still has
+            # a working one (loom#744).
+            self._unauthenticated(repo, number, fix_pr.isdigit(), lane, bare)
+            return True
         if fix_pr:
             # A fresh attempt would open a second pull request for the ticket.
             # A work failure goes to loom:failed, where the factory climbs the
@@ -3319,9 +3416,10 @@ class Station:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
         if failure_class(reason) in NOT_WORK:
-            # An incident is the factory's problem repeating, and a transient
-            # or limit exit is the lane's: neither did the ticket's work, so
-            # neither may flag it or cost it a rung (loom#572).
+            # An incident is the factory's problem repeating, a transient or
+            # limit exit is the lane's, and an expired key is the operator's:
+            # none did the ticket's work, so none may flag it or cost it a rung
+            # (loom#572, loom#744).
             return False
         authors = {author.lower() for author in self.s.authors}
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
@@ -3446,6 +3544,18 @@ class Station:
         self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
                       "the ticket goes to the next lane." % (lane, reason))
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _unauthenticated(self, repo: str, number: int, fix: bool, lane: str,
+                         reason: str) -> None:
+        """A run the provider refused the key for (not a failure, and no
+        attempt spent). The lane runner has taken every lane that shares the key
+        offline and opened the operator an ask naming the parameter, so the
+        ticket goes back to briefed, where the factory moves it to a lane whose
+        key works; a fix brief's goes back to loom:pr."""
+        self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
+        self._comment(repo, number, "Lane %s could not authenticate (%s). This is not a "
+                      "failure: the ticket goes to a lane with a working key." % (lane, reason))
+        _say("reported %s#%d unauthenticated on lane %s: %s" % (repo, number, lane, reason))
 
     def _branch_moved(self, repo: str, number: int, pr: int, lane: str, reason: str) -> None:
         """A fix brief whose push was refused because the pull request's
@@ -5047,17 +5157,24 @@ class Station:
                                             self.claude_projects, self.codex_sessions,
                                             issue=self._field(text, "Issue"))
             runs.append(("%s/%s" % (lane, name), None, body))
+        last = self._finished_brain_tick()
+        if last is not None:
+            def brain_body() -> Dict[str, Any]:
+                return transcripts.brain_body(home, last["started"], last["at"], last["outcome"],
+                                              str(last.get("model") or ""), self.claude_projects)
+            runs.append(("brain", float(last["started"]), brain_body))
+        return runs
+
+    def _finished_brain_tick(self) -> Optional[Dict[str, Any]]:
+        """The last brain tick (state/brain.json) when it ran the agent and
+        ended: outcome ok or failed, with the numeric start brain.sh records
+        and its end; else None."""
         tick = self._brain()
         last = tick[0] if tick else {}
-        started, at = last.get("started"), last.get("at")
-        if (last.get("outcome") in ("ok", "failed")
-                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                        for v in (started, at))):
-            def brain_body() -> Dict[str, Any]:
-                return transcripts.brain_body(home, started, at, last["outcome"],
-                                              str(last.get("model") or ""), self.claude_projects)
-            runs.append(("brain", float(started), brain_body))
-        return runs
+        if last.get("outcome") in ("ok", "failed") and all(
+                self._num(last.get(k)) for k in ("started", "at")):
+            return last
+        return None
 
     @staticmethod
     def _uploaded(ledger: Dict[str, Any], key: str, tick: Optional[float]) -> Any:
@@ -5147,6 +5264,130 @@ class Station:
                 return
         if first:
             _write_json(path, ledger)
+
+    # -- brain memory ------------------------------------------------------
+    def post_brain_memory(self) -> None:
+        """Post the last brain tick on this machine to the dashboard's
+        brain_ticks once (bus/brain_memory.py), with its commitments, then
+        the rules digest's sources that changed. A failed post is tried on
+        the next pass, UPLOAD_TRIES times in all; the rules wait for a tick
+        that posted. Between ticks, every CLOSE_EVERY seconds, it sends the
+        done markers written since the last send. Uses the transcript upload
+        settings and token."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return
+        path = os.path.join(self.state, "brain_memory.json")
+        ledger = _read_json(path, {})
+        if not isinstance(ledger, dict):
+            raise StateError("state file %s does not hold an object" % path)
+        last = self._finished_brain_tick()
+        tries = self._tick_tries(ledger, last)
+        closed_at = ledger.get("closed_at")
+        close_due = self._num(ledger.get("since")) and not (
+            self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
+        if tries is None and not close_due:
+            return
+        token = self._transcript_token()
+        if token is None:
+            return
+        homes = [(repo, issue, [c for c in self.gh.paginate(
+                    "/repos/%s/issues/%d/comments?per_page=100" % (repo, int(issue["number"])))
+                  if isinstance(c, dict)]) for repo, issue in self._goal_homes()]
+        found = handoff.journals(
+            [{"body": c.get("body"), "at": c.get("created_at"), "login": tickets._login(c.get("user"))}
+             for _, _, comments in homes for c in comments], self.s.authors)
+        if last is not None and tries is not None:
+            self._post_brain_tick(last, ledger, token, found, tries)
+            if ledger["tick"]["result"] == "sent":
+                self._post_brain_rules(ledger, token, homes)
+        else:
+            self._post_brain_closings(ledger, token, found)
+        _write_json(path, ledger)
+
+    def _tick_tries(self, ledger: Dict[str, Any], last: Optional[Dict[str, Any]]) -> Optional[int]:
+        """The failed posts of the last finished tick so far, or None when
+        there is none to post (none finished, or it is sent or given up)."""
+        if last is None:
+            return None
+        rec = ledger.get("tick") if isinstance(ledger.get("tick"), dict) else {}
+        tries = rec.get("result") if rec.get("started") == last["started"] else 0
+        return int(tries) if self._num(tries) else None
+
+    def _post_brain_tick(self, last: Dict[str, Any], ledger: Dict[str, Any], token: str,
+                         found: List[Dict[str, Any]], tries: int) -> None:
+        """Post the tick's row and record in the ledger "sent", "refused",
+        "gave up", or the failed tries so far. Sent, the done markers up to
+        the tick's end count as sent."""
+        record = (brain.tick_step(self.gh, self.s.status_repo)
+                  if tickets.REPO_RE.fullmatch(self.s.status_repo or "") else None)
+        since = ledger.get("since") if self._num(ledger.get("since")) else None
+        body = brain_memory.tick_body(last, record, found, brain_memory.holder_of(last), since=since)
+        when = self._utc(last["started"])
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, brain_memory.TICKS_PATH),
+                        token, body)
+            result: Any = "sent"
+            ledger["since"] = max(since or 0, last["at"] + brain_memory.GRACE)
+        except UploadRefused as err:
+            _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
+            result = "refused"
+        # Deliberately broad, as in upload_transcripts: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            result = tries + 1
+            if result >= UPLOAD_TRIES:
+                _say("gave up posting the brain tick of %s after %d tries (%s)"
+                     % (when, UPLOAD_TRIES, type(err).__name__))
+                result = "gave up"
+        ledger["tick"] = {"started": last["started"], "result": result}
+
+    def _post_brain_closings(self, ledger: Dict[str, Any], token: str,
+                             found: List[Dict[str, Any]]) -> None:
+        """Send the done markers written since the last send, so the
+        commitments they finish close; a failed send is tried CLOSE_EVERY
+        seconds later."""
+        ledger["closed_at"] = self.now
+        closings = brain_memory.closings(found, ledger["since"])
+        if not closings:
+            return
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url,
+                                                   brain_memory.COMMITMENTS_PATH),
+                        token, {"commitments": [c for _, c in closings]})
+        # Deliberately broad, as above: only the type is logged.
+        except Exception as err:  # noqa: BLE001
+            _say("could not send the brain's done markers (%s); next in %d minutes"
+                 % (type(err).__name__, CLOSE_EVERY // 60))
+            return
+        ledger["since"] = closings[-1][0] + 1
+
+    def _post_brain_rules(self, ledger: Dict[str, Any], token: str,
+                          homes: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]) -> None:
+        """Load the rules whose text or source changed since they were last
+        loaded: docs/MUSE.md's Rules, keyed by commit, and each goal home's;
+        and retire the sources that no longer have any."""
+        commit, text = _muse_rules()
+        rules = [{"source": MUSE_RULES, "source_ref": commit, "text": text}] if commit and text else []
+        rules += [r for r in (brain_memory.goal_rules(repo, issue, comments, self.s.authors)
+                              for repo, issue, comments in homes) if r]
+        loaded = ledger.get("rules") if isinstance(ledger.get("rules"), dict) else {}
+        # A source that yields no rules now (a closed goal, a removed section)
+        # is retired with an empty text; docs/MUSE.md only when it was read.
+        current = {r["source"] for r in rules}
+        rules += [{"source": source, "source_ref": "removed", "text": ""} for source in loaded
+                  if source not in current and (source != MUSE_RULES or commit)]
+        changed = [r for r in rules if loaded.get(r["source"]) != brain_memory.digest(r)]
+        if not changed:
+            return
+        try:
+            self.upload(brain_memory.dashboard_url(self.s.transcript_url, brain_memory.RULES_PATH),
+                        token, {"rules": changed})
+        # Deliberately broad, as above; the rules are loaded after the next tick.
+        except Exception as err:  # noqa: BLE001
+            _say("could not load the brain rules (%s); next tick" % type(err).__name__)
+            return
+        loaded = dict(loaded, **{r["source"]: brain_memory.digest(r) for r in changed})
+        ledger["rules"] = {source: d for source, d in loaded.items()
+                           if not any(r["source"] == source and not r["text"] for r in changed)}
 
     def post_overdue_standups(self) -> None:
         """Post a data-only report when an open goal has gone overdue."""
@@ -5918,12 +6159,54 @@ class Station:
         entry["packet"] = packet
         _say("handoff packet updated on %s#%d" % home)
 
+    def _stored_handoff(self) -> Optional[Dict[str, Any]]:
+        """The dashboard's handoff packet (brain_memory.fetch_handoff), read
+        with the transcript upload settings and token, when it answers with
+        at least one tick; else None, logged, and the packet is built from
+        the goal homes."""
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            return None
+        token = self._transcript_token()
+        if token is None:
+            _say("handoff packet: built from the goal homes, no dashboard token")
+            return None
+        try:
+            stored = self.fetch(brain_memory.dashboard_url(self.s.transcript_url,
+                                                           brain_memory.HANDOFF_PATH), token)
+        # fetch_handoff's errors never carry the URL or the token.
+        except OSError as err:
+            _say("handoff packet: built from the goal homes, the dashboard did not answer (%s)"
+                 % err)
+            return None
+        rows = [stored.get(key) for key in ("ticks", "commitments", "rules")]
+        if not (all(isinstance(r, list) and all(isinstance(x, dict) for x in r) for r in rows)
+                and rows[0]):
+            _say("handoff packet: built from the goal homes, the dashboard's packet holds no ticks")
+            return None
+        return stored
+
+    def _handoff_body(self, repo: str, homes: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """The packet text and the goal homes to keep for the next build:
+        from the dashboard's brain memory when it answers (handoff.
+        stored_packet), which reads no goal home and keeps the last build's,
+        else from the goal homes' journals (handoff.packet)."""
+        rules = self._handoff_rules(repo)
+        stored = self._stored_handoff()
+        if stored is not None:
+            return handoff.stored_packet(stored, rules, lambda r: self._shown(r, repo)), dict(homes)
+        goals, unread, kept = self._handoff_goals(repo, homes)
+        return handoff.packet(goals, brain.tick_step(self.gh, repo), rules,
+                              datetime.fromtimestamp(self.now, timezone.utc),
+                              lambda r: self._shown(r, repo), unread), kept
+
     def publish_handoff(self) -> None:
-        """Keep the handoff packet (handoff.packet) in one comment on the Loom
-        goal home, marked HANDOFF_MARKER: posted once, then edited in place,
-        and only when its text changed. It is rebuilt at most every
-        HANDOFF_EVERY seconds, or sooner when a brain tick just ended, so a
-        pass does not read every goal home's comments."""
+        """Keep the handoff packet in one comment on the Loom goal home,
+        marked HANDOFF_MARKER: posted once, then edited in place, and only
+        when its text changed. It is rendered from the dashboard's brain
+        memory, or built from the goal homes when the dashboard does not
+        answer (_handoff_body). It is rebuilt at most every HANDOFF_EVERY
+        seconds, or sooner when a brain tick just ended, so a pass does not
+        read every goal home's comments."""
         path = os.path.join(self.state, "handoff.json")
         saved = _read_json(path, {}, strict=False)
         saved = saved if isinstance(saved, dict) else {}
@@ -5940,10 +6223,7 @@ class Station:
             # The allowed logins changed: nothing kept under the old list
             # (journals or the packet comment) is trusted.
             homes = {}
-        goals, unread, kept = self._handoff_goals(repo, homes)
-        body = handoff.packet(goals, brain.tick_step(self.gh, repo), self._handoff_rules(repo),
-                              datetime.fromtimestamp(self.now, timezone.utc),
-                              lambda r: self._shown(r, repo), unread)
+        body, kept = self._handoff_body(repo, homes)
         _text.check(body)
         key = "%s#%d" % home
         if key not in kept:
@@ -6112,8 +6392,10 @@ class Station:
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
-                     self.post_metrics, self.publish_handoff,
-                     self.watch_brain, self.upload_transcripts, self.relay_operator,
+                     self.post_metrics,
+                     # The packet after the tick's row, so it renders that tick.
+                     self.watch_brain, self.upload_transcripts, self.post_brain_memory,
+                     self.publish_handoff, self.relay_operator,
                      self.watch_default_branches, self.run_factory, self.check_invariants,
                      self.release_factory_held):
             if self._deferred():

@@ -12,13 +12,19 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "station.sh"
 
-# Fake gh: prints $FAKE_CHECK as the check verdict the script's --jq asks
-# for, and $FAKE_REVERTS as the bodies of the in-flight revert tickets.
+# Fake gh: returns check-run and revert-ticket API responses.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
+if [ "${FAKE_FAIL:-}" = 1 ]; then echo 'API rate limit exceeded' >&2; exit 1; fi
 case "$*" in
-  *loom:revert*) printf '%s\\n' "${FAKE_REVERTS:-}" ;;
-  *) printf '%s\\n' "${FAKE_CHECK:-success}" ;;
+  *loom:revert*) jq -n --arg body "${FAKE_REVERTS:-}" '[{"body":$body,"labels":[]}]' ;;
+  *)
+    if [ "${FAKE_CHECK_STATE:-completed}" = in_progress ]; then
+      printf '{"check_runs":[{"conclusion":null,"status":"in_progress"}]}\\n'
+    else
+      printf '{"check_runs":[{"conclusion":"%s","status":"completed"}]}\\n' "${FAKE_CHECK:-success}"
+    fi
+    ;;
 esac
 """
 # Fake python3: records that the station pass ran, from which directory.
@@ -116,6 +122,21 @@ class StationScriptTest(unittest.TestCase):
         # A deploy that did not happen records nothing, so nothing ships.
         self.assertIsNone(self.deployed())
         self.assertTrue(self.calls()[-1].startswith("python3 -m bus station"))
+
+    def test_a_failed_check_read_says_why_deploy_did_not_happen(self):
+        before = self.head()
+        self.push_change()
+        result = self.run_script(FAKE_FAIL="1")
+        self.assertEqual(self.head(), before)
+        self.assertIn("not deploying: the CI check could not be read", result.stdout)
+        self.assertIn("API rate limit exceeded", result.stdout)
+
+    def test_a_pending_check_says_which_state_is_waiting(self):
+        before = self.head()
+        self.push_change()
+        result = self.run_script(FAKE_CHECK_STATE="in_progress")
+        self.assertEqual(self.head(), before)
+        self.assertIn("waiting: unittest is in_progress on", result.stdout)
 
     def test_a_head_that_brings_in_a_commit_a_revert_names_waits(self):
         before = self.head()
