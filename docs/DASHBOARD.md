@@ -103,3 +103,9 @@ held first, then working, then ready, in slot order), "How tickets are
 routed" (the `bus/factory.py` tiers and model ladder, each lane marked with
 its state now) and "Pull requests by model" (lane pull requests counted by
 footer model, easy to hard).
+
+A lane's hold reason comes from its last heartbeat, which the lane rewrites
+only on its next pass. A hold whose until-time has passed is read as ended
+(loom#809): `/usage` counts that lane free and asks nothing about it, and
+`/lanes` says the hold ended and that no heartbeat has come since, instead of
+a past "until" read as a live hold.

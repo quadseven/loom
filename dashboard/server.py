@@ -1260,10 +1260,12 @@ def _lane_quota(lane, rows):
     return max(used) if used else None
 
 
-def _hold_reason(lane, rows):
+def _hold_reason(lane, rows, now=None):
     """Why a held lane is held, from the usage records' heartbeat reasons:
     "limit: out of credit; unavailable until 2026-10-16T00:01:27Z" reads
-    "out of credit until 2026-10-16 00:01 UTC"."""
+    "out of credit until 2026-10-16 00:01 UTC". A hold whose time has passed
+    says it ended and that the lane has not reported since, never a past
+    "until" read as a live hold."""
     reason = next((row["holds"][lane] for row in rows
                    if isinstance(row.get("holds"), dict) and lane in row["holds"]), "")
     if not reason:
@@ -1275,8 +1277,11 @@ def _hold_reason(lane, rows):
     stamp = match.group(1).rstrip(";")
     try:
         local = views._local_time(stamp)
+        ends = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return reason
+    if ends <= (now or datetime.now(timezone.utc)):
+        return "its hold (%s) ended %s; no heartbeat from the lane since" % (reason[:match.start()], local)
     return reason[:match.start()] + " until " + local
 
 

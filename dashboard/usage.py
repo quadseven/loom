@@ -146,7 +146,9 @@ def _pct(value: float) -> str:
 
 
 def lane_state(reason: str, now: datetime) -> dict[str, Any]:
-    """A lane's heartbeat hold reason as {kind: free|held|down, why, until}."""
+    """A lane's heartbeat hold reason as {kind: free|held|down, why, until}.
+    A hold whose until-time has passed is free: it ended, whatever the last
+    heartbeat still says."""
     if not reason:
         return {"kind": "free", "why": "free", "until": None}
     text = re.sub(r"^limit:\s*", "", reason).strip()
@@ -157,10 +159,14 @@ def lane_state(reason: str, now: datetime) -> dict[str, Any]:
         if until:
             text = text[:match.start()].strip()
     kind = "down" if any(word in reason.lower() for word in DOWN_WORDS) else "held"
+    if until and until <= now:
+        # The hold ran out and the lane has not written a heartbeat since (a
+        # runner busy on a long run writes none): it no longer holds the lane.
+        return {"kind": "free", "until": until,
+                "why": "free: its hold (%s) ended %s (%s)" % (text or kind, _clock(until), _ago(until, now))}
     why = text or kind
     if until:
-        why += " until %s (%s)" % (_clock(until), _until(until, now) if until > now
-                                   else "ended " + _ago(until, now))
+        why += " until %s (%s)" % (_clock(until), _until(until, now))
     return {"kind": kind, "why": why, "until": until}
 
 
