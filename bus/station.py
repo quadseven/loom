@@ -79,6 +79,17 @@ NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
 # longer waiting or running is removed once it is this old. On 2026-10-13 the
 # 385 left behind held 7.8 GB and the disk filled.
 TREE_KEEP = 3600
+# The loom home is kept bounded (loom#643): a lane's logs (logs/<slot>/) are
+# removed once nothing in them changed for LOOM_LOG_KEEP_DAYS days (0 keeps
+# them all), unless a brief of that name is waiting or running or its
+# transcript has not reached the dashboard yet. Every pass warns when the
+# home's disk has less than LOOM_DISK_FREE_MIN_GB free; every DISK_EVERY
+# seconds the old logs go and the home's size is logged. On 2026-10-17 logs/
+# held 4.2 GB, growing 0.6 GB a day, and the disk was down to 8 GB free.
+LOG_KEEP_DAYS = 7
+DISK_FREE_MIN_GB = 10.0
+DISK_EVERY = 3600
+GB = 1024 ** 3
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
@@ -434,13 +445,19 @@ class Settings:
                  briefers: Sequence[str] = (),
                  ship_on_merge: Sequence[str] = (),
                  ship_workflows: Optional[Dict[str, str]] = None,
-                 no_topup: Sequence[str] = ()) -> None:
+                 no_topup: Sequence[str] = (),
+                 log_keep_days: int = LOG_KEEP_DAYS,
+                 disk_free_min_gb: float = DISK_FREE_MIN_GB) -> None:
         self.home = home
         # LOOM_NO_TOPUP: provider lanes (anthropic) whose credit the operator
         # never tops up. Their slots held out of credit wait for the credit
         # to renew, so the lane-held invariant skips them. Empty (the
         # default) keeps the invariant on every held lane.
         self.no_topup = [lane.lower() for lane in no_topup]
+        # Days a lane's logs are kept (0: forever), and the free disk under
+        # which every pass warns (Station.tend_disk).
+        self.log_keep_days = log_keep_days
+        self.disk_free_min_gb = disk_free_min_gb
         # Repos whose merged tickets ship at merge (ship_on_merge), and repos
         # whose merged tickets ship when their deploy workflow succeeds on the
         # merge commit, repo to workflow file (ship_workflows).
@@ -570,7 +587,69 @@ class Settings:
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
                    ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
                    ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")),
-                   no_topup=words("LOOM_NO_TOPUP"))
+                   no_topup=words("LOOM_NO_TOPUP"),
+                   log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
+                   disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")))
+
+
+def _keep_days(raw: str) -> int:
+    """LOOM_LOG_KEEP_DAYS: a whole number of days, 0 for forever; anything
+    else is said once and the default kept."""
+    raw = raw.strip()
+    if not raw:
+        return LOG_KEEP_DAYS
+    if raw.isdigit():
+        return int(raw)
+    _say("ignoring LOOM_LOG_KEEP_DAYS %r: not a whole number of days" % raw)
+    return LOG_KEEP_DAYS
+
+
+def _free_floor(raw: str) -> float:
+    """LOOM_DISK_FREE_MIN_GB: a non-negative number of GB, else the default."""
+    raw = raw.strip()
+    if not raw:
+        return DISK_FREE_MIN_GB
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not (value >= 0 and math.isfinite(value)):
+        _say("ignoring LOOM_DISK_FREE_MIN_GB %r: not a number of GB" % raw)
+        return DISK_FREE_MIN_GB
+    return value
+
+
+def _gb(n: float) -> str:
+    return "%.1f GB" % (n / GB)
+
+
+def _tree_stat(path: str) -> Tuple[float, int]:
+    """(newest mtime, bytes on disk) of a path and, for a real directory,
+    everything under it. Links are counted as themselves, never followed."""
+    st = os.lstat(path)
+    newest, size = st.st_mtime, _disk_bytes(st)
+    if stat.S_ISDIR(st.st_mode):
+        for root, dirs, files in os.walk(path, followlinks=False):
+            for name in dirs + files:
+                try:
+                    st = os.lstat(os.path.join(root, name))
+                except OSError:
+                    continue
+                newest, size = max(newest, st.st_mtime), size + _disk_bytes(st)
+    return newest, size
+
+
+def _disk_bytes(st: os.stat_result) -> int:
+    blocks = getattr(st, "st_blocks", None)
+    return blocks * 512 if isinstance(blocks, int) else st.st_size
+
+
+def _remove(path: str) -> None:
+    """Remove a file, a link (never what it points at) or a whole folder."""
+    if stat.S_ISDIR(os.lstat(path).st_mode):
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        os.unlink(path)
 
 
 def _ship_workflows(items: List[str]) -> Dict[str, str]:
@@ -6876,6 +6955,115 @@ class Station:
         if removed:
             _say("removed %d finished lane tree(s)" % removed)
 
+    def tend_disk(self) -> None:
+        """Keep the loom home bounded and say how big it is (loom#643). Every
+        pass warns when its disk has less than disk_free_min_gb free. Every
+        DISK_EVERY seconds the lane logs past retention go (prune_logs) and
+        the home's size is logged, by top-level folder."""
+        try:
+            free: Optional[int] = shutil.disk_usage(self.s.home).free
+        except OSError as err:
+            _say("cannot read the free space on the loom home's disk: %s" % err)
+            free = None
+        if free is not None and free < self.s.disk_free_min_gb * GB:
+            # Worded so the log watcher (bus/watch.py KEEP_RE) does not count
+            # it: the line repeats every pass until space is freed.
+            _say("warning: only %s free on the loom home's disk (under %s); "
+                 "lanes keep writing" % (_gb(free), _gb(self.s.disk_free_min_gb * GB)))
+        path = os.path.join(self.state, "disk.json")
+        saved = _read_json(path, {}, strict=False)
+        last = saved.get("at") if isinstance(saved, dict) else None
+        if self._num(last) and 0 <= self.now - last < DISK_EVERY:
+            return
+        self.prune_logs()
+        sizes: Dict[str, int] = {}
+        try:
+            names = os.listdir(self.s.home)
+        except OSError as err:
+            _say("cannot list the loom home to measure it: %s" % err)
+            return
+        for name in names:
+            try:
+                key = name if stat.S_ISDIR(os.lstat(os.path.join(self.s.home, name)).st_mode) else "files"
+                sizes[key] = sizes.get(key, 0) + _tree_stat(os.path.join(self.s.home, name))[1]
+            except OSError:
+                continue
+        total = sum(sizes.values())
+        parts = ", ".join("%s %s" % (k, _gb(v)) for k, v in
+                          sorted(sizes.items(), key=lambda kv: (-kv[1], kv[0])))
+        _say("loom home holds %s (%s); %s free on its disk"
+             % (_gb(total), parts or "empty", "unknown" if free is None else _gb(free)))
+        _write_json(path, {"at": self.now, "bytes": total, "free": free, "folders": sizes})
+
+    def _logs_kept(self) -> Optional[Tuple[Set[str], Set[str]]]:
+        """(names, slot/name keys) whose lane logs stay however old: every
+        brief waiting or running in a lane inbox, and, while transcripts are
+        uploaded, every finished run the ledger does not hold as settled.
+        None when an inbox or the ledger cannot be read: remove nothing."""
+        live: Set[str] = set()
+        for lane in LANES:
+            try:
+                live |= {e[:-3] for e in os.listdir(self.inbox(lane)) if e.endswith(".md")}
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's inbox, so no lane log is removed: %s" % (lane, err))
+                return None
+        pending: Set[str] = set()
+        if self.s.transcript_url and self.s.transcript_token_ssm:
+            ledger = _read_json(os.path.join(self.state, "transcripts.json"), None, strict=False)
+            if not isinstance(ledger, dict):
+                return None
+            for lane, _, _, name in self._finished_briefs():
+                rec = ledger.get("%s/%s" % (lane, name))
+                if rec is None or (isinstance(rec, int) and not isinstance(rec, bool)):
+                    pending.add("%s/%s" % (lane, name))
+        return live, pending
+
+    def prune_logs(self) -> None:
+        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
+        log, result and records, its archived transcripts) whose newest file
+        is older than log_keep_days, unless _logs_kept keeps its ticket. The
+        station's own logs in logs/ are not touched."""
+        if self.s.log_keep_days <= 0:
+            return
+        kept = self._logs_kept()
+        if kept is None:
+            return
+        live, pending = kept
+        cutoff = self.now - self.s.log_keep_days * 24 * 3600
+        removed = freed = 0
+        for slot in LANES:
+            folder = os.path.join(self.s.home, "logs", slot)
+            try:
+                if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                    continue
+                names = os.listdir(folder)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's logs to remove old ones: %s" % (slot, err))
+                continue
+            keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
+            for name in names:
+                # A run's files are <ticket>, <ticket>.log, <ticket>.result...
+                if any(name == t or name.startswith(t + ".") for t in keep):
+                    continue
+                path = os.path.join(folder, name)
+                try:
+                    newest, size = _tree_stat(path)
+                    if newest >= cutoff:
+                        continue
+                    _remove(path)
+                except OSError as err:
+                    _say("cannot remove old lane log %s/%s: %s" % (slot, name, err))
+                    continue
+                removed += 1
+                freed += size
+        if removed:
+            _say("removed %d lane log(s) older than %d days (%s)"
+                 % (removed, self.s.log_keep_days, _gb(freed)))
+
     # -- the GitHub budget --------------------------------------------------
     def _budget_state(self) -> Dict[str, Any]:
         if self._budget is None:
@@ -7038,10 +7226,12 @@ class Station:
             raise
         except (GitHubError, OSError) as err:
             _say("watch_logs failed: %s" % err)
-        try:
-            self.prune_trees()
-        except OSError as err:
-            _say("prune_trees failed: %s" % err)
+        # Local housekeeping: finished lane trees, old lane logs, the disk.
+        for local in (self.prune_trees, self.tend_disk):
+            try:
+                local()
+            except OSError as err:
+                _say("%s failed: %s" % (local.__name__, err))
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)

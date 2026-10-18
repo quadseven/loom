@@ -112,7 +112,11 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+# The check's scratch home (CHECK_HOME, a few hundred MB once a check has
+# built its caches) goes with the runner, before the lock is let go, so run/
+# holds one only while its lane is running (loom#643).
+drop_check_home() { [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME"; }
+trap 'drop_check_home; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -1223,6 +1227,8 @@ final_validation() {
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
+  # The last check of this brief has run; the next one starts a fresh home.
+  drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
 }
