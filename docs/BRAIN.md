@@ -1040,7 +1040,7 @@ spends up to a third of its tick on these items: it writes a proof only from
 evidence it saw in the tick, and otherwise leaves a one-line note on the
 ticket naming what evidence is missing.
 
-Every 2 hours the tick adds a five-line report with the marker
+Every 6 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
 
@@ -1077,7 +1077,7 @@ homes as above.
 
 ### Report deadlines
 
-Each goal owes its own report every 2 hours, counted from its newest valid
+Each goal owes its own report every 6 hours, counted from its newest valid
 report or, with none, from when the goal was opened. A valid report is a
 comment on that goal's home that starts with the report marker, from a
 `LOOM_BRIEF_AUTHORS` login when that is set. A marker inside another
@@ -1089,7 +1089,17 @@ valid report, a measurement (a journal or report with a `Measure:` line that
 is not none) and a completed action (a `Shipped:` line that is not none),
 and its report state: ok, due (2 hours past), or overdue (one more tick,
 30 minutes, past that). Due and overdue goals are listed under "Reports
-owed before unlock"; the tick posts those reports before it unlocks. An
+owed before unlock"; the tick posts those reports before it unlocks.
+
+Two reports on one goal home stay at least 90 minutes apart (the
+`report-cadence` invariant). A due or overdue goal with a report under 90
+minutes old, from a `LOOM_BRIEF_AUTHORS` login or any GitHub App (the
+station's standup, posted as the Loom App, whether or not the brain trusts
+that login), is listed as `report HELD` with that report's author, time and
+when the next may go out. `python3 -m bus journal` refuses such a report
+the same way: it posts nothing, prints `not posted:` and the same reason,
+and exits 0. With `LOOM_BRIEF_AUTHORS` empty every author's report counts;
+otherwise a person outside the list cannot hold a goal's reports back. An
 overdue report is a missed deadline only: it is separate from a report the
 station could not forward and from a brain that stopped ticking, which the
 station reports on its own.

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -470,6 +471,62 @@ class JournalTests(unittest.TestCase):
         journal.post(gh, REPO, 7, "<!-- loom:reply v1 discord=123456789 -->\nDone.")
         self.assertEqual(gh.requests, 1)
 
+    # The station's standup goes out as the Loom App; on 2026-10-18 a brain
+    # that did not trust the App's login posted its own report 8 minutes later
+    # on the goal home (and 7 to 70 minutes later on twelve others).
+    APP = {"login": "example-loom[bot]", "type": "Bot"}
+
+    @staticmethod
+    def report_comment(user, minutes_before, body=None):
+        at = NOW - timedelta(minutes=minutes_before)
+        return {"user": user, "created_at": at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "body": body or journal.REPORT_MARKER + "\nNothing moved since the last report."}
+
+    def test_a_report_8_minutes_after_the_apps_report_is_refused_and_not_posted(self):
+        t = Scripted(reply(200, [self.report_comment(self.APP, 8)]))
+        gh = GitHub("tok", transport=t)
+        with self.assertRaises(journal.ReportTooSoon) as held:
+            journal.post(gh, REPO, 7, journal.REPORT_MARKER + "\nReport", trusted=["example-operator"],
+                         now=NOW)
+        self.assertEqual([c[0] for c in t.calls], ["GET"])
+        self.assertIn("/repos/%s/issues/7/comments?since=2030-01-01T10:30:00Z" % REPO, t.calls[0][1])
+        self.assertIn("example-loom[bot] posted a report on this goal home at 2030-01-01T11:52:00Z, "
+                      "8 minutes ago", str(held.exception))
+        self.assertIn("next may go out at 2030-01-01T13:22:00Z", str(held.exception))
+
+    def test_a_trusted_login_or_any_author_without_a_trust_list_holds_a_report(self):
+        operator = {"login": "Example-Operator", "type": "User"}
+        stranger = {"login": "stranger", "type": "User"}
+        for comments, trusted, refused in (
+                ([self.report_comment(operator, 89)], ["example-operator"], True),
+                ([self.report_comment(stranger, 30)], ["example-operator"], False),
+                ([self.report_comment(stranger, 30)], [], True),
+                # A journal, or a marker quoted inside another comment, is no report.
+                ([self.report_comment(self.APP, 5, journal.JOURNAL_MARKER + "\nTick x, y"),
+                  self.report_comment(self.APP, 5, "quoting " + journal.REPORT_MARKER)], [], False)):
+            with self.subTest(comments=comments, trusted=trusted):
+                t = Scripted(reply(200, comments), reply(201, {}))
+                gh = GitHub("tok", transport=t)
+                if refused:
+                    with self.assertRaises(journal.ReportTooSoon):
+                        journal.post(gh, REPO, 7, journal.REPORT_MARKER + "\nR", trusted=trusted, now=NOW)
+                else:
+                    journal.post(gh, REPO, 7, journal.REPORT_MARKER + "\nR", trusted=trusted, now=NOW)
+                self.assertEqual([c[0] for c in t.calls], ["GET"] if refused else ["GET", "POST"])
+
+    def test_a_report_91_minutes_after_the_last_one_posts(self):
+        t = Scripted(reply(200, [self.report_comment(self.APP, 91)]), reply(201, {}))
+        gh = GitHub("tok", transport=t)
+        journal.post(gh, REPO, 7, journal.REPORT_MARKER + "\nReport", trusted=["example-operator"], now=NOW)
+        self.assertEqual([c[0] for c in t.calls], ["GET", "POST"])
+        self.assertEqual(json.loads(t.calls[1][3])["body"], journal.REPORT_MARKER + "\nReport")
+
+    def test_a_journal_is_never_held_by_the_report_gap(self):
+        t = Scripted(reply(201, {}))
+        gh = GitHub("tok", transport=t)
+        journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx", now=NOW)
+        self.assertEqual([c[0] for c in t.calls], ["POST"])
+
 
 class CliTests(unittest.TestCase):
     def run_cli(self, argv, transport):
@@ -515,6 +572,23 @@ class CliTests(unittest.TestCase):
         posted = json.loads(t.calls[0][3])["body"].splitlines()
         self.assertRegex(posted[1], r"^Tick \S+Z, lane-machine$")
         self.assertEqual(posted[2], "Moved: nothing.")
+
+    def test_journal_command_says_not_posted_for_a_report_held_by_the_gap(self):
+        just = (datetime.now(timezone.utc) - timedelta(minutes=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        t = Scripted(reply(200, [{"user": {"login": "example-loom[bot]", "type": "Bot"},
+                                  "created_at": just, "body": journal.REPORT_MARKER + "\nx"}]))
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "r.md")
+            with open(path, "w") as fh:
+                fh.write(journal.REPORT_MARKER + "\nReport\n")
+            gh = GitHub("tok", transport=t)
+            with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-operator"}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = cli.main(["journal", REPO + "#5", "--file", path], gh=gh)
+        self.assertEqual(code, 0)
+        self.assertEqual([c[0] for c in t.calls], ["GET"])
+        self.assertTrue(out.getvalue().startswith("not posted: example-loom[bot] posted a report"))
 
 
 if __name__ == "__main__":
