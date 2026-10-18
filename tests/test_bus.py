@@ -524,10 +524,13 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(json.loads(t.calls[1][3])["body"], journal.REPORT_MARKER + "\nReport")
 
     def test_a_journal_is_never_held_by_the_report_gap(self):
-        t = Scripted(reply(201, {}))
+        # A journal reads only its login and its own day's comments (to edit
+        # the day's journal in place), never the report gap's window.
+        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
         gh = GitHub("tok", transport=t)
         journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx", now=NOW)
-        self.assertEqual([c[0] for c in t.calls], ["POST"])
+        self.assertEqual([c[0] for c in t.calls], ["GET", "GET", "POST"])
+        self.assertIn("since=2030-01-01T00:00:00Z", t.calls[1][1])
 
 
 class CliTests(unittest.TestCase):
