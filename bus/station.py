@@ -3318,9 +3318,10 @@ class Station:
 
     def _retry_lane(self, repo: str, issue: Dict[str, Any], failed: str, klass: str,
                     skip: set) -> Optional[str]:
-        """The next eligible lane: another slot of the failed lane's provider
-        (not after a limit, which the slots share), then RETRY_ORDER, then free
-        lanes for an easy ticket. Only available lanes whose runner takes the
+        """The next eligible lane: RETRY_ORDER, then free lanes for an easy
+        ticket, never a slot of the failed lane's provider. Its slots share the
+        model, the key and often the box, so a sibling repeats the failure (a
+        Spark that timed out, an expired opencode-go key; loom#747). Only available lanes whose runner takes the
         ticket's model and repo; an idle one before a busy one. Candidate
         eligibility is kept in _retry_eligible so this method selects by order."""
         try:
@@ -3344,8 +3345,7 @@ class Station:
         return busy
 
     def _retry_order(self, failed: str, klass: str, difficulty: Optional[str]) -> List[str]:
-        same = [lane for lane in LANES if provider(lane) == provider(failed)]
-        order = ([] if klass == "limit" else same) + RETRY_ORDER
+        order = list(RETRY_ORDER)
         if difficulty == "easy":
             order += FREE_LANES
         return order
@@ -3353,12 +3353,12 @@ class Station:
     def _retry_eligible(self, repo: str, cand: str, failed: str, klass: str, model: str,
                         public: Dict[str, bool]) -> bool:
         """Whether lane cand can take a retry: a known, available lane, not
-        the failed lane's provider after a limit, whose runner takes the
-        model and, for a public-only lane, a public repo. public caches the
-        repo lookup across candidates."""
+        the failed lane's provider, whose runner takes the model and, for a
+        public-only lane, a public repo. public caches the repo lookup across
+        candidates."""
         if cand not in LANES or not self._heartbeat_ok(cand):
             return False
-        if klass == "limit" and provider(cand) == provider(failed):
+        if provider(cand) == provider(failed):
             return False
         if model and not lane_takes_model(cand, model):
             return False
