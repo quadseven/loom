@@ -419,37 +419,71 @@ def _limit_text(lane: str, reason: str) -> str:
     return "Waiting: lane %s is at a limit (%s)." % (lane, reason)
 
 
+def _outcome_status(lane: str, reason: str, retried_on: str = "") -> Dict[str, str]:
+    """A failed attempt's status: a limit waits, anything else failed."""
+    reason = " ".join(reason.split())
+    if reason.startswith(("[limit]", "limit:")):
+        status = {"kind": "limit", "lane": lane, "text": _limit_text(lane, reason)}
+    else:
+        status = {"kind": "failed", "lane": lane,
+                  "text": "The last attempt failed on lane %s: %s" % (lane, reason[:180])}
+    if retried_on:
+        status["text"] += " Retried on lane %s." % retried_on
+    return status
+
+
+def _comment_status(body: str) -> Optional[Dict[str, str]]:
+    """The attempt status one station comment sets, or None for a comment
+    that says nothing about the newest attempt."""
+    claim = CLAIM_RE.match(body)
+    if claim:
+        return {"kind": "live", "lane": claim.group(1), "text": ""}
+    back = UNAVAILABLE_RE.match(body)
+    if back:
+        return {"kind": "limit", "lane": back.group(1), "text": _limit_text(back.group(1), back.group(2))}
+    failed = FAILED_RE.match(body)
+    if failed:
+        return _outcome_status(failed.group(1), failed.group(2))
+    retry = RETRY_RE.match(body)
+    if retry:
+        return _outcome_status(retry.group(1), retry.group(3), retry.group(2))
+    # A pull request, or a move to another lane or rung: the old lane's
+    # limit is not what it waits for now.
+    if OPENED_RE.match(body) or MOVED_RE.match(body) or RUNG_RE.search(body):
+        return {"kind": "ended", "lane": "", "text": ""}
+    return None
+
+
 def attempt_status(comments: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
     """What the ticket's newest attempt is doing, from the station's
     comments: kind "live" (claimed, no outcome yet), "limit" (handed back at
-    a limit; text says until when), "failed", or "ended" (a pull request).
-    None when no lane ever claimed it."""
+    a limit; text says until when), "failed", or "ended" (a pull request, or
+    moved on). None when no lane ever claimed it."""
     status: Optional[Dict[str, str]] = None
     for comment in sorted(comments, key=lambda c: str(c.get("created_at") or "")):
-        body = str(comment.get("body") or "").strip()
-        claim, back, failed = CLAIM_RE.match(body), UNAVAILABLE_RE.match(body), FAILED_RE.match(body)
-        retry, opened = RETRY_RE.match(body), OPENED_RE.match(body)
-        if claim:
-            status = {"kind": "live", "lane": claim.group(1), "text": ""}
-        elif back:
-            status = {"kind": "limit", "lane": back.group(1), "text": _limit_text(back.group(1), back.group(2))}
-        elif failed or retry:
-            lane, reason = (failed.group(1), failed.group(2)) if failed else (retry.group(1), retry.group(3))
-            reason = " ".join(reason.split())
-            if reason.startswith(("[limit]", "limit:")):
-                status = {"kind": "limit", "lane": lane, "text": _limit_text(lane, reason)}
-            else:
-                status = {"kind": "failed", "lane": lane,
-                          "text": "The last attempt failed on lane %s: %s" % (lane, reason[:180])}
-            if retry:
-                status["text"] += " Retried on lane %s." % retry.group(2)
-        elif opened:
-            status = {"kind": "ended", "lane": opened.group(1), "text": ""}
-        elif MOVED_RE.match(body) or RUNG_RE.search(body):
-            # Moved to another lane or rung: the old lane's limit is not what
-            # it waits for now.
-            status = {"kind": "ended", "lane": "", "text": ""}
+        status = _comment_status(str(comment.get("body") or "").strip()) or status
     return status
+
+
+def _is_live(running: bool, status: Optional[Dict[str, str]]) -> bool:
+    """A running label alone is not a live run: the newest attempt may have
+    ended on a limit or a failure while the ticket waits for its next claim.
+    Without the station's comments the label is all there is."""
+    if not running:
+        return False
+    return status is None or status["kind"] == "live"
+
+
+def _status_row(selected, status, live: bool, waiting: bool) -> str:
+    """The pane's last row: live, waiting on a limit, failed, or none."""
+    if live:
+        lane = (status or {}).get("lane") or (selected or {}).get("slot") or "its lane"
+        return _row("live", "", '<p class="live-row"><span class="dot"></span>working... streaming from %s</p>'
+                    % _esc(lane), "live")
+    if waiting and status and status["kind"] in ("limit", "failed"):
+        word = "waiting" if status["kind"] == "limit" else "failed"
+        return _row(word, "", '<p class="live-row"><span class="dot"></span>%s</p>' % _esc(status["text"]), word)
+    return ""
 
 
 def _transcript_pane(runs, selected, events, review_threads, running, status=None, waiting=False):
@@ -458,12 +492,7 @@ def _transcript_pane(runs, selected, events, review_threads, running, status=Non
         parts.append('<div class="attempts">%s</div>' % "".join(_chip(run, selected) for run in runs))
     parts.append('<div class="run-line"><span>%s</span><label class="thought-toggle"><input type="checkbox" checked data-thought-toggle> thoughts</label></div>'
                  % _esc(_run_line(selected)))
-    # A running label alone is not a live run: the newest attempt may have
-    # ended on a limit or a failure while the ticket waits for its next claim.
-    if status is not None and running:
-        live = status["kind"] == "live"
-    else:
-        live = running and status is None
+    live = _is_live(running, status)
     parts.append('<div class="run-events" data-attempt="%s" data-running="%s">' % (
         _esc((selected or {}).get("attempt") or ""), "true" if live else "false"))
     if selected is None:
@@ -473,13 +502,7 @@ def _transcript_pane(runs, selected, events, review_threads, running, status=Non
     elif all(event.get("role") == "runner" or event.get("kind") == "log" for event in events):
         parts.append('<p class="empty-state">This attempt kept only the runner log: the lane\'s own session record was not captured.</p>')
     parts.extend(_event_rows(interleave_activity(events, review_threads)))
-    if live:
-        lane = (status or {}).get("lane") or (selected or {}).get("slot") or "its lane"
-        parts.append(_row("live", "", '<p class="live-row"><span class="dot"></span>working... streaming from %s</p>'
-                          % _esc(lane), "live"))
-    elif (running or waiting) and status and status["kind"] in ("limit", "failed"):
-        word = "waiting" if status["kind"] == "limit" else "failed"
-        parts.append(_row(word, "", '<p class="live-row"><span class="dot"></span>%s</p>' % _esc(status["text"]), word))
+    parts.append(_status_row(selected, status, live, running or waiting))
     parts.append('</div></section>')
     return "".join(parts)
 
@@ -563,6 +586,13 @@ def _pr_pane(record, runs, detail):
     return "".join(parts)
 
 
+def _detail_status(detail) -> Optional[Dict[str, str]]:
+    """attempt_status of the comments ticket_data read; None without them."""
+    if detail is None or "comments" in detail.get("errors", {}):
+        return None
+    return attempt_status(detail.get("comments") or [])
+
+
 def render(record, runs, selected, events, pull_requests=(), review_threads=(), detail=None):
     """The Ticket page body. `selected` is the chosen run (a run dict, or its
     id or attempt number); `detail` is what ticket_data read from GitHub."""
@@ -576,12 +606,10 @@ def render(record, runs, selected, events, pull_requests=(), review_threads=(), 
         '<a href="?tab=%s" data-ticket-tab="%s">%s</a>' % (tab, tab, tab) for tab in ("transcript", "path", "pr")) + '</nav>')
     parts.append('<div class="ticket-columns">')
     parts.append(_path_pane(record, detail))
-    comments = None if detail is None or "comments" in detail.get("errors", {}) else detail.get("comments") or []
-    status = attempt_status(comments) if comments is not None else None
     # A briefed ticket the station put back after a limit waits for its next
     # claim: it says what it waits for too.
     parts.append(_transcript_pane(runs, selected, events, threads if last else [], record.get("state") == "running",
-                                  status, record.get("state") == "briefed"))
+                                  _detail_status(detail), record.get("state") == "briefed"))
     parts.append(_pr_pane(record, runs, detail))
     parts.append('</div>')
     return ''.join(parts)
