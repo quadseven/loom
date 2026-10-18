@@ -544,6 +544,30 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("#2 report OVERDUE since 2030-01-01T16:26:00Z", owed)
         self.assertNotIn("#1", owed)
 
+    def test_a_goal_the_app_reported_minutes_ago_is_held_not_owed(self):
+        # 2026-10-18: the station's standup went out as the Loom App at 16:29Z
+        # and a brain trusting only the operator's login posted its own report
+        # at 16:37Z, so the report-cadence invariant fired on thirteen goal homes.
+        now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
+        goals = [{"number": 2, "title": "Stale", "labels": [{"name": "loom:goal"}],
+                  "created_at": "2029-12-01T00:00:00Z"}]
+        bot = {"login": "brain-bot"}
+        app = {"__typename": "Bot", "login": "example-loom"}
+        g2 = [{"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T14:26:00Z", "author": bot},
+              {"body": "<!-- loom:report v1 -->\nNothing moved since the last report.",
+               "createdAt": "2030-01-01T19:52:00Z", "author": app}]
+        gh = GitHub("t", transport=Fake(
+            reply(200, goals), reply(200, []),
+            reply(200, {"data": {"repository": {"g2": {"comments": {"nodes": g2}}}}}),
+            reply(200, []), reply(200, []), reply(200, [])))
+        report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])
+        self.assertIn("#2 Stale - latest journal none, report 2030-01-01T14:26:00Z", report)
+        owed = report.split("### Reports owed before unlock")[1].split("###")[0]
+        self.assertIn("#2 report HELD: example-loom[bot] posted a report on this goal home at "
+                      "2030-01-01T19:52:00Z, 8 minutes ago", owed)
+        self.assertIn("next may go out at 2030-01-01T21:22:00Z", owed)
+        self.assertNotIn("OVERDUE", owed)
+
     def test_only_a_marked_report_on_the_goal_advances_its_deadline(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
         issue = {"number": 3, "created_at": "2030-01-01T17:00:00Z"}
