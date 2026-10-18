@@ -278,34 +278,46 @@ def fetch_handoff(url: str, token: str) -> Dict[str, Any]:
 
 
 def _joined(values: Any) -> str:
-    return "; ".join(str(v) for v in values or []) or "none"
+    if not isinstance(values, list):
+        return "none"
+    return "; ".join(str(v) for v in values) or "none"
 
 
+def _rows(packet: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+    """The packet's list under key, objects only: a malformed packet drops
+    the rows it cannot read instead of failing the tick."""
+    rows = packet.get(key)
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+# Every field of a tick or commitment is a record, not instructions, so each
+# renders as one bounded line: a field cannot open a heading of its own, such
+# as a forged rules digest. Only the rules text keeps its lines.
 def _tick_line(t: Dict[str, Any]) -> str:
-    return "- %s %s on %s, model %s: %s. Decided: %s. Left open: %s. Handed off: %s." % (
+    return _line("- %s %s on %s, model %s: %s. Decided: %s. Left open: %s. Handed off: %s." % (
         t.get("started"), t.get("holder"), t.get("lane"), t.get("model"), t.get("outcome"),
-        _joined(t.get("decided")), _joined(t.get("left_open")), _joined(t.get("handed_off")))
+        _joined(t.get("decided")), _joined(t.get("left_open")), _joined(t.get("handed_off"))))
 
 
 def _commitment_line(c: Dict[str, Any]) -> str:
-    return "- %s %s from %s's tick %s, due %s: %s" % (
+    return _line("- %s %s from %s's tick %s, due %s: %s" % (
         c.get("stage"), c.get("item"), c.get("holder"), c.get("tick_id"),
-        c.get("due") or "none", c.get("what"))
+        c.get("due") or "none", c.get("what")))
 
 
 def render(packet: Dict[str, Any]) -> str:
     """The packet as text for a brain's prompt: the last ticks, the open
     commitments and the rules digest with the commit or comment of each."""
-    commits = packet.get("commitments") or []
-    rules = packet.get("rules") or []
+    commits = _rows(packet, "commitments")
+    rules = _rows(packet, "rules")
     out = ["Handoff packet from the dashboard (docs/decisions/0002, item 3).", "",
            "## Last ticks"]
-    out += [_tick_line(t) for t in packet.get("ticks") or []] or ["- none"]
+    out += [_tick_line(t) for t in _rows(packet, "ticks")] or ["- none"]
     out += ["", "## Open commitments (%d)" % len(commits)]
     out += [_commitment_line(c) for c in commits] or ["- none"]
     out += ["", "## Rules digest"]
     for rule in rules:
-        out += ["", "### %s at %s" % (rule.get("source"), rule.get("source_ref")),
+        out += ["", _line("### %s at %s" % (rule.get("source"), rule.get("source_ref"))),
                 str(rule.get("text") or "")]
     if not rules:
         out.append("- none")
