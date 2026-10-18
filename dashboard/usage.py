@@ -52,10 +52,14 @@ def _validate_row(raw_row: Any) -> dict[str, Any]:
 
 
 def _optional_fields(row: dict[str, Any]) -> dict[str, Any]:
-    """When the provider wrote the reading, and its window length: a bad
-    value is dropped, not refused, since neither is needed to show it."""
+    """When the provider wrote the reading, the machine that collected it, and
+    its window length: a bad value is dropped, not refused, since none is
+    needed to show it."""
     if row.get("observed_at") is not None and _parse_time(row["observed_at"]) is None:
         row["observed_at"] = None
+    host = row.get("host")
+    if host is not None and (not isinstance(host, str) or not host or len(host) > 100):
+        row["host"] = None
     minutes = row.get("window_minutes")
     if minutes is not None and (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
                                 or not 0 < minutes <= 60 * 24 * 366):
@@ -66,14 +70,22 @@ def _optional_fields(row: dict[str, Any]) -> dict[str, Any]:
 class Store:
     def __init__(self):
         self.providers: dict[str, list[dict[str, Any]]] = {}
+        self.received_at: datetime | None = None
 
-    def upload(self, raw: Any) -> dict[str, Any]:
+    def upload(self, raw: Any, now: datetime | None = None) -> dict[str, Any]:
         rows = validate(raw)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             grouped.setdefault(row["provider"], []).append(row)
         self.providers.update(grouped)
+        self.received_at = now or datetime.now(timezone.utc)
         return {"providers": len(grouped), "readings": len(rows)}
+
+    def snapshot(self) -> dict[str, Any]:
+        """The live readings for GET /api/usage: a brain off the lane machine
+        reads these instead of its own machine's leftover files."""
+        return {"readings": [row for rows in self.providers.values() for row in rows],
+                "received_at": self.received_at.isoformat() if self.received_at else None}
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +99,8 @@ NEAR_LIMIT_PCT = 80.0
 MIN_PACE_FRACTION = 0.05
 WINDOW_MINUTES = {"5-hour": 300, "weekly": 10080}
 WINDOW_NAMES = {"5-hour": "5-hour", "weekly": "Weekly", "credit": "Credit",
-                "all": "Usage", "last 429": "Last 429", "thermal hold": "Thermal hold"}
+                "all": "Usage", "last 429": "Last 429", "thermal hold": "Thermal hold",
+                "limit": "Limit"}
 HOLD_UNTIL = re.compile(r";\s*(?:lane waits|unavailable) until (\S+)")
 DOWN_WORDS = ("endpoint", "503", "unreachable", "down")
 RECENT_PR_DAYS = 7
@@ -235,7 +248,7 @@ def _window(row: dict[str, Any], now: datetime) -> dict[str, Any]:
          "lanes": [lane for lane in row.get("lanes") or [] if isinstance(lane, str)],
          "used": used, "reset": reset, "note": note, "observed": observed, "collected": collected,
          "stale": _staleness(used, reset, observed, now), "pace": None, "runs_out": None,
-         "at_reset": None, "error": note.startswith("adapter error")}
+         "at_reset": None, "error": note.startswith("adapter error"), "host": row.get("host")}
     minutes = row.get("window_minutes") or WINDOW_MINUTES.get(window)
     if used is not None and reset is not None and observed is not None and minutes and not w["stale"]:
         w.update(_projection(used, reset, observed, minutes))
@@ -321,8 +334,10 @@ def _window_ask(name: str, w: dict[str, Any], now: datetime) -> list[tuple[str, 
     if w["error"]:
         asks.append(("warn", "%s: the usage adapter failed (%s)." % (name, w["note"])))
     elif w["kind"] == "credit" and w["used"] is None and "not configured" in w["note"]:
-        asks.append(("info", "%s credit has no meter: the spend budget is not configured "
-                             "(LOOM_ANTHROPIC_BUDGET_USD)." % name))
+        asks.append(("info", "%s credit has no meter: no API reads the prepaid balance, so set "
+                             "LOOM_ANTHROPIC_BUDGET_USD to the console's balance and "
+                             "LOOM_ANTHROPIC_BUDGET_SINCE to the day it was read, in the lane "
+                             "machine's environment (lanes/mac/install.sh)." % name))
     return asks
 
 
@@ -402,7 +417,30 @@ def _unknown_note(w: dict[str, Any], now: datetime) -> str:
         limit = w["note"].replace("limitName:", "").strip() or "a"
         return ("Last hit its %s limit; the provider said retry after %s (%s)."
                 % (limit, _clock(w["reset"]), _until(w["reset"], now)))
+    if w["kind"] == "limit":
+        return _limit_note(w, now)
     return _sentence(w["note"])
+
+
+def _limit_note(w: dict[str, Any], now: datetime) -> str:
+    """A lane's limit hold from its heartbeat: held until the reset, or the
+    last hold and when it lifted."""
+    lanes = ", ".join(w["lanes"])
+    note = w["note"]
+    for prefix in ("limited:", "last limit:"):
+        if note.startswith(prefix):
+            why = note[len(prefix):].strip()
+            if prefix == "limited:":
+                until = (" until %s (%s)" % (_clock(w["reset"]), _until(w["reset"], now))
+                         if w["reset"] and w["reset"] > now else ", reset time unknown")
+                return "%s limited%s: %s." % (lanes, until, why.rstrip("."))
+            seen = " %s" % _ago(w["observed"], now) if w["observed"] and w["observed"] != w["collected"] else ""
+            lifted = (", lifted %s (%s)" % (_clock(w["reset"]), _ago(w["reset"], now))
+                      if w["reset"] and w["reset"] <= now else "")
+            return "%s last limited%s%s: %s." % (lanes, seen, lifted, why.rstrip("."))
+    if note == "no limit seen":
+        return "%s: no limit seen in its heartbeat." % lanes
+    return _sentence(note)
 
 
 def _unknown_meter(w: dict[str, Any], now: datetime) -> str:
@@ -490,6 +528,9 @@ def _read_line(p: dict[str, Any], newest: datetime | None, now: datetime) -> str
     if len(p["sources"]) > 3:
         sources = "%s and %d more" % (", ".join(p["sources"][:2]), len(p["sources"]) - 2)
     parts = ["Source: " + sources] if p["sources"] != ["not exposed"] else []
+    hosts = _unique(str(w.get("host") or "") for w in p["windows"])
+    if hosts:
+        parts.append("collected on " + ", ".join(hosts))
     if p["read"] is None:
         parts.append("read time unknown")
     elif newest is None or abs((newest - p["read"]).total_seconds()) >= 60:

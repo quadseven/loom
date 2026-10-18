@@ -1,7 +1,9 @@
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from pathlib import Path
 
@@ -185,6 +187,161 @@ class UsageTests(unittest.TestCase):
         self.assertEqual([row["resets_at"] for row in rows], [
             "2027-01-15T08:10:00+00:00", "2027-01-15T08:20:00+00:00"])
         self.assertEqual([row["note"] for row in rows], ["reason one", "reason two"])
+
+
+    # -- limit holds, host, credit settings and the command line (loom#813) --
+    def _beat(self, lane, **fields):
+        state = Path(self.home) / "state" / "usage"
+        state.mkdir(parents=True, exist_ok=True)
+        beat = {"lane": lane, "at": fields.pop("at", 1_800_000_000)}
+        beat.update(fields)
+        (state / (lane + ".json")).write_text(json.dumps(beat))
+
+    def test_claude_and_agy_read_limited_until_from_their_heartbeat_then_keep_the_last_limit(self):
+        now = 1_800_000_000
+        self._beat("claude", available=False, retry_at=now + 3600,
+                   reason="limit: provider limit reached; lane waits until 2027-01-15T09:00:00Z")
+        self._beat("agy", available=True, reason="")
+        rows = usage.collect(self.home, now=now, lane_names=["claude", "agy"], host="lanes")
+        by = {row["provider"]: row for row in rows}
+        self.assertEqual(by["claude"]["window"], "limit")
+        self.assertEqual(by["claude"]["resets_at"], "2027-01-15T09:00:00+00:00")
+        self.assertEqual(by["claude"]["note"], "limited: provider limit reached")
+        self.assertEqual(by["claude"]["observed_at"], "2027-01-15T08:00:00+00:00")
+        self.assertEqual(by["agy"]["note"], "no limit seen")
+        self.assertIsNone(by["agy"]["resets_at"])
+        # The hold lifts: the reading keeps the last limit and when it was seen.
+        self._beat("claude", at=now + 4000, available=True, reason="")
+        row = usage.collect(self.home, now=now + 4000, lane_names=["claude"], host="lanes")[0]
+        self.assertEqual(row["note"], "last limit: provider limit reached")
+        self.assertEqual(row["resets_at"], "2027-01-15T09:00:00+00:00")
+        self.assertEqual(row["observed_at"], "2027-01-15T08:00:00+00:00")
+
+    def test_a_hold_whose_retry_time_passed_is_not_a_current_limit(self):
+        now = 1_800_000_000
+        self._beat("agy", available=False, retry_at=now - 60, reason="limit: quota; lane waits until x")
+        row = usage.collect(self.home, now=now, lane_names=["agy"], host="lanes")[0]
+        self.assertEqual(row["note"], "no limit seen")
+
+    def test_muse_says_it_reports_no_limit_and_how_old_its_heartbeat_is(self):
+        station = Path(self.home) / "state" / "station"
+        station.mkdir(parents=True)
+        (station / "remote-status.json").write_text(json.dumps(
+            {"muse": {"checked_at": 1_800_000_000, "heartbeat": 1_799_999_400, "claims": 0}}))
+        row = usage.collect(self.home, now=1_800_000_000, lane_names=["muse"], host="lanes")[0]
+        self.assertEqual((row["provider"], row["window"]), ("muse", "limit"))
+        self.assertIn("reports no usage or limit to Loom", row["note"])
+        self.assertEqual(row["observed_at"], "2027-01-15T07:50:00+00:00")
+
+    def test_anthropic_without_a_budget_names_the_settings_and_the_spend(self):
+        directory = Path(self.home) / "state" / "usage"
+        directory.mkdir(parents=True)
+        (directory / "spend.jsonl").write_text(json.dumps({"at": 900, "slot": "anthropic", "cost_usd": 2.5}) + "\n")
+        row = usage.anthropic_records(self.home, ["anthropic"], {}, 1000)[0]
+        self.assertIsNone(row["used_pct"])
+        self.assertIn("budget is not configured", row["note"])
+        self.assertIn("LOOM_ANTHROPIC_BUDGET_USD", row["note"])
+        self.assertIn("LOOM_ANTHROPIC_BUDGET_SINCE", row["note"])
+        self.assertIn("spent USD 2.50 recorded", row["note"])
+
+    def test_anthropic_credit_reads_used_up_when_every_slot_reports_out_of_credit(self):
+        now = 1_800_000_000
+        for lane in ("anthropic", "anthropic-2"):
+            self._beat(lane, available=False, retry_at=now + 3600,
+                       reason="limit: out of credit; unavailable until 2027-01-15T09:00:00Z")
+        row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"], {}, now)[0]
+        self.assertEqual((row["used_pct"], row["remaining"]), (100.0, 0.0))
+        self.assertEqual(row["source"], "lane heartbeats")
+        self.assertIn("every anthropic slot reports out of credit", row["note"])
+        # One slot still working: the credit is not known to be gone.
+        self._beat("anthropic-2", available=True, reason="")
+        row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"], {}, now)[0]
+        self.assertIsNone(row["used_pct"])
+
+    def test_codex_on_a_machine_without_session_logs_says_so(self):
+        rows = usage.codex_records(["codex"], Path(self.home) / "no-sessions", 1000)
+        self.assertIsNone(rows[0]["used_pct"])
+        self.assertEqual(rows[0]["note"], "no codex session logs on this machine")
+
+    def test_every_record_names_the_machine_that_collected_it(self):
+        rows = usage.collect(self.home, now=1000, lane_names=["zen", "claude"], host="lane-box")
+        self.assertEqual({row["host"] for row in rows}, {"lane-box"})
+
+    def test_the_table_marks_an_old_or_reset_figure_stale(self):
+        now = 1_800_000_000
+        old = {"provider": "codex", "lanes": ["codex"], "window": "weekly", "used_pct": 40.0,
+               "remaining": None, "resets_at": "2027-01-20T00:00:00+00:00",
+               "observed_at": "2027-01-14T00:00:00+00:00", "as_of": "2027-01-15T08:00:00+00:00",
+               "host": "lane-box", "note": None}
+        reset = dict(old, observed_at="2027-01-15T07:30:00+00:00", resets_at="2027-01-15T07:50:00+00:00")
+        fresh = dict(old, observed_at="2027-01-15T07:30:00+00:00")
+        lines = usage.table([old, reset, fresh], now)
+        self.assertIn("40.0% (stale: read 32h ago)", lines[1])
+        self.assertIn("40.0% (stale: its window reset after this reading)", lines[2])
+        self.assertIn("\t40.0%\t", lines[3])
+        self.assertIn("lane-box", lines[3])
+
+    def test_the_command_off_the_lane_machine_prints_no_figures_as_current(self):
+        # A remote brain ran bus.usage on its own machine, read a folder
+        # nothing refreshed there, and took it as the usage (loom#813).
+        now = 1_800_000_000
+        self._beat("codex", at=now - 86400, available=True, reason="")
+        limits = Path(self.home) / "state" / "usage" / "limits.json"
+        limits.write_text("[]\n")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = usage.main([], env={"LOOM_HOME": self.home}, now=now)
+        self.assertEqual(code, 1)
+        self.assertIn("this is not the lane machine", out.getvalue())
+        self.assertIn("python3 -m bus.usage --live", out.getvalue())
+        self.assertNotIn("provider\tlanes", out.getvalue())
+        self.assertEqual(limits.read_text(), "[]\n")
+
+    def test_the_command_on_the_lane_machine_writes_and_prints_the_readings(self):
+        now = 1_800_000_000
+        self._beat("claude", at=now - 30, available=True, reason="")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = usage.main([], env={"LOOM_HOME": self.home}, now=now)
+        self.assertEqual(code, 0)
+        self.assertIn("provider\tlanes", out.getvalue())
+        self.assertTrue((Path(self.home) / "state" / "usage" / "limits.json").exists())
+
+    def test_live_reads_the_dashboard_snapshot_with_the_read_token(self):
+        now = 1_800_000_000
+        seen = []
+        packet = {"received_at": "2027-01-15T07:55:00+00:00", "readings": [
+            {"provider": "codex", "lanes": ["codex"], "window": "weekly", "used_pct": 40.0,
+             "remaining": None, "resets_at": "2027-01-20T00:00:00+00:00",
+             "observed_at": "2027-01-15T07:50:00+00:00", "as_of": "2027-01-15T07:55:00+00:00",
+             "host": "lane-box", "note": None}]}
+        env = {"LOOM_TRANSCRIPT_URL": "https://dashboard.example.com/api/transcripts",
+               "LOOM_HANDOFF_TOKEN": "YOUR_HANDOFF_TOKEN_HERE"}
+        out = io.StringIO()
+        with mock.patch.object(usage, "fetch_live", lambda url, token: seen.append((url, token)) or packet), \
+                redirect_stdout(out):
+            code = usage.main(["--live"], env=env, now=now)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [("https://dashboard.example.com/api/usage", "YOUR_HANDOFF_TOKEN_HERE")])
+        self.assertIn("uploaded at 2027-01-15T07:55:00+00:00 (5m ago)", out.getvalue())
+        self.assertIn("\t40.0%\t", out.getvalue())
+
+    def test_live_without_the_dashboard_settings_names_them(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = usage.main(["--live"], env={}, now=1000)
+        self.assertEqual(code, 1)
+        self.assertIn("LOOM_TRANSCRIPT_URL", err.getvalue())
+
+    def test_live_with_an_empty_dashboard_says_no_snapshot_yet(self):
+        env = {"LOOM_TRANSCRIPT_URL": "https://dashboard.example.com/api/transcripts",
+               "LOOM_HANDOFF_TOKEN": "YOUR_HANDOFF_TOKEN_HERE"}
+        out = io.StringIO()
+        with mock.patch.object(usage, "fetch_live", lambda url, token: {"readings": [], "received_at": None}), \
+                redirect_stdout(out):
+            code = usage.main(["--live"], env=env, now=1000)
+        self.assertEqual(code, 1)
+        self.assertIn("holds no usage snapshot yet", out.getvalue())
 
 
 if __name__ == "__main__":
