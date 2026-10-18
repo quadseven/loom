@@ -303,7 +303,70 @@ def _remote_records(home: str, slots: List[str], _env: Dict[str, str], now: floa
 
 def _not_exposed(provider: str, lanes: List[str], now: float) -> List[Dict[str, Any]]:
     return [_record(provider, lanes, "all", None, None, None, None,
-                    "not exposed", now, "not exposed yet")]
+                    "not exposed", now, NO_METER.get(provider, "not exposed yet"))]
+
+
+# Providers checked for a read-only usage, credit or rate-limit meter that the
+# lane's own credentials can read, and found to have none (loom#812). The
+# Usage view shows the reason instead of a bare unknown.
+NO_METER = {
+    "zai": ("no meter: provider exposes no usage. Z.ai documents no usage or quota endpoint "
+            "for API keys; its quota monitor covers the GLM Coding Plan only"),
+    "zen": ("no meter: provider exposes no usage. OpenCode Zen's free models run without "
+            "a key and have no usage endpoint"),
+}
+
+
+def _newest_meter(home: str, slots: List[str]) -> Optional[Dict[str, Any]]:
+    """The newest state/usage/<slot>.meter.json among SLOTS, or None."""
+    usage_dir = Path(home) / "state" / "usage"
+    found = []
+    for slot in slots:
+        try:
+            row = json.loads((usage_dir / (slot + ".meter.json")).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(row, dict) and isinstance(row.get("at"), (int, float)):
+            found.append(row)
+    return max(found, key=lambda item: item["at"]) if found else None
+
+
+def _meter_note(window: Dict[str, Any]) -> Optional[str]:
+    used, limit = window.get("used"), window.get("limit")
+    if not isinstance(used, (int, float)) or not isinstance(limit, (int, float)):
+        return None
+    return ("%s of %s %s used" % (_amount(used), _amount(limit), window.get("unit") or "")).strip()
+
+
+def _meter_records(provider: str, home: str, slots: List[str], now: float) -> List[Dict[str, Any]]:
+    """The meter the lane read with its own key (bus/meter.py writes
+    state/usage/<slot>.meter.json): the newest file among the slots, one
+    reading per window, or one reading that says why there is none."""
+    row = _newest_meter(home, slots)
+    if row is None:
+        return [_record(provider, slots, "all", None, None, None, None, "lane meter", now,
+                        "no meter reading yet: the lane reads it with its key on its next pass")]
+    source = str(row.get("source") or "lane meter")
+    observed = datetime.fromtimestamp(row["at"], timezone.utc).isoformat()
+    records = []
+    for window in row.get("windows") or []:
+        if not isinstance(window, dict) or not window.get("window"):
+            continue
+        record = _record(provider, slots, str(window["window"]), window.get("used_pct"),
+                         window.get("remaining"), window.get("unit"), window.get("resets_at"),
+                         source, now, _meter_note(window))
+        record["window_minutes"] = window.get("window_minutes")
+        record["observed_at"] = observed
+        records.append(record)
+    if records:
+        return records
+    error = row.get("error") if isinstance(row.get("error"), str) else None
+    return [_record(provider, slots, "all", None, None, None, None, source, now,
+                    "meter read failed: %s" % (error or "the answer had no meter"))]
+
+
+def _amount(value: float) -> str:
+    return ("%d" % value) if float(value).is_integer() else ("%.2f" % value)
 
 
 def _provider_groups(lane_names: List[str]) -> Dict[str, List[str]]:
@@ -361,6 +424,8 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
         "spark": _spark_records,
         "claude": limit_records("claude"),
         "agy": limit_records("agy"),
+        "openrouter": lambda _home, slots, _settings, stamp: _meter_records("openrouter", _home, slots, stamp),
+        "workersai": lambda _home, slots, _settings, stamp: _meter_records("workersai", _home, slots, stamp),
     }
     registry.update({lane: _remote_records for lane in labels.REMOTE_LANES})
     registry.update(adapters or {})
