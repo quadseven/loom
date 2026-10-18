@@ -1,8 +1,10 @@
 """The Tickets page (loom#608): a dense table grouped by goal home, in-flight
 tickets by default, and the model each ticket's last run used."""
+import os
 import re
 import time
 import unittest
+from unittest import mock
 from urllib.parse import urlsplit
 
 from bus import factory
@@ -125,12 +127,14 @@ class TicketsTableTest(unittest.TestCase):
                    "started_at": "2026-10-16T05:00:30Z", "finished_at": "2026-10-16T06:00:00Z"},
                   {"ticket": "example-owner/app#35", "model": "model-before",
                    "started_at": "2026-10-15T05:00:00Z", "finished_at": "2026-10-15T06:00:00Z"}])
-        body = _tickets(state, urlsplit("/tickets"))
+        with mock.patch.dict(os.environ, {"LOOM_CLAUDE_MODEL": "claude-opus-5-5"}):
+            body = _tickets(state, urlsplit("/tickets"))
         self.assertEqual(_cell(body, 31, "tickets-model"), "opencode-go / model-footer")
         self.assertEqual(_cell(body, 31, "tickets-pr"), "#91")
         self.assertEqual(_cell(body, 32, "tickets-model"), "no lane / not run yet")
-        # The claim is newer than the pull request: the claude lane's own rung model ran.
-        self.assertEqual(_cell(body, 33, "tickets-model"), "claude / claude-sonnet-5-5")
+        # The claim is newer than the pull request: the claude lane's
+        # configured model (LOOM_CLAUDE_MODEL) ran.
+        self.assertEqual(_cell(body, 33, "tickets-model"), "claude / claude-opus-5-5")
         self.assertEqual(_cell(body, 34, "tickets-model"), "spark / model-transcript")
         # The newest run is a claim no record names a model for: it says so,
         # never the older run's model.

@@ -838,6 +838,16 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("\nSize: M\n", body)
         self.assertEqual(hunt_plan.problems(body), [])
 
+    def test_pr_body_reads_an_inline_size_line(self):
+        # #668: a ticket that states "Size: S" on its own line, not as a
+        # ## Size section, still opens a body the review bot accepts.
+        self.drop_brief(text=re.sub(r"## Size\n+S: one function\.\n", "Size: s\n", BRIEF))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("\nSize: S\n", body)
+        self.assertEqual(hunt_plan.problems(body), [])
+
     def test_pr_body_has_no_refs_without_an_issue_line(self):
         self.drop_brief()
         self.run_lane()

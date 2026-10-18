@@ -2,7 +2,7 @@
 
 Each invariant is one small function from Facts (what the station already
 reads: brain journals and the marker comments on goal homes, lane run
-outcomes, lane limits, queued tickets, sub-issue counts, the review bot's plan
+outcomes, lane limits, queued tickets, each goal's epics, the review bot's plan
 check on lane pull requests, remote heartbeats) to a list of Breach. A Facts
 field the station could not read this pass is None, and the invariants that
 need it find nothing.
@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
+from . import brain
 from . import text as _text
 from . import watch
 from .github import GitHubError
@@ -47,9 +48,8 @@ HELD_MAX = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
-# A goal home holding this many GitHub sub-issues is read for tickets that
-# name it without a Part of line (GitHub refuses a 101st sub-issue).
-SUB_ISSUES_MAX = 90
+# Decision 0003: an epic holds at most EPIC_TICKETS tickets.
+EPIC_TICKETS = 15
 PLAN_FAILED_AGE = 30 * 60
 # The station checks at most this often: goal homes and check runs are read
 # no more often than its other goal-home reads.
@@ -116,6 +116,28 @@ class Check(NamedTuple):
     title: str
 
 
+class EpicShape(NamedTuple):
+    """One epic of a goal: open or closed, how many tickets it holds, and
+    which of them are still open."""
+    epic: Ref
+    open: bool
+    tickets: int
+    open_tickets: Tuple[Ref, ...]
+    # The goal's standing "Factory repairs" epic: no ticket cap, and not
+    # counted against the goal's open epic cap.
+    standing: bool = False
+
+
+class GoalShape(NamedTuple):
+    """A goal home under the epic model (decision 0003): its epics, its open
+    epic cap (6, or the goal home's recorded exception), and its open
+    tickets that sit under no epic."""
+    goal: Ref
+    cap: int
+    epics: Tuple[EpicShape, ...]
+    outside: Tuple[Ref, ...]
+
+
 class GateHold(NamedTuple):
     """A goal the unproven-work gate refuses briefed tickets for: the goal,
     when the gate first refused it, the unproven count and the limit it hit,
@@ -140,8 +162,8 @@ class Facts:
     held: Optional[Dict[str, float]] = None
     # (ticket, the lanes of its difficulty tier) for each queued ticket.
     queued: Optional[List[Tuple[Ref, Tuple[str, ...]]]] = None
-    # (goal home, how many tickets name it without a sub-issue link or a Part of line).
-    goals: Optional[List[Tuple[Ref, int]]] = None
+    # Each goal home with its epics and the open tickets under none.
+    shapes: Optional[List[GoalShape]] = None
     checks: Optional[List[Check]] = None
     # goal key -> the unproven-work gate's hold on it, per loom#564.
     gate_held: Optional[Dict[str, GateHold]] = None
@@ -325,18 +347,73 @@ def lane_held(f: Facts) -> List[Breach]:
     return out
 
 
-def goal_full(f: Facts) -> List[Breach]:
-    """A goal home with tickets that mention it but are not linked to it: the
-    Part of line is the link, so a goal at GitHub's sub-issue cap is healthy."""
-    if f.goals is None:
+def _refs(found: Sequence[Ref]) -> str:
+    shown = ", ".join(r.label for r in list(found)[:SHOWN])
+    return shown + (" and %d more" % (len(found) - SHOWN) if len(found) > SHOWN else "")
+
+
+def ticket_outside_epic(f: Facts) -> List[Breach]:
+    """A goal with open loom:ticket issues that sit under no epic: every
+    ticket belongs to an epic (decision 0003). One breach per goal."""
+    if f.shapes is None:
         return []
-    return [Breach("goal-full", goal.key,
-                   "Goal home %s has %d tickets not linked to it" % (goal.label, count),
-                   ("%d loom:ticket issues say Part of the goal but are neither its sub-issues "
-                    "nor carry a Part of line of their own, so the goal does not count them"
-                    % count,),
+    return [Breach("ticket-outside-epic", shape.goal.key,
+                   "Goal home %s has %d open tickets under no epic"
+                   % (shape.goal.label, len(shape.outside)),
+                   ("Open tickets that are the goal's own children, not an epic's: %s"
+                    % _refs(shape.outside),
+                    "Move each under an open epic of the goal (its sub-issue, with a "
+                    "Part of line naming the epic)"),
                    f.now)
-            for goal, count in f.goals if count > 0]
+            for shape in f.shapes if shape.outside]
+
+
+def epic_over_cap(f: Facts) -> List[Breach]:
+    """An epic holding more than EPIC_TICKETS tickets."""
+    if f.shapes is None:
+        return []
+    return [Breach("epic-over-cap", epic.epic.key,
+                   "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
+                                                          EPIC_TICKETS),
+                   ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
+                    "and more work goes into a next epic" % (
+                        epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
+                   f.now)
+            for shape in f.shapes for epic in shape.epics
+            if epic.tickets > EPIC_TICKETS and not epic.standing]
+
+
+def goal_epics_over_cap(f: Facts) -> List[Breach]:
+    """A goal with more open epics than its cap (6, or its recorded
+    exception)."""
+    if f.shapes is None:
+        return []
+    out = []
+    for shape in f.shapes:
+        opened = [e.epic for e in shape.epics if e.open and not e.standing]
+        if len(opened) > shape.cap:
+            out.append(Breach("goal-epics-over-cap", shape.goal.key,
+                              "Goal home %s has %d open epics (cap %d)"
+                              % (shape.goal.label, len(opened), shape.cap),
+                              ("Open epics: %s" % _refs(opened),
+                               "Finish an epic before opening another, or record a one-time "
+                               "exception on the goal home"),
+                              f.now))
+    return out
+
+
+def closed_epic_open_tickets(f: Facts) -> List[Breach]:
+    """A closed epic that still holds open tickets."""
+    if f.shapes is None:
+        return []
+    return [Breach("closed-epic-open-tickets", epic.epic.key,
+                   "Closed epic %s holds %d open tickets" % (epic.epic.label,
+                                                            len(epic.open_tickets)),
+                   ("Open tickets under it: %s" % _refs(epic.open_tickets),
+                    "Reopen the epic, or move the tickets under an open one"),
+                   f.now)
+            for shape in f.shapes for epic in shape.epics
+            if not epic.open and epic.open_tickets]
 
 
 def plan_check_failed(f: Facts) -> List[Breach]:
@@ -399,7 +476,8 @@ def gate_hold(f: Facts) -> List[Breach]:
 
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
-    goal_full, plan_check_failed, remote_silent, gate_hold)
+    ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
+    plan_check_failed, remote_silent, gate_hold)
 
 
 def check(facts: Facts, say: Say,
@@ -472,6 +550,18 @@ class Filer:
     def _evidence(self, b: Breach) -> List[str]:
         return ["- " + _checked(line) for line in b.evidence]
 
+    def _home(self) -> int:
+        """Where breaches are filed: the goal's standing repairs epic, or the
+        goal home itself when the epic cannot be read or opened."""
+        if getattr(self, "_repairs", None) is None:
+            try:
+                self._repairs = brain.repairs_epic(self.gh, self.repo, self.goal)
+            except (GitHubError, ValueError, KeyError) as err:
+                self.say("invariants: filing under goal #%d, no repairs epic: %s"
+                         % (self.goal, err))
+                self._repairs = self.goal
+        return self._repairs
+
     def _body(self, b: Breach) -> str:
         return "\n".join(
             [MARKER % b.key,
@@ -480,7 +570,7 @@ class Filer:
             ["", "Invariant: `%s` (bus/invariants.py), checked every station pass. Filed "
                  "without a model: this says what broke, not why. Rewrite it as a ticket "
                  "that fixes the cause." % b.invariant,
-             "", "Part of #%d" % self.goal])
+             "", "Part of #%d" % self._home()])
 
     def _file(self, b: Breach) -> None:
         title = b.title
@@ -492,13 +582,13 @@ class Filer:
         number = int(made["number"])
         self.state[b.key] = number
         try:
-            self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, self.goal),
+            self.gh.rest("POST", "/repos/%s/issues/%d/sub_issues" % (self.repo, self._home()),
                          {"sub_issue_id": made["id"]})
         except (GitHubError, KeyError) as err:
-            # A goal at GitHub's sub-issue limit refuses it; the Part of line
-            # still names the goal.
+            # A refused link (a goal at GitHub's sub-issue limit): the Part
+            # of line still names where it belongs.
             self.say("invariants: %s#%d is linked to #%d by its Part of line only: %s"
-                     % (self.repo, number, self.goal, err))
+                     % (self.repo, number, self._home(), err))
         self.say("invariants: filed %s#%d: %s" % (self.repo, number, title))
 
     def _reopen(self, b: Breach, number: int) -> None:

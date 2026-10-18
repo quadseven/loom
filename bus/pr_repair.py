@@ -75,14 +75,10 @@ def _brief_section(brief: str, name: str) -> str:
 
 
 def _brief_size(brief: str) -> str:
-    """The Size section's first line as the review bot's letter (Medium ->
-    M); a size it cannot read stays as its first word, colon dropped."""
-    section = _brief_section(brief, "Size")
-    first = section.split("\n", 1)[0].strip()
-    try:
-        return hunt_plan.size_letter(first)
-    except ValueError:
-        return first.split()[0].rstrip(":") if first else ""
+    """The brief's size as the review bot's letter (Medium -> M), read the
+    way the runner reads it (hunt_plan.brief_size: a ## Size section or an
+    inline Size: line)."""
+    return hunt_plan.brief_size(brief)
 
 
 def _brief_title(brief: str) -> Optional[str]:

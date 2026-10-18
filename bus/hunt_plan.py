@@ -14,6 +14,7 @@ linked-issue checks read other issues, not this body. When the gate changes,
 change the patterns here in the same way.
 
     python3 -m bus.hunt_plan size WORD    print the letter for a size, or fail
+    python3 -m bus.hunt_plan brief-size FILE  print a brief's size as the runner writes it
     python3 -m bus.hunt_plan check FILE   list what a body lacks ("-" = stdin)
 """
 from __future__ import annotations
@@ -38,6 +39,13 @@ _SIZE_WORDS = {
 }
 _TOO_BIG = {"xl", "extra large", "extra-large", "huge"}
 
+# A ticket states its size as a "## Size" section or as one line of its own,
+# "Size: S" (any case, optionally bold: "**Size:** S", "**Size: S**").
+_SIZE_HEADING = re.compile(r"^##[ \t]+size[ \t#]*$", re.IGNORECASE)
+_SIZE_LINE = re.compile(r"^[ \t]*(?:\*\*|__)?size(?:\*\*|__)?[ \t]*:[ \t]*(?:\*\*|__)?"
+                        r"[ \t]*(XS|S|M|L)[ \t]*(?:\*\*|__)?[ \t]*$", re.IGNORECASE)
+SIZE_FORMS = "a ## Size section or a Size: XS|S|M|L line"
+
 
 def size_letter(text: str) -> str:
     """The gate's letter for a size written as a letter or a word ("Medium",
@@ -55,6 +63,40 @@ def size_letter(text: str) -> str:
             return _SIZE_WORDS[candidate]
     raise ValueError("Size must be XS, S, M or L (or Small, Medium, Large), not %r"
                      % (str(text or "").strip()[:40]))
+
+
+def stated_size(body: str) -> Optional[str]:
+    """The size a ticket body states, as written: the first non-empty line of
+    its ## Size section ("" when that section is empty), else the letter of
+    its first inline Size: line. None when the body states no size in either
+    form. Triage, brief validation, the rewrite check, the runner and PR
+    repair all read the size through this one function."""
+    lines = str(body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for i, line in enumerate(lines):
+        if not _SIZE_HEADING.match(line.strip()):
+            continue
+        for following in lines[i + 1:]:
+            if following.startswith("#"):
+                break
+            if following.strip():
+                return following.strip()
+        return ""
+    for line in lines:
+        m = _SIZE_LINE.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def brief_size(brief: str) -> str:
+    """A brief's size as the runner writes it in the pull request body: the
+    gate's letter (Medium -> M); a size it cannot read stays as its first
+    word, colon dropped; "" when the brief states none."""
+    stated = stated_size(brief) or ""
+    try:
+        return size_letter(stated)
+    except ValueError:
+        return stated.split()[0].rstrip(":") if stated else ""
 
 
 def _heading_matches(heading: str, name: str) -> bool:
@@ -111,7 +153,7 @@ def with_size_letter(brief: str) -> str:
     that)."""
     lines = brief.split("\n")
     for i, line in enumerate(lines):
-        if line.strip().lower() != "## size":
+        if not _SIZE_HEADING.match(line.strip()):
             continue
         for j in range(i + 1, len(lines)):
             if lines[j].startswith("#"):
@@ -128,7 +170,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("size").add_argument("word", nargs="+")
     sub.add_parser("check").add_argument("file")
+    sub.add_parser("brief-size").add_argument("file")
     args = parser.parse_args(argv)
+    if args.cmd == "brief-size":
+        with open(args.file, encoding="utf-8") as fh:
+            print(brief_size(fh.read()))
+        return 0
     if args.cmd == "size":
         try:
             print(size_letter(" ".join(args.word)))

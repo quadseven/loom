@@ -280,7 +280,7 @@ def _update(gh: GitHub, goal: str, deploy: str, source: dict[str, Any],
             wrote = True
     wrote = _set_gitlinks(gh, deploy, branch, gitlinks, revision) or wrote
     title = "Pin roll source to %s" % revision[:12]
-    plan = ("## Why\nA merged module change needs a worldserver build.\n\n"
+    plan = ("## Why\nA merged module change needs a server build.\n\n"
             "## Summary\nUpdate only the source pins declared by the goal ship document.\n\n"
             "## Acceptance criteria\n- [ ] Source pins name `%s`.\n"
             "- [ ] Only locations named by the ship document changed.\n"

@@ -37,8 +37,9 @@ def repos_from_env() -> List[str]:
 
 def app_from_env(env: Optional[Dict[str, str]] = None) -> Optional[AppToken]:
     """The GitHub App installation token when the App settings are present
-    and this host can mint one (the openssl and aws CLIs sign the JWT and
-    read the key); else None, and the dashboard keeps its own token."""
+    and this host can mint one (openssl signs the JWT; the key is a readable
+    LOOM_GITHUB_APP_KEY_FILE, or the aws CLI reads it from the parameter
+    store); else None, and the dashboard keeps its own token."""
     try:
         app = AppToken.from_env(env)
     except GitHubError as exc:
@@ -46,7 +47,17 @@ def app_from_env(env: Optional[Dict[str, str]] = None) -> Optional[AppToken]:
         return None
     if app is None:
         return None
-    missing = [tool for tool in ("openssl", "aws") if shutil.which(tool) is None]
+    if app.key_source == "file":
+        try:
+            with open(app.key_file, "rb"):
+                pass
+        except OSError as exc:
+            # The file's name only: never its contents.
+            LOG.warning("GitHub App settings ignored: key file %s is unreadable (%s)",
+                        app.key_file, type(exc).__name__)
+            return None
+    tools = ("openssl",) if app.key_source == "file" else ("openssl", "aws")
+    missing = [tool for tool in tools if shutil.which(tool) is None]
     if missing:
         LOG.warning("GitHub App settings ignored: %s not installed", " and ".join(missing))
         return None
@@ -74,13 +85,20 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     goal = None
     if goal_match:
         goal = (goal_match.group(1) or repo) + "#" + goal_match.group(2)
+    else:
+        # No Part of line: the sub-issue parent names the epic (or goal).
+        goal = goals.issue_parent(issue)
     return {
         "repo": repo, "number": issue.get("number"), "title": issue.get("title"),
         "refs": re.findall(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)", body),
         "html_url": issue.get("html_url"),
         "state": next((name[5:] for name in names if name in labels.LABELS and name.startswith("loom:")
                         and name not in ("loom:ticket", "loom:goal", "loom:runaway")), None),
+        # The issue the ticket names: an epic or, before tickets moved under
+        # epics, a goal. TicketStore._assign_epics moves an epic here to
+        # "epic" and puts the epic's goal in "goal" (decision 0003).
         "goal": goal,
+        "epic": None,
         # Tickets are read with state=all; a closed one is history, never work.
         "open": issue.get("state", "open") != "closed",
         "closed_at": issue.get("closed_at"),
@@ -97,6 +115,50 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         "labels": names,
         "html_url": issue.get("html_url"),
     }
+
+
+# What the views read from a pull request in the list (dashboard/results.py,
+# views.py, ticket_data.py and server.py) and from an issue or review comment
+# (hot_spots.py, goals.py, results.py, tickets_table.py). The list answers
+# embed the base and head repositories and the user in full: about 17 KB of
+# JSON per pull request. Kept whole, the 6,700 pull requests of 17 repos held
+# about 190 MiB and two weeks of comments about 150 MiB more, twice over while
+# a refresh built the next snapshot beside the one being served, and the
+# dashboard was killed at its 1 GiB memory limit every few refreshes
+# (2026-10-17).
+PULL_REQUEST_FIELDS = ("number", "title", "html_url", "state", "draft", "body",
+                       "created_at", "updated_at", "merged_at", "closed_at", "repo")
+COMMENT_FIELDS = ("id", "body", "created_at", "updated_at", "html_url",
+                  "issue_url", "pull_request_url", "path")
+
+
+def _user(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    return {"login": value.get("login"), "type": value.get("type")}
+
+
+def pull_request_record(pr: Dict[str, Any]) -> Dict[str, Any]:
+    """The fields of a pull request list item that the views read."""
+    out = {key: pr[key] for key in PULL_REQUEST_FIELDS if key in pr}
+    if isinstance(pr.get("user"), dict):
+        out["user"] = _user(pr["user"])
+    head, base = pr.get("head"), pr.get("base")
+    if isinstance(head, dict):
+        out["head"] = {"ref": head.get("ref"), "sha": head.get("sha")}
+    if isinstance(base, dict):
+        base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+        out["base"] = {"ref": base.get("ref"), "repo": {"full_name": base_repo.get("full_name")}}
+    return out
+
+
+def comment_record(comment: Dict[str, Any], repo: str) -> Dict[str, Any]:
+    """The fields of an issue or review comment that the views read."""
+    out = {key: comment[key] for key in COMMENT_FIELDS if key in comment}
+    if isinstance(comment.get("user"), dict):
+        out["user"] = _user(comment["user"])
+    out["repo"] = repo
+    return out
 
 
 class TicketStore:
@@ -293,6 +355,7 @@ class TicketStore:
         rows = [row for found in data.get("tickets", {}).values() if found for row in found]
         configured = set(self.repos) | {repo for repo, _ in homes}
         titles, parents = self._goal_info(rows, configured)
+        epics = self._assign_epics(rows)
         # Reports on the goal homes read in full above count too: a goal home
         # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
         # comment feed failed this pass.
@@ -304,7 +367,7 @@ class TicketStore:
         data["goal_context"] = goals.goal_context(
             rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
             os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
-            parents=parents, unread=unread)
+            parents=parents, unread=unread, epics=epics)
         data["goal_context_error"] = ""
 
     def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
@@ -337,6 +400,8 @@ class TicketStore:
                 cache[goal] = entry
             if entry.get("parent") and entry["parent"] not in seen:
                 pending.append(entry["parent"])
+            if entry.get("is_epic") and entry.get("epic_goal") and entry["epic_goal"] not in seen:
+                pending.append(entry["epic_goal"])
 
         def accepted(parent):
             if not parent or parent.partition("#")[0] not in configured:
@@ -344,8 +409,27 @@ class TicketStore:
             return parent if parent in named or (cache.get(parent) or {}).get("is_goal") else None
 
         titles = {goal: entry.get("title") for goal, entry in cache.items()}
-        parents = {goal: accepted(entry.get("parent")) for goal, entry in cache.items()}
+        # An epic is not a smaller goal: it never rolls up as one.
+        parents = {goal: None if entry.get("is_epic") else accepted(entry.get("parent"))
+                   for goal, entry in cache.items()}
         return titles, parents
+
+    def _assign_epics(self, rows) -> Dict[str, Dict[str, Any]]:
+        """Move each ticket whose named issue is an epic (labelled epic) to
+        `epic`, with the epic's goal in `goal`, from the goal-home reads
+        _goal_info just made (no request of its own). Returns each epic the
+        tickets name: its title, whether it is open, and its goal."""
+        cache = self.__dict__.get("_goal_info_cache") or {}
+        epics: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            named = row.get("epic") or row.get("goal")
+            entry = cache.get(named) if named else None
+            if not entry or not entry.get("is_epic"):
+                continue
+            row["epic"], row["goal"] = named, entry.get("epic_goal")
+            epics[named] = {"title": entry.get("title"), "open": entry.get("open", True),
+                            "goal": entry.get("epic_goal")}
+        return epics
 
     def _read_goal_home(self, goal, entry, now, configured):
         repo, _, number = goal.partition("#")
@@ -356,9 +440,13 @@ class TicketStore:
             return dict(entry or {}, read_at=0)
         if not isinstance(issue, dict):
             return {"title": None, "parent": None, "is_goal": False, "read_at": 0}
+        names = [name.lower() for name in _label_names(issue)]
+        is_epic = "epic" in names and "loom:goal" not in names
         return {"title": str(issue.get("title") or "") or None,
                 "parent": goals.parent_of(repo, issue, configured),
-                "is_goal": "loom:goal" in _label_names(issue), "read_at": now}
+                "is_goal": "loom:goal" in names, "is_epic": is_epic,
+                "epic_goal": goals.epic_goal_of(repo, issue, configured) if is_epic else None,
+                "open": issue.get("state", "open") != "closed", "read_at": now}
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
@@ -397,9 +485,9 @@ class TicketStore:
         issues, reviews = [], []
         try:
             found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
+            issues = [comment_record(c, repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
             found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
-            reviews = [dict(c, repo=repo) for c in found if isinstance(c, dict)]
+            reviews = [comment_record(c, repo) for c in found if isinstance(c, dict)]
         except (GitHubError, OSError, ValueError) as exc:
             return issues, reviews, "%s comments: %s" % (repo, self._error_reason(exc))
         return issues, reviews, ""
@@ -457,7 +545,7 @@ class TicketStore:
         try:
             items = self.gh.paginate_parallel("/repos/%s/pulls?state=all&per_page=100" % quote(repo, safe="/"),
                                               workers=READ_WORKERS)
-            prs.extend(item for item in items if isinstance(item, dict))
+            prs.extend(pull_request_record(item) for item in items if isinstance(item, dict))
         except (GitHubError, OSError, ValueError) as exc:
             errors.append("%s pull requests: %s" % (repo, self._error_reason(exc)))
 

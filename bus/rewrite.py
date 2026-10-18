@@ -205,9 +205,8 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     one assigned to another operator (docs/LANES.md, Two Looms)."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
-    authors = brain.trusted_authors()
     return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-            and not (authors and tickets.owned_elsewhere(i, authors))]
+            and not brain.owned_elsewhere(i)]
 
 
 def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,
@@ -221,7 +220,7 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
     action, fields = validate(parse_answer(run_agent(cmd, prompt, timeout)))
     if action == "brief":
         # No lane: the ticket is queued and the station's tier pick gives it one.
-        brain.brief(gh, repo, goal, fields["title"], fields["body"],
+        brain.brief_intake(gh, repo, goal, fields["title"], fields["body"],
                     difficulty=fields["difficulty"], refs=number)
     elif action == "human":
         brain.human(gh, repo, number, fields["ask"])

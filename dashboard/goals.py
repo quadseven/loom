@@ -74,6 +74,31 @@ def parent_of(repo: str, issue: Dict[str, Any],
     return parent
 
 
+_PART_OF_LINE = re.compile(r"^[ \t]*Part of[ \t]+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#?(\d+)",
+                           re.I | re.M)
+# Decision 0003: a goal holds at most 6 open epics, an epic at most 15 tickets.
+EPIC_CAP = 6
+EPIC_TICKET_CAP = 15
+
+
+def issue_parent(issue: Dict[str, Any]) -> Optional[str]:
+    """owner/name#N of an issue's GitHub sub-issue parent, or None."""
+    match = _ISSUE_URL.search(str(issue.get("parent_issue_url") or ""))
+    return "%s#%s" % match.groups() if match else None
+
+
+def epic_goal_of(repo: str, issue: Dict[str, Any],
+                 repos: Optional[Iterable[str]] = None) -> Optional[str]:
+    """The goal an epic belongs to: its `Part of` line (a bare `#N` is in
+    the same repo), else its sub-issue parent. With `repos`, None for a goal
+    in any repo not listed there."""
+    match = _PART_OF_LINE.search(str(issue.get("body") or ""))
+    goal = "%s#%s" % (match.group(1) or repo, match.group(2)) if match else issue_parent(issue)
+    if goal and repos is not None and goal.partition("#")[0] not in set(repos):
+        return None
+    return goal
+
+
 def rollup(goals: Iterable[str], parents: Dict[str, Optional[str]]) -> Dict[str, List[str]]:
     """Each top-level goal and the goals under it, at any depth, in the order
     first seen. Goals whose parents loop (a names b, b names a) share one
@@ -258,14 +283,17 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
                  titles: Dict[str, Optional[str]], metric_comments: Sequence[Dict[str, Any]],
                  metrics_goal: Optional[str], now: datetime,
                  parents: Optional[Dict[str, Optional[str]]] = None,
-                 unread: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
+                 unread: Optional[Dict[str, str]] = None,
+                 epics: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
     """One record per goal the tickets name (their `Part of` line), and one
     per parent goal those goals roll up into.
 
     `parents` maps a goal to the goal it rolls up into (parent_of). `unread`
     maps a repo to why its issue comments were not read this pass: a goal in
     that repo gets that reason instead of "no report", and a goal with
-    tickets there gets it instead of a proof count."""
+    tickets there gets it instead of a proof count. `epics` maps each epic
+    the tickets name to its title, open flag and goal; each goal record
+    lists its epics with their ticket counts."""
     parents, unread = dict(parents or {}), dict(unread or {})
     by_goal: Dict[str, List[str]] = {}
     states: Dict[str, str] = {}
@@ -295,8 +323,33 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
                              unread_proofs=unread_for(tickets), in_flight=flying.get(goal, 0),
                              parent=parents.get(goal))
            for goal, tickets in by_goal.items()}
+    for goal, record in out.items():
+        record["epics"] = epic_rows(goal, rows, epics or {})
     factory = _factory(metric_comments, now) if metrics_goal in out else None
     if factory:
         out[metrics_goal].update(factory)
         out[metrics_goal].pop("metric_reason", None)
     return out
+
+
+def epic_rows(goal: str, rows: Sequence[Dict[str, Any]],
+              epics: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The goal's epics the tickets name, open first then by number: each
+    with its title, open flag, ticket count and tickets in flight."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for ref, info in epics.items():
+        if info.get("goal") == goal:
+            out[ref] = {"ref": ref, "title": info.get("title"), "open": info.get("open", True),
+                        "tickets": 0, "in_flight": 0}
+    for row in rows:
+        found = out.get(row.get("epic") or "")
+        if found is None:
+            continue
+        found["tickets"] += 1
+        if row.get("open", True) and row.get("state") in IN_FLIGHT_STATES:
+            found["in_flight"] += 1
+
+    def number(ref: str) -> int:
+        tail = ref.rpartition("#")[2]
+        return int(tail) if tail.isdigit() else 0
+    return sorted(out.values(), key=lambda e: (not e["open"], number(e["ref"])))

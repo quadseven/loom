@@ -193,6 +193,32 @@ EQUIVALENTS: Dict[str, Tuple[Tuple[str, ...], str, str]] = {
     "claude-opus-5-5": (("agy",), "gemini-4-argon-high",
                         "Gemini 4 Argon high, index 53, while every Anthropic lane is out"),
 }
+
+
+def _climb_rungs() -> Tuple[Tuple[Tuple[str, ...], str], ...]:
+    """LADDER, then one rung for each EQUIVALENTS or HARD_MODELS model the
+    ladder lacks, with the lanes that run it. The rungs a stuck ticket climbs
+    (Factory._climb, bus/brain.py escalate)."""
+    have = {model for _, model in LADDER}
+    extra: Dict[str, List[str]] = {}
+    for lanes, model, _ in EQUIVALENTS.values():
+        if model not in have:
+            extra.setdefault(model, []).extend(lanes)
+    for lane, model in HARD_MODELS.items():
+        if model not in have:
+            extra.setdefault(model, []).append(lane)
+    return LADDER + tuple((tuple(dict.fromkeys(lanes)), model) for model, lanes in extra.items())
+
+
+# The ladder's rungs and then Gemini 4 Argon high on agy (rung 4, public repos
+# only, as agy is). On 2026-10-17 a ticket Opus had failed five times was
+# given up on while gpt-6-sol and Gemini 4 Argon were never tried.
+CLIMB = _climb_rungs()
+# The strong models: the ladder's last rung, each lane's hard-tier model and
+# each equivalent. A ticket that ran on the last rung or past it climbs only
+# to another of these, never back down to a weaker model (climb_rungs).
+STRONG = frozenset({LADDER[-1][1]} | set(HARD_MODELS.values())
+                   | {model for _, model, _ in EQUIVALENTS.values()})
 EQUIVALENT_MARKER = "<!-- loom:equivalent %s -->"
 EQUIVALENT_RE = re.compile(r"<!-- loom:equivalent (\S+) -->")
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
@@ -223,6 +249,10 @@ NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
 CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
+# The runner's footer on a lane pull request (lanes/run_lane.sh pr_body,
+# rewritten by bus/pr_repair.py on each fix round): the lane and the model the
+# newest run used.
+RUN_FOOTER_RE = re.compile(r"^Loom ticket \S+, lane ([A-Za-z0-9_.-]+), model (\S+?)\.(?:\s|$)", re.M)
 # The comments that assign the ticket to a lane: a brief. Claims after the
 # newest of these ran on the lane the ticket was last briefed to (loom#565).
 BRIEF_RES = (
@@ -488,7 +518,7 @@ def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
     found = [int(m.group(1)) for m in RUNG_RE.finditer(body)]
     if found:
         rung = found[-1]
-        return True, LADDER[rung - 1][1] if 1 <= rung <= len(LADDER) else None
+        return True, CLIMB[rung - 1][1] if 1 <= rung <= len(CLIMB) else None
     equivalent = EQUIVALENT_RE.search(body)
     if equivalent:
         return True, equivalent.group(1)
@@ -496,17 +526,41 @@ def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
     return (True, line.group(2)) if line else (False, None)
 
 
-def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set:
+def known_models(env: Optional[Dict[str, str]] = None) -> set:
+    """The model names Loom configures: every CLIMB, HARD_MODELS and
+    EQUIVALENTS model, and each lane's LOOM_<LANE>_MODEL or LOOM_<LANE>_MODELS
+    setting (an agy setting also with its effort suffix, as run_lane.sh adds
+    it)."""
+    env = os.environ if env is None else env
+    found = {model for _, model in CLIMB} | set(HARD_MODELS.values())
+    found |= {model for _, model, _ in EQUIVALENTS.values()}
+    for key, value in env.items():
+        if re.fullmatch(r"LOOM_[A-Z0-9_]+_MODELS?", key) and key != "LOOM_BRAIN_MODEL":
+            for model in str(value).split():
+                found |= {model} | {"%s-%s" % (model, e) for e in ("low", "medium", "high")}
+    return found
+
+
+def footer_run(body: Any, env: Optional[Dict[str, str]] = None) -> Optional[Tuple[str, str]]:
+    """(lane, model) from the runner's footer on a lane pull request body,
+    the newest run on it, or None when the body has no footer or names a
+    model Loom does not configure (known_models): a footer is text in a pull
+    request body, so an unknown name never steers the ladder. Callers read it
+    only from a trusted author's pull request in the ticket's own repo."""
+    found = RUN_FOOTER_RE.findall(str(body or ""))
+    if not found or found[-1][1] not in known_models(env):
+        return None
+    return found[-1][0], found[-1][1]
+
+
+def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+               footer: Optional[Tuple[str, str]] = None) -> set:
     """The models the ticket was claimed on since its ladder last started
-    (the newest rung 0 marker). A rung marker or a brain escalation sets the
-    model for the claims after it. A claim before the first such comment ran
-    on the body's Model: line when none rewrote it since; once one did, and
-    on a body with no Model: line, a claim ran on its lane's own rung model
-    (bus/brain.py _lane_model). On 2026-10-16 a ticket's three attempts on
-    gpt-6-sol carried no rung marker, and the factory moved it back to
-    gpt-6-sol for a fourth."""
+    (the newest rung 0 marker), each read from what ran (claim_models). On
+    2026-10-16 a ticket's three attempts on gpt-6-sol carried no rung marker,
+    and the factory moved it back to gpt-6-sol for a fourth."""
     ran: set = set()
-    for comment, model in claim_models(issue, comments):
+    for comment, model in claim_models(issue, comments, footer):
         if comment is None:
             ran = set()  # a rung 0 marker starts the ladder again
         else:
@@ -514,11 +568,22 @@ def ran_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set
     return ran
 
 
-def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> List[Tuple[Optional[Dict[str, Any]], Optional[str]]]:
+def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+                 footer: Optional[Tuple[str, str]] = None) -> List[Tuple[Optional[Dict[str, Any]], Optional[str]]]:
     """Each claim comment, oldest first, as (comment, the model it ran on or
-    None when nothing names one), by the rules in ran_models; a rung 0 marker
-    appears as (None, None), where the ladder starts again. The dashboard
-    reads the newest claim's model as the model the ticket's last run used."""
+    None when nothing names one); a rung 0 marker appears as (None, None),
+    where the ladder starts again. A claim ran on the Model: line in force:
+    a rung marker, an equivalent move or a brain escalation sets it for the
+    claims after it, and the body's line holds before the first of those
+    when none rewrote it since (lanes/run_lane.sh runs a brief's Model: line
+    as it is). A claim with no Model: line in force ran on the model the
+    runner footer of its lane's pull request names (`footer`, (lane, model)),
+    else on its lane's configured model setting (bus/brain.py _lane_model),
+    else on a model nothing names. Never a fixed lane-to-model map: on
+    2026-10-17 five runs on lane claude used claude-opus-5-5 while the ladder
+    recorded claude-sonnet-5-5 and gave up with two strong models untried.
+    The dashboard reads the newest claim's model as the model the ticket's
+    last run used."""
     match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
     body_model = match.group(1) if match else None
     bodies = [str(c.get("body") or "") for c in comments]
@@ -534,16 +599,19 @@ def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> L
             continue
         claim = CLAIMED_RE.fullmatch(body.strip())
         if claim:
-            out.append((comments[i], current or brain._lane_model(claim.group(1))))
+            lane = claim.group(1)
+            ran = footer[1] if footer and footer[0] == lane else brain._lane_model(lane)
+            out.append((comments[i], current or ran))
     return out
 
 
-def ran_rungs(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> set:
+def ran_rungs(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+              footer: Optional[Tuple[str, str]] = None) -> set:
     """The rungs whose model the ticket already ran on (ran_models), with or
     without a rung marker: the ladder never gives a ticket a model that
     already failed it (docs/MUSE.md, Repeatedly stuck work)."""
-    models = ran_models(issue, comments)
-    return {n for n, (_, model) in enumerate(LADDER, 1) if model in models}
+    models = ran_models(issue, comments, footer)
+    return {n for n, (_, model) in enumerate(CLIMB, 1) if model in models}
 
 
 def reached_rung(comments: Sequence[Dict[str, Any]]) -> int:
@@ -615,10 +683,20 @@ def _cell(text: str) -> str:
     return first.replace("|", "\\|") or "-"
 
 
-def runaway_comment(trigger: str, rows: Sequence[Tuple[int, str, str, str]], model: str) -> str:
-    """The comment a flagged ticket carries: why, and its attempt table."""
+def attempt_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> Dict[str, str]:
+    """{a claim's created_at: the model it ran (claim_models)} for each claim
+    whose model something names."""
+    return {str(c.get("created_at")): model for c, model in claim_models(issue, comments)
+            if c is not None and model}
+
+
+def runaway_comment(trigger: str, rows: Sequence[Tuple[int, str, str, str]], model: str,
+                    ran: Optional[Dict[str, str]] = None) -> str:
+    """The comment a flagged ticket carries: why, and its attempt table, each
+    attempt with the model it ran (`ran`, from attempt_models), else `model`."""
+    ran = ran or {}
     lines = ["Runaway: %s." % trigger, "| Time | Lane | Model | Reason |", "|---|---|---|---|"]
-    lines += ["| %s | %s | %s | %s |" % (stamp, lane, model, _cell(reason))
+    lines += ["| %s | %s | %s | %s |" % (stamp, lane, ran.get(stamp) or model, _cell(reason))
               for _, stamp, lane, reason in rows]
     return "\n".join(lines)
 
@@ -644,21 +722,33 @@ def current_rung(issue: Dict[str, Any]) -> int:
     brief can start on a ladder model, and failing there tries that rung."""
     m = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
     model = m.group(1) if m else ""
-    return next((n for n, (lanes, rung_model) in enumerate(LADDER, 1)
+    return next((n for n, (lanes, rung_model) in enumerate(CLIMB, 1)
                  if rung_model == model and _lane(issue) in lanes), 0)
 
 
-def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None) -> int:
-    """The lowest untried rung with a lane under RUNG_BUSY (docs/MUSE.md: a
-    higher rung rather than a wait behind a busy lane), else the untried rung
-    whose least-loaded lane holds the least, to wait there. 0 once every rung
-    was tried. Waiting on the lowest rung instead queued 33 tickets on the
+def climb_rungs(tried: set, reached: int = 0) -> List[int]:
+    """The rungs of CLIMB a ticket may still climb to, in order: each one not
+    in `tried` above `reached`, the highest rung the ladder itself moved it
+    to. Once it ran on the ladder's last rung or past it, every untried
+    STRONG one instead: a ticket Opus failed goes on to gpt-6-sol and Gemini 4
+    Argon high, never back to claude-sonnet-5-5."""
+    if any(n >= len(LADDER) for n in tried | {reached}):
+        return [n for n in range(1, len(CLIMB) + 1)
+                if n not in tried and CLIMB[n - 1][1] in STRONG]
+    return [n for n in range(reached + 1, len(CLIMB) + 1) if n not in tried]
+
+
+def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None,
+              reached: int = 0) -> int:
+    """The lowest rung of climb_rungs with a lane under RUNG_BUSY
+    (docs/MUSE.md: a higher rung rather than a wait behind a busy lane), else
+    the one whose least-loaded lane holds the least, to wait there. 0 when
+    none is left. Waiting on the lowest rung instead queued 33 tickets on the
     one claude lane on 2026-10-13 while six other ladder slots sat idle."""
-    untried = [n for n in range(1, len(LADDER) + 1)
-               if n not in tried and (eligible is None or n in eligible)]
+    untried = [n for n in climb_rungs(tried, reached) if eligible is None or n in eligible]
     if not untried:
         return 0
-    least = {n: min(load.get(lane, 0) for lane in LADDER[n - 1][0]) for n in untried}
+    least = {n: min(load.get(lane, 0) for lane in CLIMB[n - 1][0]) for n in untried}
     free = [n for n in untried if least[n] < RUNG_BUSY]
     return free[0] if free else min(untried, key=lambda n: (least[n], n))
 
@@ -822,6 +912,7 @@ def agy_takes_header(issue: Dict[str, Any], rung_only: bool = False) -> bool:
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
+                 briefers: Sequence[str] = (),
                  review_check: str = DEFAULT_REVIEW_CHECK,
                  review_bot: str = DEFAULT_REVIEW_BOT,
                  merge: Callable[..., Any] = brain.merge,
@@ -835,6 +926,9 @@ class Factory:
         self.repos = list(repos)
         self.now = now
         self.trusted = {t.lower() for t in trusted}
+        # LOOM_TRUSTED_BRIEFERS: their loom:ticket briefs are tickets here;
+        # their comments and pull requests are not trusted.
+        self.briefers = {b.lower() for b in briefers}
         self.review_check = review_check
         self.review_bot = review_bot
         self.merge, self.fix, self.move = merge, fix, move
@@ -864,6 +958,13 @@ class Factory:
         return (bool(login) and login in self.trusted
                 and tickets.owned_elsewhere(item, self.trusted) is None)
 
+    def _trusted_ticket(self, item: Dict[str, Any]) -> bool:
+        """A ticket a briefing login filed (tickets.brief_author_trusted),
+        not assigned to another operator; a trusted briefer's own loom:ticket
+        is a hand-off, whoever it is assigned to among them."""
+        return (tickets.brief_author_trusted(item, self.trusted, self.briefers)
+                and tickets.owned_elsewhere(item, self.trusted, self.briefers) is None)
+
     def _dependency(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
         """The ticket an After: line names, read once a pass; None when it
         cannot be read, which keeps the hold."""
@@ -881,13 +982,13 @@ class Factory:
         """A trusted ticket issue, read once a pass; None when it cannot be
         read or a stranger opened it."""
         data = self._dependency(repo, number)
-        return data if data is not None and self._trusted(data) else None
+        return data if data is not None and self._trusted_ticket(data) else None
 
     def _tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         data = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return {int(i["number"]): i for i in data
                 if isinstance(i, dict) and "pull_request" not in i and "number" in i
-                and self._trusted(i)}
+                and self._trusted_ticket(i)}
 
     def _comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
         """The ticket's comments from trusted logins only."""
@@ -1058,37 +1159,51 @@ class Factory:
         _say("deferred %d finding(s) on %s#%d to #%d" % (len(picked), repo, number, follow))
         return True
 
-    def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
-               why: str, head: str = "Repeatedly stuck", failed_here: bool = True,
-               skip: int = 0) -> Optional[str]:
-        """Put the ticket on its next rung: its Model: line and lane label, and
-        a rung marker. The rung it ran on counts as tried when it failed
-        there. Returns the lane, or None once every rung was tried."""
-        number = int(issue["number"])
-        if RUNAWAY in _labels(issue):
-            return None  # held until a brain clears the label
+    def _tried(self, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+               failed_here: bool = True, footer: Optional[Tuple[str, str]] = None) -> Tuple[set, int]:
+        """(the rungs the ticket has tried, the highest rung the ladder itself
+        reached). Tried: those the ladder moved it to and it was claimed on,
+        the one it failed on (`failed_here`), and every rung whose model one
+        of its claims ran (ran_rungs). Only the ladder's own climbs make a
+        lower rung a move down (climb_rungs)."""
         climbed = tried_rungs(comments)
         if failed_here:
             climbed |= {current_rung(issue)} - {0}
-        # A rung whose model the ticket ran on before the ladder counts as
-        # tried, but only the ladder's own climbs make a lower rung a move down.
-        tried = climbed | ran_rungs(issue, comments)
-        available_lanes = {lane for lanes, _ in LADDER for lane in lanes
-                           if lane not in self.limited
-                           and (self.available is None or lane in self.available)}
-        eligible = {n for n, (lanes, _) in enumerate(LADDER, 1)
-                    if any(lane in available_lanes for lane in lanes)}
-        rung = next_rung(tried | ({skip} - {0}), self.load, eligible)
+        return climbed | ran_rungs(issue, comments, footer), max(climbed, default=0)
+
+    def _rung_lanes(self, repo: str, rung: int) -> Tuple[str, ...]:
+        """The lanes of a CLIMB rung that may take this repo's work: a lane
+        that takes public repos only never takes a private repo's."""
+        lanes = CLIMB[rung - 1][0]
+        if self._is_private(repo):
+            lanes = tuple(lane for lane in lanes if lane not in PUBLIC_ONLY)
+        return lanes
+
+    def _rungs_left(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+                    footer: Optional[Tuple[str, str]] = None) -> List[int]:
+        """The rungs the ticket may still climb to that have a lane for its
+        repo, free or not; [] once every such rung was tried."""
+        return [n for n in climb_rungs(*self._tried(issue, comments, footer=footer))
+                if self._rung_lanes(repo, n)]
+
+    def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
+               why: str, head: str = "Repeatedly stuck", failed_here: bool = True,
+               skip: int = 0, footer: Optional[Tuple[str, str]] = None) -> Optional[str]:
+        """Put the ticket on its next rung (climb_rungs): its Model: line and
+        lane label, and a rung marker. The rung it ran on counts as tried when
+        it failed there. Returns the lane, or None when no rung it may climb
+        to has a lane up: every such rung was tried (_rungs_left says which),
+        or each is down or at a limit and the ticket waits."""
+        number = int(issue["number"])
+        if RUNAWAY in _labels(issue):
+            return None  # held until a brain clears the label
+        tried, reached = self._tried(issue, comments, failed_here, footer)
+        up = {n: tuple(lane for lane in self._rung_lanes(repo, n) if self._up(lane))
+              for n in range(1, len(CLIMB) + 1)}
+        rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached)
         if not rung:
             return None
-        if rung < max(climbed, default=0):
-            self._flag_runaway(repo, issue, comments, "ladder move from rung %d down to rung %d"
-                               % (max(climbed), rung))
-            return None
-        lanes, model = LADDER[rung - 1]
-        lanes = tuple(lane for lane in lanes if lane in available_lanes)
-        if not lanes:
-            return None
+        lanes, model = up[rung], CLIMB[rung - 1][1]
         lane = pick_lane(lanes, self.load)
         body = with_model(str(issue.get("body") or ""), model)
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
@@ -1102,27 +1217,19 @@ class Factory:
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
-    def _flag_runaway(self, repo: str, issue: Dict[str, Any],
-                      comments: Sequence[Dict[str, Any]], trigger: str) -> None:
-        """Hold a ticket for the brain: the runaway label and its attempt table."""
-        number = int(issue["number"])
-        kept = _labels(issue) + [RUNAWAY]
-        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-        issue["labels"] = [{"name": x} for x in kept]
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": runaway_comment(trigger, attempts(comments), issue_model(issue))})
-        self.actions += 1
-        _say("%s#%d is a runaway (%s); held for the brain" % (repo, number, trigger))
-
-    def _give_up(self, repo: str, issue: Dict[str, Any], why: str) -> None:
+    def _give_up(self, repo: str, issue: Dict[str, Any], why: str,
+                 ran: Sequence[str] = ()) -> None:
+        """Leave the ticket failed for the brain, naming the ladder models it
+        ran on (`ran`). Only once _rungs_left is empty: every rung with a lane
+        for its repo was tried, or is weaker than a strong model that was."""
         number = int(issue["number"])
         if RUNAWAY in _labels(issue):
             return
         if _state(issue) != "failed":
             self.move(self.gh, repo, number, "failed",
-                      note="The factory tried every rung of the model ladder (%s). "
+                      note="The factory tried every rung of the model ladder (%s; ran on %s). "
                            "The brain rewrites this brief smaller, or asks the "
-                           "operator one exact question." % why)
+                           "operator one exact question." % (why, ", ".join(ran) or "none"))
         _say("%s#%d is past the last rung; left failed for the brain" % (repo, number))
 
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
@@ -1132,8 +1239,18 @@ class Factory:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
         if stuck(comments, open_threads, checks_failing, age, self.now, no_test):
-            if self._climb(repo, issue, comments, why) is None:
-                self._give_up(repo, issue, why)
+            footer = self._footer(repo, pr)
+            if self._climb(repo, issue, comments, why, footer=footer) is None:
+                if RUNAWAY in _labels(issue):
+                    return
+                if self._rungs_left(repo, issue, comments, footer):
+                    # Not past the ladder: no lane of an untried rung is up.
+                    # It waits, with no comment, and climbs on a later pass.
+                    _say("%s#%d waits: no lane is up for its next rung" % (repo, number))
+                    return
+                tried, _ = self._tried(issue, comments, footer=footer)
+                self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
+                                                 if 1 <= n <= len(CLIMB)])
                 return
         lane = None
         if _lane(issue) in REMOTE_LANES:
@@ -1150,6 +1267,15 @@ class Factory:
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
     # -- the three kinds of stuck ----------------------------------------
+    def _footer(self, repo: str, pr: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+        """The runner footer's (lane, model) of a trusted author's pull request
+        whose head is in `repo`, else None: anyone can open a pull request
+        that names a ticket, and its footer must never steer the ladder."""
+        if (pr is None or not self._trusted(pr)
+                or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo):
+            return None
+        return footer_run(pr.get("body"))
+
     def _is_lane_pr(self, pr: Dict[str, Any]) -> bool:
         """A trusted, non-draft pull request on a loom/ branch."""
         if pr.get("draft") or not self._trusted(pr):
@@ -1429,10 +1555,11 @@ class Factory:
         if repeated_no_reason(comments):
             self._hold_no_reason(repo, issue)
             return
-        lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue))
-        if lane is None:
-            return  # left for the brain; _give_up said so once
         pr = prs.get(number)
+        lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue),
+                           footer=self._footer(repo, pr))
+        if lane is None:
+            return  # it stays failed: for a free lane, or for the brain
         if pr is not None:
             # Back to loom:pr so the fix brief reuses its open pull request.
             kept = [x for x in _labels(issue) if x != "loom:failed"] + ["loom:pr"]
@@ -1533,7 +1660,7 @@ class Factory:
         """The other available lanes a stalled ticket may move to: those of
         its rung, or of its difficulty tier. Never up the ladder."""
         old = _lane(issue)
-        pool = LADDER[rung - 1][0] if rung else tier_lanes(issue, self._is_private(repo))
+        pool = self._rung_lanes(repo, rung) if rung else tier_lanes(issue, self._is_private(repo))
         return [x for x in pool if x != old and self._up(x)
                 and (x != "agy" or agy_takes_header(issue))]
 
@@ -1586,9 +1713,9 @@ class Factory:
         if not here or self.load.get(old, 0) <= RUNG_BUSY:
             return False
         comments = self._comments(repo, int(issue["number"]))
-        tried = tried_rungs(comments) | ran_rungs(issue, comments) | {here}
-        if not any(min(self.load.get(lane, 0) for lane in LADDER[n - 1][0]) < RUNG_BUSY
-                   for n in range(1, len(LADDER) + 1) if n not in tried):
+        tried, reached = self._tried(issue, comments, failed_here=False)
+        if not any(min(self.load.get(lane, 0) for lane in CLIMB[n - 1][0]) < RUNG_BUSY
+                   for n in climb_rungs(tried | {here}, reached) if self._rung_lanes(repo, n)):
             return False
         lane = self._climb(repo, issue, comments, "%d tickets wait on lane %s"
                            % (self.load.get(old, 0), old), head="Not a failure",
@@ -1611,7 +1738,7 @@ class Factory:
         rung = current_rung(issue)
         fallback = ""
         if rung:
-            lane = next((x for x in LADDER[rung - 1][0] if x != old and self._free(x)), None)
+            lane = next((x for x in self._rung_lanes(repo, rung) if x != old and self._free(x)), None)
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None:

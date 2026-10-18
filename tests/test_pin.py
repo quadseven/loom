@@ -1,6 +1,7 @@
 """A station pin pass against a stateful fake GitHub API."""
 import base64
 import hashlib
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -25,6 +26,8 @@ class FakeGitHub:
         self.created = 0
         self.calls = []
         self.green = True
+        self.files = [{"filename": "dashboard/server.py"}]
+        self.labels = []
 
     def rest(self, method, path, body=None, ok=()):
         self.calls.append((method, path, body))
@@ -37,7 +40,10 @@ class FakeGitHub:
         if path.startswith("/repos/%s/git/ref/heads/" % TARGET) or path == "/repos/%s/git/refs" % TARGET:
             return self.refs(path)
         if "/compare/" in path:
-            return SimpleNamespace(data={"commits": [{"sha": "e" * 40}]})
+            return SimpleNamespace(data={"commits": [{"sha": "e" * 40}], "files": self.files})
+        if path == "/repos/%s/issues/7/labels" % TARGET and method == "POST":
+            self.labels += body["labels"]
+            return SimpleNamespace(data=[])
         if path.endswith("/pulls") and "/commits/" in path:
             return SimpleNamespace(data=[{"title": "Fix dashboard card", "merged_at": "2026-01-01T00:00:00Z"}])
         if path.startswith("/repos/%s/pulls" % TARGET):
@@ -115,6 +121,46 @@ class PinTest(unittest.TestCase):
                 self.assertIsNone(gh.branch)
                 reason = "CI" if red else "tarball"
                 self.assertTrue(any(reason in line for line in logs), logs)
+
+    def test_a_dashboard_merge_opens_one_labelled_pin_pull_request_naming_commit_and_sha(self):
+        gh = FakeGitHub()
+        logs = []
+        pin.run(gh, SOURCE, NEW, "unittest", [SPEC], lambda _: b"archive", logs.append)
+        self.assertEqual(gh.created, 1)
+        self.assertIn(NEW, gh.pull["body"])
+        self.assertIn(hashlib.sha256(b"archive").hexdigest(), gh.pull["body"])
+        self.assertEqual(gh.labels, [pin.PIN_LABEL])
+        self.assertEqual(len([c for c in gh.calls if "/compare/" in c[1]]), 1)
+
+    def test_a_merge_touching_nothing_under_dashboard_opens_no_pin_pull_request(self):
+        gh = FakeGitHub()
+        gh.files = [{"filename": "bus/station.py"}, {"filename": "docs/dashboard.md"},
+                    {"filename": "tests/test_dashboard.py"}]
+        downloads = []
+        logs = []
+        pin.run(gh, SOURCE, NEW, "unittest", [SPEC],
+                lambda url: downloads.append(url) or b"archive", logs.append)
+        self.assertEqual(gh.created, 0)
+        self.assertIsNone(gh.branch)
+        self.assertEqual(downloads, [])
+        self.assertTrue(any("nothing under dashboard/ changed" in line for line in logs), logs)
+
+    def test_a_moved_dashboard_file_or_a_full_file_list_counts_as_a_change(self):
+        self.assertTrue(pin.touches({"files": [{"filename": "web/app.py",
+                                                "previous_filename": "dashboard/app.py"}]},
+                                    "dashboard/"))
+        self.assertTrue(pin.touches({"files": [{"filename": "bus/x.py"}] * 300}, "dashboard/"))
+        self.assertTrue(pin.touches({}, "dashboard/"))
+        self.assertFalse(pin.touches({"files": [{"filename": "dashboards.md"}]}, "dashboard/"))
+
+    def test_a_target_may_watch_its_own_path(self):
+        spec = dict(SPEC, watch="lanes/viewer/")
+        self.assertEqual(pin.targets(json.dumps([spec]))[0]["watch"], "lanes/viewer/")
+        with self.assertRaisesRegex(ValueError, "watch"):
+            pin.targets(json.dumps([dict(SPEC, watch="../x")]))
+        gh = FakeGitHub()
+        pin.run(gh, SOURCE, NEW, "unittest", [spec], lambda _: b"archive", lambda _: None)
+        self.assertEqual(gh.created, 0)
 
 
 if __name__ == "__main__":

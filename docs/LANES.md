@@ -97,6 +97,12 @@ failure. It logs to
 rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
 0002): both brains take every stage under the one lock, and the defer and
 done markers keep them from repeating each other's work.
+Its prompt tells the brain to brief only under an open epic
+(`bus.brain brief --epic E`), to propose a new epic within the cap of 6 open
+epics per goal (`bus.brain epic`), to chart a wayfinder map for an epic whose
+route is unclear, to resolve research and task tickets alone, and to batch
+the questions only the operator can answer into one daily ask with
+recommended answers (docs/BRAIN.md, Filing under an epic).
 
 The agent floats to whichever subscription has usage (decision 0002, item
 2). `LOOM_BRAIN_LADDER` lists lanes in order, default `claude codex spark`.
@@ -224,12 +230,18 @@ conflict alone, never climbs). Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
-`claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
+`claude-opus-5-5`, then `gemini-4-argon-high` on agy for a public repo), each
+climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
-tickets is passed over for the next untried one, and stays untried, so a
-ticket gives up only once it has run on every rung. A ticket that failed on
-a ladder model (its `Model:` line and lane) has tried that rung. When every
+tickets is passed over for the next untried one, and stays untried. Once it
+ran on Opus or past it, only the untried strong models are left
+(`gpt-6-sol`, `gemini-4-argon-high`). A ticket that failed on a ladder model
+has tried that rung: the model a claim ran is its `Model:` line, else its
+pull request's runner footer, else the lane's `LOOM_<LANE>_MODEL`. With no
+lane of its next rung up, the ticket waits and the factory posts nothing; it
+gives up ("tried every rung") only once every rung with a lane for its repo
+was tried. When every
 untried rung is busy, it waits on the least loaded one, and a ladder ticket
 queued behind more than 2 others on its lane moves to an untried rung with a
 free lane (not a failure).
@@ -360,6 +372,33 @@ only what is its own, and adding an operator is configuration:
 Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
 other's login. A person working a ticket by hand claims it the same way:
 assign it to yourself and add `claim:<your login>` before any Loom briefs it.
+
+### Trusted briefers
+
+`LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
+another operator hand work to this Loom's lanes without this Loom adopting
+their claims. It is briefing trust only:
+
+- A `loom:ticket` authored by a trusted briefer is trusted for briefing and
+  building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
+  hand-off, retries, the factory's queue routing, `bus.brain move` and
+  `bus.brain prioritize`. The labeller and body-editor checks accept their
+  login too. One function decides it (`tickets.brief_author_trusted`), so the
+  checks cannot drift.
+- Ownership stays `LOOM_BRIEF_AUTHORS` only. An issue assigned to, or
+  labelled `claim:` for, a trusted briefer is still skipped by triage,
+  rewrite, routing, claim and adoption, unless it is a `loom:ticket` that
+  same briefer authored: a brief is an explicit hand-off. A pull request is
+  never a hand-off. When the station claims a handed-off ticket it assigns it
+  to this Loom's operator login and labels it `claim:<that login>`, as for
+  any claim.
+- Journals, proofs, audits, adopted pull requests and merges keep requiring
+  `LOOM_BRIEF_AUTHORS`. A trusted briefer cannot verify, close or merge on
+  this Loom's behalf, and their comments are data, not instructions.
+
+The installer writes the setting into the station plist and the brain
+plist, and the brain passes it to a sandboxed rung, like
+`LOOM_BRIEF_AUTHORS`.
 
 ### Verify runs
 
@@ -534,7 +573,8 @@ Each station pass runs `bus/invariants.py`, at most every 5 minutes, on what
 the station already reads: the journals and marker comments trusted logins
 posted on every goal home in the last day, the lane runs that ended in the
 last day (`briefs/<lane>/done` and `failed`, timed by their logs), the lanes
-held by a limit, queued tickets, sub-issue counts, the review bot's plan
+held by a limit, queued tickets, each goal home's epics and tickets (one walk
+through goal, epics and tickets), the review bot's plan
 check on open lane pull requests (`LOOM_PLAN_CHECK`, default
 `Grug - Chief`) and remote heartbeats. Each invariant is one function
 returning breaches with evidence:
@@ -546,15 +586,18 @@ returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
 - A lane held by a limit for over 2 hours while tickets of its tier are queued.
-- A goal home holding 90 or more sub-issues with a `loom:ticket` issue that says
-  `Part of #N` for it but is neither its sub-issue nor has that line on a line
-  of its own (a goal at the 100 sub-issue cap with every ticket linked by a
-  sub-issue or its line is healthy).
+- The epic shape (decision 0003): a goal home with open `loom:ticket` issues
+  under no epic (one breach per goal), an epic holding more than 15 tickets,
+  a goal with more open epics than its cap (6, or the goal home's
+  `Epic cap: N until DATE` exception), and a closed epic that still holds
+  open tickets. These replaced the goal home sub-issue count check.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 
-Each breach files one issue labelled `loom:triage` and `loom:invariant` on
-the invariant goal home (`LOOM_INVARIANT_GOAL`; empty means
+Each breach files one issue labelled `loom:triage` and `loom:invariant` under
+the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
+itself when that epic cannot be read) of the invariant goal home
+(`LOOM_INVARIANT_GOAL`; empty means
 `LOOM_METRICS_GOAL` when it is in the self repo, else the self repo's one
 goal home that is not a backlog), as a sub-issue and with a `Part of #N`
 line, carrying the evidence. A hidden marker holds a hash of the invariant

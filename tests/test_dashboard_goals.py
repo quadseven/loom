@@ -500,3 +500,87 @@ class GoalSourcesAreTrusted(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EpicsOnGoals(unittest.TestCase):
+    """loom#639: a ticket under an epic records the epic and the epic's goal,
+    and Goals lists each goal's epics with their ticket counts."""
+
+    def setUp(self):
+        env = {key: "" for key in ("LOOM_IMPROVEMENT_HOMES", "LOOM_STATUS_REPO", "LOOM_METRICS_GOAL",
+                                   "LOOM_BRIEF_AUTHORS", "LOOM_BACKLOG_SOURCE")}
+        patcher = unittest.mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def store(self):
+        from dashboard.github import TicketStore
+        stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = "https://api.github.com/repos/%s/issues/%d"
+
+        def ticket(number, state, **extra):
+            return dict({"number": number, "title": "Ticket %d" % number, "state": "open",
+                         "created_at": stamp, "body": "## Why\nx",
+                         "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}, **extra)
+        tickets = [
+            ticket(7, "running", parent_issue_url=url % (REPO, 40)),       # a sub-issue of epic 40
+            ticket(8, "queued", body="## Why\nx\n\nPart of #40\n"),        # names epic 40
+            ticket(9, "pr", body="## Why\nx\n\nPart of #41\n"),            # under closed epic 41
+            ticket(10, "queued", body="## Why\nx\n\nPart of #30\n"),       # straight under the goal
+        ]
+        issues = {
+            "/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx",
+                                           "labels": [{"name": "loom:goal"}]},
+            "/repos/%s/issues/40" % REPO: {"number": 40, "title": "Epic: the first chunk",
+                                           "state": "open", "body": "Done when: x\n\nPart of #30\n",
+                                           "labels": [{"name": "epic"}]},
+            "/repos/%s/issues/41" % REPO: {"number": 41, "title": "Epic: an older chunk",
+                                           "state": "closed", "body": "",
+                                           "parent_issue_url": url % (REPO, 30),
+                                           "labels": [{"name": "epic"}]},
+        }
+        gh = FakeGitHub({"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets}, issues)
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+        store.refresh()
+        return store, gh
+
+    def test_a_sub_issue_of_an_epic_records_the_epic_and_its_goal(self):
+        store, _ = self.store()
+        rows = {row["number"]: row for row in store.data[REPO]}
+        self.assertEqual((rows[7]["epic"], rows[7]["goal"]), (REPO + "#40", REPO + "#30"))
+        self.assertEqual((rows[8]["epic"], rows[8]["goal"]), (REPO + "#40", REPO + "#30"))
+        self.assertEqual((rows[9]["epic"], rows[9]["goal"]), (REPO + "#41", REPO + "#30"))
+        self.assertEqual((rows[10]["epic"], rows[10]["goal"]), (None, REPO + "#30"))
+
+    def test_goals_lists_each_epic_under_its_goal_with_its_ticket_count(self):
+        store, _ = self.store()
+        found = cards(server._goals(store))
+        self.assertEqual(len(found), 1, "an epic is not a goal card of its own")
+        card = found[0]
+        self.assertIn("Main goal", card)
+        self.assertIn("open epics 1/6", card)
+        epics = card[card.index('class="goal-epics"'):]
+        self.assertIn("Epic: the first chunk", epics)
+        self.assertIn("sample#40 / tickets 2/15 / 2 in flight", epics)
+        self.assertIn('href="/tickets?epic=%s"' % server.quote(REPO + "#40", safe=""), epics)
+        closed = epics[epics.index("goal-epics-closed"):]
+        self.assertIn("1 closed epic", closed)
+        self.assertIn("Epic: an older chunk", closed)
+        self.assertIn("4 tickets on this goal", card)
+
+    def test_the_tickets_page_filters_by_epic_and_the_header_names_epic_and_goal(self):
+        from dashboard import ticket, tickets_table
+        store, _ = self.store()
+        rows = store.data[REPO]
+        body = tickets_table.render(rows, {"epic": [REPO + "#40"]}, goal_titles={}, entered={},
+                                    now=0, ticket_href=lambda row: "/t", short_ref=server._short_ref)
+        self.assertIn("epic sample#40", body)
+        self.assertIn("Ticket 7", body)
+        self.assertIn("Ticket 8", body)
+        self.assertNotIn("Ticket 9", body)
+        self.assertNotIn("Ticket 10", body)
+        self.assertIn("Filter by epic", body)
+        record = next(row for row in rows if row["number"] == 7)
+        header = ticket._header(record, [])
+        self.assertIn(" / epic sample#40 / goal sample#30", header)

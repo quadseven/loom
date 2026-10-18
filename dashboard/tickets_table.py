@@ -84,8 +84,8 @@ def resolve_models(rows: Sequence[Dict[str, Any]], *, footer_runs: Dict[str, Seq
         when, model = last_run(row, transcript=latest.get(key), footer=footer, comments=claims.get(key, ()))
         if when is None and row.get("state") in RAN_STATES:
             # It ran before the records the dashboard keeps: the run used the
-            # model its body names, else its lane's ladder model, as a claim
-            # does (bus/factory.py claim_models).
+            # model its body names, else its lane's configured model, as a
+            # claim does (bus/factory.py claim_models).
             when = 0.0
             model = _model(row.get("model")) or (brain._lane_model(row["lane"]) if row.get("lane") else None)
         row["run_model"] = model
@@ -123,7 +123,7 @@ def _is_done(row: Dict[str, Any]) -> bool:
 
 
 def _href(**params: str) -> str:
-    kept = [(key, params[key]) for key in ("state", "goal", "model", "done") if params.get(key)]
+    kept = [(key, params[key]) for key in ("state", "goal", "epic", "model", "done") if params.get(key)]
     return "/tickets" + ("?" + urlencode(kept) if kept else "")
 
 
@@ -168,7 +168,7 @@ def _counter(label: str, count: int, href: str, current: bool, state: str = "", 
 def _counters(live, finished, pick, done) -> str:
     """The state counters: in flight, each in-flight state, Done with its
     counts, and in the Done view each done state. Each one filters the table."""
-    base = {"goal": pick["goal"], "model": pick["model"]}
+    base = {"goal": pick["goal"], "epic": pick["epic"], "model": pick["model"]}
     out = [_counter("in flight", len(live), _href(**base), not done and not pick["state"])]
     out += [_counter(name, count, _href(state=name, **base), pick["state"] == name, "state-" + name)
             for name in IN_FLIGHT for count in [sum(row.get("state") == name for row in live)] if count]
@@ -184,7 +184,8 @@ def _counters(live, finished, pick, done) -> str:
 
 
 def _filter_bar(rows, pick, short_ref) -> str:
-    """The model filter (#533) and, when any filter is on, what it shows."""
+    """The epic and model filters (#533) and, when any filter is on, what it
+    shows."""
     esc = html.escape
     models: Dict[str, int] = {}
     for row in rows:
@@ -194,10 +195,22 @@ def _filter_bar(rows, pick, short_ref) -> str:
         esc(_href(model=model, done=pick["done"]), quote=True),
         ' aria-current="true"' if model == pick["model"] else "", esc(model), count)
         for model, count in sorted(models.items()))
+    epics: Dict[str, int] = {}
+    for row in rows:
+        if row.get("epic"):
+            epics[row["epic"]] = epics.get(row["epic"], 0) + 1
+    epic_chips = "".join('<a class="chip" href="%s"%s>%s %d</a>' % (
+        esc(_href(epic=epic, done=pick["done"]), quote=True),
+        ' aria-current="true"' if epic == pick["epic"] else "", esc(short_ref(epic)), count)
+        for epic, count in sorted(epics.items()))
     active = [text for key, text in (("state", "state %s" % pick["state"]),
                                      ("goal", "goal %s" % short_ref(pick["goal"])),
+                                     ("epic", "epic %s" % short_ref(pick["epic"])),
                                      ("model", "model %s" % pick["model"])) if pick[key]]
     bar = []
+    if epic_chips:
+        bar.append('<details class="tickets-epics"%s><summary>Filter by epic</summary>'
+                   '<div class="chips">%s</div></details>' % (" open" if pick["epic"] else "", epic_chips))
     if chips:
         bar.append('<details class="tickets-models"><summary>Filter by the model the last run used</summary>'
                    '<div class="chips">%s</div></details>' % chips)
@@ -229,12 +242,13 @@ def _group(goal, members, *, goal_titles, entered, now, ticket_href, short_ref, 
 def render(rows: Sequence[Dict[str, Any]], params: Dict[str, List[str]], *,
            goal_titles: Dict[str, Optional[str]], entered: Dict[str, Sequence[Any]], now: float,
            ticket_href, short_ref) -> str:
-    """The page body. Filters are query parameters: state, goal, model and
+    """The page body. Filters are query parameters: state, goal, epic, model and
     done=1 (merged, shipped, verified and closed tickets instead of the ones
     in flight)."""
-    pick = {key: (params.get(key) or [""])[0] for key in ("state", "goal", "model", "done")}
+    pick = {key: (params.get(key) or [""])[0] for key in ("state", "goal", "epic", "model", "done")}
     done = pick["done"] == "1" or pick["state"] in DONE
     scoped = [row for row in rows if (not pick["goal"] or row.get("goal") == pick["goal"])
+              and (not pick["epic"] or row.get("epic") == pick["epic"])
               and (not pick["model"] or row.get("run_model") == pick["model"])]
     live = [row for row in scoped if not _is_done(row)]
     finished = [row for row in scoped if _is_done(row)]

@@ -78,7 +78,7 @@ TREE_KEEP = 3600
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
-STRONG_MODELS = frozenset(model for _, model in factory.LADDER)
+STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
 THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
                 ' pullRequest { number repository { nameWithOwner } }'
                 ' comments(first:1) { nodes { body author { __typename login } } } } } }')
@@ -130,6 +130,8 @@ MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
+# The last line of a quiet standup the station edits in place.
+QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
 # Reports come every 2 hours, so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
@@ -391,7 +393,8 @@ class Settings:
                  health_every: int = health.EVERY,
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
-                 pin_ship_repos: Sequence[str] = ()) -> None:
+                 pin_ship_repos: Sequence[str] = (),
+                 briefers: Sequence[str] = ()) -> None:
         self.home = home
         # Deployment repos whose merged pin pull requests ship the tickets
         # of the source revision they publish (ship_pins).
@@ -407,6 +410,10 @@ class Settings:
         self.report_digest = tuple(report_digest)
         self.repos = repos
         self.authors = authors
+        # LOOM_TRUSTED_BRIEFERS: another operator's logins whose loom:ticket
+        # briefs this Loom builds (tickets.brief_author_trusted). Ownership,
+        # journals, proofs, adoption and merges read authors alone.
+        self.briefers = list(briefers)
         self.owners = owners
         self.status_repo = status_repo
         self.webhook_ssm = webhook_ssm
@@ -504,7 +511,8 @@ class Settings:
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
-                   pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"))
+                   pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
+                   briefers=words("LOOM_TRUSTED_BRIEFERS"))
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -853,7 +861,7 @@ def _linked_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
                             str((pr.get("head") or {}).get("ref") or "")))
 
 
-def adoption_body(pr: int, goal: int) -> str:
+def adoption_body(pr: int) -> str:
     """The brief for an adoption ticket. It names the pull request in words
     and #N, never in a Refs line: the lane's own pull request carries the
     Refs line to this ticket."""
@@ -886,8 +894,7 @@ def adoption_body(pr: int, goal: int) -> str:
         "## Definition of done", "",
         "Pull request #%d is closed, and its change is merged through this ticket's pull "
         "request or recorded here as superseded." % pr, "",
-        ADOPTS_MARKER % pr, "",
-        brain.part_of_line(goal), ""])
+        ADOPTS_MARKER % pr, ""])
 
 
 def adoption_comment(repo: str, ticket: int) -> str:
@@ -988,7 +995,8 @@ class Station:
         number = int(issue["number"])
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
         editor = self._editor(repo, number)
-        return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners)
+        return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
+                               self.s.briefers)
 
     def _poll(self, repo: str) -> List[Dict[str, Any]]:
         # A conditional read (bus/github.py keeps the last answer): an
@@ -1112,8 +1120,9 @@ class Station:
 
     def _owned_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
         """True when the issue or pull request is assigned to a login outside
-        LOOM_BRIEF_AUTHORS: another operator's Loom owns it."""
-        owner = tickets.owned_elsewhere(issue, self.s.authors)
+        LOOM_BRIEF_AUTHORS: another operator's Loom owns it. A trusted
+        briefer's own loom:ticket is a hand-off, not theirs."""
+        owner = tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)
         if owner is None:
             return False
         self._note_owned("%s#%s" % (repo, issue.get("number")),
@@ -1352,8 +1361,8 @@ class Station:
                           for issue in open_issues)
             if pending:
                 continue
-            brain.brief(self.gh, repo, int(goal["number"]), title, body,
-                        difficulty="medium")
+            brain.brief_intake(self.gh, repo, int(goal["number"]), title, body,
+                               difficulty="medium")
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -1775,11 +1784,10 @@ class Station:
 
     # -- verify runs ------------------------------------------------------
     def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open tickets filed by a trusted author."""
-        allowed = {a.lower() for a in self.s.authors}
+        """The repo's open tickets filed by a briefing login."""
         found = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-                and tickets._login(i.get("user")) in allowed
+                and tickets.brief_author_trusted(i, self.s.authors, self.s.briefers)
                 and not self._owned_elsewhere(repo, i)]
 
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]]) -> set:
@@ -2236,7 +2244,12 @@ class Station:
         for pr in open_prs:
             author = tickets._login(pr.get("user"))
             head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
-            if author not in trusted_authors or head_repo != repo:
+            if head_repo != repo:
+                continue
+            if author not in trusted_authors:
+                # A second contributor's pull request links only the
+                # trusted ticket that contributor owns (loom#688).
+                self._link_contributor_pr(repo, pr, author, tickets_by_number)
                 continue
             number = self._pr_ticket_number(repo, pr)
             if number is None:
@@ -2277,6 +2290,46 @@ class Station:
             if isinstance(pr, dict) and pr.get("state") == "closed":
                 pool = tickets_by_number if self._terminal_label(pr) == "loom:merged" else waiting
                 self._reconcile_pr_ticket(repo, pr, pool)
+
+    def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
+                            author: str) -> Optional[Dict[str, Any]]:
+        """The open loom:ticket a pull request names when its author owns it
+        (assigned, or labelled claim:<author>) and a trusted login filed it;
+        None otherwise. The ticket is read only for such a pull request."""
+        if not author or author in {a.lower() for a in self.s.authors}:
+            return None
+        number = self._pr_ticket_number(repo, pr)
+        if number is None:
+            return None
+        try:
+            ticket = self._issue(repo, number)
+        except GitHubError as err:
+            if err.status in (404, 410):
+                return None
+            raise
+        owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+        if ("pull_request" in ticket or ticket.get("state") != "open"
+                or "loom:ticket" not in _label_names(ticket) or author not in owners
+                or tickets._login(ticket.get("user")) not in {a.lower() for a in self.s.authors}
+                or not _linked_pr(ticket, repo, pr)):
+            return None
+        return ticket
+
+    def _link_contributor_pr(self, repo: str, pr: Dict[str, Any], author: str,
+                             found: Dict[int, Dict[str, Any]]) -> None:
+        """An open pull request by the contributor who owns its ticket moves
+        a queued ticket to loom:pr; it is never briefed or claimed. From
+        loom:pr, the closed pull request pass moves it to loom:merged when it
+        merges, as for a lane's pull request, and shipping follows."""
+        ticket = self._contributor_ticket(repo, pr, author)
+        if ticket is None or "loom:queued" not in _label_names(ticket):
+            return
+        number = int(ticket["number"])
+        kept = [n for n in _label_names(ticket) if n != "loom:queued"] + ["loom:pr"]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        ticket["labels"] = [{"name": n} for n in kept]
+        found[number] = ticket
+        self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
@@ -2365,8 +2418,8 @@ class Station:
             self._adoption_refused(repo, rec, "no goal home to file adoption tickets on")
             return
         try:
-            url = brain.brief(self.gh, repo, goal, self._adoption_title(repo, pr),
-                              adoption_body(number, goal), difficulty="medium")
+            url = brain.brief_intake(self.gh, repo, goal, self._adoption_title(repo, pr),
+                              adoption_body(number), difficulty="medium")
         except ValueError as err:
             # The goal is at its cap or holds too much unproven work: tried
             # again after ADOPT_RETRY.
@@ -3185,7 +3238,7 @@ class Station:
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
         self._comment(repo, number, factory.runaway_comment(
-            trigger, attempts, factory.issue_model(issue)))
+            trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments)))
         return True
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
@@ -3770,10 +3823,17 @@ class Station:
         # _goal_issues keeps only objects with numeric issue numbers; a read
         # failure reaches _send_digest as GitHubError before any page is posted.
         goals = {int(g["number"]): g for g in self._goal_issues(repo)}
+        epic_goals: Optional[Dict[int, int]] = None
         groups: Dict[Optional[int], List[Dict[str, Any]]] = {}
         for issue in issues:
             refs = [int(n) for n in ASK_GOAL_REF_RE.findall(str(issue.get("body") or ""))]
             goal = next((n for n in refs if n in goals), None)
+            if goal is None and refs:
+                # An ask may name an epic: it goes under that epic's goal.
+                if epic_goals is None:
+                    epic_goals = self._epic_goals(repo)
+                goal = next((epic_goals[n] for n in refs
+                             if epic_goals.get(n) in goals), None)
             groups.setdefault(goal, []).append(issue)
         out = [DIGEST_MARKER, "Asks waiting for the operator on %s: %d in this repo."
                % (today, len(issues))]
@@ -3787,6 +3847,18 @@ class Station:
                                   " ".join(str(i.get("title") or "").split()).replace("@", "@\u200b"))
                     for i in groups[goal]]
         return "\n".join(out)
+
+    def _epic_goals(self, repo: str) -> Dict[int, int]:
+        """epic number -> the goal its Part of line or sub-issue parent names,
+        for the repo's epics (one conditional list read)."""
+        found: Dict[int, int] = {}
+        for item in self.gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
+            if isinstance(item, dict) and "pull_request" not in item \
+                    and str(item.get("number") or "").isdigit():
+                goal = brain._issue_goal(item)
+                if goal is not None:
+                    found[int(item["number"])] = goal
+        return found
 
     @staticmethod
     def _digest_head(plan: Dict[str, Any]) -> str:
@@ -4593,17 +4665,24 @@ class Station:
                         "idle": info.get("idle", 0) if self._num(info.get("idle")) else 0}
         return out
 
-    def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
-        """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
-        search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
-        a refused sub-issue link leaves the Part of line as the only one."""
-        total = int((goal.get("sub_issues_summary") or {}).get("total") or 0)
-        if total < invariants.SUB_ISSUES_MAX:
-            return 0
-        return len(brain.unassociated_tickets(self.gh, repo, int(goal["number"])))
+    def _goal_shape(self, repo: str, goal: Dict[str, Any]) -> invariants.GoalShape:
+        """The goal home's epics and the open tickets under none, from one
+        walk (brain.goal_tree)."""
+        number = int(goal["number"])
+        loose, tree = brain.goal_tree(self.gh, repo, number)
+        ref = lambda issue: self._invariant_ref(repo, int(issue["number"]))  # noqa: E731
+        outside = tuple(ref(i) for i in loose if i.get("state") == "open"
+                        and "loom:ticket" in _label_names(i))
+        epics = tuple(invariants.EpicShape(
+            ref(epic), epic.get("state", "open") == "open", len(found),
+            tuple(ref(t) for t in found if t.get("state") != "closed"),
+            brain.standing_epic(epic))
+            for epic, found in tree)
+        return invariants.GoalShape(self._invariant_ref(repo, number),
+                                    brain.goal_epic_cap(goal), epics, outside)
 
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
-        """Goal homes with their unlinked tickets, and their journals and
+        """Goal homes with their epics and open tickets under none, and their journals and
         marker posts; a source that cannot be read stays None."""
         try:
             homes = self._goal_homes()
@@ -4611,8 +4690,7 @@ class Station:
             _say("invariants: could not read the goal homes: %s" % err)
             return
         try:
-            facts.goals = [(self._invariant_ref(repo, int(g["number"])), self._unassociated(repo, g))
-                           for repo, g in homes]
+            facts.shapes = [self._goal_shape(repo, g) for repo, g in homes]
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal tickets: %s" % err)
         try:
@@ -4709,7 +4787,6 @@ class Station:
 
     def _invariant_queued(self) -> List[Tuple[invariants.Ref, Tuple[str, ...]]]:
         """Each trusted queued ticket and the lanes of its difficulty tier."""
-        authors = {a.lower() for a in self.s.authors}
         out = []
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
@@ -4717,7 +4794,8 @@ class Station:
             for issue in self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo):
                 if (not isinstance(issue, dict) or "pull_request" in issue
                         or "loom:queued" not in _label_names(issue)
-                        or tickets._login(issue.get("user")).lower() not in authors):
+                        or not tickets.brief_author_trusted(issue, self.s.authors,
+                                                            self.s.briefers)):
                     continue
                 ref = self._invariant_ref(repo, int(issue["number"]))
                 if repo not in self._publics:
@@ -4918,16 +4996,40 @@ class Station:
                or (last is not None and self.now - last >= brain.REPORT_EVERY - STANDUP_LEAD))
         if not due:
             return
-        children = brain.goal_children(self.gh, repo, number)
+        loose, tree = brain.goal_tree(self.gh, repo, number)
+        children = brain._flatten(loose, tree)
         breaches = (self._open_breaches(repo, number)
                     if (repo, number) == self._invariant_goal() else None)
+        hold = self._gate_hold_for(repo, number)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
-                                          breaches,
-                                          gate_hold=self._gate_hold_for(repo, number))
+                                          breaches, gate_hold=hold,
+                                          finished=brain.finished_epics(tree))
         brain._check_written_text(body)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": body})
+        quiet = hold is None and body == self._overdue_standup_body(
+            [], None, None if breaches is None else [])
+        previous = self._last_quiet_report(comments, authors, body) if quiet else None
+        if previous is not None:
+            # Every new comment emails the goal's author; a quiet goal edits
+            # its last quiet report instead, which notifies no one.
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, previous),
+                         {"body": body + "\n" + QUIET_STAMP % now.strftime("%Y-%m-%dT%H:%MZ")})
+        else:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                         {"body": body})
         state[key] = self.now
+
+    @staticmethod
+    def _last_quiet_report(comments: List[Any], authors: List[str], quiet: str) -> Optional[int]:
+        """The id of the goal's latest report by `authors` when it is this same
+        quiet report (its stamp line aside), else None."""
+        reports = [c for c in comments if isinstance(c, dict)
+                   and tickets._login(c.get("user")).lower() in authors
+                   and str(c.get("body") or "").startswith(REPORT_MARKER)]
+        if not reports or not isinstance(reports[-1].get("id"), int):
+            return None
+        lines = str(reports[-1].get("body") or "").splitlines()
+        kept = [line for line in lines if not line.startswith(QUIET_STAMP.split("%")[0])]
+        return reports[-1]["id"] if "\n".join(kept) == quiet else None
 
     def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
         """The open loom:invariant issues filed on the goal home."""
@@ -4953,7 +5055,8 @@ class Station:
 
     def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
                               breaches: Optional[List[Dict[str, Any]]] = None,
-                              gate_hold: Optional[Dict[str, Any]] = None) -> str:
+                              gate_hold: Optional[Dict[str, Any]] = None,
+                              finished: Optional[List[Dict[str, Any]]] = None) -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
         counts = [(len(groups[k]), word) for k, word in (
@@ -4978,7 +5081,10 @@ class Station:
             + ["",
             "### Still stuck", stuck, "",
             "### Next", "In flight: %s." % rows(groups["in_flight"]),
-            "Needs difficulty: %s." % rows(groups["needs_difficulty"]), "",
+            "Needs difficulty: %s." % rows(groups["needs_difficulty"])]
+            + (["Epics with every ticket closed (check the done-when, then close): %s."
+                % rows(finished)] if finished else [])
+            + ["",
             "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
             "Written by the station from ticket data, because no brain reported in time."])
 
@@ -5395,6 +5501,7 @@ class Station:
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                               briefers=self.s.briefers,
                                review_check=self.s.review_check,
                                review_bot=self.s.review_bot,
                                limited=self.limited_lanes(),
