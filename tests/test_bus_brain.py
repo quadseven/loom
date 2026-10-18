@@ -2703,6 +2703,8 @@ class FakeRepo:
         added = re.fullmatch(r"/issues/(\d+)/labels", path)
         if added:
             found = [i for i in self.issues if i["number"] == int(added.group(1))]
+            if not found:
+                return reply(404, {"message": "Not Found"})
             found[0]["labels"] += [{"name": n} for n in payload["labels"]]
             return reply(200, found[0]["labels"])
         return None
