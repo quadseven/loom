@@ -158,56 +158,79 @@ def _pr_link(repo: str, pr: Dict[str, Any]) -> Dict[str, Any]:
             "state": _pr_state(pr), "sha": (pr.get("head") or {}).get("sha")}
 
 
-def collect(claimed: Iterable[Dict[str, Any]], ticket_rows: Iterable[Dict[str, Any]],
-            prs: Iterable[Dict[str, Any]], env: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-    """Every open item another operator holds, once each, with its owners
-    (operators.owners, the station's rule) and the pull requests linked to
-    it: the item itself when it is one, else every pull request in its repo
-    whose body names it, newest first."""
-    prs = list(prs)
+def _key(repo: Any, number: Any) -> str:
+    return "%s#%s" % (repo, number)
+
+
+def _ticket_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    """An open ticket record in the shape claim_record gives an issue."""
+    keep = ("repo", "number", "title", "html_url", "created_at", "updated_at", "author")
+    item = {key: row.get(key) for key in keep}
+    item.update(labels=list(row.get("labels") or []), assignees=list(row.get("assignees") or []),
+                pull_request=False)
+    return item
+
+
+def _candidates(claimed, ticket_rows, prs) -> Dict[str, Dict[str, Any]]:
+    """Every open item that might be held, once each: the claim lists first,
+    then open tickets, then open pull requests."""
     by_key: Dict[str, Dict[str, Any]] = {}
     for item in claimed:
-        by_key.setdefault("%s#%s" % (item.get("repo"), item.get("number")), dict(item))
+        by_key.setdefault(_key(item.get("repo"), item.get("number")), dict(item))
     for row in ticket_rows:
         if row.get("open", True):
-            by_key.setdefault("%s#%s" % (row.get("repo"), row.get("number")), {
-                "repo": row.get("repo"), "number": row.get("number"), "title": row.get("title"),
-                "html_url": row.get("html_url"), "created_at": row.get("created_at"),
-                "updated_at": row.get("updated_at"), "labels": list(row.get("labels") or []),
-                "assignees": list(row.get("assignees") or []), "author": row.get("author"),
-                "pull_request": False})
+            by_key.setdefault(_key(row.get("repo"), row.get("number")), _ticket_item(row))
     for pr in prs:
         repo = _repo_of(pr)
         if pr.get("state") == "open" and repo:
             item = claim_record(repo, pr)
             item["pull_request"] = True
-            by_key.setdefault("%s#%s" % (repo, pr.get("number")), item)
-    items = []
-    for key, item in by_key.items():
-        found = owners(item, env, pull_request=bool(item.get("pull_request")))
-        if not found:
-            continue
-        item["owners"] = found
-        item["via"] = sorted({"claim label" if "claim:" + o["login"] in [n.lower() for n in item["labels"]]
-                              else "assigned" for o in found})
-        item["loom_state"] = _loom_state(item["labels"])
-        items.append(item)
+            by_key.setdefault(_key(repo, pr.get("number")), item)
+    return by_key
+
+
+def _held(item: Dict[str, Any], env: Optional[Dict[str, str]]) -> bool:
+    """Set the item's owners, how it is held and its Loom state; whether
+    another operator holds it."""
+    found = owners(item, env, pull_request=bool(item.get("pull_request")))
+    if not found:
+        return False
+    labels = {name.lower() for name in item["labels"]}
+    item["owners"] = found
+    item["via"] = sorted({"claim label" if "claim:" + owner["login"] in labels else "assigned"
+                          for owner in found})
+    item["loom_state"] = _loom_state(item["labels"])
+    return True
+
+
+def _linked(item, index, pr_by_key) -> List[Dict[str, Any]]:
+    """The pull requests linked to an item: itself when it is one, else
+    those whose body names it and the one an adoption ticket's title names,
+    newest first, at most three."""
+    repo = item["repo"]
+    if item.get("pull_request"):
+        pr = pr_by_key.get(_key(repo, item["number"]))
+        return [_pr_link(repo, pr or {"number": item["number"], "html_url": item["html_url"]})]
+    linked = list(index.get(_key(repo, item["number"]), []))
+    adopted = _ADOPTED_RE.match(str(item.get("title") or ""))
+    pr = pr_by_key.get(_key(repo, adopted.group(1))) if adopted else None
+    if pr is not None and pr not in linked:
+        linked.append(pr)
+    linked.sort(key=lambda found: int(found.get("number") or 0), reverse=True)
+    return [_pr_link(repo, found) for found in linked[:3]]
+
+
+def collect(claimed: Iterable[Dict[str, Any]], ticket_rows: Iterable[Dict[str, Any]],
+            prs: Iterable[Dict[str, Any]], env: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """Every open item another operator holds, once each, with its owners
+    (operators.owners, the station's rule) and its linked pull requests,
+    oldest first."""
+    prs = list(prs)
+    items = [item for item in _candidates(claimed, ticket_rows, prs).values() if _held(item, env)]
     index = _ref_index(prs, {item["repo"] for item in items if not item.get("pull_request")})
-    pr_by_key = {"%s#%s" % (_repo_of(pr), pr.get("number")): pr for pr in prs}
+    pr_by_key = {_key(_repo_of(pr), pr.get("number")): pr for pr in prs}
     for item in items:
-        if item.get("pull_request"):
-            pr = pr_by_key.get("%s#%s" % (item["repo"], item["number"]))
-            item["linked"] = [_pr_link(item["repo"], pr or {"number": item["number"],
-                                                            "html_url": item["html_url"]})]
-        else:
-            linked = list(index.get("%s#%s" % (item["repo"], item["number"]), []))
-            # A Land or supersede ticket names the pull request it adopted.
-            adopted = _ADOPTED_RE.match(str(item.get("title") or ""))
-            pr = pr_by_key.get("%s#%s" % (item["repo"], adopted.group(1))) if adopted else None
-            if pr is not None and pr not in linked:
-                linked.append(pr)
-            linked = sorted(linked, key=lambda pr: int(pr.get("number") or 0), reverse=True)
-            item["linked"] = [_pr_link(item["repo"], pr) for pr in linked[:3]]
+        item["linked"] = _linked(item, index, pr_by_key)
     items.sort(key=lambda item: (str(item.get("created_at") or ""), str(item["repo"]), int(item["number"] or 0)))
     return items
 
