@@ -404,12 +404,14 @@ class Base(unittest.TestCase):
         self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS))
         self.heartbeat("codex")
 
-    def heartbeat(self, lane, available=True, age=0):
+    def heartbeat(self, lane, available=True, age=0, limited_models=None):
         d = os.path.join(self.home, "state", "usage")
         os.makedirs(d, exist_ok=True)
+        beat = {"lane": lane, "at": int(time.time()) - age, "available": available, "reason": ""}
+        if limited_models is not None:
+            beat["limited_models"] = limited_models
         with open(os.path.join(d, lane + ".json"), "w") as fh:
-            json.dump({"lane": lane, "at": int(time.time()) - age,
-                       "available": available, "reason": ""}, fh)
+            json.dump(beat, fh)
 
     def inbox(self, lane="codex", *sub):
         return os.path.join(self.home, "briefs", lane, *sub)
@@ -2249,6 +2251,24 @@ class ClaimTest(Base):
         self.assertEqual([c["body"] for c in self.fake.comments[12]],
                          ["Claimed for lane codex (body sha256 %s)" % sha])
 
+    def test_a_ticket_pinned_to_a_model_limited_on_its_lane_is_not_claimed(self):
+        # The lane is up (its ladder has another model), but not for this
+        # ticket's Model: until the limit lifts; a claim was parked at once and
+        # re-claimed every pass (24 claims in 90 minutes, 2026-10-18).
+        self.heartbeat("codex", limited_models={"model-x": int(time.time()) + 3600})
+        self.fake.add(12)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertFalse([c for c in self.fake.comments[12] if c["body"].startswith("Claimed")])
+
+    def test_a_limit_on_another_model_or_one_that_lifted_does_not_hold_the_claim(self):
+        self.heartbeat("codex", limited_models={"model-y": int(time.time()) + 3600,
+                                                "model-x": int(time.time()) - 60})
+        self.fake.add(12)
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
     def test_a_ticket_held_by_not_before_waits(self):
         self.fake.add(12, body="Not before: 2099-01-01T00:00:00Z\n" + BODY)
         self.run_pass()
@@ -2832,6 +2852,19 @@ class RetryTest(Base):
         self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
         self.assertIn("Not retried: no other eligible lane is available.", self.bodies()[-1])
+
+    def test_a_limit_with_no_other_lane_to_retry_on_is_not_a_failure(self):
+        # On 2026-10-18 such a limit went to loom:failed and the factory
+        # climbed the ticket a rung of the model ladder for it.
+        self.failed(body=BODY, reason="[limit] agent exited 3: provider limit reached; "
+                                      "lane codex waits until 2030-01-02T00:00:00Z")
+        self.run_pass()
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
+        said = [b for b in self.bodies() if b.startswith("Lane codex")]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("Lane codex is unavailable ([limit] agent exited 3", said[0])
+        self.assertIn("This is not a failure", said[0])
 
     def test_free_lanes_take_only_easy_tickets_on_public_repos(self):
         self.heartbeat("zen")

@@ -1013,6 +1013,25 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertNotIn("--model gpt-test-low", calls)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 
+    def test_the_heartbeat_names_each_limited_model_until_its_reset(self):
+        # The lane stays available for its other model; the station reads
+        # limited_models so a ticket pinned to the limited one is not claimed
+        # here again before the reset (it was, every pass, on 2026-10-18).
+        until = int(time.time()) + 3600
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / "codex.models").write_text(
+            "gpt-test-high %d provider-limit\ngpt-test-low %d provider-limit\n"
+            % (until, int(time.time()) - 60))
+        self.drop_brief("T042-fix-the-thing.md",
+                        BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-test-high"))
+        result = self.run_lane(LOOM_CODEX_MODELS="gpt-test-high gpt-test-low")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [limit] limit: requested model gpt-test-high limited until", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertTrue(beat["available"])
+        self.assertEqual(beat["limited_models"], {"gpt-test-high": until})
+
     def test_empty_api_credit_holds_the_lane_for_24_hours(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         before = int(time.time())

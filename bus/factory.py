@@ -80,7 +80,10 @@ Neither needs a model:
   spark lane's does while its box is hot) moves at once to a free lane in its
   difficulty tier (TIERS), or a ladder ticket to a free lane of its own rung.
   A limit is not a failure, so it never climbs; with no free lane the ticket
-  waits where it is for its lane to come back.
+  waits where it is for its lane to come back. A lane whose heartbeat names
+  the ticket's Model: among its limited_models (a model ladder lane, up for
+  its other models) counts as at a limit for that ticket, and the ladder
+  never climbs to a rung whose model is limited on every lane of it.
 - When no lane of a ticket's tier is up, a limit move or a queued assignment
   falls back to a free lane of the tiers FALLBACK lists (medium: hard, then
   easy), and says so in its note. The ticket's Difficulty: line is kept, so
@@ -922,7 +925,8 @@ class Factory:
                  no_test_repos: Sequence[str] = (),
                  available: Optional[Sequence[str]] = None,
                  close: Optional[Callable[..., Any]] = None,
-                 held: Sequence[str] = ()) -> None:
+                 held: Sequence[str] = (),
+                 model_limits: Optional[Dict[str, Dict[str, float]]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -935,6 +939,9 @@ class Factory:
         self.merge, self.fix, self.move = merge, fix, move
         self.close = close if close is not None else _default_close
         self.limited = set(limited)
+        # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
+        # is up while one model is limited, but not for that model.
+        self.model_limits = dict(model_limits or {})
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
         self.available = None if available is None else set(available)
@@ -1009,6 +1016,10 @@ class Factory:
     def _up(self, lane: str) -> bool:
         """A lane that is up and not at a limit."""
         return lane not in self.limited and (self.available is None or lane in self.available)
+
+    def _serves(self, lane: str, model: str) -> bool:
+        """Whether the lane can run this model now: no limit on it there."""
+        return model not in self.model_limits.get(lane, {})
 
     def _free(self, lane: str) -> bool:
         """A lane that is up, not at a limit, and holds no briefed or
@@ -1202,7 +1213,8 @@ class Factory:
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
         tried, reached = self._tried(issue, comments, failed_here, footer)
-        up = {n: tuple(lane for lane in self._rung_lanes(repo, n) if self._up(lane))
+        up = {n: tuple(lane for lane in self._rung_lanes(repo, n)
+                       if self._up(lane) and self._serves(lane, CLIMB[n - 1][1]))
               for n in range(1, len(CLIMB) + 1)}
         rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached)
         if not rung:
@@ -1603,7 +1615,7 @@ class Factory:
             # stalled, so it climbs nothing, and only a long hold is reported.
             self._tell_held(repo, issue, waiting)
             return
-        if _lane(issue) in self.limited:
+        if _lane(issue) in self.limited or not self._serves(_lane(issue), issue_model(issue)):
             self._step_aside(repo, issue)
             return
         if not self._spread(repo, issue):
@@ -1666,6 +1678,7 @@ class Factory:
         old = _lane(issue)
         pool = self._rung_lanes(repo, rung) if rung else tier_lanes(issue, self._is_private(repo))
         return [x for x in pool if x != old and self._up(x)
+                and (not rung or self._serves(x, CLIMB[rung - 1][1]))
                 and (x != "agy" or agy_takes_header(issue))]
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
@@ -1742,7 +1755,8 @@ class Factory:
         rung = current_rung(issue)
         fallback = ""
         if rung:
-            lane = next((x for x in self._rung_lanes(repo, rung) if x != old and self._free(x)), None)
+            lane = next((x for x in self._rung_lanes(repo, rung) if x != old and self._free(x)
+                         and self._serves(x, CLIMB[rung - 1][1])), None)
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None:

@@ -17,7 +17,10 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   list. Unpinned briefs use the first model not currently limited. A provider
   quota records a reset for that model; the lane remains available while
   another model is ready. A brief with a Model: line always keeps that model.
-  Account-wide out-of-credit limits still hold the lane.
+  Account-wide out-of-credit limits still hold the lane. The heartbeat names
+  each limited model and the epoch it lifts (`limited_models`); the station
+  claims no ticket for that model on the lane until then, and the factory
+  moves it as for a lane at a limit (a ladder ticket waits on its rung).
 - Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
   whose CLI or key is missing reports `available: false` and leaves its briefs
   alone; the dispatcher routes only to fresh, available lanes.
