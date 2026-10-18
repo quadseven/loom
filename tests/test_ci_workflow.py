@@ -17,5 +17,12 @@ class UnittestStep(unittest.TestCase):
         self.assertIn("set -o pipefail", step)
 
 
+class ConcurrencyTest(unittest.TestCase):
+    def test_runs_are_grouped_per_branch_and_pull_requests_cancel_older_runs(self):
+        text = WORKFLOW.read_text()
+        self.assertIn("concurrency:\n  group: test-${{ github.ref }}\n", text)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
+
+
 if __name__ == "__main__":
     unittest.main()

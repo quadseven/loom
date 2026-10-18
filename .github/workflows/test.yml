@@ -8,6 +8,15 @@ on:
 permissions:
   contents: read
 
+# One run per branch at a time. A newer push to main replaces main's waiting
+# run (the station deploys the newest commit whose run passed), and a newer
+# push to a pull request cancels its older run. The account runs five macOS
+# jobs at once; on 2026-10-18 eight queued main runs, one per merge, held the
+# lane pull requests and the self-deploy for over an hour.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   unittest:
     # macOS: the API-lane tests run the agent under sandbox-exec, which only
