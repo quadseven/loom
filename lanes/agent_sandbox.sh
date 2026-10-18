@@ -161,15 +161,42 @@ opencode_config() {
 # --auto lets it act without prompting, as 1.x run does.
 # Usage: opencode_run <key_var> <opencode binary> <run arguments...>
 opencode_run() {
-  local key_var="$1" bin="$2" port
+  local key_var="$1" bin="$2" port status before after output
   shift 2
   opencode_config || return 1
+  before="$(git rev-parse HEAD 2>/dev/null)" || return 1
+  output="$(mktemp "${TMPDIR:-/tmp}/loom-opencode.XXXXXX")" || return 1
   case "$(timeout "$NET_TIMEOUT" "$bin" --version < /dev/null 2> /dev/null | head -n 1)" in
     "opencode v2."*)
       port="$(python3 -c 'import secrets; print(49152 + secrets.randbelow(16384))')" || return 3
       OPENCODE_SERVER_PORT="$port" api_agent "$key_var" "$bin" run \
-        --server "http://127.0.0.1:$port" --auto -m "$MODEL" "$@"
-      return $? ;;
+        --server "http://127.0.0.1:$port" --auto -m "$MODEL" "$@" >"$output" 2>&1
+      status=$? ;;
+    *) api_agent "$key_var" "$bin" run -m "$MODEL" "$@" >"$output" 2>&1
+      status=$? ;;
   esac
-  api_agent "$key_var" "$bin" run -m "$MODEL" "$@"
+  cat "$output"
+  after="$(git rev-parse HEAD 2>/dev/null)" || { rm -f "$output"; return "$status"; }
+  if [ "$LANE" = spark ] && [ "$status" -eq 0 ] && [ "$before" = "$after" ] &&
+     [ ! -f .loom/summary.md ] && python3 -B - "$AGENT_HOME/.local/share/opencode/opencode.db" <<'PY'
+import sys
+from pathlib import Path
+from bus.sessions import opencode_events
+events = opencode_events(Path(sys.argv[1]))
+last_tool = max((i for i, event in enumerate(events) if event["kind"] == "tool"), default=-1)
+sys.exit(0 if any(event["kind"] == "assistant" for event in events[last_tool + 1:]) else 1)
+PY
+  then
+    rm -f "$output"
+    if [[ "$*" == *"--server"* ]]; then
+      api_agent "$key_var" "$bin" run --server "http://127.0.0.1:$port" --auto \
+        -m "$MODEL" --continue "Continue: carry out the step you just described, then commit or write .loom/summary.md"
+    else
+      api_agent "$key_var" "$bin" run -m "$MODEL" --continue \
+        "Continue: carry out the step you just described, then commit or write .loom/summary.md"
+    fi
+    return $?
+  fi
+  rm -f "$output"
+  return "$status"
 }

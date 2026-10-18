@@ -212,6 +212,11 @@ work_note() {
   printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
+spark_work_note() {
+  [ "$LANE" = spark ] || return 0
+  printf '\n- Do not search the whole filesystem (for example, `find /`). Read the repository build files and search within the repository instead.\n'
+}
+
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
 # sandbox -- an empty or one-line added file named .test* or under a new
 # top-level bin/, referenced nowhere else in the diff -- and removes them
@@ -1346,7 +1351,7 @@ markers_left() {
 
 run_agent() {
   local brief_text
-  brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
+  brief_text="$(cat "$1")$(work_note)$(spark_work_note)$(validation_note)$(summary_note)"
   AGENT_EXTRA_ENV=""
   is_api_lane && fresh_agent_home
   case "$LANE" in
