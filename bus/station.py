@@ -980,13 +980,19 @@ class Station:
         data = self.gh.graphql(
             "query($owner:String!,$name:String!,$number:Int!){"
             "repository(owner:$owner,name:$name){issue(number:$number){"
-            "editor{login} lastEditedAt}}}", {"owner": owner, "name": name, "number": number})
+            "editor{__typename login} lastEditedAt}}}",
+            {"owner": owner, "name": name, "number": number})
         issue = ((data or {}).get("repository") or {}).get("issue")
         if issue is None:
             raise GitHubError("graphql returned no issue %s#%d" % (repo, number))
         editor = issue.get("editor")
         if editor and editor.get("login"):
-            return str(editor["login"])
+            login = str(editor["login"])
+            # GraphQL names a GitHub App "loom-app"; REST, and so
+            # LOOM_BRIEF_AUTHORS, name it "loom-app[bot]".
+            if editor.get("__typename") == "Bot" and not login.endswith("[bot]"):
+                login += "[bot]"
+            return login
         # Edited, but GitHub names no editor (a deleted account): nobody on
         # the list can vouch for this body.
         return "(deleted account)" if issue.get("lastEditedAt") else None
