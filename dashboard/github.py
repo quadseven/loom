@@ -41,6 +41,12 @@ REQUEST_LOG_SECONDS = 3600
 OPERATOR_CLAIMS_SECONDS = 900
 OPERATOR_CLAIM_LABELS = 10
 OPERATOR_CHECK_READS = 30
+# needs:<login> lists (loom#810) ride the same pass: at most this many needs
+# labels are listed per repo, and at most this many items' latest comments
+# (the ask) are read in one pass; an item whose updated_at did not change
+# keeps the ask the last pass read.
+OPERATOR_NEEDS_LABELS = 10
+OPERATOR_ASK_READS = 30
 LOG = logging.getLogger(__name__)
 
 
@@ -517,31 +523,73 @@ class TicketStore:
             return
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             results = list(pool.map(self._claims_for_repo, self.repos))
-        claimed, errors = [], []
-        for repo, (found, error) in zip(self.repos, results, strict=True):
+        claimed, waiting, errors = [], [], []
+        for repo, (found, needs, error) in zip(self.repos, results, strict=True):
             if error:
                 errors.append(error)
                 found = [item for item in previous.get("items") or [] if item.get("repo") == repo]
+                needs = [item for item in previous.get("needs") or [] if item.get("repo") == repo]
             claimed.extend(found)
+            waiting.extend(needs)
         rows = [row for found in (data.get("tickets") or {}).values() if found for row in found]
         items = operators.collect(claimed, rows, data.get("pull_requests") or [])
         checks = self._read_claim_checks(items, errors)
-        data["operator_claims"] = {"items": items, "checks": checks, "error": "; ".join(errors),
+        needs = operators.collect_needs(waiting)
+        self._read_asks(needs, previous.get("needs") or [], errors)
+        data["operator_claims"] = {"items": items, "checks": checks, "needs": needs, "error": "; ".join(errors),
                                    "read_at": now, "every": OPERATOR_CLAIMS_SECONDS, "retry": bool(errors)}
 
-    def _claims_for_repo(self, repo: str) -> Tuple[List[Dict[str, Any]], str]:
+    def _claims_for_repo(self, repo: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+        """One repo's foreign claim:<login> items and needs:<login> items,
+        from its label list and one open list per such label."""
         path = quote(repo, safe="/")
         found: List[Dict[str, Any]] = []
+        needs: List[Dict[str, Any]] = []
         try:
             names = [label.get("name") for label in self.gh.paginate("/repos/%s/labels?per_page=100" % path)
                      if isinstance(label, dict) and isinstance(label.get("name"), str)]
             for name in operators.foreign_claim_labels(names)[:OPERATOR_CLAIM_LABELS]:
-                issues = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
-                                          % (path, quote(name, safe="")))
-                found.extend(operators.claim_record(repo, issue) for issue in issues if isinstance(issue, dict))
+                found.extend(operators.claim_record(repo, issue) for issue in self._open_with_label(path, name))
+            for name in operators.needs_labels(names)[:OPERATOR_NEEDS_LABELS]:
+                needs.extend(operators.needs_record(repo, issue) for issue in self._open_with_label(path, name))
         except (GitHubError, OSError, ValueError) as exc:
-            return found, "%s claims: %s" % (repo, self._error_reason(exc))
-        return found, ""
+            return found, needs, "%s claims: %s" % (repo, self._error_reason(exc))
+        return found, needs, ""
+
+    def _open_with_label(self, path: str, name: str) -> List[Dict[str, Any]]:
+        issues = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100" % (path, quote(name, safe="")))
+        return [issue for issue in issues if isinstance(issue, dict)]
+
+    def _read_asks(self, needs, previous, errors) -> None:
+        """Set each needs:<login> item's ask: the first line of its latest
+        comment. An item whose updated_at is unchanged keeps the last pass's
+        ask; an item with no comment has none; at most OPERATOR_ASK_READS
+        comment reads a pass (one page of one comment each), the rest keep
+        their last ask or say it is not read yet."""
+        kept = {"%s#%s" % (item.get("repo"), item.get("number")): item for item in previous}
+        reads = 0
+        for item in needs:
+            old = kept.get("%s#%s" % (item.get("repo"), item.get("number"))) or {}
+            if old.get("updated_at") == item.get("updated_at") and "ask" in old:
+                item["ask"] = old["ask"]
+            elif not item.get("comments"):
+                item["ask"] = ""
+            elif reads >= OPERATOR_ASK_READS:
+                item["ask"] = old.get("ask")
+            else:
+                reads += 1
+                item["ask"] = self._read_ask(item, errors, old.get("ask"))
+
+    def _read_ask(self, item, errors, fallback) -> Optional[str]:
+        try:
+            resp = self.gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=1&page=%d" % (
+                quote(str(item["repo"]), safe="/"), int(item["number"]), int(item["comments"])))
+        except (GitHubError, OSError, ValueError) as exc:
+            errors.append("%s#%s ask: %s" % (item["repo"], item["number"], self._error_reason(exc)))
+            return fallback
+        found = resp.data if isinstance(resp.data, list) else []
+        latest = found[-1] if found and isinstance(found[-1], dict) else {}
+        return operators.ask_line(latest.get("body"))
 
     def _read_claim_checks(self, items, errors) -> Dict[str, Dict[str, Any]]:
         """repo@sha -> operators.checks_summary of each open linked pull

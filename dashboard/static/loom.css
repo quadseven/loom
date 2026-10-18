@@ -701,3 +701,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .operators-note { max-width: 72ch; margin: 0 0 14px; color: var(--body); font-size: 14px; line-height: 1.5; }
 .operators-adopted { margin: 0 0 18px; }
 .operators-adopted > .machine-fact, .operators-read { margin: 4px 0 10px; color: var(--muted); font-size: 12px; }
+.operators-sub { display: block; margin: 12px 0 6px; }
+.operators-ask { color: var(--body); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+.waiting-on { margin: 6px 0 10px; padding: 0; list-style: none; }
+.waiting-on li { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }

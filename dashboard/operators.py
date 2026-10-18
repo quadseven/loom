@@ -121,6 +121,58 @@ def claim_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
             "pull_request": "pull_request" in issue}
 
 
+# needs:<login> (loom#810): an issue or pull request waiting on one person,
+# with a comment that names the exact ask. Unlike claim:<login>, every login
+# is listed, this Loom's own included: the person named is the one who has
+# to act. needs:<login> never blocks a lane (bus.tickets.owned_elsewhere
+# ignores it); the dashboard only shows it.
+NEEDS_PREFIX = "needs:"
+ASK_CHARS = 200
+_MARKER_RE = re.compile(r"<!--.*?-->", re.S)
+_LEAD_RE = re.compile(r"^(?:[#>]+\s*|[-*+]\s+)+")
+
+
+def needs_labels(names: Iterable[str]) -> List[str]:
+    """The needs:<login> label names in a repo's label list."""
+    return [name for name in names if isinstance(name, str) and name.lower().startswith(NEEDS_PREFIX)
+            and _login(name[len(NEEDS_PREFIX):])]
+
+
+def needs_of(labels: Iterable[str]) -> List[str]:
+    """The logins an item's needs:<login> labels name, once each, in order."""
+    return list(dict.fromkeys(_login(name[len(NEEDS_PREFIX):]) for name in needs_labels(labels)))
+
+
+def needs_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
+    """The fields the Operators page reads from a needs:<login> list item."""
+    item = claim_record(repo, issue)
+    comments = issue.get("comments")
+    item["comments"] = comments if isinstance(comments, int) and comments > 0 else 0
+    item["waiting_on"] = needs_of(item["labels"])
+    return item
+
+
+def collect_needs(found: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Each needs:<login> item once (an item with two needs labels is in two
+    lists), oldest first."""
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for item in found:
+        if item.get("waiting_on"):
+            by_key.setdefault(_key(item.get("repo"), item.get("number")), item)
+    return sorted(by_key.values(), key=lambda item: (str(item.get("created_at") or ""), str(item["repo"]),
+                                                      int(item["number"] or 0)))
+
+
+def ask_line(body: Any) -> str:
+    """The first line of a comment that carries words: the ask, with HTML
+    comment markers and leading markdown marks dropped, at most ASK_CHARS."""
+    for line in _MARKER_RE.sub("", str(body or "")).splitlines():
+        line = _LEAD_RE.sub("", line.strip()).strip()
+        if line:
+            return line if len(line) <= ASK_CHARS else line[:ASK_CHARS - 3].rstrip() + "..."
+    return ""
+
+
 def _loom_state(labels: Iterable[str]) -> Optional[str]:
     return next((name[5:] for name in labels if name.startswith("loom:") and name[5:] in
                  ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")), None)
@@ -350,6 +402,88 @@ def _table(rows: List[Dict[str, Any]], checks, now) -> str:
         TABLE_HEAD, "".join(_row(item, checks, now) for item in rows))
 
 
+def person_groups(items: Iterable[Dict[str, Any]],
+                  needs: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    """login -> {"waiting": items labelled needs:<login>, "claimed": items
+    that login holds}. An item claimed by one login and waiting on another
+    is a row in each group, never merged into one."""
+    groups: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for item in needs:
+        for login in item.get("waiting_on") or []:
+            groups.setdefault(login, {"waiting": [], "claimed": []})["waiting"].append(item)
+    for item in items:
+        for owner in item.get("owners") or []:
+            groups.setdefault(owner["login"], {"waiting": [], "claimed": []})["claimed"].append(item)
+    return groups
+
+
+def _group_size(group: Dict[str, List[Dict[str, Any]]]) -> int:
+    return len(group["waiting"]) + len(group["claimed"])
+
+
+def _ask_text(item: Dict[str, Any]) -> Tuple[str, str]:
+    ask = item.get("ask")
+    if ask is None:
+        return "ask not read yet", "the latest comment is read on a later refresh"
+    if not ask:
+        return "no comment names the ask", "this item has no comment, or its latest comment is empty"
+    return ask, "first line of the latest comment"
+
+
+def _waiting_row(item: Dict[str, Any], now: float) -> str:
+    esc = html.escape
+    ref = "%s#%s" % (str(item["repo"]).split("/")[-1], item["number"])
+    ask, ask_title = _ask_text(item)
+    created = _stamp(item.get("created_at"))
+    age = _age(now - created) if created else "-"
+    updated = _stamp(item.get("updated_at"))
+    age_title = "opened %s ago" % age + ("; updated %s ago" % _age(now - updated) if updated else "")
+    return ('<tr><td class="tickets-ticket"><a href="%s" title="%s"><span class="machine-fact">%s</span>'
+            '<span class="tickets-title">%s</span></a></td><td class="operators-ask" title="%s">%s</td>'
+            '<td class="tickets-age machine-fact" title="%s">%s</td><td class="tickets-pr machine-fact">%s</td>'
+            '</tr>') % (
+        esc(str(item.get("html_url") or ""), quote=True), esc(str(item.get("title") or ""), quote=True),
+        esc(ref), esc(str(item.get("title") or "")), esc(ask_title, quote=True), esc(ask),
+        esc(age_title, quote=True), esc(age), "PR" if item.get("pull_request") else "issue")
+
+
+WAITING_HEAD = ('<colgroup><col><col><col class="c-age"><col class="c-pr"></colgroup><thead><tr>'
+                '<th scope="col">Item</th><th scope="col">Ask</th><th scope="col">Age</th>'
+                '<th scope="col">Kind</th></tr></thead>')
+
+
+def _group_html(login: str, group: Dict[str, List[Dict[str, Any]]], checks, now: float) -> str:
+    esc = html.escape
+    body = []
+    if group["waiting"]:
+        body.append('<h3 class="label operators-sub">Waiting on %s</h3><table class="tickets-table">%s<tbody>%s'
+                    '</tbody></table>' % (esc(login), WAITING_HEAD,
+                                          "".join(_waiting_row(item, now) for item in group["waiting"])))
+    if group["claimed"]:
+        heading = ('<h3 class="label operators-sub">Claimed by %s</h3>' % esc(login)) if group["waiting"] else ""
+        body.append(heading + _table(group["claimed"], checks, now))
+    return ('<details class="tickets-group" id="person-%s" open><summary><span class="tickets-group-title">%s'
+            '</span><span class="machine-fact tickets-count">%d</span></summary>%s</details>'
+            % (esc(login, quote=True), esc(login), _group_size(group), "".join(body)))
+
+
+def floor_html(source: Optional[Dict[str, Any]]) -> str:
+    """The Floor's per-person count of open needs:<login> items, each linking
+    to that person's group on the Operators page; "" when there are none."""
+    counts: Dict[str, int] = {}
+    for item in (source or {}).get("needs") or []:
+        for login in item.get("waiting_on") or []:
+            counts[login] = counts.get(login, 0) + 1
+    if not counts:
+        return ""
+    esc = html.escape
+    rows = "".join('<li><a href="/operators#person-%s">%s</a> <strong class="count">%d</strong></li>' % (
+        esc(login, quote=True), esc(login), counts[login])
+        for login in sorted(counts, key=lambda login: (-counts[login], login)))
+    return ('<section class="card waiting-on-card"><span class="label">Waiting on a person</span>'
+            '<ul class="waiting-on">%s</ul><a href="/operators">who holds what &rarr;</a></section>' % rows)
+
+
 def render(source: Optional[Dict[str, Any]], now: float, env: Optional[Dict[str, str]] = None) -> str:
     """The Operators page body from TicketStore's operator_claims."""
     esc = html.escape
@@ -377,21 +511,16 @@ def render(source: Optional[Dict[str, Any]], now: float, env: Optional[Dict[str,
                      'operator claimed</h2><p class="machine-fact">loom:queued and claimed: Loom adopted '
                      'these pull requests and now waits for their operator to land or close them.</p>'
                      '%s</section>' % _table(adopted, checks, now))
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for item in items:
-        for owner in item.get("owners") or []:
-            groups.setdefault(owner["login"], []).append(item)
+    groups = person_groups(items, source.get("needs") or [])
     if not groups:
         parts.append('<div class="empty-state"><p>No open issue or pull request in LOOM_REPOS is held by '
-                     'another operator.</p></div>')
-    for login in sorted(groups, key=lambda login: (-len(groups[login]), login)):
-        rows = groups[login]
-        parts.append('<details class="tickets-group" open><summary><span class="tickets-group-title">%s</span>'
-                     '<span class="machine-fact tickets-count">%d</span></summary>%s</details>'
-                     % (esc(login), len(rows), _table(rows, checks, now)))
+                     'another operator or waiting on a person.</p></div>')
+    for login in sorted(groups, key=lambda login: (-_group_size(groups[login]), login)):
+        parts.append(_group_html(login, groups[login], checks, now))
     parts.append('<p class="machine-fact operators-read">Read %s ago, every %d minutes. An issue assigned to '
                  'another operator with no <code>claim:</code> label shows here only when it is a Loom ticket '
-                 'or a pull request.</p>' % (_age(now - _number(source.get("read_at"))),
+                 'or a pull request. An item labelled <code>needs:&lt;login&gt;</code> waits on that person, '
+                 'whoever they are; the ask is the first line of its latest comment.</p>' % (_age(now - _number(source.get("read_at"))),
                                             int(source.get("every") or 0) // 60))
     return '<section class="operators-view">%s</section>' % "".join(parts)
 
