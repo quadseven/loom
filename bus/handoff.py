@@ -87,10 +87,23 @@ def done_marker(stage: str, item: Tuple[str, int], holder: str,
 
 def journals(comments: Iterable[Dict[str, Any]], authors: Sequence[str]) -> List[Dict[str, Any]]:
     """Journal comments from allowed logins, oldest first. Each comment is
-    {"body", "at", "login"}; anything else is data, never a handoff."""
-    found = [c for c in comments if c.get("login") in authors
+    {"body", "at", "login"}; anything else is data, never a handoff. GitHub
+    logins ignore case, so the match does too."""
+    allowed = {a.lower() for a in authors}
+    found = [c for c in comments if str(c.get("login") or "").lower() in allowed
              and str(c.get("body") or "").startswith(JOURNAL_MARKER) and c.get("at")]
     return sorted(found, key=lambda c: str(c["at"]))
+
+
+def untrusted_journal_logins(comments: Iterable[Dict[str, Any]],
+                             authors: Sequence[str]) -> List[str]:
+    """The logins that wrote a journal-shaped comment but are not in
+    `authors`, sorted: what a brain skipped, so a trust list missing the
+    operator shows in its output instead of as "no stage handoffs"."""
+    allowed = {a.lower() for a in authors}
+    return sorted({str(c.get("login") or "") for c in comments
+                   if str(c.get("body") or "").startswith(JOURNAL_MARKER)
+                   and str(c.get("login") or "").lower() not in allowed})
 
 
 def marks(found: Iterable[Dict[str, Any]]) -> List[Mark]:

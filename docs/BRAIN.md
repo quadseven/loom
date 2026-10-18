@@ -888,7 +888,13 @@ with the `stage=brief` done line and the new ticket. A brief without
 `--holder`, on a goal with no standing brief defer, or refused, posts no
 journal and changes no marker; so does a `--regresses` brief, which is
 the `regression` stage. Only journals from `LOOM_BRIEF_AUTHORS` logins
-count. For each stage and item the newest line wins. Brief defers carry a
+count, matched without regard to case, and a GitHub App counts by its REST
+login `<app-slug>[bot]` (the status query asks for the author type to read
+it that way). `status` and `resume` refuse to run while the setting is
+empty, since they would report no handoffs and every stage open; both print
+the logins they trust first, and `resume` names, per goal, the logins whose
+journals it skipped. Set it on every brain to the operator's login and the
+Loom App's bot login. For each stage and item the newest line wins. Brief defers carry a
 stable key derived from their normalized note, so one goal can hold multiple
 independent brief handoffs. A written brief can name the one it finishes with
 `--resolves KEY`; a keyless done marker retires only legacy unkeyed brief

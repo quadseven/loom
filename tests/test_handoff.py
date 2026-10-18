@@ -193,6 +193,31 @@ class ResumeCommandTests(unittest.TestCase):
         self.assertIn("- resume failed %s#9" % REPO, out)
         self.assertIn("- stage merge: yielded by muse", out)
 
+    def test_resume_refuses_an_empty_trust_list_before_any_read(self):
+        # loom#783: with LOOM_BRIEF_AUTHORS empty, resume trusted nobody,
+        # printed "no stage handoffs" on every goal and called every stage open.
+        fake = Routes(self.routes())
+        with self.assertRaisesRegex(ValueError, "resume trusts no login: LOOM_BRIEF_AUTHORS is empty"):
+            brain.resume(GitHub("t", transport=fake), [REPO], "lane-machine", LOCK_REPO, NOW, {})
+        self.assertEqual([], fake.calls)
+
+    def test_resume_names_the_trusted_logins_and_the_journal_logins_it_skipped(self):
+        # The operator journals on the goal, but the setting names only the
+        # App: the goal shows no handoffs, and now also who was skipped.
+        out = brain.resume(GitHub("t", transport=Routes(self.routes())), [REPO],
+                           "lane-machine", LOCK_REPO, NOW,
+                           {"LOOM_BRIEF_AUTHORS": "example-app[bot]"})
+        self.assertIn("Trusted logins (LOOM_BRIEF_AUTHORS): example-app[bot]", out)
+        goal = out.split("## %s#1 Goal" % REPO, 1)[1].split("\n## ", 1)[0]
+        self.assertIn("- no stage handoffs", goal)
+        self.assertIn("- skipped journals by logins not in LOOM_BRIEF_AUTHORS: allowed-bot", goal)
+
+    def test_resume_matches_a_trusted_login_in_any_case(self):
+        out = brain.resume(GitHub("t", transport=Routes(self.routes())), [REPO],
+                           "lane-machine", LOCK_REPO, NOW, {"LOOM_BRIEF_AUTHORS": "Allowed-Bot"})
+        self.assertIn("- resume merge %s#7 (deferred by muse at %s)" % (REPO, at(5)), out)
+        self.assertNotIn("skipped journals", out)
+
     def test_anyone_but_the_lock_holder_is_refused_before_any_read(self):
         for lock in ({"holder": "muse"}, {"expires": "2030-01-01T11:00:00Z"}):
             with self.subTest(**lock):
