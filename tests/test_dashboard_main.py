@@ -46,7 +46,7 @@ class DashboardHostTest(unittest.TestCase):
         self.assertEqual(server.server_address[0], "0.0.0.0")  # noqa: S104 - asserts the default
 
     def test_a_host_that_is_not_one_ipv4_address_is_refused(self):
-        for bad in ("127.0.0.1; true", "dashboard.example", "127.0.0.1 10.0.0.1", "::1", "300.1.1.1"):
+        for bad in ("127.0.0.1; true", "dashboard.example", "127.0.0.1 10.0.0.1", "01.2.3.4", "10.0.0.08", "::1", "300.1.1.1"):
             with self.subTest(bad=bad), _env(LOOM_DASHBOARD_PORT="0", LOOM_DASHBOARD_HOST=bad):
                 with self.assertRaisesRegex(ValueError, "LOOM_DASHBOARD_HOST"):
                     server_from_env(store=_Store())

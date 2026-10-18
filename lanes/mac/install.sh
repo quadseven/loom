@@ -124,12 +124,15 @@ DASHBOARD_HOST="${LOOM_DASHBOARD_HOST:-}"
 if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
   [[ "$DASHBOARD_PORT" =~ ^[0-9]+$ ]] ||
     { echo "LOOM_DASHBOARD_PORT must be a port number" >&2; exit 1; }
-  # Empty (every interface) or one IPv4 address, each part 0-255.
+  # Empty (every interface) or one IPv4 address, each part 0-255 with no
+  # leading zero (Python's ipaddress, which the dashboard checks with, refuses one).
   if [ -n "$DASHBOARD_HOST" ]; then
     ok=0
     if [[ "$DASHBOARD_HOST" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
       ok=1
-      for part in "${BASH_REMATCH[@]:1}"; do [ "$((10#$part))" -le 255 ] || ok=0; done
+      for part in "${BASH_REMATCH[@]:1}"; do
+        case "$part" in 0?*) ok=0 ;; *) [ "$part" -le 255 ] || ok=0 ;; esac
+      done
     fi
     [ "$ok" = 1 ] ||
       { echo "LOOM_DASHBOARD_HOST must be empty or one IPv4 address" >&2; exit 1; }

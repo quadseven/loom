@@ -394,7 +394,7 @@ class InstallScriptTest(unittest.TestCase):
         self.assertNotIn("com.loom.dashboard", result.stdout)
 
     def test_a_dashboard_host_that_is_not_one_ipv4_address_installs_nothing(self):
-        for bad in ("127.0.0.1; true", "dashboard.example", "127.0.0.1 10.0.0.1", "300.1.1.1"):
+        for bad in ("127.0.0.1; true", "dashboard.example", "127.0.0.1 10.0.0.1", "01.2.3.4", "10.0.0.08", "300.1.1.1"):
             with self.subTest(bad=bad):
                 result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DASHBOARD_HOST=bad)
                 self.assertEqual(result.returncode, 1)
