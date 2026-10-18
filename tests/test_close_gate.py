@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from bus.github import GitHub
+from bus.github import GitHub, GitHubError
 
 
 def reply(status=200, body=None):
@@ -94,6 +94,27 @@ class CloseGateTests(unittest.TestCase):
         gh.rest("PATCH", "/repos/quadseven/conducted/issues/209",
                 {"state": "closed"})
         self.assertEqual([c[0] for c in fake.calls], ["GET", "PATCH"])
+
+    def test_failed_issue_read_refuses_the_close(self):
+        # loom#656: the verification GET failing must not let the close
+        # through. The error rises out of rest() and the PATCH is never sent.
+        fake = Fake(reply(500, {"message": "boom"}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaises(GitHubError):
+            gh.rest("PATCH", "/repos/quadseven/conducted/issues/209",
+                    {"state": "closed"})
+        self.assertEqual([c[0] for c in fake.calls], ["GET"])
+
+    def test_unreadable_issue_body_refuses_the_close(self):
+        # loom#656: a 2xx read with an empty or non-JSON answer used to become
+        # {} -- no labels, no criteria -- and the close went through unchecked.
+        for raw in (b"", b"<html>not json</html>", b"[]"):
+            fake = Fake((200, {}, raw), reply(200, {}))
+            gh = GitHub("t", transport=fake)
+            with self.assertRaisesRegex(GitHubError, "cannot read"):
+                gh.rest("PATCH", "/repos/quadseven/conducted/issues/209",
+                        {"state": "closed"})
+            self.assertEqual([c[0] for c in fake.calls], ["GET"])
 
 
 if __name__ == "__main__":
