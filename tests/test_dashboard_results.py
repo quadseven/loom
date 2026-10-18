@@ -89,12 +89,13 @@ class ResultsPage(unittest.TestCase):
         self.assertIn("ET", notice)
 
     def test_stale_notice_without_a_read_or_a_refresh_time_says_so_in_plain_words(self):
-        notice = server._stale_notice({"ticket_refreshed_at": None, "stale_reason": "",
-                                       "next_refresh_at": None}, now=3400)
-        self.assertNotIn("0 minutes old", notice)
-        self.assertNotIn("at after", notice)
-        self.assertIn("Ticket data has not been read yet", notice)
-        self.assertIn("it refreshes once GitHub can be reached", notice)
+        for invalid in (None, 0, -5, False, "EOF"):
+            notice = server._stale_notice({"ticket_refreshed_at": None, "stale_reason": "",
+                                           "next_refresh_at": invalid}, now=3400)
+            self.assertNotIn("0 minutes old", notice)
+            self.assertNotIn("at after", notice)
+            self.assertIn("Ticket data has not been read yet", notice)
+            self.assertIn("it refreshes once GitHub can be reached", notice)
 
     def test_not_looked_names_window_source_and_next_check(self):
         data = results.build_results(payload(hot_spots_error="issue comments could not be read"), NOW)
