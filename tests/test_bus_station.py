@@ -73,6 +73,7 @@ class FakeGitHub:
         self.replies = []
         self.resolved = []
         self.open_issues = []
+        self.bot = AUTHORS[0]
         # Issues of other repos, read by an After: line: (repo, number) -> issue.
         self.foreign = {}
         # Check runs per commit, files per pull request, the commits the
@@ -354,23 +355,32 @@ class FakeGitHub:
         self.version += 1
         return reply(201 if method == "POST" else 200, [])
 
+    def _get_issue(self, n, sub):
+        if sub == "sub_issues":
+            return reply(200, self.sub_issues.get(n, []))
+        found = {None: self.issues, "events": self.events, "comments": self.comments}
+        if sub in found:
+            if sub is None and n not in found[sub]:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, found[sub][n])
+        return None
+
+    def _patch_issue(self, n, data):
+        for key in ("body", "state", "state_reason"):
+            if key in data:
+                self.issues[n][key] = data[key]
+        return reply(200, {})
+
     def _issue_call(self, method, n, sub, data):
         if method == "GET":
-            if sub == "sub_issues":
-                return reply(200, self.sub_issues.get(n, []))
-            if sub == "events" and n not in self.issues:
-                return reply(200, self.events[n])
-            found = {None: self.issues, "events": self.events, "comments": self.comments}
-            if sub in found:
-                if sub is None and n not in found[sub]:
-                    return reply(404, {"message": "Not Found"})
-                return reply(200, found[sub][n])
+            result = self._get_issue(n, sub)
+            if result is not None:
+                return result
         if method == "POST" and sub == "comments":
-            self.comments[n].append({"body": data["body"]})
+            self.comments[n].append({"body": data["body"], "user": {"login": self.bot}})
             return reply(201, {})
         if method == "PATCH" and sub is None:
-            self.issues[n]["body"] = data["body"]
-            return reply(200, {})
+            return self._patch_issue(n, data)
         if method == "POST" and sub == "sub_issues":
             self.sub_issues.setdefault(n, []).append(self.issues.get(data["sub_issue_id"] - 1000, {}))
             return reply(201, {})
@@ -5847,6 +5857,43 @@ class VerifyResultTest(Base):
         self.assertTrue(all(done for done, _ in proof.criteria(self.fake.issues[5]["body"])))
         comments = [c["body"] for c in self.fake.comments[5]]
         self.assertTrue(any(c.startswith(proof.PROOF_MARKER) for c in comments))
+
+    def test_a_valid_proof_verifies_and_closes_the_ticket(self):
+        self.result(self.good())
+        self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertNotIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "closed")
+        self.assertEqual(self.fake.issues[5].get("state_reason"), "completed")
+
+    def test_a_verified_ticket_with_an_unticked_box_is_not_closed(self):
+        self.result(self.good())
+        original_move = brain.move
+
+        def move_then_untick(gh, repo, number, state, **kwargs):
+            original_move(gh, repo, number, state, **kwargs)
+            body = self.fake.issues[number]["body"]
+            self.fake.issues[number]["body"] = body + "\n- [ ] A late criterion"
+
+        with mock.patch.object(brain, "move", side_effect=move_then_untick):
+            with mock.patch("bus.station._say") as say:
+                self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertNotIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "open")
+        logged = " ".join(str(c) for c in say.call_args_list)
+        self.assertIn("A late criterion", logged)
+        self.assertIn("verified but not closed", logged)
+
+    def test_a_github_failure_on_close_is_logged_and_the_ticket_stays_verified(self):
+        self.result(self.good())
+        err = station.GitHubError("server error", 502)
+        with mock.patch.object(brain, "close", side_effect=err):
+            with mock.patch("bus.station._say") as say:
+                self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "open")
+        self.assertIn("verified but not closed", " ".join(str(c) for c in say.call_args_list))
 
     def proofs(self):
         return [c["body"] for c in self.fake.comments[5] if c["body"].startswith(proof.PROOF_MARKER)]

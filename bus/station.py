@@ -2295,6 +2295,11 @@ class Station:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
             return
         _say("verified %s#%d from the proof lane %s gathered" % (repo, number, lane))
+        try:
+            brain.close(self.gh, repo, number, reason="completed",
+                        env={"LOOM_BRIEF_AUTHORS": " ".join(self.s.authors)})
+        except (ValueError, GitHubError) as err:
+            _say("verified but not closed %s#%d: %s" % (repo, number, self._note_text(err)))
 
     def _record_slot_sample(self, idle: bool) -> None:
         if not self.s.metrics_goal:
