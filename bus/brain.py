@@ -845,10 +845,12 @@ def _with_part_of(body: str, goal: int) -> str:
     return body.rstrip("\n") + "\n\n" + part_of_line(goal) + "\n"
 
 
-def _part_of_hits(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+def _part_of_hits(gh: GitHub, repo: str, goal: int,
+                  label: Optional[str] = "loom:ticket") -> List[Dict[str, Any]]:
     """loom:ticket issues in the repo that the Part of #goal search finds
     (the search also matches loose words, so the line is not yet checked)."""
-    q = quote('repo:%s is:issue label:loom:ticket in:body "%s"' % (repo, part_of_line(goal)))
+    label_query = " label:%s" % label if label else ""
+    q = quote('repo:%s is:issue%s in:body "%s"' % (repo, label_query, part_of_line(goal)))
     url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
     found: List[Dict[str, Any]] = []
     for _ in range(SEARCH_PAGES):
@@ -916,15 +918,14 @@ def _epic_label(issue: Dict[str, Any]) -> bool:
     return "epic" in [name.lower() for name in _labels(issue)]
 
 
-def _direct_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
-    """Sub-issues of the goal, then, once the goal holds GitHub's limit of
-    sub-issues (the only way a ticket gets a Part of line instead), the Part
-    of #goal tickets not already listed. Below the limit it costs no search."""
+def _direct_children(gh: GitHub, repo: str, goal: int,
+                     part_of: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sub-issues of the goal, then Part-of tickets not already listed."""
     children = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal)))
-    if len(children) < SUB_ISSUE_LIMIT:
-        return children
     seen = {int(c.get("number") or 0) for c in children if isinstance(c, dict)}
-    for item in _part_of_issues(gh, repo, goal):
+    for item in part_of:
+        if "loom:ticket" not in _labels(item) or not _names_goal(item.get("body"), goal):
+            continue
         number = int(item.get("number") or 0)
         if number and number not in seen:
             children.append(item)
@@ -933,18 +934,15 @@ def _direct_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
 
 
 def _goal_epics(gh: GitHub, repo: str, goal: int,
-                direct: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The goal's epics, open and closed: its sub-issues labelled epic, and,
-    once the goal holds GitHub's limit of sub-issues, the repo's epics whose
-    body says Part of #goal (one conditional list read, no search)."""
+                direct: List[Dict[str, Any]],
+                part_of: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The goal's epics, open and closed, linked by sub-issue or Part-of line."""
     epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
-    if len(direct) < SUB_ISSUE_LIMIT:
-        return epics
     seen = {int(e.get("number") or 0) for e in epics}
-    for item in gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
-        number = int((item or {}).get("number") or 0) if isinstance(item, dict) else 0
+    for item in part_of:
+        number = int(item.get("number") or 0) if isinstance(item, dict) else 0
         if (number and number not in seen and number != goal and "pull_request" not in item
-                and _names_goal(item.get("body"), goal)):
+                and _epic_label(item) and _names_goal(item.get("body"), goal)):
             epics.append(item)
             seen.add(number)
     return epics
@@ -958,8 +956,9 @@ def goal_tree(gh: GitHub, repo: str, goal: int
     epic's tickets, its sub-issues plus open loom:ticket issues whose Part of
     line names the epic. While tickets move under epics, the goal's own
     tickets (sub-issues and Part of #goal tickets) still count."""
-    direct = _direct_children(gh, repo, goal)
-    epics = _goal_epics(gh, repo, goal, direct)
+    part_of = _part_of_hits(gh, repo, goal, label=None)
+    direct = _direct_children(gh, repo, goal, part_of)
+    epics = _goal_epics(gh, repo, goal, direct, part_of)
     epic_numbers = {int(e.get("number") or 0) for e in epics}
     loose = [c for c in direct if isinstance(c, dict)
              and int(c.get("number") or 0) not in epic_numbers]

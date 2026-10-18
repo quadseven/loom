@@ -3162,6 +3162,8 @@ class EpicWalk:
             10: [t(11), t(12), t(13)],
             20: [t(21), t(22)],
         }
+        self.part_of_epic = item(30, labels=("epic",), title="Epic: line linked",
+                                 body="Part of #1\n")
         self.open_tickets = [t(23, body="## Why\nx\n\nPart of #20\n"), t(5), t(11)]
         self.calls = []
 
@@ -3174,6 +3176,10 @@ class EpicWalk:
         if method == "GET" and path.startswith("/repos/%s/issues?labels=loom:ticket&state=open"
                                                % REPO):
             return reply(200, self.open_tickets)
+        if method == "GET" and path.startswith("/search/issues?"):
+            return reply(200, {"items": [self.part_of_epic]})
+        if method == "GET" and path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
+            return reply(200, [self.part_of_epic])
         if method == "GET" and path == "/repos/%s/issues/1" % REPO:
             return reply(200, goal())
         raise AssertionError("unexpected %s %s" % (method, path))
@@ -3191,6 +3197,21 @@ class GoalWalksEpicsTest(unittest.TestCase):
     def test_the_unproven_limit_counts_the_epics_tickets(self):
         gh = GitHub("t", transport=EpicWalk(state="loom:shipped"))
         self.assertEqual(brain.goal_unproven(gh, REPO, 1), 7)
+
+    def test_part_of_epic_is_walked_below_sub_issue_limit(self):
+        walk = EpicWalk(state="loom:shipped")
+        walk.subs[1] = walk.subs[1][:1]
+        walk.open_tickets.append(item(31, body="Part of #30\n", labels=("loom:ticket", "loom:shipped")))
+        gh = GitHub("t", transport=walk)
+        self.assertEqual(brain._goal_in_flight(gh, REPO, 1), 8)
+        self.assertEqual(brain.goal_unproven(gh, REPO, 1), 8)
+
+    def test_epic_linked_both_ways_is_counted_once(self):
+        walk = EpicWalk()
+        walk.subs[1].append(walk.part_of_epic)
+        gh = GitHub("t", transport=walk)
+        tree = brain.goal_tree(gh, REPO, 1)[1]
+        self.assertEqual([e["number"] for e, _ in tree].count(30), 1)
 
     def test_a_closed_epics_tickets_still_count(self):
         gh = GitHub("t", transport=EpicWalk(state="loom:shipped", closed_epic=True))
