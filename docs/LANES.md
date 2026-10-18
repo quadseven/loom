@@ -407,6 +407,25 @@ Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
 other's login. A person working a ticket by hand claims it the same way:
 assign it to yourself and add `claim:<your login>` before any Loom briefs it.
 
+Each Loom sets these for itself when it installs; a second operator running
+from a clone of another operator's checkout must not inherit them:
+
+- `LOOM_REPOS`: the repos this Loom watches.
+- `LOOM_REPO_OWNERS`: the owners whose repos it may brief (default: this
+  checkout's owner).
+- `LOOM_STATUS_REPO`: where the brain lock `loom-lock/brain` and the
+  `loom:lanes` issue live (default: this checkout's origin).
+- `LOOM_BRIEF_AUTHORS`: this operator's own logins.
+- The App settings, `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID`
+  and `LOOM_GITHUB_APP_KEY_SSM`, so each Loom spends its own installation's
+  budget.
+- `LOOM_BRAIN_HOLDER`: the name on the brain lock (default `lane-machine`).
+
+`lanes/mac/install.sh` refuses to install, writing no agent, when
+`LOOM_REPOS` is set and the status repo (`LOOM_STATUS_REPO`, or the origin
+when it is unset) or any `LOOM_REPOS` repo has an owner outside
+`LOOM_REPO_OWNERS`; the message names the setting or repo at fault.
+
 ### Trusted briefers
 
 `LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
