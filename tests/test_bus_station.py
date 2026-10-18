@@ -404,6 +404,7 @@ class Base(unittest.TestCase):
 
     def run_pass(self):
         gh = GitHub("token", transport=self.fake)
+        gh.auth = "app"
         self.assertEqual(station.run(self.settings, gh), 0)
         return gh
 
@@ -1970,6 +1971,24 @@ class TrustTest(unittest.TestCase):
 
 
 class ClaimTest(Base):
+    def test_app_labeler_is_trusted_without_listing_it_as_an_author(self):
+        self.settings.authors = ["alice-example"]
+        self.fake.add(12, events=[labeled("loom:briefed", "loom-app[bot]"),
+                                  labeled("lane:codex", "alice-example")])
+        gh = GitHub("token", transport=self.fake)
+        gh.auth = "app"
+        with mock.patch.object(gh, "rest", wraps=gh.rest) as rest:
+            # Model the authenticated GitHub App identity lookup.
+            real = gh.rest
+            def rest_with_app(method, path, *args, **kwargs):
+                if method == "GET" and path == "/app":
+                    from bus.github import Response
+                    return Response(200, {"slug": "loom-app"})
+                return real(method, path, *args, **kwargs)
+            gh.rest = rest_with_app
+            station.run(self.settings, gh)
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
     def test_a_mismatched_model_moves_to_a_compatible_lane_before_claim(self):
         self.heartbeat("opencode-go-3")
         self.heartbeat("claude")

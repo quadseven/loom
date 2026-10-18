@@ -925,6 +925,15 @@ class Station:
                  head: Optional[Callable[[], str]] = None) -> None:
         self.gh = gh
         self.s = settings
+        self._trusted_authors = list(settings.authors)
+        if gh.auth == "app":
+            app = gh.rest("GET", "/app").data
+            slug = app.get("slug") if isinstance(app, dict) else None
+            if isinstance(slug, str) and slug:
+                login = slug + "[bot]"
+                if login.lower() not in {name.lower() for name in self._trusted_authors}:
+                    self._trusted_authors.append(login)
+        _say("trusting logins: %s" % (", ".join(self._trusted_authors) or "none"))
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
         self.upload = upload or post_transcript
@@ -1010,7 +1019,7 @@ class Station:
         number = int(issue["number"])
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
         editor = self._editor(repo, number)
-        return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
+        return tickets.trusted(issue, events, editor, self._trusted_authors, self.s.owners,
                                self.s.briefers)
 
     def _poll(self, repo: str) -> List[Dict[str, Any]]:
