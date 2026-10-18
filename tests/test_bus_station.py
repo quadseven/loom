@@ -1642,6 +1642,89 @@ class HandoffPacketTest(unittest.TestCase):
         self.assertEqual([], self.gh.writes)
 
 
+STORED_PACKET = {
+    "ticks": [{"id": 3, "holder": "lane-machine", "lane": "claude", "model": "opus",
+               "started": "2030-01-01T11:30:00Z", "ended": "2030-01-01T11:50:00Z",
+               "outcome": "ok", "decided": ["shipped one"],
+               "left_open": ["merge %s#7: waiting on CI" % REPO], "handed_off": []}],
+    "commitments": [{"id": 1, "tick_id": 3, "holder": "lane-machine", "item": "%s#7" % REPO,
+                     "stage": "merge", "key": "", "what": "merge: waiting on CI",
+                     "due": "2030-01-01T13:50:00Z", "state": "open"}],
+    "rules": [{"source": "docs/MUSE.md", "source_ref": "d" * 40, "text": "- Write ASCII only.",
+               "loaded_at": "2030-01-01T11:00:00Z"},
+              {"source": "%s#30" % REPO, "source_ref": "comment 12", "text": "## Rules\n- one",
+               "loaded_at": "2030-01-01T11:00:00Z"}]}
+
+
+class StoredHandoffPacketTest(unittest.TestCase):
+    """The packet pass reads the dashboard's brain memory when it answers, and
+    falls back to the goal-home journals when it does not."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.gh = HandoffFake()
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(
+            self.temp.name, [REPO], AUTHORS, OWNERS, status_repo=REPO,
+            transcript_url="https://dashboard.example.com/api/transcripts",
+            transcript_token_ssm="/loom/upload-token")
+        self.fetched = []
+        self.answer = STORED_PACKET
+        self.gh.journal("muse", "2030-01-01T11:00:00Z", "- Decided: from the goal home",
+                        "<!-- loom:defer v1 stage=merge item=%s#7 rev=pr-abc holder=muse -->" % REPO)
+
+    def fetch(self, url, token):
+        self.fetched.append((url, token))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+    def run_pass(self, minutes=0):
+        station.Station(self.gh, self.settings, now=self.now + 60 * minutes,
+                        head=lambda: "c" * 40, read_secret=lambda name, region: "tok",
+                        fetch=self.fetch).publish_handoff()
+
+    def packets(self):
+        return [c for c in self.gh.comments if c["body"].startswith(station.handoff.HANDOFF_MARKER)]
+
+    def test_the_packet_renders_from_the_endpoint_when_it_answers(self):
+        self.run_pass()
+        self.assertEqual([("https://dashboard.example.com/api/brain/handoff", "tok")], self.fetched)
+        body = self.packets()[0]["body"]
+        self.assertIn("## Last 5 ticks\n- 2030-01-01T11:30:00Z lane-machine on claude, model opus, "
+                      "ended 2030-01-01T11:50:00Z: ok. 1 decided, 1 left open, 0 handed off.", body)
+        self.assertIn("## Open commitments (1)\n- merge %s#7, from lane-machine's tick 3, "
+                      "due 2030-01-01T13:50:00Z." % REPO, body)
+        self.assertIn("## Rules digest\n- docs/MUSE.md at %s\n- %s#30 at comment 12"
+                      % ("d" * 40, REPO), body)
+        self.assertIn("## Rules (docs/MUSE.md at %s)\n- Write ASCII only." % ("c" * 40), body)
+        self.assertNotIn("from the goal home", body)
+
+    def test_the_packet_falls_back_to_the_goal_homes_when_the_endpoint_does_not_answer(self):
+        for answer in (OSError("the handoff read answered 401"),
+                       OSError("the handoff read failed to connect"),
+                       {"ticks": [], "commitments": [], "rules": []},
+                       {"ticks": "not a list"}):
+            with self.subTest(answer=answer):
+                self.answer = answer
+                self.gh.comments = [c for c in self.gh.comments
+                                    if not c["body"].startswith(station.handoff.HANDOFF_MARKER)]
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as out:
+                    self.run_pass(minutes=len(self.fetched) * 11)
+                body = self.packets()[0]["body"]
+                self.assertIn("Decided: from the goal home.", body)
+                self.assertIn("## Open defers (1, 0 from brains no longer ticking)", body)
+                self.assertNotIn("## Open commitments", body)
+                self.assertIn("handoff packet: built from the goal homes", out.getvalue())
+
+    def test_no_dashboard_settings_build_from_the_goal_homes_without_a_fetch(self):
+        self.settings.transcript_url = ""
+        self.run_pass()
+        self.assertEqual([], self.fetched)
+        self.assertIn("Decided: from the goal home.", self.packets()[0]["body"])
+
+
 class ReviewFake:
     def __init__(self):
         self.api = "https://api.github.com"

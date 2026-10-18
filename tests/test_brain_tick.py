@@ -17,9 +17,14 @@ LANES = Path(__file__).resolve().parent.parent / "lanes"
 SCRIPT = LANES / "mac" / "brain.sh"
 
 # Fake python3: `-m bus lock` exits $FAKE_LOCK (default 0), `-m bus unlock`
-# exits 0. Every call is appended to $FAKE_LOG.
+# exits 0, and `-m bus.brain_memory handoff` prints $FAKE_PACKET and exits
+# $FAKE_PACKET_EXIT (default 0). Every call is appended to $FAKE_LOG.
 FAKE_PYTHON = """#!/usr/bin/env bash
 printf 'python3 %s\\n' "$*" >> "$FAKE_LOG"
+if [ "$2" = bus.brain_memory ]; then
+  printf '%s\\n' "${FAKE_PACKET:-}"
+  exit "${FAKE_PACKET_EXIT:-0}"
+fi
 if [ "$3" = lock ]; then
   # FAKE_LOCK_FREE_AFTER=n: the lock is held for the first n tries.
   if [ -n "${FAKE_LOCK_FREE_AFTER:-}" ]; then
@@ -163,6 +168,34 @@ class BrainTickTest(unittest.TestCase):
         self.tick(FAKE_LOCK="1")
         last, _ = self.beat()
         self.assertNotIn("started", last)
+
+    def test_a_tick_that_ran_the_agent_names_its_holder(self):
+        self.tick(LOOM_BRAIN_HOLDER="lane-two")
+        last, _ = self.beat()
+        self.assertEqual("lane-two", last["holder"])
+
+    def test_the_handoff_packet_goes_into_the_prompt(self):
+        dashboard = {"LOOM_TRANSCRIPT_URL": "https://dashboard.example.com/api/transcripts",
+                     "LOOM_TRANSCRIPT_TOKEN_SSM": "/example/token",
+                     "FAKE_PACKET": "## Open commitments (1)"}
+        _, calls = self.tick(**dashboard)
+        self.assertIn("python3 -m bus.brain_memory handoff", calls)
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertIn("Read this handoff packet before anything else.", claude[0])
+        self.assertIn("## Open commitments (1)", "\n".join(calls))
+
+    def test_no_dashboard_or_a_failed_read_runs_the_tick_without_the_packet(self):
+        _, calls = self.tick()
+        self.assertFalse(any("bus.brain_memory" in c for c in calls))
+        self.log.unlink()
+        _, calls = self.tick(LOOM_TRANSCRIPT_URL="https://dashboard.example.com/api/transcripts",
+                             LOOM_TRANSCRIPT_TOKEN_SSM="/example/token",
+                             FAKE_PACKET="half a packet", FAKE_PACKET_EXIT="1")
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertEqual(1, len(claude))
+        self.assertNotIn("handoff packet", claude[0])
+        self.assertIn("could not read the handoff packet",
+                      (self.home / "logs" / "brain.log").read_text())
 
     def test_no_repos_means_no_lock_and_no_model_call(self):
         run, calls = self.tick(LOOM_REPOS="")
