@@ -71,7 +71,7 @@ class FakePulls:
             rows = sorted(self.prs.values(), key=lambda r: r["number"], reverse=True)
         page = int(query.get("page", "1"))
         last = max(1, -(-len(rows) // PER_PAGE))
-        etag = '"%s"' % hashlib.sha1(("%s|%d|%d" % (parts.query, page, self.version)).encode()).hexdigest()
+        etag = '"%s"' % hashlib.sha256(("%s|%d|%d" % (parts.query, page, self.version)).encode()).hexdigest()
         if headers.get("If-None-Match") == etag:
             self.not_modified += 1
             return 304, {"ETag": etag}, b""
