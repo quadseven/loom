@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from bus.factory import DEFAULT_REVIEW_BOT, RUNG_RE
+from bus.metrics import bottleneck as name_bottleneck
 from bus.station import failure_class
 from .views import _ticket_href
 
@@ -124,9 +125,11 @@ def stuck_tickets(tickets, comments):
     """Tickets above rung 0 or failed, highest rung first."""
     rungs = _rungs(comments)
     stuck = [{**row, "rung": rungs.get((row.get("repo"), row.get("number")), 0)} for row in tickets]
-    # A ticket that climbed and then merged is no longer stuck.
-    stuck = [row for row in stuck if row.get("state") == "failed"
-             or (row["rung"] > 0 and row.get("state") not in DONE_STATES)]
+    # A ticket that climbed and then merged is no longer stuck, and neither
+    # is a closed one: it is out of the factory, whatever label it kept.
+    stuck = [row for row in stuck if row.get("open", True)
+             and (row.get("state") == "failed"
+                  or (row["rung"] > 0 and row.get("state") not in DONE_STATES))]
     return sorted(stuck, key=lambda row: (-row["rung"], str(row.get("repo")), row.get("number") or 0))
 
 
@@ -134,7 +137,8 @@ def build_hot_spots(payload, waits_error, now, bot=DEFAULT_REVIEW_BOT):
     """Everything /hot-spots shows, from the dashboard snapshot."""
     tickets = [row for rows in (payload.get("tickets") or {}).values() if rows for row in rows]
     comments = payload.get("issue_comments") or []
-    return {"waits": payload.get("wait_rows") or [], "bottleneck": payload.get("wait_bottleneck"),
+    waits = payload.get("wait_rows") or []
+    return {"waits": waits, "bottleneck": name_bottleneck(waits),
             "waits_error": waits_error or "waits have not been read yet",
             "comments_error": payload.get("hot_spots_error") or "",
             "findings": finding_counts(payload.get("review_comments"), bot, now),

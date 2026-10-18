@@ -6,6 +6,7 @@ import html
 import re
 
 from bus.brain import TICK_STEPS as STEPS
+from bus.metrics import TERMINAL_STATES
 from .github import journal_next
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
@@ -27,8 +28,9 @@ TAGS = (("regression", re.compile(r"\bregress", re.I)),
         ("merged", re.compile(r"\bmerged\b", re.I)),
         ("verifying", re.compile(r"\bverif|\bproof\b", re.I)),
         ("deferred", re.compile(r"\bdefer", re.I)))
-# A ticket sitting in verified is done, not waiting, so it is never ranked.
-RANKED_OUT = ("verified",)
+# A ticket in a terminal state is done, not waiting, so it is never ranked:
+# the same states the Floor and Hot spots bottleneck leaves out.
+RANKED_OUT = TERMINAL_STATES
 # What a count of tickets in each state is waiting for, for the ranking.
 WAITING = {"queued": "tickets waiting for a lane", "briefed": "briefs waiting for a lane to start",
            "running": "runs still going", "pr": "pull requests waiting to merge",

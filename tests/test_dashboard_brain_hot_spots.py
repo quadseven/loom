@@ -219,6 +219,34 @@ class HotSpotsTest(unittest.TestCase):
         stuck = hot_spots.stuck_tickets(tickets, comments)
         self.assertEqual([(row["number"], row["rung"]) for row in stuck], [(5, 1), (6, 0)])
 
+    def test_a_closed_ticket_leaves_the_stuck_list(self):
+        tickets = [{"repo": "example-owner/sample", "number": 5, "title": "Gone", "state": "failed",
+                    "open": False},
+                   {"repo": "example-owner/sample", "number": 6, "title": "Dropped", "state": "pr",
+                    "open": False},
+                   {"repo": "example-owner/sample", "number": 7, "title": "Open", "state": "failed"}]
+        comments = [outcome("codex", "failed\n<!-- loom:rung 2 -->", number=6)]
+        stuck = hot_spots.stuck_tickets(tickets, comments)
+        self.assertEqual([row["number"] for row in stuck], [7])
+
+    def test_floor_and_hot_spots_name_one_bottleneck_from_the_wait_rows(self):
+        from dashboard.server import _conveyor
+        rows = [{"state": "pr", "median_h": 5.5, "worst_h": 9, "n": 4},
+                {"state": "shipped", "median_h": 40, "worst_h": 60, "n": 2},
+                {"state": "verified", "median_h": 88.6, "worst_h": 150, "n": 12}]
+        # A snapshot written by an older reader still says verified.
+        payload = {"wait_rows": rows, "wait_bottleneck": "verified", "tickets": {}}
+
+        class State:
+            waits = {}
+
+            def response(self):
+                return payload
+        data = hot_spots.build_hot_spots(payload, "", NOW)
+        _, floor = _conveyor(State(), [])
+        self.assertEqual((data["bottleneck"], floor), ("pr", "pr"))
+        self.assertNotIn("verified", [item["state"] for item in brain_view.rank_waits(rows, "")["items"]])
+
     def test_missing_sources_say_why(self):
         body = hot_spots.render_hot_spots(hot_spots.build_hot_spots(
             {"wait_rows": [], "tickets": {}, "hot_spots_error": "comments unreadable"},
