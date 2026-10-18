@@ -5620,6 +5620,41 @@ class VerifyResultTest(Base):
         out.update(changes)
         return out
 
+    def verify_failed(self, reason, name=None, now=None):
+        name = name or self.name
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                   "[t] %s start, lane codex\n[t] %s failed: %s\n" % (name, name, reason))
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=now or time.time())
+        st._report_verify("codex", "failed", REPO, 5, name)
+        return st
+
+    def verify_runs(self):
+        with open(os.path.join(self.home, "state", "station", station.VERIFY_FILE)) as fh:
+            return json.load(fh)
+
+    def test_a_transient_verify_failure_makes_its_ticket_due_again_now(self):
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE),
+                   json.dumps({"%s#5" % REPO: time.time() - 60}))
+        self.verify_failed("[transient] agent exited 1")
+        self.assertNotIn("%s#5" % REPO, self.verify_runs())
+
+    def test_a_verify_run_that_failed_on_the_work_keeps_its_cooldown(self):
+        self.write(os.path.join(self.home, "state", "station", station.VERIFY_FILE),
+                   json.dumps({"%s#5" % REPO: time.time() - 60}))
+        self.verify_failed("[work] no verify.json written")
+        self.assertIn("%s#5" % REPO, self.verify_runs())
+
+    def test_two_transient_verify_failures_in_a_row_hold_the_lane_for_an_hour(self):
+        now = time.time()
+        self.verify_failed("[transient] agent exited 1", name="a-verify-1", now=now)
+        st = self.verify_failed("[transient] agent exited 124", name="a-verify-2", now=now)
+        self.assertTrue(st._verify_lane_held("codex"))
+        self.assertFalse(st._verify_lane_held("zen"))
+        later = station.Station(GitHub("token", transport=self.fake), self.settings,
+                                now=now + station.VERIFY_LANE_HOLD + 1)
+        self.assertFalse(later._verify_lane_held("codex"))
+
     def test_a_valid_proof_ticks_the_criteria_and_verifies_through_proof_py(self):
         self.result(self.good())
         self.run_pass()
