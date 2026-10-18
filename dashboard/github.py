@@ -19,7 +19,7 @@ from bus import brain, labels, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import goals, transcripts, views
+from . import goals, operators, transcripts, views
 
 
 READ_WORKERS = 8
@@ -32,6 +32,12 @@ GOAL_INFO_MAX = 200
 PR_FULL_READ_SECONDS = 3600
 # The dashboard logs the GitHub requests it spent this often (seconds).
 REQUEST_LOG_SECONDS = 3600
+# The Operators page's claim lists are read again this often (seconds); at
+# most this many foreign claim labels are listed per repo, and at most this
+# many open pull requests' checks are read in one pass (loom#786).
+OPERATOR_CLAIMS_SECONDS = 900
+OPERATOR_CLAIM_LABELS = 10
+OPERATOR_CHECK_READS = 30
 LOG = logging.getLogger(__name__)
 
 
@@ -393,6 +399,8 @@ class TicketStore:
         # The goal cards keep the last pass that read them. Dropping them
         # here left every Goals card at "-" with "No report on this goal
         # in the last two weeks" whenever the budget dipped (2026-10-17).
+        # The Operators page keeps the last claims read, too.
+        data["operator_claims"] = self._snapshot.get("operator_claims") or {}
         previous = self._snapshot.get("goal_context")
         data["goal_context"] = previous or {}
         data["goal_context_error"] = self._snapshot.get("goal_context_error", "") if previous else (
@@ -463,6 +471,65 @@ class TicketStore:
         self._read_goal_context(data, homes, reports, metric_comments)
         now = int(time.time())
         data["source_read_at"], data["sources_carried"] = {source: now for source in VIEW_SOURCES}, []
+        self._read_operator_claims(data)
+
+    def _read_operator_claims(self, data: Dict[str, Any]) -> None:
+        """The Operators page's source (loom#786): every open item another
+        operator holds, from one list per foreign claim:<login> label per repo
+        and the ticket and pull request records this pass already read, with
+        the checks of each open linked pull request. Read again only every
+        OPERATOR_CLAIMS_SECONDS; between reads the last result is kept. A
+        repo whose claims could not be read keeps its last items, says why,
+        and is read again on the next pass."""
+        previous = self._snapshot.get("operator_claims") or {}
+        now = time.time()
+        if (previous.get("read_at") and not previous.get("retry")
+                and now - float(previous["read_at"]) < OPERATOR_CLAIMS_SECONDS):
+            data["operator_claims"] = previous
+            return
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(self._claims_for_repo, self.repos))
+        claimed, errors = [], []
+        for repo, (found, error) in zip(self.repos, results, strict=True):
+            if error:
+                errors.append(error)
+                found = [item for item in previous.get("items") or [] if item.get("repo") == repo]
+            claimed.extend(found)
+        rows = [row for found in (data.get("tickets") or {}).values() if found for row in found]
+        items = operators.collect(claimed, rows, data.get("pull_requests") or [])
+        checks = self._read_claim_checks(items, errors)
+        data["operator_claims"] = {"items": items, "checks": checks, "error": "; ".join(errors),
+                                   "read_at": now, "every": OPERATOR_CLAIMS_SECONDS, "retry": bool(errors)}
+
+    def _claims_for_repo(self, repo: str) -> Tuple[List[Dict[str, Any]], str]:
+        path = quote(repo, safe="/")
+        found: List[Dict[str, Any]] = []
+        try:
+            names = [label.get("name") for label in self.gh.paginate("/repos/%s/labels?per_page=100" % path)
+                     if isinstance(label, dict) and isinstance(label.get("name"), str)]
+            for name in operators.foreign_claim_labels(names)[:OPERATOR_CLAIM_LABELS]:
+                issues = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                          % (path, quote(name, safe="")))
+                found.extend(operators.claim_record(repo, issue) for issue in issues if isinstance(issue, dict))
+        except (GitHubError, OSError, ValueError) as exc:
+            return found, "%s claims: %s" % (repo, self._error_reason(exc))
+        return found, ""
+
+    def _read_claim_checks(self, items, errors) -> Dict[str, Dict[str, Any]]:
+        """repo@sha -> operators.checks_summary of each open linked pull
+        request's head, at most OPERATOR_CHECK_READS reads a pass (an
+        unchanged head answers 304 from the GitHub client's ETag cache)."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for repo, sha in operators.checks_wanted(items)[:OPERATOR_CHECK_READS]:
+            try:
+                resp = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                                    % (quote(repo, safe="/"), quote(sha, safe="")))
+            except (GitHubError, OSError, ValueError) as exc:
+                errors.append("%s checks: %s" % (repo, self._error_reason(exc)))
+                continue
+            runs = resp.data.get("check_runs") if isinstance(resp.data, dict) else None
+            out["%s@%s" % (repo, sha)] = operators.checks_summary(runs or [])
+        return out
 
     def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
         """Each goal home's title and the goal it rolls up into (a `Parent
@@ -885,6 +952,7 @@ class TicketStore:
                 "hot_spots_error": snapshot.get("hot_spots_error", "the dashboard has not read its sources yet"),
                 "source_read_at": dict(snapshot.get("source_read_at") or {}),
                 "sources_carried": list(snapshot.get("sources_carried") or []),
+                "operator_claims": snapshot.get("operator_claims") or {},
                 "usage": usage_rows}
 
 
