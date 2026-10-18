@@ -711,12 +711,15 @@ class TicketStore:
                 operator_items, human_counts, ask_error = self._read_operator_items()
             snapshot = {"tickets": data, "errors": errors, "stale": stale,
                         "ready": any(rows is not None for rows in data.values())}
-            try:
-                snapshot["repeated_failures"] = self._read_repeated_failures()
-            except (GitHubError, OSError, ValueError) as exc:
+            if self._below_floor():
                 snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
-                snapshot.setdefault("dashboard_errors", []).append(
-                    "repeated failure invariants: " + self._error_reason(exc))
+            else:
+                try:
+                    snapshot["repeated_failures"] = self._read_repeated_failures()
+                except (GitHubError, OSError, ValueError) as exc:
+                    snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
+                    snapshot.setdefault("dashboard_errors", []).append(
+                        "repeated failure invariants: " + self._error_reason(exc))
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
             self._read_dashboard(snapshot)

@@ -15,6 +15,7 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1118,40 +1119,63 @@ class Station:
         os.makedirs(directory, exist_ok=True)
         day = time.strftime("%Y-%m-%d", time.gmtime(self.now))
         archive = os.path.join(directory, "events.%s.jsonl" % day)
-        if os.path.exists(self.event_log):
-            mtime = os.path.getmtime(self.event_log)
-            old_day = time.strftime("%Y-%m-%d", time.gmtime(mtime))
-            if old_day != day:
-                os.replace(self.event_log, os.path.join(directory, "events.%s.jsonl" % old_day))
-        # Retain today's file and six previous daily archives.
-        archives = sorted((p for p in Path(directory).glob("events.*.jsonl")
-                           if p.name[7:17].count("-") == 2), reverse=True)
-        for stale in archives[6:]:
-            stale.unlink()
-        record = {"time": invariants.utc(self.now), "at": self.now, "kind": kind,
-                  "reason": invariants.public(reason)[:300], "item": invariants.public(item)[:160],
-                  "lane": invariants.public(lane)[:80], "model": invariants.public(model)[:120]}
-        with open(self.event_log, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, sort_keys=True) + "\n")
+        lock_path = os.path.join(directory, "events.lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if os.path.exists(self.event_log):
+                mtime = os.path.getmtime(self.event_log)
+                old_day = time.strftime("%Y-%m-%d", time.gmtime(mtime))
+                if old_day != day:
+                    os.replace(self.event_log, os.path.join(directory, "events.%s.jsonl" % old_day))
+            # Retain today's file and six previous daily archives.
+            archives = sorted((p for p in Path(directory).glob("events.*.jsonl")
+                               if p.name[7:17].count("-") == 2), reverse=True)
+            for stale in archives[6:]:
+                stale.unlink()
+            digest = lambda value: hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+            record = {"time": invariants.utc(self.now), "at": self.now, "kind": kind,
+                      "reason": digest(reason), "item": digest(item),
+                      "lane": digest(lane), "model": digest(model)}
+            with open(self.event_log, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+        finally:
+            os.close(lock_fd)
 
     def _read_events(self) -> List[invariants.Event]:
         directory = os.path.dirname(self.event_log)
         rows = []
-        for path in list(Path(directory).glob("events.*.jsonl")) + [Path(self.event_log)]:
-            try:
-                with path.open(encoding="utf-8") as stream:
-                    for line in stream:
-                        try:
-                            row = json.loads(line)
-                            at = float(row["at"])
-                            if self.now - 3600 <= at <= self.now:
-                                rows.append(invariants.Event(at, str(row["kind"]), str(row.get("reason") or ""),
-                                                             str(row.get("item") or ""), str(row.get("lane") or ""),
-                                                             str(row.get("model") or "")))
-                        except (ValueError, KeyError, TypeError):
-                            continue
-            except FileNotFoundError:
-                continue
+        os.makedirs(directory, exist_ok=True)
+        lock_fd = os.open(os.path.join(directory, "events.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            paths = list(Path(directory).glob("events.*.jsonl")) + [Path(self.event_log)]
+            for path in paths:
+                try:
+                    with path.open(encoding="utf-8") as stream:
+                        for line in stream:
+                            try:
+                                row = json.loads(line)
+                                if not isinstance(row, dict):
+                                    continue
+                                raw_at = row.get("at")
+                                if isinstance(raw_at, bool) or not isinstance(raw_at, (int, float)):
+                                    continue
+                                at = float(raw_at)
+                                kind, reason = row.get("kind"), row.get("reason")
+                                if (not math.isfinite(at) or kind not in
+                                        ("rewrite_failed", "rewrite_skipped", "rewrite_succeeded",
+                                         "model_wait", "not_claiming") or not isinstance(reason, str)
+                                        or not re.fullmatch(r"[0-9a-f]{64}", reason)):
+                                    continue
+                                if self.now - 3600 <= at <= self.now:
+                                    rows.append(invariants.Event(at, kind, reason))
+                            except (ValueError, TypeError):
+                                continue
+                except FileNotFoundError:
+                    continue
+        finally:
+            os.close(lock_fd)
         return rows
 
     def _refuse(self, repo: str, issue: Dict[str, Any], reason: str) -> None:

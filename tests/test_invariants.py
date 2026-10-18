@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import sys
@@ -197,14 +199,33 @@ class StationBase(unittest.TestCase):
 
 
 class AcceptanceTest(StationBase):
+    def test_event_log_hashes_inputs_and_ignores_untrusted_rows(self):
+        st = station.Station(self.gh, self.settings, now=T0)
+        private_value = "private-host.example.invalid"
+        st._event("rewrite_skipped", private_value, private_value, private_value, private_value)
+        with open(st.event_log, encoding="utf-8") as stream:
+            raw = stream.read()
+        self.assertNotIn(private_value, raw)
+        with open(st.event_log, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"at": T0, "kind": "not_claiming", "reason": private_value}) + "\n")
+            stream.write(json.dumps({"at": "not-a-time", "kind": "not_claiming",
+                                     "reason": "0" * 64}) + "\n")
+        events = st._read_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].reason, hashlib.sha256(private_value.encode()).hexdigest())
+
     def test_repeated_rewrite_skip_files_once_across_two_hours(self):
         path = os.path.join(self.home, "logs", "events.jsonl")
         os.makedirs(os.path.dirname(path))
         with open(path, "w", encoding="utf-8") as stream:
-            for at in range(int(T0 - 3600), int(T0 + 3601), 60):
-                stream.write(__import__("json").dumps({"at": at, "kind": "rewrite_skipped",
-                             "reason": "no agent command for this repo"}) + "\n")
+            for at in range(int(T0 - 3600), int(T0) + 1, 60):
+                stream.write(json.dumps({"at": at, "kind": "rewrite_skipped",
+                             "reason": hashlib.sha256(b"no agent command for this repo").hexdigest()}) + "\n")
         self.run_at(T0)
+        with open(path, "a", encoding="utf-8") as stream:
+            for at in range(int(T0), int(T0 + 3601), 60):
+                stream.write(json.dumps({"at": at, "kind": "rewrite_skipped",
+                             "reason": hashlib.sha256(b"no agent command for this repo").hexdigest()}) + "\n")
         self.run_at(T0 + 3600)
         made = [i for i in self.gh.issues.values()
                 if "repeated-failure" in i.get("body", "")]
