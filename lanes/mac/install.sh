@@ -63,12 +63,62 @@ export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
 # Checked before anything is installed.
+# The status repo (the brain's loom-lock/brain branch and the loom:lanes
+# issue; default this checkout's origin) and every LOOM_REPOS repo must belong
+# to one of LOOM_REPO_OWNERS, or a second operator's Loom takes the first
+# operator's brain lock and writes to their lanes issue (docs/LANES.md, Two
+# Looms on shared repos). Owners compare case-insensitively, as the station does.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+OWNER_LIST=" $(lower "$LOOM_REPO_OWNERS" | tr ',\t\n' '   ') "
+owned() { [ -n "$1" ] && [[ "$OWNER_LIST" == *" $(lower "$1") "* ]]; }
+read -r -a WATCHED <<<"$(printf '%s' "${LOOM_REPOS:-}" | tr ',\t\n' '   ')" || true
+if [ "${#WATCHED[@]}" -gt 0 ]; then
+  STATUS_REPO="${LOOM_STATUS_REPO:-}"
+  if [ -n "$STATUS_REPO" ]; then
+    STATUS_FROM="LOOM_STATUS_REPO is $STATUS_REPO"
+  else
+    STATUS_REPO="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null |
+      sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)"
+    STATUS_FROM="LOOM_STATUS_REPO is unset, so the status repo is this checkout's origin (${STATUS_REPO:-none})"
+  fi
+  owned "${STATUS_REPO%%/*}" ||
+    { echo "$STATUS_FROM, whose owner is not in LOOM_REPO_OWNERS ($LOOM_REPO_OWNERS): set LOOM_STATUS_REPO to a repo of your own (docs/LANES.md, Two Looms on shared repos)" >&2; exit 1; }
+  for R in "${WATCHED[@]}"; do
+    owned "${R%%/*}" ||
+      { echo "LOOM_REPOS names $R, whose owner is not in LOOM_REPO_OWNERS ($LOOM_REPO_OWNERS)" >&2; exit 1; }
+  done
+fi
 BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
 [[ "$BRAIN_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BRAIN_INTERVAL" -ge 60 ] ||
   { echo "LOOM_BRAIN_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
 STATION_INTERVAL="${LOOM_STATION_INTERVAL:-60}"
 [[ "$STATION_INTERVAL" =~ ^[0-9]+$ ]] && [ "$STATION_INTERVAL" -ge 60 ] ||
   { echo "LOOM_STATION_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
+# A GitHub App needs all of its settings or none: with only some set, the
+# station and the brain would quietly fall back to the personal token
+# (bus/github.py AppToken.from_env), so refuse and name what is missing.
+APP_KEY="${LOOM_GITHUB_APP_KEY_FILE:-}${LOOM_GITHUB_APP_KEY_SSM:-}"
+if [ -n "${LOOM_GITHUB_APP_ID:-}${LOOM_GITHUB_APP_INSTALLATION_ID:-}$APP_KEY" ]; then
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] ||
+    { echo "GitHub App half set up: LOOM_GITHUB_APP_ID is missing (set all App settings or none)" >&2; exit 1; }
+  [ -n "${LOOM_GITHUB_APP_INSTALLATION_ID:-}" ] ||
+    { echo "GitHub App half set up: LOOM_GITHUB_APP_INSTALLATION_ID is missing (set all App settings or none)" >&2; exit 1; }
+  [ -n "$APP_KEY" ] ||
+    { echo "GitHub App half set up: LOOM_GITHUB_APP_KEY_FILE or LOOM_GITHUB_APP_KEY_SSM is missing (set all App settings or none)" >&2; exit 1; }
+fi
+# The App's private key as a file: it must exist and be readable by its owner
+# only (mode 600 or narrower), like an ssh key.
+if [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; then
+  [ -f "$LOOM_GITHUB_APP_KEY_FILE" ] && [ -r "$LOOM_GITHUB_APP_KEY_FILE" ] ||
+    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE is not a file this user can read" >&2; exit 1; }
+  # GNU stat first: BSD stat rejects -c, while GNU stat accepts -f with another meaning.
+  KEY_MODE="$(stat -c %a "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null ||
+    stat -f %Lp "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null)" || KEY_MODE=""
+  [[ "$KEY_MODE" =~ ^[0-7]+$ ]] ||
+    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE: could not read its mode with stat" >&2; exit 1; }
+  [ $((8#$KEY_MODE & 8#077)) -eq 0 ] ||
+    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE has mode $KEY_MODE; it must be 600 (chmod 600 $LOOM_GITHUB_APP_KEY_FILE)" >&2; exit 1; }
+fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -184,9 +234,12 @@ done
 # verify briefs, docs/LANES.md Verify runs), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
 # are filed on, and the review bot's plan check, docs/LANES.md Invariants), and
+# LOOM_NO_TOPUP (provider lanes whose credit is never topped up: their slots
+# held out of credit are no lane-held breach, docs/LANES.md Invariants), and
 # LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM
-# (a GitHub App installation token instead of the personal one, minted from
-# the key in that SSM parameter, docs/LANES.md; all three or none). Runs from
+# or LOOM_GITHUB_APP_KEY_FILE (a GitHub App installation token instead of the
+# personal one, minted from the key in that SSM parameter or that mode-600
+# file, docs/LANES.md; all or none, checked above). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -250,9 +303,11 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REWRITE_CLAUDE_TOKEN_SSM</key><string>$(xml "${LOOM_REWRITE_CLAUDE_TOKEN_SSM:-}")</string>
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
+    <key>LOOM_NO_TOPUP</key><string>$(xml "${LOOM_NO_TOPUP:-}")</string>
     <key>LOOM_GITHUB_APP_ID</key><string>$(xml "${LOOM_GITHUB_APP_ID:-}")</string>
     <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
+    <key>LOOM_GITHUB_APP_KEY_FILE</key><string>$(xml "${LOOM_GITHUB_APP_KEY_FILE:-}")</string>
 $(model_env)
   </dict>
 </dict>

@@ -14,6 +14,7 @@ VIEWS = (
     ("improving", "Improving", "/improving"),
     ("lanes", "Lanes and models", "/lanes"),
     ("usage", "Usage", "/usage"),
+    ("operators", "Operators", "/operators"),
     ("needs-you", "Needs you", "/needs-you"),
 )
 MOBILE_TABS = ("floor", "goals", "tickets", "brain")

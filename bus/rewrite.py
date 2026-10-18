@@ -2,8 +2,9 @@
 
 The agent command reads the issue prompt on stdin and writes a JSON draft to
 stdout. Code validates that draft, then files a queued ticket or a human ask.
-The original issue is never closed, retitled or edited; brain.brief and
-brain.human add a comment and labels.
+The original issue is never retitled or edited; brain.brief and
+brain.human add a comment and labels, and brain.settle_source closes it once
+its ticket is verified.
 """
 from __future__ import annotations
 

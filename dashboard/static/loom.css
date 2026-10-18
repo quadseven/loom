@@ -698,3 +698,6 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .owner-chip { display: inline-flex; flex: none; align-items: center; margin-left: 8px; padding: 1px 8px; border: 1px solid var(--info); border-radius: 999px; color: var(--info-on-bg); font: 11px var(--font-mono); white-space: nowrap; }
 .owner-chip.neutral { border-color: var(--line); color: var(--muted); }
 .tickets-ticket a .owner-chip { margin-left: 0; }
+.operators-note { max-width: 72ch; margin: 0 0 14px; color: var(--body); font-size: 14px; line-height: 1.5; }
+.operators-adopted { margin: 0 0 18px; }
+.operators-adopted > .machine-fact, .operators-read { margin: 4px 0 10px; color: var(--muted); font-size: 12px; }

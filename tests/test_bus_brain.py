@@ -2608,7 +2608,7 @@ class HumanAndRefsTests(unittest.TestCase):
                     brain.human(GitHub("t", transport=fake), REPO, 6, ask)
                 self.assertTrue(all(c[0] == "GET" for c in fake.calls))
 
-    def test_brief_refs_rewrites_without_touching_the_original(self):
+    def test_brief_refs_rewrites_without_closing_the_original(self):
         fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t"}),
                     reply(201, {}), reply(201, {}), reply(200, []), reply(200, []))
@@ -2619,6 +2619,7 @@ class HumanAndRefsTests(unittest.TestCase):
             "\n\nRewritten from issue 6.\n\nPart of #2\n"))
         self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
+        self.assertIn("closes as completed when that ticket is verified", fake.calls[5][2]["body"])
         self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
         self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
@@ -2835,6 +2836,69 @@ class OnboardTests(unittest.TestCase):
     def test_says_when_the_repo_is_private(self):
         self.assertIn("private", self.run_onboard(FakeRepo(private=True))[0])
         self.assertTrue(self.run_onboard(FakeRepo())[0].endswith("public"))
+
+    def created_home(self, fake):
+        made = [c[2] for c in fake.writes() if c[1].endswith("/issues")
+                and c[2]["labels"] == ["loom:goal", "loom:backlog"]]
+        self.assertEqual(len(made), 1)
+        return made[0]
+
+    def test_operator_names_the_goal_home_it_opens(self):
+        fake = FakeRepo(prs=[pr(7, "abc")], runs={"abc": 1})
+        brain.onboard(GitHub("t", transport=fake), REPO, env=self.ENV, operator="op-a")
+        home = self.created_home(fake)
+        self.assertTrue(home["body"].startswith("Operator: op-a\n\n## Destination\n"))
+        # The station's goal filter reads it as op-a's Loom's, and no other's.
+        self.assertEqual(tickets.goal_operator(home), "op-a")
+        self.assertTrue(tickets.goal_ours(home, ["op-a"]))
+        self.assertFalse(tickets.goal_ours(home, ["op-b", "loom-app[bot]"]))
+        fake.calls = []
+        brain.onboard(GitHub("t", transport=fake), REPO, env=self.ENV, operator="op-a")
+        self.assertEqual(fake.writes(), [])
+
+    def test_operator_must_be_a_login(self):
+        with self.assertRaises(ValueError):
+            brain.onboard(GitHub("t", transport=FakeRepo()), REPO, env=self.ENV,
+                          operator="op a\n## Rules")
+
+    def test_another_operators_goal_home_gets_ours_beside_it(self):
+        theirs = {"number": 3, "state": "open", "title": brain.backlog_title(REPO),
+                  "body": "Operator: op-b\n\n## Destination\nAll of it.",
+                  "labels": [{"name": "loom:goal"}, {"name": "loom:backlog"}]}
+        fake = FakeRepo(issues=[theirs], prs=[pr(7, "abc")], runs={"abc": 1})
+        env = dict(self.ENV, LOOM_BRIEF_AUTHORS="loom-app[bot] op-a")
+        lines = self.run_onboard(fake, env=env)
+        home = self.created_home(fake)
+        self.assertEqual(tickets.goal_operator(home), "op-a")
+        self.assertIn("operator: op-a (the first LOOM_BRIEF_AUTHORS login that is not an app), "
+                      "since #3 names operator op-b", lines)
+        self.assertIn("backlog goal home: #101, created", lines)
+        self.assertFalse([c for c in fake.writes() if "/issues/3/" in c[1]])
+
+    def test_another_operators_goal_home_needs_a_login_to_name(self):
+        theirs = {"number": 3, "state": "open", "title": "Ship the thing",
+                  "body": "Operator: op-b\n", "labels": [{"name": "loom:goal"}]}
+        fake = FakeRepo(issues=[theirs], prs=[pr(7, "abc")], runs={"abc": 1})
+        with self.assertRaisesRegex(ValueError, "pass --operator"):
+            self.run_onboard(fake, env=dict(self.ENV, LOOM_BRIEF_AUTHORS="loom-app[bot]"))
+        self.assertFalse([c for c in fake.writes() if c[1].endswith("/issues")])
+
+    def test_a_goal_home_without_the_line_is_left_with_a_hint(self):
+        home = {"number": 3, "state": "open", "title": brain.backlog_title(REPO),
+                "body": "## Destination\nAll of it.",
+                "labels": [{"name": "loom:goal"}, {"name": "loom:backlog"}]}
+        fake = FakeRepo(issues=[home], prs=[pr(7, "abc")], runs={"abc": 1})
+        env = dict(self.ENV, LOOM_BRIEF_AUTHORS="loom-app[bot] op-a")
+        for _ in range(2):
+            fake.calls = []
+            lines = self.run_onboard(fake, env=env)
+            self.assertFalse([c for c in fake.writes() if c[1].endswith("/issues/3")])
+            self.assertFalse([c for c in fake.writes() if c[1].endswith("/issues")
+                              and "loom:goal" in c[2]["labels"]])
+            self.assertIn('backlog goal home: #3 names no operator, so every Loom on %s works it; '
+                          'to keep it to one, add the line "Operator: op-a" above its first '
+                          'heading' % REPO, lines)
+        self.assertEqual(home["body"], "## Destination\nAll of it.")
 
     def test_command_line_prints_the_lines(self):
         fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})

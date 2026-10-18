@@ -214,6 +214,10 @@ class Facts:
     runs: Optional[List[Run]] = None
     # lane -> since when it has been held by a limit.
     held: Optional[Dict[str, float]] = None
+    # The held lanes that are out of credit on an account the operator never
+    # tops up (LOOM_NO_TOPUP): the hold lasts until the credit renews, and
+    # nothing is briefed onto them meanwhile, so it is no breach.
+    no_topup: Optional[Tuple[str, ...]] = None
     # (ticket, the lanes of its difficulty tier) for each queued ticket.
     queued: Optional[List[Tuple[Ref, Tuple[str, ...]]]] = None
     # Each goal home with its epics and the open tickets under none.
@@ -389,12 +393,14 @@ def lane_no_success(f: Facts) -> List[Breach]:
 
 def lane_held(f: Facts) -> List[Breach]:
     """A lane held by a limit for over HELD_MAX while tickets of its tier
-    are queued."""
+    are queued. A lane out of credit on an account the operator never tops
+    up (Facts.no_topup) is skipped: stamped with the pass time, its breach
+    reopened every day until the credit renewed (loom#399 to loom#406)."""
     if f.held is None or f.queued is None:
         return []
     out = []
     for lane, since in sorted(f.held.items()):
-        if f.now - since <= HELD_MAX:
+        if f.now - since <= HELD_MAX or lane in (f.no_topup or ()):
             continue
         waiting = [ref for ref, lanes in f.queued if lane in lanes]
         if not waiting:

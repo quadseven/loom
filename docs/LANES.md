@@ -193,7 +193,13 @@ CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
 until 5 minutes before its `expires_at`. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
-three unset, the token above is used as before. The station reads the App's
+three unset, the token above is used as before. Instead of SSM, the station
+and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
+its path (it wins when both are set). `lanes/mac/install.sh` writes it into
+both plists, refuses a key file readable by group or others (it must be mode
+600), and refuses to install at all when only some of the App id, the
+installation id and a key setting are set, naming the missing one, so a half
+setup never quietly runs on the personal token. The station reads the App's
 slug once per pass (`GET /app`, counted under `app login`) and trusts
 `<slug>[bot]` wherever `LOOM_BRIEF_AUTHORS` is, so the labels and comments the
 App writes need no hand-listed login; its startup log line `trusting briefing
@@ -201,7 +207,17 @@ logins` names every login trusted. More than three briefed tickets refused in
 an hour for one untrusted labeller file the `untrusted-labeler` invariant,
 naming the login. The App needs contents,
 issues and pull requests read and write, and checks and actions read, on the
-scanned repos. The dashboard takes the same three settings when its host has
+scanned repos. To set one up, `python3 -m bus app manifest --owner OWNER`
+(add `--org` for an organisation) prints the create page and a manifest with
+exactly those permissions and no webhook; `--form` prints an HTML page whose
+one button creates the App. Install it on the repos in `LOOM_REPOS` only and
+generate a private key; then, with the key in `LOOM_GITHUB_APP_KEY_FILE` or
+`LOOM_GITHUB_APP_KEY_SSM`, `python3 -m bus app ids --app-id N` lists the
+installations and the repos each covers, prints the `LOOM_GITHUB_APP_ID` and
+`LOOM_GITHUB_APP_INSTALLATION_ID` lines to paste, and warns about a repo in
+`LOOM_REPOS` the installation misses, one it covers outside `LOOM_REPOS`, and
+a permission Loom needs that it lacks. It never prints or writes the key or
+the tokens it mints. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
 
@@ -402,6 +418,25 @@ only what is its own, and adding an operator is configuration:
 Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
 other's login. A person working a ticket by hand claims it the same way:
 assign it to yourself and add `claim:<your login>` before any Loom briefs it.
+
+Each Loom sets these for itself when it installs; a second operator running
+from a clone of another operator's checkout must not inherit them:
+
+- `LOOM_REPOS`: the repos this Loom watches.
+- `LOOM_REPO_OWNERS`: the owners whose repos it may brief (default: this
+  checkout's owner).
+- `LOOM_STATUS_REPO`: where the brain lock `loom-lock/brain` and the
+  `loom:lanes` issue live (default: this checkout's origin).
+- `LOOM_BRIEF_AUTHORS`: this operator's own logins.
+- The App settings, `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID`
+  and `LOOM_GITHUB_APP_KEY_SSM`, so each Loom spends its own installation's
+  budget.
+- `LOOM_BRAIN_HOLDER`: the name on the brain lock (default `lane-machine`).
+
+`lanes/mac/install.sh` refuses to install, writing no agent, when
+`LOOM_REPOS` is set and the status repo (`LOOM_STATUS_REPO`, or the origin
+when it is unset) or any `LOOM_REPOS` repo has an owner outside
+`LOOM_REPO_OWNERS`; the message names the setting or repo at fault.
 
 ### Trusted briefers
 
@@ -644,7 +679,13 @@ Each invariant is one function returning breaches with evidence:
 - A `loom:metrics` line posted more than once for one day, or two
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
-- A lane held by a limit for over 2 hours while tickets of its tier are queued.
+- A lane held by a limit for over 2 hours while tickets of its tier are
+  queued. Only truly queued tickets count: `loom:queued` is their only state
+  label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
+  provider lanes whose credit the operator never tops up (for example
+  `anthropic`); a slot of one held out of credit is skipped, since it waits
+  for the credit to renew and nothing is briefed onto it meanwhile. Unset,
+  every held lane counts.
 - The epic shape (decision 0003): a goal home with open `loom:ticket` issues
   under no epic (one breach per goal), an epic holding more than 15 tickets,
   a goal with more open epics than its cap (6, or the goal home's
@@ -734,6 +775,20 @@ loopback connection; they cannot query the viewer or any other local service.
   provider's weekly limit ...` with a `retry_at`) and hands the brief on as
   `[limit]`; any other answer lets the run go ahead. Another provider can
   name its own endpoint in the same setting.
+- The Usage view's meters for the free lanes (loom#812). After a ready
+  heartbeat the openrouter and workersai lanes read their provider's
+  read-only meter with the key they already hold, at most every five minutes,
+  through `bus/meter.py` (key and account id on stdin, never argv or a log),
+  into `state/usage/<slot>.meter.json`; `bus/usage.py` shows it. openrouter:
+  `GET /api/v1/key`, the key's free-model requests in the current UTC day and
+  its credit limit if it has one. workersai: the GraphQL Analytics API,
+  `aiInferenceAdaptiveGroups` `totalNeurons` for today, against
+  `LOOM_WORKERSAI_DAILY_NEURONS` (default 10000, the free allocation; reset
+  00:00 UTC); the token needs Account Analytics read besides Workers AI, or
+  Usage says the read failed and why. `LOOM_<SLOT>_METER_URL` overrides the
+  endpoint. zai and zen have no meter: Z.ai documents no usage endpoint for
+  API keys (its quota monitor covers the GLM Coding Plan only) and Zen's free
+  models take no key, so Usage says "no meter: provider exposes no usage".
 
 ### One slot on opencode 2.0
 
@@ -751,7 +806,11 @@ LOOM_OPENCODE_GO_3_OPENCODE=/path/to/opencode2/bin/opencode lanes/mac/install.sh
 names the opencode binary; without it a lane runs `opencode` from PATH. Before
 each run the runner asks the binary for `--version`; when it prints
 `opencode v2.` the runner starts `opencode serve` with a fresh password on a
-random high loopback port inside the agent's sandbox. It allows only that
+random high loopback port (49152-65535) inside the agent's sandbox. The
+port must bind free on 127.0.0.1 when picked, and the server does not start
+if something listens on it by the time it would, so the agent never talks to
+another process's listener. When no port can be had, the run parks with the
+reason in its log. It allows only that
 port through the sandbox's loopback deny, waits up to 15 seconds for the
 server, and calls `run --server` with `--auto`. The server stops when the run
 ends, including on failure or timeout. The sandbox lets the

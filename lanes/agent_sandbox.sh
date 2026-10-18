@@ -35,7 +35,8 @@ sandbox_profile() {
   [ "$LANE" = agy ] && [ "${3:-}" != check ] && { keychain_deny=""; agy_lane=1; }
   local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule=""
   if [ -n "${4:-}" ]; then
-    [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] || return 1
+    [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
+      { echo "refusing sandbox: loopback port $4 is not in 49152-65535" >&2; return 1; }
     loopback_rule="(allow network-outbound (remote ip \"localhost:$4\"))"
   fi
   home="$(cd "$HOME" && pwd -P)"
@@ -80,9 +81,16 @@ sandbox_profile() {
 # loopback port, `$cli serve` runs on it under the same profile with a
 # password made for this run, and the agent command (which names the same
 # port) runs against it. The server is stopped when the subshell ends,
-# whatever the agent's outcome.
+# whatever the agent's outcome. A port something already listens on is
+# refused before the server starts: the readiness probe below would take that
+# listener for the server, and the agent would talk to another process.
 api_agent() {
   local key_var="$1" cli="$2" profile
+  if [ -n "${OPENCODE_SERVER_PORT:-}" ] &&
+    /usr/bin/nc -z -w 1 127.0.0.1 "$OPENCODE_SERVER_PORT" > /dev/null 2>&1; then
+    echo "loopback port $OPENCODE_SERVER_PORT is already in use; not starting the opencode server on it" >&2
+    return 3
+  fi
   mkdir -p "$AGENT_HOME/tmp"
   profile="$(sandbox_profile "$PWD" "$cli" "" "${OPENCODE_SERVER_PORT:-}")" || return 3
   (
@@ -155,10 +163,37 @@ opencode_config() {
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": $permission$provider}"
 }
 
+# A random port in 49152-65535 that nothing on this machine holds: each
+# candidate must bind on 127.0.0.1, so a port the transcript viewer, another
+# lane or another slot listens on is skipped. The probe socket closes before
+# the server starts; api_agent refuses the port if something took it since.
+# Prints the port, or says on stderr why there is none and returns 1: a
+# missing interpreter, every candidate in use, or output that is not a port.
+free_loopback_port() {
+  local port
+  port="$(python3 -c 'import secrets, socket, sys
+for _ in range(64):
+    port = 49152 + secrets.randbelow(16384)
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+    print(port)
+    sys.exit(0)
+sys.exit("all 64 ports tried were in use")' 2>&1)" ||
+    { echo "no free loopback port for the opencode server: ${port:-python3 failed}" >&2; return 1; }
+  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 49152 ] && [ "$port" -le 65535 ] ||
+    { echo "the port picker printed '$port', not a port in 49152-65535" >&2; return 1; }
+  printf '%s' "$port"
+}
+
 # opencode 2.x `run` talks to a shared background service unless pointed at a
 # server; --standalone spawns one on a random loopback port, which the sandbox
 # denies. So the run gets its own server on one allowed port (see api_agent).
 # --auto lets it act without prompting, as 1.x run does.
+# The port comes from free_loopback_port; when there is none, the run parks
+# with the reason in the log and no server or agent starts.
 # Usage: opencode_run <key_var> <opencode binary> <run arguments...>
 opencode_run() {
   local key_var="$1" bin="$2" port
@@ -166,7 +201,7 @@ opencode_run() {
   opencode_config || return 1
   case "$(timeout "$NET_TIMEOUT" "$bin" --version < /dev/null 2> /dev/null | head -n 1)" in
     "opencode v2."*)
-      port="$(python3 -c 'import secrets; print(49152 + secrets.randbelow(16384))')" || return 3
+      port="$(free_loopback_port)" || return 3
       OPENCODE_SERVER_PORT="$port" api_agent "$key_var" "$bin" run \
         --server "http://127.0.0.1:$port" --auto -m "$MODEL" "$@"
       return $? ;;
