@@ -1691,8 +1691,12 @@ class Station:
         names = set(_label_names(issue))
         if names & {REGRESSION, factory.REVERT_LABEL, URGENT}:
             return None
+        parent = _ticket_goal(issue)
         goal = self._goal_of(repo, issue)
         if goal is None:
+            if parent is not None:
+                return ("its parent issue #%d is neither an open goal nor an epic "
+                        "of a goal" % parent)
             return None
         key = (repo, goal)
         if key not in counts:

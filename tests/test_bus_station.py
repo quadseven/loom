@@ -5756,15 +5756,20 @@ class UnprovenGateTest(unittest.TestCase):
         self.assertEqual(self.run_pass(), 0)
         self.assertIn("loom:running", self.fake.names(7))
 
-    def test_a_ticket_under_a_plain_issue_is_not_gated_and_the_pass_completes(self):
+    def test_a_ticket_under_a_plain_issue_is_skipped_and_the_pass_completes(self):
         self.over_limit()
         self.fake.issues[60] = {"number": 60, "title": "A note", "state": "open",
                                 "labels": [], "body": "Just a note."}
         self.fake.comments[60] = []
         self.fake.events[60] = []
         self.brief_under(7, 60)
-        self.assertEqual(self.run_pass(), 0)
-        self.assertIn("loom:running", self.fake.names(7))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+        self.assertIn("not claiming %s#7" % REPO, err.getvalue())
+        self.assertIn("issue #60 is neither an open goal nor an epic of a goal", err.getvalue())
 
     def test_ticket_goal_reads_the_part_of_line(self):
         self.assertEqual(station._ticket_goal({"body": "x\n\nPart of #40\n"}), 40)
