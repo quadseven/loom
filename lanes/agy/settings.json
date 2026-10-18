@@ -1,4 +1,5 @@
 {
+  "enableTerminalSandbox": false,
   "permissions": {
     "allow": [
       "command(*)",

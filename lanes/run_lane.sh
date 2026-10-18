@@ -550,7 +550,9 @@ agy_forget() {
 # keeps read-only) hold its permission rules. Print mode cannot prompt, so a
 # tool no rule allows is denied and the run ends with no output. Before every
 # run the runner rewrites the file as the lane user from lanes/agy/settings.json:
-# shell commands and the file tools allowed, web fetching denied. Only
+# shell commands and the file tools allowed, web fetching denied, and agy's own
+# terminal sandbox off (it denied commands those rules allow; the sandbox-exec
+# profile below stays the boundary). Only
 # trustedWorkspaces, the operator's one-time sign-in choice, is carried over
 # from the old file; any other key is dropped. After the run it writes back
 # exactly what it wrote before, so nothing a run did to the file survives.
