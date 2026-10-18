@@ -18,6 +18,9 @@ LINE_403 = ("[2026-10-13T10:00:01Z] station: could not scan example-owner/repo-a
             "GET /repos/example-owner/repo-a/issues?labels=loom:briefed answered 403")
 LINE_403_B = ("[2026-10-13T10:02:41Z] station: could not scan example-owner/repo-b: "
               "GET /repos/example-owner/repo-b/issues?labels=loom:briefed answered 403")
+# bus/station.py _try_ticket's hold line, as loom#645 and loom#646 saw it.
+HOLD_LINE = "station: example-owner/repo-a#506 waits for #102 (failed)"
+HOLD_LINE_CROSS = "station: example-owner/repo-b#871 waits for example-owner/repo-a#102 (failed)"
 
 
 class FakeGH:
@@ -105,6 +108,19 @@ class SignatureTest(unittest.TestCase):
         for line in ("claimed example-owner/repo#3 for lane codex", "took 403 ms"):
             self.assertFalse(watch.keep(line), line)
 
+    def test_a_hold_on_a_failed_ticket_is_status_not_an_error(self):
+        # loom#645 and loom#646: the station says each pass what a held
+        # ticket waits for, and a dependency in loom:failed reads "(failed)".
+        for line in (HOLD_LINE, HOLD_LINE_CROSS,
+                     "station: example-owner/repo-a#7 waits for #3 (failed), #4 (pr)",
+                     "[2026-10-17 18:50:01] " + HOLD_LINE):
+            self.assertFalse(watch.keep(line), line)
+        # Anything more on the line than the hold is judged as usual.
+        for line in ("station: example-owner/repo-a#7 waits for #3 (failed) and push failed",
+                     "station: could not read example-owner/repo-a#3: HTTP 502 failed",
+                     "error: example-owner/repo-a#7 waits for #3 (failed)"):
+            self.assertTrue(watch.keep(line), line)
+
 
 class FilingTest(WatchBase):
     def test_three_hits_in_thirty_minutes_file_one_issue_and_a_fourth_adds_nothing(self):
@@ -126,6 +142,12 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 1260)
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual(self.gh.comments, [])
+
+    def test_a_hold_on_a_failed_ticket_files_nothing(self):
+        for i in range(5):
+            self.append(HOLD_LINE, HOLD_LINE_CROSS)
+            self.run_at(T0 + i * 300)
+        self.assertEqual(self.gh.issues, {})
 
     def test_hits_spread_wider_than_the_window_file_nothing(self):
         for i in range(3):
