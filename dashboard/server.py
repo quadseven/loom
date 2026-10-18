@@ -748,36 +748,44 @@ def _needs_you(document, state, *, source_missing=False, who=""):
     """Everything waiting on a person (loom#810): needs-operator asks from
     Hunt's document and the store, and needs:<login> items from the
     Operators pass, each once, filtered by ?who=."""
-    order = lambda item: (-_number(item.get("unblocks")), str(item.get("waiting_since", "9999")))
     asks = list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", []))
     response = getattr(state, "response", None)
     claims = (response() if callable(response) else {}).get("operator_claims") or {}
     repos = list(getattr(state, "repos", None) or [])
     found, cards = needs_you_view.render(asks, claims, who, repos)
-    names = needs_you_view.full_names(repos + [entry["repo"] for entry in found])
+    out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
+           'Everything else the brain does itself.</p>']
+    if source_missing:
+        out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
+    out.append(cards)
+    if not who:
+        out.append(_backlog_asks(document, found, repos))
+    counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
+    out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(
+        ", ".join("%s: %s" % (repo, count) for repo, count in counts.items()) or "none"))
+    return page("Needs you", "needs-you", "".join(out), status="Read only")
+
+
+def _backlog_asks(document, found, repos):
+    """Hunt's ready-for-a-person items not already listed above, collapsed."""
+    names = needs_you_view.full_names(list(repos) + [entry["repo"] for entry in found])
     listed = {entry["key"] for entry in found}
     backlog = {}
     for item in document.get("ready_for_human") or []:
         key = needs_you_view.ref_key(item.get("repo"), item.get("number"), names) if _repo_number(item) else ""
         if key and key not in listed:
             backlog.setdefault(key, {**item, "queue": "ready_for_human"})
-    out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
-           'Everything else the brain does itself.</p>']
-    if source_missing:
-        out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
-    out.append(cards)
-    if backlog and not who:
-        out.append('<details class="backlog-asks"><summary>From the backlog (%d), ready for a person</summary>' % len(backlog))
-        for item in sorted(backlog.values(), key=order):
-            waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
-            out.append('<p class="backlog-ask"><a href="%s">%s</a> %s <span class="machine-fact">%s | unblocks %s</span></p>' % (
-                html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item)),
-                html.escape(str(item.get("title") or "")), waiting, html.escape(str(item.get("unblocks", 0)))))
-        out.append('</details>')
-    counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
-    out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(
-        ", ".join("%s: %s" % (repo, count) for repo, count in counts.items()) or "none"))
-    return page("Needs you", "needs-you", "".join(out), status="Read only")
+    if not backlog:
+        return ""
+    order = lambda item: (-_number(item.get("unblocks")), str(item.get("waiting_since", "9999")))
+    rows = []
+    for item in sorted(backlog.values(), key=order):
+        waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
+        rows.append('<p class="backlog-ask"><a href="%s">%s</a> %s <span class="machine-fact">%s | unblocks %s</span></p>' % (
+            html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item)),
+            html.escape(str(item.get("title") or "")), waiting, html.escape(str(item.get("unblocks", 0)))))
+    return ('<details class="backlog-asks"><summary>From the backlog (%d), ready for a person</summary>%s</details>'
+            % (len(backlog), "".join(rows)))
 
 
 def _number(value):

@@ -91,6 +91,19 @@ def _merge(entry: Dict[str, Any], item: Dict[str, Any], waiting: bool, names: Di
         entry["comment_ask"] = ""
 
 
+def _listable(item: Dict[str, Any], who: List[str]) -> bool:
+    return item.get("number") is not None and bool(_repo_name(item.get("repo"))) and bool(who)
+
+
+def _add(found: Dict[str, Dict[str, Any]], item: Dict[str, Any], is_needs: bool, who: List[str],
+         names: Dict[str, str]) -> None:
+    key = ref_key(item.get("repo"), item.get("number"), names)
+    entry = found.setdefault(key, {"key": key, "repo": "", "who": [], "unblocks": 0, "body_ask": "",
+                                   "comment_ask": None, "comment_url": ""})
+    _merge(entry, item, is_needs, names)
+    entry["who"].extend(login for login in who if login not in entry["who"])
+
+
 def entries(operator_asks: Iterable[Any], needs: Iterable[Any], repos: Iterable[Any] = ()) -> List[Dict[str, Any]]:
     """Every item waiting on a person, once each, with who it waits on
     (logins, and OPERATOR for needs-operator), its asks and its fields."""
@@ -101,13 +114,8 @@ def entries(operator_asks: Iterable[Any], needs: Iterable[Any], repos: Iterable[
     sources = [(item, False, [OPERATOR]) for item in asks] + [
         (item, True, list(item.get("waiting_on") or [])) for item in waiting]
     for item, is_needs, who in sources:
-        if item.get("number") is None or not _repo_name(item.get("repo")) or not who:
-            continue
-        key = ref_key(item.get("repo"), item.get("number"), names)
-        entry = found.setdefault(key, {"key": key, "repo": "", "who": [], "unblocks": 0, "body_ask": "",
-                                       "comment_ask": None, "comment_url": ""})
-        _merge(entry, item, is_needs, names)
-        entry["who"].extend(login for login in who if login not in entry["who"])
+        if _listable(item, who):
+            _add(found, item, is_needs, who, names)
     return sorted(found.values(), key=lambda entry: (
         -entry["unblocks"], str(entry.get("waiting_since") or entry.get("updated_at") or "9999")))
 
