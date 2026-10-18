@@ -261,7 +261,7 @@ where the repo's work actually lands.
 
 ## Onboarding a repo
 
-`python3 -m bus.brain onboard <owner/name> [--review-check NAME]` readies a
+`python3 -m bus.brain onboard <owner/name> [--review-check NAME] [--operator LOGIN]` readies a
 repo for Loom in one step, and a second run changes nothing:
 
 - creates the labels above that are missing (the same as `python3 -m bus
@@ -271,6 +271,13 @@ repo for Loom in one step, and a second run changes nothing:
   <owner/name> issue" (docs/NAMING.md), with the destination, the metric (open issues not
   yet tickets, tickets, `loom:human`) and the rules (triage never closes an
   issue; a private repo's briefs never go to lanes that train on prompts);
+- writes `Operator: LOGIN` above the first heading of a backlog goal home it
+  opens (docs/LANES.md): `--operator`, else, when another operator's goal home
+  is already open in the repo, the first `LOOM_BRIEF_AUTHORS` login that is
+  not an app, naming which login it used. A goal home naming another operator
+  is that operator's, so onboard opens this Loom's own beside it. An open
+  backlog goal home without the line is left as it is, and onboard prints the
+  line to add by hand;
 - checks whether the review check (`--review-check`, else
   `LOOM_REVIEW_CHECK`, else `Grug - Elder`) ran on any of the repo's last 5
   pull requests, and prints a `warning:` line when it did not, because the
