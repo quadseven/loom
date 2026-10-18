@@ -566,12 +566,14 @@ class EpicsOnGoals(unittest.TestCase):
         self.assertIn("Main goal", card)
         self.assertIn("open epics 1/6", card)
         epics = card[card.index('class="goal-epics"'):]
-        self.assertIn("Epic: the first chunk", epics)
+        # The row sits under "open epics", so the title drops its "Epic:".
+        self.assertIn('<span class="goal-child-title">the first chunk</span>', epics)
+        self.assertNotIn("Epic:", epics)
         self.assertIn("sample#40 / tickets 2/15 / 2 in flight", epics)
         self.assertIn('href="/tickets?epic=%s"' % server.quote(REPO + "#40", safe=""), epics)
         closed = epics[epics.index("goal-epics-closed"):]
         self.assertIn("1 closed epic", closed)
-        self.assertIn("Epic: an older chunk", closed)
+        self.assertIn('<span class="goal-child-title">an older chunk</span>', closed)
         self.assertIn("4 tickets on this goal", card)
 
     def test_the_tickets_page_filters_by_epic_and_the_header_names_epic_and_goal(self):
