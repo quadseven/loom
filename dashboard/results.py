@@ -98,12 +98,44 @@ def _week_by_repo(prs, comments, week: datetime):
     return sorted(by_repo.items(), key=lambda kv: (-kv[1]["merged"], kv[0]))
 
 
+def _clock(stamp: Any) -> str:
+    return datetime.fromtimestamp(stamp, timezone.utc).strftime("%H:%M UTC")
+
+
+def _read_note(payload: Dict[str, Any], read_at: Dict[str, Any]) -> str:
+    """When the counted sources a pass carried forward were last read: a pass
+    below the budget floor keeps the last read, and the page says how old it
+    is instead of passing it off as current."""
+    carried = payload.get("sources_carried") or []
+    parts = ["%s not read since %s" % (label, _clock(read_at[source]))
+             for source, label in (("pull_requests", "pull requests"), ("comments", "issue comments"))
+             if source in carried and isinstance(read_at.get(source), (int, float))]
+    if not parts:
+        return ""
+    parts[0] = parts[0][0].upper() + parts[0][1:]
+    return "%s: %s." % ("; ".join(parts), payload.get("stale_reason") or "GitHub could not refresh them")
+
+
 def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """Counts per window, and the week's counts per repo."""
     prs = [pr for pr in payload.get("pull_requests") or [] if isinstance(pr, dict)]
     tickets = [row for rows in (payload.get("tickets") or {}).values() if rows for row in rows]
     comments = [c for c in payload.get("issue_comments") or [] if isinstance(c, dict)]
-    comments_read = "issue_comments" in payload and not payload.get("hot_spots_error")
+    # source_read_at (dashboard/github.py) stamps each source a pass read; a
+    # source with no stamp was never read, so its count is unknown, not 0
+    # (loom#779). A payload without the stamps predates them.
+    stamps = payload.get("source_read_at")
+    read_at = stamps if isinstance(stamps, dict) else {}
+
+    def unread(source):
+        return isinstance(stamps, dict) and not read_at.get(source)
+
+    prs_read = not unread("pull_requests")
+    comments_read = ("issue_comments" in payload and not payload.get("hot_spots_error")
+                     and not unread("comments"))
+    reason = "" if comments_read else (payload.get("hot_spots_error") or "issue comments were not read")
+    pr_reason = "" if prs_read else "the dashboard has not read them since it started%s" % (
+        "; " + str((payload.get("dashboard_errors") or [""])[0]) if payload.get("dashboard_errors") else "")
 
     def comment_count(delta, test):
         # None is "not looked": unread, or older than the comment window.
@@ -111,28 +143,37 @@ def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
             return None
         return _count_comments(comments, now - delta, test)
 
+    def pr_count(delta, lane, merged):
+        return _count_prs(prs, now - delta, lane, merged) if prs_read else None
+
+    reach = "issue comments are read back %d days only" % COMMENT_REACH.days
+    pr_row = {"source": "pull requests", "reason": pr_reason, "unread": not prs_read}
+    comment_row = {"source": "issue comments", "reason": reason or reach, "unread": False}
+    ticket_row = {"source": "tickets", "reason": "", "unread": False}
     rows = [
-        ("Lane pull requests merged", lambda d: _count_prs(prs, now - d, True, True)),
-        ("Pull requests merged outside the lanes", lambda d: _count_prs(prs, now - d, False, True)),
-        ("Tickets closed as done", lambda d: _count_closed(tickets, now - d, "completed")),
-        ("Tickets closed as not planned", lambda d: _count_closed(tickets, now - d, "not_planned")),
-        ("Live proofs posted", lambda d: comment_count(d, _is_proof)),
-        ("Lane runs failed at the work", lambda d: comment_count(d, _work_failure)),
-        ("Lane pull requests closed unmerged", lambda d: _count_prs(prs, now - d, True, False)),
+        ("Lane pull requests merged", pr_row, lambda d: pr_count(d, True, True)),
+        ("Pull requests merged outside the lanes", pr_row, lambda d: pr_count(d, False, True)),
+        ("Tickets closed as done", ticket_row, lambda d: _count_closed(tickets, now - d, "completed")),
+        ("Tickets closed as not planned", ticket_row, lambda d: _count_closed(tickets, now - d, "not_planned")),
+        ("Live proofs posted", comment_row, lambda d: comment_count(d, _is_proof)),
+        ("Lane runs failed at the work", comment_row, lambda d: comment_count(d, _work_failure)),
+        ("Lane pull requests closed unmerged", pr_row, lambda d: pr_count(d, True, False)),
     ]
-    table = [{"name": name, "values": {key: fn(delta) for key, _, delta in WINDOWS}}
-             for name, fn in rows]
-    reason = "" if comments_read else (payload.get("hot_spots_error") or "issue comments were not read")
+    table = [dict(meta, name=name, values={key: fn(delta) for key, _, delta in WINDOWS})
+             for name, meta, fn in rows]
     return {"rows": table, "repos": _week_by_repo(prs, comments, now - timedelta(days=7)),
-            "comments_reason": reason, "comment_reach_days": COMMENT_REACH.days}
+            "comments_reason": reason, "comment_reach_days": COMMENT_REACH.days,
+            "prs_read": prs_read, "pr_reason": pr_reason, "comments_read": comments_read,
+            "read_note": _read_note(payload, read_at)}
 
 
-def _cell(value: Optional[int], reach_days: int, reason: str, window: str) -> str:
+def _cell(value: Optional[int], row: Dict[str, Any], window: str) -> str:
     if value is None:
-        why = reason or "issue comments are read back %d days only" % reach_days
-        message = "%s window was not read: issue comments; %s. Check again at the next dashboard refresh." % (window, why)
-        return '<td class="not-looked" title="%s">%s not looked</td>' % (
-            html.escape(message, quote=True), html.escape(window.capitalize()))
+        message = "%s window was not read: %s; %s. Check again at the next dashboard refresh." % (
+            window, row.get("source", "issue comments"), row.get("reason") or "it was not read")
+        return '<td class="not-looked" title="%s">%s %s</td>' % (
+            html.escape(message, quote=True), html.escape(window.capitalize()),
+            "not read" if row.get("unread") else "not looked")
     return '<td class="machine-fact">%d</td>' % value
 
 
@@ -142,23 +183,34 @@ def render_results(data: Dict[str, Any]) -> str:
     body = "".join(
         "<tr><th scope=\"row\">%s</th>%s</tr>" % (
             esc(row["name"]),
-            "".join(_cell(row["values"][key], data["comment_reach_days"], data["comments_reason"], key)
-                    for key, _, _ in WINDOWS))
+            "".join(_cell(row["values"][key], row, key) for key, _, _ in WINDOWS))
         for row in data["rows"])
     parts = ['<p class="page-lede">What the factory finished and what failed. Proofs and lane '
              'failures come from issue comments, read back %d days; older ones say not looked.</p>'
              % data["comment_reach_days"],
+             '<p class="stale-note">%s</p>' % esc(data["read_note"]) if data.get("read_note") else "",
              '<section><h2 class="label">Done and failed</h2>'
              '<table class="results-table"><thead><tr><th></th>%s</tr></thead><tbody>%s</tbody></table>'
              '</section>' % (head, body),
              '<section><h2 class="label">Last week by repo: lane pull requests merged, lane runs failed</h2>']
+    prs_read, comments_read = data.get("prs_read", True), data.get("comments_read", True)
+    unread = ["%s were not read (%s)" % (source, why) for source, read, why in (
+        ("pull requests", prs_read, data.get("pr_reason")),
+        ("issue comments", comments_read, data.get("comments_reason"))) if not read]
     if not data["repos"]:
-        parts.append('<p class="empty-state">No lane pull request merged and no lane run failed this week.</p>')
+        parts.append('<p class="empty-state">%s</p>' % (
+            esc("Not looked: %s." % "; ".join(unread)) if unread else
+            "No lane pull request merged and no lane run failed this week."))
     else:
+        def count(value, read, source):
+            if read:
+                return '<td class="machine-fact">%d</td>' % value
+            return '<td class="not-looked" title="%s were not read">not read</td>' % source
         parts.append('<table class="results-table"><thead><tr><th>Repo</th><th>Merged</th><th>Failed</th>'
                      '</tr></thead><tbody>')
-        parts.extend('<tr><th scope="row">%s</th><td class="machine-fact">%d</td>'
-                     '<td class="machine-fact">%d</td></tr>' % (esc(repo), v["merged"], v["failed"])
+        parts.extend('<tr><th scope="row">%s</th>%s%s</tr>' % (
+                         esc(repo), count(v["merged"], prs_read, "pull requests"),
+                         count(v["failed"], comments_read, "issue comments"))
                      for repo, v in data["repos"])
         parts.append('</tbody></table>')
     parts.append('</section>')

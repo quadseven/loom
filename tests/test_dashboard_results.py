@@ -73,6 +73,39 @@ class ResultsCounts(unittest.TestCase):
         self.assertIn("not looked", page)
         self.assertIn("comments: 502", page)
 
+    def test_an_unread_source_never_renders_zero(self):
+        # A first pass below the budget floor read no pull requests and no
+        # comments: the page said "Lane pull requests merged 0" (loom#779).
+        skipped = "GitHub's request budget ran low; these details refresh at 13:00 UTC"
+        data = results.build_results(payload(pull_requests=[], issue_comments=[], source_read_at={},
+                                             hot_spots_error=skipped, dashboard_errors=[skipped]), NOW)
+        for name in ("Lane pull requests merged", "Pull requests merged outside the lanes",
+                     "Lane pull requests closed unmerged", "Live proofs posted",
+                     "Lane runs failed at the work"):
+            self.assertEqual(values(data, name), {"day": None, "week": None, "month": None}, name)
+        page = results.render_results(data)
+        for row in page.split("<tr>"):
+            if "pull requests" in row.lower() or "proofs" in row or "failed at" in row:
+                self.assertNotIn('<td class="machine-fact">', row)
+        self.assertIn("Day not read", page)
+        self.assertIn("pull requests; the dashboard has not read them since it started", page)
+        self.assertNotIn("No lane pull request merged", page)
+        self.assertIn("Not looked: pull requests were not read", page)
+
+    def test_a_carried_read_says_when_it_was_read(self):
+        stamp = int(datetime(2030, 1, 31, 10, 5, tzinfo=timezone.utc).timestamp())
+        data = results.build_results(payload(
+            source_read_at={"pull_requests": stamp, "comments": stamp},
+            sources_carried=["pull_requests", "comments"],
+            stale_reason="GitHub's request budget ran low"), NOW)
+        self.assertEqual(values(data, "Lane pull requests merged"), {"day": 1, "week": 2, "month": 3})
+        page = results.render_results(data)
+        self.assertIn("Pull requests not read since 10:05 UTC; issue comments not read since 10:05 UTC: "
+                      "GitHub&#x27;s request budget ran low.", page)
+        fresh = results.render_results(results.build_results(payload(
+            source_read_at={"pull_requests": stamp, "comments": stamp}, sources_carried=[]), NOW))
+        self.assertNotIn("not read since", fresh)
+
     def test_the_week_by_repo(self):
         data = results.build_results(payload(), NOW)
         self.assertEqual(data["repos"], [(REPO, {"merged": 2, "failed": 1})])

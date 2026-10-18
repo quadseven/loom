@@ -53,7 +53,77 @@ class SlowGitHub:
         return self.paginate(path)
 
 
+class HomeGitHub(SlowGitHub):
+    """SlowGitHub plus a status home with a goal journal and a lanes comment,
+    and a lock branch with no tick record, counting every request."""
+
+    def __init__(self):
+        super().__init__(delay=0)
+        self.requests = 0
+
+    def paginate(self, path):
+        self.requests += 1
+        if "labels=loom%3Agoal" in path:
+            return [{"number": 5, "title": "Goal"}]
+        if path.endswith("/issues/5/comments"):
+            return [{"id": 41, "body": "<!-- loom:journal v1 -->\n- Friction: slow reads",
+                     "user": {"login": "bot"}, "created_at": "2030-01-01T00:00:00Z"},
+                    {"id": 42, "body": "<!-- loom:lanes v1 -->\n| codex | idle |",
+                     "user": {"login": "bot"}, "created_at": "2030-01-01T00:00:00Z"}]
+        return super().paginate(path)
+
+    def rest(self, method, path, **kwargs):
+        self.requests += 1
+
+        class Missing:
+            status, data, headers = 404, {}, {}
+        return Missing()
+
+
 class SnapshotTest(unittest.TestCase):
+    def test_a_pass_below_the_floor_keeps_every_view_source_of_the_last_read(self):
+        # Emptying them showed false zeros while the budget stayed low:
+        # Improving 0/0/0/0, Lanes "no loom:lanes comment", Brain "no goal
+        # journal found", Results "Lane pull requests merged 0" (loom#779).
+        gh = HomeGitHub()
+        with patch.dict(os.environ, {"LOOM_STATUS_REPO": REPOS[0]}, clear=True):
+            store = TicketStore(REPOS, gh=gh, budget_floor=500)
+            store._waits_refreshed_at = float("inf")
+            store.refresh()
+            first = store.response()
+            store._last_remaining, store._reset_at = 10, int(time.time()) + 3600
+            before = gh.requests
+            store.refresh()
+            second = store.response()
+        self.assertEqual(gh.requests, before)
+        for key in ("improving", "lanes", "pull_requests", "issue_comments", "review_comments",
+                    "brain_step"):
+            self.assertTrue(first[key], key)
+            self.assertEqual(second[key], first[key], key)
+        self.assertTrue(first["improving"]["journals"])
+        self.assertEqual(second["footer_runs"], first["footer_runs"])
+        self.assertEqual(second["brain_step_error"], "")
+        self.assertEqual(second["hot_spots_error"], "")
+        self.assertEqual(set(first["source_read_at"]),
+                         {"improving", "lanes", "pull_requests", "brain_step", "comments"})
+        self.assertEqual(second["source_read_at"], first["source_read_at"])
+        self.assertEqual(first["sources_carried"], [])
+        self.assertEqual(set(second["sources_carried"]), set(first["source_read_at"]))
+        self.assertIn("request budget ran low", second["dashboard_errors"][0])
+
+    def test_a_first_pass_below_the_floor_records_no_read_time(self):
+        gh = HomeGitHub()
+        with patch.dict(os.environ, {"LOOM_STATUS_REPO": REPOS[0]}, clear=True):
+            store = TicketStore(REPOS, gh=gh, budget_floor=500)
+            store._waits_refreshed_at = float("inf")
+            store._last_remaining, store._reset_at = 10, int(time.time()) + 3600
+            store.refresh()
+            payload = store.response()
+        self.assertEqual(payload["source_read_at"], {})
+        self.assertEqual(payload["sources_carried"], [])
+        self.assertEqual(payload["pull_requests"], [])
+        self.assertIn("request budget ran low", payload["hot_spots_error"])
+
     def test_pull_request_pages_overlap_within_a_repo_and_keep_page_order(self):
         repo = REPOS[0]
         active = 0
