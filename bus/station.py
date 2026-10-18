@@ -112,6 +112,8 @@ URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
+# A usage snapshot that fails once is sent again after this pause (loom#345).
+USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
@@ -6040,12 +6042,23 @@ class Station:
         token = self._transcript_token()
         if token is None:
             return
-        try:
-            self.upload(url, token, records)
-        except UploadRefused as err:
-            _say("the dashboard refused the usage snapshot (%d)" % err.status)
-        except Exception as err:  # noqa: BLE001
-            _say("usage snapshot upload failed (%s)" % type(err).__name__)
+        for attempt in (1, 2):
+            try:
+                self.upload(url, token, records)
+                return
+            except UploadRefused as err:
+                _say("the dashboard refused the usage snapshot (%d)" % err.status)
+                return
+            except Exception as err:  # noqa: BLE001
+                if attempt == 1:
+                    # A dashboard rollout or a slow first snapshot drops one
+                    # upload; the second try usually lands (loom#345).
+                    time.sleep(USAGE_RETRY_PAUSE)
+                    continue
+                # post_transcript's messages carry neither URL nor token; the
+                # token is redacted anyway in case another uploader names it.
+                _say("usage snapshot upload failed twice: %s: %s"
+                     % (type(err).__name__, str(err).replace(token, "[token]")))
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
