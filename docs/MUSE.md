@@ -165,14 +165,17 @@ project goals. Muse, the lane machine's tick and the operator's interactive
 session are peers here: each improves the brain and the factory, through
 tickets and pull requests like any other work.
 
-- Each tick, note in the journal what slowed the factory down: a lane PR
-  that failed for a reason the runner could catch, a step done by hand that
-  the station could do, a rule a brief kept missing, a check that wasted a
-  reply.
+- Each tick, note in the journal what slowed the factory down, one
+  `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
+  for a reason the runner could catch, a step done by hand that the station
+  could do, a rule a brief kept missing, a check that wasted a reply.
 - Every 2 hours, with the report, brief the single biggest such problem as a
   ticket on loom#30 (or on the review bot's goal, quadseven/grug#1143, when
-  the review bot caused it), with the evidence. Skip it when a ticket for it
-  is already open; add the new evidence there instead.
+  the review bot caused it), with the evidence. End its Why with a
+  `Noticed in <journal comment link>: "<the Friction line>"` line
+  (docs/BRAIN.md, Ticket issues) so the Improving page counts it ticketed.
+  Skip it when a ticket for it is already open; add the new evidence there
+  instead.
 - Review the other brains' Loom pull requests like any lane PR.
 
 ## Remote pull lane
