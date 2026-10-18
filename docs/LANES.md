@@ -205,6 +205,14 @@ scanned repos. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
 
+With those App settings, the lane runner mints a fresh installation token
+before each agent run and passes it as `GH_TOKEN` and `GITHUB_TOKEN` to the
+agent. A failed mint stops that run; it does not pass the operator's token.
+The agent brief tells the agent to stop after opening or updating a pull
+request. The station reads checks and reviews and sends a fix brief when
+needed. Each run log reports how many `gh` command lines appeared in the
+agent's logged output.
+
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 It skips future `Not before:` times and tickets without a readable Difficulty.

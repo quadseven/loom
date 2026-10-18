@@ -227,7 +227,20 @@ summary_note() {
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n- Do not poll pull request checks or reviews. Open or update the pull request and stop; the station reads checks and hands work back when needed.\n'
+}
+
+# Mint once per agent run, shortly before launch. The station uses this same
+# client; a failed App mint must not fall back to the operator's gh login.
+mint_agent_token() {
+  PYTHONPATH="$LOOM_ROOT${PYTHONPATH:+:$PYTHONPATH}" timeout "$NET_TIMEOUT" python3 -c '
+from bus.github import AppToken, GitHub
+app = AppToken.from_env()
+if app is None:
+    raise SystemExit("GitHub App settings are incomplete")
+client = GitHub(app)
+print(app.token(client._mint_app_token))
+'
 }
 
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
@@ -616,11 +629,13 @@ agy_agent() {
   profile="$(sandbox_profile "$PWD" "$AGY_BIN")" || return 3
   settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
-  "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
-    LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
+  printf '%s\n' "${AGENT_GH_TOKEN:-}" | "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" \
+    HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb LANG="${LANG:-en_US.UTF-8}" \
+    /bin/bash -c 'IFS= read -r GH_TOKEN; export GH_TOKEN GITHUB_TOKEN="$GH_TOKEN"; exec "$@"' bash \
+    timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
     "$AGY_BIN" -p "$1
 
-$AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
+$AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
   local rc=$?
   # A failed restore must fail the run, even if agy itself succeeded. Only the
   # copy of the file that agy_settings prints goes to /dev/null, not its status.
@@ -1475,6 +1490,10 @@ run_agent() {
   local brief_text
   brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
   AGENT_EXTRA_ENV=""
+  if [ -n "${AGENT_GH_TOKEN:-}" ]; then
+    export GH_TOKEN="$AGENT_GH_TOKEN" GITHUB_TOKEN="$AGENT_GH_TOKEN"
+    AGENT_EXTRA_ENV="GH_TOKEN=$AGENT_GH_TOKEN"$'\n'"GITHUB_TOKEN=$AGENT_GH_TOKEN"
+  fi
   is_api_lane && fresh_agent_home
   case "$LANE" in
     codex|claude) agent_cli "$LANE" lane "$brief_text" ;;
@@ -1483,7 +1502,7 @@ run_agent() {
     zen) opencode_agent - "$brief_text" ;;
     spark) opencode_agent - "$brief_text" ;;
     zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
-    workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
+    workersai) AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV$'\n'}CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
     anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
@@ -1817,12 +1836,22 @@ for BRIEF in "$INBOX"/*.md; do
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
+  AGENT_GH_TOKEN=""
+  if [ -n "${LOOM_GITHUB_APP_ID:-}" ] &&
+     [ -n "${LOOM_GITHUB_APP_INSTALLATION_ID:-}" ] &&
+     { [ -n "${LOOM_GITHUB_APP_KEY_SSM:-}" ] || [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; }; then
+    if ! AGENT_GH_TOKEN="$(mint_agent_token 2>> "$LOG")"; then
+      park "$BRIEF" "could not mint the GitHub App installation token" transient; continue
+    fi
+  fi
   ( set -m
     (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
   STATUS=$?
+  AGENT_GH_CALLS="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -Ec '(^|[[:space:]])gh[[:space:]]+(api|pr|issue|run|repo|search|auth)[[:space:]]' || true)"
+  echo "[$(date -u +%FT%TZ)] agent gh calls: $AGENT_GH_CALLS" >> "$LOG"
   is_api_lane && archive_transcripts
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then

@@ -486,6 +486,54 @@ class LaneRunnerTest(unittest.TestCase):
             extra += agent.read_text().splitlines()
         return self.log.read_text().splitlines() + extra
 
+    def test_configured_app_token_reaches_agent_without_operator_token(self):
+        self.drop_brief()
+        self.write_tool(self.bin / "python3", """#!/usr/bin/env bash
+case "$*" in
+  *AppToken.from_env*) printf '%s' 'ghs_minted_for_test'; exit 0 ;;
+esac
+exec /usr/bin/python3 "$@"
+""")
+        self.write_tool(self.bin / "codex", """#!/usr/bin/env bash
+printf 'agent GH_TOKEN=%s GITHUB_TOKEN=%s\\n' "${GH_TOKEN:-none}" "${GITHUB_TOKEN:-none}" >> "$FAKE_LOG"
+echo fixed > fix.txt
+""")
+        result = self.run_lane(LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",
+                               GH_TOKEN="gho_operator_for_test", GITHUB_TOKEN="gho_operator_for_test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent GH_TOKEN=ghs_minted_for_test GITHUB_TOKEN=ghs_minted_for_test",
+                      self.calls())
+
+    def test_failed_app_mint_never_runs_agent_with_operator_token(self):
+        self.drop_brief()
+        self.write_tool(self.bin / "python3", """#!/usr/bin/env bash
+case "$*" in
+  *AppToken.from_env*) echo 'mint refused' >&2; exit 1 ;;
+esac
+exec /usr/bin/python3 "$@"
+""")
+        result = self.run_lane(LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",
+                               GH_TOKEN="gho_operator_for_test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertIn("could not mint the GitHub App installation token", self.lane_log())
+
+    def test_agent_brief_stops_check_polling_and_log_reports_gh_calls(self):
+        self.drop_brief()
+        self.write_tool(self.bin / "codex", """#!/usr/bin/env bash
+case "$*" in
+  *'Do not poll pull request checks or reviews'*) echo 'agent saw no-poll instruction' >> "$FAKE_LOG" ;;
+esac
+printf 'gh pr checks 7\\ngh api rate_limit\\n'
+echo fixed > fix.txt
+""")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent saw no-poll instruction", self.calls())
+        self.assertIn("agent gh calls: 2", self.lane_log())
+
     def test_fix_items_ignores_dispositions_before_a_finding(self):
         brief = Path(self._tmp.name) / "fix-items.md"
         brief.write_text("## Fix\nFixed\n### Thread F1 (comment 1) at test.py:10\n"
