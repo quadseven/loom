@@ -7174,14 +7174,12 @@ class Station:
             raise
         except (GitHubError, OSError) as err:
             _say("watch_logs failed: %s" % err)
-        try:
-            self.prune_trees()
-        except OSError as err:
-            _say("prune_trees failed: %s" % err)
-        try:
-            self.tend_disk()
-        except OSError as err:
-            _say("tend_disk failed: %s" % err)
+        # Local housekeeping: finished lane trees, old lane logs, the disk.
+        for local in (self.prune_trees, self.tend_disk):
+            try:
+                local()
+            except OSError as err:
+                _say("%s failed: %s" % (local.__name__, err))
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
