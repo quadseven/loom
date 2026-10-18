@@ -318,6 +318,10 @@ VERIFY_INTERVAL = 6 * 3600
 # loom:awaiting-evidence label: a reason, not a word.
 MISSING_MIN = 20
 VERIFY_FILE = "verify-runs.json"
+# Per-lane transient verify failures and the holds they earn (loom#714).
+VERIFY_LANES_FILE = "verify-lanes.json"
+VERIFY_STRIKES = 2
+VERIFY_LANE_HOLD = 3600
 # Lanes that spend Anthropic models never take a verify run; the free and
 # subscription lanes do (the claude lane spends the operator's subscription).
 VERIFY_SKIP = ("anthropic", "claude")
@@ -1946,7 +1950,7 @@ class Station:
             _say("could not list tickets to verify: %s" % err)
             return
         for lane in lanes:
-            if lane in held:
+            if lane in held or self._verify_lane_held(lane):
                 continue
             for repo, issue in list(pool):
                 if needs_public_repo(lane, "") and not self._public(repo):
@@ -2064,8 +2068,22 @@ class Station:
         """Apply a finished verify run. A failed run changes nothing: the
         ticket is due again once its cooldown is over."""
         if kind == "failed":
+            klass = failure_class(self._failure_reason(lane, name))
+            if klass in ("transient", "limit"):
+                # The run never looked at the ticket: it costs the ticket no
+                # cooldown, and a lane failing this way twice sits out an hour
+                # (loom#714).
+                self._forget_verify_attempt(repo, number)
+                held = klass == "transient" and self._verify_strike(lane)
+                _say("verify run %s failed [%s]; %s#%d is due again now%s"
+                     % (name, klass, repo, number,
+                        "; lane %s takes no verify run for an hour after %d transient "
+                        "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
+                return True
+            self._verify_clear(lane)
             _say("verify run %s failed; %s#%d stays shipped" % (name, repo, number))
             return True
+        self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
         if result is None:
             self._verify_note(repo, number, lane, why)
@@ -2076,6 +2094,45 @@ class Station:
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True
+
+    def _forget_verify_attempt(self, repo: str, number: int) -> None:
+        path = os.path.join(self.state, VERIFY_FILE)
+        attempts = _read_json(path, {}, strict=False)
+        if isinstance(attempts, dict) and attempts.pop("%s#%d" % (repo, number), None) is not None:
+            _write_json(path, attempts)
+
+    def _verify_lanes(self) -> Dict[str, Any]:
+        data = _read_json(os.path.join(self.state, VERIFY_LANES_FILE), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    def _verify_strike(self, lane: str) -> bool:
+        """Count one transient verify failure for the lane; True when it now
+        sits out VERIFY_LANE_HOLD seconds."""
+        data = self._verify_lanes()
+        entry = data.get(lane) if isinstance(data.get(lane), dict) else {}
+        strikes = int(entry.get("strikes", 0) or 0) + 1
+        held = strikes >= VERIFY_STRIKES
+        data[lane] = {"strikes": 0 if held else strikes,
+                      "until": self.now + VERIFY_LANE_HOLD if held else entry.get("until", 0)}
+        _write_json(os.path.join(self.state, VERIFY_LANES_FILE), data)
+        return held
+
+    def _verify_clear(self, lane: str) -> None:
+        """A verify run that reached the ticket ends the lane's strike run."""
+        data = self._verify_lanes()
+        entry = data.get(lane)
+        if isinstance(entry, dict) and entry.get("strikes"):
+            entry["strikes"] = 0
+            _write_json(os.path.join(self.state, VERIFY_LANES_FILE), data)
+
+    def _verify_lane_held(self, lane: str) -> bool:
+        entry = self._verify_lanes().get(lane)
+        until = float(entry.get("until", 0) or 0) if isinstance(entry, dict) else 0.0
+        if until > self.now:
+            _say("lane %s takes no verify run until %s: %d transient verify failures in a row"
+                 % (lane, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(until)), VERIFY_STRIKES))
+            return True
+        return False
 
     def _verify_model(self, lane: str, name: str) -> str:
         """The model the verify run used, as the runner recorded it next to
