@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import brain
+from . import journal
 from . import naming
 from . import text as _text
 from . import watch
@@ -42,8 +43,9 @@ CLEAR_AFTER = 6 * 3600
 RECURRING_AFTER = 7 * DAY
 # No journal from any brain for this long is a brain that stopped ticking.
 BRAIN_SILENT = 90 * 60
-# Two loom:report comments on one goal closer than this are one too many.
-REPORT_GAP = 90 * 60
+# Two loom:report comments on one goal closer than this are one too many; the
+# same gap bus journal and brain status hold a report back by.
+REPORT_GAP = journal.REPORT_GAP
 RUNS_MIN = 5
 HELD_MAX = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own

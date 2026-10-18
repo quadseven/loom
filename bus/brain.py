@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
-from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
+from . import audit, change_class, handoff, hunt_plan, journal, lock, pr_repair, proof, text, tickets
 from . import naming
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -304,16 +304,24 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
-        if led["state"] != "ok":
+        comments = (node.get("comments") or {}).get("nodes") or []
+        # Any App's report holds the next one back too, whether or not this
+        # brain trusts the App's login: a goal the station reported 8 minutes
+        # ago is not owed a second report (journal.REPORT_GAP).
+        held = journal.report_hold(((rest_login(c.get("author")), c.get("createdAt"), c.get("body"))
+                                    for c in comments), now, authors or ())
+        if led["state"] != "ok" and held is not None:
+            owed.append("- #%s report HELD: %s" % (issue["number"], journal.hold_message(held, now)))
+        elif led["state"] != "ok":
             owed.append("- #%s report %s since %s" % (
                 issue["number"], led["state"].upper(), led["due"] or "an unknown time"))
-        comments = (node.get("comments") or {}).get("nodes") or []
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
               "login": rest_login(c.get("author"))} for c in comments], authors or ())
         lines += ["  " + x for x in handoff.stage_lines(handoff.marks(found))]
     # A missed report deadline is its own condition: not a forwarding failure
-    # and not a stopped brain. Post these before unlocking.
+    # and not a stopped brain. Post these before unlocking; a HELD one is not
+    # posted this tick (journal refuses it).
     lines += ["", "### Reports owed before unlock"] + (owed or ["- none"])
     return lines
 
