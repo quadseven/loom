@@ -136,6 +136,7 @@ Base: <branch, optional>
 
 ## Why
 ...
+Noticed in <journal comment link>: "<the journal's Friction line>" (optional)
 ## What
 ...
 ## Acceptance criteria
@@ -145,6 +146,12 @@ XS | S | M | L
 ## Out of scope
 - ...
 ```
+
+A ticket briefed from a journal's friction ends its Why with a `Noticed in`
+line: the journal comment's link, then the Friction line it came from,
+quoted. The Improving page counts that friction as ticketed through it; the
+quote picks the friction when the journal names more than one, and a line
+with no quote counts for every friction of that journal.
 
 `Priority:` orders the work. Every queue (station claims, the factory's
 queued tier moves and its landing order) takes `loom:urgent`,
@@ -863,8 +870,16 @@ Tick <UTC time>, <holder>
 - Briefed: <links with lanes or none>
 - Waiting: <what is in flight and on whom>
 - Asks: <links or none>
+- Friction: <what slowed the factory this tick, or none>
 - Cost: <GitHub requests>, <minutes>
 ```
+
+`- Friction:` is the canonical line for what slowed the factory (docs/MUSE.md,
+Improving Loom itself): one line per slowdown, each its own `- Friction:`
+line. The dashboard's Improving page reads it, and still reads the older
+headings brains wrote (`What slowed the factory`, `Factory note(s)`,
+`Improving Loom itself`, `Blocker(s)`, a heading line with a list under it),
+but a new journal writes `- Friction:`.
 
 A step that failed or ran degraded adds a line `- Step <name>: failed <why>`
 or `- Step <name>: degraded <why>` (the step names are in docs/MUSE.md); a
