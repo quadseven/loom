@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
-from bus import brain, labels, tickets
+from bus import brain, handoff, labels, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
@@ -699,7 +699,8 @@ class TicketStore:
                     comment.update({"repo": repo, "issue_number": issue["number"],
                                     "issue_title": issue.get("title")})
                     if body.startswith("<!-- loom:journal v1 -->"):
-                        journals.append(comment)
+                        # A journal edited in place shows once per tick.
+                        journals.extend(handoff.expand_journals([comment], at_key="created_at"))
                     if body.startswith("<!-- loom:report v1 -->"):
                         reports.append(comment)
                     if body.startswith("<!-- loom:metrics v1 -->"):

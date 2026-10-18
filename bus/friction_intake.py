@@ -31,7 +31,7 @@ import re
 import time
 from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Tuple
 
-from . import brain, naming
+from . import brain, handoff, naming
 from .friction import fingerprint, friction_lines, jaccard, words
 from .github import GitHub
 
@@ -111,7 +111,8 @@ def journals_from(comments: List[Any], authors: List[str], now: float) -> List[J
     WINDOW seconds."""
     trusted = {a.lower() for a in authors}
     found = []
-    for c in comments:
+    # A journal edited in place counts once per tick, at its Tick time.
+    for c in handoff.expand_journals(comments, at_key="created_at"):
         if not isinstance(c, dict):
             continue
         login = str((c.get("user") or {}).get("login") or "") if isinstance(c.get("user"), dict) \

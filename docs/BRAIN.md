@@ -966,7 +966,15 @@ whenever it changes.
 
 ## Journal
 
-One comment per tick that changed something, on the goal's home issue:
+One journal per tick that changed something, on the goal's home issue. Each
+brain keeps one journal comment per goal home per UTC day: `bus journal`
+posts the day's first tick and edits that comment for every later tick, the
+new tick at the top and the earlier ticks of the day under a
+`<details><summary>Earlier ticks today</summary>` block, newest first,
+dropping the oldest past 60000 characters. A new comment emails the operator
+and an edit does not. Readers split an edited journal back into its ticks,
+each at the time on its Tick line (`bus.handoff.expand_journals`). Each tick
+looks like this:
 
 ```markdown
 <!-- loom:journal v1 -->

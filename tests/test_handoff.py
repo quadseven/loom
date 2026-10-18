@@ -389,6 +389,8 @@ class BriefDoneTests(unittest.TestCase):
             ("POST", "/repos/%s/issues" % REPO): ticket,
             ("POST", "/repos/%s/issues/1/sub_issues" % REPO): (201, {}),
             ("POST", "/repos/%s/issues/1/comments" % REPO): (201, {}),
+            # The journal writer looks for its own journal of the day first.
+            ("GET", "/user"): (200, {"login": "allowed-bot"}),
             # Epic #3 under goal #1: briefs file under an open epic.
             ("GET", "/repos/%s/issues/3" % REPO): (200, {
                 "number": 3, "id": 103, "state": "open", "title": "Epic: the work",

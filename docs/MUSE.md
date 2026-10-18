@@ -452,7 +452,9 @@ this tick"; a step with no note shows nothing there.
    close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close.
 9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md --holder muse`,
-   before unlocking. `--holder` adds the `Tick <UTC time>, muse` line after
+   before unlocking. The day's first tick posts the journal; every later
+   tick that day edits that comment in place, newest tick first, so the
+   operator gets no email per tick. `--holder` adds the `Tick <UTC time>, muse` line after
    the marker; without that line a peer reads the journal as another brain's
    and stays to its resume items, and `journal` refuses it. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the

@@ -5516,8 +5516,10 @@ class Station:
         journals, posts = [], []
         for repo, goal in homes:
             ref = self._invariant_ref(repo, int(goal["number"]))
-            for c in self._paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
-                                      % (repo, int(goal["number"]), stamp)):
+            # A journal edited in place counts once per tick, at its Tick time.
+            for c in handoff.expand_journals(
+                    self._paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
+                                   % (repo, int(goal["number"]), stamp)), at_key="created_at"):
                 if not isinstance(c, dict) or tickets._login(c.get("user")).lower() not in authors:
                     continue
                 at = self._epoch(str(c.get("created_at") or ""))
@@ -6161,8 +6163,10 @@ class Station:
                 if not isinstance(goal, dict) or "number" not in goal:
                     continue
                 number = int(goal["number"])
-                for c in self._paginate(
-                        "/repos/%s/issues/%d/comments?since=%s" % (repo, number, since)):
+                # A journal edited in place is newest at its newest Tick.
+                for c in handoff.expand_journals(self._paginate(
+                        "/repos/%s/issues/%d/comments?since=%s" % (repo, number, since)),
+                        at_key="created_at"):
                     login = (c.get("user") or {}).get("login")
                     body = str(c.get("body") or "").lstrip()
                     at = self._epoch(c.get("created_at", ""))
