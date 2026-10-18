@@ -916,7 +916,9 @@ lookup leaves the brief for the next pass. The rule covers:
   runner writes agy's settings (`~/.gemini/antigravity-cli/settings.json`)
   as the lane user from `lanes/agy/settings.json`: `permissions.allow` lets
   through shell commands and the file tools, and `permissions.deny` blocks
-  web fetching (`read_url`, `execute_url`). Of the old file, only
+  web fetching (`read_url`, `execute_url`). `enableTerminalSandbox` is
+  false: agy's own terminal sandbox denied commands those rules allow, and
+  the `sandbox-exec` profile stays the boundary. Of the old file, only
   `trustedWorkspaces` (set at sign-in) is kept. After the run the runner
   writes back exactly what it wrote before, and the sandbox keeps the file
   read-only during the run, so a run cannot leave a wider rule behind. The

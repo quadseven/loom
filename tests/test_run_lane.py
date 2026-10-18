@@ -1821,6 +1821,9 @@ cat > /dev/null
         self.assertIn("command(*)", seen["permissions"]["allow"])
         self.assertIn("read_url(*)", seen["permissions"]["deny"])
         self.assertNotIn("read_url(*)", seen["permissions"]["allow"])
+        # agy's own terminal sandbox denied commands the lane's rules allow
+        # (infra#5522), so it is off; sandbox-exec stays the boundary.
+        self.assertIs(seen["enableTerminalSandbox"], False)
         # The file is restored after the run, whatever it did, and the
         # sandbox kept the run from widening it in the first place.
         self.assertEqual(json.loads((state / "settings.json").read_text()), expected)
