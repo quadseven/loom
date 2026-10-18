@@ -16,6 +16,7 @@ VIEWS = (
     ("usage", "Usage", "/usage"),
     ("operators", "Operators", "/operators"),
     ("needs-you", "Needs you", "/needs-you"),
+    ("free", "Free to take", "/free"),
 )
 MOBILE_TABS = ("floor", "goals", "tickets", "brain")
 

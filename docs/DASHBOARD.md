@@ -95,6 +95,15 @@ records the pass already holds, and the check runs of at most 30 open
 linked heads. An issue assigned to another operator with no claim label
 shows only when it is a Loom ticket or a pull request.
 
+`/free` lists, per repo, the open issues free for the operator named by
+`?operator=<login>` (anyone, with none), from `bus.free`, the function
+behind `python3 -m bus.free` (docs/LANES.md, "Two Looms on shared repos").
+It reads each repo's open issues at most once an hour
+(`FREE_ISSUES_SECONDS`), never below the budget floor, and takes the
+covering tickets from the ticket records and the comment feed every pass
+already holds. Issues whose Loom ticket is closed or merged are listed to
+check.
+
 `/goals` shows one card per top-level goal home. A goal home rolls up into a
 bigger one through a `Parent goal: OWNER/NAME#N` line in its body or its
 GitHub sub-issue parent, and then shows as a row inside that card. A pass

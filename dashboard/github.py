@@ -19,7 +19,7 @@ from bus import brain, labels, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import goals, operators, transcripts, views
+from . import free_view, goals, operators, transcripts, views
 
 
 READ_WORKERS = 8
@@ -30,6 +30,9 @@ GOAL_INFO_MAX = 200
 # Every pull request is read again this often (seconds); between those full
 # reads a pass reads only the pull requests updated since the last one (#686).
 PR_FULL_READ_SECONDS = 3600
+# Every repo's open issues are read for the /free page this often (seconds):
+# one paginated list per repo (loom#685).
+FREE_ISSUES_SECONDS = 3600
 # The dashboard logs the GitHub requests it spent this often (seconds).
 REQUEST_LOG_SECONDS = 3600
 # The Operators page's claim lists are read again this often (seconds); at
@@ -268,6 +271,10 @@ class TicketStore:
                           "goal_context_error": "the dashboard has not read its sources yet"}
         self.operator_items = []
         self.human_counts = {}
+        # repo -> open issue records for the /free page, None until read.
+        self.open_issues: Dict[str, Optional[List[Dict[str, Any]]]] = {repo: None for repo in self.repos}
+        self.open_issues_error = ""
+        self.open_issues_read_at = 0.0
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
         self.auth = "app" if getattr(gh, "auth", "") == "app" else "token" if token else "none"
         self._snapshot_lock = threading.Lock()
@@ -376,6 +383,24 @@ class TicketStore:
                   "unblocks": 0, "queue": "needs_operator"}
                  for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
         return repo, found, count, ""
+
+    def _read_open_issues(self, now: float) -> None:
+        """Each repo's open issues for the /free page, at most once every
+        FREE_ISSUES_SECONDS and never below the budget floor; a repo that
+        fails keeps its last read and the error is shown on the page."""
+        if now - self.open_issues_read_at < FREE_ISSUES_SECONDS or self._below_floor():
+            return
+        errors = []
+        for repo in self.repos:
+            try:
+                found = self.gh.paginate("/repos/%s/issues?state=open" % quote(repo, safe="/"))
+            except (GitHubError, OSError, ValueError) as exc:
+                errors.append("%s: %s" % (repo, self._error_reason(exc)))
+                continue
+            self.open_issues[repo] = [free_view.open_issue_record(item) for item in found
+                                      if isinstance(item, dict) and "pull_request" not in item]
+        self.open_issues_error = "; ".join(errors)
+        self.open_issues_read_at = now
 
     def _skip_dashboard_below_floor(self, data: Dict[str, Any]) -> None:
         reset = ("at %s UTC" % datetime.fromtimestamp(self._reset_at, timezone.utc).strftime("%H:%M")
@@ -886,6 +911,7 @@ class TicketStore:
             self._read_latest_runs(snapshot)
             now = time.time()
             self._refresh_waits(snapshot, now)
+            self._read_open_issues(now)
             floor_context = dict(snapshot.get("floor_context") or {})
             floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
                                   "needs_you_reason": ask_error,

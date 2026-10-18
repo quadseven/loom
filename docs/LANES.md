@@ -413,6 +413,17 @@ Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
 other's login. A person working a ticket by hand claims it the same way:
 assign it to yourself and add `claim:<your login>` before any Loom briefs it.
 
+To find what is free to take, run `python3 -m bus.free OWNER/NAME ...
+--operator <your login>` (read only), or open the dashboard's `/free` page
+(`?operator=<your login>`). An open issue is free when no one else is
+assigned or holds a `claim:` label on it (the same `owned_elsewhere` rule
+triage uses), it is not an epic, goal home or Loom ticket, and no open Loom
+ticket covers it: none says "Rewritten from issue M." or "Refs #M" in its
+body, and none is named by a "Rewritten as ticket #N" or "Briefed as #N"
+comment on the issue. `loom:triage` and `loom:rewritten` alone do not hold
+an issue. An issue whose covering ticket is closed or merged is listed apart,
+to verify and close; so is a `loom:rewritten` issue whose ticket is not found.
+
 Each Loom sets these for itself when it installs; a second operator running
 from a clone of another operator's checkout must not inherit them:
 
