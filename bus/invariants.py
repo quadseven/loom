@@ -3,9 +3,9 @@
 Each invariant is one small function from Facts (what the station already
 reads: brain journals and the marker comments on goal homes, lane run
 outcomes, lane limits, queued tickets, each goal's epics, the review bot's plan
-check on lane pull requests, remote heartbeats) to a list of Breach. A Facts
-field the station could not read this pass is None, and the invariants that
-need it find nothing.
+check on lane pull requests, the lane pull requests nothing drives, remote
+heartbeats) to a list of Breach. A Facts field the station could not read this
+pass is None, and the invariants that need it find nothing.
 
 Filer files each breach as one loom:invariant issue on the factory's goal
 home, deduplicated by invariant and subject: a breach whose issue is open
@@ -51,6 +51,11 @@ GATE_HOLD_MAX = 3600
 # Decision 0003: an epic holds at most EPIC_TICKETS tickets.
 EPIC_TICKETS = 15
 PLAN_FAILED_AGE = 30 * 60
+# A lane pull request open longer than this is a breach: six hours is the time
+# the factory gives a lane to open one, and nothing else named the pull
+# requests that sat past it (loom#715). Not CLEAR_AFTER, which is how long a
+# breach must be gone before its issue closes.
+PR_STALLED = 6 * 3600
 # The station checks at most this often: goal homes and check runs are read
 # no more often than its other goal-home reads.
 CHECK_EVERY = 300
@@ -116,6 +121,22 @@ class Check(NamedTuple):
     title: str
 
 
+class LanePull(NamedTuple):
+    """An open pull request on a loom/ branch as the station reads it: the pull
+    request and when it opened, the issue that carries it (None when it names
+    none that can be read), the labels of that issue and of the pull request,
+    whether that issue is an open loom:ticket the factory can move (drives),
+    how many unresolved threads the review bot left on it, and whether a fix
+    round is queued on its ticket."""
+    pr: Ref
+    at: float
+    ticket: Optional[Ref]
+    labels: Tuple[str, ...]
+    drives: bool
+    threads: int
+    fix_pending: bool
+
+
 class EpicShape(NamedTuple):
     """One epic of a goal: open or closed, how many tickets it holds, and
     which of them are still open."""
@@ -165,6 +186,9 @@ class Facts:
     # Each goal home with its epics and the open tickets under none.
     shapes: Optional[List[GoalShape]] = None
     checks: Optional[List[Check]] = None
+    # The open lane pull requests past PR_STALLED, with what the station can
+    # see driving each of them.
+    lane_pulls: Optional[List[LanePull]] = None
     # goal key -> the unproven-work gate's hold on it, per loom#564.
     gate_held: Optional[Dict[str, GateHold]] = None
     # remote lane -> its newest heartbeat, None when it never posted one.
@@ -430,6 +454,69 @@ def plan_check_failed(f: Facts) -> List[Breach]:
             if c.conclusion in PLAN_FAILED and f.now - c.at > PLAN_FAILED_AGE]
 
 
+def _stall(p: LanePull) -> Tuple[Optional[str], str]:
+    """Why nothing drives this open lane pull request, and the one thing that
+    unsticks it: (None, "") when something does drive it."""
+    if not p.drives:
+        return ("no open loom:ticket carries it",
+                "make its ticket an open loom:ticket and move it to loom:pr with "
+                "python3 -m bus.brain move OWNER/NAME#N --to pr, or close the pull request "
+                "as superseded")
+    if "loom:failed" in p.labels:
+        return ("its ticket is past the last rung of the model ladder",
+                "brief the work again as a new loom:ticket with "
+                "python3 -m bus.brain brief OWNER/NAME --title TITLE --file BODY.md, or "
+                "close the pull request as superseded")
+    if "needs-brain" in p.labels:
+        return ("its ticket waits on the brain (needs-brain)",
+                "review it in a brain tick and move it on: python3 -m bus.brain merge "
+                "OWNER/NAME#N, or python3 -m bus.brain fix OWNER/NAME#N --ticket "
+                "OWNER/NAME#N --file FIX.md")
+    if p.threads and not p.fix_pending:
+        return ("%d open review thread%s and no fix round queued"
+                % (p.threads, "" if p.threads == 1 else "s"),
+                "send it back to a lane with "
+                "python3 -m bus.brain fix OWNER/NAME#N --ticket OWNER/NAME#N --file FIX.md")
+    return (None, "")
+
+
+def _ticket_line(p: LanePull) -> str:
+    """What the invariant can say about the issue behind a lane pull request:
+    the one it found, whether the factory can move it, and the labels that
+    explain why it does not."""
+    if p.ticket is None:
+        return "Ticket: the pull request names none that could be read"
+    marks = [n for n in ("loom:failed", "needs-brain") if n in p.labels]
+    return "Ticket: %s%s%s" % (p.ticket.label,
+                              "" if p.drives else ", which is not an open loom:ticket",
+                              " (%s)" % ", ".join(marks) if marks else "")
+
+
+def lane_pr_stalled(f: Facts) -> List[Breach]:
+    """An open lane pull request nothing drives for over PR_STALLED: no open
+    loom:ticket carries it, its ticket is past the last rung of the model
+    ladder, its ticket waits on the brain, or it holds open review threads
+    with no fix round queued (loom#715). Each breach names its own reason and
+    the one thing that unsticks it."""
+    if f.lane_pulls is None:
+        return []
+    out = []
+    for p in f.lane_pulls:
+        if f.now - p.at <= PR_STALLED:
+            continue
+        why, fix = _stall(p)
+        if why is None:
+            continue
+        out.append(Breach("lane-pr-stalled", p.pr.key,
+                          "Lane %s open %s: %s" % (p.pr.label, _hours(f.now - p.at), why),
+                          ("Opened at %s and still open after %s (limit: %s)"
+                           % (utc(p.at), _hours(f.now - p.at), _hours(PR_STALLED)),
+                           _ticket_line(p),
+                           "Unstick it: %s" % fix),
+                          f.now))
+    return out
+
+
 def remote_silent(f: Facts) -> List[Breach]:
     """A remote lane whose newest heartbeat is older than its beat_max. A
     lane that never posted one is not running anywhere and is left alone."""
@@ -477,7 +564,7 @@ def gate_hold(f: Facts) -> List[Breach]:
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
-    plan_check_failed, remote_silent, gate_hold)
+    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold)
 
 
 def check(facts: Facts, say: Say,
