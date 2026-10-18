@@ -1800,40 +1800,57 @@ class Factory:
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
         the tier is up) across repos in tickets.work_order: FIRST labels,
-        then priority, then the oldest."""
+        then priority, then the oldest. A pass that gives none a lane says
+        how many wait and why the first does."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
         queued = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
                   if _state(issue) == "queued"]
-        for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item)):
-            if self.now < held_until(issue):
-                continue
-            model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
-            if model_match:
-                model = model_match.group(1)
-                equivalent = self._equivalent_lane(repo, model)
-                if equivalent is not None:
-                    self._guarded(self._assign_equivalent, repo, issue, model, *equivalent)
-                    continue
-                lane = self._queued_model_lane(repo, model)
-                if lane is None:
-                    _say("%s#%s waits: no free lane takes model %s"
-                         % (repo, issue["number"], model))
-                    continue
-                self._guarded(self._assign_queued_one, repo, issue, lane,
-                              "model %s" % model)
-                continue
-            assigned = _lane(issue)
-            if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
-                continue  # A live remote assignment stays queued for its pull worker.
-            if assigned in REMOTE_LANES:
-                lane, fallback = self._tier_move(repo, issue, old=assigned)
-            else:
-                lane, fallback = self._tier_move(repo, issue)
-            if lane is None:
-                continue
-            tier = difficulty_of(issue) + (", " + fallback if fallback else "")
-            self._guarded(self._assign_queued_one, repo, issue, lane, tier)
+        waits = [self._assign_queued_ticket(repo, issue)
+                 for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
+        if waits and all(waits):
+            _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
+
+    def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Give one queued ticket a lane: "" when it got one, else why it waits."""
+        ref = "%s#%s" % (repo, issue["number"])
+        if self.now < held_until(issue):
+            return "%s is held" % ref
+        model_match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+        if model_match:
+            return self._assign_queued_model(repo, issue, model_match.group(1))
+        assigned = _lane(issue)
+        if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
+            # A live remote assignment stays queued for its pull worker.
+            return "%s waits for remote lane %s to pull it" % (ref, assigned)
+        if assigned in REMOTE_LANES:
+            lane, fallback = self._tier_move(repo, issue, old=assigned)
+        else:
+            lane, fallback = self._tier_move(repo, issue)
+        if lane is None:
+            return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue) or "(none)")
+        tier = difficulty_of(issue) + (", " + fallback if fallback else "")
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            return "%s: giving it lane %s failed" % (ref, lane)
+        return ""
+
+    def _assign_queued_model(self, repo: str, issue: Dict[str, Any], model: str) -> str:
+        """Give a queued ticket pinned to `model` a lane that takes it, or an
+        equivalent's: "" when it got one, else why it waits."""
+        ref = "%s#%s" % (repo, issue["number"])
+        equivalent = self._equivalent_lane(repo, model)
+        if equivalent is not None:
+            if not self._guarded(self._assign_equivalent, repo, issue, model, *equivalent):
+                return "%s: giving it lane %s failed" % (ref, equivalent[0])
+            return ""
+        lane = self._queued_model_lane(repo, model)
+        if lane is None:
+            why = "%s waits: no free lane takes model %s" % (ref, model)
+            _say(why)
+            return why
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
+            return "%s: giving it lane %s failed" % (ref, lane)
+        return ""
 
     def _assign_equivalent(self, repo: str, issue: Dict[str, Any], pinned: str,
                            lane: str, model: str, why: str) -> None:
@@ -1911,13 +1928,16 @@ class Factory:
                 self._guarded(step, repo, issue)
 
     @staticmethod
-    def _guarded(step: Callable[..., None], repo: str, item: Dict[str, Any], *rest: Any) -> None:
-        """One item's failure is logged and never stops the others."""
+    def _guarded(step: Callable[..., None], repo: str, item: Dict[str, Any], *rest: Any) -> bool:
+        """One item's failure is logged and never stops the others; False
+        when the step failed."""
         try:
             step(repo, item, *rest)
         except (GitHubError, ValueError, KeyError, TypeError) as err:
             _say("%s on %s#%s failed: %s" % (getattr(step, "__name__", "step"), repo,
                                              item.get("number"), err))
+            return False
+        return True
 
 
 def due(state_dir: str, now: float) -> bool:

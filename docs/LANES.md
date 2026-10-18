@@ -193,10 +193,14 @@ the `openssl` and `aws` CLIs, and otherwise keeps
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 It skips future `Not before:` times and tickets without a readable Difficulty.
-The latter appear in their goal's next station standup.
+The latter appear in their goal's next station standup. A pass that gives no
+queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
+being the first ticket's in that order.
 
 Lane status: every pass the station reads each lane's heartbeat (`yes` when
-available and at most 600 seconds old, else `no`) and keeps one comment on the
+available and at most 600 seconds older than the pass's start, else `no`; a
+beat written while the pass runs counts, one stamped more than a minute
+ahead of the clock does not) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
 only when a yes or no changes, when an anthropic run is recorded, and at
