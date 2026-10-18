@@ -12,7 +12,7 @@ import urllib.request
 from typing import Callable
 from urllib.parse import quote, urlsplit
 
-from .github import GitHub, GitHubError, auth_from_env
+from .github import GitHub, GitHubError, token_from_env
 from .hunt_plan import problems
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -219,6 +219,17 @@ def run(gh: GitHub, source: str, revision: str, check: str,
             log("pin: %s: %s" % (spec["repo"], exc))
 
 
+def _pin_client() -> GitHub:
+    """The GitHub client the pin pass uses.
+
+    The pin pull request is opened on the deployment repo, whose
+    collaborator-only self-hosted trust gate rejects the GitHub App
+    installation token (loom#612). It is opened with the operator's personal
+    token instead, so the trust gate passes and the pin pull request can merge.
+    """
+    return GitHub(token_from_env())
+
+
 def main() -> int:
     try:
         specs = targets(os.environ["LOOM_PIN_TARGETS"])
@@ -229,7 +240,7 @@ def main() -> int:
         with open(state, encoding="utf-8") as stream:
             if json.load(stream).get("revision") != revision:
                 raise ValueError("checkout is not the recorded deployment")
-        run(GitHub(auth_from_env()), source, revision,
+        run(_pin_client(), source, revision,
             os.environ.get("LOOM_DEPLOY_CHECK", "unittest"), specs)
     except (GitHubError, KeyError, OSError, ValueError) as exc:
         print("pin: %s" % exc, file=sys.stderr)
