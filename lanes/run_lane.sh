@@ -620,6 +620,11 @@ SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_WHY=""
+# An expired key holds a lane with no retry time, so its reason is the whole
+# of it: "API key expired: renew <the SSM parameter, or the lane sign-in>".
+AUTH_HELD=""
+AUTH_WHY=""
+AUTH_WHY_PREFIX="API key expired: renew"
 
 # Ask the endpoint for its models. 0: it answered; 1: refused or 503, with
 # LIMIT_WHY set; 2: no answer for another reason, with READY_REASON set.
@@ -720,11 +725,11 @@ provider_at_limit() {
   return 0
 }
 
-# The slots that bill the same provider account as this slot: a provider limit
-# recorded by one holds every slot in the group until the shared reset.
+# The slots that bill the same provider account as this slot, and so the same
+# key: a limit or an expired key recorded by one holds every slot in the group.
 # opencode-go's four slots share one OpenCode Go account; every other lane is a
 # group of one (the numbered slots map to their provider lane above).
-limit_group() {
+key_group() {
   local lane="${LANE:-}"
   case "$lane" in
     opencode-go)
@@ -756,15 +761,110 @@ limit_until() {
   printf '%s' "$((now + 7 * 86400))"; return 0
 }
 
-# Hold every slot in this slot's limit group until the provider's reset, and
+# Hold every slot in this slot's group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
   local until slot
   until="$(limit_until)" || return 0
   LIMITED=1
-  for slot in $(limit_group); do
+  for slot in $(key_group); do
     write_beat "$slot" false "limit: $LIMIT_WHY; unavailable until $(utc "$until")" "$until"
   done
+}
+
+# The digest of a key, never the key: the hold an expired key puts on a lane
+# lifts when the value at its SSM parameter changes, and a digest changes with
+# the value. The key goes to the hasher on stdin, so it reaches no argv.
+key_digest() {
+  if command -v shasum > /dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -c1-16
+  else
+    printf '%s' "$1" | sha256sum | cut -c1-16
+  fi
+}
+
+# Why a lane is unavailable for a key the provider refused: the SSM parameter
+# its value came from, or the lane's own sign-in for a lane that reads no key.
+key_renew_reason() {
+  local param
+  param="$(lane_setting KEY_SSM)"
+  printf '%s %s' "$AUTH_WHY_PREFIX" "${param:-the $LANE lane sign-in}"
+}
+
+# Whether this lane reads its key from an SSM parameter (a name under a path,
+# as lanes/mac/install.sh writes them) whose value the operator can change.
+# Only such a lane can be held for an expired key: codex, claude and zen keep
+# their sign-in in the CLI's own file, where there is no value to watch and
+# therefore no hold to wait on.
+key_renewable() {
+  case "$(lane_setting KEY_SSM)" in /*) return 0 ;; esac
+  return 1
+}
+
+# The file slot $1's expired-key hold records the digest of the key it refused
+# in. The digest, never the key: it is all the hold needs to notice a renewal.
+key_sha_file() {
+  printf '%s' "$LOOM_HOME/state/usage/$1.key-sha"
+}
+
+# Every slot that bills the key the provider refused is unavailable, with no
+# retry time: only a renewed key lifts that hold. Each held slot records the
+# digest of the key that failed.
+hold_expired_key() {  # reason
+  local reason="$1" digest slot
+  digest="$(key_digest "$API_KEY")"
+  mkdir -p "$LOOM_HOME/state/usage"
+  for slot in $(key_group); do
+    printf '%s\n' "$digest" > "$(key_sha_file "$slot")"
+    write_beat "$slot" false "$reason"
+  done
+}
+
+# Whether an expired key still holds this slot: 0 while it stands, 1 when there
+# is no hold. It lifts only when the value at the parameter its heartbeat names
+# is not the one the hold was recorded for: only the operator can renew a key.
+# Sets AUTH_HELD, AUTH_WHY and READY_REASON while it stands.
+key_held() {
+  local reason param want key
+  reason="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  case "$reason" in "$AUTH_WHY_PREFIX "/*) ;; *) return 1 ;; esac
+  AUTH_HELD=1 AUTH_WHY="$reason" READY_REASON="$reason"
+  param="${reason#"$AUTH_WHY_PREFIX "}"
+  want="$(cat "$(key_sha_file "$SLOT")" 2>/dev/null)"
+  key="$(ssm_value "$param")"
+  if [ -n "$want" ] && [ -n "$key" ] && [ "$(key_digest "$key")" != "$want" ]; then
+    rm -f "$(key_sha_file "$SLOT")"
+    AUTH_HELD="" AUTH_WHY="" READY_REASON=""
+    return 1
+  fi
+  return 0
+}
+
+# The operator's ask for an expired key: $1 is the failure's reason, whose
+# tail names what to renew (the SSM parameter the key came from, or the lane's
+# own sign-in). Filed once per parameter -- another lane that hits the same key
+# comments on the open ask instead of filing a second. The body names no agent
+# output, so nothing the provider said, or a run echoed, can reach a public
+# issue.
+ask_renew_key() {
+  local reason="$1" param title body number existing
+  param="${reason#"$AUTH_WHY_PREFIX "}"
+  title="Provider key expired: renew $param"
+  body="$(printf '%s\n\nLane %s could not use the provider key it reads.\n\nWhat to renew: `%s`\n\nThe lane log holds what the provider said. A lane that reads that parameter is unavailable until the value there changes.\n' \
+    "$KEY_ASK_MARKER" "$SLOT" "$param")"
+  existing="$(open_issue "$title")"
+  if [ -n "$existing" ]; then
+    gh issue comment --repo "$FACTORY_REPO" "$existing" \
+      --body "Lane $SLOT could not use the key again, at $(date -u +%FT%TZ)." >>"$LOG" 2>&1 ||
+      echo "could not comment on the open ask $FACTORY_REPO#$existing" >> "$LOG"
+    return 0
+  fi
+  number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
+             --label needs-operator --body "$body" 2>>"$LOG" ||
+           gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
+  number="${number##*/}"
+  case "$number" in ''|*[!0-9]*) echo "needs-operator ask filing failed" >> "$LOG" ;; esac
+  return 0
 }
 
 # Model ladders keep usage limits per model so a slot can continue on the
@@ -915,14 +1015,21 @@ record() {
 # failing line or command, and the exit code.
 FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
+# The marker on the body of the needs-operator ask an expired key files.
+KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
+# The number of the open issue on the factory repo whose title is exactly $1,
+# empty when there is none: one open issue per incident kind, per expired key.
+open_issue() {
+  TITLE="$1" gh search issues --repo "$FACTORY_REPO" --state open \
+    --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
+    -- "$1" 2>>"$LOG" | head -1
+}
 file_factory_incident() {  # kind, detail
   local kind="$1" detail="$2" title body number existing
   title="Factory incident: $REPO validation $kind"
   body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
     "$INCIDENT_MARKER" "$REPO" "$kind" "$TICKET" "$detail")"
-  existing="$(TITLE="$title" gh search issues --repo "$FACTORY_REPO" --state open \
-    --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
-    -- "$title" 2>>"$LOG" | head -1)"
+  existing="$(open_issue "$title")"
   if [ -n "$existing" ]; then
     number="$existing"
     gh issue comment --repo "$FACTORY_REPO" "$number" \
@@ -1399,6 +1506,8 @@ lane_ready() {
   local cli key_ssm
   # A limit an earlier run hit holds for every lane, not only spark.
   limit_held && return 1
+  # A key the provider refused holds the lane until it is renewed.
+  key_held && return 1
   if [ "$LANE" = agy ]; then
     command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
     "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
@@ -1487,8 +1596,9 @@ LANE_ACCOUNT=""
 READY_REASON=""
 if ! lane_ready; then
   heartbeat false "$READY_REASON"
-  # A limited lane still passes over its inbox, to hand every brief on.
-  [ -n "$LIMITED" ] || exit 0
+  # A limited lane, or one whose key expired, still passes over its inbox, to
+  # hand every brief on.
+  [ -n "$LIMITED" ] || [ -n "$AUTH_HELD" ] || exit 0
 else
   heartbeat true ""
 fi
@@ -1518,6 +1628,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "ticket name must be letters, digits, dot, underscore or dash"; continue
   fi
   if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY" limit; continue; fi
+  if [ -n "$AUTH_HELD" ]; then park "$BRIEF" "$AUTH_WHY" auth; continue; fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -1739,6 +1850,21 @@ for BRIEF in "$INBOX"/*.md; do
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    break
+  fi
+  if [ "$FAIL_CLASS" = auth ]; then
+    # The provider refused the key, not the lane's work, so the brief is handed
+    # on rather than spent and the rest of the inbox waits for the operator.
+    AUTH_WHY="$(key_renew_reason)"
+    if key_renewable; then
+      # Every slot that bills that key goes unavailable until the value at the
+      # parameter changes. A lane that signs in with the CLI's own file has no
+      # such value to wait for, and is left to fail again on its next pass.
+      AUTH_HELD=1
+      hold_expired_key "$AUTH_WHY"
+    fi
+    ask_renew_key "$AUTH_WHY"
+    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY" auth
     break
   fi
   if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
