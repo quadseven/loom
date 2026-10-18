@@ -95,6 +95,19 @@ records the pass already holds, and the check runs of at most 30 open
 linked heads. An issue assigned to another operator with no claim label
 shows only when it is a Loom ticket or a pull request.
 
+The same page groups every open issue and pull request labelled
+`needs:<login>` under that login as "Waiting on <login>", with its age and
+the ask: the first worded line of its latest comment (HTML comment markers
+dropped). Every login is listed, this Loom's own included, because the
+person named is the one who has to act; `needs:<login>` never blocks a lane.
+An item claimed by one login and waiting on another is a row in each group.
+The Floor shows a "Waiting on a person" card with each person's count,
+linking to `/operators#person-<login>`, and no card when nothing waits. The
+reads ride the same pass and interval: one open list per `needs:<login>`
+label per repo (at most 10), then one single-comment page per item whose
+`updated_at` changed since the last read (at most 30 a pass); below the
+budget floor nothing is read and the last result stays shown.
+
 `/free` lists, per repo, the open issues free for the operator named by
 `?operator=<login>` (anyone, with none), from `bus.free`, the function
 behind `python3 -m bus.free` (docs/LANES.md, "Two Looms on shared repos").

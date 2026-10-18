@@ -293,6 +293,7 @@ def _floor(state):
             '<p>%s</p>' % esc(str(top.get("title") or "")) if top else "")
     else:
         needs_html = '<p class="muted">not looked: %s</p>' % esc(str(context.get("needs_you_reason") or "needs-operator source unavailable"))
+    parts.append(operators_view.floor_html(payload.get("operator_claims")))
     parts.append('<section class="card"><span class="label">Needs you</span>%s</section></aside></div>' % needs_html)
     return page("Floor", "floor", "".join(parts), status="snapshot")
 
