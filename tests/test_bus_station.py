@@ -6591,12 +6591,16 @@ class TwoLoomsTest(Base):
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
         self.assertIn("loom:running", self.fake.names(12))
 
-    def test_a_claim_assigns_the_ticket_to_the_operator_login(self):
+    def test_a_claim_marks_the_operator_with_a_label_not_an_assignment(self):
+        # 2026-10-18: an assignee is emailed for every comment on the ticket;
+        # the claim label already tells another operator's Loom it is taken.
         self.settings.authors = ["loom-app[bot]"] + list(AUTHORS)
         self.fake.add(12)
         self.run_quiet()
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
-        self.assertEqual(tickets.assignees(self.fake.issues[12]), ["alice-example"])
+        self.assertEqual(tickets.assignees(self.fake.issues[12]), [])
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertFalse(any("/assignees" in p for p in self.fake.paths("POST")))
 
     def test_a_claim_adds_and_creates_the_operator_claim_label(self):
         self.fake.add(12)
