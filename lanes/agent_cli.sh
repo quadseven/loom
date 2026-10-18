@@ -25,11 +25,14 @@ agent_cli() {
 }
 
 # What ended a failed run, from the tail of the agent's output. A provider
-# limit: a usage, rate or quota limit, or an HTTP 429 or 402 answer. A
-# transient fault: the network or the provider's servers. The patterns look
-# at the last lines only, so a ticket that is about rate limits does not
-# read as one.
+# limit: a usage, rate or quota limit, or an HTTP 429 or 402 answer. An expired
+# or refused key: what the provider says when it will not take the key, or an
+# HTTP 401. A transient fault: the network or the provider's servers. The
+# patterns look at the last lines only, so a ticket that is about rate limits
+# does not read as one.
 LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+KEY_STATE='expired|revoked|invalid|incorrect|disabled'
+AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)"
 OUT_OF_CREDIT_RE='credit balance is too low|insufficient[ _](credit|balance|funds)|payment required|(http|status|code|error)[^0-9a-z]{0,3}402([^0-9]|$)'
 NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network error|fetch failed|connection (reset|refused|closed)|could not resolve host|overloaded|service unavailable|bad gateway|gateway timeout|internal server error|(http|status|code|error)[^0-9a-z]{0,3}(500|502|503|504|529)([^0-9]|$)'
 # When the provider says its limit lifts: an epoch after "limit reached|" or a
@@ -39,16 +42,20 @@ AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|h
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 
-# Sets FAIL_CLASS (limit, transient or work) for a run that ended with exit
-# status $1 and output $2, where $3 is "edited" when the agent changed the
-# tree. On limit also sets RETRY_AT. A crash before any edit, a timeout, a
-# signal or a network fault is transient; anything else is work.
+# Sets FAIL_CLASS (auth, limit, transient or work) for a run that ended with
+# exit status $1 and output $2, where $3 is "edited" when the agent changed the
+# tree. On limit also sets RETRY_AT. A key the provider will not take is auth:
+# no retry and no attempt can fix it, so the runner takes its lanes offline
+# until the operator renews it. A crash before any edit, a timeout, a signal
+# or a network fault is transient; anything else is work.
 classify_failure() {
   local status="$1" out="$2" edited="$3" now n
   FAIL_CLASS=work RETRY_AT=""
   now="$(date +%s)"
   shopt -s nocasematch
-  if [[ "$out" =~ $LIMIT_RE ]]; then
+  if [[ "$out" =~ $AUTH_RE ]]; then
+    FAIL_CLASS=auth
+  elif [[ "$out" =~ $LIMIT_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
     if [[ "$out" =~ $OUT_OF_CREDIT_RE ]]; then
       RETRY_AT=$((now + LIMIT_WAIT_MAX))

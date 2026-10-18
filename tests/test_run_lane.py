@@ -2409,7 +2409,7 @@ cat > /dev/null
 
     def hold_provider_limit_for(self, slot="opencode-go-2", limit_name="weekly", retry_after=None):
         self.write_provider_limit(slot, limit_name, retry_after)
-        script = self.source_functions("hold_provider_limit", "limit_until", "limit_group",
+        script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
                                        "write_beat", "utc") + (
             'SLOT=%s LANE=opencode-go LIMIT_WHY="the provider weekly limit (429 GoUsageLimitError)"\n'
             'hold_provider_limit\n' % slot)
@@ -2446,6 +2446,104 @@ cat > /dev/null
             self.assertIn("weekly", beat["reason"])
             self.assertTrue(before + 7 * 86400 <= beat["retry_at"] <= now + 7 * 86400, slot)
             self.assertGreater(beat["retry_at"], before + 43200, slot)
+
+    # A sandbox that runs what it is given: the seatbelt itself is another
+    # lane's subject (tests above), and this run is about the class an expired
+    # key gets and the heartbeat that follows.
+    FAKE_SANDBOX = """#!/usr/bin/env bash
+while [ $# -gt 0 ]; do
+  case "$1" in -p) shift 2 ;; *) break ;; esac
+done
+exec "$@"
+"""
+
+    # An opencode whose provider refuses the key it was handed: the message the
+    # OpenCode Go lanes gave on 2026-10-18. A renewed key runs the work instead.
+    FAKE_OPENCODE_EXPIRED = """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+if [ "${OPENCODE_API_KEY:-}" = expired-key ]; then
+  echo "Error: This API key has expired. Create a new API key in OpenCode Console."
+  exit 1
+fi
+echo fixed > fix.txt
+"""
+
+    def go_key_env(self, key="expired-key"):
+        return {"LOOM_OPENCODE_GO_KEY_SSM": "/k/go", "FAKE_SECRET__k_go": key,
+                "LOOM_OPENCODE_GO_MODEL": "opencode-go/kimi-k2.7-code"}
+
+    def expired_key_lane(self, key="expired-key", **env):
+        """The opencode-go lane with a provider that refuses its key."""
+        self.write_tool(self.bin / "sandbox-exec", self.FAKE_SANDBOX)
+        self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_EXPIRED)
+        return self.api_lane("opencode-go", **self.go_key_env(key), **env)
+
+    def go_brief(self, name="T043-next.md"):
+        self.write_tool(self.bin / "sandbox-exec", self.FAKE_SANDBOX)
+        self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_EXPIRED)
+        inbox = self.loom / "briefs" / "opencode-go"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / name).write_text(BRIEF.replace("T042-fix-the-thing", name[:-3])
+                                  .replace("Lane: codex", "Lane: opencode-go"))
+        return inbox
+
+    def test_an_expired_key_is_auth_and_takes_every_lane_that_bills_it_offline(self):
+        # Acceptance (loom#744): the expired-key error is [auth], not
+        # [transient], and every slot billing that key is unavailable with the
+        # reason naming the parameter to renew.
+        inbox, result = self.expired_key_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failed: [auth] agent exited 1: API key expired: renew /k/go", self.go_log())
+        self.assertNotIn("transient", self.go_log())
+        for slot in self.GROUP:
+            beat = self.beat(slot)
+            self.assertFalse(beat["available"], slot)
+            self.assertEqual(beat["reason"], "API key expired: renew /k/go", slot)
+            # No retry time: only a renewed key lifts this hold.
+            self.assertNotIn("retry_at", beat, slot)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertNotIn("expired-key", self.go_log())
+
+    def test_a_lane_held_by_an_expired_key_takes_no_brief_until_the_key_is_renewed(self):
+        self.expired_key_lane()
+        inbox = self.go_brief()
+        self.log.write_text("")
+        result = self.run_lane("opencode-go", **self.go_key_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # No run, and the waiting brief is handed on rather than left to fail.
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertFalse((inbox / "T043-next.md").exists())
+        self.assertIn("failed: [auth] API key expired: renew /k/go",
+                      (self.loom / "logs" / "opencode-go" / "T043-next.log").read_text())
+        self.assertFalse(self.beat("opencode-go")["available"])
+        # The operator renews the key: the lane is back, and its digest is gone
+        # so the next expiry is this key's, not the old one's.
+        self.go_brief("T044-next.md")
+        result = self.run_lane("opencode-go", **self.go_key_env("a-renewed-key"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T044-next.md").exists())
+        self.assertTrue(self.beat("opencode-go")["available"])
+        usage = self.loom / "state" / "usage"
+        self.assertFalse((usage / "opencode-go.key-sha").exists())
+
+    def test_an_expired_key_opens_one_needs_operator_ask_naming_the_parameter(self):
+        self.expired_key_lane()
+        filed = [c for c in self.calls() if c.startswith("gh issue create")]
+        self.assertEqual(len(filed), 1, self.calls())
+        self.assertIn("--label needs-operator", filed[0])
+        self.assertIn("renew /k/go", filed[0])
+        # The next lane to hit that key finds the open ask and comments on it,
+        # so the operator has one thread to answer, not one per lane.
+        script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
+                  'SLOT=opencode-go-2 LOG=/dev/null\n'
+                  + self.source_functions("open_issue", "ask_renew_key") +
+                  'ask_renew_key "API key expired: renew /k/go"\n')
+        result = subprocess.run(["bash", "-c", script, "bash"],
+                                env={**self.lane_env(), "FAKE_GH_SEARCH": "7"},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("gh issue comment") for c in self.calls()))
+        self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_provider_that_answers_lets_the_run_go_ahead(self):
@@ -2679,6 +2777,9 @@ exit %d
         ("Rate limit hit. Please try again in 20 minutes.", 0, False, "limit"),
         ("TypeError: fetch failed (ECONNRESET)", 1, True, "transient"),
         ('API Error: 529 {"type":"overloaded_error"}', 1, True, "transient"),
+        ("Error: This API key has expired. Create a new API key in OpenCode Console",
+         1, True, "auth"),
+        ("AuthenticationError: HTTP 401 Unauthorized", 1, True, "auth"),
         ("panic: something broke before any edit", 1, False, "transient"),
         ("killed", 137, True, "transient"),
         ("FAILED tests/test_x.py::test_y - AssertionError at line 429", 1, True, "work"),
@@ -2699,7 +2800,23 @@ exit %d
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
                 self.assertTrue(self.failure_line().startswith("[%s] " % want), self.failure_line())
+                # A limit takes the lane offline; an expired key does too on a
+                # lane that reads its key from a parameter, and codex, which
+                # reads no key here, keeps its heartbeat as it is.
                 self.assertEqual(self.beat()["available"], want != "limit")
+
+    def test_an_expired_key_on_a_lane_that_reads_no_key_is_auth_but_not_a_hold(self):
+        # codex keeps its sign-in in the CLI's own file: there is no parameter
+        # whose value the operator could change, so the lane is not held for
+        # good, and the operator still gets the ask naming what to renew.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="Invalid API key - please run /login")
+        self.assertTrue(self.failure_line().startswith("[auth] "), self.failure_line())
+        self.assertTrue(self.beat()["available"])
+        ask = [c for c in self.calls() if c.startswith("gh issue create")]
+        self.assertEqual(len(ask), 1, self.calls())
+        self.assertIn("--label needs-operator", ask[0])
+        self.assertIn("renew the codex lane sign-in", ask[0])
 
     def test_a_limit_holds_the_lane_unavailable_until_the_providers_reset(self):
         reset = int(time.time()) + 7200

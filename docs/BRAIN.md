@@ -551,14 +551,32 @@ When the runner finishes, the station finds the brief in `done/` or
   automatic retries below. Label `loom:briefed` again (`loom:pr` for a fix
   brief), comment that the lane is unavailable; the factory moves a ticket
   briefed on a lane whose heartbeat says `limit:` to the next rung at once.
+- An expired key (an `[auth]` reason): not a failure, not an attempt, and
+  never a runaway, whatever else the ticket has been through. Label
+  `loom:briefed` again (`loom:pr` for a fix brief) and comment that the lane
+  could not authenticate; the factory moves the ticket to a lane whose key
+  works.
 
 The runner starts each failure reason with its class: `[limit]` (a usage,
-rate or quota limit, or an HTTP 429 or 402 from the provider), `[transient]`
-(a network or server fault, a timeout, or the agent exiting before any
-edit) or `[work]` (anything else: failing tests, no commit, a guard's
-refusal). A reason without a class is work. On a limit the runner also
-writes its heartbeat unavailable with a `retry_at` time (the provider's
-reset when it names one, else 60 minutes) and takes no brief until then.
+rate or quota limit, or an HTTP 429 or 402 from the provider), `[auth]` (a
+key the provider will not take: an expired, revoked or invalid API key, or
+an HTTP 401), `[transient]` (a network or server fault, a timeout, or the
+agent exiting before any edit) or `[work]` (anything else: failing tests, no
+commit, a guard's refusal). A reason without a class is work. On a limit the
+runner also writes its heartbeat unavailable with a `retry_at` time (the
+provider's reset when it names one, else 60 minutes) and takes no brief until
+then.
+
+An `[auth]` failure takes every lane that bills that key offline instead: each
+one writes its heartbeat unavailable with `API key expired: renew <the SSM
+parameter its key came from>`, no `retry_at`, takes no brief and hands each one
+on as `[auth]`. The hold lifts only when the value at that parameter changes
+(the operator renewed it). A lane that reads no key parameter at all (codex,
+claude and zen sign in with the CLI's own file) is not held: nothing there
+changes, so its next pass fails the same way, and the ask below still says
+which lane to fix. The runner files one `needs-operator` ask on the factory
+repo naming the exact parameter, and comments on that ask instead of filing a
+second one.
 
 - A failed fix brief (a `Fix-PR:` line) goes back to `loom:pr`, whatever its
   class, so its open pull request is never duplicated.
