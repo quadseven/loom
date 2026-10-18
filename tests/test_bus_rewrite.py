@@ -205,11 +205,24 @@ class RewriteIssueTest(Base):
         self.assertEqual(self.rewrite(text), "brief")
 
     def test_a_human_answer_labels_the_issue_with_the_ask(self):
-        answer = {"action": "human", "ask": "Buy the domain name for the site."}
+        answer = {"action": "human", "kind": "money", "ask": "Buy the domain name for the site."}
         self.assertEqual(self.rewrite(answer), "human")
         self.assertEqual(self.fake.labels, [(7, ["loom:human"])])
         self.assertIn("Buy the domain name", self.fake.comments[0][1])
         self.assertEqual(self.fake.created, [])
+
+    def test_a_human_answer_without_a_person_only_kind_writes_nothing(self):
+        # 2026-10-18: a free model parked "Using GitHub credentials, locate the
+        # 25 tickets..." and "Diagnose the station's 403..." as waiting on the
+        # operator. The kind names why only a person can do it.
+        self.assert_writes_nothing({"action": "human", "ask": "Diagnose the 403."})
+        self.assert_writes_nothing({"action": "human", "kind": "github",
+                                    "ask": "Using GitHub credentials, sort the tickets."})
+
+    def test_the_prompt_says_what_is_not_a_human_task(self):
+        prompt = rewrite.build_prompt({"title": "t", "body": "b", "labels": []}, [], "FORMAT")
+        self.assertIn("Never use human for work a coding agent or the factory can do", prompt)
+        self.assertIn('"kind": "money|hardware|account|credential|physical|decision"', prompt)
 
     def test_a_skip_answer_writes_nothing(self):
         self.assertEqual(self.rewrite({"action": "skip", "reason": "unclear"}), "skip")
@@ -263,7 +276,7 @@ class RewriteIssueTest(Base):
 
     def test_no_request_closes_retitles_or_edits_the_original(self):
         self.rewrite(BRIEF)
-        self.rewrite({"action": "human", "ask": "Buy the domain name."}, number=8)
+        self.rewrite({"action": "human", "kind": "money", "ask": "Buy the domain name."}, number=8)
         for method, path in self.fake.requests:
             self.assertNotIn(method, ("PATCH", "PUT"), path)
             if method == "DELETE":
