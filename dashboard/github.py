@@ -844,7 +844,11 @@ class TicketStore:
             self.transcripts = store
         try:
             snapshot["latest_runs"] = store.latest()
-        except (RuntimeError, *transcripts.storage_errors()) as exc:
+        # Broad on purpose: this runs on the background refresh thread, and a
+        # driver error storage_errors() does not list would otherwise end the
+        # refresh loop for good instead of failing one read.
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("transcript runs read failed: %s", exc)
             snapshot["latest_runs"] = self._snapshot.get("latest_runs", {})
             snapshot["dashboard_errors"] = list(snapshot.get("dashboard_errors", [])) + [
                 "transcript runs: " + (self._error_reason(exc) or type(exc).__name__)]

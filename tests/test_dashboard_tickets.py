@@ -270,6 +270,17 @@ class LatestRunsOffTheRequestTest(unittest.TestCase):
         self.assertEqual(payload["latest_runs"]["example-owner/app#7"]["model"], "model-a")
         self.assertTrue(any("connect timed out" in error for error in payload["dashboard_errors"]))
 
+    def test_a_driver_error_outside_storage_errors_never_breaks_the_refresh(self):
+        class DriverError(Exception):
+            """A driver's own error class, which storage_errors() may not list."""
+        store = self._ticket_store()
+        store.transcripts = SlowTranscripts(error=DriverError("canceling statement due to statement timeout"))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            store.refresh()
+        payload = store.response()
+        self.assertEqual(payload["latest_runs"], {})
+        self.assertTrue(any("statement timeout" in error for error in payload["dashboard_errors"]))
+
 
 if __name__ == "__main__":
     unittest.main()
