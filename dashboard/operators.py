@@ -12,6 +12,7 @@ another operator's, so it shows every claim:<login> label neutrally.
 from __future__ import annotations
 
 import html
+import re
 from typing import Any, Dict, List, Optional
 
 from bus import brain, tickets
@@ -22,10 +23,18 @@ ELSEWHERE_TITLE = ("Another operator owns this: it is assigned to, or labelled c
                    "outside this Loom's LOOM_BRIEF_AUTHORS. This Loom leaves it alone.")
 
 
+# A GitHub login: letters, digits and single hyphens, or an App's
+# <slug>[bot]. Anything else in a record is dropped, never shown as an owner.
+_LOGIN_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38})(?:\[bot\])?")
+
+
 def _login(value: Any) -> str:
+    """The lower-case login of a user object or login string, or "" when it
+    is not shaped like a GitHub login."""
     if isinstance(value, dict):
         value = value.get("login")
-    return str(value or "").strip().lower()
+    login = str(value or "").strip().lower()
+    return login if _LOGIN_RE.fullmatch(login) else ""
 
 
 def issue_shape(record: Dict[str, Any], pull_request: bool = False) -> Dict[str, Any]:

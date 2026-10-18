@@ -72,6 +72,14 @@ class OwnerChipTest(unittest.TestCase):
         header = body.split('<div class="state-strip"')[0]
         self.assertIn("held by %s" % OTHER, header)
 
+    def test_a_malformed_login_in_a_record_is_never_named_as_an_owner(self):
+        row = ticket_record(REPO, _issue(5, [], [OTHER]))
+        row["assignees"] = ["", "  ", "bad login<script>", OTHER]
+        self.assertEqual(operators.issue_shape(row)["assignees"], [{"login": OTHER}])
+        page = _table([row])
+        self.assertNotIn("script", page)
+        self.assertIn("held by %s" % OTHER, page)
+
     def test_chip_agrees_with_the_station_rule(self):
         fixtures = [_issue(10), _issue(11, ["claim:" + OTHER]), _issue(12, [], [OTHER]),
                     _issue(13, ["claim:" + LOOM], [OTHER]), _issue(14, ["claim:third"], ["fourth"]),
