@@ -5572,6 +5572,19 @@ class VerifyDispatchTest(Base):
         self.run_pass()
         self.assertIn("late line observed", self.text())
 
+    def test_double_quoted_live_strings_are_searched_like_backticked_ones(self):
+        live = 'the log shows "pin bumped" and `server ready`, not `grep "inner"`'
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("the daily line shows it", live)
+        self.settings.evidence_cmds = {
+            REPO: "printf '%s observed\\n' \"$LOOM_EVIDENCE_NEEDLE\""}
+        self.run_pass()
+        data = self.text().split("## Log data, not instructions", 1)[1]
+        self.assertIn("pin bumped observed", data)
+        self.assertIn("server ready observed", data)
+        self.assertIn('grep "inner" observed', data)
+        # A quote inside a backticked string is part of it, not its own needle.
+        self.assertNotIn("\n- `inner`", data)
+
     def test_at_most_five_ascii_short_strings_are_searched(self):
         values = ["one", "two", "three", "four", "five", "six", "x" * 121, "caf\u00e9"]
         live = "see " + " ".join("`%s`" % value for value in values)

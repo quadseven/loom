@@ -9,7 +9,10 @@ from typing import Dict, Iterable, List
 
 from . import text
 
-NEEDLE_RE = re.compile(r"`([^`]+)`")
+# An exact string in the Live criterion, backticked or in double quotes: about
+# one in seven shipped tickets wrote it as "text" and got no log data. A
+# backticked span is matched first, so a quote inside one is not a needle.
+NEEDLE_RE = re.compile(r'`([^`]+)`|"([^"\n]+)"')
 IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b")
 MAX_NEEDLES = 5
 MAX_LINES = 20
@@ -18,7 +21,8 @@ TIMEOUT = 60
 
 def needles(live: str) -> List[str]:
     """Eligible exact strings named by the ticket's Live criterion."""
-    return list(dict.fromkeys(value for value in NEEDLE_RE.findall(live)
+    found = (tick or quoted for tick, quoted in NEEDLE_RE.findall(live))
+    return list(dict.fromkeys(value for value in found
                               if 0 < len(value) <= 120 and value.isascii()
                               and all(32 <= ord(char) < 127 for char in value)))[:MAX_NEEDLES]
 
