@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
 from bus import brain, factory
+from bus.naming import strip_kind
 from bus.metrics import stamp
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
@@ -229,7 +230,8 @@ def _group(goal, members, *, goal_titles, entered, now, ticket_href, short_ref, 
     """One goal home's collapsible table."""
     esc = html.escape
     members = sorted(members, key=lambda row: _sort_key(row, entered))
-    title = goal_titles.get(goal) if goal != NO_GOAL else "Tickets with no Part of line"
+    # Every group is a goal home, so its title drops a kind word.
+    title = strip_kind(goal_titles.get(goal)) if goal != NO_GOAL else "Tickets with no Part of line"
     link = ('<a class="tickets-goal-link" href="%s">only this goal</a>' % esc(_href(goal=goal), quote=True)
             if linked and goal != NO_GOAL else "")
     return ('<details class="tickets-group" open><summary><span class="machine-fact">%s</span>'

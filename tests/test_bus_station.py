@@ -1666,6 +1666,37 @@ class TriageTest(Base):
         self.run_at()
         self.assertEqual(len(self.triage_reads()), 0)
 
+    def add_labelled_backlog(self, number=30):
+        """A backlog home that carries loom:backlog and no "Backlog:" prefix."""
+        self.fake.add_goal(number, title="Goal: Loom or a person works every open %s issue" % REPO)
+        for issue in (self.fake.goals[-1], self.fake.issues[number]):
+            issue["labels"] = [{"name": "loom:goal"}, {"name": "loom:backlog"}]
+
+    def test_a_goal_labelled_backlog_is_the_backlog_home_whatever_its_title(self):
+        self.add_labelled_backlog(30)
+        self.fake.add_goal(31, title="Goal: ship the thing")
+        self.fake.add_open_issue(100, body=READY_BODY)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
+            st.triage_backlogs()
+        # Only the backlog home: other goal homes are triaged only in a repo
+        # that has none.
+        self.assertEqual([c.args[2] for c in triage.call_args_list], [30])
+
+    def test_the_backlog_label_orders_adoption_invariant_and_handoff_homes(self):
+        self.add_labelled_backlog(30)
+        self.fake.add_goal(31, title="Goal: ship the thing")
+        self.settings.self_repo = REPO
+        self.settings.status_repo = REPO
+        self.settings.invariant_goal = ""
+        self.settings.metrics_goal = ""
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=self.start)
+        self.assertEqual(st._adoption_goal(REPO), 31)
+        self.assertEqual(st._invariant_goal(), (REPO, 31))
+        self.assertEqual(st._handoff_home(), (REPO, 31))
+
     def test_a_goal_without_backlog_home_is_triaged(self):
         self.fake.add_goal(31, title="Ship the thing")
         self.fake.add_open_issue(102, body="It is slow.")

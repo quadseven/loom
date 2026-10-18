@@ -37,6 +37,7 @@ from . import handoff
 from . import health
 from . import invariants
 from . import metrics
+from . import naming
 from . import proof
 from . import rewrite
 from . import roll_pin
@@ -228,7 +229,6 @@ ADOPTED_MARKER = "<!-- loom:adopted v1 ticket=%s#%d -->"
 ADOPTED_RE = re.compile(r"<!-- loom:adopted v1 ticket=[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+ -->")
 ADOPTS_MARKER = "<!-- loom:adopts pr=%d -->"
 ADOPT_TITLE = "Land or supersede #%d"
-ADOPT_TITLE_MAX = 200
 ADOPTIONS_FILE = "adoptions.json"
 # Issues another operator's Loom owns, each logged once (docs/LANES.md).
 OWNED_FILE = "owned.json"
@@ -1599,7 +1599,7 @@ class Station:
                 "- [ ] The ticket pull request passes the contract on the default branch.\n\n"
                 "## Size\nS\n\n## Out of scope\nWriting the contract by the station.\n")
         for repo, goal in self._goal_homes():
-            if not str(goal.get("title") or "").startswith("Backlog:"):
+            if not naming.is_backlog_home(goal):
                 continue
             if self._contents_text(repo, ".loom/validation.conf") is not None:
                 continue
@@ -2946,19 +2946,20 @@ class Station:
         """The goal home the repo's adoption tickets are filed under: its
         oldest open goal home that is not a backlog, else its backlog home;
         None when the repo has none."""
-        homes = sorted((str(i.get("title") or "").startswith("Backlog:"), int(i["number"]))
+        homes = sorted((naming.is_backlog_home(i), int(i["number"]))
                        for r, i in self._goal_homes() if r == repo)
         return homes[0][1] if homes else None
 
     @staticmethod
     def _adoption_title(repo: str, pr: Dict[str, Any]) -> str:
-        """"Land or supersede #N: <title>", or without the title when it is
-        text a brief refuses (a closing keyword, another repo's issue)."""
+        """"Land or supersede #N: <title>" clipped to naming.TITLE_MAX, or
+        without the title when it is text a brief refuses (a closing keyword,
+        another repo's issue)."""
         bare = ADOPT_TITLE % int(pr["number"])
         title = " ".join(str(pr.get("title") or "").split())
         if not title:
             return bare
-        full = "%s: %s" % (bare, _clip(title, ADOPT_TITLE_MAX))
+        full = naming.generated(bare, title)
         try:
             _text.check(full)
         except ValueError:
@@ -4478,7 +4479,8 @@ class Station:
             if goal is None:
                 head = "Not filed under a goal"
             else:
-                head = "%s (#%d)" % (" ".join(str(goals[goal].get("title") or "").split()), goal)
+                # The heading names the goal, so its title drops a kind word.
+                head = "%s (#%d)" % (naming.strip_kind(goals[goal].get("title")), goal)
             out += ["", "## " + head.replace("@", "@\u200b"), ""]
             out += ["- #%d %s" % (int(i["number"]),
                                   " ".join(str(i.get("title") or "").split()).replace("@", "@\u200b"))
@@ -5019,8 +5021,7 @@ class Station:
         fallback = []
         repos_with_backlog = set()
         for repo, goal in homes:
-            title = str(goal.get("title") or "")
-            if not title.startswith("Backlog:"):
+            if not naming.is_backlog_home(goal):
                 continue
             repos_with_backlog.add(repo)
             number = int(goal["number"])
@@ -5028,7 +5029,7 @@ class Station:
             keep.add(key)
             goals[key] = (repo, number, state.get(key))
         for repo, goal in homes:
-            if repo in repos_with_backlog or str(goal.get("title") or "").startswith("Backlog:"):
+            if repo in repos_with_backlog or naming.is_backlog_home(goal):
                 continue
             number = int(goal["number"])
             key = "%s#%d" % (repo, number)
@@ -5060,8 +5061,9 @@ class Station:
     def triage_backlogs(self) -> None:
         """Run brain.triage once an hour on every backlog goal home.
 
-        A backlog goal is the goal home onboard opens: its title starts with
-        "Backlog:". The last run time per goal is kept in triage.json so a
+        A backlog goal is the goal home onboard opens: labelled loom:backlog,
+        or titled "Backlog: ..." when opened before that label existed
+        (docs/NAMING.md). The last run time per goal is kept in triage.json so a
         restart does not repeat a run. Goal homes are re-read at most once an
         hour, so a pass that does no triage costs no extra GitHub calls."""
         path = os.path.join(self.state, "triage.json")
@@ -5275,7 +5277,7 @@ class Station:
         if not repo or not tickets.REPO_RE.fullmatch(repo):
             return None
         homes = [i for i in self._goal_issues(repo)
-                 if not str(i.get("title") or "").startswith("Backlog:")]
+                 if not naming.is_backlog_home(i)]
         return (repo, int(homes[0]["number"])) if len(homes) == 1 else None
 
     def _invariant_ref(self, repo: str, number: int, noun: str = "issue") -> invariants.Ref:
@@ -6498,7 +6500,7 @@ class Station:
         if not repo or not tickets.REPO_RE.fullmatch(repo):
             return None
         homes = [i for i in self._goal_issues(repo)
-                 if not str(i.get("title") or "").startswith("Backlog:")]
+                 if not naming.is_backlog_home(i)]
         return (repo, int(homes[0]["number"])) if len(homes) == 1 else None
 
     def _shown(self, repo: str, home: str) -> bool:

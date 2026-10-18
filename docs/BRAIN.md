@@ -40,6 +40,7 @@ that talks to GitHub about tickets.
 | Label | Meaning |
 |---|---|
 | `loom:goal` | The goal's home issue. |
+| `loom:backlog` | With `loom:goal`: the goal home that holds the repo's whole backlog (docs/NAMING.md). |
 | `loom:ticket` | Every ticket issue. |
 | `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, by priority then oldest; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
@@ -265,9 +266,9 @@ repo for Loom in one step, and a second run changes nothing:
 
 - creates the labels above that are missing (the same as `python3 -m bus
   labels`);
-- opens the repo's backlog goal home when none is open: `loom:goal`, titled
-  "Backlog: every open issue in <owner/name> is worked through Loom or
-  handed to a person", with the destination, the metric (open issues not
+- opens the repo's backlog goal home when none is open: `loom:goal` and
+  `loom:backlog`, titled "Goal: Loom or a person works every open
+  <owner/name> issue" (docs/NAMING.md), with the destination, the metric (open issues not
   yet tickets, tickets, `loom:human`) and the rules (triage never closes an
   issue; a private repo's briefs never go to lanes that train on prompts);
 - checks whether the review check (`--review-check`, else

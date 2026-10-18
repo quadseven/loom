@@ -962,7 +962,7 @@ class DeferredFindings(Base):
         self.assertEqual(len(self.gh.filed), 1)
         filed = self.gh.filed[0]
         self.assertEqual((filed["title"], filed["labels"]),
-                         ("Deferred review findings from %s#50" % REPO, ["loom:triage"]))
+                         ("Settle the review findings left from PR #50", ["loom:triage"]))
         self.assertIn("- medium | _robustness_ | `missing-error-handling` | quick win in `bus/a.py`:"
                       " https://example.invalid/pr/50#r1", filed["body"])
         self.assertTrue(all(ord(ch) < 128 for ch in filed["body"]))
@@ -1031,6 +1031,14 @@ class DeferredFindings(Base):
         self.finding(MEDIUM)
         self.go()
         self.assertEqual((self.gh.filed, self.merged), ([], []))
+
+    def test_an_open_follow_up_under_the_new_title_is_reused(self):
+        self.gh.filed.append({"number": 778, "title": "Settle the review findings left from PR #50",
+                              "user": ME})
+        self.finding(MEDIUM)
+        self.go()
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertTrue([w for w in self.gh.writes if w[0] == "REPLY"][0][2].startswith("Deferred to #778: "))
 
     def test_an_open_follow_up_from_an_earlier_pass_is_reused(self):
         self.gh.filed.append({"number": 777, "title": "Deferred review findings from %s#50" % REPO,

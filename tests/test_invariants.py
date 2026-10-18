@@ -381,8 +381,9 @@ class StationTest(StationBase):
         self.lane_pull(658, 507, T0 - 5 * 3600)
         self.run_at(T0)
         (filed,) = self.breaches()
-        self.assertIn("Lane pull request #657 open 7.0 hours", filed["title"])
-        self.assertIn("past the last rung of the model ladder", filed["title"])
+        self.assertEqual("Lane pull request #657 open 7.0 hours: ticket past the model ladder",
+                         filed["title"])
+        self.assertIn("past the last rung of the model ladder", filed["body"])
         self.assertIn("#506", filed["body"])
         self.assertNotIn("#658", filed["title"] + filed["body"])
 
@@ -392,7 +393,9 @@ class StationTest(StationBase):
         self.bot_threads(2)
         self.run_at(T0)
         (filed,) = self.breaches()
-        self.assertIn("2 open review threads and no fix round queued", filed["title"])
+        self.assertIn("2 review threads, no fix round", filed["title"])
+        self.assertLessEqual(len(filed["title"]), 72)
+        self.assertIn("2 open review threads and no fix round queued", filed["body"])
         self.assertIn("bus.brain fix", filed["body"])
 
     def test_a_lane_pull_with_its_fix_round_queued_or_waiting_to_merge_files_nothing(self):
@@ -521,6 +524,15 @@ class FilerTest(unittest.TestCase):
         self.file(invariants.Breach("goal-full", "x/y#2", "Another", ("line",), T0))
         self.assertEqual(len([i for i in self.gh.issues.values()
                               if i.get("title") == brain.REPAIRS_TITLE]), 1)
+
+    def test_a_long_breach_title_is_clipped_to_72_and_kept_whole_in_the_body(self):
+        long = ("Repeated rewrite skip for one hour: the agent answered with no brief "
+                "and no reason on every issue it was given")
+        self.file(invariants.Breach("repeated-failure", "k|r", long, ("line",), T0))
+        (filed,) = self.gh.issues.values()
+        self.assertLessEqual(len(filed["title"]), 72)
+        self.assertTrue(filed["title"].startswith("Repeated rewrite skip for one hour:"))
+        self.assertIn(long, filed["body"])
 
     def test_a_closed_issue_reopens_only_for_evidence_newer_than_the_close(self):
         self.file(self.breach())
@@ -754,18 +766,25 @@ class InvariantTest(unittest.TestCase):
             Facts(T0, lane_pulls=[self.pull(T0 - 5 * 3600, threads=2)])), [])
 
     def test_each_stall_names_its_own_reason(self):
+        # (short reason in the title, full reason in the evidence)
         cases = {
-            "no open loom:ticket carries it": dict(ticket=None, drives=False, labels=()),
-            "past the last rung of the model ladder": dict(labels=("loom:ticket", "loom:failed")),
-            "its ticket waits on the brain": dict(labels=("loom:ticket", "loom:pr", "needs-brain")),
-            "1 open review thread and no fix round queued": dict(threads=1),
+            ("no open loom:ticket carries it", "no open loom:ticket carries it"):
+                dict(ticket=None, drives=False, labels=()),
+            ("ticket past the model ladder", "past the last rung of the model ladder"):
+                dict(labels=("loom:ticket", "loom:failed")),
+            ("ticket waits on the brain", "its ticket waits on the brain"):
+                dict(labels=("loom:ticket", "loom:pr", "needs-brain")),
+            ("1 review thread, no fix round", "1 open review thread and no fix round queued"):
+                dict(threads=1),
         }
-        for reason, shape in cases.items():
+        for (short, reason), shape in cases.items():
             with self.subTest(reason):
                 (b,) = invariants.lane_pr_stalled(
                     Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, **shape)]))
                 self.assertEqual((b.invariant, b.subject), ("lane-pr-stalled", "%s#534" % REPO))
-                self.assertIn(reason, b.title)
+                self.assertIn(short, b.title)
+                self.assertLessEqual(len(b.title), 72)
+                self.assertIn(reason, " ".join(b.evidence))
                 self.assertIn("Unstick it:", " ".join(b.evidence))
 
     def test_the_ladder_and_the_open_threads_name_the_one_command_that_unsticks_them(self):

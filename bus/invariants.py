@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import brain
+from . import naming
 from . import text as _text
 from . import watch
 from .github import GitHubError
@@ -477,30 +478,34 @@ def plan_check_failed(f: Facts) -> List[Breach]:
             if c.conclusion in PLAN_FAILED and f.now - c.at > PLAN_FAILED_AGE]
 
 
-def _stall(p: LanePull) -> Tuple[Optional[str], str]:
-    """Why nothing drives this open lane pull request, and the one thing that
-    unsticks it: (None, "") when something does drive it."""
+def _stall(p: LanePull) -> Tuple[Optional[str], str, str]:
+    """Why nothing drives this open lane pull request, in a few words for
+    the title and in full for the body, and the one thing that unsticks it:
+    (None, "", "") when something does drive it."""
     if not p.drives:
-        return ("no open loom:ticket carries it",
+        return ("no open loom:ticket carries it", "no open loom:ticket carries it",
                 "make its ticket an open loom:ticket and move it to loom:pr with "
                 "python3 -m bus.brain move OWNER/NAME#N --to pr, or close the pull request "
                 "as superseded")
     if "loom:failed" in p.labels:
-        return ("its ticket is past the last rung of the model ladder",
+        return ("ticket past the model ladder",
+                "its ticket is past the last rung of the model ladder",
                 "brief the work again as a new loom:ticket with "
                 "python3 -m bus.brain brief OWNER/NAME --title TITLE --file BODY.md, or "
                 "close the pull request as superseded")
     if "needs-brain" in p.labels:
-        return ("its ticket waits on the brain (needs-brain)",
+        return ("ticket waits on the brain",
+                "its ticket waits on the brain (needs-brain)",
                 "review it in a brain tick and move it on: python3 -m bus.brain merge "
                 "OWNER/NAME#N, or python3 -m bus.brain fix OWNER/NAME#N --ticket "
                 "OWNER/NAME#N --file FIX.md")
     if p.threads and not p.fix_pending:
-        return ("%d open review thread%s and no fix round queued"
+        return ("%d review thread%s, no fix round" % (p.threads, "" if p.threads == 1 else "s"),
+                "%d open review thread%s and no fix round queued"
                 % (p.threads, "" if p.threads == 1 else "s"),
                 "send it back to a lane with "
                 "python3 -m bus.brain fix OWNER/NAME#N --ticket OWNER/NAME#N --file FIX.md")
-    return (None, "")
+    return (None, "", "")
 
 
 def _ticket_line(p: LanePull) -> str:
@@ -527,13 +532,16 @@ def lane_pr_stalled(f: Facts) -> List[Breach]:
     for p in f.lane_pulls:
         if f.now - p.at <= PR_STALLED:
             continue
-        why, fix = _stall(p)
-        if why is None:
+        short, why, fix = _stall(p)
+        if short is None:
             continue
+        # A short reason, so the title fits the naming standard's 72
+        # characters (docs/NAMING.md); the body says it in full.
         out.append(Breach("lane-pr-stalled", p.pr.key,
-                          "Lane %s open %s: %s" % (p.pr.label, _hours(f.now - p.at), why),
+                          "Lane %s open %s: %s" % (p.pr.label, _hours(f.now - p.at), short),
                           ("Opened at %s and still open after %s (limit: %s)"
                            % (utc(p.at), _hours(f.now - p.at), _hours(PR_STALLED)),
+                           "Stalled because %s" % why,
                            _ticket_line(p),
                            "Unstick it: %s" % fix),
                           f.now))
@@ -634,8 +642,8 @@ def untrusted_labeler(f: Facts) -> List[Breach]:
         if count <= LABELER_REFUSALS_MAX:
             continue
         out.append(Breach("untrusted-labeler", login,
-                          "Briefed tickets were refused %d times in an hour for labeller %s"
-                          % (count, login),
+                          "Labeller %s had %d briefed tickets refused in an hour"
+                          % (login, count),
                           ("%d briefed tickets were refused because %s applied their labels"
                            % (count, login),
                            "Add the login to LOOM_BRIEF_AUTHORS (or LOOM_TRUSTED_BRIEFERS) "
@@ -745,7 +753,9 @@ class Filer:
              "", "Part of #%d" % self._home()])
 
     def _file(self, b: Breach) -> None:
-        title = b.title
+        # The body quotes the whole breach; the title is clipped to the
+        # naming standard's TITLE_MAX.
+        title = naming.clip(b.title)
         body = self._body(b)
         _text.check(title + "\n" + body)
         made = self.gh.rest("POST", "/repos/%s/issues" % self.repo,

@@ -39,6 +39,7 @@ LANES += list(REMOTE_LANES)
 # name -> (6-hex color, short ASCII description)
 LABELS: Dict[str, Dict[str, str]] = {
     "loom:goal": {"color": "5319e7", "description": "The goal's home issue"},
+    "loom:backlog": {"color": "5319e7", "description": "The goal home that holds the repo's whole backlog"},
     "loom:ticket": {"color": "0e8a16", "description": "A ticket issue"},
     "loom:queued": {"color": "c5def5", "description": "Written by the brain, no lane chosen yet"},
     "loom:briefed": {"color": "1d76db", "description": "Assigned to a lane, waiting for the station"},

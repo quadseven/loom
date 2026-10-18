@@ -22,6 +22,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 from bus import brain as bus_brain
 from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
+from bus.naming import strip_kind
 
 from .github import TicketStore
 from .shell import page
@@ -344,7 +345,7 @@ def _goal_child_row(goal, info, own, now):
     """One smaller goal inside its parent's card: title, in-flight count,
     last report age; it links to that goal's tickets."""
     esc = html.escape
-    title = info.get("title") or _short_ref(goal)
+    title = strip_kind(info.get("title")) or _short_ref(goal)
     flying = info.get("in_flight") if info else None
     if flying is None:
         flying = sum(1 for row in own if row.get("open", True) and row.get("state") in goals_view.IN_FLIGHT_STATES)
@@ -365,7 +366,7 @@ def _goal_epic_row(epic):
     esc = html.escape
     return ('<li><a href="/tickets?epic=%s"><span class="goal-child-title">%s</span>'
             '<span class="machine-fact">%s / tickets %d/%d / %d in flight</span></a></li>') % (
-                quote(epic["ref"], safe=""), esc(goals_view.short(str(epic.get("title") or _short_ref(epic["ref"])), 90)),
+                quote(epic["ref"], safe=""), esc(goals_view.short(strip_kind(epic.get("title")) or _short_ref(epic["ref"]), 90)),
                 esc(_short_ref(epic["ref"])), epic.get("tickets", 0), goals_view.EPIC_TICKET_CAP,
                 epic.get("in_flight", 0))
 
@@ -428,7 +429,7 @@ def _goal_card(goal, children, grouped, goal_data, missing, now):
         esc(name, quote=True), quote(goal, safe=""), esc(name),
         sum(row.get("state") == name for row in tickets)) for name in STATES
         if any(row.get("state") == name for row in tickets))
-    title = info.get("title") or _short_ref(goal)
+    title = strip_kind(info.get("title")) or _short_ref(goal)
     measure = info.get("measure")
     child_html = ('<ul class="goal-children" aria-label="Smaller goals in this goal">%s</ul>' % "".join(
         _goal_child_row(child, goal_data.get(child) or {}, grouped.get(child, []), now)
@@ -645,7 +646,7 @@ def _epic_row(epic):
     tier = epic.get("tier")
     age = _epic_age(epic)
     epic_number = _int_or_none(epic.get("number"))
-    title = str(epic.get("title") or "Untitled epic")
+    title = strip_kind(epic.get("title")) or "Untitled epic"
     return ('<tr><td class="machine-fact">%s%s</td><td class="epic-title">%s</td>'
             '<td class="machine-fact%s">%s</td><td class="machine-fact num">%s</td>'
             '<td><span class="epic-bar" role="img" aria-label="%d of %d children done, %d open">'
@@ -752,7 +753,7 @@ def _backlog_page(document, parsed, state):
     if empty:
         out.append('<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
             len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
-                _link_or_text(epic.get("html_url") or epic.get("url"), str(epic.get("title") or "Untitled epic")),
+                _link_or_text(epic.get("html_url") or epic.get("url"), strip_kind(epic.get("title")) or "Untitled epic"),
                 html.escape(_repo_number(epic))) for epic in empty)))
     out.append(_render_inspectors(document))
     return page("Backlog", "backlog", "".join(out), status="Read only")

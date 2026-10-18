@@ -419,7 +419,8 @@ this tick"; a step with no note shows nothing there.
    never only in journal prose.
 8. First run `python3 -m bus.brain step triage --holder muse`. Triage the backlog. The station runs `python3 -m bus.brain triage
    OWNER/NAME --goal N` once an hour on every backlog goal home (the goal
-   home onboard opens for a repo has a title starting `Backlog:`), with the
+   home onboard opens for a repo carries the `loom:backlog` label; one opened
+   before that label existed has a title starting `Backlog:`), with the
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
