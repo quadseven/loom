@@ -166,6 +166,23 @@ class DashboardTest(unittest.TestCase):
             connection.close()
         self.assertEqual(len(self.api_calls), before)
 
+    def test_stale_banner_names_age_reason_and_next_refresh(self):
+        self.store._snapshot.update({"stale": True, "ticket_refreshed_at": time.time() - 2400,
+                                     "stale_reason": "GitHub's request budget ran low",
+                                     "next_refresh_at": time.time() + 600})
+        _, _, body = self.raw_get("/")
+        page = body.decode()
+        self.assertRegex(page, r"Ticket data is 40 minutes old: GitHub's request budget ran low")
+        self.assertIn("refreshes at", page)
+        self.assertIn("ET", page)
+
+    def test_no_page_uses_internal_budget_wording(self):
+        for path in ("/", "/results", "/brain", "/hot-spots"):
+            _, _, body = self.raw_get(path)
+            page = body.decode().lower()
+            self.assertNotIn("optional view sources", page)
+            self.assertNotIn("below its floor", page)
+
     def test_conditional_request_and_budget_floor_stale_response(self):
         self.store.refresh()
         self.store.budget_floor = 20
@@ -202,6 +219,19 @@ class DashboardTest(unittest.TestCase):
         self.store.refresh()
         self.assertGreater(len(self.api_calls), before)
         self.assertFalse(self.get_json("/api/tickets")["stale"])
+
+    def test_below_the_floor_without_a_reset_time_the_next_refresh_is_unknown(self):
+        # A pass below the floor reads nothing, so "now plus the interval" is
+        # not when the data refreshes; without GitHub's reset time it is unknown.
+        self.store.refresh()
+        self.store._last_remaining, self.store.budget_floor, self.store._reset_at = 3, 20, 0
+        self.store.refresh()
+        payload = self.get_json("/api/tickets")
+        self.assertTrue(payload["stale"])
+        self.assertIsNone(payload["next_refresh_at"])
+        self.store._reset_at = int(time.time()) + 600
+        self.store.refresh()
+        self.assertEqual(self.get_json("/api/tickets")["next_refresh_at"], self.store._reset_at)
 
     def raw_get(self, path):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)

@@ -127,10 +127,12 @@ def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
             "comments_reason": reason, "comment_reach_days": COMMENT_REACH.days}
 
 
-def _cell(value: Optional[int], reach_days: int, reason: str) -> str:
+def _cell(value: Optional[int], reach_days: int, reason: str, window: str) -> str:
     if value is None:
-        why = reason or "comments are read back %d days only" % reach_days
-        return '<td class="not-looked" title="%s">not looked</td>' % html.escape(why, quote=True)
+        why = reason or "issue comments are read back %d days only" % reach_days
+        message = "%s window was not read: issue comments; %s. Check again at the next dashboard refresh." % (window, why)
+        return '<td class="not-looked" title="%s">%s not looked</td>' % (
+            html.escape(message, quote=True), html.escape(window.capitalize()))
     return '<td class="machine-fact">%d</td>' % value
 
 
@@ -140,7 +142,7 @@ def render_results(data: Dict[str, Any]) -> str:
     body = "".join(
         "<tr><th scope=\"row\">%s</th>%s</tr>" % (
             esc(row["name"]),
-            "".join(_cell(row["values"][key], data["comment_reach_days"], data["comments_reason"])
+            "".join(_cell(row["values"][key], data["comment_reach_days"], data["comments_reason"], key)
                     for key, _, _ in WINDOWS))
         for row in data["rows"])
     parts = ['<p class="page-lede">What the factory finished and what failed. Proofs and lane '

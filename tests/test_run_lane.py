@@ -1457,6 +1457,8 @@ cat > /dev/null
         self.assertIn("failed: [transient] model claude-sonnet-5-5 is not an opencode-go model", log)
 
     def api_lane(self, lane, extra="", **env):
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
         planted = self.home / ".ssh" / "id_planted"
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_text("private key\n")

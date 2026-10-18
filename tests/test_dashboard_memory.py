@@ -85,7 +85,8 @@ def _size(rows):
 
 class SnapshotMemoryTest(unittest.TestCase):
     def refreshed(self):
-        env = {"LOOM_IMPROVEMENT_HOMES": "", "LOOM_STATUS_REPO": "", "LOOM_METRICS_GOAL": ""}
+        env = {"LOOM_IMPROVEMENT_HOMES": "", "LOOM_STATUS_REPO": "", "LOOM_METRICS_GOAL": "",
+               "LOOM_BRIEF_AUTHORS": ""}
         with patch.dict(os.environ, env):
             store = TicketStore([REPO], gh=RawGitHub(), budget_floor=0)
             store._waits_refreshed_at = float("inf")
