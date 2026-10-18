@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -161,6 +162,34 @@ class PinTest(unittest.TestCase):
         gh = FakeGitHub()
         pin.run(gh, SOURCE, NEW, "unittest", [spec], lambda _: b"archive", lambda _: None)
         self.assertEqual(gh.created, 0)
+
+
+class PinAuthTest(unittest.TestCase):
+    def test_pin_pass_uses_personal_token_not_app_token(self):
+        from bus.github import GitHub, auth_from_env
+
+        names = ("LOOM_GITHUB_APP_ID", "LOOM_GITHUB_APP_INSTALLATION_ID",
+                 "LOOM_GITHUB_APP_KEY_SSM", "LOOM_GITHUB_TOKEN")
+        saved = {name: os.environ.get(name) for name in names}
+        try:
+            os.environ["LOOM_GITHUB_APP_ID"] = "1"
+            os.environ["LOOM_GITHUB_APP_INSTALLATION_ID"] = "1"
+            os.environ["LOOM_GITHUB_APP_KEY_SSM"] = "/example/ssm"
+            os.environ["LOOM_GITHUB_TOKEN"] = "personal-token"
+            # With the App configured, auth_from_env would send the App
+            # installation token, which the deployment repo's collaborator-only
+            # trust gate rejects (auth == "app").
+            self.assertEqual(GitHub(auth_from_env()).auth, "app")
+            # The pin pass must open the pull request with the operator's
+            # personal token instead (auth == "token"), so the trust gate
+            # passes and the pin pull request can merge.
+            self.assertEqual(pin._pin_client().auth, "token")
+        finally:
+            for name in names:
+                if saved[name] is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = saved[name]
 
 
 if __name__ == "__main__":
