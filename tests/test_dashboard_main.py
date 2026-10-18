@@ -39,11 +39,17 @@ class DashboardHostTest(unittest.TestCase):
 
     def test_without_a_host_every_interface_is_bound(self):
         server = self.serve()
-        self.assertEqual(server.server_address[0], "0.0.0.0")
+        self.assertEqual(server.server_address[0], "0.0.0.0")  # noqa: S104 - asserts the default
 
     def test_a_blank_host_is_every_interface(self):
         server = self.serve(LOOM_DASHBOARD_HOST="  ")
-        self.assertEqual(server.server_address[0], "0.0.0.0")
+        self.assertEqual(server.server_address[0], "0.0.0.0")  # noqa: S104 - asserts the default
+
+    def test_a_host_that_is_not_one_ipv4_address_is_refused(self):
+        for bad in ("127.0.0.1; true", "dashboard.example", "127.0.0.1 10.0.0.1", "::1", "300.1.1.1"):
+            with self.subTest(bad=bad), _env(LOOM_DASHBOARD_PORT="0", LOOM_DASHBOARD_HOST=bad):
+                with self.assertRaisesRegex(ValueError, "LOOM_DASHBOARD_HOST"):
+                    server_from_env(store=_Store())
 
     def test_memory_transcripts_are_announced_in_the_log(self):
         with self.assertLogs("dashboard.__main__", level="WARNING") as logs:

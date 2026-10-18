@@ -120,8 +120,21 @@ if [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; then
     { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE has mode $KEY_MODE; it must be 600 (chmod 600 $LOOM_GITHUB_APP_KEY_FILE)" >&2; exit 1; }
 fi
 DASHBOARD_PORT="${LOOM_DASHBOARD_PORT:-8080}"
-[ "${LOOM_DASHBOARD:-}" != 1 ] || [[ "$DASHBOARD_PORT" =~ ^[0-9]+$ ]] ||
-  { echo "LOOM_DASHBOARD_PORT must be a port number" >&2; exit 1; }
+DASHBOARD_HOST="${LOOM_DASHBOARD_HOST:-}"
+if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
+  [[ "$DASHBOARD_PORT" =~ ^[0-9]+$ ]] ||
+    { echo "LOOM_DASHBOARD_PORT must be a port number" >&2; exit 1; }
+  # Empty (every interface) or one IPv4 address, each part 0-255.
+  if [ -n "$DASHBOARD_HOST" ]; then
+    ok=0
+    if [[ "$DASHBOARD_HOST" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+      ok=1
+      for part in "${BASH_REMATCH[@]:1}"; do [ "$((10#$part))" -le 255 ] || ok=0; done
+    fi
+    [ "$ok" = 1 ] ||
+      { echo "LOOM_DASHBOARD_HOST must be empty or one IPv4 address" >&2; exit 1; }
+  fi
+fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -436,7 +449,6 @@ case "${LOOM_DASHBOARD:-}" in
   echo "removed $LABEL (LOOM_DASHBOARD=0)"
   ;;
 1)
-  DASHBOARD_HOST="${LOOM_DASHBOARD_HOST:-}"
   DASHBOARD_MEMORY="${LOOM_TRANSCRIPTS_MEMORY:-}"
   if [ -z "$DASHBOARD_MEMORY" ] && [ -z "${LOOM_DB_PASSWORD:-}" ]; then
     DASHBOARD_MEMORY=1
