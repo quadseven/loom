@@ -384,7 +384,7 @@ class StoreGoals(unittest.TestCase):
 
     def test_a_pass_below_the_budget_floor_keeps_the_goal_cards_of_the_last_pass(self):
         self.store.refresh()
-        self.store._last_remaining, self.store._reset_at = 10, 2 ** 40
+        self.store._last_remaining, self.store._reset_at = 10, 2000000000
         self.store.refresh()
         found = cards(server._goals(self.store))
         self.assertEqual(len(found), 1)
@@ -394,9 +394,14 @@ class StoreGoals(unittest.TestCase):
         self.assertIn("Smaller goal", found[0][found[0].index("goal-children"):])
 
     def test_a_first_pass_below_the_floor_says_why_the_cards_are_empty(self):
-        self.store._last_remaining, self.store._reset_at = 10, 2 ** 40
+        self.store._last_remaining, self.store._reset_at = 10, 2000000000
         self.store.refresh()
-        self.assertIn("request budget is below its floor", self.store.response()["goal_context_error"])
+        page = server._goals(self.store)
+        self.assertIn("GitHub goal comments were not read", page)
+        self.assertIn("request budget ran low", page)
+        self.assertIn("refreshes at", page)
+        self.assertIn("UTC", page)
+        self.assertNotIn("below its floor", page)
 
 
 class GoalSourcesAreTrusted(unittest.TestCase):

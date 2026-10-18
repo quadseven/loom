@@ -79,6 +79,31 @@ class ResultsCounts(unittest.TestCase):
 
 
 class ResultsPage(unittest.TestCase):
+    def test_stale_notice_names_age_reason_and_next_refresh(self):
+        notice = server._stale_notice({"ticket_refreshed_at": 1000,
+                                       "stale_reason": "GitHub's request budget ran low",
+                                       "next_refresh_at": 2000}, now=3400)
+        self.assertIn("Ticket data is 40 minutes old", notice)
+        self.assertIn("GitHub's request budget ran low", notice)
+        self.assertIn("refreshes at", notice)
+        self.assertIn("ET", notice)
+
+    def test_stale_notice_without_a_read_or_a_refresh_time_says_so_in_plain_words(self):
+        for invalid in (None, 0, -5, False, "EOF"):
+            notice = server._stale_notice({"ticket_refreshed_at": None, "stale_reason": "",
+                                           "next_refresh_at": invalid}, now=3400)
+            self.assertNotIn("0 minutes old", notice)
+            self.assertNotIn("at after", notice)
+            self.assertIn("Ticket data has not been read yet", notice)
+            self.assertIn("it refreshes once GitHub can be reached", notice)
+
+    def test_not_looked_names_window_source_and_next_check(self):
+        data = results.build_results(payload(hot_spots_error="issue comments could not be read"), NOW)
+        page = results.render_results(data)
+        self.assertIn("month window was not read: issue comments", page)
+        self.assertIn("issue comments could not be read", page)
+        self.assertIn("Check again at the next dashboard refresh", page)
+
     def test_the_page_is_routed_and_in_the_nav(self):
         sent = {}
 
