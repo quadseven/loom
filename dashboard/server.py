@@ -1298,7 +1298,8 @@ def _lane_view_data(payload, tickets, state=None):
         model_display = None
         if model_info:
             age_str = views.format_age(model_info["time"])
-            model_display = "%s (%s)" % (model_info["model"], age_str) if age_str else model_info["model"]
+            model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
+                             if age_str else model_info["model"])
         lane_quota = _lane_quota(lane_name, usage_records)
         reason = _hold_reason(lane_name, usage_records)
         if item["available"] and reason == "no reason":

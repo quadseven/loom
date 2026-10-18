@@ -549,7 +549,8 @@ class LanesAndImprovingTest(unittest.TestCase):
         with patch.dict(factory.TIERS, {"easy": ("test-lane",)}):
             body = render_lanes({"lanes": [], "scoreboard": {}})
         self.assertIn('<table class="factory-tiers">', body)
-        self.assertIn("<th>Easy</th><td>test-lane</td>", body)
+        self.assertIn('<th>Easy</th><td><ul class="lane-chips"><li class="lane-chip lane-unknown"', body)
+        self.assertIn("test-lane", body)
         self.assertIn('<table class="model-ladder">', body)
 
     def test_tier_table_has_one_row_for_each_factory_tier(self):
@@ -756,7 +757,7 @@ class LaneCardsTest(unittest.TestCase):
         for lane in ("codex", "claude", "agy"):
             self.assertIn(lane, body)
 
-    def test_running_ticket_has_separator_before_heartbeat_line(self):
+    def test_running_ticket_link_and_heartbeat_are_separate_facts(self):
         from dashboard.views import render_lanes
         from dashboard.server import _lane_view_data
         comment = (
@@ -770,7 +771,8 @@ class LaneCardsTest(unittest.TestCase):
         payload = {"lanes": [{"body": comment}], "pull_requests": [], "tickets": {}}
         data = _lane_view_data(payload, tickets)
         body = render_lanes(data)
-        self.assertIn("Lane cards</a> - heartbeat 20:17Z", body)
+        self.assertIn('<p class="lane-doing"><a href="/t/example-owner/sample/362">sample#362 Lane cards</a></p>', body)
+        self.assertIn('<span class="lane-beat">heartbeat 20:17Z</span>', body)
 
     def test_pull_request_footer_shows_model_and_configured_model_is_fallback(self):
         from unittest.mock import patch
@@ -809,7 +811,7 @@ class LaneCardsTest(unittest.TestCase):
                                              "tickets": {}}, []))
         self.assertIn("gpt-6-sol", body)
 
-    def test_usage_record_shows_quota_bar_and_missing_says_quota_missing(self):
+    def test_usage_record_shows_quota_bar_and_missing_says_quota_not_reported(self):
         from dashboard.views import render_lanes
         from dashboard.server import _lane_view_data
         comment = (
@@ -826,8 +828,8 @@ class LaneCardsTest(unittest.TestCase):
         payload = {"lanes": [{"body": comment}], "pull_requests": [], "tickets": {}, "usage": usage}
         data = _lane_view_data(payload, [])
         body = render_lanes(data)
-        self.assertIn('<div class="quota"><span style="width:65%"></span></div>', body)
-        self.assertIn("quota missing", body)
+        self.assertIn('<span class="quota" aria-hidden="true"><span style="width:65%"></span></span>', body)
+        self.assertIn("quota not reported", body)
 
     def test_lanes_http_route_integration(self):
         from dashboard.server import _dispatch_get
@@ -864,8 +866,8 @@ class LaneCardsTest(unittest.TestCase):
         self.assertNotIn("heartbeat available", body)
         self.assertIn("heartbeat 20:17Z", body)
         self.assertIn("gpt-6-sol", body)
-        self.assertIn('<div class="quota"><span style="width:42%"></span></div>', body)
-        self.assertIn("quota missing", body)
+        self.assertIn('<span class="quota" aria-hidden="true"><span style="width:42%"></span></span>', body)
+        self.assertIn("quota not reported", body)
 
 
 if __name__ == "__main__":

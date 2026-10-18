@@ -195,3 +195,103 @@ class NeedsYouTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _lane(name, available=True, ticket=None, reason=None, quota=None):
+    return {"lane": name, "available": available, "ticket": ticket, "model": "model-alpha",
+            "quota": quota, "reason": reason or ("available" if available else "no reason"),
+            "heartbeat": "2030-01-01 12:00:00Z"}
+
+
+LANE_FIXTURE = {
+    "lanes": [
+        _lane("spark-2", available=False, reason="the spark endpoint did not answer"),
+        _lane("codex", ticket={"repo": "example-owner/sample", "number": 7, "title": "Fix it"}, quota=33),
+        _lane("anthropic-10", available=False, reason="out of credit until 2030-01-01 20:00 UTC"),
+        _lane("spark"),
+        _lane("anthropic-2", available=False, reason="out of credit until 2030-01-01 20:00 UTC"),
+        _lane("anthropic", available=False, reason="out of credit until 2030-01-01 20:00 UTC"),
+        _lane("zen", available=False),
+    ],
+    "scoreboard": {
+        "hard": {"model-beta": {"lane": "codex", "merged": 3, "open": 1, "closed": 0}},
+        "unknown": {"model-gamma": {"lane": "main-chat", "merged": 1, "open": 0, "closed": 0}},
+        "easy": {"model-alpha": {"lane": "spark", "merged": 2, "open": 0, "closed": 1}},
+    },
+    "anthropic_share": 12,
+}
+
+
+class LaneSectionsTest(unittest.TestCase):
+    """/lanes reads top to bottom: a summary strip, then lanes now, routing,
+    and pull requests by model, each with one heading and one row shape."""
+
+    def setUp(self):
+        import re
+        self.re = re
+        self.html = render_lanes(LANE_FIXTURE)
+
+    def test_sections_come_in_order_each_with_a_heading_and_a_note(self):
+        order = [self.html.index(marker) for marker in (
+            'class="section lanes-summary"', 'class="section lanes-now"',
+            'class="section lanes-routing"', 'class="section lanes-models"')]
+        self.assertEqual(order, sorted(order))
+        for title in ("Lanes now", "How tickets are routed", "Pull requests by model"):
+            self.assertIn('">%s</h2>' % title, self.html)
+        self.assertEqual(self.html.count('<p class="section-note">'), 3)
+        self.assertTrue(self.html.isascii())
+
+    def test_summary_counts_each_state_and_shows_the_anthropic_share(self):
+        tiles = dict(self.re.findall(
+            r'<li class="summary-tile lane-(\w+)"><span class="summary-num">(\d+)</span>', self.html))
+        self.assertEqual(tiles, {"held": "5", "busy": "1", "free": "1"})
+        self.assertIn('<span class="summary-num">12%</span>', self.html)
+        self.assertIn("of lane runs; cap 50%", self.html)
+
+    def test_needs_attention_groups_held_lanes_by_reason_largest_first(self):
+        self.assertIn("Needs attention: 5 lanes held", self.html)
+        reasons = self.re.findall(r'<span class="attention-reason">(.*?)</span>', self.html)
+        self.assertEqual(reasons, ["out of credit until 2030-01-01 20:00 UTC",
+                                   "held with no reason sent", "the spark endpoint did not answer"])
+        self.assertIn("3 lanes: anthropic, anthropic-2, anthropic-10", self.html)
+        self.assertIn("1 lane: zen", self.html)
+
+    def test_lane_cards_group_by_state_held_first_in_slot_order(self):
+        groups = self.re.findall(r'<div class="lane-group lane-group-(\w+)">', self.html)
+        self.assertEqual(groups, ["held", "busy", "free"])
+        names = self.re.findall(r'<article class="card lane-card lane-\w+"><div class="lane-head">'
+                                r'<i class="lane-dot"></i><strong>([\w-]+)</strong>', self.html)
+        self.assertEqual(names, ["anthropic", "anthropic-2", "anthropic-10", "spark-2", "zen",
+                                 "codex", "spark"])
+        self.assertIn('<span class="lane-state">working</span>', self.html)
+        self.assertIn('<span class="lane-state">ready</span>', self.html)
+
+    def test_every_lane_card_has_the_same_three_parts(self):
+        cards = self.re.findall(r'<article class="card lane-card.*?</article>', self.html)
+        self.assertEqual(len(cards), len(LANE_FIXTURE["lanes"]))
+        for card in cards:
+            self.assertIn('<div class="lane-head">', card)
+            self.assertIn('<p class="lane-doing">', card)
+            self.assertIn('<div class="lane-facts"><span class="lane-model">', card)
+            self.assertIn('<span class="lane-beat">heartbeat 12:00Z</span>', card)
+
+    def test_routing_chips_carry_each_lanes_state(self):
+        self.assertIn('<li class="lane-chip lane-held" title="held"><i class="lane-dot"></i>anthropic', self.html)
+        self.assertIn('<li class="lane-chip lane-busy" title="working"><i class="lane-dot"></i>codex', self.html)
+        self.assertIn('<table class="model-ladder"><thead><tr><th>Rung</th><th>Model</th><th>Lanes</th>', self.html)
+
+    def test_scoreboard_runs_easy_to_hard_and_counts_with_units(self):
+        tiers = self.re.findall(r'<div class="tier-head"><h3>(\w+)</h3><span class="machine-fact">([^<]+)</span>',
+                                self.html)
+        self.assertEqual(tiers, [("Easy", "3 PRs"), ("Hard", "4 PRs"), ("Unknown", "1 PR")])
+        self.assertIn('<span class="lane-model">lane codex</span>'
+                      '<span class="model-label">3 merged / 1 open / 0 closed</span>', self.html)
+
+    def test_no_held_lane_says_all_clear_and_no_lanes_says_missing(self):
+        clear = render_lanes({"lanes": [_lane("spark")], "scoreboard": {}, "anthropic_share": None})
+        self.assertIn("No lane is held", clear)
+        self.assertNotIn("Needs attention", clear)
+        self.assertIn("missing: no lane run totals were available", clear)
+        empty = render_lanes({"lanes": [], "scoreboard": {}})
+        self.assertIn("Lane status is missing", empty)
+        self.assertIn("Scoreboard is missing", empty)

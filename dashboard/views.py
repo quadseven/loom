@@ -429,45 +429,88 @@ def parse_lane_rows(body):
     return rows
 
 
+# Status words a reader sees, by the card's state class. The classes stay
+# busy/free/held (loom.css colors them); the words say what each means.
+LANE_STATES = (("held", "Held", "not taking work"),
+               ("busy", "Working", "on a ticket now"),
+               ("free", "Ready", "waiting for work"))
+LANE_STATE_WORD = {key: word.lower() for key, word, _ in LANE_STATES}
+TIER_ORDER = ("easy", "medium", "hard", "frontier", "unknown")
+
+
+def lane_state(lane):
+    """busy (on a ticket), free (available, no ticket) or held."""
+    if lane.get("ticket"):
+        return "busy"
+    return "free" if lane.get("available") else "held"
+
+
+def _lane_order(name):
+    """anthropic before anthropic-2 before anthropic-10: by family, then slot."""
+    match = re.fullmatch(r"(.*?)-(\d+)", str(name))
+    return (match.group(1), int(match.group(2))) if match else (str(name), 1)
+
+
+def _hold_text(lane):
+    reason = str(lane.get("reason") or "").strip()
+    return "held with no reason sent" if reason in ("", "no reason", "available") else reason
+
+
+def _plural(count, word):
+    return "%d %s%s" % (count, word, "" if count == 1 else "s")
+
+
 def _lane_card(lane):
     esc = html.escape
     ticket = lane.get("ticket")
-    state = "busy" if ticket else ("free" if lane["available"] else "held")
-    heartbeat = format_heartbeat(lane.get("heartbeat"))
+    state = lane_state(lane)
     if ticket:
-        line = '<a href="%s">%s %s</a> - %s' % (
+        doing = '<a href="%s">%s %s</a>' % (
             _ticket_href(ticket["repo"], ticket["number"]), esc(_short_ref(ticket["repo"], ticket["number"])),
-            esc(str(ticket.get("title") or "ticket")), esc(heartbeat))
-    elif lane.get("reason"):
-        line = "%s - %s" % (esc(lane["reason"]), esc(heartbeat))
+            esc(str(ticket.get("title") or "ticket")))
+    elif state == "held":
+        doing = esc(_hold_text(lane))
     else:
-        line = "waiting for work - %s" % esc(heartbeat)
+        doing = "waiting for work"
     quota = lane.get("quota")
     if quota is None:
-        quota_html = '<div class="quota-row"><span class="quota-label">quota missing</span></div>'
+        quota_html = '<span class="quota-label">quota not reported</span>'
     else:
         pct = max(0, min(100, int(quota)))
-        quota_html = ('<div class="quota-row"><div class="quota%s"><span style="width:%d%%"></span></div>'
-                      '<span class="quota-label">quota %d%% used</span></div>') % (" low" if pct >= 75 else "", pct, pct)
+        quota_html = ('<span class="quota-label">quota %d%% used</span>'
+                      '<span class="quota%s" aria-hidden="true"><span style="width:%d%%"></span></span>'
+                      ) % (pct, " low" if pct >= 75 else "", pct)
     return ('<article class="card lane-card lane-%s"><div class="lane-head"><i class="lane-dot"></i>'
             '<strong>%s</strong><span class="lane-state">%s</span></div>'
-            '<span class="lane-model">%s</span><p>%s</p>%s</article>') % (
-        state, esc(lane["lane"]), state, esc(lane.get("model") or "model missing"), line, quota_html)
+            '<p class="lane-doing">%s</p>'
+            '<div class="lane-facts"><span class="lane-model">%s</span>'
+            '<span class="lane-beat">%s</span><span class="lane-quota">%s</span></div></article>') % (
+        state, esc(lane["lane"]), LANE_STATE_WORD[state], doing,
+        esc(lane.get("model") or "model not reported"), esc(format_heartbeat(lane.get("heartbeat"))), quota_html)
+
+
+def _model_counts(counts):
+    return counts["merged"] + counts["open"] + counts["closed"]
 
 
 def _tier_card(tier, models):
     esc = html.escape
-    most = max((sum(c[k] for k in ("merged", "open", "closed")) for c in models.values()), default=0) or 1
+    most = max((_model_counts(c) for c in models.values()), default=0) or 1
     rows = []
-    for model, counts in sorted(models.items(), key=lambda item: -sum(item[1][k] for k in ("merged", "open", "closed"))):
-        total = counts["merged"] + counts["open"] + counts["closed"]
+    for model, counts in sorted(models.items(), key=lambda item: (-_model_counts(item[1]), item[0])):
+        total = _model_counts(counts)
         bars = "".join('<span class="bar-%s" style="width:%.1f%%"></span>' % (key, 100.0 * counts[key] / most)
                        for key in ("merged", "open", "closed"))
-        rows.append('<div class="model-row"><div><span class="model-name">%s</span> <span class="lane-model">%s</span>'
-                    '<span class="model-label">%d PRs, %d merged / %d open / %d closed</span></div>'
-                    '<div class="stack">%s</div></div>' % (esc(model), esc(counts["lane"]), total,
-                                                          counts["merged"], counts["open"], counts["closed"], bars))
-    return '<section class="card tier-card"><h3 class="label">%s</h3>%s</section>' % (esc(tier.title()), "".join(rows))
+        rows.append('<li class="model-row"><div class="model-line"><span class="model-name">%s</span>'
+                    '<span class="model-total">%s</span></div>'
+                    '<div class="model-line"><span class="lane-model">lane %s</span>'
+                    '<span class="model-label">%d merged / %d open / %d closed</span></div>'
+                    '<div class="stack" aria-hidden="true">%s</div></li>' % (
+                        esc(model), _plural(total, "PR"), esc(counts["lane"]),
+                        counts["merged"], counts["open"], counts["closed"], bars))
+    total = sum(_model_counts(c) for c in models.values())
+    return ('<section class="card tier-card"><div class="tier-head"><h3>%s</h3><span class="machine-fact">%s</span></div>'
+            '<ul class="model-list">%s</ul></section>') % (esc(tier.title()), _plural(total, "PR"), "".join(rows))
 
 
 def _dashboard_zone():
@@ -486,20 +529,6 @@ def _local_time(stamp):
         raise ValueError("timezone required")
     local = moment.astimezone(_dashboard_zone())
     return local.strftime("%Y-%m-%d %H:%M ") + (local.tzname() or "UTC")
-
-
-def _factory_tables():
-    tiers = ['<table class="factory-tiers"><thead><tr><th>Tier</th><th>Lanes</th></tr></thead><tbody>']
-    for name, lanes in factory.TIERS.items():
-        tiers.append('<tr class="factory-tier"><th>%s</th><td>%s</td></tr>' %
-                     (html.escape(name.title()), html.escape(", ".join(lanes))))
-    tiers.append("</tbody></table>")
-    ladder = ['<table class="model-ladder"><thead><tr><th>Lanes</th><th>Model</th></tr></thead><tbody>']
-    for lanes, model in factory.LADDER:
-        ladder.append("<tr><td>%s</td><td>%s</td></tr>" %
-                      (html.escape(", ".join(lanes)), html.escape(model)))
-    ladder.append("</tbody></table>")
-    return "".join(tiers + ladder)
 
 
 def render_lane_usage(rows):
@@ -531,26 +560,108 @@ def render_lane_usage(rows):
     return "".join(parts)
 
 
-def render_lanes(data):
-    parts = ['<section><h2 class="label">Factory tiers</h2>%s</section>' % _factory_tables(),
-             '<p class="page-lede">At most half of runs on Anthropic.</p>'
-             '<section><h2 class="label">Anthropic share of runs</h2>']
-    share = data.get("anthropic_share")
+def _lane_chip(name, states):
+    state = states.get(name)
+    word = LANE_STATE_WORD.get(state, "no status")
+    return '<li class="lane-chip lane-%s" title="%s"><i class="lane-dot"></i>%s<span class="visually-hidden"> (%s)</span></li>' % (
+        state or "unknown", word, html.escape(name), word)
+
+
+def _factory_tables(states=None):
+    """The routing tables from bus.factory, each lane marked with its state now."""
+    states = states or {}
+    chips = lambda lanes: '<ul class="lane-chips">%s</ul>' % "".join(_lane_chip(name, states) for name in lanes)
+    tiers = ['<table class="factory-tiers"><thead><tr><th>Difficulty</th><th>Lanes, best first</th></tr></thead><tbody>']
+    for name, lanes in factory.TIERS.items():
+        tiers.append('<tr class="factory-tier"><th>%s</th><td>%s</td></tr>' % (html.escape(name.title()), chips(lanes)))
+    tiers.append("</tbody></table>")
+    ladder = ['<table class="model-ladder"><thead><tr><th>Rung</th><th>Model</th><th>Lanes</th></tr></thead><tbody>']
+    for rung, (lanes, model) in enumerate(factory.LADDER, 1):
+        ladder.append("<tr><th>%d</th><td>%s</td><td>%s</td></tr>" % (rung, html.escape(model), chips(lanes)))
+    ladder.append("</tbody></table>")
+    return "".join(tiers + ladder)
+
+
+def _section(key, title, note, body, fact=""):
+    return ('<section class="section lanes-%s" aria-labelledby="lanes-%s-h"><div class="section-head">'
+            '<h2 class="label" id="lanes-%s-h">%s</h2>%s</div><p class="section-note">%s</p>%s</section>') % (
+        key, key, key, title, '<span class="machine-fact">%s</span>' % fact if fact else "", note, body)
+
+
+def _lane_summary(lanes, share):
+    """The top strip: how many lanes are held, working and ready, the
+    Anthropic share against its cap, and the held lanes grouped by reason."""
+    esc = html.escape
+    counts = {key: sum(1 for lane in lanes if lane_state(lane) == key) for key, _, _ in LANE_STATES}
+    tiles = ['<li class="summary-tile lane-%s"><span class="summary-num">%d</span>'
+             '<span class="summary-word"><i class="lane-dot"></i>%s</span><small>%s</small></li>' % (
+                 key, counts[key], word, sub) for key, word, sub in LANE_STATES]
     if share is None:
-        parts.append('<p class="empty-state">Share is missing: no lane run totals were available.</p>')
+        share_html = '<small>missing: no lane run totals were available</small>'
+        number = "-"
     else:
-        parts.append('<div class="share-track"><span style="width:%d%%"></span><i></i></div><p class="machine-fact">%d%% of lane runs / cap 50%%</p>' % (min(100, share), share))
-    parts.append('</section><section><h2 class="label">Lanes</h2><div class="lane-grid">')
-    if not data.get("lanes"):
-        parts.append('<p class="empty-state">Lane status is missing: no loom:lanes comment was found.</p>')
-    parts.extend(_lane_card(lane) for lane in data.get("lanes", []))
-    parts.append('</div></section><section><h2 class="label">Which model opened each lane PR</h2>'
-                 '<p class="legend"><span class="bar-merged"></span> merged <span class="bar-open"></span> open '
-                 '<span class="bar-closed"></span> closed</p><div class="tier-grid">')
-    if not data.get("scoreboard"):
-        parts.append('<p class="empty-state">Scoreboard is missing: no lane pull requests matched the runner footer.</p>')
-    parts.extend(_tier_card(tier, models) for tier, models in data.get("scoreboard", {}).items())
-    parts.append("</div></section>")
+        number = "%d%%" % share
+        share_html = ('<div class="share-track" aria-hidden="true">'
+                      '<span style="width:%d%%"></span><i></i></div><small>of lane runs; cap 50%%</small>') % min(100, share)
+    tiles.append('<li class="summary-tile summary-share%s"><span class="summary-num">%s</span>'
+                 '<span class="summary-word">Anthropic share</span>%s</li>' % (
+                     " over" if share is not None and share > 50 else "", number, share_html))
+    held = {}
+    for lane in sorted((l for l in lanes if lane_state(l) == "held"), key=lambda l: _lane_order(l["lane"])):
+        held.setdefault(_hold_text(lane), []).append(lane["lane"])
+    if not lanes:
+        attention = ""  # Lanes now says the status comment is missing.
+    elif not held:
+        attention = '<p class="all-clear">No lane is held: every lane is working or ready for work.</p>'
+    else:
+        items = "".join('<li><span class="attention-reason">%s</span><span class="attention-lanes">%s: %s</span></li>' % (
+            esc(reason), _plural(len(names), "lane"), esc(", ".join(names)))
+            for reason, names in sorted(held.items(), key=lambda item: (-len(item[1]), item[0])))
+        attention = ('<div class="attention"><h3>Needs attention: %s held</h3><ul class="attention-list">%s</ul></div>'
+                     % (_plural(sum(len(v) for v in held.values()), "lane"), items))
+    return ('<section class="section lanes-summary" aria-label="Lane summary"><ul class="summary-strip">%s</ul>%s</section>'
+            % ("".join(tiles), attention))
+
+
+def render_lanes(data):
+    lanes = list(data.get("lanes") or [])
+    states = {lane["lane"]: lane_state(lane) for lane in lanes}
+    parts = ['<p class="page-lede">Every lane the factory runs tickets on: what each is doing now, '
+             'which lanes take which tickets, and which models opened their pull requests.</p>',
+             _lane_summary(lanes, data.get("anthropic_share"))]
+
+    groups = []
+    for key, word, sub in LANE_STATES:
+        members = sorted((lane for lane in lanes if states[lane["lane"]] == key), key=lambda l: _lane_order(l["lane"]))
+        if members:
+            groups.append('<div class="lane-group lane-group-%s"><h3><i class="lane-dot lane-%s"></i>%s '
+                          '<span class="machine-fact">%d, %s</span></h3><div class="lane-grid">%s</div></div>' % (
+                              key, key, word, len(members), sub, "".join(_lane_card(lane) for lane in members)))
+    if not lanes:
+        groups.append('<p class="empty-state">Lane status is missing: no loom:lanes comment was found.</p>')
+    parts.append(_section("now", "Lanes now",
+                          "Each lane's ticket or hold reason, its model (with its newest pull request), "
+                          "last heartbeat (UTC) and quota. Held lanes come first.",
+                          "".join(groups), _plural(len(lanes), "lane")))
+
+    parts.append(_section("routing", "How tickets are routed",
+                          "Which lanes may take a ticket of each difficulty, best first, and the model ladder "
+                          "a stuck ticket climbs. The dot is each lane's state now. At most half of runs go to Anthropic.",
+                          '<div class="routing-tables">%s</div>' % _factory_tables(states)))
+
+    board = data.get("scoreboard") or {}
+    order = sorted(board, key=lambda tier: (TIER_ORDER.index(tier) if tier in TIER_ORDER else len(TIER_ORDER), tier))
+    total = sum(_model_counts(c) for models in board.values() for c in models.values())
+    if board:
+        body = ('<p class="legend"><span class="bar-merged"></span> merged <span class="bar-open"></span> open '
+                '<span class="bar-closed"></span> closed</p><div class="tier-grid">%s</div>'
+                % "".join(_tier_card(tier, board[tier]) for tier in order))
+    else:
+        body = '<p class="empty-state">Scoreboard is missing: no lane pull requests matched the runner footer.</p>'
+    parts.append(_section("models", "Pull requests by model",
+                          "Lane pull requests counted by the model their footer names, by ticket difficulty, "
+                          "most first. Bars share one scale within a difficulty.",
+                          body, _plural(total, "PR") if board else ""))
     return "".join(parts)
 
 
