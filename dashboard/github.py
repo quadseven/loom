@@ -83,6 +83,16 @@ def _body_field(body: str, key: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _user_login(value: Any) -> Optional[str]:
+    login = value.get("login") if isinstance(value, dict) else None
+    return str(login).lower() if login else None
+
+
+def _logins(values: Any) -> List[str]:
+    """The lower-case logins of a list of GitHub user objects."""
+    return [login for login in (_user_login(v) for v in values or []) if login]
+
+
 def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     names = _label_names(issue)
     body = str(issue.get("body") or "")
@@ -119,6 +129,10 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         "body": body,
         "labels": names,
         "html_url": issue.get("html_url"),
+        # Who owns it (dashboard/operators.py): the assignees and the author,
+        # read with the claim:<login> labels by bus.tickets.owned_elsewhere.
+        "assignees": _logins(issue.get("assignees")),
+        "author": _user_login(issue.get("user")),
     }
 
 
@@ -148,6 +162,11 @@ def pull_request_record(pr: Dict[str, Any]) -> Dict[str, Any]:
     out = {key: pr[key] for key in PULL_REQUEST_FIELDS if key in pr}
     if isinstance(pr.get("user"), dict):
         out["user"] = _user(pr["user"])
+    # Ownership (dashboard/operators.py): assignees and claim:<login> labels.
+    if "assignees" in pr:
+        out["assignees"] = _logins(pr.get("assignees"))
+    if "labels" in pr:
+        out["labels"] = _label_names(pr)
     head, base = pr.get("head"), pr.get("base")
     if isinstance(head, dict):
         out["head"] = {"ref": head.get("ref"), "sha": head.get("sha")}

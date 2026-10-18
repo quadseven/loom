@@ -689,3 +689,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .ul { grid-template-columns: 7px minmax(0, 1fr); }
   .ul-why { grid-column: 2; }
 }
+/* Another operator's claim (dashboard/operators.py). */
+.owner-chip { display: inline-flex; flex: none; align-items: center; margin-left: 8px; padding: 1px 8px; border: 1px solid var(--info); border-radius: 999px; color: var(--info-on-bg); font: 11px var(--font-mono); white-space: nowrap; }
+.owner-chip.neutral { border-color: var(--line); color: var(--muted); }
+.tickets-ticket a .owner-chip { margin-left: 0; }
