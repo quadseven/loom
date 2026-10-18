@@ -2499,23 +2499,24 @@ class RetryTest(Base):
     def bodies(self, number=12):
         return [c["body"] for c in self.fake.comments[number]]
 
-    def test_a_transient_failure_moves_to_another_slot_on_a_fresh_branch(self):
+    def test_a_transient_failure_moves_to_another_provider_on_a_fresh_branch(self):
+        # codex-2 shares codex's provider (and so its model): never the retry.
         self.heartbeat("codex-2")
         self.heartbeat("anthropic")
         self.failed()
         self.run_pass()
         retry = [b for b in self.bodies() if b.startswith("Automatic retry")]
         self.assertEqual(retry, ["Automatic retry 1 of 2 (transient): moved from lane codex to "
-                                 "lane codex-2. Lane codex failed: [transient] agent exited 1"])
-        # The same pass claims it for codex-2 as a new attempt.
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex-2", "loom:running",
+                                 "lane anthropic. Lane codex failed: [transient] agent exited 1"])
+        # The same pass claims it for anthropic as a new attempt.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:anthropic", "loom:running",
                                                "claim:alice-example"])
         name = "example-owner.example-repo-12-r2"
-        self.assertEqual(self.listing("codex-2"), [name + ".md"])
-        with open(self.inbox("codex-2", name + ".md")) as fh:
+        self.assertEqual(self.listing("anthropic"), [name + ".md"])
+        with open(self.inbox("anthropic", name + ".md")) as fh:
             text = fh.read()
         self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
-        self.assertIn("Lane: codex-2\n", text)
+        self.assertIn("Lane: anthropic\n", text)
         self.assertNotIn("loom:failed", self.fake.names(12))
 
     def test_runner_model_refusal_is_reported_as_transient(self):
@@ -2528,11 +2529,27 @@ class RetryTest(Base):
         self.assertIn("Automatic retry 1 of 2 (transient)", self.bodies()[-2])
 
     def test_a_retry_is_reported_once(self):
-        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
         self.failed()
         self.run_pass()
         self.run_pass()
         self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic retry")]), 1)
+
+    def test_a_spark_that_timed_out_is_not_retried_on_another_spark(self):
+        for lane in ("spark", "spark-2", "spark-4", "codex"):
+            self.heartbeat(lane)
+        self.failed(lane="spark-3", reason="[transient] agent exited 124")
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertFalse([n for n in names if n.startswith("lane:spark")], names)
+        self.assertIn("lane:codex", names)
+
+    def test_a_failure_on_one_opencode_go_slot_is_not_retried_on_another(self):
+        for lane in ("opencode-go", "opencode-go-3", "anthropic"):
+            self.heartbeat(lane)
+        self.failed(lane="opencode-go-2", reason="[transient] agent exited 1")
+        self.run_pass()
+        self.assertIn("moved from lane opencode-go-2 to lane anthropic.", self.bodies()[-2])
 
     def test_a_limit_failure_skips_the_providers_other_slots(self):
         for lane in ("anthropic", "anthropic-3", "codex"):
@@ -2633,15 +2650,15 @@ class RetryTest(Base):
                       "anthropic.", self.bodies()[-2])
 
     def test_a_failure_the_brain_saw_starts_a_new_count(self):
-        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
         self.failed()
         self.fake.comments[12][:0] = [
             {"body": "Automatic retry 1 of 2 (transient): moved from lane a to lane b. x"},
-            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane codex-2. x"},
-            {"body": "Lane codex-2 failed: [work] agent made no commit on loom/12-x"},
+            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane anthropic. x"},
+            {"body": "Lane anthropic failed: [work] agent made no commit on loom/12-x"},
         ]
         self.run_pass()
-        self.assertIn("lane:codex-2", self.fake.names(12))
+        self.assertIn("lane:anthropic", self.fake.names(12))
 
     def test_a_retry_whose_relabel_failed_is_finished_without_a_second_comment(self):
         self.heartbeat("codex-2")
