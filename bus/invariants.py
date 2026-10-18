@@ -48,7 +48,12 @@ HELD_MAX = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
+# One refused decision repeating this long with no success of its kind is an
+# invariant (loom#593). The event log is read EVENT_WINDOW back, so a run that
+# began just over an hour ago is seen whole between irregular station passes.
 REPEATED_FAILURE = 3600
+EVENT_WINDOW = 2 * REPEATED_FAILURE
+FAILURE_KINDS = ("rewrite_failed", "rewrite_skipped", "model_wait", "not_claiming")
 # Decision 0003: an epic holds at most EPIC_TICKETS tickets.
 EPIC_TICKETS = 15
 PLAN_FAILED_AGE = 30 * 60
@@ -579,30 +584,41 @@ def gate_hold(f: Facts) -> List[Breach]:
     return out
 
 
+def _decision(kind: str) -> str:
+    """The decision an event kind reports on: rewrite_failed, rewrite_skipped
+    and rewrite_succeeded all report on rewrite."""
+    for suffix in ("_succeeded", "_failed", "_skipped"):
+        if kind.endswith(suffix):
+            return kind[:-len(suffix)]
+    return kind
+
+
 def repeated_failure(f: Facts) -> List[Breach]:
-    """A refused decision repeated for an hour without a matching success."""
+    """A refused decision that began at least an hour ago, still repeats in
+    the last hour, and saw no success of its decision since it began. Any
+    success suppresses every failure kind and reason of its decision, since a
+    success logs its action, not the failures' reason."""
     if f.events is None:
         return []
-    failures: Dict[Tuple[str, str], List[Event]] = {}
-    successes = set()
-    for event in f.events:
-        if f.now - REPEATED_FAILURE <= event.at <= f.now and event.reason:
-            if event.kind.endswith("_succeeded"):
-                successes.add((event.kind[:-10], event.reason))
-            elif event.kind in ("rewrite_failed", "rewrite_skipped", "model_wait", "not_claiming"):
-                failures.setdefault((event.kind, event.reason), []).append(event)
+    recent = [e for e in f.events if f.now - EVENT_WINDOW <= e.at <= f.now and e.reason]
+    succeeded: Dict[str, float] = {}
+    for event in recent:
+        if event.kind.endswith("_succeeded"):
+            decision = _decision(event.kind)
+            succeeded[decision] = max(event.at, succeeded.get(decision, event.at))
+    failures: Dict[Tuple[str, str], List[float]] = {}
+    for event in recent:
+        if event.kind in FAILURE_KINDS and event.at > succeeded.get(_decision(event.kind), -1.0):
+            failures.setdefault((event.kind, event.reason), []).append(event.at)
     out = []
-    for (kind, reason), rows in sorted(failures.items()):
-        if (kind.removesuffix("_failed").removesuffix("_skipped"), reason) in successes:
+    for (kind, reason), stamps in sorted(failures.items()):
+        first, last = min(stamps), max(stamps)
+        if f.now - first < REPEATED_FAILURE or f.now - last >= REPEATED_FAILURE:
             continue
-        first = min(row.at for row in rows)
-        if f.now - first < REPEATED_FAILURE:
-            continue
-        subject = kind + "|" + reason
-        out.append(Breach("repeated-failure", subject,
+        out.append(Breach("repeated-failure", kind + "|" + reason,
                           "Repeated %s for one hour: %s" % (kind.replace("_", " "), public(reason)),
-                          ("%d matching events in the last hour" % len(rows),
-                           "Most recent: %s" % utc(max(row.at for row in rows))), f.now))
+                          ("%d matching events since %s" % (len(stamps), utc(first)),
+                           "Most recent: %s" % utc(last)), f.now))
     return out
 
 

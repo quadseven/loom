@@ -1207,11 +1207,11 @@ class Station:
                                 at = float(raw_at)
                                 kind, reason = row.get("kind"), row.get("reason")
                                 if (not math.isfinite(at) or kind not in
-                                        ("rewrite_failed", "rewrite_skipped", "rewrite_succeeded",
-                                         "model_wait", "not_claiming") or not isinstance(reason, str)
+                                        invariants.FAILURE_KINDS + ("rewrite_succeeded",)
+                                        or not isinstance(reason, str)
                                         or not re.fullmatch(r"[0-9a-f]{64}", reason)):
                                     continue
-                                if self.now - 3600 <= at <= self.now:
+                                if self.now - invariants.EVENT_WINDOW <= at <= self.now:
                                     rows.append(invariants.Event(at, kind, reason))
                             except (ValueError, TypeError):
                                 continue
