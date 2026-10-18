@@ -196,8 +196,12 @@ HANDOFF_EVERY = 600
 # (LOOM_SHIP_WORKFLOWS, OWNER/NAME=WORKFLOW_FILE words): a repo with its own
 # deploy workflow ships a ticket once a successful run of that workflow ran
 # on its pull request's merge commit, or the newest successful run on the
-# default branch carries it. At most SHIP_PER_PASS move per rule a pass.
-SHIP_RUNS_URL = "/repos/%s/actions/workflows/%s/runs?status=success&per_page=30"
+# default branch carries it. Only push runs on the default branch of the repo
+# itself count: a pull request run, or one from a fork's head repository, can
+# sit at the same commit without deploying anything. At most SHIP_PER_PASS
+# move per rule a pass.
+SHIP_RUNS_URL = ("/repos/%s/actions/workflows/%s/runs?status=success&event=push"
+                 "&branch=%s&per_page=30")
 # Shipping through a pin pull request (LOOM_PIN_SHIP_REPOS): a merged pull
 # request in a deployment repo that adds a "# Published from <repo> ..., merge
 # <sha>" comment line deploys that revision of the source repo, so it ships
@@ -3051,19 +3055,17 @@ class Station:
         merged = self._merged_tickets(repo)
         if not merged:
             return
-        data = self.gh.rest("GET", SHIP_RUNS_URL % (repo, workflow)).data
+        branch = self._default_branch(repo)
+        if not branch:
+            return
+        data = self.gh.rest("GET", SHIP_RUNS_URL % (repo, workflow, quote(branch, safe=""))).data
         runs = [r for r in ((data or {}).get("workflow_runs") or [] if isinstance(data, dict)
                             else [])
-                if isinstance(r, dict) and r.get("status") == "completed"
-                and r.get("conclusion") == "success"
-                and COMMIT_RE.fullmatch(str(r.get("head_sha") or ""))]
+                if isinstance(r, dict) and self._deploy_run(repo, branch, r)]
         if not runs:
             return
         by_sha = {str(r["head_sha"]): r for r in runs}
-        branch = self._default_branch(repo)
-        newest = next((r for r in sorted(runs, key=lambda r: str(r.get("created_at") or ""),
-                                         reverse=True)
-                       if branch and r.get("head_branch") == branch), None)
+        newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
         latest = self._merged_pulls(repo, merged)
         shipped = 0
         for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
@@ -3082,6 +3084,16 @@ class Station:
                                   workflow, repo, str(run["head_sha"])[:12], run.get("id")),
                               "workflow %s" % workflow):
                 shipped += 1
+
+    @staticmethod
+    def _deploy_run(repo: str, branch: str, run: Dict[str, Any]) -> bool:
+        """A successful push run on the repo's own default branch: the
+        filters asked of GitHub, checked again on what came back."""
+        head = run.get("head_repository") if isinstance(run.get("head_repository"), dict) else {}
+        return (run.get("status") == "completed" and run.get("conclusion") == "success"
+                and run.get("event") == "push" and run.get("head_branch") == branch
+                and str(head.get("full_name") or "").lower() == repo.lower()
+                and bool(COMMIT_RE.fullmatch(str(run.get("head_sha") or ""))))
 
     # -- shipping through a pin pull request ------------------------------
     def ship_pins(self) -> None:
