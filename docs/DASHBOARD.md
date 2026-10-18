@@ -1,7 +1,16 @@
 # Dashboard settings
 
 Run the stdlib dashboard with `python3 -m dashboard`. It serves on port 8080
-by default. Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
+by default, on every interface. Set `LOOM_DASHBOARD_HOST` to the one address
+it should listen on (on a laptop, its private-network address, so the
+dashboard is not served on whatever network the laptop joins). On a lane
+machine, `LOOM_DASHBOARD=1 lanes/mac/install.sh` installs it as the launchd
+agent `com.loom.dashboard` (restarted if it exits, logging to
+`$LOOM_HOME/logs/dashboard.log`) with every `LOOM_*` setting of the installing
+environment; `LOOM_DASHBOARD=0` removes it. With no `LOOM_DB_PASSWORD` the
+agent sets `LOOM_TRANSCRIPTS_MEMORY=1`, so it starts with transcripts kept in
+memory, and its log says so.
+Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
 space-separated list of `OWNER/NAME` repositories. Set
 `LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
 the dashboard also checks the standard GitHub CLI authentication. To read

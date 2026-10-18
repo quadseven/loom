@@ -119,6 +119,25 @@ if [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; then
   [ $((8#$KEY_MODE & 8#077)) -eq 0 ] ||
     { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE has mode $KEY_MODE; it must be 600 (chmod 600 $LOOM_GITHUB_APP_KEY_FILE)" >&2; exit 1; }
 fi
+DASHBOARD_PORT="${LOOM_DASHBOARD_PORT:-8080}"
+DASHBOARD_HOST="${LOOM_DASHBOARD_HOST:-}"
+if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
+  [[ "$DASHBOARD_PORT" =~ ^[0-9]+$ ]] ||
+    { echo "LOOM_DASHBOARD_PORT must be a port number" >&2; exit 1; }
+  # Empty (every interface) or one IPv4 address, each part 0-255 with no
+  # leading zero (Python's ipaddress, which the dashboard checks with, refuses one).
+  if [ -n "$DASHBOARD_HOST" ]; then
+    ok=0
+    if [[ "$DASHBOARD_HOST" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+      ok=1
+      for part in "${BASH_REMATCH[@]:1}"; do
+        case "$part" in 0?*) ok=0 ;; *) [ "$part" -le 255 ] || ok=0 ;; esac
+      done
+    fi
+    [ "$ok" = 1 ] ||
+      { echo "LOOM_DASHBOARD_HOST must be empty or one IPv4 address" >&2; exit 1; }
+  fi
+fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -136,10 +155,13 @@ LANES=("$@")
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")"
 
-# Every LOOM_* setting in the environment, as plist entries.
+# Every LOOM_* setting in the environment, as plist entries, less the names
+# given as arguments (the ones a plist writes itself: a key twice is ambiguous).
 loom_env() {
+  local skip=" $* "
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
     case "$k" in LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS) continue ;; LOOM_*) ;; *) continue ;; esac
+    case "$skip" in *" $k "*) continue ;; esac
     v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
   done
@@ -410,3 +432,66 @@ EOF
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "installed $LABEL -> http://localhost:$VIEWER_PORT/"
 fi
+
+# The dashboard (docs/DASHBOARD.md): python3 -m dashboard from this checkout,
+# a long-running server restarted if it exits, like the viewer.
+# LOOM_DASHBOARD=1 installs it, LOOM_DASHBOARD=0 removes an installed one, and
+# unset leaves it as it is. It gets every LOOM_* setting of the installing
+# environment. LOOM_DASHBOARD_HOST is the one address it listens on (empty:
+# every interface; give the private-network address), LOOM_DASHBOARD_PORT its
+# port (default 8080). With no LOOM_DB_PASSWORD and no LOOM_TRANSCRIPTS_MEMORY
+# it keeps transcripts in memory (LOOM_TRANSCRIPTS_MEMORY=1) instead of
+# failing on the missing database, and its log says so.
+LABEL="com.loom.dashboard"
+PLIST="$AGENTS/$LABEL.plist"
+case "${LOOM_DASHBOARD:-}" in
+0)
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  wait_job_gone "gui/$(id -u)/$LABEL"
+  rm -f "$PLIST"
+  echo "removed $LABEL (LOOM_DASHBOARD=0)"
+  ;;
+1)
+  DASHBOARD_MEMORY="${LOOM_TRANSCRIPTS_MEMORY:-}"
+  if [ -z "$DASHBOARD_MEMORY" ] && [ -z "${LOOM_DB_PASSWORD:-}" ]; then
+    DASHBOARD_MEMORY=1
+    echo "$LABEL: no LOOM_DB_PASSWORD, so transcripts are kept in memory (LOOM_TRANSCRIPTS_MEMORY=1)"
+  fi
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>-m</string>
+    <string>dashboard</string>
+  </array>
+  <key>WorkingDirectory</key><string>$X_REPO</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>$X_LOOM/logs/dashboard.log</string>
+  <key>StandardErrorPath</key><string>$X_LOOM/logs/dashboard.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$X_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$X_HOME</string>
+    <key>LOOM_HOME</key><string>$X_LOOM</string>
+    <key>LOOM_DASHBOARD_HOST</key><string>$(xml "$DASHBOARD_HOST")</string>
+    <key>LOOM_DASHBOARD_PORT</key><string>$(xml "$DASHBOARD_PORT")</string>
+    <key>LOOM_TRANSCRIPTS_MEMORY</key><string>$(xml "$DASHBOARD_MEMORY")</string>
+$(loom_env LOOM_DASHBOARD LOOM_DASHBOARD_HOST LOOM_DASHBOARD_PORT LOOM_TRANSCRIPTS_MEMORY)
+  </dict>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  wait_job_gone "gui/$(id -u)/$LABEL"
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "installed $LABEL -> http://${DASHBOARD_HOST:-localhost}:$DASHBOARD_PORT/ (listening on ${DASHBOARD_HOST:-every interface})"
+  ;;
+esac
