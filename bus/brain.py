@@ -2197,7 +2197,8 @@ def _moved_labels(have: List[str], state: str, lane: Optional[str]) -> List[str]
     # (tickets.ticket_state), and the Priorities list showed shipped work as
     # lane work (2026-10-15).
     states = ["loom:" + item for item in STATES + tickets.TICKET_STATES]
-    kept = [x for x in have if x not in states
+    # A move ends whatever the ticket waited for, so its wait:* label goes.
+    kept = [x for x in have if x not in states and not x.startswith("wait:")
             and not (lane is not None and x.startswith("lane:"))]
     kept.append("loom:" + state)
     if lane:

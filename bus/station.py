@@ -121,6 +121,8 @@ USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
+# Why a ticket waits (bus/labels.py): one wait:* label at a time.
+WAIT = "wait:"
 HUMAN_HEAD = "Waiting on you"
 HUMAN_SHOWN = 5
 # A report first line whose only count is work in flight: the digest counts
@@ -1498,7 +1500,7 @@ class Station:
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
         # assignee is emailed for every comment on the ticket (2026-10-18).
-        labels = [n for n in _label_names(issue) if n != BRIEFED]
+        labels = [n for n in _label_names(issue) if n != BRIEFED and not n.startswith(WAIT)]
         if RUNNING not in labels:
             labels.append(RUNNING)
         mark = self._claim_label(repo)
@@ -2050,6 +2052,7 @@ class Station:
                     gated[lane].append((repo, issue))
                 else:
                     self._record_gate_hold(repo, issue, limit, counts)
+                    self._set_wait(repo, issue, "gate")
                     _say("not claiming %s#%s for lane %s: %s"
                          % (repo, issue.get("number"), lane, reason))
                     self._event("not_claiming", reason,
@@ -2543,6 +2546,7 @@ class Station:
         if released and not waiting:
             self._release_hold(repo, issue, released)
         if waiting:
+            self._set_wait(repo, issue, "after")
             _say("%s#%s waits for %s" % (repo, issue["number"], ", ".join(
                 "%s (%s)" % (a.short, a.why) for a in waiting)))
             return False
@@ -2578,6 +2582,7 @@ class Station:
             return False
         _say("%s#%s waits: model %s is limited on lane %s until %s"
              % (repo, issue["number"], model, lane, self._utc(until)))
+        self._set_wait(repo, issue, "model-limit")
         return True
 
     def _route_model_claim(self, repo: str, issue: Dict[str, Any], lane: str,
@@ -2588,10 +2593,12 @@ class Station:
         number = int(issue["number"])
         names = [name for name in _label_names(issue) if not name.startswith("lane:")]
         if target is None:
-            names = [name for name in names if name != BRIEFED] + ["loom:queued"]
+            names = [name for name in names if name != BRIEFED and not name.startswith(WAIT)] \
+                + ["loom:queued", WAIT + "lane"]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": names})
-            self._comment(repo, number, "Model %s waits for a free compatible lane." % model)
+            # A log line, not a comment: each comment emails the operator
+            # (2026-10-18), and the ticket's labels already say it waits.
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
             self._event("model_wait", "no free lane takes model %s" % model,
                         "%s#%d" % (repo, number), lane, model)
@@ -2734,7 +2741,7 @@ class Station:
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept})
             ticket["labels"] = [{"name": name} for name in kept]
-            self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
+            _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
         # A ticket still at queued or briefed whose pull request merged:
         # a brain fix round sent it back to briefed and the pull request
         # merged before a lane took the fix, or the pull request opened and
@@ -2847,7 +2854,7 @@ class Station:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         ticket["labels"] = [{"name": n} for n in kept]
         found[number] = ticket
-        self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
+        _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
@@ -3813,6 +3820,7 @@ class Station:
             match = HELD_FOR_RE.search(bare)
             self._note_held(repo, number,
                             "%s#%s" % (match.group(1), match.group(2)) if match else None)
+            self._set_wait(repo, self._issue(repo, number), "incident")
             self._comment(repo, number,
                           "Lane %s held: %s. The ticket keeps its rung and returns to the "
                           "queue when the factory incident closes." % (lane, bare))
@@ -3988,9 +3996,10 @@ class Station:
         ticket goes back to briefed, where the factory moves it to the next
         lane; a fix brief's goes back to loom:pr, where the factory sends its
         pull request back again."""
-        self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
-        self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
-                      "the ticket goes to the next lane." % (lane, reason))
+        self._relabel(repo, number, "loom:pr" if fix else BRIEFED,
+                      wait="" if fix else "model-limit")
+        # No comment: a limit is not news, and one comment a bounce emailed
+        # the operator dozens of times an hour (2026-10-18).
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
 
     def _unauthenticated(self, repo: str, number: int, fix: bool, lane: str,
@@ -4001,8 +4010,7 @@ class Station:
         ticket goes back to briefed, where the factory moves it to a lane whose
         key works; a fix brief's goes back to loom:pr."""
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
-        self._comment(repo, number, "Lane %s could not authenticate (%s). This is not a "
-                      "failure: the ticket goes to a lane with a working key." % (lane, reason))
+        # No comment: the runner already opened the operator one ask for the key.
         _say("reported %s#%d unauthenticated on lane %s: %s" % (repo, number, lane, reason))
 
     def _branch_moved(self, repo: str, number: int, pr: int, lane: str, reason: str) -> None:
@@ -4011,9 +4019,7 @@ class Station:
         of the ladder is spent: the ticket returns to loom:pr, where the
         factory judges the new head and sends it back if it still needs a fix."""
         self._relabel(repo, number, "loom:pr")
-        self._comment(repo, number, "Lane %s did not push its fix to #%d: the branch moved "
-                      "during the run (%s). This is not a failure: the new head goes back "
-                      "to review." % (lane, pr, reason))
+        # No comment: nothing failed, and the new head's review says the rest.
         _say("reported %s#%d: branch moved on lane %s: %s" % (repo, number, lane, reason))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
@@ -4144,15 +4150,31 @@ class Station:
             pass
         return scrub(reason) or "no reason was recorded"
 
-    def _relabel(self, repo: str, number: int, new: str) -> None:
+    def _relabel(self, repo: str, number: int, new: str, wait: str = "") -> None:
+        """Move a running ticket to `new`, with wait:<wait> as its only wait
+        label when given, in one labels write."""
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = [n for n in names if n != RUNNING]
+        labels = [n for n in names if n != RUNNING and not n.startswith(WAIT)]
         if new not in labels:
             labels.append(new)
+        if wait:
+            labels.append(WAIT + wait)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
+
+    def _set_wait(self, repo: str, issue: Dict[str, Any], reason: str) -> None:
+        """Make wait:<reason> the ticket's only wait label, from the labels
+        already read; no write when it already is (loom labels, not comments:
+        a comment emails the operator, a label does not)."""
+        names = _label_names(issue)
+        want = [n for n in names if not n.startswith(WAIT)] + [WAIT + reason]
+        if set(want) == set(names):
+            return
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                     {"labels": want})
+        issue["labels"] = [{"name": n} for n in want]
 
     def _comment(self, repo: str, number: int, body: str) -> None:
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),

@@ -71,12 +71,21 @@ LABELS: Dict[str, Dict[str, str]] = {
     "class:logic": {"color": "0075ca", "description": "Changes behavior-carrying code"},
     "class:tests": {"color": "0e8a16", "description": "Changes test files only"},
     "class:docs": {"color": "ededed", "description": "Changes docs only"},
+    # Why a ticket waits, set where the station or factory decides it waits
+    # and cleared at the claim: a label change sends no email, a comment does.
+    "wait:gate": {"color": "fef2c0", "description": "Waiting: the unproven-work gate holds its goal"},
+    "wait:model-limit": {"color": "fef2c0", "description": "Waiting: its model or lane is at a limit until a reset"},
+    "wait:lane": {"color": "fef2c0", "description": "Waiting: no free lane takes its model"},
+    "wait:incident": {"color": "fef2c0", "description": "Waiting: held for an open factory incident"},
+    "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
+    "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",
                                "description": "Work for the %s lane" % _lane}
 
-MANAGED_PREFIXES = ("loom:", "lane:", "class:")
+MANAGED_PREFIXES = ("loom:", "lane:", "class:", "wait:")
+WAIT_PREFIX = "wait:"
 
 
 def ensure_labels(gh: GitHub, repo: str) -> List[str]:
