@@ -48,6 +48,12 @@ HELD_MAX = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
+# One refused decision repeating this long with no success of its kind is an
+# invariant (loom#593). The event log is read EVENT_WINDOW back, so a run that
+# began just over an hour ago is seen whole between irregular station passes.
+REPEATED_FAILURE = 3600
+EVENT_WINDOW = 2 * REPEATED_FAILURE
+FAILURE_KINDS = ("rewrite_failed", "rewrite_skipped", "model_wait", "not_claiming")
 # Decision 0003: an epic holds at most EPIC_TICKETS tickets.
 EPIC_TICKETS = 15
 PLAN_FAILED_AGE = 30 * 60
@@ -175,6 +181,15 @@ class GateHold(NamedTuple):
     idle: int
 
 
+class Event(NamedTuple):
+    at: float
+    kind: str
+    reason: str
+    item: str = ""
+    lane: str = ""
+    model: str = ""
+
+
 @dataclass
 class Facts:
     now: float
@@ -197,6 +212,7 @@ class Facts:
     gate_held: Optional[Dict[str, GateHold]] = None
     # remote lane -> its newest heartbeat, None when it never posted one.
     beats: Optional[Dict[str, Optional[float]]] = None
+    events: Optional[List[Event]] = None
     # untrusted labeler login -> briefed tickets refused for it in the last
     # LABELER_WINDOW seconds.
     label_refusals: Optional[Dict[str, int]] = None
@@ -568,6 +584,44 @@ def gate_hold(f: Facts) -> List[Breach]:
     return out
 
 
+def _decision(kind: str) -> str:
+    """The decision an event kind reports on: rewrite_failed, rewrite_skipped
+    and rewrite_succeeded all report on rewrite."""
+    for suffix in ("_succeeded", "_failed", "_skipped"):
+        if kind.endswith(suffix):
+            return kind[:-len(suffix)]
+    return kind
+
+
+def repeated_failure(f: Facts) -> List[Breach]:
+    """A refused decision that began at least an hour ago, still repeats in
+    the last hour, and saw no success of its decision since it began. Any
+    success suppresses every failure kind and reason of its decision, since a
+    success logs its action, not the failures' reason."""
+    if f.events is None:
+        return []
+    recent = [e for e in f.events if f.now - EVENT_WINDOW <= e.at <= f.now and e.reason]
+    succeeded: Dict[str, float] = {}
+    for event in recent:
+        if event.kind.endswith("_succeeded"):
+            decision = _decision(event.kind)
+            succeeded[decision] = max(event.at, succeeded.get(decision, event.at))
+    failures: Dict[Tuple[str, str], List[float]] = {}
+    for event in recent:
+        if event.kind in FAILURE_KINDS and event.at > succeeded.get(_decision(event.kind), -1.0):
+            failures.setdefault((event.kind, event.reason), []).append(event.at)
+    out = []
+    for (kind, reason), stamps in sorted(failures.items()):
+        first, last = min(stamps), max(stamps)
+        if f.now - first < REPEATED_FAILURE or f.now - last >= REPEATED_FAILURE:
+            continue
+        out.append(Breach("repeated-failure", kind + "|" + reason,
+                          "Repeated %s for one hour: %s" % (kind.replace("_", " "), public(reason)),
+                          ("%d matching events since %s" % (len(stamps), utc(first)),
+                           "Most recent: %s" % utc(last)), f.now))
+    return out
+
+
 def untrusted_labeler(f: Facts) -> List[Breach]:
     """A login whose briefed-ticket labels the station refused more than
     LABELER_REFUSALS_MAX times in an hour: a trust gap (a credential change,
@@ -594,7 +648,8 @@ def untrusted_labeler(f: Facts) -> List[Breach]:
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
-    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold, untrusted_labeler)
+    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold, repeated_failure,
+    untrusted_labeler)
 
 
 def check(facts: Facts, say: Say,

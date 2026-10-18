@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
-from bus.invariants import Check, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
+from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"
@@ -198,6 +199,63 @@ class StationBase(unittest.TestCase):
 
 
 class AcceptanceTest(StationBase):
+    def test_event_log_hashes_inputs_and_ignores_untrusted_rows(self):
+        st = station.Station(self.gh, self.settings, now=T0)
+        private_value = "private-host.example.invalid"
+        st._event("rewrite_skipped", private_value, private_value, private_value, private_value)
+        with open(st.event_log, encoding="utf-8") as stream:
+            raw = stream.read()
+        self.assertNotIn(private_value, raw)
+        with open(st.event_log, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"at": T0, "kind": "not_claiming", "reason": private_value}) + "\n")
+            stream.write(json.dumps({"at": "not-a-time", "kind": "not_claiming",
+                                     "reason": "0" * 64}) + "\n")
+        events = st._read_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].reason, hashlib.sha256(private_value.encode()).hexdigest())
+
+    def test_repeated_rewrite_skip_files_once_across_two_hours(self):
+        path = os.path.join(self.home, "logs", "events.jsonl")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as stream:
+            for at in range(int(T0 - 3600), int(T0) + 1, 60):
+                stream.write(json.dumps({"at": at, "kind": "rewrite_skipped",
+                             "reason": hashlib.sha256(b"no agent command for this repo").hexdigest()}) + "\n")
+        self.run_at(T0)
+        with open(path, "a", encoding="utf-8") as stream:
+            for at in range(int(T0), int(T0 + 3601), 60):
+                stream.write(json.dumps({"at": at, "kind": "rewrite_skipped",
+                             "reason": hashlib.sha256(b"no agent command for this repo").hexdigest()}) + "\n")
+        self.run_at(T0 + 3600)
+        made = [i for i in self.gh.issues.values()
+                if "repeated-failure" in i.get("body", "")]
+        self.assertEqual(len(made), 1)
+
+    def write_events(self, rows):
+        path = os.path.join(self.home, "logs", "events.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as stream:
+            for at, kind, reason in rows:
+                stream.write(json.dumps({"at": at, "kind": kind,
+                                         "reason": hashlib.sha256(reason.encode()).hexdigest()}) + "\n")
+
+    def repeated_failure_tickets(self):
+        return [i for i in self.gh.issues.values() if "repeated-failure" in i.get("body", "")]
+
+    def test_repeated_failure_fires_between_irregular_passes(self):
+        self.write_events((at, "rewrite_skipped", "no agent command for this repo")
+                          for at in range(int(T0 - 3650), int(T0) + 1, 290))
+        self.run_at(T0)
+        self.assertEqual(len(self.repeated_failure_tickets()), 1)
+
+    def test_a_rewrite_success_with_another_reason_suppresses_every_rewrite_failure(self):
+        self.write_events([(at, kind, "no agent command for this repo")
+                           for at in range(int(T0 - 3600), int(T0) + 1, 60)
+                           for kind in ("rewrite_skipped", "rewrite_failed")]
+                          + [(T0 - 1800, "rewrite_succeeded", "rewrote the body")])
+        self.run_at(T0)
+        self.assertEqual(self.repeated_failure_tickets(), [])
+
     def test_thirteen_metrics_lines_for_one_day_file_one_ticket_and_a_second_pass_none(self):
         for i in range(13):
             self.gh.comment(GOAL, T0 - 3600 + i * 60,
@@ -540,6 +598,29 @@ class InvariantTest(unittest.TestCase):
 
     def j(self, at, holder="muse", steps=("status failed",)):
         return Journal(at, self.goal, holder, stamp(at), steps)
+
+    def test_repeated_failure_opens_after_an_hour_and_success_suppresses_it(self):
+        events = [Event(T0 - 3600 + i * 60, "rewrite_skipped", "no command")
+                  for i in range(61)]
+        (breach,) = invariants.repeated_failure(Facts(T0, events=events))
+        self.assertEqual(breach.invariant, "repeated-failure")
+        events.append(Event(T0 - 30, "rewrite_succeeded", "no command"))
+        self.assertEqual(invariants.repeated_failure(Facts(T0, events=events)), [])
+
+    def test_repeated_failure_success_is_per_kind_not_per_reason(self):
+        events = [Event(T0 - 3600 + i * 60, kind, "no command")
+                  for i in range(61) for kind in ("rewrite_skipped", "rewrite_failed")]
+        events.append(Event(T0 - 1800, "rewrite_succeeded", "rewrote the body"))
+        self.assertEqual(invariants.repeated_failure(Facts(T0, events=events)), [])
+
+    def test_repeated_failure_that_stopped_an_hour_ago_is_not_a_breach(self):
+        events = [Event(T0 - 7000 + i * 290, "model_wait", "no lane") for i in range(12)]
+        self.assertEqual(invariants.repeated_failure(Facts(T0, events=events)), [])
+
+    def test_repeated_failure_needs_full_hour(self):
+        events = [Event(T0 - 3599, "rewrite_skipped", "no command"),
+                  Event(T0, "rewrite_skipped", "no command")]
+        self.assertEqual(invariants.repeated_failure(Facts(T0, events=events)), [])
 
     def test_one_failed_tick_between_good_ones_is_not_a_breach(self):
         f = Facts(T0, journals=[self.j(T0 - 3000), self.j(T0 - 1800, steps=()), self.j(T0 - 600)])

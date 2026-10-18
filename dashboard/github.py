@@ -697,6 +697,20 @@ class TicketStore:
         except (GitHubError, OSError, ValueError) as exc:
             return repo, None, self._error_reason(exc)
 
+    def _read_repeated_failures(self):
+        """Open repeated-failure invariant issues across configured repos."""
+        found = []
+        for repo in self.repos:
+            issues = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ainvariant&state=open" % quote(repo, safe="/"))
+            for issue in issues:
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                if "repeated-failure" not in str(issue.get("body") or ""):
+                    continue
+                found.append({"repo": repo, "number": issue.get("number"),
+                              "title": issue.get("title") or "Repeated failure invariant",
+                              "html_url": issue.get("html_url"), "open": True})
+        return found
     def _stale_metadata(self, stale: bool, errors: Dict[str, str], current: Dict[str, Any]):
         refreshed_at = current.get("ticket_refreshed_at")
         if not stale and not errors:
@@ -747,6 +761,15 @@ class TicketStore:
                         "ticket_refreshed_at": refreshed_at, "next_refresh_at": reset_at,
                         "stale_reason": stale_reason,
                         "ready": any(rows is not None for rows in data.values())}
+            if self._below_floor():
+                snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
+            else:
+                try:
+                    snapshot["repeated_failures"] = self._read_repeated_failures()
+                except (GitHubError, OSError, ValueError) as exc:
+                    snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
+                    snapshot.setdefault("dashboard_errors", []).append(
+                        "repeated failure invariants: " + self._error_reason(exc))
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
             self._read_dashboard(snapshot)
@@ -769,6 +792,7 @@ class TicketStore:
         store = getattr(self, "usage", None)
         usage_rows = [row for items in getattr(store, "providers", {}).values() for row in items] if store else []
         return {"tickets": snapshot["tickets"], "errors": snapshot["errors"],
+                "repeated_failures": snapshot.get("repeated_failures", []),
                 "stale": snapshot["stale"], "auth": self.auth,
                 "ticket_refreshed_at": snapshot.get("ticket_refreshed_at"),
                 "next_refresh_at": snapshot.get("next_refresh_at"),
