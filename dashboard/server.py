@@ -282,6 +282,14 @@ def _floor(state):
         brain = '<p class="muted">not looked: %s</p>' % esc(str(context.get("journal_reason") or "no goal journal found"))
     parts.append('<aside class="floor-aside"><section class="card next-move-card"><span class="label">%s</span>%s</section>' % (esc(label), brain))
     parts.append(_priorities_card(rows))
+    repeated = payload.get("repeated_failures") or []
+    repeated_html = ("<ul>" + "".join(
+        '<li><a href="%s">%s</a></li>' % (
+            esc(str(item.get("html_url") or "/tickets"), quote=True),
+            esc("%s#%s: %s" % (item.get("repo", ""), item.get("number", ""), item.get("title", "Repeated failure"))))
+        for item in repeated if isinstance(item, dict)) + "</ul>" if repeated else
+        '<p class="empty-state">No open repeated failure invariants.</p>')
+    parts.append('<section class="card"><span class="label">Repeated failures</span>%s</section>' % repeated_html)
     start, why = _start_here_line(state)
     if start:
         epic, url, ticket = start
@@ -543,8 +551,10 @@ def _health_inspectors(document):
         title = str(epic.get("title", ""))
         if title and (title != title.strip() or title.startswith(("[", "#")) or len(title) > 120):
             titles.append(epic)
+    repeated = [item for item in document.get("repeated_failures") or []
+                if isinstance(item, dict) and item.get("open", True)]
     return (("Finished children, open epic", finished), ("Children without parent link", unlinked),
-            ("Nonstandard titles", titles))
+            ("Nonstandard titles", titles), ("Repeated failure invariants", repeated))
 
 
 def _backlog_filters(epics, parsed):

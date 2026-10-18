@@ -15,6 +15,7 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -311,6 +312,7 @@ MAX_FIX_BODY = 60000
 # only: the hourly budget is shared with the brains, and a station that spends
 # it all stops claiming until the reset.
 BUDGET_FLOOR = 0.15
+PASS_REQUEST_TARGET = 500
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
@@ -984,6 +986,7 @@ class Station:
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
+        self.event_log = os.path.join(settings.home, "logs", "events.jsonl")
         self._spend: Optional[spend.Summary] = None
         # This pass's repo scans: the repos due, what was read of each, and
         # which held a ticket in flight.
@@ -1014,6 +1017,9 @@ class Station:
         self._branch_cache: Dict[str, str] = {}
         # Repos whose claim:<login> label this pass has made sure of.
         self._claim_labels: set = set()
+        self._issue_stamps: Dict[Tuple[str, int], str] = {}
+        saved_reads = _read_json(os.path.join(self.state, "ticket_reads.json"), {}, strict=False)
+        self._ticket_reads: Dict[str, Any] = saved_reads if isinstance(saved_reads, dict) else {}
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -1023,10 +1029,47 @@ class Station:
         return repo in self.s.repos and bool(tickets.REPO_RE.fullmatch(repo))
 
     # -- reading GitHub ------------------------------------------------
+    def _remember_issues(self, repo: str, items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for issue in items:
+            if not isinstance(issue, dict) or not isinstance(issue.get("updated_at"), str):
+                continue
+            try:
+                number = int(issue["number"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._issue_stamps[(repo, number)] = issue["updated_at"]
+
+    def _paginate(self, path: str) -> List[Any]:
+        issue_list = re.match(r"^/repos/([^/]+/[^/]+)/issues\?", path)
+        if issue_list:
+            items = self.gh.paginate(path)
+            self._remember_issues(issue_list.group(1), items)
+            return items
+        detail = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)/(comments|events)(?:\?.*)?$", path)
+        if detail is None or ("?" in path and "since=" in path):
+            return self.gh.paginate(path)
+        repo, number_text, kind = detail.groups()
+        number = int(number_text)
+        stamp = self._issue_stamps.get((repo, number))
+        if (not stamp or not hasattr(self.gh, "issue_writes")
+                or self.gh.comment_edits or (repo, number) in self.gh.issue_writes):
+            return self.gh.paginate(path)
+        key = "%s#%d/%s" % (repo, number, kind)
+        kept = self._ticket_reads.get(key)
+        if isinstance(kept, dict) and kept.get("stamp") == stamp and isinstance(kept.get("data"), list):
+            kept["seen"] = self.now
+            return kept["data"]
+        items = self.gh.paginate(path)
+        self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
+        return items
+
     def _issue(self, repo: str, number: int) -> Dict[str, Any]:
         data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
         if not isinstance(data, dict):
             raise GitHubError("no issue %s#%d" % (repo, number))
+        self._remember_issues(repo, [data])
         data.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
         return data
 
@@ -1054,7 +1097,7 @@ class Station:
 
     def _check_trust(self, repo: str, issue: Dict[str, Any]) -> Tuple[bool, str]:
         number = int(issue["number"])
-        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
         editor = self._editor(repo, number)
         return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
                                self.s.briefers)
@@ -1065,6 +1108,7 @@ class Station:
         resp = self.gh.rest(
             "GET", "/repos/%s/issues?labels=loom:briefed&state=open&per_page=100" % repo)
         items = resp.data if isinstance(resp.data, list) else []
+        self._remember_issues(repo, items)
         if resp.status != 304 and len(items) >= 100:
             _say("%s has 100 or more briefed tickets; only the first page is read" % repo)
         out = []
@@ -1154,6 +1198,71 @@ class Station:
             "%s#%s" % (repo, issue["number"]))
         return bool(rec) and rec.get("updated_at") == issue.get("updated_at")
 
+    def _event(self, kind: str, reason: str, item: str = "", lane: str = "",
+               model: str = "") -> None:
+        """Append one redacted decision event and rotate its log by UTC day."""
+        directory = os.path.dirname(self.event_log)
+        os.makedirs(directory, exist_ok=True)
+        day = time.strftime("%Y-%m-%d", time.gmtime(self.now))
+        lock_path = os.path.join(directory, "events.lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if os.path.exists(self.event_log):
+                mtime = os.path.getmtime(self.event_log)
+                old_day = time.strftime("%Y-%m-%d", time.gmtime(mtime))
+                if old_day != day:
+                    os.replace(self.event_log, os.path.join(directory, "events.%s.jsonl" % old_day))
+            # Retain today's file and six previous daily archives.
+            archives = sorted((p for p in Path(directory).glob("events.*.jsonl")
+                               if p.name[7:17].count("-") == 2), reverse=True)
+            for stale in archives[6:]:
+                stale.unlink()
+            digest = lambda value: hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+            record = {"time": invariants.utc(self.now), "at": self.now, "kind": kind,
+                      "reason": digest(reason), "item": digest(item),
+                      "lane": digest(lane), "model": digest(model)}
+            with open(self.event_log, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+        finally:
+            os.close(lock_fd)
+
+    def _read_events(self) -> List[invariants.Event]:
+        directory = os.path.dirname(self.event_log)
+        rows = []
+        os.makedirs(directory, exist_ok=True)
+        lock_fd = os.open(os.path.join(directory, "events.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            paths = list(Path(directory).glob("events.*.jsonl")) + [Path(self.event_log)]
+            for path in paths:
+                try:
+                    with path.open(encoding="utf-8") as stream:
+                        for line in stream:
+                            try:
+                                row = json.loads(line)
+                                if not isinstance(row, dict):
+                                    continue
+                                raw_at = row.get("at")
+                                if isinstance(raw_at, bool) or not isinstance(raw_at, (int, float)):
+                                    continue
+                                at = float(raw_at)
+                                kind, reason = row.get("kind"), row.get("reason")
+                                if (not math.isfinite(at) or kind not in
+                                        invariants.FAILURE_KINDS + ("rewrite_succeeded",)
+                                        or not isinstance(reason, str)
+                                        or not re.fullmatch(r"[0-9a-f]{64}", reason)):
+                                    continue
+                                if self.now - invariants.EVENT_WINDOW <= at <= self.now:
+                                    rows.append(invariants.Event(at, kind, reason))
+                            except (ValueError, TypeError):
+                                continue
+                except FileNotFoundError:
+                    continue
+        finally:
+            os.close(lock_fd)
+        return rows
+
     def _refuse(self, repo: str, issue: Dict[str, Any], reason: str) -> None:
         """Log a refusal once per issue and body, and remember it. A refusal
         for an untrusted labeller is also counted toward its invariant."""
@@ -1167,6 +1276,7 @@ class Station:
         old = seen.get(key) or {}
         if old.get("sha") != sha:
             _say("not claiming %s: %s" % (key, reason))
+            self._event("not_claiming", reason, key)
         seen[key] = {"sha": sha, "updated_at": issue.get("updated_at")}
         _write_json(path, seen)
 
@@ -1266,7 +1376,7 @@ class Station:
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
         number = int(issue["number"])
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
             fix_source = self._fix_for(repo, comments)
         except ValueError as err:
@@ -1556,7 +1666,7 @@ class Station:
             return None
         latest = None
         pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
-        for comment in self.gh.paginate("/repos/%s/issues/%d/comments" %
+        for comment in self._paginate("/repos/%s/issues/%d/comments" %
                                         (repo, int(issues[0]["number"]))):
             match = pattern.fullmatch(str(comment.get("body") or "").strip()) \
                 if isinstance(comment, dict) else None
@@ -1658,7 +1768,7 @@ class Station:
             return
         for repo in self.scan_repos():
             try:
-                found = self.gh.paginate("/repos/%s/issues?labels=%s&state=open"
+                found = self._paginate("/repos/%s/issues?labels=%s&state=open"
                                          % (repo, RUNAWAY))
             except GitHubError as err:
                 _say("could not list runaway tickets in %s: %s" % (repo, err))
@@ -1682,7 +1792,7 @@ class Station:
             # A runaway held on an open pull request stays with the brain:
             # re-briefing it would orphan the fix-round machinery.
             return
-        comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict)]
         lane = factory.dead_lane(comments)
         if lane is None or lane not in dead:
@@ -1800,6 +1910,8 @@ class Station:
                     self._record_gate_hold(repo, issue, limit, counts)
                     _say("not claiming %s#%s for lane %s: %s"
                          % (repo, issue.get("number"), lane, reason))
+                    self._event("not_claiming", reason,
+                                "%s#%s" % (repo, issue.get("number")), lane)
         return gated
 
     def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
@@ -1871,7 +1983,7 @@ class Station:
     # -- verify runs ------------------------------------------------------
     def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
         """The repo's open tickets filed by a briefing login."""
-        found = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return [i for i in found if isinstance(i, dict) and "pull_request" not in i
                 and tickets.brief_author_trusted(i, self.s.authors, self.s.briefers)
                 and not self._owned_elsewhere(repo, i)]
@@ -1893,13 +2005,13 @@ class Station:
     def _proven(self, repo: str, number: int) -> bool:
         """A trusted proof stands on the ticket: a failed audit after it
         (bus/audit.py) makes the ticket due again."""
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return audit.proven(comments, self.s.authors)
 
     def _shipped_stamp(self, repo: str, issue: Dict[str, Any]) -> float:
         """When loom:shipped was last applied; the issue's update time if the
         events do not say."""
-        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
         stamps = [metrics.stamp(e.get("created_at")) for e in events
                   if isinstance(e, dict) and e.get("event") == "labeled"
                   and (e.get("label") or {}).get("name") == "loom:shipped"]
@@ -2209,7 +2321,7 @@ class Station:
         """Say on the ticket that an After: line no longer holds it, once per
         ticket that was closed as not planned."""
         number = int(issue["number"])
-        said = {m.group(1) for c in self.gh.paginate(
+        said = {m.group(1) for c in self._paginate(
             "/repos/%s/issues/%d/comments" % (repo, number)) if isinstance(c, dict)
             for m in [AFTER_RELEASE_RE.match(str(c.get("body") or ""))] if m}
         for dep in released:
@@ -2283,6 +2395,8 @@ class Station:
                          {"labels": names})
             self._comment(repo, number, "Model %s waits for a free compatible lane." % model)
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
+            self._event("model_wait", "no free lane takes model %s" % model,
+                        "%s#%d" % (repo, number), lane, model)
             return None
         names.append("lane:" + target)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -2355,7 +2469,7 @@ class Station:
         if target is None or target in labels:
             return
         if target == "loom:merged" and "loom:regression" in labels:
-            events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+            events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
             if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
                 return
         state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
@@ -2508,7 +2622,7 @@ class Station:
         # The open tickets are read only when a pull request may need one.
         open_tickets: List[Dict[str, Any]] = []
         if pulls:
-            issues = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open"
+            issues = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open"
                                       "&per_page=100" % repo)
             open_tickets = [i for i in issues if isinstance(i, dict) and "pull_request" not in i
                             and "loom:ticket" in _label_names(i)]
@@ -2592,7 +2706,7 @@ class Station:
     def _marked_adopted(self, repo: str, number: int) -> bool:
         """A trusted author marked the pull request adopted."""
         authors = {a.lower() for a in self.s.authors}
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return any(isinstance(c, dict) and tickets._login(c.get("user")) in authors
                    and ADOPTED_RE.search(str(c.get("body") or "")) for c in comments)
 
@@ -2706,7 +2820,7 @@ class Station:
     def _unwind_repo(self, repo: str, allowed: set) -> None:
         landed: Dict[int, Dict[str, Any]] = {}
         for label in ("loom:merged", "loom:shipped"):
-            data = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+            data = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
                                     % (repo, label))
             for issue in data:
                 names = _label_names(issue)
@@ -2747,7 +2861,7 @@ class Station:
             return
         undone = {int(hand["number"]): hand for pr in prs
                   for hand in [self._match(pr, hands)] if hand is not None}
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         seen = {m.group(1) for c in comments if isinstance(c, dict)
                 and str((c.get("user") or {}).get("login") or "").lower() in allowed
                 for m in [re.search(r"loom:hand-revert (\d+)", str(c.get("body") or ""))]
@@ -2907,7 +3021,7 @@ class Station:
         """Ship what one merged pin pull request publishes; whether every
         ticket it carries has moved (a pull request that publishes nothing
         has nothing left to ship)."""
-        files = self.gh.paginate("/repos/%s/pulls/%d/files" % (deploy, int(pin["number"])))
+        files = self._paginate("/repos/%s/pulls/%d/files" % (deploy, int(pin["number"])))
         published = sorted({m.groups() for f in files if isinstance(f, dict)
                             for m in PUBLISHED_RE.finditer(str(f.get("patch") or ""))})
         finished = True
@@ -3021,7 +3135,7 @@ class Station:
     def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
         """Closed factory incidents the runner filed, by "owner/repo#n"."""
         closed: Dict[str, Dict[str, Any]] = {}
-        for incident in self.gh.paginate(
+        for incident in self._paginate(
                 "/repos/%s/issues?state=closed&labels=%s&per_page=100" % (FACTORY_REPO, FACTORY_LABEL)):
             if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
                 closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
@@ -3037,7 +3151,7 @@ class Station:
         incident = closed_incidents.get(ref) if ref else None
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
-            comments = self.gh.paginate(
+            comments = self._paginate(
                 "/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
         except GitHubError as err:
             _say("factory release: could not read %s#%d: %s" % (repo, number, err))
@@ -3093,6 +3207,7 @@ class Station:
 
     def _pr_tickets(self, repo: str) -> List[Dict[str, Any]]:
         issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % repo).data or []
+        self._remember_issues(repo, issues)
         found = [i for i in issues if isinstance(i, dict) and "pull_request" not in i]
         self._observe(repo, "pr", bool(found))
         return found
@@ -3118,7 +3233,7 @@ class Station:
         sha = str((detail.get("head") or {}).get("sha") or "")
         if not sha:
             return
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
         ready = self._ready_marker(comments)
         if brain._pending_brain_fix(comments, self.s.authors):
@@ -3379,7 +3494,7 @@ class Station:
             # (loom#572, loom#744).
             return False
         authors = {author.lower() for author in self.s.authors}
-        comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         attempts = factory.attempts(comments, reason)
         work = [a for a in attempts if not a[3] or failure_class(a[3]) not in NOT_WORK]
@@ -3409,7 +3524,7 @@ class Station:
         names = _label_names(issue)
         if RUNNING not in names:
             return "the ticket is no longer running"
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         used, left, pending = retry_chain(comments)
         if pending and pending[0] == lane:
             # An earlier pass commented this retry but did not relabel.
@@ -3753,7 +3868,7 @@ class Station:
         return count
 
     def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
-        for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)):
+        for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
             if isinstance(c, dict) and str(c.get("body") or "").startswith(LANES_MARKER):
                 self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(c["id"])),
                              {"body": body})
@@ -3799,7 +3914,7 @@ class Station:
         allowed = {a.lower() for a in self.s.authors}
         if tickets._login(issue.get("user")) not in allowed:
             return False
-        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
         actor = tickets._latest_label_actor(events, lambda n: n == NEEDS_OPERATOR)
         return actor is not None and actor in allowed
 
@@ -3832,7 +3947,7 @@ class Station:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
             try:
-                items = self.gh.paginate(
+                items = self._paginate(
                     "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, HUMAN))
             except GitHubError as err:
                 _say("could not list %s issues in %s: %s" % (HUMAN, repo, err))
@@ -3851,7 +3966,7 @@ class Station:
         # long the thread is. Only the HUMAN_SHOWN listed issues are read, once a
         # day when the digest is due. A GitHubError is left to _human_text,
         # which holds the whole digest rather than send a list missing an ask.
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100"
                                     % (repo, int(issue["number"])))
         for c in reversed(comments):
             body = str(c.get("body") or "") if isinstance(c, dict) else ""
@@ -4024,7 +4139,7 @@ class Station:
         """epic number -> the goal its Part of line or sub-issue parent names,
         for the repo's epics (one conditional list read)."""
         found: Dict[int, int] = {}
-        for item in self.gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
+        for item in self._paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
             if isinstance(item, dict) and "pull_request" not in item \
                     and str(item.get("number") or "").isdigit():
                 goal = brain._issue_goal(item)
@@ -4059,7 +4174,7 @@ class Station:
         return "\n\n".join(part for part in (asks, plan.get("human") or "") if part)
 
     def _digest_issue(self, repo: str) -> int:
-        found = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+        found = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
                                  % (repo, DIGEST_LABEL))
         numbers = sorted(int(i["number"]) for i in found
                          if isinstance(i, dict) and "pull_request" not in i and "number" in i)
@@ -4172,7 +4287,7 @@ class Station:
 
     # -- goal reports -----------------------------------------------------
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
-        data = self.gh.paginate(
+        data = self._paginate(
             "/repos/%s/issues?labels=loom:goal&state=open&per_page=100" % repo)
         found = [i for i in (data if isinstance(data, list) else [])
                  if isinstance(i, dict) and "pull_request" not in i
@@ -4310,7 +4425,7 @@ class Station:
         for issue in issues:
             path = "/repos/%s/issues/%d/comments?since=%s" % (
                 repo, int(issue["number"]), since)
-            for comment in self.gh.paginate(path):
+            for comment in self._paginate(path):
                 if (isinstance(comment, dict)
                         and str(comment.get("body") or "").startswith(REPORT_MARKER)):
                     comments.append((self._report_id(comment), issue, comment))
@@ -4606,7 +4721,7 @@ class Station:
                 continue
             try:
                 if key in fallback:
-                    queued = self.gh.paginate(
+                    queued = self._paginate(
                         "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
                     if len(queued if isinstance(queued, list) else []) >= 3:
                         continue
@@ -4664,6 +4779,7 @@ class Station:
         cmd = self._rewrite_command(repo, cmds)
         if not cmd:
             _say("rewrite %s: no agent command for this repo; skipped" % key)
+            self._event("rewrite_skipped", "no agent command for this repo", key)
             return 0
         done = 0
         for issue in rewrite.candidates(self.gh, repo):
@@ -4681,11 +4797,14 @@ class Station:
             except rewrite.CommandFailure as err:
                 tried.pop(str(number), None)
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
+                self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
                 continue
             except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
+                self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
                 continue
             _say("rewrite %s#%d: %s" % (repo, number, action))
+            self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
         return done
 
     def rewrite_triaged(self) -> None:
@@ -4874,6 +4993,7 @@ class Station:
         """What the invariants read, each source on its own: one that cannot
         be read stays None and its invariants find nothing this pass."""
         facts = invariants.Facts(now=self.now)
+        facts.events = self._read_events()
         for name, read in (("runs", self._invariant_runs),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
@@ -4941,7 +5061,7 @@ class Station:
         journals, posts = [], []
         for repo, goal in homes:
             ref = self._invariant_ref(repo, int(goal["number"]))
-            for c in self.gh.paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
+            for c in self._paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
                                       % (repo, int(goal["number"]), stamp)):
                 if not isinstance(c, dict) or tickets._login(c.get("user")).lower() not in authors:
                     continue
@@ -4968,7 +5088,7 @@ class Station:
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
-            for issue in self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo):
+            for issue in self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo):
                 if (not isinstance(issue, dict) or "pull_request" in issue
                         or "loom:queued" not in _label_names(issue)
                         or not tickets.brief_author_trusted(issue, self.s.authors,
@@ -5093,7 +5213,7 @@ class Station:
         open threads are what a fix round would answer."""
         if issue is None or not threads:
             return False
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100"
                                     % (repo, int(issue["number"])))
         return self._fix_pending(_label_names(issue), comments,
                                  str((pr.get("head") or {}).get("sha") or ""))
@@ -5372,7 +5492,7 @@ class Station:
         if isinstance(sent, (int, float)) and not isinstance(sent, bool) \
                 and 0 <= self.now - sent < brain.REPORT_EVERY - STANDUP_LEAD:
             return
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" %
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" %
                                     (repo, number))
         node = {"comments": {"nodes": [
             {"body": c.get("body"), "createdAt": c.get("created_at"),
@@ -5421,7 +5541,7 @@ class Station:
 
     def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
         """The open loom:invariant issues filed on the goal home."""
-        return [i for i in self.gh.paginate("/repos/%s/issues?labels=%s&state=open"
+        return [i for i in self._paginate("/repos/%s/issues?labels=%s&state=open"
                                             % (repo, invariants.LABEL))
                 if isinstance(i, dict) and "pull_request" not in i
                 and brain._names_goal(i.get("body"), goal)]
@@ -5570,12 +5690,12 @@ class Station:
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
-            for goal in self.gh.paginate(
+            for goal in self._paginate(
                     "/repos/%s/issues?labels=loom:goal&state=open" % repo):
                 if not isinstance(goal, dict) or "number" not in goal:
                     continue
                 number = int(goal["number"])
-                for c in self.gh.paginate(
+                for c in self._paginate(
                         "/repos/%s/issues/%d/comments?since=%s" % (repo, number, since)):
                     login = (c.get("user") or {}).get("login")
                     body = str(c.get("body") or "").lstrip()
@@ -5846,7 +5966,7 @@ class Station:
         allowed = {a.lower() for a in self.s.authors}
         found = []
         for repo, goal in self._goal_homes():
-            for c in self.gh.paginate("/repos/%s/issues/%d/comments?since=%s"
+            for c in self._paginate("/repos/%s/issues/%d/comments?since=%s"
                                       % (repo, int(goal["number"]), since)):
                 if not isinstance(c, dict):
                     continue
@@ -5909,7 +6029,7 @@ class Station:
     def _dated_metrics(self, path: str) -> Dict[str, Tuple[int, int]]:
         dated = {}
         allowed = {author.lower() for author in self.s.authors}
-        for comment in self.gh.paginate(path):
+        for comment in self._paginate(path):
             body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
             author = str((comment.get("user") or {}).get("login") or "").lower()
             if author not in allowed:
@@ -6064,7 +6184,7 @@ class Station:
         if (isinstance(old, dict) and old.get("stamp") == stamp and stamp[0]
                 and isinstance(old.get("journals"), list)):
             return old
-        comments = [c for c in self.gh.paginate(
+        comments = [c for c in self._paginate(
             "/repos/%s/issues/%d/comments?per_page=100" % (repo, number)) if isinstance(c, dict)]
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("created_at"),
@@ -6282,6 +6402,9 @@ class Station:
                           sorted(gh.kinds.items(), key=lambda kv: (-kv[1], kv[0])))
         line = "requests: %d, %d counted (%s), %d answered 304 (not counted)" % (
             gh.requests, gh.requests - gh.not_modified, kinds or "none", gh.not_modified)
+        counted = gh.requests - gh.not_modified
+        line += "; target %d counted (%s)" % (
+            PASS_REQUEST_TARGET, "over" if counted > PASS_REQUEST_TARGET else "met")
         rates = self._rates()
         if "core" in rates:
             remaining, limit, reset = rates["core"]
@@ -6294,6 +6417,16 @@ class Station:
             state.pop("told", None)
         try:
             _write_json(os.path.join(self.state, "budget.json"), state)
+            if getattr(gh, "comment_edits", False):
+                self._ticket_reads.clear()
+            for repo, number in getattr(gh, "issue_writes", ()):
+                for kind in ("comments", "events"):
+                    self._ticket_reads.pop("%s#%d/%s" % (repo, number, kind), None)
+            self._ticket_reads = {
+                key: value for key, value in self._ticket_reads.items()
+                if isinstance(value, dict) and isinstance(value.get("seen"), (int, float))
+                and 0 <= self.now - value["seen"] < CACHE_KEEP}
+            _write_json(os.path.join(self.state, "ticket_reads.json"), self._ticket_reads)
             gh.prune_cache(CACHE_KEEP, self.now)
         except OSError as err:
             _say("could not keep the GitHub budget: %s" % err)

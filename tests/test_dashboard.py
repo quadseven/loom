@@ -521,6 +521,9 @@ class BacklogHelperTest(unittest.TestCase):
         self.assertEqual(len(reports["Finished children, open epic"]), 1)
         self.assertEqual(len(reports["Children without parent link"]), 1)
         self.assertEqual(len(reports["Nonstandard titles"]), 1)
+        document["repeated_failures"] = [{"repo": "example-owner/sample", "number": 9,
+                                          "title": "Repeated rewrite skip", "open": True}]
+        self.assertEqual(len(dict(_health_inspectors(document))["Repeated failure invariants"]), 1)
 
     def test_needs_you_deduplicates_orders_and_marks_updated_idle(self):
         from dashboard.server import _needs_you
