@@ -67,3 +67,11 @@ Each refresh keeps only the fields the pages read from each pull request and
 comment it lists (`PULL_REQUEST_FIELDS` and `COMMENT_FIELDS` in
 `dashboard/github.py`), not GitHub's whole answers with their embedded
 repositories and users, and the Ticket page keeps at most 64 tickets' details.
+
+Pull requests are read in full once an hour (`PR_FULL_READ_SECONDS`). Between
+those reads a refresh asks only for the pull requests updated since the newest
+update it already holds (`sort=updated`, newest first, stopping at the first
+page that reaches back past it) and merges them by number, so a push to a
+large repository costs one page instead of every page. Once an hour the
+dashboard logs the GitHub requests it spent ("GitHub requests in the last N
+minutes: ... counted (by kind), ... not modified").

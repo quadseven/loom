@@ -1219,6 +1219,28 @@ class Queued(Base):
         self.assign(limited=["codex"], available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
 
+    def test_a_pass_that_assigns_no_queued_ticket_says_why_for_the_first(self):
+        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n", age=600)
+        self.queued(8, age=60)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=[])
+        say.assert_called_with("assigned 0 of 2 queued: %s#7 waits: no free lane takes "
+                               "model claude-opus-5-5" % REPO)
+
+    def test_a_queued_ticket_with_no_free_tier_lane_names_its_tier(self):
+        self.queued(7)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=[])
+        say.assert_called_once_with("assigned 0 of 1 queued: %s#7 waits: no free lane "
+                                    "in tier medium" % REPO)
+
+    def test_a_pass_that_assigns_a_queued_ticket_says_no_count(self):
+        self.queued(7, age=600)
+        self.queued(8, age=60)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=["codex"])
+        self.assertFalse([c for c in say.call_args_list if "assigned 0 of" in c.args[0]])
+
 
     def test_a_queued_medium_ticket_whose_tier_is_at_a_limit_falls_back(self):
         self.queued(7)

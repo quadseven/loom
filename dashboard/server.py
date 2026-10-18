@@ -442,7 +442,9 @@ def _goals(state):
                 quote(goal, safe=""), len(tickets)))
     body = ('<p class="page-lede">Each top-level goal home, with the smaller goals that roll up into it,'
             ' measured by what reached a live proof.</p><div class="goal-grid">%s</div>') % (
-        "".join(cards) or '<p class="empty-state">No goals with ticket data.</p>')
+        "".join(cards) or ('<p class="empty-state">%s.</p>' % esc(missing)
+                           if response.get("goal_context_error") else
+                           '<p class="empty-state">No goals with ticket data.</p>'))
     return page("Goals", "goals", body, status="snapshot")
 
 

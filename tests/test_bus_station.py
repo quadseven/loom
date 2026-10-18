@@ -2256,6 +2256,30 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertTrue(any(path.endswith("/issues/12/labels") for path in self.fake.paths("PUT")))
 
+    def test_a_lane_that_beat_during_the_pass_takes_a_queued_ticket_after_the_claims(self):
+        # The pass began five minutes ago, and every lane beat again since:
+        # its claims run first, then the free spark lane takes the queued
+        # ticket (loom#717).
+        self.settings.factory_on = True
+        self.heartbeat("spark")
+        self.fake.add(12)
+        self.fake.add(13, body="Difficulty: medium\n\n## Why\nx\n", state="queued")
+        self.fake.issues[13]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time() - 300)
+        os.makedirs(st.state, exist_ok=True)
+        st.claim_new()
+        st.assign_queued()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("loom:briefed", self.fake.names(13))
+        self.assertIn("lane:spark", self.fake.names(13))
+
+    def test_a_beat_stamped_ahead_of_the_wall_clock_is_not_fresh(self):
+        self.heartbeat("spark", age=-120)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertFalse(st._heartbeat_ok("spark"))
+        self.assertTrue(st._heartbeat_ok("codex"))
+
     def test_a_half_done_claim_is_dropped_when_the_ticket_is_no_longer_trusted(self):
         self.fake.add(12, editor="stranger")
         name = "example-owner.example-repo-12"
