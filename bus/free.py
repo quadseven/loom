@@ -96,6 +96,35 @@ def _ref(repo: str, ticket_repo: str, number: Any) -> str:
     return "#%s" % number if ticket_repo == repo else "%s#%s" % (ticket_repo, number)
 
 
+def _not_work(issue: Dict[str, Any]) -> Optional[str]:
+    """Why the issue is no one's work to take: an epic, goal home or ticket."""
+    names = _names(issue)
+    if is_epic(issue):
+        return "an epic"
+    if "loom:goal" in names:
+        return "a goal home"
+    if "loom:ticket" in names:
+        return "a Loom ticket"
+    return None
+
+
+def _covered(repo: str, issue: Dict[str, Any],
+             covering: Sequence[Tuple[str, Dict[str, Any]]]) -> Optional[Tuple[str, str]]:
+    """(taken or check, why) from the Loom tickets covering the issue, or
+    None when no ticket covers it and it is not marked rewritten."""
+    refs = lambda found: ", ".join(_ref(repo, r, t.get("number")) for r, t in found)
+    open_tickets = [(r, t) for r, t in covering if not ticket_done(t)]
+    if open_tickets:
+        return TAKEN, "Loom ticket %s is open" % refs(open_tickets)
+    if covering:
+        how = "/".join(dict.fromkeys("closed" if t.get("state") == "closed" else "merged"
+                                     for _, t in covering))
+        return CHECK, "Loom ticket %s is %s; verify and close this issue" % (refs(covering), how)
+    if "loom:rewritten" in _names(issue):
+        return CHECK, "loom:rewritten, but no ticket naming it was found; check before taking it"
+    return None
+
+
 def classify(repo: str, issue: Dict[str, Any], operator: str,
              covering: Sequence[Tuple[str, Dict[str, Any]]] = ()) -> Tuple[str, str]:
     """(free | check | taken, why) for one open issue, for one operator login
@@ -105,24 +134,12 @@ def classify(repo: str, issue: Dict[str, Any], operator: str,
     owner = tickets.owned_elsewhere(issue, [operator] if operator else [])
     if owner is not None:
         return TAKEN, "held by %s (assigned or claim:%s)" % (owner, owner)
-    names = _names(issue)
-    if is_epic(issue):
-        return TAKEN, "an epic"
-    if "loom:goal" in names:
-        return TAKEN, "a goal home"
-    if "loom:ticket" in names:
-        return TAKEN, "a Loom ticket"
-    open_tickets = [(r, t) for r, t in covering if not ticket_done(t)]
-    if open_tickets:
-        return TAKEN, "Loom ticket %s is open" % ", ".join(
-            _ref(repo, r, t.get("number")) for r, t in open_tickets)
-    if covering:
-        return CHECK, "Loom ticket %s is %s; verify and close this issue" % (
-            ", ".join(_ref(repo, r, t.get("number")) for r, t in covering),
-            "/".join(dict.fromkeys("closed" if t.get("state") == "closed" else "merged"
-                                   for _, t in covering)))
-    if "loom:rewritten" in names:
-        return CHECK, "loom:rewritten, but no ticket naming it was found; check before taking it"
+    why = _not_work(issue)
+    if why:
+        return TAKEN, why
+    verdict = _covered(repo, issue, covering)
+    if verdict:
+        return verdict
     mine = operator and operator in tickets.assignees(issue) + tickets.claimed_by(issue)
     return FREE, "yours (assigned or claim:%s)" % operator if mine else "no owner and no Loom ticket"
 

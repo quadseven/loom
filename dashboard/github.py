@@ -271,10 +271,7 @@ class TicketStore:
                           "goal_context_error": "the dashboard has not read its sources yet"}
         self.operator_items = []
         self.human_counts = {}
-        # repo -> open issue records for the /free page, None until read.
-        self.open_issues: Dict[str, Optional[List[Dict[str, Any]]]] = {repo: None for repo in self.repos}
-        self.open_issues_error = ""
-        self.open_issues_read_at = 0.0
+        self._init_open_issues()
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
         self.auth = "app" if getattr(gh, "auth", "") == "app" else "token" if token else "none"
         self._snapshot_lock = threading.Lock()
@@ -383,6 +380,12 @@ class TicketStore:
                   "unblocks": 0, "queue": "needs_operator"}
                  for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
         return repo, found, count, ""
+
+    def _init_open_issues(self) -> None:
+        # repo -> open issue records for the /free page, None until read.
+        self.open_issues: Dict[str, Optional[List[Dict[str, Any]]]] = {repo: None for repo in self.repos}
+        self.open_issues_error = ""
+        self.open_issues_read_at = 0.0
 
     def _read_open_issues(self, now: float) -> None:
         """Each repo's open issues for the /free page, at most once every
