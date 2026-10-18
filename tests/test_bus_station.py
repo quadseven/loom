@@ -355,25 +355,32 @@ class FakeGitHub:
         self.version += 1
         return reply(201 if method == "POST" else 200, [])
 
+    def _get_issue(self, n, sub):
+        if sub == "sub_issues":
+            return reply(200, self.sub_issues.get(n, []))
+        found = {None: self.issues, "events": self.events, "comments": self.comments}
+        if sub in found:
+            if sub is None and n not in found[sub]:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, found[sub][n])
+        return None
+
+    def _patch_issue(self, n, data):
+        for key in ("body", "state", "state_reason"):
+            if key in data:
+                self.issues[n][key] = data[key]
+        return reply(200, {})
+
     def _issue_call(self, method, n, sub, data):
         if method == "GET":
-            if sub == "sub_issues":
-                return reply(200, self.sub_issues.get(n, []))
-            if sub == "events" and n not in self.issues:
-                return reply(200, self.events[n])
-            found = {None: self.issues, "events": self.events, "comments": self.comments}
-            if sub in found:
-                if sub is None and n not in found[sub]:
-                    return reply(404, {"message": "Not Found"})
-                return reply(200, found[sub][n])
+            result = self._get_issue(n, sub)
+            if result is not None:
+                return result
         if method == "POST" and sub == "comments":
             self.comments[n].append({"body": data["body"], "user": {"login": self.bot}})
             return reply(201, {})
         if method == "PATCH" and sub is None:
-            for key in ("body", "state", "state_reason"):
-                if key in data:
-                    self.issues[n][key] = data[key]
-            return reply(200, {})
+            return self._patch_issue(n, data)
         if method == "POST" and sub == "sub_issues":
             self.sub_issues.setdefault(n, []).append(self.issues.get(data["sub_issue_id"] - 1000, {}))
             return reply(201, {})
