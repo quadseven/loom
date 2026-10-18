@@ -2029,6 +2029,12 @@ class Station:
                                 "%s#%s" % (repo, issue.get("number")), lane)
         return gated
 
+    def _gate_held(self) -> List[str]:
+        """The tickets the unproven-work gate refused this pass, "owner/repo#n":
+        the factory neither counts them as lane load nor moves them."""
+        return ["%s#%d" % (hold["repo"], int(number))
+                for hold in self._gate_holds.values() for number in hold["tickets"]]
+
     def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
                          counts: Dict[Tuple[str, int], int]) -> None:
         """Remember the unproven-work gate's refusal of one briefed ticket,
@@ -6400,7 +6406,7 @@ class Station:
                                model_limits=self.model_limits(),
                                no_test_repos=self.s.no_test_repos,
                                available=[x for x in LANES if self._heartbeat_ok(x)],
-                               held=list(self._held_tickets()))
+                               held=list(self._held_tickets()) + self._gate_held())
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.
