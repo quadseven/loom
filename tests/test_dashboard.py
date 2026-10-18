@@ -515,7 +515,17 @@ class LanesAndImprovingTest(unittest.TestCase):
         from dashboard.views import render_lanes
         with patch.dict(factory.TIERS, {"easy": ("test-lane",)}):
             body = render_lanes({"lanes": [], "scoreboard": {}})
-        self.assertIn("Easy: test-lane", body)
+        self.assertIn('<table class="factory-tiers">', body)
+        self.assertIn("<th>Easy</th><td>test-lane</td>", body)
+        self.assertIn('<table class="model-ladder">', body)
+
+    def test_tier_table_has_one_row_for_each_factory_tier(self):
+        from dashboard.views import render_lanes
+        from bus import factory
+        body = render_lanes({"lanes": [], "scoreboard": {}})
+        self.assertEqual(body.count('<tr class="factory-tier">'), len(factory.TIERS))
+        for tier in factory.TIERS:
+            self.assertIn("<th>%s</th>" % tier.title(), body)
 
     def test_pull_request_footer_and_models_scoreboard(self):
         from dashboard import views
@@ -729,7 +739,8 @@ class LaneCardsTest(unittest.TestCase):
         body = render_lanes(data)
         self.assertIn("Lane cards</a> - heartbeat 20:17Z", body)
 
-    def test_pull_request_footer_shows_model_and_missing_says_model_missing(self):
+    def test_pull_request_footer_shows_model_and_configured_model_is_fallback(self):
+        from unittest.mock import patch
         from dashboard.views import render_lanes
         from dashboard.server import _lane_view_data
         comment = (
@@ -744,10 +755,11 @@ class LaneCardsTest(unittest.TestCase):
             "created_at": "2026-10-14T12:00:00Z",
         }]
         payload = {"lanes": [{"body": comment}], "pull_requests": prs, "tickets": {}}
-        data = _lane_view_data(payload, [])
+        with patch.dict("os.environ", {"LOOM_CLAUDE_MODEL": "claude-sonnet-5-5"}, clear=True):
+            data = _lane_view_data(payload, [])
         body = render_lanes(data)
         self.assertIn("gpt-6-sol", body)
-        self.assertIn("model missing", body)
+        self.assertIn("claude-sonnet-5-5", body)
 
     def test_the_runners_ticket_name_footer_names_the_lanes_model(self):
         from dashboard.views import footer, render_lanes
@@ -821,7 +833,6 @@ class LaneCardsTest(unittest.TestCase):
         self.assertIn("gpt-6-sol", body)
         self.assertIn('<div class="quota"><span style="width:42%"></span></div>', body)
         self.assertIn("quota missing", body)
-        self.assertIn("model missing", body)
 
 
 if __name__ == "__main__":
