@@ -317,10 +317,8 @@ NO_METER = {
 }
 
 
-def _meter_records(provider: str, home: str, slots: List[str], now: float) -> List[Dict[str, Any]]:
-    """The meter the lane read with its own key (bus/meter.py writes
-    state/usage/<slot>.meter.json): the newest file among the slots, one
-    reading per window, or one reading that says why there is none."""
+def _newest_meter(home: str, slots: List[str]) -> Optional[Dict[str, Any]]:
+    """The newest state/usage/<slot>.meter.json among SLOTS, or None."""
     usage_dir = Path(home) / "state" / "usage"
     found = []
     for slot in slots:
@@ -330,23 +328,33 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
             continue
         if isinstance(row, dict) and isinstance(row.get("at"), (int, float)):
             found.append(row)
-    if not found:
+    return max(found, key=lambda item: item["at"]) if found else None
+
+
+def _meter_note(window: Dict[str, Any]) -> Optional[str]:
+    used, limit = window.get("used"), window.get("limit")
+    if not isinstance(used, (int, float)) or not isinstance(limit, (int, float)):
+        return None
+    return ("%s of %s %s used" % (_amount(used), _amount(limit), window.get("unit") or "")).strip()
+
+
+def _meter_records(provider: str, home: str, slots: List[str], now: float) -> List[Dict[str, Any]]:
+    """The meter the lane read with its own key (bus/meter.py writes
+    state/usage/<slot>.meter.json): the newest file among the slots, one
+    reading per window, or one reading that says why there is none."""
+    row = _newest_meter(home, slots)
+    if row is None:
         return [_record(provider, slots, "all", None, None, None, None, "lane meter", now,
                         "no meter reading yet: the lane reads it with its key on its next pass")]
-    row = max(found, key=lambda item: item["at"])
     source = str(row.get("source") or "lane meter")
     observed = datetime.fromtimestamp(row["at"], timezone.utc).isoformat()
     records = []
     for window in row.get("windows") or []:
         if not isinstance(window, dict) or not window.get("window"):
             continue
-        used, limit = window.get("used"), window.get("limit")
-        note = None
-        if isinstance(used, (int, float)) and isinstance(limit, (int, float)):
-            note = "%s of %s %s used" % (_amount(used), _amount(limit), window.get("unit") or "")
         record = _record(provider, slots, str(window["window"]), window.get("used_pct"),
                          window.get("remaining"), window.get("unit"), window.get("resets_at"),
-                         source, now, note.strip() if note else None)
+                         source, now, _meter_note(window))
         record["window_minutes"] = window.get("window_minutes")
         record["observed_at"] = observed
         records.append(record)

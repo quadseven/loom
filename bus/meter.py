@@ -93,19 +93,21 @@ def openrouter_windows(payload: Any, now: float) -> List[Dict[str, Any]]:
     return windows
 
 
-def workersai_windows(payload: Any, now: float, allowance: float) -> List[Dict[str, Any]]:
-    """Today's Neurons from a GraphQL Analytics answer, against the free
-    daily allocation."""
-    if not isinstance(payload, dict):
-        raise MeterError("the analytics API answered with something other than an object")
+def _graphql_error(payload: Dict[str, Any]) -> None:
+    """Raise the first GraphQL error of PAYLOAD, naming the missing
+    permission when that is what it says."""
     errors = payload.get("errors")
-    if isinstance(errors, list) and errors:
-        first = errors[0] if isinstance(errors[0], dict) else {}
-        message = str(first.get("message") or "error")
-        if re.search(r"not authori[sz]ed|permission|forbidden|access", message, re.I):
-            raise MeterError("the token cannot read account analytics (it needs Account Analytics read): "
-                             + message)
-        raise MeterError("the analytics API answered: " + message)
+    if not isinstance(errors, list) or not errors:
+        return
+    first = errors[0] if isinstance(errors[0], dict) else {}
+    message = str(first.get("message") or "error")
+    if re.search(r"not authori[sz]ed|permission|forbidden|access", message, re.I):
+        raise MeterError("the token cannot read account analytics (it needs Account Analytics read): "
+                         + message)
+    raise MeterError("the analytics API answered: " + message)
+
+
+def _neuron_groups(payload: Dict[str, Any]) -> List[Any]:
     try:
         accounts = payload["data"]["viewer"]["accounts"]
     except (KeyError, TypeError):
@@ -115,11 +117,24 @@ def workersai_windows(payload: Any, now: float, allowance: float) -> List[Dict[s
     groups = accounts[0].get("aiInferenceAdaptiveGroups") if isinstance(accounts[0], dict) else None
     if not isinstance(groups, list):
         raise MeterError("the analytics API answered without aiInferenceAdaptiveGroups")
-    used = 0.0
-    for group in groups:
-        total = _number(((group or {}).get("sum") or {}).get("totalNeurons")) if isinstance(group, dict) else None
-        used += total or 0.0
-    return [_window("daily", used, allowance, "neurons", next_utc_midnight(now), minutes=1440)]
+    return groups
+
+
+def _neurons(group: Any) -> float:
+    total = group.get("sum") if isinstance(group, dict) else None
+    if not isinstance(total, dict):
+        return 0.0
+    return _number(total.get("totalNeurons")) or 0.0
+
+
+def workersai_windows(payload: Any, now: float, allowance: float) -> List[Dict[str, Any]]:
+    """Today's Neurons from a GraphQL Analytics answer, against the free
+    daily allocation."""
+    if not isinstance(payload, dict):
+        raise MeterError("the analytics API answered with something other than an object")
+    _graphql_error(payload)
+    used = sum(_neurons(group) for group in _neuron_groups(payload))
+    return [_window("daily", float(used), allowance, "neurons", next_utc_midnight(now), minutes=1440)]
 
 
 def _send(fetch: Fetch, request: urllib.request.Request) -> Any:
@@ -139,7 +154,42 @@ def _send(fetch: Fetch, request: urllib.request.Request) -> Any:
 
 
 def _urlopen(request: urllib.request.Request) -> Any:
-    return urllib.request.urlopen(request, timeout=TIMEOUT)  # noqa: S310 - fixed https URLs
+    return urllib.request.urlopen(request, timeout=TIMEOUT)  # noqa: S310 - _request allows http(s) only
+
+
+def _request(url: str, key: str, body: Optional[bytes] = None) -> urllib.request.Request:
+    """A request to URL with the key as a bearer token. Only http and https
+    are sent: a file: or custom scheme in an override is refused."""
+    if not re.match(r"https?://", url):
+        raise MeterError("the meter URL is not http or https")
+    headers = {"Authorization": "Bearer " + key, "Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    return urllib.request.Request(url, data=body, method="POST" if body is not None else "GET",  # noqa: S310 - scheme checked above
+                                  headers=headers)
+
+
+def _daily_neurons(env: Dict[str, str]) -> float:
+    try:
+        return float(env.get("LOOM_WORKERSAI_DAILY_NEURONS") or WORKERSAI_FREE_NEURONS)
+    except ValueError:
+        return WORKERSAI_FREE_NEURONS
+
+
+def _read_openrouter(record: Dict[str, Any], key: str, now: float, url: Optional[str], fetch: Fetch) -> None:
+    record["source"] = "OpenRouter GET /api/v1/key"
+    record["windows"] = openrouter_windows(_send(fetch, _request(url or OPENROUTER_URL, key)), now)
+
+
+def _read_workersai(record: Dict[str, Any], key: str, account: str, now: float, env: Dict[str, str],
+                    url: Optional[str], fetch: Fetch) -> None:
+    record["source"] = "Cloudflare GraphQL Analytics (aiInferenceAdaptiveGroups)"
+    if not re.fullmatch(r"[A-Za-z0-9]+", account or ""):
+        raise MeterError("the lane has no Cloudflare account id")
+    body = json.dumps({"query": NEURONS_QUERY, "variables": {
+        "account": account, "date": datetime.fromtimestamp(now, timezone.utc).date().isoformat()}}).encode()
+    answer = _send(fetch, _request(url or CLOUDFLARE_GRAPHQL_URL, key, body))
+    record["windows"] = workersai_windows(answer, now, _daily_neurons(env))
 
 
 def read(lane: str, key: str, account: str, now: float, env: Dict[str, str],
@@ -150,26 +200,9 @@ def read(lane: str, key: str, account: str, now: float, env: Dict[str, str],
         if not key:
             raise MeterError("the lane has no key to read the meter with")
         if lane == "openrouter":
-            record["source"] = "OpenRouter GET /api/v1/key"
-            request = urllib.request.Request(url or OPENROUTER_URL, headers={
-                "Authorization": "Bearer " + key, "Accept": "application/json"})
-            record["windows"] = openrouter_windows(_send(fetch, request), now)
+            _read_openrouter(record, key, now, url, fetch)
         elif lane == "workersai":
-            record["source"] = "Cloudflare GraphQL Analytics (aiInferenceAdaptiveGroups)"
-            if not re.fullmatch(r"[A-Za-z0-9]+", account or ""):
-                raise MeterError("the lane has no Cloudflare account id")
-            allowance = WORKERSAI_FREE_NEURONS
-            try:
-                allowance = float(env.get("LOOM_WORKERSAI_DAILY_NEURONS") or WORKERSAI_FREE_NEURONS)
-            except ValueError:
-                pass
-            body = json.dumps({"query": NEURONS_QUERY, "variables": {
-                "account": account,
-                "date": datetime.fromtimestamp(now, timezone.utc).date().isoformat()}}).encode()
-            request = urllib.request.Request(url or CLOUDFLARE_GRAPHQL_URL, data=body, method="POST", headers={
-                "Authorization": "Bearer " + key, "Content-Type": "application/json",
-                "Accept": "application/json"})
-            record["windows"] = workersai_windows(_send(fetch, request), now, allowance)
+            _read_workersai(record, key, account, now, env, url, fetch)
         else:
             raise MeterError("no meter for lane %s" % lane)
     except MeterError as err:

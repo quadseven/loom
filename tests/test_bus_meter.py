@@ -128,6 +128,12 @@ class MeterReadTests(unittest.TestCase):
         self.assertEqual(fetch.requests, [])
         self.assertEqual(record["error"], "the lane has no Cloudflare account id")
 
+    def test_a_url_that_is_not_http_is_refused_unsent(self):
+        fetch = FakeFetch(OPENROUTER_KEY)
+        record = meter.read("openrouter", "k", "", NOW, {}, url="file:///etc/passwd", fetch=fetch)
+        self.assertEqual(fetch.requests, [])
+        self.assertEqual(record["error"], "the meter URL is not http or https")
+
     def test_the_key_never_reaches_the_record(self):
         body = {"data": None, "errors": [{"message": "bad token sk-secret-1"}]}
         record = meter.read("workersai", "sk-secret-1", "acct", NOW, {}, fetch=FakeFetch(body))
