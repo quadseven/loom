@@ -51,6 +51,10 @@ HELD_MAX = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
+# How long a lane that held a running ticket while silent stays a breach after
+# the factory last found one: the move takes the ticket off the lane, so the
+# breach would otherwise be gone before the next invariant check.
+SILENT_KEEP = 2 * 3600
 # One refused decision repeating this long with no success of its kind is an
 # invariant (loom#593). The event log is read EVENT_WINDOW back, so a run that
 # began just over an hour ago is seen whole between irregular station passes.
@@ -184,6 +188,15 @@ class GateHold(NamedTuple):
     idle: int
 
 
+class SilentRun(NamedTuple):
+    """A lane that held running tickets while it sent no heartbeat: how long
+    it had been silent when the factory found them, the tickets, and when."""
+    lane: str
+    silent_for: float
+    tickets: Tuple[Ref, ...]
+    at: float
+
+
 class Event(NamedTuple):
     at: float
     kind: str
@@ -219,6 +232,8 @@ class Facts:
     gate_held: Optional[Dict[str, GateHold]] = None
     # remote lane -> its newest heartbeat, None when it never posted one.
     beats: Optional[Dict[str, Optional[float]]] = None
+    # Lanes that held a running ticket while silent, in the last SILENT_KEEP.
+    silent_runs: Optional[List[SilentRun]] = None
     events: Optional[List[Event]] = None
     # untrusted labeler login -> briefed tickets refused for it in the last
     # LABELER_WINDOW seconds.
@@ -573,6 +588,27 @@ def remote_silent(f: Facts) -> List[Breach]:
     return out
 
 
+def silent_lane(f: Facts) -> List[Breach]:
+    """A lane that held a running ticket while it sent no heartbeat, so the
+    claim could not end (loom#538)."""
+    if f.silent_runs is None:
+        return []
+    out = []
+    for run in sorted(f.silent_runs, key=lambda r: r.lane):
+        if not 0 <= f.now - run.at <= SILENT_KEEP:
+            continue
+        shown = ", ".join(t.label for t in run.tickets[:SHOWN])
+        more = " and %d more" % (len(run.tickets) - SHOWN) if len(run.tickets) > SHOWN else ""
+        out.append(Breach("silent-lane", run.lane,
+                          "Lane %s held a running ticket while silent for %s"
+                          % (run.lane, _hours(run.silent_for)),
+                          ("Silent for %s when found, at %s" % (_hours(run.silent_for), utc(run.at)),
+                           "Running tickets it held: %s%s" % (shown or "none", more),
+                           "Each moved to a free lane of its tier, or back to the queue"),
+                          run.at))
+    return out
+
+
 def gate_hold(f: Facts) -> List[Breach]:
     """A goal the unproven-work gate refused briefed tickets for past
     GATE_HOLD_MAX: the refusal would otherwise live only in the station log
@@ -664,7 +700,8 @@ def untrusted_labeler(f: Facts) -> List[Breach]:
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
-    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold, repeated_failure,
+    plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
+    repeated_failure,
     untrusted_labeler)
 
 

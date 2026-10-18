@@ -201,7 +201,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
 
-    def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=()):
+    def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
@@ -219,7 +219,8 @@ class Base(unittest.TestCase):
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
                             merge=merge, fix=fix, move=move, close=close,
                             limited=limited, no_test_repos=no_test_repos,
-                            available=available, model_limits=model_limits, held=held)
+                            available=available, model_limits=model_limits, held=held,
+                            silent=silent)
         f.run()
         return f
 
@@ -1748,6 +1749,83 @@ class Tickets(Base):
         self.assertEqual(len(self.moved), factory.MAX_ACTIONS)
 
 
+class SilentLane(Base):
+    """A running ticket on a lane that has sent no heartbeat for SILENT_MAX."""
+
+    def silent_ticket(self, body="Difficulty: medium\n\n## Why\nx\n"):
+        self.gh.ticket(7, "running", lane="codex", body=body)
+        self.gh.comments[7].append({"body": "Claimed for lane codex (body sha256 0123456789ab)",
+                                    "user": ME})
+
+    def labels(self, number=7):
+        return {x["name"] for x in self.gh.issues[number]["labels"]}
+
+    def test_a_ticket_on_a_lane_silent_31_minutes_moves_to_a_free_lane_of_its_tier(self):
+        self.silent_ticket()
+        f = self.go(silent={"codex": 31 * 60})
+        self.assertNotEqual(self.lane(7), "codex")
+        self.assertIn(self.lane(7), factory.TIERS["medium"])
+        self.assertEqual(self.labels() & {"loom:running", "loom:queued"}, set())
+        self.assertIn("loom:briefed", self.labels())
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("Not a failure", note)
+        self.assertIn("lane codex", note)
+        self.assertIn("31 minutes", note)
+        self.assertIn("lane %s" % self.lane(7), note)
+        self.assertEqual(f.silent_running, {"codex": [(REPO, 7)]})
+
+    def test_the_move_records_no_failure_and_uses_no_retry(self):
+        self.silent_ticket()
+        self.go(silent={"codex": 31 * 60})
+        comments = self.gh.comments[7]
+        self.assertEqual(station.retry_chain(comments), (0, set(), None))
+        self.assertEqual(factory.rung_of(comments), 0)
+        self.assertFalse(any(factory.FAILED_RE.match(c["body"]) for c in comments))
+        self.assertEqual(self.moved, [])
+        # Its claim is no attempt on the new lane: the move is a new brief.
+        self.assertEqual(factory.attempts_since_brief(comments), [])
+
+    def test_a_model_ticket_moves_to_a_free_lane_that_takes_its_model(self):
+        self.silent_ticket(body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.go(silent={"codex": 31 * 60})
+        self.assertIn("loom:briefed", self.labels())
+        self.assertTrue(station.lane_takes_model(self.lane(7), "claude-sonnet-5-5"))
+        self.assertEqual(self.model(7), "claude-sonnet-5-5")
+
+    def test_a_lane_silent_29_minutes_leaves_the_ticket_alone(self):
+        self.silent_ticket()
+        f = self.go(silent={"codex": 29 * 60})
+        self.assertEqual((self.lane(7), self.gh.writes, f.silent_running), ("codex", [], {}))
+
+    def test_a_live_lane_leaves_the_ticket_alone(self):
+        self.silent_ticket()
+        f = self.go(silent={})
+        self.assertEqual((self.lane(7), self.gh.writes, f.silent_running), ("codex", [], {}))
+
+    def test_a_remote_lane_is_left_to_the_remote_heartbeat_rules(self):
+        self.gh.ticket(7, "running", lane="muse")
+        f = self.go(silent={"muse": 31 * 60})
+        self.assertEqual((self.gh.writes, f.silent_running), ([], {}))
+
+    def test_a_held_ticket_is_left_alone(self):
+        self.silent_ticket()
+        self.go(silent={"codex": 31 * 60}, held=["%s#7" % REPO])
+        self.assertEqual(self.gh.writes, [])
+
+    def test_with_no_free_lane_of_the_tier_the_ticket_goes_back_to_queued(self):
+        self.silent_ticket()
+        busy = [x for x in factory.lanes_of("medium", True) if x != "codex"]
+        for n, lane in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        f = self.go(silent={"codex": 31 * 60}, available=busy)
+        self.assertEqual(self.labels() & {"loom:running", "loom:briefed"}, set())
+        self.assertIn("loom:queued", self.labels())
+        self.assertNotIn("lane:codex", self.labels())
+        self.assertIn("Not a failure", self.gh.comments[7][-1]["body"])
+        self.assertEqual(station.retry_chain(self.gh.comments[7]), (0, set(), None))
+        self.assertEqual(f.silent_running, {"codex": [(REPO, 7)]})
+
+
 class Helpers(unittest.TestCase):
     def test_with_model_replaces_or_inserts_the_header(self):
         self.assertEqual(factory.with_model("Difficulty: hard\nModel: a\n\n## Why\nModel: x", "b"),
@@ -1870,7 +1948,8 @@ class Helpers(unittest.TestCase):
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
-                         model_limits=None):
+                         model_limits=None, silent=None):
+                self.silent_running, self.silent = {}, silent
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 
