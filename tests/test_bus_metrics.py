@@ -161,6 +161,28 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(bottleneck, "queued")
         self.assertEqual(next(row for row in rows if row["state"] == "running")["n"], 2)
 
+    def test_a_closed_ticket_stops_its_wait_clock_at_the_close(self):
+        # A ticket verified 160h ago and closed 150h ago waited 10h in
+        # verified, not 160h: the label stays on after the close.
+        events = [{"event": "labeled", "label": label("loom:verified"), "created_at": iso(NOW - 160 * 3600)},
+                  {"event": "closed", "created_at": iso(NOW - 150 * 3600)}]
+        self.assertEqual(metrics.ticket_waits(events, NOW), {"verified": 10})
+
+    def test_a_reopen_restarts_the_clock_and_labels_added_while_closed_wait_for_it(self):
+        events = [{"event": "labeled", "label": label("loom:failed"), "created_at": iso(NOW - 20 * 3600)},
+                  {"event": "closed", "created_at": iso(NOW - 18 * 3600)},
+                  {"event": "labeled", "label": label("loom:queued"), "created_at": iso(NOW - 10 * 3600)},
+                  {"event": "reopened", "created_at": iso(NOW - 4 * 3600)}]
+        self.assertEqual(metrics.ticket_waits(events, NOW), {"failed": 2, "queued": 4})
+
+    def test_verified_is_terminal_and_never_the_bottleneck(self):
+        tickets = [("r#%d" % n, {"pr": n, "verified": 100 * n}) for n in (1, 2, 3)]
+        rows, bottleneck = metrics.summarize_waits(tickets)
+        self.assertEqual(bottleneck, "pr")
+        self.assertEqual(next(r for r in rows if r["state"] == "verified")["n"], 3)
+        self.assertIsNone(metrics.bottleneck([{"state": "verified", "median_h": 88.6, "n": 9},
+                                              {"state": "closed-unmerged", "median_h": 50, "n": 9}]))
+
     def test_each_target_can_fail(self):
         changes = [
             lambda: self.gh.pr.update(state="open", created_at=iso(NOW - 30000), merged_at=None),

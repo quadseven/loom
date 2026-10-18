@@ -19,31 +19,69 @@ from .labels import LANES
 
 WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 WAIT_WINDOW = 7 * 86400
+# A ticket in a terminal state is done, not waiting: verified is the end of the
+# line and closed-unmerged was dropped. Neither is ever the bottleneck, and the
+# Brain ranking leaves them out too. Counting verified as a queue named it the
+# bottleneck at an 88.6h median, all of it time after the proof (2026-10-17).
+TERMINAL_STATES = ("verified", "closed-unmerged")
+# A state needs this many tickets' waits before it can be the bottleneck.
+BOTTLENECK_MIN = 3
+
+
+def _state(event: Dict[str, Any]) -> str | None:
+    label = (event.get("label") or {}).get("name")
+    return label[5:] if isinstance(label, str) and label.startswith("loom:") else None
 
 
 def ticket_waits(events: Sequence[Dict[str, Any]], now: float) -> Dict[str, float]:
-    """Return hours spent in each lifecycle state, including the current state."""
+    """Return hours spent in each lifecycle state, including the current state.
+    The clock stops when the issue closes and starts again only on a reopen:
+    a closed ticket still carries its last state label, and counting that
+    label until now added days of false waiting to every read."""
     waits: Dict[str, float] = {}
     current: str | None = None
     entered: float | None = None
+    closed = False
+
+    def stop(at: float) -> None:
+        if current is not None and entered is not None:
+            waits[current] = waits.get(current, 0.0) + max(0.0, at - entered) / 3600
+
     for event in sorted(events, key=lambda item: stamp(item.get("created_at"))):
         kind = event.get("event")
-        label = (event.get("label") or {}).get("name")
-        state = label[5:] if isinstance(label, str) and label.startswith("loom:") else None
+        at = stamp(event.get("created_at"))
+        if kind == "closed":
+            stop(at)
+            closed, entered = True, None
+            continue
+        if kind == "reopened":
+            closed = False
+            entered = at if current is not None else None
+            continue
+        state = _state(event)
         if state not in WAIT_STATES:
             continue
-        at = stamp(event.get("created_at"))
         if kind == "labeled":
-            if current is not None and entered is not None:
-                waits[current] = waits.get(current, 0.0) + max(0.0, at - entered) / 3600
-            current, entered = state, at
+            stop(at)
+            current, entered = state, (None if closed else at)
         elif kind == "unlabeled" and state == current:
-            if entered is not None:
-                waits[current] = waits.get(current, 0.0) + max(0.0, at - entered) / 3600
+            stop(at)
             current, entered = None, None
-    if current is not None and entered is not None:
-        waits[current] = waits.get(current, 0.0) + max(0.0, now - entered) / 3600
+    stop(now)
     return waits
+
+
+def bottleneck(rows: Sequence[Any]) -> str | None:
+    """The waiting state with the longest median wait over at least
+    BOTTLENECK_MIN tickets, or None. Terminal states never qualify. The
+    Floor and Hot spots pages both name the bottleneck through this, from
+    the same wait rows, so they cannot disagree."""
+    candidates = [row for row in rows or () if isinstance(row, dict)
+                  and row.get("state") in WAIT_STATES
+                  and row.get("state") not in TERMINAL_STATES
+                  and (row.get("n") or 0) >= BOTTLENECK_MIN
+                  and row.get("median_h") is not None]
+    return max(candidates, key=lambda row: float(row["median_h"]))["state"] if candidates else None
 
 
 def summarize_waits(tickets: Sequence[tuple[str, Dict[str, float]]]) -> tuple[List[Dict[str, Any]], str | None]:
@@ -58,9 +96,7 @@ def summarize_waits(tickets: Sequence[tuple[str, Dict[str, float]]]) -> tuple[Li
         worst_ticket, worst_h = max(samples, key=lambda pair: pair[1])
         rows.append({"state": state, "median_h": statistics.median(v for _, v in samples),
                      "worst_h": worst_h, "worst_ticket": worst_ticket, "n": len(samples)})
-    candidates = [row for row in rows if row["n"] >= 3]
-    bottleneck = max(candidates, key=lambda row: row["median_h"])["state"] if candidates else None
-    return rows, bottleneck
+    return rows, bottleneck(rows)
 
 
 def entered_state(events: Sequence[Dict[str, Any]]) -> tuple[str, float] | None:
@@ -68,8 +104,7 @@ def entered_state(events: Sequence[Dict[str, Any]]) -> tuple[str, float] | None:
     the same reading as ticket_waits, or None when no state label is on."""
     current: tuple[str, float] | None = None
     for event in sorted(events, key=lambda item: stamp(item.get("created_at"))):
-        label = (event.get("label") or {}).get("name")
-        state = label[5:] if isinstance(label, str) and label.startswith("loom:") else None
+        state = _state(event)
         if state not in WAIT_STATES:
             continue
         if event.get("event") == "labeled":

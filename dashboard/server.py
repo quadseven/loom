@@ -21,6 +21,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 
 from bus import brain as bus_brain
 from bus import tickets as bus_tickets
+from bus import metrics as bus_metrics
 
 from .github import TicketStore
 from .shell import page
@@ -33,7 +34,6 @@ from . import ticket_data
 from . import tickets_table
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
-WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
 from . import views
 from . import brain_view, hot_spots
 
@@ -158,13 +158,12 @@ def _conveyor(state, rows):
     waits = getattr(state, "waits", None)
     response = state.response()
     wait_rows = {row.get("state"): row for row in response.get("wait_rows", []) if isinstance(row, dict)}
-    waiting = [(name, wait_rows[name].get("median_h")) for name in WAIT_STATES
-               if name in wait_rows and wait_rows[name].get("n", 0) >= 3
-               and wait_rows[name].get("median_h") is not None]
-    if not wait_rows:
-        waiting = [(name, statistics.median(waits[name])) for name in WAIT_STATES
-                   if isinstance(waits, dict) and isinstance(waits.get(name), list) and len(waits[name]) >= 3]
-    bottleneck = max(waiting, key=lambda pair: pair[1])[0] if waiting else None
+    # The same function and rows as Hot spots, so the two pages name one bottleneck.
+    named = list(wait_rows.values()) if wait_rows else [
+        {"state": name, "median_h": statistics.median(sample), "n": len(sample)}
+        for name, sample in (waits.items() if isinstance(waits, dict) else ())
+        if isinstance(sample, list) and sample]
+    bottleneck = bus_metrics.bottleneck(named)
     backlog_count, backlog_error = _backlog(state)
     cards = ['<a class="step-card" href="/backlog"><strong>%s</strong><span>backlog</span><small>%s</small></a>' % (
         str(backlog_count) if backlog_count is not None else "not looked",
@@ -174,7 +173,7 @@ def _conveyor(state, rows):
         stats = wait_rows.get(name, {})
         median = stats.get("median_h") if wait_rows else (statistics.median(sample) if sample else None)
         worst = stats.get("worst_h")
-        mark = " bottleneck" if name == bottleneck and name not in ("verified", "failed") else ""
+        mark = " bottleneck" if name == bottleneck else ""
         note = ("<small>median %.1fh%s</small>" % (median, " | worst %.1fh" % worst if worst is not None else "")) if median is not None else "<small>%s</small>" % html.escape(getattr(state, "waits_error", "median unavailable"))
         if name == bottleneck:
             note = "<small>bottleneck - median %.1fh%s</small>" % (median, " | worst %.1fh" % worst if worst is not None else "")
