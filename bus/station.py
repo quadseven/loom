@@ -938,6 +938,7 @@ class Station:
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
         self.state = os.path.join(settings.home, "state", "station")
+        self.event_log = os.path.join(settings.home, "logs", "events.jsonl")
         self._spend: Optional[spend.Summary] = None
         # This pass's repo scans: the repos due, what was read of each, and
         # which held a ticket in flight.
@@ -1108,6 +1109,49 @@ class Station:
             "%s#%s" % (repo, issue["number"]))
         return bool(rec) and rec.get("updated_at") == issue.get("updated_at")
 
+    def _event(self, kind: str, reason: str, item: str = "", lane: str = "",
+               model: str = "") -> None:
+        """Append one redacted decision event and rotate its log by UTC day."""
+        directory = os.path.dirname(self.event_log)
+        os.makedirs(directory, exist_ok=True)
+        day = time.strftime("%Y-%m-%d", time.gmtime(self.now))
+        archive = os.path.join(directory, "events.%s.jsonl" % day)
+        if os.path.exists(self.event_log):
+            mtime = os.path.getmtime(self.event_log)
+            old_day = time.strftime("%Y-%m-%d", time.gmtime(mtime))
+            if old_day != day:
+                os.replace(self.event_log, os.path.join(directory, "events.%s.jsonl" % old_day))
+        # Retain today's file and six previous daily archives.
+        archives = sorted((p for p in Path(directory).glob("events.*.jsonl")
+                           if p.name[7:17].count("-") == 2), reverse=True)
+        for stale in archives[6:]:
+            stale.unlink()
+        record = {"time": invariants.utc(self.now), "at": self.now, "kind": kind,
+                  "reason": invariants.public(reason)[:300], "item": invariants.public(item)[:160],
+                  "lane": invariants.public(lane)[:80], "model": invariants.public(model)[:120]}
+        with open(self.event_log, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _read_events(self) -> List[invariants.Event]:
+        directory = os.path.dirname(self.event_log)
+        rows = []
+        for path in list(Path(directory).glob("events.*.jsonl")) + [Path(self.event_log)]:
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        try:
+                            row = json.loads(line)
+                            at = float(row["at"])
+                            if self.now - 3600 <= at <= self.now:
+                                rows.append(invariants.Event(at, str(row["kind"]), str(row.get("reason") or ""),
+                                                             str(row.get("item") or ""), str(row.get("lane") or ""),
+                                                             str(row.get("model") or "")))
+                        except (ValueError, KeyError, TypeError):
+                            continue
+            except FileNotFoundError:
+                continue
+        return rows
+
     def _refuse(self, repo: str, issue: Dict[str, Any], reason: str) -> None:
         """Log a refusal once per issue and body, and remember it."""
         path = os.path.join(self.state, "untrusted.json")
@@ -1119,6 +1163,7 @@ class Station:
         old = seen.get(key) or {}
         if old.get("sha") != sha:
             _say("not claiming %s: %s" % (key, reason))
+            self._event("not_claiming", reason, key)
         seen[key] = {"sha": sha, "updated_at": issue.get("updated_at")}
         _write_json(path, seen)
 
@@ -1728,6 +1773,8 @@ class Station:
                     self._record_gate_hold(repo, issue, limit, counts)
                     _say("not claiming %s#%s for lane %s: %s"
                          % (repo, issue.get("number"), lane, reason))
+                    self._event("not_claiming", reason,
+                                "%s#%s" % (repo, issue.get("number")), lane)
         return gated
 
     def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
@@ -2158,6 +2205,8 @@ class Station:
                          {"labels": names})
             self._comment(repo, number, "Model %s waits for a free compatible lane." % model)
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
+            self._event("model_wait", "no free lane takes model %s" % model,
+                        "%s#%d" % (repo, number), lane, model)
             return None
         names.append("lane:" + target)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -4506,6 +4555,7 @@ class Station:
         cmd = self._rewrite_command(repo, cmds)
         if not cmd:
             _say("rewrite %s: no agent command for this repo; skipped" % key)
+            self._event("rewrite_skipped", "no agent command for this repo", key)
             return 0
         done = 0
         for issue in rewrite.candidates(self.gh, repo):
@@ -4523,11 +4573,14 @@ class Station:
             except rewrite.CommandFailure as err:
                 tried.pop(str(number), None)
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
+                self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
                 continue
             except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
+                self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
                 continue
             _say("rewrite %s#%d: %s" % (repo, number, action))
+            self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
         return done
 
     def rewrite_triaged(self) -> None:
@@ -4716,6 +4769,7 @@ class Station:
         """What the invariants read, each source on its own: one that cannot
         be read stays None and its invariants find nothing this pass."""
         facts = invariants.Facts(now=self.now)
+        facts.events = self._read_events()
         for name, read in (("runs", self._invariant_runs),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):

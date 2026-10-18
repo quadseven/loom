@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
-from bus.invariants import Check, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
+from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"
@@ -197,6 +197,19 @@ class StationBase(unittest.TestCase):
 
 
 class AcceptanceTest(StationBase):
+    def test_repeated_rewrite_skip_files_once_across_two_hours(self):
+        path = os.path.join(self.home, "logs", "events.jsonl")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as stream:
+            for at in range(int(T0 - 3600), int(T0 + 3601), 60):
+                stream.write(__import__("json").dumps({"at": at, "kind": "rewrite_skipped",
+                             "reason": "no agent command for this repo"}) + "\n")
+        self.run_at(T0)
+        self.run_at(T0 + 3600)
+        made = [i for i in self.gh.issues.values()
+                if "repeated-failure" in i.get("body", "")]
+        self.assertEqual(len(made), 1)
+
     def test_thirteen_metrics_lines_for_one_day_file_one_ticket_and_a_second_pass_none(self):
         for i in range(13):
             self.gh.comment(GOAL, T0 - 3600 + i * 60,
@@ -531,6 +544,19 @@ class InvariantTest(unittest.TestCase):
 
     def j(self, at, holder="muse", steps=("status failed",)):
         return Journal(at, self.goal, holder, stamp(at), steps)
+
+    def test_repeated_failure_opens_after_an_hour_and_success_suppresses_it(self):
+        events = [Event(T0 - 3600 + i * 60, "rewrite_skipped", "no command")
+                  for i in range(61)]
+        (breach,) = invariants.repeated_failure(Facts(T0, events=events))
+        self.assertEqual(breach.invariant, "repeated-failure")
+        events.append(Event(T0 - 30, "rewrite_succeeded", "no command"))
+        self.assertEqual(invariants.repeated_failure(Facts(T0, events=events)), [])
+
+    def test_repeated_failure_needs_full_hour(self):
+        events = [Event(T0 - 3599, "rewrite_skipped", "no command"),
+                  Event(T0, "rewrite_skipped", "no command")]
+        self.assertEqual(invariants.repeated_failure(Facts(T0, events=events)), [])
 
     def test_one_failed_tick_between_good_ones_is_not_a_breach(self):
         f = Facts(T0, journals=[self.j(T0 - 3000), self.j(T0 - 1800, steps=()), self.j(T0 - 600)])

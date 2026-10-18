@@ -48,6 +48,7 @@ HELD_MAX = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
+REPEATED_FAILURE = 3600
 # Decision 0003: an epic holds at most EPIC_TICKETS tickets.
 EPIC_TICKETS = 15
 PLAN_FAILED_AGE = 30 * 60
@@ -171,6 +172,15 @@ class GateHold(NamedTuple):
     idle: int
 
 
+class Event(NamedTuple):
+    at: float
+    kind: str
+    reason: str
+    item: str = ""
+    lane: str = ""
+    model: str = ""
+
+
 @dataclass
 class Facts:
     now: float
@@ -193,6 +203,7 @@ class Facts:
     gate_held: Optional[Dict[str, GateHold]] = None
     # remote lane -> its newest heartbeat, None when it never posted one.
     beats: Optional[Dict[str, Optional[float]]] = None
+    events: Optional[List[Event]] = None
 
 
 @dataclass(frozen=True)
@@ -561,10 +572,37 @@ def gate_hold(f: Facts) -> List[Breach]:
     return out
 
 
+def repeated_failure(f: Facts) -> List[Breach]:
+    """A refused decision repeated for an hour without a matching success."""
+    if f.events is None:
+        return []
+    failures: Dict[Tuple[str, str], List[Event]] = {}
+    successes = set()
+    for event in f.events:
+        if f.now - REPEATED_FAILURE <= event.at <= f.now and event.reason:
+            if event.kind.endswith("_succeeded"):
+                successes.add((event.kind[:-10], event.reason))
+            elif event.kind in ("rewrite_failed", "rewrite_skipped", "model_wait", "not_claiming"):
+                failures.setdefault((event.kind, event.reason), []).append(event)
+    out = []
+    for (kind, reason), rows in sorted(failures.items()):
+        if (kind.removesuffix("_failed").removesuffix("_skipped"), reason) in successes:
+            continue
+        first = min(row.at for row in rows)
+        if f.now - first < REPEATED_FAILURE:
+            continue
+        subject = kind + "|" + reason
+        out.append(Breach("repeated-failure", subject,
+                          "Repeated %s for one hour: %s" % (kind.replace("_", " "), public(reason)),
+                          ("%d matching events in the last hour" % len(rows),
+                           "Most recent: %s" % utc(max(row.at for row in rows))), f.now))
+    return out
+
+
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
-    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold)
+    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold, repeated_failure)
 
 
 def check(facts: Facts, say: Say,
