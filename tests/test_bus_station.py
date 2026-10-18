@@ -322,8 +322,11 @@ class FakeGitHub:
         if "PullRequestReviewThread" in query:
             return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
         editor = self.editors[data["variables"]["number"]]
+        # GitHub's GraphQL names an App by its slug, typed Bot, without "[bot]".
+        actor = ({"__typename": "Bot", "login": editor[:-len("[bot]")]}
+                 if editor and editor.endswith("[bot]") else {"__typename": "User", "login": editor})
         return reply(200, {"data": {"repository": {"issue": {
-            "editor": {"login": editor} if editor and editor != "<ghost>" else None,
+            "editor": actor if editor and editor != "<ghost>" else None,
             "lastEditedAt": "2030-01-01T00:05:00Z" if editor else None}}}})
 
     def _list_briefed(self, headers):
@@ -2246,6 +2249,12 @@ class ClaimTest(Base):
         self.assertEqual(self.listing(), [name + ".md"])
         self.assertEqual(self.fake.paths("PUT"), [])
         self.assertEqual(self.fake.comments[12], [])
+
+    def test_a_ticket_the_loom_app_last_edited_is_still_claimed(self):
+        self.settings.authors = list(self.settings.authors) + ["loom-app[bot]"]
+        self.fake.add(12, editor="loom-app[bot]")
+        self.run_pass()
+        self.assertTrue(any(path.endswith("/issues/12/labels") for path in self.fake.paths("PUT")))
 
     def test_a_half_done_claim_is_dropped_when_the_ticket_is_no_longer_trusted(self):
         self.fake.add(12, editor="stranger")
