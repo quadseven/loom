@@ -83,7 +83,27 @@ time, and one log line per move. The pull request is the merged one whose
 `Refs` line or `loom/<number>` branch names the ticket. At most 20 move a
 pass, oldest merge first. A deploy that did not happen records nothing, so it
 ships nothing. Tickets of every other repo are never moved here; their goal
-home's ship rules decide, unless they ship through a pin pull request (below).
+home's ship rules decide, unless they ship on merge, on a deploy workflow or
+through a pin pull request (below).
+
+### Shipping on merge or on a deploy workflow
+
+A repo nothing deploys (a library, a tool people install themselves) ships at
+merge. List it in `LOOM_SHIP_ON_MERGE` (space separated `OWNER/NAME`). Each
+pass, the station moves its open `loom:merged` tickets to `loom:shipped`,
+oldest merge first, with a note saying the repo ships on merge.
+
+A repo with its own deploy workflow ships when that workflow succeeds. List
+it in `LOOM_SHIP_WORKFLOWS` as `OWNER/NAME=WORKFLOW_FILE` words (for example
+`example-owner/service=deploy.yml`). Each pass, the station reads that
+workflow's 30 most recent successful runs once and moves each open
+`loom:merged` ticket whose pull request's merge commit a run ran on, or the
+newest successful run on the default branch carries (the compare API; a merge
+outside the workflow's path filter ships with the next deploy), to
+`loom:shipped`, with a note naming the run. Only push runs on the repo's own
+default branch count (event `push`, head branch the default branch, head
+repository the repo itself): a pull request run, or a fork's, can sit at the
+same commit without deploying it. At most 20 move per repo a pass.
 
 ### Shipping through a pin pull request
 

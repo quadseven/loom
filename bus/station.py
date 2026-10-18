@@ -191,6 +191,17 @@ COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 # The handoff packet is rebuilt at most this often, or sooner when a brain
 # tick on this machine just ended (publish_handoff).
 HANDOFF_EVERY = 600
+# Shipping on merge (LOOM_SHIP_ON_MERGE): a repo nothing deploys ships a
+# ticket when its pull request merges. Shipping on a workflow
+# (LOOM_SHIP_WORKFLOWS, OWNER/NAME=WORKFLOW_FILE words): a repo with its own
+# deploy workflow ships a ticket once a successful run of that workflow ran
+# on its pull request's merge commit, or the newest successful run on the
+# default branch carries it. Only push runs on the default branch of the repo
+# itself count: a pull request run, or one from a fork's head repository, can
+# sit at the same commit without deploying anything. At most SHIP_PER_PASS
+# move per rule a pass.
+SHIP_RUNS_URL = ("/repos/%s/actions/workflows/%s/runs?status=success&event=push"
+                 "&branch=%s&per_page=30")
 # Shipping through a pin pull request (LOOM_PIN_SHIP_REPOS): a merged pull
 # request in a deployment repo that adds a "# Published from <repo> ..., merge
 # <sha>" comment line deploys that revision of the source repo, so it ships
@@ -415,8 +426,15 @@ class Settings:
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = (),
-                 briefers: Sequence[str] = ()) -> None:
+                 briefers: Sequence[str] = (),
+                 ship_on_merge: Sequence[str] = (),
+                 ship_workflows: Optional[Dict[str, str]] = None) -> None:
         self.home = home
+        # Repos whose merged tickets ship at merge (ship_on_merge), and repos
+        # whose merged tickets ship when their deploy workflow succeeds on the
+        # merge commit, repo to workflow file (ship_workflows).
+        self.ship_on_merge = list(ship_on_merge)
+        self.ship_workflows = dict(ship_workflows or {})
         # Deployment repos whose merged pin pull requests ship the tickets
         # of the source revision they publish (ship_pins).
         self.pin_ship_repos = list(pin_ship_repos)
@@ -533,7 +551,22 @@ class Settings:
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
-                   briefers=words("LOOM_TRUSTED_BRIEFERS"))
+                   briefers=words("LOOM_TRUSTED_BRIEFERS"),
+                   ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
+                   ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")))
+
+
+def _ship_workflows(items: List[str]) -> Dict[str, str]:
+    """OWNER/NAME=WORKFLOW_FILE words as a map; a malformed word is skipped
+    and said once."""
+    found: Dict[str, str] = {}
+    for item in items:
+        repo, _, workflow = item.partition("=")
+        if tickets.REPO_RE.fullmatch(repo) and re.fullmatch(r"[\w.-]+\.ya?ml", workflow):
+            found[repo] = workflow
+        else:
+            _say("ignoring %r in LOOM_SHIP_WORKFLOWS: not OWNER/NAME=WORKFLOW.yml" % item)
+    return found
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -3174,6 +3207,91 @@ class Station:
             return False
         _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
         return True
+
+    # -- shipping on merge or on a deploy workflow --------------------------
+    def ship_merged(self) -> None:
+        """Move the open merged tickets of each LOOM_SHIP_ON_MERGE repo to
+        loom:shipped: nothing deploys those repos, so the merge is the ship."""
+        for repo in [r for r in self.s.ship_on_merge if tickets.REPO_RE.fullmatch(r)]:
+            try:
+                merged = self._merged_tickets(repo)
+                if not merged:
+                    continue
+                latest = self._merged_pulls(repo, merged)
+            except GitHubError as err:
+                _say("could not ship merged tickets of %s: %s" % (repo, err))
+                continue
+            ordered = sorted((str(pr["merged_at"]), number, pr) for number, pr in latest.items())
+            for _, number, pr in ordered[:SHIP_PER_PASS]:
+                self._ship_one(repo, number, pr,
+                               "%s ships on merge (LOOM_SHIP_ON_MERGE); pull request #%d "
+                               "merged at %s" % (repo, int(pr["number"]),
+                                                 str(pr["merged_at"]).replace("T", " ")),
+                               "merge")
+
+    def ship_workflows(self) -> None:
+        """Move the open merged tickets of each LOOM_SHIP_WORKFLOWS repo whose
+        pull request's merge commit a successful run of the repo's deploy
+        workflow ran on, or the newest successful run on the default branch
+        carries, to loom:shipped."""
+        for repo, workflow in sorted(self.s.ship_workflows.items()):
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                self._ship_workflow(repo, workflow)
+            except GitHubError as err:
+                _say("could not ship %s on workflow %s: %s" % (repo, workflow, err))
+
+    def _ship_workflow(self, repo: str, workflow: str) -> None:
+        merged = self._merged_tickets(repo)
+        branch = self._default_branch(repo) if merged else ""
+        runs = self._deploy_runs(repo, workflow, branch) if branch else []
+        if not runs:
+            return
+        by_sha = {str(r["head_sha"]): r for r in runs}
+        newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
+        latest = self._merged_pulls(repo, merged)
+        shipped = 0
+        for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
+            if shipped >= SHIP_PER_PASS:
+                return
+            run = self._covering_run(repo, pr, by_sha, newest)
+            if run is not None and self._ship_one(
+                    repo, number, pr,
+                    "workflow %s succeeded on %s revision %s (run %s)" % (
+                        workflow, repo, str(run["head_sha"])[:12], run.get("id")),
+                    "workflow %s" % workflow):
+                shipped += 1
+
+    def _deploy_runs(self, repo: str, workflow: str, branch: str) -> List[Dict[str, Any]]:
+        """The workflow's recent successful push runs on the repo's own
+        default branch, read once (SHIP_RUNS_URL) and checked again here."""
+        data = self.gh.rest("GET", SHIP_RUNS_URL % (repo, workflow, quote(branch, safe=""))).data
+        listed = data.get("workflow_runs") if isinstance(data, dict) else None
+        return [r for r in (listed if isinstance(listed, list) else [])
+                if isinstance(r, dict) and self._deploy_run(repo, branch, r)]
+
+    def _covering_run(self, repo: str, pr: Dict[str, Any], by_sha: Dict[str, Dict[str, Any]],
+                      newest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The deploy run that covers the pull request's merge commit: one
+        that ran on it, else the newest run when it started after the merge
+        and its revision carries the commit; None when no run does."""
+        sha = str(pr["merge_commit_sha"])
+        if sha in by_sha:
+            return by_sha[sha]
+        if str(newest.get("created_at") or "") < str(pr["merged_at"]):
+            return None
+        return newest if self._carries(repo, sha, str(newest["head_sha"])) else None
+
+    @staticmethod
+    def _deploy_run(repo: str, branch: str, run: Dict[str, Any]) -> bool:
+        """A successful push run on the repo's own default branch: the
+        filters asked of GitHub, checked again on what came back."""
+        head = run.get("head_repository") if isinstance(run.get("head_repository"), dict) else {}
+        return (run.get("status") == "completed" and run.get("conclusion") == "success"
+                and run.get("event") == "push" and run.get("head_branch") == branch
+                and str(head.get("full_name") or "").lower() == repo.lower()
+                and bool(COMMIT_RE.fullmatch(str(run.get("head_sha") or ""))))
 
     # -- shipping through a pin pull request ------------------------------
     def ship_pins(self) -> None:
@@ -6760,7 +6878,8 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.unwind_reverts,
+        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_merged,
+                     self.ship_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
