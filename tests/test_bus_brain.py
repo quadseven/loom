@@ -2881,6 +2881,53 @@ def evidenced(number, evidence="p95 claim wait rose from 40 s to 900 s after it 
     return BODY.replace("## Why\nwhy", "## Why\nRegresses #%d\n%s" % (number, evidence))
 
 
+class RepairBriefTests(unittest.TestCase):
+    """loom#767: factory-repair briefs (Priority: P0, or under an epic named
+    in LOOM_REPAIR_EPICS) pass the unproven-work limit, at most
+    REPAIR_IN_FLIGHT at once per goal."""
+
+    def over_limit(self, *extra):
+        shipped = [item(100 + i, labels=["loom:ticket", "loom:shipped"])
+                   for i in range(brain.unverified_limit() + 1)]
+        return GoalRepo(shipped + list(extra))
+
+    def brief(self, fake, **kw):
+        return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex", **kw)
+
+    def test_an_ordinary_brief_over_the_limit_is_refused(self):
+        fake = self.over_limit()
+        with self.assertRaisesRegex(ValueError, "without a proof"):
+            self.brief(fake)
+        self.assertEqual(fake.created(), [])
+
+    def test_a_p0_brief_over_the_limit_is_filed(self):
+        fake = self.over_limit()
+        self.brief(fake, priority="P0")
+        self.assertEqual(len(fake.created()), 1)
+
+    def test_a_brief_under_a_repair_epic_over_the_limit_is_filed(self):
+        fake = self.over_limit()
+        with unittest.mock.patch.dict(os.environ, {"LOOM_REPAIR_EPICS": "%s#%d" % (REPO, EPIC)}):
+            self.brief(fake)
+        self.assertEqual(len(fake.created()), 1)
+
+    def test_a_third_repair_brief_waits_while_two_are_in_flight(self):
+        flying = [item(200 + i, labels=["loom:ticket", "loom:running"],
+                       body="Priority: P0\n\n## Why\nx\n") for i in range(2)]
+        fake = self.over_limit(*flying)
+        with self.assertRaisesRegex(ValueError, "2 factory-repair tickets are in flight "
+                                                "already \\(#200, #201"):
+            self.brief(fake, priority="P0")
+        self.assertEqual(fake.created(), [])
+
+    def test_repair_epics_reads_owner_name_number_words(self):
+        env = {"LOOM_REPAIR_EPICS": "o/r#5 junk o.x/r-2#17 o/r#"}
+        self.assertEqual(brain.repair_epics(env), {("o/r", 5), ("o.x/r-2", 17)})
+        self.assertTrue(brain.is_repair("o/r", {"body": "x\n\nPart of #5\n"}, env))
+        self.assertFalse(brain.is_repair("o/q", {"body": "x\n\nPart of #5\n"}, env))
+        self.assertTrue(brain.is_repair("o/q", {"body": "Priority: P0\n\n## Why\nx\n"}, env))
+
+
 class RegressionSlotTests(unittest.TestCase):
     ORDINARY = ["queued", "briefed", "running", "pr"] * 4
 

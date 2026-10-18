@@ -716,6 +716,27 @@ fixes a measured regression of ticket M:
 - Briefing the same regression again while its ticket is in flight files
   nothing and prints that ticket.
 
+## Factory-repair tickets
+
+The unproven-work limit (`LOOM_UNVERIFIED_LIMIT`, shipped tickets with no
+standing proof per goal) holds back new build work until the goal verifies
+what it shipped. It must not hold back repairs to the factory itself, which
+are often what verification is waiting on (loom#767). A factory-repair
+ticket is one at `Priority: P0`, or one under an epic that
+`LOOM_REPAIR_EPICS` names (space-separated `owner/name#N` words). Over the
+limit:
+
+- `bus.brain brief` files a repair brief while fewer than two repair
+  tickets of the goal are in flight (queued, briefed, running, pr or
+  failed); the third is refused and names the two.
+- The station claims a repair ticket while fewer than two other repair
+  tickets of the goal are running or at a pull request.
+- The in-flight cap (`LOOM_GOAL_CAP`) still applies; only the
+  unproven-work limit is passed. Ordinary tickets still wait.
+
+Set `LOOM_REPAIR_EPICS` on the station and on every brain, so both agree
+on what passes.
+
 ## Red default branch
 
 Lanes merge as soon as their own pull request is green and reviewed: there
