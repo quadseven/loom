@@ -55,6 +55,8 @@ class FakeGH:
         self.calls = []
         self.writes = []
         self.search_items = []
+        # The open review threads the review bot left on a pull request.
+        self.threads = []
         # (repo, issue number) -> its sub-issues, for the goal walk.
         self.subs = {}
 
@@ -134,6 +136,10 @@ class FakeGH:
     def filed(self):
         return [i for i in self.issues.values()]
 
+    def graphql(self, query):
+        self.calls.append(("POST", "/graphql"))
+        return {"repository": {"pullRequest": {"reviewThreads": {"nodes": self.threads}}}}
+
     def comment(self, number, at, body, repo=REPO, author=AUTHOR):
         self.comments.setdefault((repo, number), []).append(
             {"body": body, "created_at": stamp(at), "user": {"login": author}})
@@ -165,6 +171,29 @@ class StationBase(unittest.TestCase):
             fh.write(text)
         if at is not None:
             os.utime(path, (at, at))
+
+    def lane_ticket(self, number, labels=("loom:ticket", "loom:pr"), state="open"):
+        """The issue that carries a lane pull request."""
+        self.gh.issues[number] = {"number": number, "state": state, "body": "Why.",
+                                  "labels": [{"name": n} for n in labels]}
+
+    def lane_pull(self, number, ticket, opened, labels=(), author=AUTHOR):
+        """An open, non-draft lane pull request opened at `opened`, on the
+        branch its ticket number names."""
+        self.gh.pulls.setdefault(REPO, []).append(
+            {"number": number, "created_at": stamp(opened),
+             "head": {"ref": "loom/%d-thing" % ticket, "sha": "%x" % number},
+             "labels": [{"name": n} for n in labels], "user": {"login": author}})
+
+    def bot_threads(self, count=1):
+        """`count` unresolved review threads the review bot opened."""
+        self.gh.threads = [{"id": "T%d" % i, "comments": {"nodes": [
+            {"author": {"login": "grug-tribe[bot]"}, "body": "naming %d" % i}]}}
+            for i in range(count)]
+
+    def breaches(self):
+        """The invariant issues this pass filed."""
+        return [i for i in self.gh.filed() if invariants.LABEL in i.get("labels", [])]
 
 
 class AcceptanceTest(StationBase):
@@ -267,6 +296,66 @@ class StationTest(StationBase):
             self.run_at(at)
         self.assertEqual(self.gh.filed(), [])
         self.assertTrue(any("/issues?labels=loom:ticket" in c[1] for c in self.gh.calls))
+
+    def test_a_lane_pull_open_seven_hours_whose_ticket_is_not_a_loom_ticket_files_a_breach(self):
+        self.lane_ticket(481, labels=("epic",))
+        self.lane_pull(534, 481, T0 - 7 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("Lane pull request #534 open 7.0 hours", filed["title"])
+        self.assertIn("no open loom:ticket carries it", filed["title"])
+        self.assertIn("#481, which is not an open loom:ticket", filed["body"])
+        self.assertIn("`lane-pr-stalled`", filed["body"])
+
+    def test_a_lane_pull_whose_ticket_was_closed_is_a_breach_for_the_same_reason(self):
+        self.lane_ticket(481, state="closed")
+        self.lane_pull(534, 481, T0 - 7 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("no open loom:ticket carries it", filed["title"])
+        self.assertIn("#481, which is not an open loom:ticket", filed["body"])
+
+    def test_a_lane_pull_past_the_ladder_files_a_breach_and_five_hours_old_does_not(self):
+        self.lane_ticket(506, labels=("loom:ticket", "loom:failed"))
+        self.lane_ticket(507, labels=("loom:ticket", "loom:failed"))
+        self.lane_pull(657, 506, T0 - 7 * 3600)
+        self.lane_pull(658, 507, T0 - 5 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("Lane pull request #657 open 7.0 hours", filed["title"])
+        self.assertIn("past the last rung of the model ladder", filed["title"])
+        self.assertIn("#506", filed["body"])
+        self.assertNotIn("#658", filed["title"] + filed["body"])
+
+    def test_a_lane_pull_with_open_review_threads_and_no_fix_round_files_a_breach(self):
+        self.lane_ticket(602)
+        self.lane_pull(660, 602, T0 - 7 * 3600)
+        self.bot_threads(2)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("2 open review threads and no fix round queued", filed["title"])
+        self.assertIn("bus.brain fix", filed["body"])
+
+    def test_a_lane_pull_with_its_fix_round_queued_or_waiting_to_merge_files_nothing(self):
+        self.lane_ticket(603, labels=("loom:ticket", "loom:briefed", "lane:zen"))
+        self.lane_pull(661, 603, T0 - 7 * 3600)
+        self.bot_threads()
+        self.gh.comment(603, T0 - 3600,
+                        "<!-- loom:fix v1 -->\n<!-- loom:fix-head %x -->" % 661)
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [], self.said)
+        # The same pull request clean: the brain merges it.
+        self.gh.threads = []
+        self.lane_ticket(603)
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(self.breaches(), [], self.said)
+
+    def test_a_stale_lane_pull_nothing_can_read_is_skipped_rather_than_reported(self):
+        self.lane_pull(670, 699, T0 - 7 * 3600)  # the ticket it names is gone
+        self.lane_pull(671, 481, T0 - 7 * 3600, author="stranger")
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [], self.said)
+        self.assertTrue(any("unreadable" in line for line in self.said), self.said)
 
     def unlinked_goal(self):
         """A goal home with one open ticket under no epic."""
@@ -551,6 +640,49 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(len(invariants.gate_hold(Facts(T0, gate_held={"k": hold}))), 1)
         # A claim for the goal succeeded, so the station no longer holds it.
         self.assertEqual(invariants.gate_hold(Facts(T0, gate_held={})), [])
+
+    def pull(self, at, number=534, ticket=481, labels=("loom:ticket", "loom:pr"),
+             drives=True, threads=0, fix_pending=False):
+        """One open lane pull request as the station reads it."""
+        return invariants.LanePull(
+            Ref("%s#%d" % (REPO, number), "pull request #%d" % number), at,
+            Ref("%s#%d" % (REPO, ticket), "#%d" % ticket) if ticket is not None else None,
+            tuple(labels), drives, threads, fix_pending)
+
+    def test_a_lane_pull_open_five_hours_and_unread_pull_requests_find_nothing(self):
+        self.assertEqual(invariants.lane_pr_stalled(Facts(T0)), [])
+        self.assertEqual(invariants.lane_pr_stalled(
+            Facts(T0, lane_pulls=[self.pull(T0 - 5 * 3600, threads=2)])), [])
+
+    def test_each_stall_names_its_own_reason(self):
+        cases = {
+            "no open loom:ticket carries it": dict(ticket=None, drives=False, labels=()),
+            "past the last rung of the model ladder": dict(labels=("loom:ticket", "loom:failed")),
+            "its ticket waits on the brain": dict(labels=("loom:ticket", "loom:pr", "needs-brain")),
+            "1 open review thread and no fix round queued": dict(threads=1),
+        }
+        for reason, shape in cases.items():
+            with self.subTest(reason):
+                (b,) = invariants.lane_pr_stalled(
+                    Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, **shape)]))
+                self.assertEqual((b.invariant, b.subject), ("lane-pr-stalled", "%s#534" % REPO))
+                self.assertIn(reason, b.title)
+                self.assertIn("Unstick it:", " ".join(b.evidence))
+
+    def test_the_ladder_and_the_open_threads_name_the_one_command_that_unsticks_them(self):
+        (ladder,) = invariants.lane_pr_stalled(
+            Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, labels=("loom:ticket", "loom:failed"))]))
+        self.assertIn("bus.brain brief", ladder.evidence[-1])
+        (threads,) = invariants.lane_pr_stalled(
+            Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, threads=2)]))
+        self.assertIn("bus.brain fix", threads.evidence[-1])
+
+    def test_a_ticket_the_factory_can_move_drives_the_pull_request_it_carries(self):
+        for shape in ({}, dict(threads=2, fix_pending=True),
+                      dict(labels=("loom:ticket", "loom:ready"))):
+            with self.subTest(shape):
+                self.assertEqual(invariants.lane_pr_stalled(
+                    Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, **shape)])), [])
 
 
 if __name__ == "__main__":
