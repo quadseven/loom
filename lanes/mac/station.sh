@@ -7,7 +7,11 @@
 # main), and only to a head whose CI check (LOOM_DEPLOY_CHECK, default
 # unittest) passed; a newer head with CI running or failing waits, and so
 # does one that would bring in a commit an in-flight revert ticket names
-# (bus/revert.py: a merge that turned the branch red). The update
+# (bus/revert.py: a merge that turned the branch red). When the newest head
+# has not passed yet, the newest of the last DEPLOY_LOOKBACK commits on the
+# branch whose check passed is deployed instead: lane and operator merges can
+# land faster than CI clears them, and waiting for the head alone then
+# deployed nothing for hours (2026-10-18). The update
 # runs here, before Python, so a station a bad merge broke still receives the
 # fix merged after it. LOOM_DEPLOY=0 turns it off. A deploy that succeeded is
 # recorded in the station's state (deployed.json: the revision and when), and
@@ -17,6 +21,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BRANCH="${LOOM_DEPLOY_BRANCH:-main}"
 CHECK="${LOOM_DEPLOY_CHECK:-unittest}"
+DEPLOY_LOOKBACK=8
 STATE_DIR="${LOOM_HOME:-$HOME/loom}/state/station"
 say() { printf 'station: %s\n' "$*"; }
 g() { git -C "$REPO_ROOT" -c core.hooksPath=/dev/null "$@"; }
@@ -44,6 +49,19 @@ record_deploy() {
     say "could not record the deploy of ${1:0:12}"
 }
 
+# Sets verdict (success|other|none) and check_state for commit $1 of $slug;
+# fails with check_error set when the check cannot be read.
+read_check() {
+  local check_json
+  if check_json="$(api "repos/$slug/commits/$1/check-runs?check_name=$CHECK" 2>&1)"; then
+    verdict="$(printf '%s' "$check_json" | jq -r '[.check_runs[].conclusion] | if length == 0 then "none" elif all(. == "success") then "success" else "other" end')"
+    check_state="$(printf '%s' "$check_json" | jq -r '[.check_runs[].status] | if length == 0 then "none" elif any(. == "in_progress") then "in_progress" elif any(. == "queued") then "queued" elif any(. == "requested") then "requested" else "completed" end')"
+  else
+    check_error="$(printf '%s' "$check_json" | tail -1)"
+    return 1
+  fi
+}
+
 deploy() {
   [ "${LOOM_DEPLOY:-1}" != 0 ] || return 0
   [ "$(g symbolic-ref --short -q HEAD)" = "$BRANCH" ] || return 0
@@ -52,18 +70,14 @@ deploy() {
   fi
   timeout 60 git -C "$REPO_ROOT" -c core.hooksPath=/dev/null fetch -q origin "$BRANCH" 2>/dev/null ||
     { say "not deploying: fetch of $BRANCH failed"; return 0; }
-  local head target slug verdict check_json check_error check_state
+  local head target slug verdict check_error check_state newest sha
   head="$(g rev-parse HEAD)"; target="$(g rev-parse FETCH_HEAD)"
   [ "$head" != "$target" ] || return 0
   if ! g merge-base --is-ancestor "$head" "$target"; then
     say "not deploying: $BRANCH is not a fast-forward of the checkout"; return 0
   fi
   slug="$(g remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')"
-  if check_json="$(api "repos/$slug/commits/$target/check-runs?check_name=$CHECK" 2>&1)"; then
-    verdict="$(printf '%s' "$check_json" | jq -r '[.check_runs[].conclusion] | if length == 0 then "none" elif all(. == "success") then "success" else "other" end')"
-    check_state="$(printf '%s' "$check_json" | jq -r '[.check_runs[].status] | if length == 0 then "none" elif any(. == "in_progress") then "in_progress" elif any(. == "queued") then "queued" elif any(. == "requested") then "requested" else "completed" end')"
-  else
-    check_error="$(printf '%s' "$check_json" | tail -1)"
+  if ! read_check "$target"; then
     say "not deploying: the CI check could not be read ($check_error)"
     return 0
   fi
@@ -73,9 +87,17 @@ deploy() {
     else
       say "not deploying: $CHECK did not pass on ${target:0:12} ($verdict)"
     fi
-    return 0
+    # The newest older commit on the branch whose check passed, if any:
+    # never one the checkout already has, never one unchecked or red.
+    newest="$target"; target=""
+    for sha in $(g rev-list --first-parent --max-count="$DEPLOY_LOOKBACK" "$head..$newest" | tail -n +2); do
+      read_check "$sha" || break
+      if [ "$verdict" = success ]; then target="$sha"; break; fi
+    done
+    [ -n "$target" ] || return 0
+    say "deploying ${target:0:12}, the newest commit $CHECK passed on, while ${newest:0:12} waits"
   fi
-  local named sha
+  local named
   named="$(api "repos/$slug/issues?labels=loom:revert&state=open&per_page=100" 2>/dev/null | jq -r '.[] | select([.labels[].name] | any(. == "loom:merged" or . == "loom:shipped" or . == "loom:verified") | not) | .body')" ||
     { say "not deploying: could not read the revert tickets"; return 0; }
   for sha in $(printf '%s\n' "$named" | sed -nE 's/.*git revert --no-edit ([0-9a-f]{40}).*/\1/p'); do
