@@ -580,8 +580,8 @@ last day (`briefs/<lane>/done` and `failed`, timed by their logs), the lanes
 held by a limit, queued tickets, each goal home's epics and tickets (one walk
 through goal, epics and tickets), the review bot's plan
 check on open lane pull requests (`LOOM_PLAN_CHECK`, default
-`Grug - Chief`) and remote heartbeats. Each invariant is one function
-returning breaches with evidence:
+`Grug - Chief`), the lane pull requests nothing drives and remote heartbeats.
+Each invariant is one function returning breaches with evidence:
 
 - One brain's two newest ticks each journaled a failed or degraded step
   (`- Step <name>: failed ...`, docs/BRAIN.md Journal), or no brain journaled
@@ -596,6 +596,13 @@ returning breaches with evidence:
   `Epic cap: N until DATE` exception), and a closed epic that still holds
   open tickets. These replaced the goal home sub-issue count check.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
+- An open lane pull request nothing drives for over 6 hours (the time a lane
+  has to open one): no open `loom:ticket` carries it, its ticket is past the
+  last rung of the model ladder (`loom:failed`), its ticket is marked
+  `needs-brain`, or it holds unresolved review threads from the review bot
+  with no fix round queued. The breach names which of those it is and the one
+  command that unsticks it (`bus.brain move`, `bus.brain brief` as a
+  re-ticket, `bus.brain fix`, or closing the pull request as superseded).
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 
 Each breach files one issue labelled `loom:triage` and `loom:invariant` under

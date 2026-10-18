@@ -112,6 +112,8 @@ URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
+# A usage snapshot that fails once is sent again after this pause (loom#345).
+USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
@@ -4749,6 +4751,10 @@ class Station:
             facts.checks = self._invariant_checks()
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the plan checks: %s" % err)
+        try:
+            facts.lane_pulls = self._invariant_lane_pulls()
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the lane pull requests: %s" % err)
         return facts
 
     def _invariant_runs(self) -> List[invariants.Run]:
@@ -4854,6 +4860,86 @@ class Station:
             self.s.plan_check, str(run.get("conclusion") or ""),
             self._epoch(str(run["completed_at"])) or 0.0,
             str((run.get("output") or {}).get("title") or ""))
+
+    def _invariant_lane_pulls(self) -> List[invariants.LanePull]:
+        """The open lane pull requests the stalled invariant reads: trusted, on
+        a loom/ branch and opened over invariants.PR_STALLED ago (loom#715).
+        A pull request that cannot be read is logged and skipped, so one
+        unreadable repo or ticket costs that pull request and no other."""
+        authors = {a.lower() for a in self.s.authors}
+        out: List[invariants.LanePull] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                pulls = self._open_pulls(repo)
+            except GitHubError as err:
+                _say("invariants: could not read the open pull requests of %s: %s" % (repo, err))
+                continue
+            for pr in pulls:
+                at = self._stalled_since(pr, authors)
+                if at is None:
+                    continue
+                try:
+                    out.append(self._lane_pull(repo, pr, at))
+                except GitHubError as err:
+                    _say("invariants: left out pull request %s#%s, unreadable: %s"
+                         % (repo, pr.get("number"), err))
+        return out
+
+    def _stalled_since(self, pr: Dict[str, Any], authors: set) -> Optional[float]:
+        """When this pull request opened, or None when it is not one the
+        stalled invariant reads."""
+        if not self._trusted_lane_pull(pr, authors):
+            return None
+        at = self._epoch(str(pr.get("created_at") or ""))
+        return at if at is not None and self.now - at > invariants.PR_STALLED else None
+
+    def _lane_pull(self, repo: str, pr: Dict[str, Any], at: float) -> invariants.LanePull:
+        """One open lane pull request as the stalled invariant reads it: the
+        issue that carries it and its labels, the open threads the review bot
+        left on it, and whether a fix round is queued on its ticket."""
+        number = int(pr["number"])
+        issue = self._pr_ticket(repo, pr)
+        names = set(_label_names(pr))
+        if issue is not None:
+            names |= set(_label_names(issue))
+        drives = bool(issue is not None and issue.get("state") == "open"
+                      and "loom:ticket" in _label_names(issue))
+        threads = len(self._bot_threads(repo, number)) if drives else 0
+        return invariants.LanePull(
+            self._invariant_ref(repo, number, "pull request"), at,
+            self._invariant_ref(repo, int(issue["number"])) if issue is not None else None,
+            tuple(sorted(names)), drives, threads,
+            self._fix_queued(repo, issue, pr, threads))
+
+    def _pr_ticket(self, repo: str, pr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The issue that carries this pull request (the Refs line of its body
+        or the number in its branch), or None when it names none or names two.
+        A ticket GitHub cannot read raises, so a transient failure skips this
+        pull request instead of reporting it as a pull request no ticket
+        carries."""
+        try:
+            association = brain._ticket_association(repo, pr)
+        except ValueError as err:
+            _say("invariants: %s#%d names no one ticket: %s" % (repo, pr["number"], err))
+            return None
+        if association is None:
+            return None
+        data = self.gh.rest("GET", "/repos/%s/issues/%d" % association).data
+        return data if isinstance(data, dict) else None
+
+    def _fix_queued(self, repo: str, issue: Optional[Dict[str, Any]], pr: Dict[str, Any],
+                    threads: int) -> bool:
+        """Whether a fix round is queued on this ticket for the pull request's
+        head: hand-back's own rule. The ticket's comments are read only when
+        open threads are what a fix round would answer."""
+        if issue is None or not threads:
+            return False
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                    % (repo, int(issue["number"])))
+        return self._fix_pending(_label_names(issue), comments,
+                                 str((pr.get("head") or {}).get("sha") or ""))
 
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
@@ -5956,12 +6042,23 @@ class Station:
         token = self._transcript_token()
         if token is None:
             return
-        try:
-            self.upload(url, token, records)
-        except UploadRefused as err:
-            _say("the dashboard refused the usage snapshot (%d)" % err.status)
-        except Exception as err:  # noqa: BLE001
-            _say("usage snapshot upload failed (%s)" % type(err).__name__)
+        for attempt in (1, 2):
+            try:
+                self.upload(url, token, records)
+                return
+            except UploadRefused as err:
+                _say("the dashboard refused the usage snapshot (%d)" % err.status)
+                return
+            except Exception as err:  # noqa: BLE001
+                if attempt == 1:
+                    # A dashboard rollout or a slow first snapshot drops one
+                    # upload; the second try usually lands (loom#345).
+                    time.sleep(USAGE_RETRY_PAUSE)
+                    continue
+                # post_transcript's messages carry neither URL nor token; the
+                # token is redacted anyway in case another uploader names it.
+                _say("usage snapshot upload failed twice: %s: %s"
+                     % (type(err).__name__, str(err).replace(token, "[token]")))
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
