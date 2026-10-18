@@ -201,7 +201,17 @@ logins` names every login trusted. More than three briefed tickets refused in
 an hour for one untrusted labeller file the `untrusted-labeler` invariant,
 naming the login. The App needs contents,
 issues and pull requests read and write, and checks and actions read, on the
-scanned repos. The dashboard takes the same three settings when its host has
+scanned repos. To set one up, `python3 -m bus app manifest --owner OWNER`
+(add `--org` for an organisation) prints the create page and a manifest with
+exactly those permissions and no webhook; `--form` prints an HTML page whose
+one button creates the App. Install it on the repos in `LOOM_REPOS` only and
+generate a private key; then, with the key in `LOOM_GITHUB_APP_KEY_FILE` or
+`LOOM_GITHUB_APP_KEY_SSM`, `python3 -m bus app ids --app-id N` lists the
+installations and the repos each covers, prints the `LOOM_GITHUB_APP_ID` and
+`LOOM_GITHUB_APP_INSTALLATION_ID` lines to paste, and warns about a repo in
+`LOOM_REPOS` the installation misses, one it covers outside `LOOM_REPOS`, and
+a permission Loom needs that it lacks. It never prints or writes the key or
+the tokens it mints. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
 
@@ -404,6 +414,25 @@ only what is its own, and adding an operator is configuration:
 Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
 other's login. A person working a ticket by hand claims it the same way:
 assign it to yourself and add `claim:<your login>` before any Loom briefs it.
+
+Each Loom sets these for itself when it installs; a second operator running
+from a clone of another operator's checkout must not inherit them:
+
+- `LOOM_REPOS`: the repos this Loom watches.
+- `LOOM_REPO_OWNERS`: the owners whose repos it may brief (default: this
+  checkout's owner).
+- `LOOM_STATUS_REPO`: where the brain lock `loom-lock/brain` and the
+  `loom:lanes` issue live (default: this checkout's origin).
+- `LOOM_BRIEF_AUTHORS`: this operator's own logins.
+- The App settings, `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID`
+  and `LOOM_GITHUB_APP_KEY_SSM`, so each Loom spends its own installation's
+  budget.
+- `LOOM_BRAIN_HOLDER`: the name on the brain lock (default `lane-machine`).
+
+`lanes/mac/install.sh` refuses to install, writing no agent, when
+`LOOM_REPOS` is set and the status repo (`LOOM_STATUS_REPO`, or the origin
+when it is unset) or any `LOOM_REPOS` repo has an owner outside
+`LOOM_REPO_OWNERS`; the message names the setting or repo at fault.
 
 ### Trusted briefers
 
@@ -742,6 +771,20 @@ loopback connection; they cannot query the viewer or any other local service.
   provider's weekly limit ...` with a `retry_at`) and hands the brief on as
   `[limit]`; any other answer lets the run go ahead. Another provider can
   name its own endpoint in the same setting.
+- The Usage view's meters for the free lanes (loom#812). After a ready
+  heartbeat the openrouter and workersai lanes read their provider's
+  read-only meter with the key they already hold, at most every five minutes,
+  through `bus/meter.py` (key and account id on stdin, never argv or a log),
+  into `state/usage/<slot>.meter.json`; `bus/usage.py` shows it. openrouter:
+  `GET /api/v1/key`, the key's free-model requests in the current UTC day and
+  its credit limit if it has one. workersai: the GraphQL Analytics API,
+  `aiInferenceAdaptiveGroups` `totalNeurons` for today, against
+  `LOOM_WORKERSAI_DAILY_NEURONS` (default 10000, the free allocation; reset
+  00:00 UTC); the token needs Account Analytics read besides Workers AI, or
+  Usage says the read failed and why. `LOOM_<SLOT>_METER_URL` overrides the
+  endpoint. zai and zen have no meter: Z.ai documents no usage endpoint for
+  API keys (its quota monitor covers the GLM Coding Plan only) and Zen's free
+  models take no key, so Usage says "no meter: provider exposes no usage".
 
 ### One slot on opencode 2.0
 

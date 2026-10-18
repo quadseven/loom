@@ -475,6 +475,10 @@ class LaneRunnerTest(unittest.TestCase):
             "LOOM_REPO_OWNERS": "example",
             "LOOM_CODEX_MODEL": "gpt-test-default",
             "LOOM_CLAUDE_MODEL": "claude-test-default",
+            # The free lanes' usage meters (bus/meter.py) read a closed
+            # loopback port, never the real provider, unless a test serves one.
+            "LOOM_OPENROUTER_METER_URL": "http://127.0.0.1:9/meter",
+            "LOOM_WORKERSAI_METER_URL": "http://127.0.0.1:9/meter",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             **env,
@@ -1692,6 +1696,70 @@ cat > /dev/null
         self.assertIn("account=fakeaccount0123", calls)
         self.assertIn("small=cloudflare-workers-ai/@cf/vendor/model", agent[0])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def meter_server(self, body):
+        """A fake provider meter on loopback: answers every request with BODY
+        and records the request's method, path, headers and body."""
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def answer(self):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                requests.append({"method": self.command, "path": self.path, "headers": dict(self.headers),
+                                 "body": self.rfile.read(length).decode() if length else ""})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode())
+
+            do_GET = do_POST = answer
+
+            def log_message(self, format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return requests, "http://127.0.0.1:%d/api/v1/key" % server.server_port
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_openrouter_lane_records_its_key_meter_with_the_key_kept_out_of_argv(self):
+        # loom#812: Usage said "not exposed yet" for openrouter although
+        # GET /api/v1/key gives the key's free-model requests today.
+        requests, url = self.meter_server({"data": {
+            "label": "lane", "limit": None, "limit_remaining": None, "usage": 0,
+            "is_free_tier": True, "free_model_daily_requests": {"used": 12, "limit": 50, "remaining": 38}}})
+        inbox, result = self.api_lane(
+            "openrouter", LOOM_OPENROUTER_KEY_SSM="/k/or", FAKE_SECRET__k_or="fake-or-key-s3cr3t",
+            LOOM_OPENROUTER_MODEL="openrouter/vendor/model:free", LOOM_OPENROUTER_METER_URL=url)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(r["method"], r["path"]) for r in requests], [("GET", "/api/v1/key")])
+        self.assertEqual(requests[0]["headers"].get("Authorization"), "Bearer fake-or-key-s3cr3t")
+        meter = json.loads((self.loom / "state" / "usage" / "openrouter.meter.json").read_text())
+        self.assertIsNone(meter["error"])
+        self.assertEqual([(w["window"], w["used"], w["limit"]) for w in meter["windows"]], [("daily", 12, 50)])
+        self.assertNotIn("fake-or-key-s3cr3t", json.dumps(meter))
+        for where in (result.stdout, result.stderr, *self.calls()):
+            if where.startswith("opencode "):
+                continue  # the agent's own record of the key it was handed
+            self.assertNotIn("fake-or-key-s3cr3t", where)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_workersai_lane_records_todays_neurons_for_its_account(self):
+        requests, url = self.meter_server({"data": {"viewer": {"accounts": [
+            {"aiInferenceAdaptiveGroups": [{"sum": {"totalNeurons": 2500.0}}]}]}}, "errors": None})
+        inbox, result = self.api_lane(
+            "workersai", LOOM_WORKERSAI_KEY_SSM="/k/cf", FAKE_SECRET__k_cf="fake-cf-token",
+            LOOM_WORKERSAI_ACCOUNT_SSM="/k/acct", FAKE_SECRET__k_acct="fakeaccount0123",
+            LOOM_WORKERSAI_MODEL="cloudflare-workers-ai/@cf/vendor/model", LOOM_WORKERSAI_METER_URL=url)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([r["method"] for r in requests], ["POST"])
+        self.assertEqual(requests[0]["headers"].get("Authorization"), "Bearer fake-cf-token")
+        self.assertEqual(json.loads(requests[0]["body"])["variables"]["account"], "fakeaccount0123")
+        meter = json.loads((self.loom / "state" / "usage" / "workersai.meter.json").read_text())
+        self.assertEqual([(w["window"], w["used"], w["used_pct"]) for w in meter["windows"]],
+                         [("daily", 2500.0, 25.0)])
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_workersai_lane_refuses_a_model_from_elsewhere(self):

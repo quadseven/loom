@@ -46,14 +46,17 @@ class InstallScriptTest(unittest.TestCase):
         self.lock.write_text("%s\n" % pid)
 
     def run_install(self, **env):
-        full = dict(os.environ,
-                    PATH="%s:/usr/bin:/bin" % self.bin,
+        # The watched repos and status repo come only from the test: an
+        # operator's own settings in the environment would trip the owner check.
+        full = {k: v for k, v in os.environ.items()
+                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")}
+        full.update(PATH="%s:/usr/bin:/bin" % self.bin,
                     HOME=str(self.home),
                     LOOM_HOME=str(self.loom),
                     LOOM_REPO_OWNERS="example-owner",
                     LOOM_CODEX_MODEL="codex-test",
-                    FAKE_LOG=str(self.log),
-                    **env)
+                    FAKE_LOG=str(self.log))
+        full.update(env)
         return subprocess.run(
             ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), "codex"],
             env=full, capture_output=True, text=True, timeout=60)
@@ -180,6 +183,50 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("LOOM_STATION_INTERVAL", result.stderr)
                 self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    # A second operator's settings (docs/LANES.md, Two Looms on shared repos):
+    # the status repo and every watched repo must belong to LOOM_REPO_OWNERS.
+    def set_origin(self, url):
+        subprocess.run(["git", "init", "-q", str(self.checkout)], check=True)
+        subprocess.run(["git", "-C", str(self.checkout), "remote", "add", "origin", url],
+                       check=True)
+
+    def test_an_unset_status_repo_outside_the_owners_installs_nothing(self):
+        self.set_origin("git@github.com:b/loom.git")
+        result = self.run_install(LOOM_REPOS="a/x", LOOM_REPO_OWNERS="a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_STATUS_REPO", result.stderr)
+        self.assertIn("b/loom", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_a_status_repo_of_another_owner_installs_nothing(self):
+        result = self.run_install(LOOM_REPOS="a/x", LOOM_REPO_OWNERS="a",
+                                  LOOM_STATUS_REPO="b/loom")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_STATUS_REPO", result.stderr)
+        self.assertIn("b/loom", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_a_watched_repo_of_another_owner_installs_nothing(self):
+        result = self.run_install(LOOM_REPOS="a/x c/y", LOOM_REPO_OWNERS="a",
+                                  LOOM_STATUS_REPO="a/x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("c/y", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_consistent_owner_settings_install_as_before(self):
+        result = self.run_install(LOOM_REPOS="a/x", LOOM_REPO_OWNERS="a",
+                                  LOOM_STATUS_REPO="a/x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_STATUS_REPO</key><string>a/x</string>", plist)
+
+    def test_an_unset_status_repo_of_an_own_owner_installs(self):
+        # The single-operator default: origin's owner is the default owner.
+        self.set_origin("https://github.com/A/loom.git")
+        result = self.run_install(LOOM_REPOS="a/x, A/z", LOOM_REPO_OWNERS="a")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("installed com.loom.station", result.stdout)
 
 
 if __name__ == "__main__":

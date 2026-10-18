@@ -760,6 +760,22 @@ provider_at_limit() {
   return 0
 }
 
+# A free lane whose provider has a read-only meter (openrouter: the key's
+# free-model requests today; workersai: today's Neurons) records it for the
+# Usage view through bus/meter.py, at most every five minutes. The key and the
+# account id go on stdin, so they reach no argv and no log. LOOM_<SLOT>_METER_URL
+# overrides the provider's endpoint. A failed read is recorded, never fatal.
+lane_meter() {
+  local url
+  case "$LANE" in openrouter|workersai) ;; *) return 0 ;; esac
+  [ -n "$API_KEY" ] || return 0
+  url="$(lane_setting METER_URL)"
+  [ -z "$url" ] || [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 0
+  printf '%s\n%s\n' "$API_KEY" "$LANE_ACCOUNT" |
+    PYTHONPATH="$LOOM_ROOT" timeout "$PROBE_TIMEOUT" python3 -B -m bus.meter "$LANE" \
+      "$LOOM_HOME/state/usage/$SLOT.meter.json" "$url" > /dev/null 2>&1 || true
+}
+
 # The slots that bill the same provider account as this slot, and so the same
 # key: a limit or an expired key recorded by one holds every slot in the group.
 # opencode-go's four slots share one OpenCode Go account; every other lane is a
@@ -1640,6 +1656,7 @@ if ! lane_ready; then
   [ -n "$LIMITED" ] || [ -n "$AUTH_HELD" ] || exit 0
 else
   heartbeat true ""
+  lane_meter
 fi
 # Only the sandboxed lanes need the snapshot (codex and claude read the
 # operator's own folders), and only when there is work.
