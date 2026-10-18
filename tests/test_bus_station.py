@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, proof, spend, station, tickets  # noqa: E402
-from bus.github import AppToken, GitHub  # noqa: E402
+from bus import github as github_module  # noqa: E402
+from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
 
 REPO = "example-owner/example-repo"
 AUTHORS = ["alice-example", "bob-example"]
@@ -6457,3 +6458,83 @@ class AppLoginTrustTest(Base):
         path = os.path.join(self.home, "state", "station", "labeler_refusals.json")
         with open(path, encoding="utf-8") as fh:
             self.assertEqual(len(json.load(fh)["stranger[bot]"]), 2)
+
+
+class BudgetExhaustedTest(unittest.TestCase):
+    """loom#666: a 403 that says the hourly budget is spent is not a missing
+    grant. The pass stops in one line, the next pass waits for the reset
+    without a request, and nothing logs a per-repo 403."""
+
+    RESET = int(time.time()) + 1800
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = os.path.join(self._tmp.name, "loom")
+        self.settings = station.Settings(self.home, [REPO, "example-owner/other"],
+                                         list(AUTHORS), list(OWNERS))
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "codex.json"), "w") as fh:
+            json.dump({"lane": "codex", "at": int(time.time()), "available": True,
+                       "reason": ""}, fh)
+        self.calls = []
+
+    def refused(self, headers, body):
+        def transport(method, url, headers_in, payload):
+            self.calls.append((method, url))
+            return 403, dict(headers), json.dumps(body).encode()
+        return GitHub("token", transport=transport)
+
+    def spent(self):
+        # Recorded from the station's 2026-10-18 pass at 0 of 5000.
+        return self.refused(
+            {"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "0",
+             "X-RateLimit-Reset": str(self.RESET), "X-RateLimit-Resource": "core"},
+            {"message": "API rate limit exceeded for installation ID 172475698.",
+             "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api",
+             "status": "403"})
+
+    def run_pass(self, gh):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = station.run(self.settings, gh)
+        return code, out.getvalue()
+
+    def test_a_spent_budget_stops_the_pass_in_one_line(self):
+        code, said = self.run_pass(self.spent())
+        self.assertEqual(code, 0)
+        self.assertIn("GitHub budget exhausted until", said)
+        self.assertNotIn("could not list", said)
+        self.assertEqual(said.count("GitHub budget exhausted"), 1, said)
+        with open(os.path.join(self.home, "state", "station", "budget.json")) as fh:
+            self.assertEqual(json.load(fh)["limited_until"], self.RESET)
+
+    def test_the_next_pass_waits_for_the_reset_without_a_request(self):
+        self.run_pass(self.spent())
+        self.calls.clear()
+        code, said = self.run_pass(self.spent())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [])
+        self.assertIn("this pass waits for the reset", said)
+
+    def test_a_secondary_rate_limit_is_a_budget_refusal_too(self):
+        gh = self.refused({"Retry-After": "120"},
+                          {"message": "You have exceeded a secondary rate limit. "
+                                      "Please wait a few minutes before you try again."})
+        with self.assertRaises(github_module.RateLimited) as caught:
+            gh.rest("GET", "/repos/%s/issues" % REPO)
+        self.assertGreaterEqual(caught.exception.until, int(time.time()) + 119)
+        self.calls.clear()
+        with self.assertRaises(github_module.RateLimited):
+            gh.rest("GET", "/repos/%s/pulls" % REPO)
+        self.assertEqual(self.calls, [])
+
+    def test_a_403_without_rate_limit_signs_is_still_a_missing_grant(self):
+        gh = self.refused({"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "4100",
+                           "X-RateLimit-Reset": str(self.RESET)},
+                          {"message": "Resource not accessible by integration"})
+        with self.assertRaises(GitHubError) as caught:
+            gh.rest("GET", "/repos/%s/issues" % REPO)
+        self.assertNotIsInstance(caught.exception, github_module.RateLimited)
+        self.assertIsNone(gh.limited_until)

@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -67,6 +68,46 @@ class GitHubError(Exception):
         super().__init__(message)
         self.status = status
         self.body = body
+
+
+class RateLimited(GitHubError):
+    """GitHub refused a call for budget: a 403 or 429 with no requests left in
+    the window, or its secondary rate limit. `until` is when the window
+    resets (epoch seconds). A GitHubError, so every caller that handles one
+    keeps working; the station ends its pass on it (loom#666)."""
+
+    def __init__(self, message: str, status: int, body: str, until: int) -> None:
+        super().__init__(message, status, body)
+        self.until = until
+
+
+# GitHub's words for a budget refusal, primary or secondary, when the
+# x-ratelimit-remaining header alone does not say so.
+RATE_LIMIT_RE = re.compile(r"\b(?:secondary )?rate limit\b", re.I)
+
+
+def _utc(stamp: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
+
+
+def rate_limit_until(status: int, headers: Dict[str, str], text: str,
+                     now: float) -> Optional[int]:
+    """When a refused call may be tried again, if GitHub refused it for
+    budget, else None. A 403 also means a missing grant, so only the rate
+    limit headers or GitHub's rate limit message make it a budget refusal."""
+    if status not in (403, 429):
+        return None
+    remaining = _int(headers.get("x-ratelimit-remaining"))
+    if remaining != 0 and not RATE_LIMIT_RE.search(text or ""):
+        return None
+    reset = _int(headers.get("x-ratelimit-reset"))
+    after = _int(headers.get("retry-after"))
+    if after is not None and after >= 0:
+        return int(now) + after
+    if reset is not None and remaining == 0 and reset > now:
+        return reset
+    # GitHub asks for at least a minute's wait when it names no time.
+    return int(now) + 60
 
 
 class Response:
@@ -347,6 +388,9 @@ class GitHub:
         # resource (core, graphql, ...) -> (remaining, limit, reset epoch),
         # from the newest response that carried the headers.
         self.rate: Dict[str, Tuple[int, int, int]] = {}
+        # Set by a budget refusal: until then every call fails at once with
+        # RateLimited and spends nothing (loom#666).
+        self.limited_until: Optional[int] = None
 
     def _url(self, path: str) -> str:
         # Absolute URLs (pagination's next links) must stay on the API host:
@@ -507,13 +551,25 @@ class GitHub:
 
     def _send(self, method: str, url: str, headers: Dict[str, str],
               payload: Optional[bytes]) -> Tuple[int, Dict[str, str], str]:
-        """One request on the wire, counted: status, lower-cased headers, text."""
+        """One request on the wire, counted: status, lower-cased headers, text.
+        A budget refusal raises RateLimited, and so does every later call until
+        the window resets, without a request."""
+        path = urlsplit(url).path
+        if self.limited_until is not None and time.time() < self.limited_until:
+            raise RateLimited("%s %s: GitHub budget exhausted until %s" % (
+                method, path, _utc(self.limited_until)), 403, "", self.limited_until)
         status, raw_headers, raw = self._transport_with_retry(method, url, headers, payload)
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
         # Read before any error is raised: a 403 at the limit carries them.
         self._note_rate(resp_headers)
         self._count(method, url, status)
-        return status, resp_headers, (raw or b"").decode("utf-8", "replace")
+        text = (raw or b"").decode("utf-8", "replace")
+        until = rate_limit_until(status, resp_headers, text, time.time())
+        if until is not None:
+            self.limited_until = until
+            raise RateLimited("%s %s -> %d: GitHub budget exhausted until %s" % (
+                method, path, status, _utc(until)), status, text, until)
+        return status, resp_headers, text
 
     def _transport_with_retry(self, method: str, url: str, headers: Dict[str, str],
                               payload: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
