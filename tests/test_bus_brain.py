@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import brain, journal, proof, text, tickets
 from bus.github import GitHub, GitHubError
 
+# status refuses to run with no trusted login (loom#783).
+TRUSTED = {"LOOM_BRIEF_AUTHORS": "example-brain"}
 REPO = "example-owner/example-repo"
 BODY = ("## Why\nwhy: the page query is slow for every visitor.\n## What\nwhat\n"
         "## Acceptance criteria\n- [ ] done\n- [ ] tested\n- [ ] live\n## Size\nS\n## Out of scope\n- none")
@@ -341,7 +343,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
             reply(200, []), reply(200, []), reply(200, [])))
-        report = brain.status(gh, [REPO], REPO, env={})
+        report = brain.status(gh, [REPO], REPO, env={}, authors=())
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request, the goal's
@@ -381,14 +383,14 @@ class SensitiveResumeTests(unittest.TestCase):
                                                                    "area": "search", "impact": 60.0,
                                                                    "priority": "P1"}]},
                                        REPO + "#2": {"error": "the answer is not JSON"}}}, fh)
-            report = brain.status(gh, [REPO], REPO, env={"LOOM_HOME": home})
+            report = brain.status(gh, [REPO], REPO, env=dict(TRUSTED, LOOM_HOME=home))
         self.assertIn("## Health findings\n- %s#1: 1 finding (checked 2030-01-01T00:00:00Z)\n"
                       "  - P1 Search is slow (search, impact 60)\n"
                       "- %s#2: not looked: the answer is not JSON" % (REPO, REPO), report)
         self.assertIn("## Priorities", report)
         report = brain.status(GitHub("t", transport=Fake(
             reply(200, []), reply(200, []), reply(200, {"data": {"repository": {}}}),
-            reply(200, []))), [REPO], REPO, env={})
+            reply(200, []))), [REPO], REPO, env=TRUSTED)
         self.assertIn("## Health findings\n- not looked: LOOM_HOME is not set", report)
 
     def test_status_reads_lane_comments_with_one_more_request(self):
@@ -397,7 +399,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, []), reply(200, []),
             reply(200, [lanes_issue]),
             reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z"}])))
-        report = brain.status(gh, [REPO], REPO, env={})
+        report = brain.status(gh, [REPO], REPO, env=TRUSTED)
         self.assertIn("| codex | yes |", report)
         self.assertEqual(gh.requests, 4)
 
@@ -410,7 +412,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, {"data": {"repository": {"p4": ready_node(),
                                                 "g1": {"comments": {"nodes": []}}}}}),
             reply(200, []), reply(200, [])))
-        lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
+        lines = brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
 
@@ -422,7 +424,7 @@ class SensitiveResumeTests(unittest.TestCase):
                     reply(200, {"check_runs": [
                         {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]}),
                     reply(200, []))
-        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 Sensitive - blocked: review check has not passed on the head commit",
                       report)
         self.assertIn("## Runaway tickets\n- none", report)
@@ -440,7 +442,7 @@ class SensitiveResumeTests(unittest.TestCase):
                     {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral"}]})
             return fake(method, url, headers, body)
 
-        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={})
+        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 Docs - READY", report)
 
     def test_status_pull_request_lines_with_and_without_pending_brain_fix(self):
@@ -458,7 +460,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, comments_with),
             reply(200, []))
         report_with = brain.status(GitHub("t", transport=fake_with), [REPO], REPO,
-                                   env={}, authors=authors)
+                                   env=TRUSTED, authors=authors)
         lines = report_with.splitlines()
         at = lines.index("### Pull requests")
         self.assertEqual(lines[at + 1], "- #4 PR - READY - pending brain fix")
@@ -475,7 +477,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, comments_without),
             reply(200, []))
         report_without = brain.status(GitHub("t", transport=fake_without), [REPO], REPO,
-                                      env={}, authors=authors)
+                                      env=TRUSTED, authors=authors)
         lines = report_without.splitlines()
         at = lines.index("### Pull requests")
         self.assertEqual(lines[at + 1], "- #4 PR - READY")
@@ -515,7 +517,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, [{"number": 7, "title": "Lane spark: 12 runs in 24 hours and none done",
                          "labels": [{"name": "loom:triage"}, {"name": "loom:invariant"}]}]),
             reply(200, []), reply(200, [])))
-        lines = brain.status(gh, [REPO], REPO, env={}).splitlines()
+        lines = brain.status(gh, [REPO], REPO, env=TRUSTED).splitlines()
         at = lines.index(brain.INVARIANTS_HEADING)
         self.assertEqual(lines[at + 1], "- #7 Lane spark: 12 runs in 24 hours and none done")
 
@@ -533,7 +535,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
             reply(200, []), reply(200, []),
             reply(200, [])))
-        report = brain.status(gh, [REPO], REPO, env={}, now=now, authors=["brain-bot"])
+        report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])
         self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
                       "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
         self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T14:26:00Z, "
@@ -615,7 +617,7 @@ class SensitiveResumeTests(unittest.TestCase):
             gh = GitHub("t", transport=Fake(reply(200, []), reply(200, pulls),
                                             reply(200, {"data": {"repository": {"p4": node}}}),
                                             reply(200, [])))
-            return [line for line in brain.status(gh, [REPO], REPO, env={}).splitlines()
+            return [line for line in brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
                     if line.startswith("- #4 ")]
 
         first, second = run(), run()
@@ -628,7 +630,7 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_status_asks_for_every_field_merge_ready_reads(self):
         fake = Fake(reply(200, []), reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
                     reply(200, {"data": {"repository": {"p4": None}}}), reply(200, []))
-        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={}, authors=())
         self.assertIn("- #4 PR - blocked: checks unknown", report)
         query = fake.calls[2][2]["query"]
         for field in ("committedDate", "statusCheckRollup", "reviews(last:100)", "submittedAt",
@@ -645,7 +647,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "merged": {"nodes": merged}}}}),
                     reply(200, []),
                     reply(200, []))
-        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=TRUSTED)
         self.assertIn("warning: work merges into side; set Trunk: side on the goal home", report)
 
     def test_status_does_not_flag_a_repo_whose_recent_merges_match_the_default_branch(self):
@@ -658,7 +660,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "merged": {"nodes": merged}}}}),
                     reply(200, []),
                     reply(200, []))
-        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=TRUSTED)
         self.assertNotIn("warning: work merges into", report)
 
     def test_status_does_not_flag_a_repo_whose_recent_merges_match_the_declared_trunk(self):
@@ -672,7 +674,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         "merged": {"nodes": merged}}}}),
                     reply(200, []),
                     reply(200, []))
-        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=TRUSTED)
         self.assertNotIn("warning: work merges into", report)
 
     def test_status_warns_only_when_more_than_half_of_merges_are_undeclared(self):
@@ -688,7 +690,7 @@ class SensitiveResumeTests(unittest.TestCase):
                                 "merged": {"nodes": merged}}}}),
                             reply(200, []),
                             reply(200, []))
-                report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env={})
+                report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=TRUSTED)
                 if should_warn:
                     self.assertIn("warning: work merges into side", report)
                 else:
@@ -1914,7 +1916,7 @@ class EscalateTests(unittest.TestCase):
                     ("GET", "/issues/9/comments"): reply(200, comments)}
                 routes.update(lanes_routes(()))
                 routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [])
-                report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO)
+                report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO, env=TRUSTED)
                 self.assertIn("REPEATEDLY STUCK", report)
                 self.assertIn("next rung", report)
 
@@ -1926,7 +1928,7 @@ class EscalateTests(unittest.TestCase):
                   ("GET", "/issues/9/comments"): reply(200, []),
                   ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
         routes.update(lanes_routes(()))
-        self.assertNotIn("REPEATEDLY STUCK", brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO))
+        self.assertNotIn("REPEATEDLY STUCK", brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO, env=TRUSTED))
 
     def test_status_shows_attempts_and_the_next_rung(self):
         issue = stuck_ticket("failed")
@@ -1935,7 +1937,7 @@ class EscalateTests(unittest.TestCase):
                   ("GET", "/issues/9/comments"): reply(200, [claim("2030-01-01T00:11:00Z"), fixc("2030-01-01T00:50:00Z")]),
                   ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
         routes.update(lanes_routes(()))
-        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO)
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO, env=TRUSTED)
         self.assertIn("failed 2 times", report)
         self.assertIn("attempts 3", report)
         self.assertIn("tried claude-sonnet-5-5", report)
@@ -1957,7 +1959,7 @@ class EscalateTests(unittest.TestCase):
         routes.update(lanes_routes(()))
         fake = Routed(routes)
         with unittest.mock.patch.object(brain, "STATUS_HISTORY_MAX", 1):
-            report = brain.status(GitHub("t", transport=fake), [REPO], REPO)
+            report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=TRUSTED)
         read = sorted(c[1].split("?")[0] for c in fake.calls
                       if c[1].split("?")[0].endswith(("/events", "/comments")) and "/issues/99/" not in c[1])
         self.assertEqual(read, ["/repos/%s/issues/9/comments" % REPO, "/repos/%s/issues/9/events" % REPO])
@@ -2339,7 +2341,7 @@ class VerifyDueTests(unittest.TestCase):
             if path == "/graphql":
                 return reply(200, {"data": {"repository": {}}})
             return inner(method, url, headers, body)
-        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env={},
+        report = brain.status(GitHub("t", transport=transport), [REPO], REPO, env=TRUSTED,
                               now=self.NOW, authors=[])
         section = report.split("### Verify due", 1)[1].split("###", 1)[0]
         self.assertIn("- #5 T5 - shipped 6h ago - Live: the dashboard shows the new column", section)
@@ -2996,7 +2998,7 @@ class HeldTicketsTest(unittest.TestCase):
     def status_for(self, *issues, events=(), now=None):
         """status over these issues, at `now` (the real clock when None)."""
         routes = self.routes(*issues, events=events)
-        return brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO, now=now)
+        return brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO, now=now, env=TRUSTED)
 
     def ticket_line(self, report, number=12):
         """The ticket's own line under #### briefed, not its Held one."""

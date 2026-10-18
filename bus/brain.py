@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, _next_link, auth_from_env
+from .github import GitHub, GitHubError, _next_link, auth_from_env, rest_login
 from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -127,7 +127,10 @@ def _status_pr_fields(pr_ids: Sequence[int], ruling: Sequence[int]) -> List[str]
 
 def _status_goal_fields(goal_ids: Sequence[int]) -> List[str]:
     """GraphQL aliases for the latest comments on each goal issue."""
-    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt author { login } } } }" % (n, n)
+    # __typename: GraphQL names the Loom App "<slug>" without "[bot]", and
+    # only a Bot author gains the suffix that LOOM_BRIEF_AUTHORS carries.
+    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt"
+            " author { __typename login } } } }" % (n, n)
             for n in goal_ids]
 
 
@@ -235,7 +238,7 @@ def _goal_comments(node: Optional[Dict[str, Any]],
     allowed = {a.lower() for a in authors} if authors else None
     found = []
     for c in ((node or {}).get("comments") or {}).get("nodes") or []:
-        login = str((c.get("author") or {}).get("login") or "").lower()
+        login = rest_login(c.get("author")).lower()
         at = str(c.get("createdAt") or "")
         if _stamp(at) is None or (allowed is not None and login not in allowed):
             continue
@@ -302,7 +305,7 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         comments = (node.get("comments") or {}).get("nodes") or []
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
-              "login": (c.get("author") or {}).get("login")} for c in comments], authors)
+              "login": rest_login(c.get("author"))} for c in comments], authors or ())
         lines += ["  " + x for x in handoff.stage_lines(handoff.marks(found))]
     # A missed report deadline is its own condition: not a forwarding failure
     # and not a stopped brain. Post these before unlocking.
@@ -698,9 +701,11 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     env = os.environ if env is None else env
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
+    # Explicit `authors` are the caller's choice; read from the environment,
+    # an empty list is refused, as it would trust no journal (loom#783).
     if authors is None:
-        authors = trusted_authors(env)
-    out: List[str] = ["# Loom status"]
+        authors = require_trusted_authors(env, "status")
+    out: List[str] = ["# Loom status", "", trusted_line(authors)]
     # Each repo's reads are independent, so they run side by side; the
     # sections keep the order of `repos`. A status took 68 s here and 152 s
     # from a remote brain, over a 15-minute tick (2026-10-15).
@@ -2514,6 +2519,27 @@ def trusted_authors(env: Optional[Dict[str, str]] = None) -> List[str]:
     return raw.replace(",", " ").split()
 
 
+_NO_TRUST = ("%s trusts no login: LOOM_BRIEF_AUTHORS is empty. Set it to the operator's "
+             "login and the Loom App's bot login (<app-slug>[bot]); without it every "
+             "journal, report and handoff is skipped and every stage reads as open")
+
+
+def require_trusted_authors(env: Optional[Dict[str, str]], command: str) -> List[str]:
+    """trusted_authors, or a ValueError naming the setting when it is empty:
+    status and resume read only trusted journals, so with nobody trusted they
+    would report no handoffs and every stage open instead of failing."""
+    authors = trusted_authors(env)
+    if not authors:
+        raise ValueError(_NO_TRUST % command)
+    return authors
+
+
+def trusted_line(authors: Sequence[str]) -> str:
+    """The line status and resume print first, so a trust list that misses
+    a login shows in the output."""
+    return "Trusted logins (LOOM_BRIEF_AUTHORS): %s" % " ".join(authors)
+
+
 def trusted_briefers(env: Optional[Dict[str, str]] = None) -> List[str]:
     """LOOM_TRUSTED_BRIEFERS: another operator's logins whose loom:ticket
     briefs this Loom builds like its own (tickets.brief_author_trusted). They
@@ -2981,33 +3007,43 @@ def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
         print("brain step write failed: %s" % exc, file=sys.stderr)
 
 
+GoalJournals = Tuple[str, Dict[str, Any], List[Dict[str, Any]], List[str]]
+
+
 def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
-                   ) -> List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]:
+                   ) -> List[GoalJournals]:
+    """(repo, goal, trusted journals, logins of the journals skipped) for
+    every goal across `repos`."""
     # Nothing is caught here: a GitHubError ends the command through main's
     # narrow handler, so a fault never reads as a goal with no journals.
-    goals: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]] = []
+    goals: List[GoalJournals] = []
     for repo in repos:
         for issue in _issues(gh, repo):
             if "loom:goal" not in _labels(issue):
                 continue
-            goals.append((repo, issue, _goal_home_journals(gh, repo, int(issue["number"]),
-                                                           authors)))
+            comments = _goal_home_comments(gh, repo, int(issue["number"]))
+            goals.append((repo, issue, handoff.journals(comments, authors),
+                          handoff.untrusted_journal_logins(comments, authors)))
     return goals
+
+
+def _goal_home_comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
+    """Every comment on one goal home as {"body", "at", "login"}."""
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    return [{"body": c.get("body"), "at": c.get("created_at"),
+             "login": (c.get("user") or {}).get("login")} for c in comments]
 
 
 def _goal_home_journals(gh: GitHub, repo: str, number: int,
                         authors: Sequence[str]) -> List[Dict[str, Any]]:
     """The journals on one goal home from `authors`, oldest first."""
-    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-    return handoff.journals(
-        [{"body": c.get("body"), "at": c.get("created_at"),
-          "login": (c.get("user") or {}).get("login")} for c in comments], authors)
+    return handoff.journals(_goal_home_comments(gh, repo, number), authors)
 
 
 def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                        found: List[Dict[str, Any]],
-    latest: Optional[Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]] = None
-                       ) -> List[str]:
+    latest: Optional[Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]] = None,
+                       skipped: Sequence[str] = ()) -> List[str]:
     found_marks = handoff.marks(found)
     items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
     latest = latest or {(m.stage, m.item, m.key if m.stage == "brief" else ""): m
@@ -3016,6 +3052,9 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
+    if skipped:
+        out.append("- skipped journals by logins not in LOOM_BRIEF_AUTHORS: %s"
+                   % " ".join(skipped))
     for m in items:
         newest = latest[(m.stage, m.item, m.key if m.stage == "brief" else "")]
         if newest.kind == "defer" and newest != m:
@@ -3129,21 +3168,22 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     work is open to it under the freshness rule (handoff.QUIET). Refuses
     unless `holder` holds the lock, so only the lock holder acts on it."""
     now = now or datetime.now(timezone.utc)
+    authors = require_trusted_authors(env, "resume")
     _lock_holder(gh, lock_repo, holder, now)
-    goals = _goal_journals(gh, repos, trusted_authors(env))
+    goals = _goal_journals(gh, repos, authors)
     latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
-    for _, _, found in goals:
+    for _, _, found, _ in goals:
         for mark in handoff.marks(found):
             key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
             if key not in latest or mark.at >= latest[key].at:
                 latest[key] = mark
-    out = ["# Resume for %s" % holder, "",
+    out = ["# Resume for %s" % holder, "", trusted_line(authors), "",
            _freshness_line(handoff.peer_journals(
-               [j for _, _, found in goals for j in found], holder, now))]
-    for repo, issue, found in goals:
-        out += _goal_resume_lines(gh, repo, issue, found, latest)
+               [j for _, _, found, _ in goals for j in found], holder, now))]
+    for repo, issue, found, skipped in goals:
+        out += _goal_resume_lines(gh, repo, issue, found, latest, skipped)
     return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
-                      + _finished_epic_resume_lines(gh, [(r, i) for r, i, _ in goals])
+                      + _finished_epic_resume_lines(gh, [(r, i) for r, i, _, _ in goals])
                       + _verify_resume_lines(gh, repos, now)
                       + _audit_resume_lines(gh, repos, now, env))
 

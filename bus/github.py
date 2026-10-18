@@ -79,6 +79,18 @@ class Response:
         self.headers = headers if headers is not None else {}
 
 
+def rest_login(author: Optional[Dict[str, Any]]) -> str:
+    """A GraphQL author's login in the form REST, and so LOOM_BRIEF_AUTHORS,
+    uses: GraphQL names a GitHub App "<slug>" and REST "<slug>[bot]". Only an
+    author whose __typename is Bot gains the suffix, so a person who takes the
+    bare slug as a user login is never read as the App."""
+    author = author or {}
+    login = str(author.get("login") or "")
+    if login and author.get("__typename") == "Bot" and not login.lower().endswith("[bot]"):
+        login += "[bot]"
+    return login
+
+
 def request_kind(method: str, url: str) -> str:
     """The endpoint kind a request is counted under in the station's log."""
     path = url.split("://", 1)[-1].split("/", 1)[-1].split("?", 1)[0]
