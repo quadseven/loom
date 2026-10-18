@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, factory, proof, spend, station, tickets  # noqa: E402
+from bus import audit, brain, factory, invariants, proof, spend, station, tickets  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
 
@@ -3269,6 +3269,41 @@ class RetryTest(Base):
         self.assertTrue(station.needs_public_repo("agy", ""))
         self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
         self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
+
+
+class SilentLaneTest(Base):
+    """A running ticket on a lane with no heartbeat for 30 minutes (loom#538):
+    the station reports each lane's silence to the factory and keeps the lanes
+    that held a running ticket for the invariant check."""
+
+    def station(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings,
+                               now=time.time())
+
+    def test_a_lane_without_a_live_heartbeat_reports_how_long_it_has_been_silent(self):
+        self.heartbeat("codex", age=31 * 60)
+        self.heartbeat("codex-2", age=60)
+        self.heartbeat("opencode-go", available=False, age=60)
+        silent = self.station()._silent_lanes()
+        self.assertAlmostEqual(silent["codex"], 31 * 60, delta=5)
+        self.assertAlmostEqual(silent["opencode-go"], 60, delta=5)
+        self.assertNotIn("codex-2", silent)
+        # A lane that never reported has no silence to measure.
+        self.assertNotIn("claude", silent)
+
+    def test_the_lanes_found_holding_a_running_ticket_become_an_invariant_fact(self):
+        st = self.station()
+        st._record_silent({"codex": [(REPO, 12)]}, {"codex": 1860.0})
+        (run,) = st._invariant_silent()
+        self.assertEqual((run.lane, run.silent_for, run.at), ("codex", 1860.0, st.now))
+        self.assertEqual(len(run.tickets), 1)
+        (breach,) = invariants.silent_lane(invariants.Facts(st.now, silent_runs=[run]))
+        self.assertIn("codex", breach.title)
+
+    def test_nothing_found_records_nothing(self):
+        st = self.station()
+        st._record_silent({}, {})
+        self.assertEqual(st._invariant_silent(), [])
 
 
 class DeadLaneRunawayTest(Base):

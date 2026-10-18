@@ -5371,6 +5371,7 @@ class Station:
         facts = invariants.Facts(now=self.now)
         facts.events = self._read_events()
         for name, read in (("runs", self._invariant_runs),
+                           ("silent_runs", self._invariant_silent),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:
@@ -6389,7 +6390,55 @@ class Station:
         factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
         if not self.s.factory_on or not factory.due(self.state, self.now):
             return
-        self._factory().run()
+        runner = self._factory()
+        runner.run()
+        self._record_silent(runner.silent_running, runner.silent)
+
+    def _silent_lanes(self) -> Dict[str, float]:
+        """Local lane -> seconds since its last heartbeat, for each lane
+        without a live one (_heartbeat_ok false) that has ever reported."""
+        out = {}
+        for lane in LANES:
+            if lane in REMOTE_LANES or self._heartbeat_ok(lane):
+                continue
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            at = beat.get("at") if isinstance(beat, dict) else None
+            if self._num(at):
+                out[lane] = max(0.0, self.now - at)
+        return out
+
+    def _record_silent(self, found: Dict[str, List[Tuple[str, int]]],
+                       silent: Dict[str, float]) -> None:
+        """Keep the lanes the factory found holding a running ticket while
+        silent for the invariant check (invariants.SILENT_KEEP), which may
+        come passes after the move."""
+        if not found:
+            return
+        path = os.path.join(self.state, "silent-lanes.json")
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        for lane, held in found.items():
+            saved[lane] = {"at": self.now, "silent_for": silent[lane],
+                           "tickets": ["%s#%d" % item for item in held]}
+        _write_json(path, saved)
+
+    def _invariant_silent(self) -> List[invariants.SilentRun]:
+        """The lanes _record_silent kept, their tickets named for a public
+        issue."""
+        saved = _read_json(os.path.join(self.state, "silent-lanes.json"), {}, strict=False)
+        out = []
+        for lane, info in sorted(saved.items() if isinstance(saved, dict) else []):
+            if not (isinstance(info, dict) and self._num(info.get("at"))
+                    and self._num(info.get("silent_for"))):
+                continue
+            refs = []
+            for key in info.get("tickets") or []:
+                match = re.fullmatch(r"(.+)#([0-9]+)", str(key))
+                if match:
+                    refs.append(self._invariant_ref(match.group(1), int(match.group(2))))
+            out.append(invariants.SilentRun(lane, info["silent_for"], tuple(refs), info["at"]))
+        return out
 
     def assign_queued(self) -> None:
         """Give ready queued tickets a free lane after this pass's claims."""
@@ -6406,7 +6455,8 @@ class Station:
                                model_limits=self.model_limits(),
                                no_test_repos=self.s.no_test_repos,
                                available=[x for x in LANES if self._heartbeat_ok(x)],
-                               held=list(self._held_tickets()) + self._gate_held())
+                               held=list(self._held_tickets()) + self._gate_held(),
+                               silent=self._silent_lanes())
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.

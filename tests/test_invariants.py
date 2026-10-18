@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
-from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
+from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun  # noqa: E402
 
 REPO = "example-owner/factory"
 OTHER = "example-owner/hidden"
@@ -708,6 +708,15 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(invariants.remote_silent(Facts(T0, beats={"muse": None})), [])
         self.assertEqual(invariants.remote_silent(Facts(T0, beats={"muse": T0 - limit + 60})), [])
         self.assertEqual(len(invariants.remote_silent(Facts(T0, beats={"muse": T0 - limit - 60}))), 1)
+
+    def test_a_lane_that_held_a_running_ticket_while_silent_is_named(self):
+        run = SilentRun("codex", 31 * 60, (Ref("%s#1" % REPO, "#1"),), T0 - 60)
+        (b,) = invariants.silent_lane(Facts(T0, silent_runs=[run]))
+        self.assertIn("codex", b.title)
+        self.assertIn("#1", " ".join(b.evidence))
+        self.assertEqual(invariants.silent_lane(Facts(T0)), [])
+        old = run._replace(at=T0 - invariants.SILENT_KEEP - 1)
+        self.assertEqual(invariants.silent_lane(Facts(T0, silent_runs=[old])), [])
 
     def test_unread_facts_break_nothing_and_a_raising_invariant_is_logged(self):
         said = []

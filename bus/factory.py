@@ -84,6 +84,9 @@ Neither needs a model:
   the ticket's Model: among its limited_models (a model ladder lane, up for
   its other models) counts as at a limit for that ticket, and the ladder
   never climbs to a rung whose model is limited on every lane of it.
+- A running ticket on a local lane with no live heartbeat for SILENT_MAX
+  moves like a limit move: to a free lane of its tier (of its Model: for a
+  pinned ticket), else back to queued. It is no failure and no retry.
 - When no lane of a ticket's tier is up, a limit move or a queued assignment
   falls back to a free lane of the tiers FALLBACK lists (medium: hard, then
   easy), and says so in its note. The ticket's Difficulty: line is kept, so
@@ -238,6 +241,8 @@ PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse")
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.
 RUNG_BUSY = 2
+# A running ticket on a lane with no live heartbeat for this long moves off it.
+SILENT_MAX = 30 * 60
 RUNG_MARKER = "<!-- loom:rung %d -->"
 RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 # The thread and check headings bus.brain.fix writes into a loom:fix comment.
@@ -929,7 +934,8 @@ class Factory:
                  available: Optional[Sequence[str]] = None,
                  close: Optional[Callable[..., Any]] = None,
                  held: Sequence[str] = (),
-                 model_limits: Optional[Dict[str, Dict[str, float]]] = None) -> None:
+                 model_limits: Optional[Dict[str, Dict[str, float]]] = None,
+                 silent: Optional[Dict[str, float]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -952,6 +958,11 @@ class Factory:
         # incident (they keep their running label and lane, but no lane is
         # working them) or refused this pass by the unproven-work gate.
         self.held = set(held)
+        # Lane -> seconds since its last heartbeat, for each local lane
+        # without a live one; silent_running is the lanes found holding a
+        # running ticket past SILENT_MAX, with those tickets.
+        self.silent = dict(silent or {})
+        self.silent_running: Dict[str, List[Tuple[str, int]]] = {}
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         self.actions = 0
@@ -1632,6 +1643,48 @@ class Factory:
         if not self._spread(repo, issue):
             self._unclaimed(repo, issue)
 
+    def running(self, repo: str, issue: Dict[str, Any]) -> None:
+        """A running ticket whose lane has sent no heartbeat for SILENT_MAX
+        moves like a transient failure but is no failure: a free lane of its
+        tier (of its model, for a Model: ticket), else back to the queue. It
+        takes no rung marker and none of its automatic retries. A remote lane
+        is left to the remote heartbeat rules, a held ticket to the station."""
+        old = _lane(issue)
+        number = int(issue["number"])
+        silent = self.silent.get(old, 0)
+        if (old in REMOTE_LANES or silent < SILENT_MAX
+                or "%s#%d" % (repo, number) in self.held):
+            return
+        self.silent_running.setdefault(old, []).append((repo, number))
+        model = issue_model(issue)
+        lane = (self._queued_model_lane(repo, model) if model != "unspecified"
+                else self._tier_move(repo, issue, old, allow_remote=False)[0])
+        said = ("Not a failure (lane %s has sent no heartbeat for %d minutes): "
+                % (old, silent // 60))
+        if lane is None:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+                "body": said + "no lane of its tier is free, so the ticket goes back to the queue."})
+            kept = [x for x in _labels(issue) if x != "loom:running" and not x.startswith("lane:")]
+            self._relabel(repo, issue, kept + ["loom:queued"])
+            _say("queued %s#%d: lane %s sent no heartbeat for %d minutes"
+                 % (repo, number, old, silent // 60))
+        else:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+                "body": said + "the factory moved this ticket to lane %s, %s." % (
+                    lane, "in its difficulty tier" if model == "unspecified"
+                    else "which takes its model")})
+            kept = brain._moved_labels(_labels(issue), "briefed", lane)
+            self._relabel(repo, issue, kept)
+            self.load[lane] = self.load.get(lane, 0) + 1
+            _say("moved running %s#%d off silent lane %s to %s" % (repo, number, old, lane))
+        self.load[old] = self.load.get(old, 0) - 1
+        self.actions += 1
+
+    def _relabel(self, repo: str, issue: Dict[str, Any], labels: List[str]) -> None:
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, issue["number"]),
+                     {"labels": labels})
+        issue["labels"] = [{"name": x} for x in labels]
+
     def held_by(self, repo: str, issue: Dict[str, Any]) -> List[tickets.After]:
         """The After: tickets of this one that are not merged yet."""
         try:
@@ -1952,7 +2005,8 @@ class Factory:
             if self.actions >= MAX_ACTIONS:
                 return
             self._guarded(self.pull_request, repo, pr, tickets)
-        steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed}
+        steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
+                 "running": self.running}
         for issue in list(tickets.values()):
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:

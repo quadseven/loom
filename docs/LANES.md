@@ -290,7 +290,13 @@ A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
 does while its box is hot) is not failing: a ticket briefed on it moves at
 once to a free lane in its difficulty tier (docs/MUSE.md, Lane choice), with
 no rung marker, or a ticket on a ladder rung to a free lane of that rung; with
-none free it waits where it is for its lane to come back. A failed or stalled
+none free it waits where it is for its lane to come back. A `loom:running`
+ticket on a local lane with no live heartbeat for 30 minutes (an unloaded or
+crashed lane, or a machine that is off) moves the same way, with a comment
+naming the lane and how long it was silent: to a free lane of its tier, or of
+its Model, else back to `loom:queued`. It is no failure and no retry, so it
+never climbs, and the station files a `silent-lane` invariant naming the lane.
+A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
