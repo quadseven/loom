@@ -43,7 +43,8 @@ class Fake:
             return reply(200, {"number": EPIC, "state": "open", "labels": [{"name": "epic"}],
                                "body": "Done when: done.\n\nPart of #1\n"})
         if method == "GET" and (path.startswith("/repos/%s/issues/%d/sub_issues" % (REPO, EPIC))
-                                or path.startswith("/repos/%s/issues?labels=loom:ticket&" % REPO)):
+                                or path.startswith("/repos/%s/issues?labels=loom:ticket&" % REPO)
+                                or path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO)):
             return reply(200, [])
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
