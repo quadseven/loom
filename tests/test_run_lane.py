@@ -492,6 +492,8 @@ class LaneRunnerTest(unittest.TestCase):
 
     def test_configured_app_token_reaches_agent_without_operator_token(self):
         self.drop_brief()
+        key_file = Path(self._tmp.name) / "fake-app-key"
+        key_file.write_text("fake key\n")
         self.write_tool(self.bin / "python3", """#!/usr/bin/env bash
 case "$*" in
   *AppToken.from_env*) printf '%s' 'ghs_minted_for_test'; exit 0 ;;
@@ -503,7 +505,7 @@ printf 'agent GH_TOKEN=%s GITHUB_TOKEN=%s\\n' "${GH_TOKEN:-none}" "${GITHUB_TOKE
 echo fixed > fix.txt
 """)
         result = self.run_lane(LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456",
-                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",  # noqa: S108
+                               LOOM_GITHUB_APP_KEY_FILE=str(key_file),
                                GH_TOKEN="gho_operator_for_test", GITHUB_TOKEN="gho_operator_for_test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("agent GH_TOKEN=ghs_minted_for_test GITHUB_TOKEN=ghs_minted_for_test",
@@ -511,6 +513,8 @@ echo fixed > fix.txt
 
     def test_failed_app_mint_never_runs_agent_with_operator_token(self):
         self.drop_brief()
+        key_file = Path(self._tmp.name) / "fake-app-key"
+        key_file.write_text("fake key\n")
         self.write_tool(self.bin / "python3", """#!/usr/bin/env bash
 case "$*" in
   *AppToken.from_env*) echo 'mint refused' >&2; exit 1 ;;
@@ -518,7 +522,7 @@ esac
 exec /usr/bin/python3 "$@"
 """)
         result = self.run_lane(LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456",
-                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",  # noqa: S108
+                               LOOM_GITHUB_APP_KEY_FILE=str(key_file),
                                GH_TOKEN="gho_operator_for_test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
