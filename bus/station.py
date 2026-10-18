@@ -230,7 +230,9 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # factory broke (a contract the runner cannot read, a check it cannot run,
 # a base check already red), so the ticket stays running on its lane and
 # keeps its rung, and the brain re-queues it when the incident closes.
-CLASS_RE = re.compile(r"^\[(limit|transient|work|factory)\] ")
+# An [auth] one is the operator's key, which no lane can renew: it is not a
+# failure, not an attempt spent and never a runaway.
+CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Where the runner files its validation incidents (lanes/run_lane.sh
@@ -819,7 +821,7 @@ def provider(lane: str) -> str:
 
 
 # Failure classes that did no work on the ticket (loom#572).
-NOT_WORK = ("factory", "transient", "limit")
+NOT_WORK = ("factory", "transient", "limit", "auth")
 
 
 def failure_class(reason: str) -> str:
@@ -3336,6 +3338,12 @@ class Station:
                           "queue when the factory incident closes." % (lane, bare))
             _say("held %s#%d for the factory: %s" % (repo, number, reason))
             return True
+        if klass == "auth":
+            # The provider refused the key: no attempt of any lane can renew
+            # it, so the ticket costs nothing and goes to a lane that still has
+            # a working one (loom#744).
+            self._unauthenticated(repo, number, fix_pr.isdigit(), lane, bare)
+            return True
         if fix_pr:
             # A fresh attempt would open a second pull request for the ticket.
             # A work failure goes to loom:failed, where the factory climbs the
@@ -3365,9 +3373,10 @@ class Station:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
         if failure_class(reason) in NOT_WORK:
-            # An incident is the factory's problem repeating, and a transient
-            # or limit exit is the lane's: neither did the ticket's work, so
-            # neither may flag it or cost it a rung (loom#572).
+            # An incident is the factory's problem repeating, a transient or
+            # limit exit is the lane's, and an expired key is the operator's:
+            # none did the ticket's work, so none may flag it or cost it a rung
+            # (loom#572, loom#744).
             return False
         authors = {author.lower() for author in self.s.authors}
         comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
@@ -3492,6 +3501,18 @@ class Station:
         self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
                       "the ticket goes to the next lane." % (lane, reason))
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _unauthenticated(self, repo: str, number: int, fix: bool, lane: str,
+                         reason: str) -> None:
+        """A run the provider refused the key for (not a failure, and no
+        attempt spent). The lane runner has taken every lane that shares the key
+        offline and opened the operator an ask naming the parameter, so the
+        ticket goes back to briefed, where the factory moves it to a lane whose
+        key works; a fix brief's goes back to loom:pr."""
+        self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
+        self._comment(repo, number, "Lane %s could not authenticate (%s). This is not a "
+                      "failure: the ticket goes to a lane with a working key." % (lane, reason))
+        _say("reported %s#%d unauthenticated on lane %s: %s" % (repo, number, lane, reason))
 
     def _branch_moved(self, repo: str, number: int, pr: int, lane: str, reason: str) -> None:
         """A fix brief whose push was refused because the pull request's

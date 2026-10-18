@@ -168,7 +168,13 @@ failure moves the ticket to another available lane as a new attempt, at most
 back to `loom:pr`, and one that fails its work goes to `loom:failed`, so the
 factory climbs the ladder and sends the fix to the next rung; a lane that hit its provider limit stays unavailable until the
 provider's reset (else 60 minutes; delete its heartbeat file in
-`state/usage/` to clear it sooner). It reads `LOOM_REPOS`,
+`state/usage/` to clear it sooner). A key the provider will not take is
+`[auth]`, not a transient failure: it costs the ticket no attempt, never
+flags `loom:runaway`, and every lane that bills that key stays unavailable
+with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
+`retry_at`, until the value at that parameter changes. The runner opens one
+`needs-operator` ask on the factory repo naming that parameter. It reads
+`LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.

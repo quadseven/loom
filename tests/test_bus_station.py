@@ -3036,6 +3036,59 @@ class DeadLaneRunawayTest(Base):
             [b for b in self.bodies() if b.startswith("<!-- loom:runaway-dead-lane v1")], [])
 
 
+class ExpiredKeyTest(Base):
+    """An [auth] brief is the provider refusing the key, not the lane's work:
+    the ticket goes back where it was, no retry is spent on it, and however
+    many keys expire it never flags runaway (loom#744)."""
+
+    REASON = "[auth] agent exited 1: API key expired: renew /prod/loom/opencode-go/key"
+
+    def failed(self, lane="opencode-go", number=12, attempt=1, reason=None):
+        reason = reason or self.REASON
+        self.fake.add(number, lane=lane, body=PLAIN, state="running")
+        for _ in range(attempt):
+            self.fake.comments[number].append(
+                {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane})
+        name = tickets.ticket_name(REPO, number, attempt)
+        self.write(self.inbox(lane, "failed", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[number], lane, attempt, None))
+        self.write(os.path.join(self.home, "logs", lane, name + ".log"),
+                   "[t] %s start, lane %s\n[t] %s failed: %s\n" % (name, lane, name, reason))
+        return name
+
+    def bodies(self, number=12):
+        return [c["body"] for c in self.fake.comments[number]]
+
+    def test_auth_is_a_failure_class_not_work(self):
+        self.assertEqual(station.failure_class(self.REASON), "auth")
+
+    def test_an_expired_key_is_not_a_failure_and_spends_no_retry(self):
+        self.failed()
+        self.run_pass()
+        # Back to briefed, where the factory moves it to a lane whose key works.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:opencode-go", "loom:briefed"])
+        self.assertFalse(any(b.startswith("Automatic retry") for b in self.bodies()))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        said = self.bodies()[-1]
+        # The parameter itself is scrubbed here as any path is; the exact one is
+        # in the lane heartbeat and in the ask the runner files.
+        self.assertIn("could not authenticate (agent exited 1: API key expired:", said)
+        self.assertIn("not a failure", said)
+
+    def test_expired_key_failures_never_flag_runaway_or_spend_an_attempt(self):
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.failed(attempt=3)
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane,
+             "created_at": at, "user": {"login": "alice-example"}}
+            for lane in ("opencode-go", "opencode-go-2", "opencode-go-3")]
+        before = factory.attempts(self.fake.comments[12])
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertEqual(factory.attempts(self.fake.comments[12]), before)
+
+
 class FactoryIncidentTest(Base):
     """A [factory] brief is not a work failure: the ticket stays running on
     its lane and keeps its rung, and a closed incident re-queues it."""
