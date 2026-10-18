@@ -254,7 +254,9 @@ class FakeGitHub:
             return reply(201, {"number": 1})
         if method == "PATCH":
             self.edits.append(data["body"])
-            return reply(200, {})
+            # GitHub answers a comment edit with the comment, naming its issue.
+            return reply(200, getattr(self, "edit_answer",
+                                      {"issue_url": "https://api.github.com/repos/%s/issues/1" % REPO}))
         if method == "GET":
             return reply(200, self.status_comments)
         self.status_comments.append({"id": 77, "body": data["body"]})
@@ -454,6 +456,35 @@ class StationReadBudgetTest(Base):
         second._proven(REPO, 12)
         paths = self.fake.paths("GET")
         self.assertEqual(len([p for p in paths if "/issues/12/comments" in p]), 1)
+
+    def test_a_comment_edit_on_another_issue_keeps_the_ticket_read(self):
+        # The station edits its handoff packet and lane status every pass; that
+        # must not throw away every other ticket's cached reads (loom#722).
+        self.fake.add(12, state="shipped")
+        first = self.reader()
+        first._tickets_open(REPO)
+        first._proven(REPO, 12)
+        first.gh.rest("PATCH", "/repos/%s/issues/comments/901" % REPO, {"body": "packet"})
+        first.end_pass()
+        self.fake.calls.clear()
+        second = self.reader()
+        second._tickets_open(REPO)
+        second._proven(REPO, 12)
+        self.assertFalse([p for p in self.fake.paths("GET") if "/issues/12/comments" in p])
+
+    def test_a_comment_edit_that_names_no_issue_still_drops_every_read(self):
+        self.fake.add(12, state="shipped")
+        self.fake.edit_answer = {}
+        first = self.reader()
+        first._tickets_open(REPO)
+        first._proven(REPO, 12)
+        first.gh.rest("PATCH", "/repos/%s/issues/comments/901" % REPO, {"body": "packet"})
+        first.end_pass()
+        self.fake.calls.clear()
+        second = self.reader()
+        second._tickets_open(REPO)
+        second._proven(REPO, 12)
+        self.assertTrue([p for p in self.fake.paths("GET") if "/issues/12/comments" in p])
 
     def test_comment_post_invalidates_the_ticket_read(self):
         self.fake.add(12, state="shipped")
