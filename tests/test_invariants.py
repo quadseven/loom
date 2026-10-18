@@ -20,6 +20,7 @@ OTHER = "example-owner/hidden"
 GOAL = 30
 AUTHOR = "trusted-example"
 T0 = 1_800_000_000.0
+DAY_S = 24 * 3600
 
 
 def stamp(at):
@@ -61,6 +62,8 @@ class FakeGH:
         self.threads = []
         # (repo, issue number) -> its sub-issues, for the goal walk.
         self.subs = {}
+        # repo -> its open loom:ticket issues.
+        self.tickets = {}
 
     def paginate(self, path):
         self.calls.append(("GET", path))
@@ -76,7 +79,7 @@ class FakeGH:
                     if m.group(2) == "all" or i["state"] == "open"]
         m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:ticket&state=open", path)
         if m:
-            return []
+            return list(self.tickets.get(m.group(1), []))
         # The goal walk (goal, epics, tickets).
         m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues\?", path)
         if m:
@@ -355,6 +358,70 @@ class StationTest(StationBase):
             self.run_at(at)
         self.assertEqual(self.gh.filed(), [])
         self.assertTrue(any("/issues?labels=loom:ticket" in c[1] for c in self.gh.calls))
+
+    def out_of_credit(self, lanes, at):
+        """Each lane's heartbeat at `at`: held out of credit, as run_lane.sh
+        writes it."""
+        for lane in lanes:
+            self.write(os.path.join(self.home, "state", "usage", lane + ".json"), json.dumps(
+                {"lane": lane, "at": at, "available": False,
+                 "reason": "limit: out of credit; unavailable until %s" % stamp(at + DAY_S)}))
+
+    def queued_ticket(self, number, *labels, author=AUTHOR):
+        self.gh.tickets.setdefault(REPO, []).append(
+            {"number": number, "state": "open", "user": {"login": author},
+             "body": "Difficulty: hard\n\n## Why\nx\n",
+             "labels": [{"name": n} for n in ("loom:ticket",) + labels]})
+
+    def held_out_of_credit(self):
+        """Two anthropic slots out of credit for three hours, with one hard
+        ticket queued: the breach the no-top-up rule is about."""
+        self.queued_ticket(653, "loom:queued")
+        for at in (T0, T0 + 3 * 3600):
+            self.out_of_credit(("anthropic", "anthropic-2"), at)
+            self.run_at(at)
+
+    def test_an_out_of_credit_lane_held_while_its_tier_waits_files_by_default(self):
+        self.held_out_of_credit()
+        self.assertEqual(sorted(b["title"].split(" held")[0] for b in self.breaches()),
+                         ["Lane anthropic", "Lane anthropic-2"])
+
+    def test_no_topup_skips_lanes_held_out_of_credit_on_that_account(self):
+        self.settings.no_topup = ["anthropic"]
+        self.held_out_of_credit()
+        self.assertEqual(self.breaches(), [])
+        # Nothing to file, so the queued tickets are not even read.
+        self.assertFalse(any("/issues?labels=loom:ticket" in c[1] for c in self.gh.calls))
+
+    def test_no_topup_still_files_a_lane_of_that_account_held_by_another_limit(self):
+        self.settings.no_topup = ["anthropic"]
+        self.queued_ticket(653, "loom:queued")
+        usage = os.path.join(self.home, "state", "usage", "anthropic-3.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps({"lane": "anthropic-3", "at": at, "available": False,
+                                          "reason": "limit: rate limited"}))
+            self.run_at(at)
+        (filed,) = self.breaches()
+        self.assertIn("Lane anthropic-3 held", filed["title"])
+
+    def test_a_ticket_queued_beside_a_later_state_or_claimed_elsewhere_is_not_counted(self):
+        self.queued_ticket(653, "loom:queued", "loom:shipped")
+        self.queued_ticket(629, "loom:queued", "claim:another-operator")
+        self.queued_ticket(609, "loom:queued", "loom:merged")
+        self.queued_ticket(41, "loom:queued")
+        for at in (T0, T0 + 3 * 3600):
+            self.out_of_credit(("anthropic",), at)
+            self.run_at(at)
+        (filed,) = self.breaches()
+        self.assertIn("while 1 tickets", filed["title"])
+        self.assertIn("Queued for its tier: #41", filed["body"])
+        for shipped in ("#653", "#629", "#609"):
+            self.assertNotIn(shipped, filed["body"])
+
+    def test_no_topup_is_read_from_the_environment(self):
+        self.assertEqual(station.Settings.from_env({"LOOM_NO_TOPUP": "Anthropic, zen"}).no_topup,
+                         ["anthropic", "zen"])
+        self.assertEqual(station.Settings.from_env({}).no_topup, [])
 
     def test_a_lane_pull_open_seven_hours_whose_ticket_is_not_a_loom_ticket_files_a_breach(self):
         self.lane_ticket(481, labels=("epic",))
@@ -670,6 +737,13 @@ class InvariantTest(unittest.TestCase):
         runs.append(Run("zen", True, T0, ""))
         runs.append(Run("zen", False, T0, "x"))
         self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+
+    def test_a_lane_out_of_credit_on_a_no_topup_account_is_not_held(self):
+        ticket = Ref("%s#5" % REPO, "#5")
+        f = Facts(T0, held={"anthropic": T0 - 3 * 3600, "anthropic-2": T0 - 3 * 3600},
+                  queued=[(ticket, ("anthropic", "anthropic-2"))], no_topup=("anthropic-2",))
+        (b,) = invariants.lane_held(f)
+        self.assertEqual(b.subject, "anthropic")
 
     def test_a_lane_held_over_two_hours_while_its_tier_waits(self):
         ticket = Ref("%s#5" % REPO, "#5")

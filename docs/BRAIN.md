@@ -362,6 +362,32 @@ per live finding, with `Priority:` from its impact, updates it while the
 finding lasts and notes when it goes absent (`bus/health.py`). docs/HEALTH.md
 has the endpoint contract and the rules.
 
+### Friction intake
+
+A slowdown the tick journals keep naming gets a ticket without waiting for a
+brain to brief it (`bus/friction_intake.py`). With `LOOM_FRICTION_INTAKE=1`
+the station reads, at most every 10 minutes, the journals the
+`LOOM_BRIEF_AUTHORS` logins posted in the last 24 hours on the goal home
+invariant breaches are filed on (`LOOM_INVARIANT_GOAL`, else Loom's own goal),
+and groups their `- Friction:` lines (`bus/friction.py`, the same parser the
+Improving page uses) by their words longer than three letters: a line joins
+the group whose first line shares at least 0.6 of them (Jaccard). A group
+named by 3 or more journals over at least 2 hours recurs.
+
+- A recurring group no ticket is linked to (a `Noticed in` line naming one
+  of its journals, or its `<!-- loom:friction key=... -->` marker) gets one
+  ticket under the goal's intake epic, with a `Noticed in` line, every
+  member journal as evidence and the marker. At most one per pass.
+- A linked open ticket gets the journals it does not cite yet as one
+  `<!-- loom:friction-evidence -->` comment, at most every 6 hours.
+- A ticket closed as not planned is never filed again for its slowdown; one
+  closed as done is filed again only when journals after the close recur.
+
+The ledger is `state/station/friction.json`, written after each write
+succeeds. `LOOM_FRICTION_INTAKE=dry` logs `friction OWNER/NAME: would file
+...` and writes nothing, so a dry run can be read in the station log before
+turning it on; each ticket filed logs `friction OWNER/NAME: filed #N`.
+
 ### Agent rewrites
 
 The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).

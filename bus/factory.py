@@ -948,8 +948,9 @@ class Factory:
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
         self.available = None if available is None else set(available)
-        # The tickets the station held for a factory incident, "owner/repo#n":
-        # they keep their running label and lane, but no lane is working them.
+        # The tickets the station holds, "owner/repo#n": held for a factory
+        # incident (they keep their running label and lane, but no lane is
+        # working them) or refused this pass by the unproven-work gate.
         self.held = set(held)
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
@@ -1613,6 +1614,12 @@ class Factory:
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
+        if "%s#%s" % (repo, issue["number"]) in self.held:
+            # The station holds it (a factory incident, or the unproven-work
+            # gate this pass): no lane is late, so it is neither spread nor
+            # moved as stalled. Moving it rotated loom#633 through every rung
+            # with a comment each time while the gate held it (2026-10-18).
+            return
         waiting = self.held_by(repo, issue)
         if waiting:
             # Waiting for another ticket is not this one's fault: it is not
