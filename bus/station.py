@@ -784,6 +784,10 @@ def provider(lane: str) -> str:
     return re.sub(r"-[0-9]+$", "", lane)
 
 
+# Failure classes that did no work on the ticket (loom#572).
+NOT_WORK = ("factory", "transient", "limit")
+
+
 def failure_class(reason: str) -> str:
     m = CLASS_RE.match(reason)
     return m.group(1) if m else "work"
@@ -2956,9 +2960,16 @@ class Station:
         if self._claimed_since(comments, incident):
             return
         self._relabel(repo, number, "loom:queued")
+        cleared = RUNAWAY in _label_names(issue)
+        if cleared:
+            # The hold came from the factory's own failure, which is now fixed
+            # (loom#572); a runaway label kept here held tickets for hours.
+            kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         self._comment(repo, number,
                       "Factory incident %s is closed: the ticket is back in the queue "
-                      "on its lane." % ref)
+                      "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
+                                          if cleared else ""))
         self._forget_held(key)
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
 
@@ -3264,25 +3275,32 @@ class Station:
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
-        if failure_class(reason) == "factory":
-            # An incident is the factory's problem repeating, not the lane's:
-            # it must never flag the ticket or cost it a rung.
+        if failure_class(reason) in NOT_WORK:
+            # An incident is the factory's problem repeating, and a transient
+            # or limit exit is the lane's: neither did the ticket's work, so
+            # neither may flag it or cost it a rung (loom#572).
             return False
         authors = {author.lower() for author in self.s.authors}
         comments = [c for c in self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         attempts = factory.attempts(comments, reason)
-        failures = [a[3] for a in attempts[:-1] if a[3]]
+        work = [a for a in attempts if not a[3] or failure_class(a[3]) not in NOT_WORK]
+        failures = [a[3] for a in work[:-1] if a[3]]
         reason_repeat = bool(failures) and failures[-1] == reason
-        recent = [a for a in attempts if a[0] >= self.now - 6 * 3600]
+        recent = [a for a in work if a[0] >= self.now - 6 * 3600]
         if not reason_repeat and len(recent) < 3:
             return False
         issue = self._issue(repo, number)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
-        self._comment(repo, number, factory.runaway_comment(
-            trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments)))
+        body = factory.runaway_comment(
+            trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments))
+        skipped = len(attempts) - len(work)
+        if skipped:
+            body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit] "
+                     "or [factory]." % skipped)
+        self._comment(repo, number, body)
         return True
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:

@@ -2677,6 +2677,38 @@ class RetryTest(Base):
         self.assertIn("| codex-2 | model-x | - |", table)
         self.assertIn("| codex | model-x | [work] agent made no commit", table)
 
+    def test_attempts_that_ended_transient_or_limit_do_not_count_toward_runaway(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        claim = "Claimed for lane %s (body sha256 0123456789ab)"
+        self.fake.comments[12][:] = [
+            dict({"body": claim % "codex"}, **who),
+            dict({"body": "Lane codex failed: [transient] agent exited 1"}, **who),
+            dict({"body": claim % "codex-2"}, **who),
+            dict({"body": "Lane codex-2 failed: [limit] agent exited 1: provider limit reached"}, **who),
+            dict({"body": claim % "codex"}, **who)]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_a_runaway_comment_says_how_many_attempts_it_left_out(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        claim = "Claimed for lane %s (body sha256 0123456789ab)"
+        self.fake.comments[12][:] = [
+            dict({"body": claim % "codex"}, **who),
+            dict({"body": "Lane codex failed: [transient] agent exited 1"}, **who),
+            dict({"body": claim % "codex"}, **who),
+            dict({"body": "Lane codex failed: [work] agent made no commit on loom/12-x"}, **who),
+            dict({"body": claim % "codex-2"}, **who),
+            dict({"body": "Lane codex-2 failed: [work] agent made no commit on loom/12-y"}, **who),
+            dict({"body": claim % "codex"}, **who)]
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit] or "
+                      "[factory].", self.bodies()[-1])
+
     def test_the_attempt_table_names_the_model_each_attempt_ran(self):
         # No Model: line: each claim ran its lane's configured model, a slot's
         # own setting first, never the issue's "unspecified" or a fixed map.
@@ -2971,6 +3003,17 @@ class FactoryIncidentTest(Base):
             self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
         self.assertTrue(any("back in the queue" in b for b in self.bodies()))
+
+    def test_a_closed_factory_incident_clears_the_runaway_hold_of_its_ticket(self):
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertTrue(any("its loom:runaway hold is cleared" in b for b in self.bodies()))
 
     def test_a_claim_newer_than_the_incident_close_blocks_the_requeue(self):
         self.heartbeat("muse")
