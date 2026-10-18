@@ -52,6 +52,10 @@ REPEATED_FAILURE = 3600
 # Decision 0003: an epic holds at most EPIC_TICKETS tickets.
 EPIC_TICKETS = 15
 PLAN_FAILED_AGE = 30 * 60
+# More than LABELER_REFUSALS_MAX refusals of briefed tickets for one untrusted
+# labeler within LABELER_WINDOW seconds is a trust gap (loom#660).
+LABELER_REFUSALS_MAX = 3
+LABELER_WINDOW = 3600
 # A lane pull request open longer than this is a breach: six hours is the time
 # the factory gives a lane to open one, and nothing else named the pull
 # requests that sat past it (loom#715). Not CLEAR_AFTER, which is how long a
@@ -204,6 +208,9 @@ class Facts:
     # remote lane -> its newest heartbeat, None when it never posted one.
     beats: Optional[Dict[str, Optional[float]]] = None
     events: Optional[List[Event]] = None
+    # untrusted labeler login -> briefed tickets refused for it in the last
+    # LABELER_WINDOW seconds.
+    label_refusals: Optional[Dict[str, int]] = None
 
 
 @dataclass(frozen=True)
@@ -599,10 +606,34 @@ def repeated_failure(f: Facts) -> List[Breach]:
     return out
 
 
+def untrusted_labeler(f: Facts) -> List[Breach]:
+    """A login whose briefed-ticket labels the station refused more than
+    LABELER_REFUSALS_MAX times in an hour: a trust gap (a credential change,
+    a new bot login) that would otherwise live only in the station log while
+    no new work starts (loom#660). It clears when the refusals stop."""
+    if f.label_refusals is None:
+        return []
+    out = []
+    for login, count in sorted(f.label_refusals.items()):
+        if count <= LABELER_REFUSALS_MAX:
+            continue
+        out.append(Breach("untrusted-labeler", login,
+                          "Briefed tickets were refused %d times in an hour for labeller %s"
+                          % (count, login),
+                          ("%d briefed tickets were refused because %s applied their labels"
+                           % (count, login),
+                           "Add the login to LOOM_BRIEF_AUTHORS (or LOOM_TRUSTED_BRIEFERS) "
+                           "if it is yours to trust",
+                           "No new work starts for those tickets until it is trusted"),
+                          f.now))
+    return out
+
+
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
-    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold, repeated_failure)
+    plan_check_failed, lane_pr_stalled, remote_silent, gate_hold, repeated_failure,
+    untrusted_labeler)
 
 
 def check(facts: Facts, say: Say,

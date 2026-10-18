@@ -58,6 +58,8 @@ class Fake:
                 return reply(200, self.epic_tickets)
             if path.startswith("/repos/%s/issues?labels=loom:ticket&state=open" % REPO):
                 return reply(200, [])
+            if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
+                return reply(200, [])
         self.calls.append((method, url, json.loads(body) if body else None))
         return self.replies.pop(0)
 
@@ -343,10 +345,9 @@ class SensitiveResumeTests(unittest.TestCase):
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
         # Project repo: issues, pulls, one GraphQL request, the goal's
-        # unproven-work read; lane repo: issues (no loom:lanes issue here, so
-        # no comments read). The fake has no replies left, so any extra call
-        # fails the test.
-        self.assertEqual(gh.requests, 5)
+        # unproven-work read and epic list; lane repo: issues (no loom:lanes
+        # issue here, so no comments read). The fake has no replies left.
+        self.assertEqual(gh.requests, 6)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -2370,6 +2371,8 @@ class Routes:
             return reply(200, goal())
         if "/issues/1/sub_issues" in path:
             return reply(200, self.goal_children)
+        if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
+            return reply(200, [])
         if path.startswith("/repos/%s/issues?" % REPO):
             return self._issue_page(path)
         if path.startswith("/search/issues?") and self.search is not None:
@@ -2504,7 +2507,8 @@ class TriageTests(unittest.TestCase):
         lines = self.run_triage(routes, limit=12)
         self.assertEqual(sorted(routes.labelled()), list(range(10, 22)))
         self.assertEqual(len(lines), 12)
-        pages = [c for c in routes.calls if c[1].startswith("/repos/%s/issues?" % REPO)]
+        pages = [c for c in routes.calls if c[1].startswith("/repos/%s/issues?" % REPO)
+                 and "sort=created&direction=asc" in c[1]]
         self.assertEqual(len(pages), 2)
         self.assertIn("sort=created&direction=asc", pages[0][1])
         self.assert_never_edited(routes)
@@ -2656,6 +2660,9 @@ class FakeRepo:
         if path.startswith("/issues?labels=loom:ticket&"):
             return reply(200, [i for i in self.issues
                                if any(l["name"] == "loom:ticket" for l in i["labels"])])
+        if path.startswith("/issues?labels=epic&state=all"):
+            return reply(200, [i for i in self.issues
+                               if any(l["name"] == "epic" for l in i["labels"])])
         if path.startswith("/issues?"):
             self.assertIn_("labels=loom%3Agoal", path)
             return reply(200, [i for i in self.issues
@@ -3163,6 +3170,7 @@ class EpicWalk:
             20: [t(21), t(22)],
         }
         self.open_tickets = [t(23, body="## Why\nx\n\nPart of #20\n"), t(5), t(11)]
+        self.epics = []
         self.calls = []
 
     def __call__(self, method, url, headers, body):
@@ -3174,6 +3182,8 @@ class EpicWalk:
         if method == "GET" and path.startswith("/repos/%s/issues?labels=loom:ticket&state=open"
                                                % REPO):
             return reply(200, self.open_tickets)
+        if method == "GET" and path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
+            return reply(200, self.epics)
         if method == "GET" and path == "/repos/%s/issues/1" % REPO:
             return reply(200, goal())
         raise AssertionError("unexpected %s %s" % (method, path))
@@ -3181,6 +3191,27 @@ class EpicWalk:
 
 class GoalWalksEpicsTest(unittest.TestCase):
     """loom#636: every goal count walks goal, epics and tickets."""
+
+    def test_part_of_only_epic_below_sub_issue_limit_counts_toward_both_limits(self):
+        for state in ("loom:briefed", "loom:shipped"):
+            with self.subTest(state=state):
+                walk = EpicWalk(state=state)
+                walk.epics = [item(30, labels=("epic",), title="Epic: line only",
+                                   body="Part of #1\n")]
+                walk.subs[30] = [item(31, labels=("loom:ticket", state))]
+                gh = GitHub("t", transport=walk)
+                count = (brain._goal_in_flight(gh, REPO, 1) if state == "loom:briefed"
+                         else brain.goal_unproven(gh, REPO, 1))
+                self.assertEqual(count, 8)
+
+    def test_epic_linked_both_ways_is_walked_once(self):
+        walk = EpicWalk()
+        walk.epics = [walk.subs[1][1]]
+        gh = GitHub("t", transport=walk)
+        loose, tree = brain.goal_tree(gh, REPO, 1)
+        self.assertEqual([epic["number"] for epic, _ in tree], [10, 20])
+        self.assertEqual(len(loose) + sum(len(tickets_) for _, tickets_ in tree), 7)
+        self.assertEqual(sum("labels=epic&state=all" in path for _, path in walk.calls), 1)
 
     def test_the_in_flight_cap_counts_the_epics_tickets(self):
         gh = GitHub("t", transport=EpicWalk())

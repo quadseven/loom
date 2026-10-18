@@ -556,6 +556,16 @@ def _labeller_problem(events: List[Dict[str, Any]], allowed: set) -> Optional[st
     return None
 
 
+_LABELLER_REFUSAL_RE = re.compile(r"^(?:loom:briefed|the lane label) was applied by (\S+), not in ")
+
+
+def refused_labeller(reason: str) -> Optional[str]:
+    """The login a trust refusal says applied a label it does not trust, or
+    None when the refusal is for another cause."""
+    m = _LABELLER_REFUSAL_RE.match(reason)
+    return m.group(1) if m and m.group(1) != "unknown" else None
+
+
 def briefing_logins(authors: Iterable[str], briefers: Iterable[str] = ()) -> List[str]:
     """The lower-case logins whose briefs this Loom builds: its own
     LOOM_BRIEF_AUTHORS, then LOOM_TRUSTED_BRIEFERS (docs/LANES.md, "Trusted

@@ -2343,7 +2343,7 @@ cat > /dev/null
             self.assertNotIn("fake-go-key-s3cr3t", where)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
-    def test_a_go_usage_limit_before_the_run_holds_the_lane_12_hours_and_hands_the_brief_on(self):
+    def test_a_go_usage_limit_on_one_slot_holds_the_whole_group_until_the_reset(self):
         requests, env = self.provider(self.GO_LIMIT)
         before = int(time.time())
         inbox, result = self.api_lane("opencode-go", **env)
@@ -2356,7 +2356,16 @@ cat > /dev/null
         self.assertFalse(beat["available"])
         self.assertTrue(beat["reason"].startswith("limit: "), beat)
         self.assertIn("weekly", beat["reason"])
-        self.assertTrue(before + 43200 <= beat["retry_at"] <= int(time.time()) + 43200)
+        # A weekly limit with no reset time holds the group until the next weekly
+        # reset, never the short default window.
+        self.assertTrue(before + 7 * 86400 <= beat["retry_at"] <= int(time.time()) + 7 * 86400)
+        self.assertGreater(beat["retry_at"], before + 43200)
+        for slot in ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"):
+            beat = self.beat(slot)
+            self.assertFalse(beat["available"], slot)
+            self.assertTrue(beat["reason"].startswith("limit: "), beat)
+            self.assertIn("weekly", beat["reason"])
+            self.assertEqual(beat["retry_at"], self.beat("opencode-go")["retry_at"], slot)
         # One small request for the run's model, keyed and with a session header.
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["path"], "/zen/go/v1/chat/completions")
@@ -2365,13 +2374,14 @@ cat > /dev/null
         self.assertEqual(requests[0]["headers"]["Authorization"], "Bearer fake-go-key-s3cr3t")
         self.assertTrue(requests[0]["headers"].get("x-opencode-session"))
         self.assert_key_kept_out(result)
-        # The next pass asks nothing and keeps saying which limit holds.
+        # The next pass asks nothing and keeps saying which limit holds, for every slot.
         (inbox / "T043-next.md").write_text(BRIEF.replace("Lane: codex", "Lane: opencode-go"))
         self.run_lane("opencode-go", **env)
         self.assertEqual(len(requests), 1)
         self.assertTrue((inbox / "T043-next.md").exists())
-        self.assertIn("weekly", self.beat("opencode-go")["reason"])
-        self.assertTrue(self.beat("opencode-go")["reason"].startswith("limit: "))
+        for slot in ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"):
+            self.assertIn("weekly", self.beat(slot)["reason"])
+            self.assertTrue(self.beat(slot)["reason"].startswith("limit: "))
 
     def test_a_model_with_a_quote_never_reaches_the_probe_body(self):
         # The probe checks the model itself, not only through the brief loop's allowlist.
@@ -2387,6 +2397,53 @@ cat > /dev/null
                                     capture_output=True, text=True)
             self.assertEqual(result.stdout.strip(), "rc=1", model)
             self.assertEqual(sent.exists(), reaches, model)
+
+    def write_provider_limit(self, slot, limit_name="weekly", retry_after=None):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        (usage / (slot + ".provider-limit.json")).write_text(json.dumps({
+            "at": int(time.time()), "limit_name": limit_name,
+            "retry_after": retry_after if retry_after is not None else ""}) + "\n")
+
+    def hold_provider_limit_for(self, slot="opencode-go-2", limit_name="weekly", retry_after=None):
+        self.write_provider_limit(slot, limit_name, retry_after)
+        script = self.source_functions("hold_provider_limit", "limit_until", "limit_group",
+                                       "write_beat", "utc") + (
+            'SLOT=%s LANE=opencode-go LIMIT_WHY="the provider weekly limit (429 GoUsageLimitError)"\n'
+            'hold_provider_limit\n' % slot)
+        env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": slot, "LANE": "opencode-go"}
+        return subprocess.run(["bash", "-c", script, "bash"], env=env,
+                              capture_output=True, text=True)
+
+    GROUP = ["opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"]
+
+    def test_a_weekly_limit_on_one_group_slot_holds_every_group_slot_until_the_stated_reset(self):
+        # Acceptance: a weekly-limit failure on one lane of a group marks every
+        # lane of that group unavailable until the stated reset.
+        reset = int(time.time()) + 7200
+        self.hold_provider_limit_for("opencode-go-2", limit_name="weekly", retry_after=str(reset))
+        beats = {k: v for k, v in self.beats().items() if "." not in k}
+        self.assertEqual(sorted(beats), sorted(self.GROUP))
+        for slot, beat in beats.items():
+            self.assertFalse(beat["available"], slot)
+            self.assertTrue(beat["reason"].startswith("limit: "), beat)
+            self.assertIn("weekly", beat["reason"])
+            self.assertEqual(beat["retry_at"], reset, slot)
+
+    def test_a_weekly_limit_with_no_reset_time_holds_the_group_until_the_next_weekly_reset(self):
+        # Acceptance: a weekly-limit error with no reset time holds the group
+        # until the next weekly reset, not for the short default.
+        before = int(time.time())
+        self.hold_provider_limit_for("opencode-go-2", limit_name="weekly", retry_after=None)
+        beats = {k: v for k, v in self.beats().items() if "." not in k}
+        self.assertEqual(sorted(beats), sorted(self.GROUP))
+        now = int(time.time())
+        for slot, beat in beats.items():
+            self.assertFalse(beat["available"], slot)
+            self.assertTrue(beat["reason"].startswith("limit: "), beat)
+            self.assertIn("weekly", beat["reason"])
+            self.assertTrue(before + 7 * 86400 <= beat["retry_at"] <= now + 7 * 86400, slot)
+            self.assertGreater(beat["retry_at"], before + 43200, slot)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_provider_that_answers_lets_the_run_go_ahead(self):
@@ -2421,7 +2478,13 @@ cat > /dev/null
         beat = self.beat("opencode-go")
         self.assertFalse(beat["available"])
         self.assertIn("weekly", beat["reason"])
-        self.assertTrue(before + 43200 <= beat["retry_at"] <= int(time.time()) + 43200)
+        # A weekly limit with no reset time holds the group until the next weekly
+        # reset, never the short default window.
+        self.assertTrue(before + 7 * 86400 <= beat["retry_at"] <= int(time.time()) + 7 * 86400)
+        self.assertGreater(beat["retry_at"], before + 43200)
+        for slot in ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"):
+            self.assertFalse(self.beat(slot)["available"], slot)
+            self.assertEqual(self.beat(slot)["retry_at"], beat["retry_at"], slot)
         self.assert_key_kept_out(result)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)

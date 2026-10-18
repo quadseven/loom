@@ -184,7 +184,13 @@ CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
 until 5 minutes before its `expires_at`. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
-three unset, the token above is used as before. The App needs contents,
+three unset, the token above is used as before. The station reads the App's
+slug once per pass (`GET /app`, counted under `app login`) and trusts
+`<slug>[bot]` wherever `LOOM_BRIEF_AUTHORS` is, so the labels and comments the
+App writes need no hand-listed login; its startup log line `trusting briefing
+logins` names every login trusted. More than three briefed tickets refused in
+an hour for one untrusted labeller file the `untrusted-labeler` invariant,
+naming the login. The App needs contents,
 issues and pull requests read and write, and checks and actions read, on the
 scanned repos. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
