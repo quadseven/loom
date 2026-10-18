@@ -6026,7 +6026,8 @@ class Station:
                                review_bot=self.s.review_bot,
                                limited=self.limited_lanes(),
                                no_test_repos=self.s.no_test_repos,
-                               available=[x for x in LANES if self._heartbeat_ok(x)])
+                               available=[x for x in LANES if self._heartbeat_ok(x)],
+                               held=list(self._held_tickets()))
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.
