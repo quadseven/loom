@@ -210,11 +210,39 @@ class UsageDashboardTests(unittest.TestCase):
         spark = provider_row(body, "spark")
         self.assertIn("none active on 3 lanes", spark)
         self.assertEqual(spark.count("Thermal hold"), 1)
-        self.assertIn("partly held", spark)
+        self.assertIn("partly down", spark)
         self.assertIn("ul ul-down", spark)
         self.assertIn("down: the spark endpoint did not answer (curl exit 28)", spark)
-        self.assertIn("provider limit reached until 2026-10-18 10:00 EDT (ended 30m ago)", spark)
+        # spark-3's hold ended 30m ago: it no longer holds the lane.
+        self.assertIn("free: its hold (provider limit reached) ended 2026-10-18 10:00 EDT (30m ago)", spark)
         self.assertIn("state/usage/spark.limit, state/usage/spark-2.limit, state/usage/spark-3.limit", spark)
+
+    def test_a_hold_that_has_ended_stops_counting_the_lane_down(self):
+        # The live page showed a spark lane "down" from a hold that ended over
+        # an hour before, because the lane had written no heartbeat since.
+        rows = [reading("spark", ["spark", "spark-2"], "all", note="not exposed")]
+        rows[0]["holds"] = {"spark": "limit: the spark endpoint answered 503; unavailable until 2026-10-18T13:25:00Z",
+                            "spark-2": "limit: the spark endpoint answered 503; unavailable until 2026-10-18T15:00:00Z"}
+        data = usage.build(rows, NOW)
+        spark = data["providers"][0]
+        self.assertEqual((data["free"], data["down"], data["held"]), (1, 1, 0))
+        self.assertEqual(spark["status"], "partly down")
+        kinds = {lane: g["kind"] for g in spark["groups"] for lane in g["lanes"]}
+        self.assertEqual(kinds, {"spark": "free", "spark-2": "down"})
+        asks = " ".join(text for _, text in data["asks"])
+        self.assertIn("spark: 1 lane down: the spark endpoint answered 503 until 2026-10-18 15:00 UTC (in 30m).", asks)
+        self.assertNotIn("ended", asks)
+        body = usage.render(data)
+        self.assertIn("free: its hold (the spark endpoint answered 503) ended 2026-10-18 13:25 UTC (1h 5m ago)",
+                      provider_row(body, "spark"))
+
+    def test_every_lane_whose_hold_ended_is_free_not_down(self):
+        rows = [reading("spark", ["spark"], "all", note="not exposed")]
+        rows[0]["holds"] = {"spark": "limit: the spark endpoint answered 503; unavailable until 2026-10-18T13:25:00Z"}
+        data = usage.build(rows, NOW)
+        self.assertEqual(data["providers"][0]["status"], "no meter")
+        self.assertEqual((data["free"], data["down"]), (1, 0))
+        self.assertIn("1 of 1 lane can take work.", usage.render(data))
 
     def test_no_snapshot_says_what_is_missing_and_when_it_fills(self):
         body = usage.render(usage.build([], NOW))

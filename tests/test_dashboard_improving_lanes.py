@@ -151,6 +151,21 @@ class HeldLaneTest(unittest.TestCase):
         self.assertIn("no reason", cards["zen"])
         self.assertNotIn("held reason missing from lane status comment", html)
 
+    def test_a_hold_that_has_ended_says_so_not_a_past_until(self):
+        from unittest.mock import patch
+        from dashboard.server import _lane_view_data
+        comment = ("<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n|---|---|---|\n"
+                   "| spark | no | 20:17Z |\n")
+        usage = [{"provider": "spark", "lanes": ["spark"], "window": "all",
+                  "holds": {"spark": "limit: the spark endpoint answered 503; unavailable until 2020-01-02T00:01:27Z"}}]
+        with patch.dict("os.environ", {"LOOM_DASHBOARD_TZ": "UTC"}, clear=True):
+            html = render_lanes(_lane_view_data({"lanes": [{"body": comment}], "pull_requests": [],
+                                                 "usage": usage}, []))
+        cards = dict(__import__("re").findall(r"<strong>([\w-]+)</strong>(.*?)</article>", html))
+        self.assertIn("its hold (the spark endpoint answered 503) ended 2020-01-02 00:01 UTC; "
+                      "no heartbeat from the lane since", cards["spark"])
+        self.assertNotIn("until 2020-01-02", cards["spark"])
+
     def test_the_upload_keeps_holds_and_refuses_bad_ones(self):
         from dashboard.usage import validate
         row = {"provider": "anthropic", "window": "credit", "source": "spend", "lanes": ["anthropic-3"],
