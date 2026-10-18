@@ -1249,7 +1249,17 @@ class Station:
 
     def _event(self, kind: str, reason: str, item: str = "", lane: str = "",
                model: str = "") -> None:
-        """Append one redacted decision event and rotate its log by UTC day."""
+        """Append one redacted decision event and rotate its log by UTC day.
+        The log is a record of decisions, not a decision: a disk error is
+        logged and the event dropped, so it cannot fail the step that made
+        the decision (loom#763)."""
+        try:
+            self._write_event(kind, reason, item, lane, model)
+        except OSError as err:
+            _say("could not write %s to the event log: %s" % (kind, err))
+
+    def _write_event(self, kind: str, reason: str, item: str, lane: str,
+                     model: str) -> None:
         directory = os.path.dirname(self.event_log)
         os.makedirs(directory, exist_ok=True)
         day = time.strftime("%Y-%m-%d", time.gmtime(self.now))
@@ -5369,8 +5379,8 @@ class Station:
         """What the invariants read, each source on its own: one that cannot
         be read stays None and its invariants find nothing this pass."""
         facts = invariants.Facts(now=self.now)
-        facts.events = self._read_events()
-        for name, read in (("runs", self._invariant_runs),
+        for name, read in (("events", self._read_events),
+                           ("runs", self._invariant_runs),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:
