@@ -149,6 +149,7 @@ def needs_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     comments = issue.get("comments")
     item["comments"] = comments if isinstance(comments, int) and comments > 0 else 0
     item["waiting_on"] = needs_of(item["labels"])
+    item["body_ask"] = body_ask(issue.get("body"))
     return item
 
 
@@ -171,6 +172,61 @@ def ask_line(body: Any) -> str:
         if line:
             return line if len(line) <= ASK_CHARS else line[:ASK_CHARS - 3].rstrip() + "..."
     return ""
+
+
+# The ask of an item waiting on a person: its body's "## Ask" section when it
+# has one, else the newest comment that names the ask (a "## Ask" section, a
+# line that starts with "Ask", or a mention of the item's needs label), else
+# its latest comment. A comment read is one page of ASK_COMMENTS, the last.
+ASK_COMMENTS = 100
+ASK_SECTION_RE = re.compile(r"^##\s*Ask\s*\n(.*?)(?=^##\s|\Z)", re.M | re.S)
+_ASK_START_RE = re.compile(r"^[*_]*(?:exact\s+)?ask\b", re.I)
+
+
+def body_ask(body: Any) -> str:
+    """An issue body's "## Ask" section, stripped, or ""."""
+    found = ASK_SECTION_RE.search(str(body or ""))
+    return found.group(1).strip() if found else ""
+
+
+def ask_names(labels: Iterable[str]) -> List[str]:
+    """The lower-case needs labels an ask comment may mention."""
+    labels = list(labels)
+    names = [name.lower() for name in needs_labels(labels)]
+    return names + ["needs-operator"] if "needs-operator" in labels else names
+
+
+def _ask_lines(body: str) -> List[str]:
+    return [_LEAD_RE.sub("", line.strip()).strip() for line in _MARKER_RE.sub("", body).splitlines()]
+
+
+def _names_the_ask(body: str, names: Iterable[str]) -> bool:
+    lower = body.lower()
+    return (bool(ASK_SECTION_RE.search(body)) or any(name in lower for name in names)
+            or any(_ASK_START_RE.match(line) for line in _ask_lines(body)))
+
+
+def comment_ask(body: Any) -> str:
+    """One short line from an ask comment: its "## Ask" section's first line,
+    else its first line that starts with "Ask", else its first worded line."""
+    text = str(body or "")
+    section = body_ask(text)
+    if section:
+        return ask_line(section)
+    starts = next((line for line in _ask_lines(text) if _ASK_START_RE.match(line)), "")
+    return ask_line(starts or text)
+
+
+def pick_ask(comments: Iterable[Any], names: Iterable[str]) -> Tuple[str, str]:
+    """(ask, comment url) from an item's comments, oldest first: the newest
+    comment that names the ask, else the latest comment; ("", "") with none."""
+    found = [comment for comment in comments if isinstance(comment, dict)]
+    names = list(names)
+    chosen = next((comment for comment in reversed(found)
+                   if _names_the_ask(str(comment.get("body") or ""), names)), found[-1] if found else None)
+    if chosen is None:
+        return "", ""
+    return comment_ask(chosen.get("body")), str(chosen.get("html_url") or "")
 
 
 def _loom_state(labels: Iterable[str]) -> Optional[str]:
@@ -427,7 +483,7 @@ def _ask_text(item: Dict[str, Any]) -> Tuple[str, str]:
         return "ask not read yet", "the latest comment is read on a later refresh"
     if not ask:
         return "no comment names the ask", "this item has no comment, or its latest comment is empty"
-    return ask, "first line of the latest comment"
+    return ask, "the body's ## Ask section, else the newest comment that names the ask"
 
 
 def _waiting_row(item: Dict[str, Any], now: float) -> str:
@@ -520,8 +576,9 @@ def render(source: Optional[Dict[str, Any]], now: float, env: Optional[Dict[str,
     parts.append('<p class="machine-fact operators-read">Read %s ago, every %d minutes. An issue assigned to '
                  'another operator with no <code>claim:</code> label shows here only when it is a Loom ticket '
                  'or a pull request. An item labelled <code>needs:&lt;login&gt;</code> waits on that person, '
-                 'whoever they are; the ask is the first line of its latest comment.</p>' % (_age(now - _number(source.get("read_at"))),
-                                            int(source.get("every") or 0) // 60))
+                 'whoever they are; the ask is the <code>## Ask</code> section of its body, else the newest '
+                 'comment that names it.</p>' % (_age(now - _number(source.get("read_at"))),
+                                                 int(source.get("every") or 0) // 60))
     return '<section class="operators-view">%s</section>' % "".join(parts)
 
 
