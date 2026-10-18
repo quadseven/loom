@@ -2566,16 +2566,18 @@ class Station:
 
     def _unlinked_tickets(self, repo: str,
                           linked: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-        """The repo's open tickets at loom:queued or loom:briefed, by number.
-        The open-tickets list is the verify runs' own read, so a pass that
-        reads both pays for it once."""
+        """The repo's open tickets at loom:queued or loom:briefed that a
+        briefing login filed, by number. The open-tickets list is the verify
+        runs' own read, so a pass that reads both pays for it once; with no
+        such ticket and no loom:pr ticket, no closed pull request is read."""
         found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         out: Dict[int, Dict[str, Any]] = {}
         for issue in found:
             if (isinstance(issue, dict) and "pull_request" not in issue
                     and int(issue.get("number") or 0) not in linked
                     and "loom:ticket" in _label_names(issue)
-                    and set(_label_names(issue)).intersection(("loom:queued", "loom:briefed"))):
+                    and set(_label_names(issue)).intersection(("loom:queued", "loom:briefed"))
+                    and tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)):
                 # The trust check reads the repo owner from repository_url.
                 issue.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
                 out[int(issue["number"])] = issue

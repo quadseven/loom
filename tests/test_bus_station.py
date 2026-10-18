@@ -2046,8 +2046,9 @@ class CorruptStateTest(Base):
         self.write(os.path.join(d, "codex.json"), '{"lane": "co')
         # Reconciliation, PR review polling, the goal scan, the hand-revert
         # scan's merged and shipped lists, and the invariant check's read of
-        # open pull requests (their plan checks) still run.
-        self.assertEqual(self.run_pass().requests, 7)
+        # open pull requests (their plan checks) still run, and so does
+        # reconciliation's read of the open tickets (loom#784).
+        self.assertEqual(self.run_pass().requests, 8)
 
 
 class TicketsTest(unittest.TestCase):
@@ -2398,9 +2399,11 @@ class ClaimTest(Base):
         gh = self.run_pass()
         # Reconciliation reads open PRs to discover linked queued tickets,
         # even when the repo has no loom:pr ticket. PR review and hand-revert
-        # scans add their usual reads.
+        # scans add their usual reads. It also reads the open tickets, to
+        # find a queued or briefed one a merged pull request delivers
+        # (loom#784; a conditional read the verify runs share).
         self.assertEqual(len(self.fake.calls), first + 6)
-        self.assertEqual(gh.requests, 7)
+        self.assertEqual(gh.requests, 8)
         self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
