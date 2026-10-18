@@ -3065,6 +3065,25 @@ exit %d
                 except ProcessLookupError:
                     pass
 
+    def test_a_check_home_left_by_a_killed_runner_goes_with_the_next_pass(self):
+        # loom#643: 17 of these, about 300 MB each, filled run/.
+        left = self.loom / "run" / "codex-check" / "Library" / "Caches"
+        left.mkdir(parents=True)
+        (left / "big").write_text("x" * 1000)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.loom / "run" / "codex-check").exists())
+
+    def test_a_running_lanes_check_home_is_left_to_it(self):
+        left = self.loom / "run" / "codex-check" / "tmp"
+        left.mkdir(parents=True)
+        lock = self.loom / "run" / "codex.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text(f"{os.getpid()}\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(left.exists())
+
     def test_stale_lock_without_a_live_group_is_reclaimed(self):
         self.drop_brief()
         lock = self.loom / "run" / "codex.lock"
@@ -3192,6 +3211,8 @@ exit %d
                                capture_output=True, text=True, check=True).stdout.split()
         self.assertIn("fix.txt", files)
         self.assertNotIn(".prepared", files)
+        # The check's scratch home is gone once the run is over (loom#643).
+        self.assertFalse((self.loom / "run" / "codex-check").exists())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_zero_exit_agent_with_a_failing_check_opens_no_pr_and_keeps_its_edits(self):
@@ -3203,6 +3224,7 @@ exit %d
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertIn("validation failed: the check exited 1", self.lane_log())
         self.assertFalse(any(r["phase"] == "final" and r["ok"] for r in self.records()))
+        self.assertFalse((self.loom / "run" / "codex-check").exists())
         heads = self.remote_heads()
         self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
         side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-unvalidated-" in h]

@@ -617,6 +617,24 @@ Before the agent starts, `lanes/mac/brain.sh` reads the handoff packet with
 parameter) and puts it in the prompt. With either setting empty, or the
 dashboard down, the tick runs without it.
 
+## Disk
+
+The loom home is kept bounded by the station and the runner (loom#643).
+
+- A lane's logs (`logs/<slot>/`: each run's log, result, validation records
+  and archived transcripts) are removed once nothing in an entry changed for
+  `LOOM_LOG_KEEP_DAYS` days (default 7; `0` keeps them all). An entry is kept
+  however old while a brief of its name is waiting or running in a lane
+  inbox, and, while transcripts are uploaded, until the ledger holds the run
+  as sent or settled; an unreadable inbox or ledger removes nothing. The
+  station's own logs at the top of `logs/` are not touched.
+- The runner removes a check's scratch home (`run/<slot>-check`) after the
+  final check and when it exits, so `run/` holds one only while that lane runs.
+- Every pass logs a warning to `station.log` while the home's disk has less
+  than `LOOM_DISK_FREE_MIN_GB` free (default 10). Every hour the station
+  removes the old lane logs and logs the home's size by top-level folder
+  (`loom home holds ...`), kept in `state/station/disk.json`.
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the

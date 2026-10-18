@@ -159,6 +159,13 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_SHIP_WORKFLOWS</key><string>example-owner/svc=deploy.yml</string>",
                       plist)
 
+    def test_disk_settings_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
+        self.assertIn("<key>LOOM_DISK_FREE_MIN_GB</key><string>20</string>", plist)
+
     def test_trusted_briefers_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example")
         self.assertEqual(result.returncode, 0, result.stderr)

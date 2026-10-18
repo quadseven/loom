@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, proof, spend, station, tickets  # noqa: E402
 from bus import github as github_module  # noqa: E402
+from bus import watch as watch_module  # noqa: E402
 from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -3625,6 +3626,159 @@ class PruneTest(Base):
         self.run_pass()
         self.assertFalse(os.path.lexists(link))
         self.assertTrue(os.path.exists(os.path.join(outside, "f")))
+class LogRetentionTest(Base):
+    """Lane logs past LOOM_LOG_KEEP_DAYS are removed, and the loom home's
+    size and free disk are reported (loom#643)."""
+    DAY = 24 * 3600
+
+    def aged(self, path, days, text="x\n"):
+        self.write(path, text)
+        old = time.time() - days * self.DAY
+        os.utime(path, (old, old))
+        return path
+
+    def lane_log(self, slot, name, days):
+        return self.aged(os.path.join(self.home, "logs", slot, name), days)
+
+    def ticket_dir(self, slot, name, days, inner_days=None):
+        d = os.path.join(self.home, "logs", slot, name)
+        self.aged(os.path.join(d, ".claude", "projects", "p", "s.jsonl"),
+                  days if inner_days is None else inner_days)
+        old = time.time() - days * self.DAY
+        for sub in (os.path.join(d, ".claude", "projects", "p"), os.path.join(d, ".claude", "projects"),
+                    os.path.join(d, ".claude"), d):
+            os.utime(sub, (old, old))
+        return d
+
+    def tend(self, free=100 * 1024 ** 3):
+        usage = mock.Mock(free=free, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._say") as say:
+            self.reader().tend_disk()
+        return [c.args[0] for c in say.call_args_list]
+
+    def reader(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def test_a_pass_removes_lane_logs_past_retention_and_keeps_the_rest(self):
+        old_log = self.lane_log("codex", "example.repo-1.log", 8)
+        old_result = self.lane_log("opencode-go-2", "example.repo-1.validation.jsonl", 8)
+        old_dir = self.ticket_dir("anthropic", "example.repo-1", 8)
+        fresh = self.lane_log("codex", "example.repo-2.log", 1)
+        station_log = self.aged(os.path.join(self.home, "logs", "station.log"), 30)
+        events = self.aged(os.path.join(self.home, "logs", "events.jsonl"), 30)
+        self.run_pass()
+        self.assertFalse(os.path.exists(old_log))
+        self.assertFalse(os.path.exists(old_result))
+        self.assertFalse(os.path.exists(old_dir))
+        self.assertTrue(os.path.exists(fresh))
+        # Only the lanes' own folders are pruned; the station's logs stay.
+        self.assertTrue(os.path.exists(station_log))
+        self.assertTrue(os.path.exists(events))
+
+    def test_a_ticket_folder_with_a_fresh_file_inside_is_kept(self):
+        d = self.ticket_dir("anthropic", "example.repo-1", 8, inner_days=1)
+        self.tend()
+        self.assertTrue(os.path.exists(d))
+
+    def test_a_waiting_or_running_briefs_logs_are_kept_however_old(self):
+        log = self.lane_log("codex", "example.repo-3.log", 30)
+        record = self.lane_log("codex", "example.repo-3.validation.jsonl", 30)
+        self.write(self.inbox("claude", "example.repo-3.md"), "brief\n")
+        self.tend()
+        self.assertTrue(os.path.exists(log))
+        self.assertTrue(os.path.exists(record))
+
+    def test_a_transcript_not_yet_uploaded_is_kept_until_the_dashboard_has_it(self):
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/loom/token"
+        for name in ("example.repo-4", "example.repo-5", "example.repo-6", "example.repo-7"):
+            self.write(self.inbox("codex", "done", name + ".md"), "brief\n")
+            self.lane_log("codex", name + ".log", 30)
+        self.write(os.path.join(self.home, "state", "station", "transcripts.json"),
+                   json.dumps({"codex/example.repo-4": "sent", "codex/example.repo-5": 2,
+                               "codex/example.repo-7": "gave up"}))
+        self.tend()
+        logs = os.path.join(self.home, "logs", "codex")
+        self.assertEqual(sorted(os.listdir(logs)), ["example.repo-5.log", "example.repo-6.log"])
+
+    def test_uploads_on_without_a_ledger_remove_nothing(self):
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/loom/token"
+        log = self.lane_log("codex", "example.repo-8.log", 30)
+        self.tend()
+        self.assertTrue(os.path.exists(log))
+
+    def test_an_unreadable_inbox_removes_no_log(self):
+        log = self.lane_log("codex", "example.repo-1.log", 30)
+        unreadable = self.inbox("claude")
+        os.makedirs(unreadable)
+        real = os.listdir
+
+        def listdir(path="."):
+            if path == unreadable:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path)
+
+        with mock.patch.object(station.os, "listdir", listdir):
+            said = self.tend()
+        self.assertTrue(os.path.exists(log))
+        self.assertTrue(any("no lane log is removed" in s for s in said), said)
+
+    def test_retention_zero_keeps_every_log(self):
+        self.settings.log_keep_days = 0
+        log = self.lane_log("codex", "example.repo-1.log", 400)
+        self.tend()
+        self.assertTrue(os.path.exists(log))
+
+    def test_a_link_in_a_lane_log_folder_is_removed_without_following_it(self):
+        outside = os.path.join(self._tmp.name, "keep-me")
+        self.write(os.path.join(outside, "f"), "x\n")
+        folder = os.path.join(self.home, "logs", "codex")
+        os.makedirs(folder)
+        link = os.path.join(folder, "example.repo-9")
+        os.symlink(outside, link)
+        old = time.time() - 30 * self.DAY
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.tend()
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(os.path.exists(os.path.join(outside, "f")))
+
+    def test_the_size_of_the_loom_home_is_said_once_an_hour(self):
+        self.write(os.path.join(self.home, "run", "codex-check", "big"), "x" * 300000)
+        self.lane_log("codex", "example.repo-2.log", 1)
+        said = self.tend()
+        line = [s for s in said if s.startswith("loom home holds ")]
+        self.assertEqual(len(line), 1, said)
+        self.assertIn("run ", line[0])
+        self.assertIn("logs ", line[0])
+        self.assertIn("100.0 GB free on its disk", line[0])
+        self.assertFalse(any(s.startswith("loom home holds ") for s in self.tend()))
+
+    def test_low_free_disk_warns_every_pass(self):
+        for _ in range(2):
+            said = self.tend(free=3 * 1024 ** 3)
+            self.assertTrue(any(s.startswith("warning: only 3.0 GB free on the loom home's disk")
+                                for s in said), said)
+        self.assertFalse(any(s.startswith("warning:") for s in self.tend()))
+
+    def test_the_warning_never_reads_as_an_error_to_the_log_watcher(self):
+        said = self.tend(free=1024 ** 3)
+        warning = [s for s in said if s.startswith("warning:")]
+        self.assertTrue(warning)
+        self.assertFalse(watch_module.KEEP_RE.search(warning[0]))
+
+    def test_settings_read_the_retention_and_the_free_disk_floor(self):
+        self.assertEqual(station.Settings.from_env({}).log_keep_days, 7)
+        self.assertEqual(station.Settings.from_env({}).disk_free_min_gb, 10)
+        self.assertEqual(station.Settings.from_env({"LOOM_LOG_KEEP_DAYS": "14"}).log_keep_days, 14)
+        self.assertEqual(station.Settings.from_env({"LOOM_LOG_KEEP_DAYS": "0"}).log_keep_days, 0)
+        with mock.patch("bus.station._say"):
+            self.assertEqual(station.Settings.from_env({"LOOM_LOG_KEEP_DAYS": "x"}).log_keep_days, 7)
+            self.assertEqual(station.Settings.from_env({"LOOM_DISK_FREE_MIN_GB": "-1"}).disk_free_min_gb, 10)
+        self.assertEqual(station.Settings.from_env({"LOOM_DISK_FREE_MIN_GB": "2.5"}).disk_free_min_gb, 2.5)
+
+
 BOT = {"__typename": "Bot", "login": "grug-tribe"}
 THREAD_FIX = FIX_BODY + "\n### Thread PRRT_abcd1 (comment 5) at a.py:3\n\n    medium finding\n"
 
