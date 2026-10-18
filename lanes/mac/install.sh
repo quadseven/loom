@@ -84,10 +84,13 @@ fi
 # The App's private key as a file: it must exist and be readable by its owner
 # only (mode 600 or narrower), like an ssh key.
 if [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; then
-  [ -f "$LOOM_GITHUB_APP_KEY_FILE" ] ||
-    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE is not a file" >&2; exit 1; }
+  [ -f "$LOOM_GITHUB_APP_KEY_FILE" ] && [ -r "$LOOM_GITHUB_APP_KEY_FILE" ] ||
+    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE is not a file this user can read" >&2; exit 1; }
   # GNU stat first: BSD stat rejects -c, while GNU stat accepts -f with another meaning.
-  KEY_MODE="$(stat -c %a "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null || stat -f %Lp "$LOOM_GITHUB_APP_KEY_FILE")"
+  KEY_MODE="$(stat -c %a "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null ||
+    stat -f %Lp "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null)" || KEY_MODE=""
+  [[ "$KEY_MODE" =~ ^[0-7]+$ ]] ||
+    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE: could not read its mode with stat" >&2; exit 1; }
   [ $((8#$KEY_MODE & 8#077)) -eq 0 ] ||
     { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE has mode $KEY_MODE; it must be 600 (chmod 600 $LOOM_GITHUB_APP_KEY_FILE)" >&2; exit 1; }
 fi

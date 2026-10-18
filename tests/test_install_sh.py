@@ -242,6 +242,30 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn(str(key), result.stderr)
         self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
 
+    def test_an_unreadable_key_file_is_refused(self):
+        # Mode 000 has no group or other bits, but the station could not read it.
+        key = self.app_key(0o000)
+        self.addCleanup(key.chmod, 0o600)
+        result = self.run_install(LOOM_GITHUB_APP_ID="123",
+                                  LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                  LOOM_GITHUB_APP_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(str(key), result.stderr)
+        self.assertIn("can read", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_a_key_file_whose_mode_cannot_be_read_is_refused(self):
+        key = self.app_key(0o600)
+        fake_stat = self.bin / "stat"
+        fake_stat.write_text("#!/usr/bin/env bash\nexit 1\n")
+        fake_stat.chmod(0o755)
+        result = self.run_install(LOOM_GITHUB_APP_ID="123",
+                                  LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                  LOOM_GITHUB_APP_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("could not read its mode", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
     def test_no_app_settings_install_as_before(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
