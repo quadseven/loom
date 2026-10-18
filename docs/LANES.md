@@ -193,7 +193,13 @@ CLI (key on stdin, never on the command line or on disk), and
 `POST /app/installations/<id>/access_tokens` returns a token kept in memory
 until 5 minutes before its `expires_at`. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
-three unset, the token above is used as before. The station reads the App's
+three unset, the token above is used as before. Instead of SSM, the station
+and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
+its path (it wins when both are set). `lanes/mac/install.sh` writes it into
+both plists, refuses a key file readable by group or others (it must be mode
+600), and refuses to install at all when only some of the App id, the
+installation id and a key setting are set, naming the missing one, so a half
+setup never quietly runs on the personal token. The station reads the App's
 slug once per pass (`GET /app`, counted under `app login`) and trusts
 `<slug>[bot]` wherever `LOOM_BRIEF_AUTHORS` is, so the labels and comments the
 App writes need no hand-listed login; its startup log line `trusting briefing
