@@ -573,3 +573,213 @@ class RegressionThroughBrain(unittest.TestCase):
         self.assertIn("Regresses #100", ticket["body"])
         self.assertNotEqual(tickets.priority_of(ticket), "P1")
         self.assertEqual(ticket["body"].count("## Regression"), 1)
+
+
+class AbsentVerification(Base):
+    """A shipped Health ticket whose finding stays absent for 24 hours is
+    queued for verification (loom#585)."""
+
+    def shipped_ticket(self, number=100, state="loom:shipped", shipped=NOW - 30 * 3600):
+        digest = sha()
+        issue = self.open_ticket(number, digest)
+        issue["labels"].append({"name": state})
+        self.gh.events[number] = [labelled("loom:pr", shipped - 7200),
+                                  labelled("loom:merged", shipped - 3600),
+                                  labelled("loom:shipped", shipped)]
+        self.state = {"keys": {REPO + "#1": {digest: {"ticket": number, "band": "P1"}}}}
+        return issue
+
+    def run_intake(self, now=NOW, queue_verify=None, checked=None):
+        doc = dict(self.doc)
+        if checked is not None:
+            doc["checked_at"] = checked
+        intake = health.Intake(self.gh, self.state, now, stamp(now),
+                               self.said.append, read=lambda url: doc, brief=self.brief,
+                               queue_verify=queue_verify)
+        intake.run([health.Source(REPO, 1, URL)])
+        return intake
+
+    def verify_comments(self):
+        return [w[2]["body"] for w in self.gh.writes
+                if w[0] == "POST" and w[1].endswith("/comments")
+                and health.ABSENT_VERIFY_MARKER in w[2]["body"]]
+
+    def test_24_hour_boundary_and_single_comment(self):
+        # Ticket shipped 30 hours ago, finding goes absent at T0
+        self.shipped_ticket(shipped=NOW - 30 * 3600)
+        self.doc["findings"] = []
+        t0 = NOW
+        self.run_intake(now=t0, checked=stamp(t0))
+        # Initial absent comment was posted, but verify comment is not yet due
+        self.assertEqual(len(self.verify_comments()), 0)
+
+        # At 23h59m: not queued yet
+        queued = []
+        intake = self.run_intake(now=t0 + 24 * 3600 - 60,
+                                queue_verify=lambda r, n: queued.append((r, n)),
+                                checked=stamp(t0 + 24 * 3600 - 60))
+        self.assertEqual(len(self.verify_comments()), 0)
+        self.assertEqual(intake.verify_queued, [])
+        self.assertEqual(queued, [])
+
+        # At 24h00m: queued and exactly one evidence comment posted
+        intake = self.run_intake(now=t0 + 24 * 3600,
+                                queue_verify=lambda r, n: queued.append((r, n)),
+                                checked=stamp(t0 + 24 * 3600))
+        self.assertEqual(intake.verify_queued, [(REPO, 100)])
+        self.assertEqual(queued, [(REPO, 100)])
+        comments = self.verify_comments()
+        self.assertEqual(len(comments), 1)
+        body = comments[0]
+        self.assertIn(health.ABSENT_VERIFY_MARKER, body)
+        self.assertIn("Health finding absent for 24 hours on %s#1:" % REPO, body)
+        self.assertIn("finding absent since %s" % stamp(t0), body)
+        self.assertIn("ticket shipped %s" % stamp(NOW - 30 * 3600), body)
+        self.assertIn("last checked %s" % stamp(t0 + 24 * 3600), body)
+        self.assertNotIn("absent before ship", body)
+        self.assertNotIn(URL, body)
+        self.assertTrue(any("absent for 24 hours; queued for verification" in s for s in self.said))
+
+        # At 25h00m: no second comment and not queued again
+        queued.clear()
+        intake = self.run_intake(now=t0 + 25 * 3600,
+                                queue_verify=lambda r, n: queued.append((r, n)),
+                                checked=stamp(t0 + 25 * 3600))
+        self.assertEqual(len(self.verify_comments()), 1)
+        self.assertEqual(intake.verify_queued, [])
+        self.assertEqual(queued, [])
+
+    def test_before_ship_case_counts_from_ship_time(self):
+        # Finding absent since T0; ticket ships at T0 + 10 hours
+        t0 = NOW
+        t_ship = t0 + 10 * 3600
+        digest = sha()
+        issue = self.open_ticket(100, digest)
+        issue["labels"].append({"name": "loom:shipped"})
+        self.gh.events[100] = [labelled("loom:shipped", t_ship)]
+        self.state = {"keys": {REPO + "#1": {digest: {"ticket": 100, "band": "P1",
+                                                      "absent": stamp(t0)}}}}
+        self.doc["findings"] = []
+
+        # At T0 + 33h: 33h since absent, but only 23h since ship -> not queued yet
+        queued = []
+        intake = self.run_intake(now=t0 + 33 * 3600,
+                                queue_verify=lambda r, n: queued.append((r, n)),
+                                checked=stamp(t0 + 33 * 3600))
+        self.assertEqual(len(self.verify_comments()), 0)
+        self.assertEqual(intake.verify_queued, [])
+        self.assertEqual(queued, [])
+
+        # At T0 + 34h: exactly 24h since ship -> queued with attribution note
+        intake = self.run_intake(now=t_ship + 24 * 3600,
+                                queue_verify=lambda r, n: queued.append((r, n)),
+                                checked=stamp(t_ship + 24 * 3600))
+        self.assertEqual(intake.verify_queued, [(REPO, 100)])
+        self.assertEqual(queued, [(REPO, 100)])
+        comments = self.verify_comments()
+        self.assertEqual(len(comments), 1)
+        body = comments[0]
+        self.assertIn("(absent before ship, counted from ship time)", body)
+        self.assertIn("finding absent since %s" % stamp(t0), body)
+        self.assertIn("ticket shipped %s" % stamp(t_ship), body)
+
+    def test_returned_finding_resets_clock(self):
+        # Shipped ticket; finding absent at T0
+        self.shipped_ticket(shipped=NOW - 40 * 3600)
+        t0 = NOW
+        self.doc["findings"] = []
+        self.run_intake(now=t0, checked=stamp(t0))
+        self.assertEqual(len(self.verify_comments()), 0)
+
+        # Finding returns at T0 + 12h: clears absent stamp
+        self.doc["findings"] = [finding()]
+        self.run_intake(now=t0 + 12 * 3600, checked=stamp(t0 + 12 * 3600))
+        digest = sha()
+        rec = self.state["keys"][REPO + "#1"][digest]
+        self.assertNotIn("absent", rec)
+        self.assertNotIn("verified_absent", rec)
+        self.assertNotIn("verify_queued", rec)
+
+        # Finding goes absent again at T0 + 15h
+        t1 = t0 + 15 * 3600
+        self.doc["findings"] = []
+        self.run_intake(now=t1, checked=stamp(t1))
+        self.assertEqual(rec.get("absent"), stamp(t1))
+        self.assertEqual(len(self.verify_comments()), 0)
+
+        # At T0 + 25h (only 10h after new absent): not queued
+        queued = []
+        intake = self.run_intake(now=t1 + 10 * 3600,
+                                queue_verify=lambda r, n: queued.append((r, n)),
+                                checked=stamp(t1 + 10 * 3600))
+        self.assertEqual(len(self.verify_comments()), 0)
+        self.assertEqual(intake.verify_queued, [])
+
+        # At T1 + 24h: queued for verification
+        intake = self.run_intake(now=t1 + 24 * 3600,
+                                queue_verify=lambda r, n: queued.append((r, n)),
+                                checked=stamp(t1 + 24 * 3600))
+        self.assertEqual(intake.verify_queued, [(REPO, 100)])
+        self.assertEqual(queued, [(REPO, 100)])
+        self.assertEqual(len(self.verify_comments()), 1)
+
+    def test_unshipped_ticket_is_not_queued(self):
+        for state in ("loom:queued", "loom:running", "loom:pr", "loom:merged"):
+            with self.subTest(state=state):
+                self.setUp()
+                issue = self.shipped_ticket()
+                issue["labels"] = [{"name": "loom:ticket"}, {"name": state}]
+                self.doc["findings"] = []
+                t0 = NOW
+                self.run_intake(now=t0, checked=stamp(t0))
+                queued = []
+                intake = self.run_intake(now=t0 + 48 * 3600,
+                                        queue_verify=lambda r, n: queued.append((r, n)),
+                                        checked=stamp(t0 + 48 * 3600))
+                self.assertEqual(self.verify_comments(), [])
+                self.assertEqual(intake.verify_queued, [])
+                self.assertEqual(queued, [])
+
+    def test_verify_evidence_from_comments(self):
+        ev = health.absent_evidence_line("%s#1" % REPO, stamp(NOW - 30 * 3600),
+                                        stamp(NOW - 25 * 3600), stamp(NOW))
+        comment = {"body": health.absent_verify_comment(ev)}
+        self.assertEqual(health.verify_evidence_from_comments([comment]), ev)
+        self.assertIsNone(health.verify_evidence_from_comments([{"body": "regular comment"}]))
+
+    def test_station_queue_verify_clears_attempts(self):
+        with tempfile.TemporaryDirectory() as home:
+            st = station.Station(FakeGitHub(), station.Settings(home, [REPO], [], []))
+            path = os.path.join(st.state, station.VERIFY_FILE)
+            os.makedirs(st.state, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"%s#100" % REPO: NOW}, fh)
+            st._queue_verify(REPO, 100)
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertNotIn("%s#100" % REPO, data)
+
+    def test_verify_evidence_in_resume_lines(self):
+        ev = health.absent_evidence_line("%s#1" % REPO, stamp(NOW - 30 * 3600),
+                                        stamp(NOW - 25 * 3600), stamp(NOW))
+        body = ("Priority: P1\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] test\n"
+                "- [ ] Live: x\n\n" + (health.MARKER % sha()))
+        issue = {"number": 100, "state": "open", "body": body,
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+        comment = {"body": health.absent_verify_comment(ev)}
+
+        class GH:
+            def paginate(self, path):
+                if path.endswith("/comments"):
+                    return [comment]
+                return [issue]
+
+            def rest(self, method, path):
+                return Reply({})
+
+        now_dt = brain.datetime.fromtimestamp(NOW, brain.timezone.utc)
+        with unittest.mock.patch.object(brain, "verify_due",
+                                        return_value=[(now_dt - brain.timedelta(hours=25), issue)]):
+            lines = brain._verify_resume_lines(GH(), [REPO], now_dt)
+        self.assertTrue(any(ev in line for line in lines))
+

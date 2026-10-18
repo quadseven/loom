@@ -8,8 +8,9 @@ station reads each endpoint and, per finding:
   finding's marker, with Priority from its impact (affected x hours);
 - on the open ticket, moves the Priority line when the band changes and
   posts the new numbers at most every EVIDENCE_EVERY;
-- once the finding is gone, posts one "finding absent since" comment, the
-  evidence the brain verifies against. It never closes a ticket;
+- once the finding is gone, posts one "finding absent since" comment. Once
+  it has stayed absent for 24 hours after the ticket shipped, posts the
+  evidence line and queues the ticket for verification. It never closes a ticket;
 - when the finding is still reported REGRESS_AFTER after its open ticket
   shipped, the fix did not work: the ticket is re-briefed as a regression
   through brain brief --regresses, at most once per ticket per
@@ -62,6 +63,8 @@ MARKER = "<!-- loom:health key=%s -->"
 MARKER_RE = re.compile(r"<!-- loom:health key=([0-9a-f]{40}) -->")
 EVIDENCE_MARKER = "<!-- loom:health-evidence -->"
 ABSENT_MARKER = "<!-- loom:health-absent -->"
+ABSENT_VERIFY_MARKER = "<!-- loom:health-verify -->"
+ABSENT_VERIFY_AFTER = 24 * 3600
 # The contract's shapes. A field outside its pattern breaks the contract and
 # the whole read is "not looked" (half a list would read as cleared).
 KEY_RE = re.compile(r"[A-Za-z0-9:._ -]{1,120}")
@@ -335,6 +338,31 @@ def absent_comment(when: str) -> str:
             "%s. It verifies once it has stayed absent for 24 hours." % (ABSENT_MARKER, when))
 
 
+def absent_evidence_line(goal_key: str, absent_since: str, shipped_at: str,
+                         last_checked: str, absent_before_ship: bool = False) -> str:
+    note = " (absent before ship, counted from ship time)" if absent_before_ship else ""
+    return ("Health finding absent for 24 hours on %s: finding absent since %s, "
+            "ticket shipped %s%s, last checked %s."
+            % (goal_key, absent_since, shipped_at, note, last_checked))
+
+
+def absent_verify_comment(line: str) -> str:
+    return "%s\n%s" % (ABSENT_VERIFY_MARKER, line)
+
+
+def verify_evidence_from_comments(comments: Iterable[Dict[str, Any]]) -> Optional[str]:
+    """The latest health verify evidence line on the ticket, if any."""
+    for c in reversed(list(comments)):
+        if not isinstance(c, dict):
+            continue
+        body = str(c.get("body") or "")
+        if ABSENT_VERIFY_MARKER in body:
+            for line in body.splitlines():
+                if line.startswith("Health finding absent for 24 hours"):
+                    return line.strip()
+    return None
+
+
 class Intake:
     """One read of every source against the open tickets; `state` is the
     ledger the station keeps in state/health.json between passes."""
@@ -342,7 +370,8 @@ class Intake:
     def __init__(self, gh: GitHub, state: Dict[str, Any], now: float, stamp: str,
                  say: Callable[[str], None],
                  read: Callable[[str], Any] = fetch,
-                 brief: Callable[..., str] = brain.brief_intake) -> None:
+                 brief: Callable[..., str] = brain.brief_intake,
+                 queue_verify: Optional[Callable[[str, int], None]] = None) -> None:
         self.gh = gh
         self.state = state
         self.now = now
@@ -350,8 +379,10 @@ class Intake:
         self.say = say
         self.read = read
         self.brief = brief
+        self.queue_verify = queue_verify
         self.filed = 0
         self.regressed: Dict[str, Any] = {}
+        self.verify_queued: List[Tuple[str, int]] = []
 
     def run(self, sources: List[Source]) -> None:
         looked = self.state.setdefault("sources", {})
@@ -401,6 +432,8 @@ class Intake:
             if digest not in current and not rec.get("absent"):
                 self._comment(source.repo, issue, absent_comment(checked or self.stamp))
                 rec["absent"] = checked or self.stamp
+            if digest not in current:
+                self._verify_absent(source, digest, rec, issue, checked)
         for digest in [d for d in ledger if d not in current and d not in open_by_digest]:
             del ledger[digest]
 
@@ -430,6 +463,8 @@ class Intake:
                  issue: Optional[Dict[str, Any]], checked: str) -> None:
         rec.pop("absent", None)
         rec.pop("refused", None)
+        rec.pop("verified_absent", None)
+        rec.pop("verify_queued", None)
         if issue is None:
             self._file(source, f, rec)
             return
@@ -445,6 +480,51 @@ class Intake:
             rec.update(posted=posted, commented=self.now)
         self._regression(source, f, rec, issue)
 
+    def _ticket_shipped_time(self, repo: str, number: int, rec: Dict[str, Any]) -> Optional[float]:
+        cached = rec.get("shipped")
+        if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
+            return float(cached[1])
+        found = self._shipped_at(repo, number)
+        if found is None:
+            return None
+        rec["shipped"] = [number, found]
+        return found
+
+    def _verify_absent(self, source: Source, digest: str, rec: Dict[str, Any],
+                       issue: Optional[Dict[str, Any]], checked: str) -> None:
+        """When an open shipped ticket's finding has stayed absent for
+        ABSENT_VERIFY_AFTER counted from the later of absence and ship, post
+        the evidence comment and queue the ticket for verification."""
+        if issue is None:
+            return
+        if tickets.ticket_state(issue) != "shipped":
+            rec.pop("shipped", None)
+            return
+        absent_str = rec.get("absent")
+        if not absent_str or rec.get("verified_absent") == absent_str:
+            return
+        number = int(issue["number"])
+        shipped = self._ticket_shipped_time(source.repo, number, rec)
+        if shipped is None:
+            return
+        absent_epoch = _epoch(absent_str)
+        if absent_epoch is None:
+            absent_epoch = self.now
+        if self.now - max(absent_epoch, shipped) < ABSENT_VERIFY_AFTER:
+            return
+        shipped_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(shipped))
+        ev = absent_evidence_line(source.key, absent_str, shipped_str,
+                                  checked or self.stamp,
+                                  absent_before_ship=(absent_epoch < shipped))
+        self._comment(source.repo, issue, absent_verify_comment(ev))
+        rec["verified_absent"] = absent_str
+        rec["verify_queued"] = True
+        self.verify_queued.append((source.repo, number))
+        if self.queue_verify:
+            self.queue_verify(source.repo, number)
+        self.say("health %s: #%d finding absent for 24 hours; queued for verification"
+                 % (source.key, number))
+
     def _regression(self, source: Source, f: Finding, rec: Dict[str, Any],
                     issue: Dict[str, Any]) -> None:
         """Re-brief the finding's shipped ticket as a regression once the
@@ -457,17 +537,11 @@ class Intake:
         ticket = "%s#%d" % (source.repo, number)
         if ticket in self.regressed:
             return
-        cached = rec.get("shipped")
-        if isinstance(cached, list) and len(cached) == 2 and cached[0] == number:
-            shipped = float(cached[1])
-        else:
-            found = self._shipped_at(source.repo, number)
-            if found is None:
-                self._regress_error(source, f, rec, "#%d carries no loom:shipped label event, "
-                                    "so its ship time is unknown" % number)
-                return
-            shipped = found
-            rec["shipped"] = [number, shipped]
+        shipped = self._ticket_shipped_time(source.repo, number, rec)
+        if shipped is None:
+            self._regress_error(source, f, rec, "#%d carries no loom:shipped label event, "
+                                "so its ship time is unknown" % number)
+            return
         if self.now - shipped < REGRESS_AFTER:
             return
         hours = (self.now - shipped) / 3600

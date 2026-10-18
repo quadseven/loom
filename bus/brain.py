@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, auth_from_env
-from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
+from . import audit, change_class, handoff, health, hunt_plan, lock, pr_repair, proof, text, tickets
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -3058,8 +3058,13 @@ def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime) -> Lis
     due.sort(key=lambda x: (x[0], x[1], int(x[2]["number"])))
     out = ["", "## Verify due (up to %d, oldest ship first)" % VERIFY_RESUME_MAX]
     for shipped, repo, issue in due[:VERIFY_RESUME_MAX]:
+        ev = None
+        if health.MARKER_RE.search(str(issue.get("body") or "")):
+            comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
+            ev = health.verify_evidence_from_comments(comments)
+        summary = ev or live_criterion(issue.get("body"))
         out.append("- resume verify %s#%s shipped %s ago: %s" % (
-            repo, issue["number"], _since(shipped, now), live_criterion(issue.get("body"))))
+            repo, issue["number"], _since(shipped, now), summary))
     return out if due else out + ["- none"]
 
 
