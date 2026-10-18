@@ -1146,14 +1146,12 @@ def _dispatch_usage(handler, state):
     from datetime import datetime, timezone
     rows = [row for items in getattr(getattr(state, "usage", None), "providers", {}).values() for row in items]
     now = datetime.now(timezone.utc)
-    rows.sort(key=lambda row: (row.get("used_pct") is None,
-                               -(float(row["used_pct"]) if row.get("used_pct") is not None else 0)))
-    body = ['<section><h2 class="label">Lane status</h2>%s</section>' % views.render_lane_usage(rows)]
-    if not rows:
-        body.append('<p class="empty-state">Usage limits have not been uploaded yet.</p>')
-    for row in rows:
-        body.append(views.render_usage_row(row, now))
-    return handler.send_page(page("Usage", "usage", "".join(body), status="Live"))
+    payload = state.response() if hasattr(state, "response") else {}
+    lanes = {lane for row in rows for lane in (row.get("lanes") or []) if isinstance(lane, str)}
+    models = {lane: model for lane in lanes for model in [bus_brain._lane_model(lane)] if model}
+    data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models)
+    return handler.send_page(page("Usage", "usage", usage_store.render(data),
+                                  status="stale" if payload.get("stale") else "live"))
 
 
 def _dispatch_brain_hot_spots(handler, state, path):
