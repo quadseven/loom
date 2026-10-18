@@ -100,7 +100,10 @@ workflow's 30 most recent successful runs once and moves each open
 `loom:merged` ticket whose pull request's merge commit a run ran on, or the
 newest successful run on the default branch carries (the compare API; a merge
 outside the workflow's path filter ships with the next deploy), to
-`loom:shipped`, with a note naming the run. At most 20 move per repo a pass.
+`loom:shipped`, with a note naming the run. Only push runs on the repo's own
+default branch count (event `push`, head branch the default branch, head
+repository the repo itself): a pull request run, or a fork's, can sit at the
+same commit without deploying it. At most 20 move per repo a pass.
 
 ### Shipping through a pin pull request
 
