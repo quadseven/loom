@@ -5624,6 +5624,16 @@ class VerifyResultTest(Base):
         self.assertIn("A late criterion", logged)
         self.assertIn("verified but not closed", logged)
 
+    def test_a_github_failure_on_close_is_logged_and_the_ticket_stays_verified(self):
+        self.result(self.good())
+        err = station.GitHubError("server error", 502)
+        with mock.patch.object(brain, "close", side_effect=err):
+            with mock.patch("bus.station._say") as say:
+                self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "open")
+        self.assertIn("verified but not closed", " ".join(str(c) for c in say.call_args_list))
+
     def proofs(self):
         return [c["body"] for c in self.fake.comments[5] if c["body"].startswith(proof.PROOF_MARKER)]
 
