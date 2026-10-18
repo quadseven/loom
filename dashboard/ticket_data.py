@@ -17,6 +17,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from bus.github import GitHubError
 
 TTL = 90
+# At most this many tickets' details are kept. Every Ticket page opened added
+# one entry (its comments and label events) and none was ever dropped, so the
+# cache grew for as long as the dashboard ran.
+MAX_KEPT = 64
 # The station's comment when a lane opens or updates a pull request.
 PR_COMMENT_RE = re.compile(r"^Lane \S+ (?:opened|pushed fixes to) a pull request: "
                            r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)")
@@ -98,7 +102,12 @@ class TicketDetails:
                 return hit[1]
         detail = self._read(repo, int(number), list(pull_requests), footer)
         with self._lock:
-            self._cache[key] = (self.clock(), detail)
+            now = self.clock()
+            self._cache[key] = (now, detail)
+            for stale in [k for k, (at, _) in self._cache.items() if now - at >= self.ttl]:
+                del self._cache[stale]
+            while len(self._cache) > MAX_KEPT:
+                del self._cache[min(self._cache, key=lambda k: self._cache[k][0])]
         return detail
 
     def _part(self, errors: Dict[str, str], name: str, read: Callable[[], Any], empty: Any) -> Any:

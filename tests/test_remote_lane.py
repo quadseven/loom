@@ -184,7 +184,7 @@ class RemoteLaneTests(unittest.TestCase):
         gh = FakeGitHub()
         out = io.StringIO()
         err = io.StringIO()
-        with mock.patch("bus.lane.token_from_env", return_value="dummy"):
+        with mock.patch("bus.lane.auth_from_env", return_value="dummy"):
             with mock.patch("bus.lane.GitHub", return_value=gh):
                 with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
                     code = lane.main(["claim", "--lane", "muse", "--repos", "example/project"])
@@ -215,6 +215,219 @@ class RemoteBeatTests(unittest.TestCase):
         self.assertFalse(station.remote_beat_fresh("muse", 1000.0, 1000.0 + 2 * 3600 + 1))
         self.assertFalse(station.remote_beat_fresh("codex", 1000.0, 1000.0 + 2400))
         self.assertFalse(station.remote_beat_fresh("muse", None, 1000.0))
+
+
+class FakeGitDatabase:
+    """A GitHub API fake that speaks the git-database endpoints push_branch
+    needs: ref reads, blob/tree/commit creation, ref creation."""
+
+    def __init__(self, tree_sha="t" * 40, commit_sha="c" * 40, trees=None,
+                 commits=None):
+        self.tree_sha = tree_sha
+        self.commit_sha = commit_sha
+        # Optional per-call answers, consumed in order, for multi-commit pushes.
+        self.trees = list(trees or [])
+        self.commits = list(commits or [])
+        self.refs = {}  # branch -> sha
+        self.calls = []
+        self.bodies = []
+
+    def _blob_sha(self, content_b64):
+        import base64
+        import hashlib
+        content = base64.b64decode(content_b64)
+        # Git's own object id, not a security use: the fake must answer the
+        # same blob SHA git computes locally.
+        return hashlib.sha1(b"blob %d\0" % len(content) + content,
+                            usedforsecurity=False).hexdigest()
+
+    def rest(self, method, path, body=None, **kwargs):
+        from bus.github import GitHubError
+        from urllib.parse import unquote
+        self.calls.append((method, path))
+        self.bodies.append((method, path, body))
+        if method == "GET" and "/git/refs/heads/" in path:
+            branch = unquote(path.split("/git/refs/heads/", 1)[1])
+            if branch in self.refs:
+                return type("Response", (), {"data": {
+                    "object": {"sha": self.refs[branch]}}})()
+            raise GitHubError("GET %s -> 404" % path, 404, "")
+        if method == "POST" and path.endswith("/git/blobs"):
+            return type("Response", (), {"data": {
+                "sha": self._blob_sha(body["content"])}})()
+        if method == "POST" and path.endswith("/git/trees"):
+            sha = self.trees.pop(0) if self.trees else self.tree_sha
+            return type("Response", (), {"data": {"sha": sha}})()
+        if method == "POST" and path.endswith("/git/commits"):
+            sha = self.commits.pop(0) if self.commits else self.commit_sha
+            return type("Response", (), {"data": {"sha": sha}})()
+        if method == "POST" and path.endswith("/git/refs"):
+            branch = body["ref"].split("refs/heads/", 1)[1]
+            self.refs[branch] = body["sha"]
+            return type("Response", (), {"data": {}})()
+        if method == "PATCH" and "/git/refs/heads/" in path:
+            branch = path.split("/git/refs/heads/", 1)[1]
+            self.refs[branch] = body["sha"]
+            return type("Response", (), {"data": {}})()
+        raise AssertionError("unexpected API call: %s %s" % (method, path))
+
+
+def _make_repo(tmp, extra_commit=False):
+    import subprocess
+    def git(*args, **kwargs):
+        subprocess.run(["git", *args], capture_output=True, check=True, cwd=kwargs.get("cwd", tmp),
+                       env={**__import__("os").environ,
+                            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    origin = __import__("os").path.join(tmp, "origin.git")
+    git("init", "--bare", origin)
+    work = __import__("os").path.join(tmp, "work")
+    __import__("os").makedirs(work)
+    git("init", "-b", "main", cwd=work)
+    git("remote", "add", "origin", origin, cwd=work)
+    with open(__import__("os").path.join(work, "file.txt"), "w") as f:
+        f.write("base\n")
+    git("add", "file.txt", cwd=work)
+    git("commit", "-m", "base", cwd=work)
+    git("push", "-u", "origin", "main", cwd=work)
+    git("checkout", "-b", "loom/4-add-a-feature", cwd=work)
+    with open(__import__("os").path.join(work, "file.txt"), "w") as f:
+        f.write("changed\n")
+    git("add", "file.txt", cwd=work)
+    git("commit", "-m", "change", cwd=work)
+    if extra_commit:
+        with open(__import__("os").path.join(work, "second.txt"), "w") as f:
+            f.write("second\n")
+        git("add", "second.txt", cwd=work)
+        git("commit", "-m", "second change", cwd=work)
+    return work
+
+
+class PushBranchTests(unittest.TestCase):
+    def test_push_creates_remote_branch_via_git_database_api(self):
+        import os
+        import subprocess
+        import tempfile
+        from bus import lane
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo(tmp)
+            tree_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"], capture_output=True,
+                text=True, check=True, cwd=repo).stdout.strip()
+            gh = FakeGitDatabase(tree_sha=tree_sha)
+            issue = {"number": 4, "title": "Add a feature"}
+            gh_issue = FakeGitHub()
+            # FakeGitHub serves the issue; FakeGitDatabase speaks git-database.
+            # Combine: issue GETs go to FakeGitHub, git-database to FakeGitDatabase.
+            class Combined:
+                def rest(self, method, path, body=None, **kwargs):
+                    if "/git/" in path:
+                        return gh.rest(method, path, body, **kwargs)
+                    return gh_issue.rest(method, path, body, **kwargs)
+            old = os.getcwd()
+            os.chdir(repo)
+            try:
+                sha = lane.push_branch(Combined(), "example/project", 4)
+            finally:
+                os.chdir(old)
+            self.assertEqual(sha, gh.commit_sha)
+            self.assertEqual(gh.refs["loom/4-add-a-feature"], gh.commit_sha)
+            posts = [c for c in gh.calls if c[0] == "POST"]
+            self.assertTrue(any(p[1].endswith("/git/blobs") for p in posts))
+            self.assertTrue(any(p[1].endswith("/git/trees") for p in posts))
+            self.assertTrue(any(p[1].endswith("/git/commits") for p in posts))
+            self.assertTrue(any(p[1].endswith("/git/refs") for p in posts))
+
+    def test_push_recreates_every_commit_of_a_multi_commit_branch_in_order(self):
+        import os
+        import subprocess
+        import tempfile
+        from bus import lane
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo(tmp, extra_commit=True)
+
+            def rev(spec):
+                return subprocess.run(
+                    ["git", "rev-parse", spec], capture_output=True,
+                    text=True, check=True, cwd=repo).stdout.strip()
+            base = rev("main")
+            local_trees = [rev("HEAD~1^{tree}"), rev("HEAD^{tree}")]
+            made = ["a" * 40, "b" * 40]
+            gh = FakeGitDatabase(trees=local_trees, commits=list(made))
+            gh_issue = FakeGitHub()
+
+            class Combined:
+                def rest(self, method, path, body=None, **kwargs):
+                    if "/git/" in path:
+                        return gh.rest(method, path, body, **kwargs)
+                    return gh_issue.rest(method, path, body, **kwargs)
+            old = os.getcwd()
+            os.chdir(repo)
+            try:
+                sha = lane.push_branch(Combined(), "example/project", 4)
+            finally:
+                os.chdir(old)
+            commit_posts = [b for m, p, b in gh.bodies
+                            if m == "POST" and p.endswith("/git/commits")]
+            self.assertEqual(len(commit_posts), 2)
+            # Oldest first, each tree matching the local commit's tree, and
+            # each commit chained onto the one the API made before it.
+            self.assertEqual([c["tree"] for c in commit_posts], local_trees)
+            self.assertEqual([c["message"] for c in commit_posts],
+                             ["change", "second change"])
+            self.assertEqual(commit_posts[0]["parents"], [base])
+            self.assertEqual(commit_posts[1]["parents"], [made[0]])
+            self.assertEqual(sha, made[1])
+            self.assertEqual(gh.refs["loom/4-add-a-feature"], made[1])
+
+    def test_push_is_a_no_op_when_remote_is_up_to_date(self):
+        import os
+        import tempfile
+        from bus import lane
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo(tmp)
+            gh = FakeGitDatabase()
+            gh.refs["loom/4-add-a-feature"] = "d" * 40
+            # Local HEAD differs from remote, so it is not up to date; use
+            # the up-to-date path by pointing the ref at the local HEAD.
+            import subprocess
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True,
+                text=True, check=True, cwd=repo).stdout.strip()
+            gh.refs["loom/4-add-a-feature"] = head
+            gh_issue = FakeGitHub()
+            class Combined:
+                def rest(self, method, path, body=None, **kwargs):
+                    if "/git/" in path:
+                        return gh.rest(method, path, body, **kwargs)
+                    return gh_issue.rest(method, path, body, **kwargs)
+            old = os.getcwd()
+            os.chdir(repo)
+            try:
+                sha = lane.push_branch(Combined(), "example/project", 4)
+            finally:
+                os.chdir(old)
+            self.assertEqual(sha, head)
+            posts = [c for c in gh.calls if c[0] == "POST"]
+            self.assertEqual(posts, [])
+
+    def test_push_refuses_when_current_branch_is_not_the_ticket_branch(self):
+        import os
+        import subprocess
+        import tempfile
+        from bus import lane
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo(tmp)
+            subprocess.run(["git", "checkout", "main"], capture_output=True,
+                           check=True, cwd=repo)
+            gh_issue = FakeGitHub()
+            old = os.getcwd()
+            os.chdir(repo)
+            try:
+                with self.assertRaises(ValueError):
+                    lane.push_branch(gh_issue, "example/project", 4)
+            finally:
+                os.chdir(old)
 
 
 if __name__ == "__main__":

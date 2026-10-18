@@ -303,9 +303,9 @@ pr_body() {
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
   # passes whatever word the brief used; an unknown size is kept as written.
-  size="$(section Size "$1" | head -1)"
-  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan size "$size" 2>/dev/null ||
-    printf '%s' "$size" | awk '{print $1}' | tr -d ':')"
+  # bus.hunt_plan reads a ## Size section or an inline "Size: S" line.
+  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan brief-size "$1" 2>/dev/null ||
+    section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
@@ -676,7 +676,6 @@ spark_ready() {
 # The key goes to curl as a config file on stdin, written by the printf
 # builtin, so it reaches no process's argv and no log.
 PROBE_TIMEOUT=20
-PROBE_HOLD=43200
 
 # 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
 # MODEL; 1 for any other answer, no answer, or no probe configured.
@@ -721,12 +720,51 @@ provider_at_limit() {
   return 0
 }
 
-# Hold this lane PROBE_HOLD seconds through the heartbeat's retry_at, and
+# The slots that bill the same provider account as this slot: a provider limit
+# recorded by one holds every slot in the group until the shared reset.
+# opencode-go's four slots share one OpenCode Go account; every other lane is a
+# group of one (the numbered slots map to their provider lane above).
+limit_group() {
+  local lane="${LANE:-}"
+  case "$lane" in
+    opencode-go)
+      printf '%s\n' opencode-go opencode-go-2 opencode-go-3 opencode-go-4 ;;
+    *)
+      [ -n "$lane" ] && printf '%s\n' "$lane" ;;
+  esac
+}
+
+# The epoch this slot's provider limit lifts: the reset the provider gave, else
+# the next reset of the period the error names (weekly / daily), never a short
+# fixed window. Empty when there is no recorded limit to hold on.
+limit_until() {
+  local file ra name now
+  now="$(date +%s)"
+  file="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  [ -f "$file" ] || return 1
+  ra="$(sed -nE 's/.*"retry_after": *"?([0-9]+)"?.*/\1/p' "$file" | head -1)"
+  if [ -n "$ra" ] && [ "$ra" -gt "$now" ]; then
+    printf '%s' "$ra"; return 0
+  fi
+  name="$(sed -nE 's/.*"limit_name": *"?([A-Za-z]+)"?.*/\1/p' "$file" | head -1)"
+  case "$name" in
+    weekly) printf '%s' "$((now + 7 * 86400))"; return 0 ;;
+    daily) printf '%s' "$((now + 86400))"; return 0 ;;
+  esac
+  # No reset the provider gave and no named period: hold a week, not the short
+  # default, so a shared account stays held until it is known to have reset.
+  printf '%s' "$((now + 7 * 86400))"; return 0
+}
+
+# Hold every slot in this slot's limit group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
-  LIMIT_UNTIL=$(( $(date +%s) + PROBE_HOLD ))
+  local until slot
+  until="$(limit_until)" || return 0
   LIMITED=1
-  heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")" "$LIMIT_UNTIL"
+  for slot in $(limit_group); do
+    write_beat "$slot" false "limit: $LIMIT_WHY; unavailable until $(utc "$until")" "$until"
+  done
 }
 
 # Model ladders keep usage limits per model so a slot can continue on the

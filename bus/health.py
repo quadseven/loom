@@ -342,7 +342,7 @@ class Intake:
     def __init__(self, gh: GitHub, state: Dict[str, Any], now: float, stamp: str,
                  say: Callable[[str], None],
                  read: Callable[[str], Any] = fetch,
-                 brief: Callable[..., str] = brain.brief) -> None:
+                 brief: Callable[..., str] = brain.brief_intake) -> None:
         self.gh = gh
         self.state = state
         self.now = now

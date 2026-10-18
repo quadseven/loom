@@ -128,7 +128,7 @@ below; where the steps leave room, this is how to spend it.
    again; say "unchanged" and move on.
 8. Every failure the brain finds by hand becomes a factory ticket (Improving
    Loom itself), so the factory catches it next time without the brain. File
-   it in the same tick with `bus.brain brief` on the Loom goal home, quoting
+   it in the same tick with `bus.brain brief` under an open epic of the Loom goal home, quoting
    the evidence; a journal line that names a factory problem without a ticket
    number is a rule broken, and the next tick files it before anything else.
 9. Failed tickets get a decision every tick. For each ticket at loom:failed,
@@ -387,7 +387,20 @@ this tick"; a step with no note shows nothing there.
    work not merged yet (`brief --after '#5, owner/name#7'` writes the line,
    and the station holds the ticket until each of them is merged),
    regressions first, with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --holder muse`.
+   `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --holder muse`.
+   Every ticket goes under an open epic of its goal (decision 0003): `brief`
+   refuses without `--epic`, and for a closed, unlabelled or full epic (15
+   tickets). `status` lists each goal's open epics. When no open epic fits
+   the work, propose a new one within the cap of 6 open epics per goal with
+   `python3 -m bus.brain epic OWNER/NAME --goal N --title "Epic: SENTENCE" --file EPIC.md`
+   (a done-when and a size line in the body). When an epic's route is
+   unclear, chart a wayfinder map for it before filing work; resolve its
+   research and task tickets alone, and batch the questions only the
+   operator can answer into one daily ask, each with a recommended answer.
+   For each `close-epic` item resume lists (every ticket of the epic is
+   closed), check the epic's done-when and close it with
+   `python3 -m bus.brain close-epic OWNER/NAME#N --note TEXT`, or file the
+   ticket it is missing.
    Give each brief `--priority P0` to `P3` by how much it costs the goal
    while it stays unfixed (without it the ticket is P2); the station and the
    factory take P0 first. Read the Priorities and Health findings sections
@@ -407,12 +420,12 @@ this tick"; a step with no note shows nothing there.
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal, the rest get `loom:triage` and one comment naming
+   ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
    what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left, and only rewrites `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
+   `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket refs it, the original gets
    `loom:rewritten` and stays open) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
@@ -551,11 +564,19 @@ it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
 2. the codex lane (or codex-2) with `gpt-6-sol`;
-3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot;
+4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
+   agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
 
-A rung counts as tried once the ticket was claimed on its model, read from
-the ticket's `Model:` line before the ladder started as well as from the
-ladder's own moves. A green, reviewed pull request is not escalated: a ticket
+A rung counts as tried once the ticket was claimed on its model. The model a
+claim ran is what ran: the `Model:` line in force (the ticket's own before the
+ladder started, then the ladder's moves), else the model the runner footer of
+its lane's pull request names (`lane <lane>, model <model>`), else the lane's
+configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
+Once a ticket ran on Opus or past it, it climbs only to the untried strong
+models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
+lane of its next rung is up, it waits with no comment; the factory says it
+tried every rung only once every rung with a lane for its repo was tried. A green, reviewed pull request is not escalated: a ticket
 whose open pull request has nothing to fix (its head is green, the review
 check passed on that head, and no review thread is open) is landed, whatever
 its fix rounds.

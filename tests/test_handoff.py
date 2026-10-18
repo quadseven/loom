@@ -124,6 +124,9 @@ class Routes:
             self.posted.append((path, json.loads(body) if body else None))
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
+        if (method == "GET" and path.endswith("/sub_issues")
+                and (method, path) not in self.routes):
+            return 200, {}, b"[]"  # a goal with no epics or tickets linked
         if (method, path) not in self.routes:
             raise AssertionError("unexpected call %s %s" % (method, path))
         status, data = self.routes[(method, path)]
@@ -160,6 +163,27 @@ class ResumeCommandTests(unittest.TestCase):
                        "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]}),
         })
         return routes
+
+    def test_an_epic_whose_tickets_are_all_closed_is_a_brain_item(self):
+        routes = self.routes()
+        epic = {"number": 20, "title": "Epic: the work", "state": "open",
+                "labels": [{"name": "epic"}], "body": "Done when: x.\n\nPart of #1\n"}
+        busy = dict(epic, number=21, title="Epic: still going")
+        empty = dict(epic, number=22, title="Epic: just opened")
+        closed = lambda n: {"number": n, "state": "closed",  # noqa: E731
+                            "labels": [{"name": "loom:ticket"}]}
+        routes[("GET", "/repos/%s/issues/1/sub_issues" % REPO)] = (200, [epic, busy, empty])
+        routes[("GET", "/repos/%s/issues/20/sub_issues" % REPO)] = (200, [closed(30), closed(31)])
+        routes[("GET", "/repos/%s/issues/21/sub_issues" % REPO)] = (
+            200, [closed(32), {"number": 33, "state": "open", "labels": [{"name": "loom:ticket"}]}])
+        out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
+                           "lane-machine", LOCK_REPO, NOW, {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
+        section = out.split("## Finished epics (every ticket closed)")[1].split("\n## ")[0]
+        self.assertIn("- resume close-epic %s#20 Epic: the work: check its done-when" % REPO,
+                      section)
+        self.assertIn("bus.brain close-epic %s#20 --note TEXT" % REPO, section)
+        self.assertNotIn("#21", section)
+        self.assertNotIn("#22", section)
 
     def test_the_lock_holder_gets_the_merge_and_failed_ticket(self):
         out = brain.resume(GitHub("t", transport=Routes(self.routes())), [REPO],
@@ -209,15 +233,15 @@ class ResumeCommandTests(unittest.TestCase):
             brain.defer(GitHub("t", transport=Routes(self.routes())), "failed", PR, "muse")
         with self.assertRaises(ValueError):
             brain.defer(GitHub("t", transport=Routes(self.routes())), "brief", TICKET, "muse",
-                        note="party-trip fix")
+                        note="checkout fix")
 
     def test_defer_brief_writes_marker_listed_by_resume_and_dropped_by_done(self):
         routes = self.routes()
         marker = brain.defer(GitHub("t", transport=Routes(routes)), "brief",
-                             (REPO, 1), "muse", note="party-trip fix")
+                             (REPO, 1), "muse", note="checkout fix")
         self.assertIn(" key=", marker)
         self.assertEqual(
-            '<!-- loom:defer v1 stage=brief item=%s#1 rev=open key=c7ec7cc4 holder=muse note="party-trip fix" -->' % REPO,
+            '<!-- loom:defer v1 stage=brief item=%s#1 rev=open key=345c819b holder=muse note="checkout fix" -->' % REPO,
             marker)
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
@@ -225,10 +249,10 @@ class ResumeCommandTests(unittest.TestCase):
         out = brain.resume(GitHub("t", transport=Routes(routes)), [REPO],
                            "lane-machine", LOCK_REPO, NOW,
                            {"LOOM_BRIEF_AUTHORS": "allowed-bot"})
-        self.assertIn("- resume brief %s#1: party-trip fix (deferred by muse at %s)" % (
+        self.assertIn("- resume brief %s#1: checkout fix (deferred by muse at %s)" % (
             REPO, at(10)), out)
 
-        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine", key="c7ec7cc4")
+        done_line = handoff.done_marker("brief", (REPO, 1), "lane-machine", key="345c819b")
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
             comment(journal(5, "lane-machine", done_line)),
@@ -268,7 +292,7 @@ class ResumeCommandTests(unittest.TestCase):
     def test_brief_handoff_whose_goal_home_was_closed_is_dropped_from_resume(self):
         routes = self.routes(goal_state="closed")
         marker = handoff.defer_marker("brief", (REPO, 1), "open", "muse",
-                                     note="party-trip fix")
+                                     note="checkout fix")
         routes[("GET", "/repos/%s/issues/1/comments" % REPO)] = (200, [
             comment(journal(10, "muse", marker)),
         ])
@@ -323,7 +347,7 @@ class ResumeCommandTests(unittest.TestCase):
 BRIEF = ("## Why\nwhy: the page query is slow for every visitor.\n## What\nwhat\n"
          "## Acceptance criteria\n- [ ] done\n- [ ] tested\n- [ ] live\n## Size\nS\n"
          "## Out of scope\n- none")
-BRIEF_DEFER = handoff.defer_marker("brief", (REPO, 1), "open", "muse", note="party-trip fix")
+BRIEF_DEFER = handoff.defer_marker("brief", (REPO, 1), "open", "muse", note="checkout fix")
 ENV = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
 
 
@@ -340,6 +364,12 @@ class BriefDoneTests(unittest.TestCase):
             ("POST", "/repos/%s/issues" % REPO): ticket,
             ("POST", "/repos/%s/issues/1/sub_issues" % REPO): (201, {}),
             ("POST", "/repos/%s/issues/1/comments" % REPO): (201, {}),
+            # Epic #3 under goal #1: briefs file under an open epic.
+            ("GET", "/repos/%s/issues/3" % REPO): (200, {
+                "number": 3, "id": 103, "state": "open", "title": "Epic: the work",
+                "labels": [{"name": "epic"}], "body": "Done when: done.\n\nPart of #1\n"}),
+            ("GET", "/repos/%s/issues/3/sub_issues" % REPO): (200, []),
+            ("POST", "/repos/%s/issues/3/sub_issues" % REPO): (201, {}),
         })
         return routes
 
@@ -350,7 +380,7 @@ class BriefDoneTests(unittest.TestCase):
     def test_a_brief_under_a_standing_brief_defer_retires_it_in_resume(self):
         routes = self.routes(journal(10, "muse", BRIEF_DEFER))
         fake = Routes(routes)
-        url = brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF,
+        url = brain.brief(GitHub("t", transport=fake), REPO, 3, "Ticket", BRIEF,
                           holder="lane-machine", env=ENV)
         self.assertEqual("https://example.com/12", url)
         [posted] = self.journals_posted(fake)
@@ -379,13 +409,13 @@ class BriefDoneTests(unittest.TestCase):
         for name, journals in cases.items():
             with self.subTest(name):
                 fake = Routes(self.routes(*journals))
-                brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF,
+                brain.brief(GitHub("t", transport=fake), REPO, 3, "Ticket", BRIEF,
                             holder="lane-machine", env=ENV)
                 self.assertEqual([], self.journals_posted(fake))
                 self.assertIn(("POST", "/repos/%s/issues" % REPO), fake.calls)
         # Without a holder the brief reads no journals and writes none, as before.
         fake = Routes(self.routes(journal(10, "muse", BRIEF_DEFER)))
-        brain.brief(GitHub("t", transport=fake), REPO, 1, "Ticket", BRIEF, env=ENV)
+        brain.brief(GitHub("t", transport=fake), REPO, 3, "Ticket", BRIEF, env=ENV)
         self.assertEqual([], self.journals_posted(fake))
         self.assertNotIn(("GET", "/repos/%s/issues/1/comments" % REPO), fake.calls)
 
@@ -401,7 +431,7 @@ class BriefDoneTests(unittest.TestCase):
                 fake = Routes(self.routes(journal(10, "muse", BRIEF_DEFER),
                                           **{k: v for k, v in case.items() if k == "ticket"}))
                 with self.assertRaises((ValueError, GitHubError)):
-                    brain.brief(GitHub("t", transport=fake), REPO, 1,
+                    brain.brief(GitHub("t", transport=fake), REPO, 3,
                                 case.get("title", "Ticket"), case.get("body", BRIEF),
                                 holder=case.get("holder", "lane-machine"), env=ENV)
                 self.assertEqual([], self.journals_posted(fake))
@@ -410,7 +440,7 @@ class BriefDoneTests(unittest.TestCase):
         routes = self.routes(journal(10, "muse", BRIEF_DEFER))
         routes[("POST", "/repos/%s/issues/1/comments" % REPO)] = (502, {"message": "Bad Gateway"})
         with self.assertRaises(GitHubError) as caught:
-            brain.brief(GitHub("t", transport=Routes(routes)), REPO, 1, "Ticket", BRIEF,
+            brain.brief(GitHub("t", transport=Routes(routes)), REPO, 3, "Ticket", BRIEF,
                         holder="lane-machine", env=ENV)
         self.assertIn("https://example.com/12", str(caught.exception))
         self.assertIn(handoff.done_marker("brief", (REPO, 1), "lane-machine"),

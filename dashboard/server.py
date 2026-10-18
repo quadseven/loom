@@ -288,18 +288,103 @@ def _short_ref(goal):
     return goal.split("/", 1)[-1]
 
 
+def _goal_report_html(info, missing, now):
+    """The card's report line: the newest report and how old it is, "No
+    report on this goal in the last two weeks" only when the goal's reports
+    were read and none is that recent, or the source that was not read."""
+    esc = html.escape
+    if not info:
+        return '<p class="muted">report not read: %s</p>' % esc(missing)
+    report, stamp = info.get("report"), info.get("report_time")
+    when = _when(stamp)
+    ago = goals_view.age(stamp, now)
+    if info.get("report_quiet"):
+        last = " Last report %s." % when if report and when else ""
+        return "<p>No report on this goal in the last two weeks.%s</p>" % esc(last)
+    if report:
+        return '<p>%s</p><p class="machine-fact">last report %s%s</p>' % (
+            esc(report), esc(when or str(stamp)), esc(" (%s ago)" % ago) if ago else "")
+    return '<p class="muted">report not read: %s</p>' % esc(
+        str(info.get("report_reason") or "the goal home's comments were not read"))
+
+
+def _goal_child_row(goal, info, own, now):
+    """One smaller goal inside its parent's card: title, in-flight count,
+    last report age; it links to that goal's tickets."""
+    esc = html.escape
+    title = info.get("title") or _short_ref(goal)
+    flying = info.get("in_flight") if info else None
+    if flying is None:
+        flying = sum(1 for row in own if row.get("open", True) and row.get("state") in goals_view.IN_FLIGHT_STATES)
+    ago = goals_view.age(info.get("report_time"), now) if info else None
+    if ago:
+        report = "report %s ago" % ago
+    elif info and info.get("report_quiet"):
+        report = "no report in two weeks"
+    else:
+        report = "report not read"
+    return ('<li><a href="/tickets?goal=%s"><span class="goal-child-title">%s</span>'
+            '<span class="machine-fact">%s / %d in flight / %s</span></a></li>') % (
+                quote(goal, safe=""), esc(goals_view.short(str(title), 90)),
+                esc(_short_ref(goal)), flying, esc(report))
+
+
+def _goal_epic_row(epic):
+    esc = html.escape
+    return ('<li><a href="/tickets?epic=%s"><span class="goal-child-title">%s</span>'
+            '<span class="machine-fact">%s / tickets %d/%d / %d in flight</span></a></li>') % (
+                quote(epic["ref"], safe=""), esc(goals_view.short(str(epic.get("title") or _short_ref(epic["ref"])), 90)),
+                esc(_short_ref(epic["ref"])), epic.get("tickets", 0), goals_view.EPIC_TICKET_CAP,
+                epic.get("in_flight", 0))
+
+
+def _goal_epics_html(info):
+    """The goal's epics: the open ones against the cap of 6, each with its
+    tickets against 15, then the closed ones as a collapsed record."""
+    found = [e for e in (info.get("epics") or []) if isinstance(e, dict) and e.get("ref")]
+    if not found:
+        return ""
+    live = [e for e in found if e.get("open", True)]
+    done = [e for e in found if not e.get("open", True)]
+    out = ['<div class="goal-epics"><p class="machine-fact">open epics %d/%d</p>' % (len(live), goals_view.EPIC_CAP)]
+    if live:
+        out.append('<ul class="goal-children" aria-label="Open epics of this goal">%s</ul>'
+                   % "".join(_goal_epic_row(e) for e in live))
+    if done:
+        out.append('<details class="goal-epics-closed"><summary>%d closed epic%s</summary>'
+                   '<ul class="goal-children">%s</ul></details>' % (
+                       len(done), "" if len(done) == 1 else "s", "".join(_goal_epic_row(e) for e in done)))
+    out.append("</div>")
+    return "".join(out)
+
+
 def _goals(state):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
     rows = _all_tickets(state)
     grouped = {}
     for row in rows:
         if row.get("goal"):
             grouped.setdefault(row["goal"], []).append(row)
     context = getattr(state, "context", None) or {}
-    goal_data = context.get("goals") or state.response().get("goal_context") or {}
+    response = state.response()
+    goal_data = context.get("goals") or response.get("goal_context") or {}
+    if not isinstance(goal_data, dict):
+        goal_data = {}
+    # Why a goal has no record: the snapshot says, else it is not in it.
+    missing = str(response.get("goal_context_error") or
+                  "the goal is not in the last snapshot's goal data")
+    parents = {goal: (info or {}).get("parent") for goal, info in goal_data.items()}
+    tree = goals_view.rollup(list(grouped) + [g for g in goal_data if g not in grouped], parents)
+
+    def size(top):
+        return len(grouped.get(top, [])) + sum(len(grouped.get(child, [])) for child in tree[top])
+
     esc = html.escape
     cards = []
-    for goal, tickets in sorted(grouped.items(), key=lambda item: -len(item[1])):
-        info = goal_data.get(goal, {}) if isinstance(goal_data, dict) else {}
+    for goal in sorted(tree, key=lambda top: -size(top)):
+        tickets = grouped.get(goal, [])
+        info = goal_data.get(goal) or {}
         history = [v for v in info.get("history", [])][-7:]
         scale = info.get("scale") or max([v for v in history if isinstance(v, (int, float))] or [1]) or 1
         spark = "".join('<i style="height:%d%%"%s></i>' % (
@@ -311,7 +396,6 @@ def _goals(state):
             sum(row.get("state") == name for row in tickets)) for name in STATES
             if any(row.get("state") == name for row in tickets))
         title = info.get("title") or _short_ref(goal)
-        report = info.get("report")
         measure = info.get("measure")
         held, limit = info.get("unproven"), info.get("unproven_limit")
         if isinstance(held, int) and isinstance(limit, int):
@@ -321,19 +405,30 @@ def _goals(state):
             unproven_html = '<p class="machine-fact">%s</p>' % esc(note)
         else:
             unproven_html = ""
+        if info.get("metric") is not None:
+            metric_html = '<div class="metric">%s</div><div class="machine-fact">%s%s</div>' % (
+                esc(str(info["metric"])), esc(str(info.get("unit") or "")),
+                esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else "")
+        else:
+            metric_html = ('<div class="metric metric-missing">not read</div>'
+                           '<div class="machine-fact">verified with proof: %s</div>') % esc(
+                               str(info.get("metric_reason") or missing))
+        children = tree[goal]
+        child_html = ('<ul class="goal-children" aria-label="Smaller goals in this goal">%s</ul>' % "".join(
+            _goal_child_row(child, goal_data.get(child) or {}, grouped.get(child, []), now)
+            for child in sorted(children, key=lambda c: -len(grouped.get(c, []))))) if children else ""
         cards.append(
             '<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
-            '<div class="goal-metric"><div><div class="metric">%s</div><div class="machine-fact">%s%s</div></div>'
+            '<div class="goal-metric"><div>%s</div>'
             '<div class="sparkline" aria-label="Last 7 days, one bar a day">%s</div></div>%s'
-            '<div class="chips">%s</div>%s<p>%s</p><a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
-                esc(_short_ref(goal)), esc(str(title)), esc(str(info.get("metric", "-"))),
-                esc(str(info.get("unit") or "not looked: the goal has no snapshot data")),
-                esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else "",
+            '<div class="chips">%s</div>%s%s%s<a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
+                esc(_short_ref(goal)), esc(str(title)), metric_html,
                 spark, '<p class="machine-fact">measure: %s</p>' % esc(measure) if measure else "",
-                counts, unproven_html,
-                esc(report) if report else "No report on this goal in the last two weeks.",
+                counts, unproven_html, _goal_report_html(info, missing, now),
+                _goal_epics_html(info) + child_html,
                 quote(goal, safe=""), len(tickets)))
-    body = '<p class="page-lede">Each goal home, measured by what reached a live proof.</p><div class="goal-grid">%s</div>' % (
+    body = ('<p class="page-lede">Each top-level goal home, with the smaller goals that roll up into it,'
+            ' measured by what reached a live proof.</p><div class="goal-grid">%s</div>') % (
         "".join(cards) or '<p class="empty-state">No goals with ticket data.</p>')
     return page("Goals", "goals", body, status="snapshot")
 
@@ -543,11 +638,12 @@ FINISHED_STATES = ("merged", "shipped", "verified", "closed-unmerged")
 
 
 def _outside_any_epic(rows, epics, repo_filter=""):
-    """Open tickets with no goal home (no Part of line) that no backlog epic
-    lists as a child: each one is work nobody has placed."""
+    """Open tickets under no epic (decision 0003: their Part of line or
+    sub-issue parent names no epic) that no backlog epic lists as a child:
+    each one is work nobody has placed."""
     members = _epic_members(epics)
     found = [row for row in rows
-             if row.get("open", True) and row.get("state") not in FINISHED_STATES and not row.get("goal")
+             if row.get("open", True) and row.get("state") not in FINISHED_STATES and not row.get("epic")
              and (_short_repo(row.get("repo")), _int_or_none(row.get("number"))) not in members
              and (not repo_filter or _short_repo(row.get("repo")) == _short_repo(repo_filter))]
     return sorted(found, key=lambda row: (str(row.get("repo") or ""), _int_or_none(row.get("number")) or 0))
@@ -555,8 +651,8 @@ def _outside_any_epic(rows, epics, repo_filter=""):
 
 def _outside_section(rows):
     esc = html.escape
-    lede = ('<p class="backlog-note">Each open ticket below belongs to no epic and no goal home. Each is an incoherence '
-            'to fix: add a Part of line naming its epic, or close it. Read from the ticket snapshot, which holds '
+    lede = ('<p class="backlog-note">Each open ticket below belongs to no epic. Each is an incoherence '
+            'to fix: move it under an open epic of its goal, or close it. Read from the ticket snapshot, which holds '
             'open loom:ticket issues only; open issues without that label are not checked here.</p>')
     if rows:
         items = "".join('<li><a href="%s"><span class="machine-fact">%s#%s</span> %s</a><span class="machine-fact state-%s">%s</span></li>' % (

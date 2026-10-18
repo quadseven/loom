@@ -134,7 +134,8 @@ ladder_open() {
 # The settings the brain's commands read (bus.brain, bus journal), passed
 # to a sandboxed rung by name. An allowlist: nothing else of this
 # environment, a key or an SSM parameter name included, reaches the agent.
-BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_REPO_OWNERS LOOM_HOME
+BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
+  LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
   LOOM_UNVERIFIED_LIMIT LOOM_MERGE_SETTLE_SECONDS)
 
@@ -265,7 +266,12 @@ those items only when resume says all GitHub stages are open to you (no other \
 brain journaled in the last 2 hours). Defer and done markers go in your \
 journal as MUSE.md says; post each journal with python3 -m bus journal \
 OWNER/NAME#N --file FILE --holder $HOLDER so it carries your Tick line. A brief named but not written this tick is deferred \
-with the brief stage, never only in journal prose."
+with the brief stage, never only in journal prose. Brief only under an \
+open epic (bus.brain brief --epic E); propose a new epic within the cap of 6 \
+open epics per goal (bus.brain epic); chart a wayfinder map for an epic whose \
+route is unclear; resolve research and task tickets alone; batch the \
+questions only the operator can answer into one daily ask, each with a \
+recommended answer."
 fi
 
 if [ -n "$PACKET" ]; then

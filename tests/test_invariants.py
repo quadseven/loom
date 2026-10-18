@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import invariants, metrics, station  # noqa: E402
+from bus import brain, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, Response  # noqa: E402
 from bus.invariants import Check, Facts, GateHold, Journal, Posted, Ref, Run  # noqa: E402
 
@@ -29,6 +29,16 @@ def journal(at, holder="muse", step="- Step status: failed (GitHub answered 502)
                       "- Shipped: none", "- Cost: 40 requests, 6 minutes"])
 
 
+def ticket(number, state="open"):
+    return {"number": number, "state": state, "labels": [{"name": "loom:ticket"}],
+            "body": "Why."}
+
+
+def epic(number, state="open"):
+    return {"number": number, "state": state, "title": "Epic: part %d" % number,
+            "labels": [{"name": "epic"}], "body": "Done when: x.\n\nPart of #%d\n" % GOAL}
+
+
 class FakeGH:
     """The GitHub reads and writes the invariant check makes, on one repo."""
 
@@ -45,6 +55,10 @@ class FakeGH:
         self.calls = []
         self.writes = []
         self.search_items = []
+        # The open review threads the review bot left on a pull request.
+        self.threads = []
+        # (repo, issue number) -> its sub-issues, for the goal walk.
+        self.subs = {}
 
     def paginate(self, path):
         self.calls.append(("GET", path))
@@ -61,6 +75,12 @@ class FakeGH:
         m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:ticket&state=open", path)
         if m:
             return []
+        # The goal walk (goal, epics, tickets).
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues\?", path)
+        if m:
+            return list(self.subs.get((m.group(1), int(m.group(2))), []))
+        if re.match(r"/repos/[^/]+/[^/]+/issues\?labels=epic&", path):
+            return []
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None):
@@ -74,14 +94,24 @@ class FakeGH:
             return Response(201, {"number": number, "id": 9000 + number})
         if method == "GET" and path.startswith("/search/issues?"):
             return Response(200, {"items": self.search_items})
-        if method == "POST" and path.endswith("/sub_issues"):
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues", path)
+        if method == "POST" and m:
+            child = next((i for i in self.issues.values() if i.get("id") == body["sub_issue_id"]),
+                         None)
+            if child is not None:
+                self.subs.setdefault((m.group(1), int(m.group(2))), []).append(
+                    dict(child, labels=[x if isinstance(x, dict) else {"name": x}
+                                        for x in child.get("labels", [])]))
             return Response(201, {})
         m = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/(\d+)", path)
         if m and method == "GET":
             issue = self.issues.get(int(m.group(1)))
             if issue is None:
                 raise GitHubError("Not Found", 404)
-            return Response(200, issue)
+            # As GitHub answers: label objects, and when the issue was opened.
+            return Response(200, dict(issue, created_at=issue.get("created_at", stamp(T0)),
+                                      labels=[x if isinstance(x, dict) else {"name": x}
+                                              for x in issue.get("labels", [])]))
         if m and method == "PATCH":
             self.issues[int(m.group(1))].update(body)
             return Response(200, {})
@@ -105,6 +135,10 @@ class FakeGH:
 
     def filed(self):
         return [i for i in self.issues.values()]
+
+    def graphql(self, query):
+        self.calls.append(("POST", "/graphql"))
+        return {"repository": {"pullRequest": {"reviewThreads": {"nodes": self.threads}}}}
 
     def comment(self, number, at, body, repo=REPO, author=AUTHOR):
         self.comments.setdefault((repo, number), []).append(
@@ -137,6 +171,29 @@ class StationBase(unittest.TestCase):
             fh.write(text)
         if at is not None:
             os.utime(path, (at, at))
+
+    def lane_ticket(self, number, labels=("loom:ticket", "loom:pr"), state="open"):
+        """The issue that carries a lane pull request."""
+        self.gh.issues[number] = {"number": number, "state": state, "body": "Why.",
+                                  "labels": [{"name": n} for n in labels]}
+
+    def lane_pull(self, number, ticket, opened, labels=(), author=AUTHOR):
+        """An open, non-draft lane pull request opened at `opened`, on the
+        branch its ticket number names."""
+        self.gh.pulls.setdefault(REPO, []).append(
+            {"number": number, "created_at": stamp(opened),
+             "head": {"ref": "loom/%d-thing" % ticket, "sha": "%x" % number},
+             "labels": [{"name": n} for n in labels], "user": {"login": author}})
+
+    def bot_threads(self, count=1):
+        """`count` unresolved review threads the review bot opened."""
+        self.gh.threads = [{"id": "T%d" % i, "comments": {"nodes": [
+            {"author": {"login": "grug-tribe[bot]"}, "body": "naming %d" % i}]}}
+            for i in range(count)]
+
+    def breaches(self):
+        """The invariant issues this pass filed."""
+        return [i for i in self.gh.filed() if invariants.LABEL in i.get("labels", [])]
 
 
 class AcceptanceTest(StationBase):
@@ -206,9 +263,8 @@ class StationTest(StationBase):
         self.assertEqual(station.Station(self.gh, self.settings, now=T0)._invariant_goal(), (REPO, GOAL))
 
     def test_a_private_goal_home_is_named_in_words_only(self):
-        self.gh.goal_issues[OTHER] = [{"number": 3, "title": "Hidden", "labels": [],
-                                       "sub_issues_summary": {"total": 95}}]
-        self.search_loose_ticket(3)
+        self.gh.goal_issues[OTHER] = [{"number": 3, "title": "Hidden", "labels": []}]
+        self.gh.subs[(OTHER, 3)] = [ticket(7)]
         self.run_at(T0)
         filed = self.gh.filed()
         self.assertEqual(len(filed), 1, self.said)
@@ -241,32 +297,115 @@ class StationTest(StationBase):
         self.assertEqual(self.gh.filed(), [])
         self.assertTrue(any("/issues?labels=loom:ticket" in c[1] for c in self.gh.calls))
 
+    def test_a_lane_pull_open_seven_hours_whose_ticket_is_not_a_loom_ticket_files_a_breach(self):
+        self.lane_ticket(481, labels=("epic",))
+        self.lane_pull(534, 481, T0 - 7 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("Lane pull request #534 open 7.0 hours", filed["title"])
+        self.assertIn("no open loom:ticket carries it", filed["title"])
+        self.assertIn("#481, which is not an open loom:ticket", filed["body"])
+        self.assertIn("`lane-pr-stalled`", filed["body"])
+
+    def test_a_lane_pull_whose_ticket_was_closed_is_a_breach_for_the_same_reason(self):
+        self.lane_ticket(481, state="closed")
+        self.lane_pull(534, 481, T0 - 7 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("no open loom:ticket carries it", filed["title"])
+        self.assertIn("#481, which is not an open loom:ticket", filed["body"])
+
+    def test_a_lane_pull_past_the_ladder_files_a_breach_and_five_hours_old_does_not(self):
+        self.lane_ticket(506, labels=("loom:ticket", "loom:failed"))
+        self.lane_ticket(507, labels=("loom:ticket", "loom:failed"))
+        self.lane_pull(657, 506, T0 - 7 * 3600)
+        self.lane_pull(658, 507, T0 - 5 * 3600)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("Lane pull request #657 open 7.0 hours", filed["title"])
+        self.assertIn("past the last rung of the model ladder", filed["title"])
+        self.assertIn("#506", filed["body"])
+        self.assertNotIn("#658", filed["title"] + filed["body"])
+
+    def test_a_lane_pull_with_open_review_threads_and_no_fix_round_files_a_breach(self):
+        self.lane_ticket(602)
+        self.lane_pull(660, 602, T0 - 7 * 3600)
+        self.bot_threads(2)
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("2 open review threads and no fix round queued", filed["title"])
+        self.assertIn("bus.brain fix", filed["body"])
+
+    def test_a_lane_pull_with_its_fix_round_queued_or_waiting_to_merge_files_nothing(self):
+        self.lane_ticket(603, labels=("loom:ticket", "loom:briefed", "lane:zen"))
+        self.lane_pull(661, 603, T0 - 7 * 3600)
+        self.bot_threads()
+        self.gh.comment(603, T0 - 3600,
+                        "<!-- loom:fix v1 -->\n<!-- loom:fix-head %x -->" % 661)
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [], self.said)
+        # The same pull request clean: the brain merges it.
+        self.gh.threads = []
+        self.lane_ticket(603)
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(self.breaches(), [], self.said)
+
+    def test_a_stale_lane_pull_nothing_can_read_is_skipped_rather_than_reported(self):
+        self.lane_pull(670, 699, T0 - 7 * 3600)  # the ticket it names is gone
+        self.lane_pull(671, 481, T0 - 7 * 3600, author="stranger")
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [], self.said)
+        self.assertTrue(any("unreadable" in line for line in self.said), self.said)
+
     def unlinked_goal(self):
-        """A goal at the sub-issue cap with one ticket naming it loosely."""
-        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
-        self.search_loose_ticket()
+        """A goal home with one open ticket under no epic."""
+        self.gh.subs[(REPO, GOAL)] = [ticket(7)]
 
-    def search_loose_ticket(self, goal=GOAL):
-        self.gh.search_items = [{"number": 7, "body": "part of #%d inline" % goal,
-                                 "labels": [{"name": "loom:ticket"}]}]
-
-    def test_a_goal_at_the_sub_issue_cap_with_every_ticket_linked_by_part_of_is_healthy(self):
-        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
-        self.gh.search_items = [{"number": 7, "body": "## Why\nx\n\nPart of #30\n",
-                                 "labels": [{"name": "loom:ticket"}]}]
+    def test_a_goal_whose_tickets_all_sit_under_epics_is_healthy(self):
+        self.gh.subs[(REPO, GOAL)] = [epic(40)]
+        self.gh.subs[(REPO, 40)] = [ticket(7), ticket(8, state="closed")]
         self.run_at(T0)
-        self.assertEqual(self.gh.filed(), [])
-        self.assertTrue(any(c[1].startswith("/search/issues?") for c in self.gh.calls))
+        self.assertEqual(self.gh.filed(), [], self.said)
 
-    def test_a_goal_at_the_cap_whose_sub_issues_name_it_inline_is_healthy(self):
-        self.gh.goal_issues[REPO][0]["sub_issues_summary"]["total"] = 100
-        self.gh.search_items = [{"number": 7, "body": "Work that is Part of #30.",
-                                 "labels": [{"name": "loom:ticket"}],
-                                 "parent_issue_url": "https://api.github.com/repos/%s/issues/%d"
-                                                     % (REPO, GOAL)}]
+    def test_each_epic_shape_opens_its_invariant_once_and_clearing_closes_it(self):
+        cases = {
+            "ticket-outside-epic": (lambda: self.gh.subs.update({(REPO, GOAL): [ticket(7)]}),
+                                    "has 1 open tickets under no epic"),
+            "epic-over-cap": (lambda: self.gh.subs.update({
+                (REPO, GOAL): [epic(40)],
+                (REPO, 40): [ticket(n, state="closed") for n in range(50, 66)]}),
+                "holds 16 tickets (cap 15)"),
+            "goal-epics-over-cap": (lambda: self.gh.subs.update({
+                (REPO, GOAL): [epic(n) for n in range(40, 47)]}),
+                "has 7 open epics (cap 6)"),
+            "closed-epic-open-tickets": (lambda: self.gh.subs.update({
+                (REPO, GOAL): [epic(40, state="closed")], (REPO, 40): [ticket(7)]}),
+                "Closed epic #40 holds 1 open tickets"),
+        }
+        for name, (shape, title) in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                shape()
+                self.run_at(T0)
+                filed = self.gh.filed()
+                self.assertEqual(len(filed), 1, self.said)
+                self.assertIn(title, filed[0]["title"])
+                self.assertIn("`%s`" % name, filed[0]["body"])
+                # Still broken a pass later: nothing more is filed.
+                self.run_at(T0 + invariants.CHECK_EVERY)
+                self.assertEqual(len(self.gh.filed()), 1)
+                self.assertEqual(filed[0]["state"], "open")
+                # Cleared: once the shape is gone long enough, the issue closes.
+                self.gh.subs.clear()
+                self.run_at(T0 + 2 * invariants.CHECK_EVERY)
+                self.run_at(T0 + invariants.CLEAR_AFTER + 3 * invariants.CHECK_EVERY)
+                self.assertEqual(filed[0]["state"], "closed", self.said)
+
+    def test_a_goal_home_exception_raises_its_epic_cap(self):
+        self.gh.goal_issues[REPO][0]["body"] = "Epic cap: 8 until 2999-12-31\n"
+        self.gh.subs[(REPO, GOAL)] = [epic(n) for n in range(40, 47)]
         self.run_at(T0)
-        self.assertEqual(self.gh.filed(), [])
-        self.assertTrue(any(c[1].startswith("/search/issues?") for c in self.gh.calls))
+        self.assertEqual(self.gh.filed(), [], self.said)
 
     def test_breaches_wait_while_the_github_budget_is_low(self):
         self.unlinked_goal()
@@ -282,7 +421,8 @@ class StationTest(StationBase):
         st = self.run_at(T0)
         number = self.gh.filed()[0]["number"]
         body = st._overdue_standup_body([], None, st._open_breaches(REPO, GOAL))
-        self.assertIn("Invariants broken: #%d Goal home #30 has 1 tickets not linked to it." % number, body)
+        self.assertIn("Invariants broken: #%d Goal home #30 has 1 open tickets under no epic."
+                      % number, body)
         self.assertNotIn("Invariants broken", st._overdue_standup_body([], None))
 
 
@@ -298,6 +438,22 @@ class FilerTest(unittest.TestCase):
     def breach(self, at=T0, evidence=("one line",)):
         return invariants.Breach("goal-full", "x/y#1", "Goal home #1 has 2 tickets not linked to it",
                                  tuple(evidence), at)
+
+    def test_a_breach_files_under_the_goals_repairs_epic(self):
+        self.gh.issues[GOAL] = {"number": GOAL, "id": 9000 + GOAL, "state": "open",
+                                "title": "Goal", "labels": [{"name": "loom:goal"}], "body": ""}
+        self.file(self.breach())
+        epics = [i for i in self.gh.issues.values() if i.get("title") == brain.REPAIRS_TITLE]
+        self.assertEqual(len(epics), 1)
+        epic = epics[0]["number"]
+        (filed,) = [i for i in self.gh.issues.values() if "loom:invariant" in i.get("labels", [])]
+        self.assertTrue(filed["body"].endswith("Part of #%d" % epic))
+        self.assertEqual([c["number"] for c in self.gh.subs[(REPO, epic)]], [filed["number"]])
+        self.assertIn(epic, [c["number"] for c in self.gh.subs[(REPO, GOAL)]])
+        # The next pass finds the same epic: none is opened twice.
+        self.file(invariants.Breach("goal-full", "x/y#2", "Another", ("line",), T0))
+        self.assertEqual(len([i for i in self.gh.issues.values()
+                              if i.get("title") == brain.REPAIRS_TITLE]), 1)
 
     def test_a_closed_issue_reopens_only_for_evidence_newer_than_the_close(self):
         self.file(self.breach())
@@ -421,9 +577,24 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(b.subject, "agy")
         self.assertIn("#5", " ".join(b.evidence))
 
-    def test_a_goal_home_with_tickets_not_linked_to_it(self):
-        self.assertEqual(invariants.goal_full(Facts(T0, goals=[(self.goal, 0)])), [])
-        self.assertEqual(len(invariants.goal_full(Facts(T0, goals=[(self.goal, 1)]))), 1)
+    def test_the_four_epic_shapes(self):
+        t7, e40 = Ref("%s#7" % REPO, "#7"), Ref("%s#40" % REPO, "#40")
+        ok = invariants.GoalShape(self.goal, 6, (invariants.EpicShape(e40, True, 15, (t7,)),), ())
+        f = Facts(T0, shapes=[ok])
+        for check in (invariants.ticket_outside_epic, invariants.epic_over_cap,
+                      invariants.goal_epics_over_cap, invariants.closed_epic_open_tickets):
+            self.assertEqual(check(f), [])
+            self.assertEqual(check(Facts(T0)), [])  # not read: nothing found
+        bad = invariants.GoalShape(self.goal, 1, (
+            invariants.EpicShape(e40, True, 16, ()),
+            invariants.EpicShape(Ref("%s#41" % REPO, "#41"), True, 1, ()),
+            invariants.EpicShape(Ref("%s#42" % REPO, "#42"), False, 2, (t7,))), (t7,))
+        f = Facts(T0, shapes=[bad])
+        self.assertEqual([b.subject for b in invariants.ticket_outside_epic(f)], [self.goal.key])
+        self.assertEqual([b.subject for b in invariants.epic_over_cap(f)], [e40.key])
+        self.assertEqual([b.subject for b in invariants.goal_epics_over_cap(f)], [self.goal.key])
+        self.assertEqual([b.subject for b in invariants.closed_epic_open_tickets(f)],
+                         ["%s#42" % REPO])
 
     def test_a_plan_check_that_passed_or_failed_recently_is_not_a_breach(self):
         pr = Ref("%s#7" % REPO, "pull request #7")
@@ -470,6 +641,60 @@ class InvariantTest(unittest.TestCase):
         # A claim for the goal succeeded, so the station no longer holds it.
         self.assertEqual(invariants.gate_hold(Facts(T0, gate_held={})), [])
 
+    def pull(self, at, number=534, ticket=481, labels=("loom:ticket", "loom:pr"),
+             drives=True, threads=0, fix_pending=False):
+        """One open lane pull request as the station reads it."""
+        return invariants.LanePull(
+            Ref("%s#%d" % (REPO, number), "pull request #%d" % number), at,
+            Ref("%s#%d" % (REPO, ticket), "#%d" % ticket) if ticket is not None else None,
+            tuple(labels), drives, threads, fix_pending)
+
+    def test_a_lane_pull_open_five_hours_and_unread_pull_requests_find_nothing(self):
+        self.assertEqual(invariants.lane_pr_stalled(Facts(T0)), [])
+        self.assertEqual(invariants.lane_pr_stalled(
+            Facts(T0, lane_pulls=[self.pull(T0 - 5 * 3600, threads=2)])), [])
+
+    def test_each_stall_names_its_own_reason(self):
+        cases = {
+            "no open loom:ticket carries it": dict(ticket=None, drives=False, labels=()),
+            "past the last rung of the model ladder": dict(labels=("loom:ticket", "loom:failed")),
+            "its ticket waits on the brain": dict(labels=("loom:ticket", "loom:pr", "needs-brain")),
+            "1 open review thread and no fix round queued": dict(threads=1),
+        }
+        for reason, shape in cases.items():
+            with self.subTest(reason):
+                (b,) = invariants.lane_pr_stalled(
+                    Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, **shape)]))
+                self.assertEqual((b.invariant, b.subject), ("lane-pr-stalled", "%s#534" % REPO))
+                self.assertIn(reason, b.title)
+                self.assertIn("Unstick it:", " ".join(b.evidence))
+
+    def test_the_ladder_and_the_open_threads_name_the_one_command_that_unsticks_them(self):
+        (ladder,) = invariants.lane_pr_stalled(
+            Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, labels=("loom:ticket", "loom:failed"))]))
+        self.assertIn("bus.brain brief", ladder.evidence[-1])
+        (threads,) = invariants.lane_pr_stalled(
+            Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, threads=2)]))
+        self.assertIn("bus.brain fix", threads.evidence[-1])
+
+    def test_a_ticket_the_factory_can_move_drives_the_pull_request_it_carries(self):
+        for shape in ({}, dict(threads=2, fix_pending=True),
+                      dict(labels=("loom:ticket", "loom:ready"))):
+            with self.subTest(shape):
+                self.assertEqual(invariants.lane_pr_stalled(
+                    Facts(T0, lane_pulls=[self.pull(T0 - 7 * 3600, **shape)])), [])
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StandingEpicTest(unittest.TestCase):
+    def test_the_repairs_epic_is_exempt_from_both_caps(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epics = tuple(invariants.EpicShape(Ref("%s#%d" % (REPO, n), "#%d" % n), True, 1, ())
+                      for n in range(40, 46))
+        repairs = invariants.EpicShape(Ref("%s#50" % REPO, "#50"), True, 40, (), True)
+        f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, epics + (repairs,), ())])
+        self.assertEqual(invariants.epic_over_cap(f), [])
+        self.assertEqual(invariants.goal_epics_over_cap(f), [])

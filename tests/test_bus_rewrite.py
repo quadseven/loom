@@ -17,11 +17,13 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import rewrite, station  # noqa: E402
+from bus import brain, rewrite, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
 GOAL = 30
+# The goal's intake epic, where rewrites file their tickets (decision 0003).
+INTAKE = 31
 BODY = ("## Why\nThe page is slow for every visitor.\n\n## What\nCache the query.\n\n"
         "## Acceptance criteria\n- [ ] The page loads in under a second.\n"
         "- [ ] A test fails without the cache.\n- [ ] The query runs once a minute.\n\n"
@@ -43,6 +45,13 @@ class FakeGitHub:
         self.comments = []
         self.labels = []
         self.removed = []
+        self.linked = []
+
+    @staticmethod
+    def intake():
+        return {"number": INTAKE, "id": 1000 + INTAKE, "state": "open",
+                "title": brain.INTAKE_TITLE, "labels": [{"name": "epic"}],
+                "body": "Done when: full.\n\nSize: S\n\nPart of #%d\n" % GOAL}
 
     def add_triage(self, number, created=None):
         self.triage[number] = {
@@ -78,7 +87,15 @@ class FakeGitHub:
                 return reply(200, {"number": GOAL, "state": "open", "body": "",
                                    "labels": [{"name": "loom:goal"}]})
             if sub == "sub_issues":
-                return reply(201 if method == "POST" else 200, [])
+                return reply(201, {}) if method == "POST" else reply(200, [self.intake()])
+        if number == INTAKE:
+            if method == "GET" and sub is None:
+                return reply(200, self.intake())
+            if sub == "sub_issues":
+                if method == "POST":
+                    self.linked.append(data["sub_issue_id"])
+                    return reply(201, {})
+                return reply(200, [])
         if method == "GET" and sub is None:
             return reply(200, self.triage[number])
         if method == "GET" and sub == "comments":
@@ -156,6 +173,9 @@ class RewriteIssueTest(Base):
         self.assertEqual(ticket["labels"], ["loom:ticket", "loom:queued"])
         self.assertTrue(ticket["body"].startswith("Difficulty: easy\n"))
         self.assertIn("Rewritten from issue 7.", ticket["body"])
+        # Filed under the goal's intake epic: its sub-issue, named by Part of.
+        self.assertTrue(ticket["body"].endswith("\n\nPart of #%d\n" % INTAKE))
+        self.assertEqual(self.fake.linked, [9001])
         self.assertEqual(self.fake.labels, [(7, ["loom:rewritten"])])
         self.assertEqual(self.fake.removed, [(7, "loom%3Atriage")])
 

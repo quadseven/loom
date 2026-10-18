@@ -224,5 +224,363 @@ class UnprovenWork(unittest.TestCase):
         self.assertIn("over limit: no new build tickets", body)
 
 
+def goal_rows(*specs):
+    """Ticket rows from (number, goal number, state) through ticket_record."""
+    from dashboard.github import ticket_record
+    return [ticket_record(REPO, {
+        "number": number, "title": "Ticket %d" % number, "created_at": "2026-10-15T10:00:00Z",
+        "body": "Part of %s#%d\n\n## Why\nx" % (REPO, goal),
+        "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}) for number, goal, state in specs]
+
+
+def goals_state(rows, context, error=""):
+    class State:
+        data = {}
+
+        def response(self):
+            return {"tickets": {REPO: rows}, "operator_items": [], "goal_context": context,
+                    "goal_context_error": error}
+    return State()
+
+
+def cards(body):
+    return re.findall(r'<article class="goal-card card">(.*?)</article>', body, re.S)
+
+
+class RollUp(unittest.TestCase):
+    """Small goals roll up into their parent goal (loom#609): one repo showed
+    nine goal cards that read as fragments of one bigger goal."""
+
+    def test_the_parent_goal_line_and_the_sub_issue_link_name_the_parent(self):
+        self.assertEqual(goals.parent_of(REPO, {"body": "## Why\nx\n\nParent goal: example-owner/app#5\n"}),
+                         "example-owner/app#5")
+        self.assertEqual(goals.parent_of(REPO, {"body": "- Parent goal: #30"}), REPO + "#30")
+        self.assertEqual(goals.parent_of(REPO, {"body": "", "parent_issue_url":
+                                                "https://api.github.com/repos/%s/issues/30" % REPO}),
+                         REPO + "#30")
+        self.assertIsNone(goals.parent_of(REPO, {"body": "Part of #30"}))
+
+    def test_a_goal_with_a_parent_goal_line_renders_as_a_row_inside_its_parents_card(self):
+        rows = goal_rows((7, 30, "pr"), (8, 41, "running"), (9, 41, "queued"), (10, 41, "verified"))
+        child = {"number": 41, "title": "Smaller goal", "body": "Parent goal: %s#30" % REPO}
+        parents = {REPO + "#41": goals.parent_of(REPO, child)}
+        comments = [comment(41, "<!-- loom:report v1 -->\nChild report.", "2026-10-15T09:00:00Z")]
+        context = goals.goal_context(rows, comments, {REPO + "#30": "Main goal", REPO + "#41": "Smaller goal"},
+                                     [], None, NOW, parents=parents)
+        body = server._goals(goals_state(rows, context))
+        found = cards(body)
+        self.assertEqual(len(found), 1, "the smaller goal must not get its own card")
+        self.assertIn("Main goal", found[0])
+        children = found[0][found[0].index('class="goal-children"'):]
+        self.assertIn("Smaller goal", children)
+        self.assertIn("sample#41 / 2 in flight / report", children)
+        self.assertIn('href="/tickets?goal=%s"' % server.quote(REPO + "#41", safe=""), children)
+
+    def test_a_parent_with_no_tickets_of_its_own_still_gets_the_card(self):
+        rows = goal_rows((8, 41, "running"))
+        context = goals.goal_context(rows, [], {REPO + "#30": "Main goal"}, [], None, NOW,
+                                     parents={REPO + "#41": REPO + "#30"})
+        found = cards(server._goals(goals_state(rows, context)))
+        self.assertEqual(len(found), 1)
+        self.assertIn("Main goal", found[0])
+        self.assertIn("goal-children", found[0])
+
+    def test_a_parent_loop_still_shows_each_goal_once(self):
+        tree = goals.rollup(["a#1", "a#2"], {"a#1": "a#2", "a#2": "a#1"})
+        self.assertEqual(sum(1 + len(children) for children in tree.values()), 2)
+
+
+class ReportFreshness(unittest.TestCase):
+    QUIET_TEXT = "No report on this goal in the last two weeks"
+
+    def render(self, comments, unread=None, now=None):
+        rows = goal_rows((7, 30, "pr"))
+        context = goals.goal_context(rows, comments, {}, [], None, now or NOW, unread=unread)
+        return cards(server._goals(goals_state(rows, context)))[0]
+
+    def test_a_goal_with_a_standup_in_the_last_two_hours_has_no_quiet_line(self):
+        recent = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        card = self.render([comment(30, "<!-- loom:report v1 -->\n15 in flight since the last report.", recent)],
+                           now=datetime.now(timezone.utc))
+        self.assertNotIn(self.QUIET_TEXT, card)
+        self.assertIn("15 in flight since the last report.", card)
+        self.assertRegex(card, r"last report .*\(\d+m ago\)")
+
+    def test_a_report_older_than_two_weeks_is_quiet_and_says_when_it_was(self):
+        card = self.render([comment(30, "<!-- loom:report v1 -->\nOld.", "2026-09-20T10:00:00Z")])
+        self.assertIn(self.QUIET_TEXT, card)
+        self.assertIn("Last report Sep 20", card)
+
+    def test_an_unread_comment_feed_names_its_cause_instead_of_no_report(self):
+        card = self.render([], unread={REPO: REPO + " comments: GET ... -> 502"})
+        self.assertNotIn(self.QUIET_TEXT, card)
+        self.assertIn("report not read: %s comments: GET ... -&gt; 502" % REPO, card)
+        self.assertIn("not read", card[card.index("goal-metric"):card.index("sparkline")])
+        self.assertNotIn('<div class="metric">-</div>', card)
+
+    def test_a_goal_missing_from_the_snapshot_shows_why_instead_of_a_dash(self):
+        rows = goal_rows((7, 30, "pr"))
+        card = cards(server._goals(goals_state(rows, {}, "the dashboard has not read its sources yet")))[0]
+        self.assertNotIn('<div class="metric">-</div>', card)
+        self.assertNotIn(self.QUIET_TEXT, card)
+        self.assertIn("verified with proof: the dashboard has not read its sources yet", card)
+        self.assertIn("report not read: the dashboard has not read its sources yet", card)
+
+
+class FakeGitHub:
+    """Just enough of bus.github.GitHub for one TicketStore pass."""
+
+    def __init__(self, pages, issues):
+        self.pages, self.issues, self.calls = pages, issues, []
+        self.rate = {"core": (4000, 5000, 0)}
+
+    def paginate(self, path):
+        self.calls.append(path)
+        for prefix, items in self.pages.items():
+            if path.startswith(prefix):
+                return list(items)
+        return []
+
+    def paginate_parallel(self, path, workers=8):
+        return self.paginate(path)
+
+    def rest(self, method, path, body=None):
+        self.calls.append(path)
+
+        class Response:
+            data = self.issues.get(path)
+        return Response()
+
+
+class StoreGoals(unittest.TestCase):
+    """The live cause (2026-10-17): a refresh below the request budget floor
+    dropped goal_context, so every Goals card read "-", "the goal has no
+    snapshot data" and "No report on this goal in the last two weeks", even
+    for a goal with a standup every two hours."""
+
+    def setUp(self):
+        env = {key: "" for key in ("LOOM_IMPROVEMENT_HOMES", "LOOM_STATUS_REPO", "LOOM_METRICS_GOAL",
+                                   "LOOM_BRIEF_AUTHORS", "LOOM_BACKLOG_SOURCE")}
+        patcher = unittest.mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        from dashboard.github import TicketStore
+        stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tickets = [{"number": n, "title": "Ticket %d" % n, "state": "open", "created_at": stamp,
+                    "body": "Part of #%d\n\n## Why\nx" % goal,
+                    "labels": [{"name": "loom:ticket"}, {"name": "loom:running"}]}
+                   for n, goal in ((7, 30), (8, 41))]
+        standup = {"id": 1, "body": "<!-- loom:report v1 -->\n1 in flight since the last report.",
+                   "created_at": stamp, "user": {"login": "station"},
+                   "issue_url": "https://api.github.com/repos/%s/issues/30" % REPO}
+        self.gh = FakeGitHub(
+            {"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets,
+             "/repos/%s/issues/comments" % REPO: [standup]},
+            {"/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx"},
+             "/repos/%s/issues/41" % REPO: {"number": 41, "title": "Smaller goal",
+                                            "body": "## Why\nx\n\nParent goal: %s#30" % REPO}})
+        self.store = TicketStore([REPO], gh=self.gh, budget_floor=500)
+        self.store._waits_refreshed_at = float("inf")
+
+    def test_a_pass_below_the_budget_floor_keeps_the_goal_cards_of_the_last_pass(self):
+        self.store.refresh()
+        self.store._last_remaining, self.store._reset_at = 10, 2 ** 40
+        self.store.refresh()
+        found = cards(server._goals(self.store))
+        self.assertEqual(len(found), 1)
+        self.assertIn("Main goal", found[0])
+        self.assertIn("1 in flight since the last report.", found[0])
+        self.assertNotIn("No report on this goal in the last two weeks", found[0])
+        self.assertIn("Smaller goal", found[0][found[0].index("goal-children"):])
+
+    def test_a_first_pass_below_the_floor_says_why_the_cards_are_empty(self):
+        self.store._last_remaining, self.store._reset_at = 10, 2 ** 40
+        self.store.refresh()
+        self.assertIn("request budget is below its floor", self.store.response()["goal_context_error"])
+
+
+class GoalSourcesAreTrusted(unittest.TestCase):
+    """Only configured authors and configured repos shape the goal cards."""
+
+    def store(self, home_comments=(), goal_41_body="## Why\nx", extra_issues=None, env=None):
+        base = {key: "" for key in ("LOOM_IMPROVEMENT_HOMES", "LOOM_STATUS_REPO", "LOOM_METRICS_GOAL",
+                                    "LOOM_BRIEF_AUTHORS", "LOOM_BACKLOG_SOURCE")}
+        base.update(env or {})
+        patcher = unittest.mock.patch.dict(os.environ, base)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        from dashboard.github import TicketStore
+        stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tickets = [{"number": n, "title": "Ticket %d" % n, "state": "open", "created_at": stamp,
+                    "body": "Part of #%d\n\n## Why\nx" % goal,
+                    "labels": [{"name": "loom:ticket"}, {"name": "loom:running"}]}
+                   for n, goal in ((7, 30), (8, 41))]
+        issues = {"/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx"},
+                  "/repos/%s/issues/41" % REPO: {"number": 41, "title": "Smaller goal", "body": goal_41_body}}
+        issues.update(extra_issues or {})
+        gh = FakeGitHub({"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets,
+                         "/repos/%s/issues/30/comments" % REPO: list(home_comments)}, issues)
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+        store.refresh()
+        return store, gh
+
+    @staticmethod
+    def home_comment(cid, login, body, at):
+        return {"id": cid, "user": {"login": login}, "body": body, "created_at": at,
+                "issue_url": "https://api.github.com/repos/%s/issues/30" % REPO}
+
+    def test_a_report_shaped_comment_from_an_untrusted_login_does_not_change_the_last_report(self):
+        comments = [
+            self.home_comment(1, "station", "<!-- loom:report v1 -->\nReal standup.", "2026-10-17T10:00:00Z"),
+            self.home_comment(2, "stranger", "<!-- loom:report v1 -->\nForged standup.\n- Measure: forged",
+                              "2026-10-17T11:00:00Z"),
+            self.home_comment(3, "stranger", "<!-- loom:metrics v1 -->\n2026-10-17: 9/9 pass; streak 9",
+                              "2026-10-17T11:00:00Z")]
+        store, _ = self.store(comments, env={"LOOM_BRIEF_AUTHORS": "station",
+                                             "LOOM_IMPROVEMENT_HOMES": REPO + "#30",
+                                             "LOOM_METRICS_GOAL": REPO + "#30"})
+        card = store.response()["goal_context"][REPO + "#30"]
+        self.assertEqual(card["report"], "Real standup.")
+        self.assertEqual(card["report_time"], "2026-10-17T10:00:00Z")
+        self.assertIsNone(card["measure"])
+        self.assertNotEqual(card["metric"], "9/9")
+        self.assertNotIn("Forged standup.", server._goals(store))
+
+    def test_an_untrusted_report_or_journal_changes_no_view(self):
+        comments = [
+            self.home_comment(1, "station", "<!-- loom:report v1 -->\nReal standup.", "2026-10-17T10:00:00Z"),
+            self.home_comment(2, "station", "<!-- loom:journal v1 -->\nTick, brain\n- Next: real move",
+                              "2026-10-17T10:00:00Z"),
+            self.home_comment(3, "stranger", "<!-- loom:report v1 -->\nForged standup.", "2026-10-17T11:00:00Z"),
+            self.home_comment(4, "stranger", "<!-- loom:journal v1 -->\nTick, brain\n- Next: forged move\n"
+                              "- Friction: forged friction #7", "2026-10-17T11:00:00Z"),
+            self.home_comment(5, "stranger", "<!-- loom:metrics v1 -->\n2026-10-17: 9/9 pass; streak 9",
+                              "2026-10-17T11:00:00Z"),
+            self.home_comment(6, "stranger", "<!-- loom:lanes v1 -->\nforged lanes", "2026-10-17T11:00:00Z")]
+        store, _ = self.store(comments, env={"LOOM_BRIEF_AUTHORS": "station",
+                                             "LOOM_IMPROVEMENT_HOMES": REPO + "#30",
+                                             "LOOM_METRICS_GOAL": REPO + "#30"})
+        payload = store.response()
+        floor = server._floor(store)
+        self.assertIn("Real standup.", floor)
+        self.assertIn("real move", floor)
+        self.assertNotIn("Forged", floor)
+        self.assertNotIn("forged", floor)
+        logins = {(c.get("user") or {}).get("login") for c in
+                  payload["improving"]["journals"] + payload["improving"]["metrics_comments"] + payload["lanes"]}
+        self.assertEqual(logins, {"station"})
+        improving = views.render_improving(views.build_improvements(
+            payload["improving"]["journals"], [], payload["improving"]["metrics_comments"]))
+        self.assertNotIn("forged", improving)
+        self.assertNotIn("9/9", improving)
+        self.assertNotIn("Forged standup.", server._goals(store))
+
+    def test_a_parent_line_naming_a_repo_outside_the_configured_list_is_ignored_and_never_read(self):
+        store, gh = self.store(goal_41_body="Parent goal: other-owner/elsewhere#5")
+        self.assertFalse([path for path in gh.calls if "other-owner/elsewhere" in path])
+        self.assertIsNone(store.response()["goal_context"][REPO + "#41"]["parent"])
+        self.assertEqual(len(cards(server._goals(store))), 2)
+
+    def test_a_parent_that_is_not_a_goal_home_is_ignored(self):
+        store, _ = self.store(goal_41_body="Parent goal: #50", extra_issues={
+            "/repos/%s/issues/50" % REPO: {"number": 50, "title": "Plain issue", "body": "", "labels": []}})
+        self.assertIsNone(store.response()["goal_context"][REPO + "#41"]["parent"])
+        self.assertEqual(len(cards(server._goals(store))), 2)
+
+    def test_a_parent_labelled_as_a_goal_home_is_followed(self):
+        store, _ = self.store(goal_41_body="Parent goal: #50", extra_issues={
+            "/repos/%s/issues/50" % REPO: {"number": 50, "title": "Big goal", "body": "",
+                                           "labels": [{"name": "loom:goal"}]}})
+        found = cards(server._goals(store))
+        self.assertEqual(len(found), 2)
+        big = next(card for card in found if "Big goal" in card)
+        self.assertIn("Smaller goal", big[big.index("goal-children"):])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class EpicsOnGoals(unittest.TestCase):
+    """loom#639: a ticket under an epic records the epic and the epic's goal,
+    and Goals lists each goal's epics with their ticket counts."""
+
+    def setUp(self):
+        env = {key: "" for key in ("LOOM_IMPROVEMENT_HOMES", "LOOM_STATUS_REPO", "LOOM_METRICS_GOAL",
+                                   "LOOM_BRIEF_AUTHORS", "LOOM_BACKLOG_SOURCE")}
+        patcher = unittest.mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def store(self):
+        from dashboard.github import TicketStore
+        stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = "https://api.github.com/repos/%s/issues/%d"
+
+        def ticket(number, state, **extra):
+            return dict({"number": number, "title": "Ticket %d" % number, "state": "open",
+                         "created_at": stamp, "body": "## Why\nx",
+                         "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}, **extra)
+        tickets = [
+            ticket(7, "running", parent_issue_url=url % (REPO, 40)),       # a sub-issue of epic 40
+            ticket(8, "queued", body="## Why\nx\n\nPart of #40\n"),        # names epic 40
+            ticket(9, "pr", body="## Why\nx\n\nPart of #41\n"),            # under closed epic 41
+            ticket(10, "queued", body="## Why\nx\n\nPart of #30\n"),       # straight under the goal
+        ]
+        issues = {
+            "/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx",
+                                           "labels": [{"name": "loom:goal"}]},
+            "/repos/%s/issues/40" % REPO: {"number": 40, "title": "Epic: the first chunk",
+                                           "state": "open", "body": "Done when: x\n\nPart of #30\n",
+                                           "labels": [{"name": "epic"}]},
+            "/repos/%s/issues/41" % REPO: {"number": 41, "title": "Epic: an older chunk",
+                                           "state": "closed", "body": "",
+                                           "parent_issue_url": url % (REPO, 30),
+                                           "labels": [{"name": "epic"}]},
+        }
+        gh = FakeGitHub({"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets}, issues)
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+        store.refresh()
+        return store, gh
+
+    def test_a_sub_issue_of_an_epic_records_the_epic_and_its_goal(self):
+        store, _ = self.store()
+        rows = {row["number"]: row for row in store.data[REPO]}
+        self.assertEqual((rows[7]["epic"], rows[7]["goal"]), (REPO + "#40", REPO + "#30"))
+        self.assertEqual((rows[8]["epic"], rows[8]["goal"]), (REPO + "#40", REPO + "#30"))
+        self.assertEqual((rows[9]["epic"], rows[9]["goal"]), (REPO + "#41", REPO + "#30"))
+        self.assertEqual((rows[10]["epic"], rows[10]["goal"]), (None, REPO + "#30"))
+
+    def test_goals_lists_each_epic_under_its_goal_with_its_ticket_count(self):
+        store, _ = self.store()
+        found = cards(server._goals(store))
+        self.assertEqual(len(found), 1, "an epic is not a goal card of its own")
+        card = found[0]
+        self.assertIn("Main goal", card)
+        self.assertIn("open epics 1/6", card)
+        epics = card[card.index('class="goal-epics"'):]
+        self.assertIn("Epic: the first chunk", epics)
+        self.assertIn("sample#40 / tickets 2/15 / 2 in flight", epics)
+        self.assertIn('href="/tickets?epic=%s"' % server.quote(REPO + "#40", safe=""), epics)
+        closed = epics[epics.index("goal-epics-closed"):]
+        self.assertIn("1 closed epic", closed)
+        self.assertIn("Epic: an older chunk", closed)
+        self.assertIn("4 tickets on this goal", card)
+
+    def test_the_tickets_page_filters_by_epic_and_the_header_names_epic_and_goal(self):
+        from dashboard import ticket, tickets_table
+        store, _ = self.store()
+        rows = store.data[REPO]
+        body = tickets_table.render(rows, {"epic": [REPO + "#40"]}, goal_titles={}, entered={},
+                                    now=0, ticket_href=lambda row: "/t", short_ref=server._short_ref)
+        self.assertIn("epic sample#40", body)
+        self.assertIn("Ticket 7", body)
+        self.assertIn("Ticket 8", body)
+        self.assertNotIn("Ticket 9", body)
+        self.assertNotIn("Ticket 10", body)
+        self.assertIn("Filter by epic", body)
+        record = next(row for row in rows if row["number"] == 7)
+        header = ticket._header(record, [])
+        self.assertIn(" / epic sample#40 / goal sample#30", header)

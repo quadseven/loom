@@ -49,7 +49,7 @@ from . import transcripts
 from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, _OPENER, _next_link
+from .github import GitHub, GitHubError, _OPENER, _next_link, read_ssm
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -79,7 +79,7 @@ TREE_KEEP = 3600
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
-STRONG_MODELS = frozenset(model for _, model in factory.LADDER)
+STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
 THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved'
                 ' pullRequest { number repository { nameWithOwner } }'
                 ' comments(first:1) { nodes { body author { __typename login } } } } } }')
@@ -113,6 +113,8 @@ URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
 POST_TIMEOUT = 30
+# A usage snapshot that fails once is sent again after this pause (loom#345).
+USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
@@ -131,6 +133,8 @@ MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
+# The last line of a quiet standup the station edits in place.
+QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
 # Reports come every 2 hours, so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
@@ -199,6 +203,24 @@ PUBLISHED_RE = re.compile(r"^\+\s*#\s*Published from\s+([A-Za-z0-9._-]+(?:/[A-Za
 PIN_SHIP_LOOKBACK = 7 * 24 * 3600
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
+# Adopting open pull requests no ticket links (decision 0002, item 1): each
+# pass files at most one "Land or supersede" ticket per scanned repo, oldest
+# pull request first, and marks the pull request with ADOPTED_MARKER so it is
+# never adopted twice. The ticket's body carries ADOPTS_MARKER too, so a
+# marker comment that failed to post files no second ticket. ADOPTIONS_FILE
+# keeps, per repo, the pull requests known to be adopted (so each one's
+# comments are read once), the count and refusal last logged (each logged
+# when it changes), and when a brief was last refused: the repo is tried
+# again ADOPT_RETRY seconds later, not every pass.
+ADOPTED_MARKER = "<!-- loom:adopted v1 ticket=%s#%d -->"
+ADOPTED_RE = re.compile(r"<!-- loom:adopted v1 ticket=[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+ -->")
+ADOPTS_MARKER = "<!-- loom:adopts pr=%d -->"
+ADOPT_TITLE = "Land or supersede #%d"
+ADOPT_TITLE_MAX = 200
+ADOPTIONS_FILE = "adoptions.json"
+# Issues another operator's Loom owns, each logged once (docs/LANES.md).
+OWNED_FILE = "owned.json"
+ADOPT_RETRY = 600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
@@ -382,7 +404,8 @@ class Settings:
                  health_every: int = health.EVERY,
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
-                 pin_ship_repos: Sequence[str] = ()) -> None:
+                 pin_ship_repos: Sequence[str] = (),
+                 briefers: Sequence[str] = ()) -> None:
         self.home = home
         # Deployment repos whose merged pin pull requests ship the tickets
         # of the source revision they publish (ship_pins).
@@ -398,6 +421,10 @@ class Settings:
         self.report_digest = tuple(report_digest)
         self.repos = repos
         self.authors = authors
+        # LOOM_TRUSTED_BRIEFERS: another operator's logins whose loom:ticket
+        # briefs this Loom builds (tickets.brief_author_trusted). Ownership,
+        # journals, proofs, adoption and merges read authors alone.
+        self.briefers = list(briefers)
         self.owners = owners
         self.status_repo = status_repo
         self.webhook_ssm = webhook_ssm
@@ -495,7 +522,8 @@ class Settings:
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
-                   pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"))
+                   pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
+                   briefers=words("LOOM_TRUSTED_BRIEFERS"))
 
 
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
@@ -571,18 +599,6 @@ def _muse_rules() -> Tuple[str, str]:
              % out.returncode)
         return "", ""
     return commit, brain_memory.rules_section(doc)
-
-
-def read_ssm(name: str, region: str) -> str:
-    """A SecureString parameter, read the way lanes/run_lane.sh reads keys.
-    The read is bounded by POST_TIMEOUT, so a hung call cannot stall a pass."""
-    out = subprocess.run(
-        ["aws", "ssm", "get-parameter", "--region", region, "--name", name,
-         "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
-        capture_output=True, text=True, timeout=POST_TIMEOUT)
-    if out.returncode != 0 or not out.stdout.strip():
-        raise OSError("could not read the parameter from SSM")
-    return out.stdout.strip()
 
 
 def post_webhook(url: str, payload: Dict[str, Any]) -> None:
@@ -816,11 +832,20 @@ def model_lanes(model: str) -> List[str]:
             if lane not in REMOTE_LANES and lane_takes_model(lane, model)]
 
 
+def beat_fresh(at: float, now: float, window: float = HEARTBEAT_MAX_AGE) -> bool:
+    """Whether a heartbeat stamped `at` is at most `window` seconds older than
+    the pass time `now` and at most a minute ahead of the clock. A pass reads
+    beats long after it began, so a beat written since is fresh: measured
+    against `now` alone, every lane that beat in a pass's first minutes read
+    as down and the station gave no queued ticket a lane (loom#717)."""
+    return now - at <= window and at - max(now, time.time()) <= 60
+
+
 def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     """Whether a remote lane's last heartbeat still counts as up: within its
     configured beat_max (labels.REMOTE_LANES), else HEARTBEAT_MAX_AGE."""
     window = REMOTE_LANES.get(lane, {}).get("beat_max", HEARTBEAT_MAX_AGE)
-    return at is not None and -60 <= now - at <= window
+    return at is not None and beat_fresh(at, now, window)
 
 
 def needs_public_repo(lane: str, model: str) -> bool:
@@ -877,6 +902,50 @@ def _linked_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
                             str((pr.get("head") or {}).get("ref") or "")))
 
 
+def adoption_body(pr: int) -> str:
+    """The brief for an adoption ticket. It names the pull request in words
+    and #N, never in a Refs line: the lane's own pull request carries the
+    Refs line to this ticket."""
+    return "\n".join([
+        "## Why", "",
+        "Pull request #%d is open in this repo, but no Loom ticket links it, so the station "
+        "never lands it, sends it back or reconciles it: its checks and review findings have "
+        "no owner. The station adopted it with this ticket (decision 0002, item 1)." % pr, "",
+        "## What", "",
+        "Land or supersede pull request #%d." % pr, "",
+        "- If its change is still wanted, take its diff onto this ticket's fresh `loom/` "
+        "branch, bring it up to date with the default branch, make the checks and the review "
+        "pass, and open the pull request with a `Refs` line to this ticket. Then close pull "
+        "request #%d with a comment naming the new pull request." % pr,
+        "- If its change is already on the default branch or no longer applies, close pull "
+        "request #%d as superseded with a comment giving the reason, change nothing, and give "
+        "that reason as the run's answer, so it is posted on this ticket and a brain moves the "
+        "ticket to merged with that note." % pr, "",
+        "## Acceptance criteria", "",
+        "- [ ] The change from pull request #%d reaches the default branch through a pull "
+        "request with a `Refs` line to this ticket, or it is shown to be on the default branch "
+        "already or no longer needed." % pr,
+        "- [ ] The new pull request's checks pass and every review thread on it is answered.",
+        "- [ ] Pull request #%d is closed with a comment naming the pull request that replaced "
+        "it or the reason it was superseded." % pr, "",
+        "## Size", "", "M", "",
+        "## Out of scope", "",
+        "Changes beyond what pull request #%d makes, other than what its checks and review "
+        "require." % pr, "",
+        "## Definition of done", "",
+        "Pull request #%d is closed, and its change is merged through this ticket's pull "
+        "request or recorded here as superseded." % pr, "",
+        ADOPTS_MARKER % pr, ""])
+
+
+def adoption_comment(repo: str, ticket: int) -> str:
+    """The marker the station leaves on a pull request it adopted."""
+    return ("%s\nLoom adopted this pull request: no ticket linked it, so ticket #%d now owns "
+            "it. The lane that takes the ticket lands this change on a `loom/` branch, or "
+            "closes this pull request as superseded with the reason."
+            % (ADOPTED_MARKER % (repo, ticket), ticket))
+
+
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
@@ -926,10 +995,13 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        self._parents: Dict[Tuple[str, int], Dict[str, Any]] = {}
         # This pass's closed pull requests and default branches, per repo:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._branch_cache: Dict[str, str] = {}
+        # Repos whose claim:<login> label this pass has made sure of.
+        self._claim_labels: set = set()
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -951,13 +1023,19 @@ class Station:
         data = self.gh.graphql(
             "query($owner:String!,$name:String!,$number:Int!){"
             "repository(owner:$owner,name:$name){issue(number:$number){"
-            "editor{login} lastEditedAt}}}", {"owner": owner, "name": name, "number": number})
+            "editor{__typename login} lastEditedAt}}}",
+            {"owner": owner, "name": name, "number": number})
         issue = ((data or {}).get("repository") or {}).get("issue")
         if issue is None:
             raise GitHubError("graphql returned no issue %s#%d" % (repo, number))
         editor = issue.get("editor")
         if editor and editor.get("login"):
-            return str(editor["login"])
+            login = str(editor["login"])
+            # GraphQL names a GitHub App "loom-app"; REST, and so
+            # LOOM_BRIEF_AUTHORS, name it "loom-app[bot]".
+            if editor.get("__typename") == "Bot" and not login.endswith("[bot]"):
+                login += "[bot]"
+            return login
         # Edited, but GitHub names no editor (a deleted account): nobody on
         # the list can vouch for this body.
         return "(deleted account)" if issue.get("lastEditedAt") else None
@@ -966,7 +1044,8 @@ class Station:
         number = int(issue["number"])
         events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
         editor = self._editor(repo, number)
-        return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners)
+        return tickets.trusted(issue, events, editor, self.s.authors, self.s.owners,
+                               self.s.briefers)
 
     def _poll(self, repo: str) -> List[Dict[str, Any]]:
         # A conditional read (bus/github.py keeps the last answer): an
@@ -1077,6 +1156,40 @@ class Station:
         seen[key] = {"sha": sha, "updated_at": issue.get("updated_at")}
         _write_json(path, seen)
 
+    # -- another operator's issues (docs/LANES.md, Two Looms) -------------
+    def _note_owned(self, key: str, why: str) -> None:
+        """Log once per issue and reason that another operator owns it."""
+        path = os.path.join(self.state, OWNED_FILE)
+        seen = _read_json(path, {}, strict=False)
+        seen = seen if isinstance(seen, dict) else {}
+        if seen.get(key) != why:
+            _say("leaving %s alone: %s" % (key, why))
+            seen[key] = why
+            _write_json(path, seen)
+
+    def _owned_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """True when the issue or pull request is assigned to a login outside
+        LOOM_BRIEF_AUTHORS: another operator's Loom owns it. A trusted
+        briefer's own loom:ticket is a hand-off, not theirs."""
+        owner = tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers)
+        if owner is None:
+            return False
+        self._note_owned("%s#%s" % (repo, issue.get("number")),
+                         "assigned to %s, not a LOOM_BRIEF_AUTHORS login" % owner)
+        return True
+
+    def _goal_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """True when the ticket's goal home names another operator."""
+        goal = self._goal_of(repo, issue)
+        if goal is None:
+            return False
+        home = self._parent(repo, goal)
+        if tickets.goal_ours(home, self.s.authors):
+            return False
+        self._note_owned("%s#%s" % (repo, issue.get("number")),
+                         "its goal #%d names operator %s" % (goal, tickets.goal_operator(home)))
+        return True
+
     # -- claims ---------------------------------------------------------
     def _write_brief(self, lane: str, name: str, text: str) -> str:
         os.makedirs(self.inbox(lane), exist_ok=True)
@@ -1158,9 +1271,13 @@ class Station:
         text = tickets.render_brief(repo, issue, lane, attempt, fix,
                                     checks, has_contract)
         claiming = self._write_brief(lane, name, text)
+        self._assign_operator(repo, issue)
         labels = [n for n in _label_names(issue) if n != BRIEFED]
         if RUNNING not in labels:
             labels.append(RUNNING)
+        mark = self._claim_label(repo)
+        if mark and mark not in [n.lower() for n in labels]:
+            labels.append(mark)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
@@ -1173,10 +1290,42 @@ class Station:
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
         # A claim for the goal succeeded, so the unproven-work gate no longer
         # holds it and its refusal tracking clears (loom#564).
-        goal = _ticket_goal(issue)
+        goal = self._goal_of(repo, issue)
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _assign_operator(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Assign a claimed issue to this Loom's operator login, so another
+        operator's Loom sees the claim before it acts. A refused assignment
+        is logged and the claim goes on."""
+        login = tickets.operator_login(self.s.authors)
+        if not login or login.lower() in tickets.assignees(issue):
+            return
+        number = int(issue["number"])
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/assignees" % (repo, number),
+                         {"assignees": [login]})
+        except GitHubError as err:
+            _say("could not assign %s#%d to %s: %s" % (repo, number, login, err))
+
+    def _claim_label(self, repo: str) -> Optional[str]:
+        """The claim:<operator login> label a claim adds, created in the repo
+        the first time this pass needs it; None without an operator login."""
+        login = tickets.operator_login(self.s.authors)
+        if not login:
+            return None
+        name = tickets.claim_label(login)
+        if repo not in self._claim_labels:
+            try:
+                self.gh.rest("POST", "/repos/%s/labels" % repo,
+                             {"name": name, "color": "c5def5",
+                              "description": "Claimed by this operator's Loom or sessions"})
+            except GitHubError as err:
+                if err.status != 422:  # 422: the label already exists
+                    _say("could not create label %s in %s: %s" % (name, repo, err))
+            self._claim_labels.add(repo)
+        return name
 
     def _contents_text(self, repo: str, path: str) -> Optional[str]:
         """Read a text file through GitHub contents; None means it is absent."""
@@ -1261,8 +1410,8 @@ class Station:
                           for issue in open_issues)
             if pending:
                 continue
-            brain.brief(self.gh, repo, int(goal["number"]), title, body,
-                        difficulty="medium")
+            brain.brief_intake(self.gh, repo, int(goal["number"]), title, body,
+                               difficulty="medium")
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -1339,7 +1488,7 @@ class Station:
         at = beat.get("at")
         if isinstance(at, bool) or not isinstance(at, (int, float)):
             return False
-        return -60 <= self.now - at <= HEARTBEAT_MAX_AGE
+        return beat_fresh(at, self.now)
 
     def _remote_heartbeat(self, lane: str) -> Optional[float]:
         """Latest heartbeat posted by a remote worker on the lane status issue."""
@@ -1392,8 +1541,7 @@ class Station:
             at = beat.get("at")
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 continue
-            if (-60 <= self.now - at <= HEARTBEAT_MAX_AGE
-                    and str(beat.get("reason") or "").startswith(LIMIT)):
+            if beat_fresh(at, self.now) and str(beat.get("reason") or "").startswith(LIMIT):
                 out.append(lane)
         return out
 
@@ -1533,6 +1681,42 @@ class Station:
         used.add(target)
         _say("released runaway %s#%d from dead lane %s to lane %s" % (repo, number, lane, target))
 
+    def _parent(self, repo: str, number: int) -> Dict[str, Any]:
+        """An issue a ticket names as its parent, read once a pass; empty
+        when it cannot be read."""
+        key = (repo, number)
+        if key not in self._parents:
+            try:
+                data = self.gh.rest("GET", "/repos/%s/issues/%d" % key).data
+            except GitHubError:
+                data = None
+            self._parents[key] = data if isinstance(data, dict) else {}
+        return self._parents[key]
+
+    def _goal_of(self, repo: str, issue: Dict[str, Any]) -> Optional[int]:
+        """The goal a ticket belongs to (decision 0003: a goal holds epics, an
+        epic holds tickets). The issue the ticket names counts when it is an
+        open loom:goal; when it is an epic, the goal that epic names counts.
+        Anything else is no goal, never the parent's own number: a ticket
+        under an epic once handed the epic to the unproven-work check, which
+        raised and ended the pass."""
+        parent = _ticket_goal(issue)
+        if parent is None:
+            return None
+        data = self._parent(repo, parent)
+        names = _label_names(data)
+        if data.get("state") == "open" and "loom:goal" in names:
+            return parent
+        if "epic" not in [name.lower() for name in names]:
+            return None
+        goal = _ticket_goal(data)
+        if goal is None or goal == parent:
+            return None
+        home = self._parent(repo, goal)
+        if home.get("state") == "open" and "loom:goal" in _label_names(home):
+            return goal
+        return None
+
     def _unproven_gate(self, repo: str, issue: Dict[str, Any], limit: int,
                        counts: Dict[Tuple[str, int], int]) -> Optional[str]:
         """Why the station must not claim this build ticket, or None when the
@@ -1541,12 +1725,17 @@ class Station:
         names = set(_label_names(issue))
         if names & {REGRESSION, factory.REVERT_LABEL, URGENT}:
             return None
-        goal = _ticket_goal(issue)
+        goal = self._goal_of(repo, issue)
         if goal is None:
             return None
         key = (repo, goal)
         if key not in counts:
-            counts[key] = brain.goal_unproven(self.gh, repo, goal)
+            try:
+                counts[key] = brain.goal_unproven(self.gh, repo, goal)
+            except ValueError as err:
+                # One ticket with a bad goal is skipped this pass; it must
+                # never end the pass for every other ticket.
+                return "its goal #%d cannot be read: %s" % (goal, err)
         held = counts[key]
         if held <= limit:
             return None
@@ -1579,8 +1768,8 @@ class Station:
                          counts: Dict[Tuple[str, int], int]) -> None:
         """Remember the unproven-work gate's refusal of one briefed ticket,
         per goal, so an hour of refusals becomes an invariant (loom#564)."""
-        goal = _ticket_goal(issue)
-        if goal is None:
+        goal = self._goal_of(repo, issue)
+        if goal is None or (repo, goal) not in counts:
             return
         key = "%s#%d" % (repo, goal)
         hold = self._gate_holds.setdefault(
@@ -1643,11 +1832,11 @@ class Station:
 
     # -- verify runs ------------------------------------------------------
     def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open tickets filed by a trusted author."""
-        allowed = {a.lower() for a in self.s.authors}
+        """The repo's open tickets filed by a briefing login."""
         found = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-                and tickets._login(i.get("user")) in allowed]
+                and tickets.brief_author_trusted(i, self.s.authors, self.s.briefers)
+                and not self._owned_elsewhere(repo, i)]
 
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]]) -> set:
         """The lanes a queued ticket of the repo may be given: its model's
@@ -1946,6 +2135,8 @@ class Station:
                     free: List[str]) -> bool:
         if RUNAWAY in _label_names(issue):
             return False
+        if self._owned_elsewhere(repo, issue):
+            return False
         if self._skip_known(repo, issue):
             return False
         try:
@@ -1961,6 +2152,8 @@ class Station:
         if not ok:
             self._refuse(repo, issue, reason)
             return False
+        if self._goal_elsewhere(repo, issue):
+            return False
         waiting, released = tickets.after_holds(repo, headers, self._dependency)
         if released and not waiting:
             self._release_hold(repo, issue, released)
@@ -1972,6 +2165,8 @@ class Station:
         labelled_lane = _lane_of(issue)
         if not self._still_ours(fresh, labelled_lane or lane):
             _say("%s#%s changed before the claim; leaving it" % (repo, issue["number"]))
+            return False
+        if self._owned_elsewhere(repo, fresh):
             return False
         if (fresh.get("body") or "") != (issue.get("body") or "") \
                 or fresh.get("updated_at") != issue.get("updated_at"):
@@ -2068,6 +2263,10 @@ class Station:
         target = self._terminal_label(pr)
         if target is None or target in labels:
             return
+        if target == "loom:merged" and "loom:regression" in labels:
+            events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+            if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
+                return
         state_names = ("queued", "briefed", "running", "pr", "failed", "merged",
                        "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
@@ -2084,15 +2283,21 @@ class Station:
         # recently updated closed ones, so one page of them is read, never the
         # repo's whole PR history. A merged one delivers the ticket even while
         # a second PR for it is still open (a duplicate lane run would
-        # otherwise keep taking fix rounds on work already on main); a closed
-        # unmerged one only counts for a ticket with no open PR left.
+        # otherwise keep taking fix rounds on work already on main). A merge
+        # before a regression re-queue cannot deliver its newer attempt. A
+        # closed unmerged PR only counts with no open PR left.
         open_prs = [p for p in self._open_pulls(repo)
                     if isinstance(p, dict) and p.get("state", "open") == "open"]
         trusted_authors = {name.lower() for name in self.s.authors}
         for pr in open_prs:
             author = tickets._login(pr.get("user"))
             head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
-            if author not in trusted_authors or head_repo != repo:
+            if head_repo != repo:
+                continue
+            if author not in trusted_authors:
+                # A second contributor's pull request links only the
+                # trusted ticket that contributor owns (loom#688).
+                self._link_contributor_pr(repo, pr, author, tickets_by_number)
                 continue
             number = self._pr_ticket_number(repo, pr)
             if number is None:
@@ -2134,6 +2339,46 @@ class Station:
                 pool = tickets_by_number if self._terminal_label(pr) == "loom:merged" else waiting
                 self._reconcile_pr_ticket(repo, pr, pool)
 
+    def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
+                            author: str) -> Optional[Dict[str, Any]]:
+        """The open loom:ticket a pull request names when its author owns it
+        (assigned, or labelled claim:<author>) and a trusted login filed it;
+        None otherwise. The ticket is read only for such a pull request."""
+        if not author or author in {a.lower() for a in self.s.authors}:
+            return None
+        number = self._pr_ticket_number(repo, pr)
+        if number is None:
+            return None
+        try:
+            ticket = self._issue(repo, number)
+        except GitHubError as err:
+            if err.status in (404, 410):
+                return None
+            raise
+        owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+        if ("pull_request" in ticket or ticket.get("state") != "open"
+                or "loom:ticket" not in _label_names(ticket) or author not in owners
+                or tickets._login(ticket.get("user")) not in {a.lower() for a in self.s.authors}
+                or not _linked_pr(ticket, repo, pr)):
+            return None
+        return ticket
+
+    def _link_contributor_pr(self, repo: str, pr: Dict[str, Any], author: str,
+                             found: Dict[int, Dict[str, Any]]) -> None:
+        """An open pull request by the contributor who owns its ticket moves
+        a queued ticket to loom:pr; it is never briefed or claimed. From
+        loom:pr, the closed pull request pass moves it to loom:merged when it
+        merges, as for a lane's pull request, and shipping follows."""
+        ticket = self._contributor_ticket(repo, pr, author)
+        if ticket is None or "loom:queued" not in _label_names(ticket):
+            return
+        number = int(ticket["number"])
+        kept = [n for n in _label_names(ticket) if n != "loom:queued"] + ["loom:pr"]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        ticket["labels"] = [{"name": n} for n in kept]
+        found[number] = ticket
+        self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
+
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
 
@@ -2145,6 +2390,151 @@ class Station:
                 self._reconcile_repo(repo)
             except (GitHubError, OSError) as err:
                 _say("could not reconcile pull requests for %s: %s" % (repo, err))
+
+    # -- adopting pull requests no ticket links ----------------------------
+    def adopt_untracked_pulls(self) -> None:
+        """File an adoption ticket for the oldest open pull request in each
+        scanned repo that no open ticket links, at most one per repo a pass
+        (decision 0002, item 1). The station never closes the pull request:
+        the lane that takes the ticket does. A GitHub failure on one repo is
+        logged and the pass moves on."""
+        path = os.path.join(self.state, ADOPTIONS_FILE)
+        ledger = _read_json(path, {}, strict=False)
+        if not isinstance(ledger, dict):
+            ledger = {}
+        for repo in self.scan_repos():
+            rec = ledger.get(repo)
+            rec = rec if isinstance(rec, dict) else {}
+            try:
+                self._adopt_repo(repo, rec)
+            except (GitHubError, OSError) as err:
+                _say("could not adopt pull requests for %s: %s" % (repo, err))
+            ledger[repo] = rec
+        _write_json(path, {r: v for r, v in ledger.items() if r in self.s.repos})
+
+    def _adopt_repo(self, repo: str, rec: Dict[str, Any]) -> None:
+        pulls = self._adoptable_pulls(repo)
+        # The open tickets are read only when a pull request may need one.
+        open_tickets: List[Dict[str, Any]] = []
+        if pulls:
+            issues = self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open"
+                                      "&per_page=100" % repo)
+            open_tickets = [i for i in issues if isinstance(i, dict) and "pull_request" not in i
+                            and "loom:ticket" in _label_names(i)]
+        pulls = [pr for pr in pulls if not any(_linked_pr(t, repo, pr) for t in open_tickets)]
+        # The pull requests known to be adopted: remembered from an earlier
+        # pass, or named by an open ticket's ADOPTS_MARKER. Only those still
+        # open and untracked are kept.
+        numbers = [int(pr["number"]) for pr in pulls]
+        known = {n for n in rec.get("adopted") or [] if isinstance(n, int) and n in numbers}
+        known |= {n for n in numbers
+                  if any(ADOPTS_MARKER % n in str(t.get("body") or "") for t in open_tickets)}
+        rec["adopted"] = sorted(known)
+        if not self._adoption_backing_off(rec):
+            self._adopt_one(repo, rec, [pr for pr in pulls if int(pr["number"]) not in known])
+        count = [len(pulls), len(rec["adopted"])]
+        if rec.get("count") != count:
+            _say("adoption %s: %d open pull requests no ticket links, %d of them adopted"
+                 % (repo, count[0], count[1]))
+            rec["count"] = count
+
+    def _adoption_backing_off(self, rec: Dict[str, Any]) -> bool:
+        """The repo's last brief was refused less than ADOPT_RETRY ago: no
+        comments are read and nothing is briefed until then."""
+        at = rec.get("refused_at")
+        return (bool(rec.get("refused")) and self._num(at)
+                and 0 <= self.now - at < ADOPT_RETRY)
+
+    def _adopt_one(self, repo: str, rec: Dict[str, Any], waiting: List[Dict[str, Any]]) -> None:
+        """Adopt the oldest waiting pull request that carries no adopted
+        marker. Comments are read oldest first and only until that one is
+        found; a marked pull request is remembered, so its comments are read
+        once."""
+        pr = None
+        for candidate in waiting:
+            if not self._marked_adopted(repo, int(candidate["number"])):
+                pr = candidate
+                break
+            rec["adopted"] = sorted(set(rec["adopted"]) | {int(candidate["number"])})
+        if pr is None:
+            rec.pop("refused", None)
+            rec.pop("refused_at", None)
+            return
+        number = int(pr["number"])
+        goal = self._adoption_goal(repo)
+        if goal is None:
+            self._adoption_refused(repo, rec, "no goal home to file adoption tickets on")
+            return
+        try:
+            url = brain.brief_intake(self.gh, repo, goal, self._adoption_title(repo, pr),
+                              adoption_body(number), difficulty="medium")
+        except ValueError as err:
+            # The goal is at its cap or holds too much unproven work: tried
+            # again after ADOPT_RETRY.
+            self._adoption_refused(repo, rec, "#%d: %s" % (number, err))
+            return
+        rec.pop("refused", None)
+        rec.pop("refused_at", None)
+        rec["adopted"] = sorted(set(rec["adopted"]) | {number})
+        ticket = url.rstrip("/").rpartition("/")[2]
+        if not ticket.isdigit():
+            # The ticket's ADOPTS_MARKER still keeps the next pass from
+            # filing a second one.
+            _say("adopted %s#%d, but GitHub named no ticket number to mark it with" % (repo, number))
+            return
+        self._comment(repo, number, adoption_comment(repo, int(ticket)))
+        _say("adopted %s#%d as ticket %s#%s" % (repo, number, repo, ticket))
+
+    def _adoptable_pulls(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open pull requests that are not drafts and come from a
+        trusted author on a branch of the repo itself, oldest first. Whether
+        an open ticket links one (a Refs line or a loom/N branch) is checked
+        by the caller."""
+        authors = {a.lower() for a in self.s.authors}
+        found = [pr for pr in self._open_pulls(repo)
+                 if isinstance(pr, dict) and pr.get("state", "open") == "open"
+                 and not pr.get("draft") and tickets._login(pr.get("user")) in authors
+                 and brain._same_repo(repo, pr, {}) and not self._owned_elsewhere(repo, pr)]
+        return sorted(found, key=lambda pr: (str(pr.get("created_at") or ""),
+                                             int(pr.get("number") or 0)))
+
+    def _marked_adopted(self, repo: str, number: int) -> bool:
+        """A trusted author marked the pull request adopted."""
+        authors = {a.lower() for a in self.s.authors}
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        return any(isinstance(c, dict) and tickets._login(c.get("user")) in authors
+                   and ADOPTED_RE.search(str(c.get("body") or "")) for c in comments)
+
+    def _adoption_goal(self, repo: str) -> Optional[int]:
+        """The goal home the repo's adoption tickets are filed under: its
+        oldest open goal home that is not a backlog, else its backlog home;
+        None when the repo has none."""
+        homes = sorted((str(i.get("title") or "").startswith("Backlog:"), int(i["number"]))
+                       for r, i in self._goal_homes() if r == repo)
+        return homes[0][1] if homes else None
+
+    @staticmethod
+    def _adoption_title(repo: str, pr: Dict[str, Any]) -> str:
+        """"Land or supersede #N: <title>", or without the title when it is
+        text a brief refuses (a closing keyword, another repo's issue)."""
+        bare = ADOPT_TITLE % int(pr["number"])
+        title = " ".join(str(pr.get("title") or "").split())
+        if not title:
+            return bare
+        full = "%s: %s" % (bare, _clip(title, ADOPT_TITLE_MAX))
+        try:
+            _text.check(full)
+        except ValueError:
+            return bare
+        if any(m.group(1).lower() != repo.lower() for m in brain._REPO_REF.finditer(full)):
+            return bare
+        return full
+
+    def _adoption_refused(self, repo: str, rec: Dict[str, Any], why: str) -> None:
+        if rec.get("refused") != why:
+            _say("adoption %s: could not file an adoption ticket: %s" % (repo, why))
+        rec["refused"] = why
+        rec["refused_at"] = self.now
 
     # -- hand-made reverts -----------------------------------------------
     def _closed_pulls(self, repo: str) -> List[Dict[str, Any]]:
@@ -2896,7 +3286,7 @@ class Station:
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
         self._comment(repo, number, factory.runaway_comment(
-            trigger, attempts, factory.issue_model(issue)))
+            trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments)))
         return True
 
     def _retry(self, repo: str, number: int, lane: str, klass: str, reason: str) -> str:
@@ -3481,10 +3871,17 @@ class Station:
         # _goal_issues keeps only objects with numeric issue numbers; a read
         # failure reaches _send_digest as GitHubError before any page is posted.
         goals = {int(g["number"]): g for g in self._goal_issues(repo)}
+        epic_goals: Optional[Dict[int, int]] = None
         groups: Dict[Optional[int], List[Dict[str, Any]]] = {}
         for issue in issues:
             refs = [int(n) for n in ASK_GOAL_REF_RE.findall(str(issue.get("body") or ""))]
             goal = next((n for n in refs if n in goals), None)
+            if goal is None and refs:
+                # An ask may name an epic: it goes under that epic's goal.
+                if epic_goals is None:
+                    epic_goals = self._epic_goals(repo)
+                goal = next((epic_goals[n] for n in refs
+                             if epic_goals.get(n) in goals), None)
             groups.setdefault(goal, []).append(issue)
         out = [DIGEST_MARKER, "Asks waiting for the operator on %s: %d in this repo."
                % (today, len(issues))]
@@ -3498,6 +3895,18 @@ class Station:
                                   " ".join(str(i.get("title") or "").split()).replace("@", "@\u200b"))
                     for i in groups[goal]]
         return "\n".join(out)
+
+    def _epic_goals(self, repo: str) -> Dict[int, int]:
+        """epic number -> the goal its Part of line or sub-issue parent names,
+        for the repo's epics (one conditional list read)."""
+        found: Dict[int, int] = {}
+        for item in self.gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
+            if isinstance(item, dict) and "pull_request" not in item \
+                    and str(item.get("number") or "").isdigit():
+                goal = brain._issue_goal(item)
+                if goal is not None:
+                    found[int(item["number"])] = goal
+        return found
 
     @staticmethod
     def _digest_head(plan: Dict[str, Any]) -> str:
@@ -3641,9 +4050,18 @@ class Station:
     def _goal_issues(self, repo: str) -> List[Dict[str, Any]]:
         data = self.gh.paginate(
             "/repos/%s/issues?labels=loom:goal&state=open&per_page=100" % repo)
-        return [i for i in (data if isinstance(data, list) else [])
-                if isinstance(i, dict) and "pull_request" not in i
-                and str(i.get("number")).isdigit()]
+        found = [i for i in (data if isinstance(data, list) else [])
+                 if isinstance(i, dict) and "pull_request" not in i
+                 and str(i.get("number")).isdigit()]
+        # A goal home that names another operator is that operator's Loom's.
+        ours = []
+        for issue in found:
+            if tickets.goal_ours(issue, self.s.authors):
+                ours.append(issue)
+            else:
+                self._note_owned("%s#%s" % (repo, issue["number"]),
+                                 "goal home names operator %s" % tickets.goal_operator(issue))
+        return ours
 
     @staticmethod
     def _report_id(comment: Dict[str, Any]) -> int:
@@ -4295,17 +4713,24 @@ class Station:
                         "idle": info.get("idle", 0) if self._num(info.get("idle")) else 0}
         return out
 
-    def _unassociated(self, repo: str, goal: Dict[str, Any]) -> int:
-        """Tickets naming the goal without a sub-issue link or its Part of line. Read (one
-        search) only for a goal holding SUB_ISSUES_MAX or more sub-issues, where
-        a refused sub-issue link leaves the Part of line as the only one."""
-        total = int((goal.get("sub_issues_summary") or {}).get("total") or 0)
-        if total < invariants.SUB_ISSUES_MAX:
-            return 0
-        return len(brain.unassociated_tickets(self.gh, repo, int(goal["number"])))
+    def _goal_shape(self, repo: str, goal: Dict[str, Any]) -> invariants.GoalShape:
+        """The goal home's epics and the open tickets under none, from one
+        walk (brain.goal_tree)."""
+        number = int(goal["number"])
+        loose, tree = brain.goal_tree(self.gh, repo, number)
+        ref = lambda issue: self._invariant_ref(repo, int(issue["number"]))  # noqa: E731
+        outside = tuple(ref(i) for i in loose if i.get("state") == "open"
+                        and "loom:ticket" in _label_names(i))
+        epics = tuple(invariants.EpicShape(
+            ref(epic), epic.get("state", "open") == "open", len(found),
+            tuple(ref(t) for t in found if t.get("state") != "closed"),
+            brain.standing_epic(epic))
+            for epic, found in tree)
+        return invariants.GoalShape(self._invariant_ref(repo, number),
+                                    brain.goal_epic_cap(goal), epics, outside)
 
     def _invariant_goal_facts(self, facts: invariants.Facts) -> None:
-        """Goal homes with their unlinked tickets, and their journals and
+        """Goal homes with their epics and open tickets under none, and their journals and
         marker posts; a source that cannot be read stays None."""
         try:
             homes = self._goal_homes()
@@ -4313,8 +4738,7 @@ class Station:
             _say("invariants: could not read the goal homes: %s" % err)
             return
         try:
-            facts.goals = [(self._invariant_ref(repo, int(g["number"])), self._unassociated(repo, g))
-                           for repo, g in homes]
+            facts.shapes = [self._goal_shape(repo, g) for repo, g in homes]
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal tickets: %s" % err)
         try:
@@ -4359,6 +4783,10 @@ class Station:
             facts.checks = self._invariant_checks()
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the plan checks: %s" % err)
+        try:
+            facts.lane_pulls = self._invariant_lane_pulls()
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read the lane pull requests: %s" % err)
         return facts
 
     def _invariant_runs(self) -> List[invariants.Run]:
@@ -4411,7 +4839,6 @@ class Station:
 
     def _invariant_queued(self) -> List[Tuple[invariants.Ref, Tuple[str, ...]]]:
         """Each trusted queued ticket and the lanes of its difficulty tier."""
-        authors = {a.lower() for a in self.s.authors}
         out = []
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
@@ -4419,7 +4846,8 @@ class Station:
             for issue in self.gh.paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo):
                 if (not isinstance(issue, dict) or "pull_request" in issue
                         or "loom:queued" not in _label_names(issue)
-                        or tickets._login(issue.get("user")).lower() not in authors):
+                        or not tickets.brief_author_trusted(issue, self.s.authors,
+                                                            self.s.briefers)):
                     continue
                 ref = self._invariant_ref(repo, int(issue["number"]))
                 if repo not in self._publics:
@@ -4464,6 +4892,86 @@ class Station:
             self.s.plan_check, str(run.get("conclusion") or ""),
             self._epoch(str(run["completed_at"])) or 0.0,
             str((run.get("output") or {}).get("title") or ""))
+
+    def _invariant_lane_pulls(self) -> List[invariants.LanePull]:
+        """The open lane pull requests the stalled invariant reads: trusted, on
+        a loom/ branch and opened over invariants.PR_STALLED ago (loom#715).
+        A pull request that cannot be read is logged and skipped, so one
+        unreadable repo or ticket costs that pull request and no other."""
+        authors = {a.lower() for a in self.s.authors}
+        out: List[invariants.LanePull] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                pulls = self._open_pulls(repo)
+            except GitHubError as err:
+                _say("invariants: could not read the open pull requests of %s: %s" % (repo, err))
+                continue
+            for pr in pulls:
+                at = self._stalled_since(pr, authors)
+                if at is None:
+                    continue
+                try:
+                    out.append(self._lane_pull(repo, pr, at))
+                except GitHubError as err:
+                    _say("invariants: left out pull request %s#%s, unreadable: %s"
+                         % (repo, pr.get("number"), err))
+        return out
+
+    def _stalled_since(self, pr: Dict[str, Any], authors: set) -> Optional[float]:
+        """When this pull request opened, or None when it is not one the
+        stalled invariant reads."""
+        if not self._trusted_lane_pull(pr, authors):
+            return None
+        at = self._epoch(str(pr.get("created_at") or ""))
+        return at if at is not None and self.now - at > invariants.PR_STALLED else None
+
+    def _lane_pull(self, repo: str, pr: Dict[str, Any], at: float) -> invariants.LanePull:
+        """One open lane pull request as the stalled invariant reads it: the
+        issue that carries it and its labels, the open threads the review bot
+        left on it, and whether a fix round is queued on its ticket."""
+        number = int(pr["number"])
+        issue = self._pr_ticket(repo, pr)
+        names = set(_label_names(pr))
+        if issue is not None:
+            names |= set(_label_names(issue))
+        drives = bool(issue is not None and issue.get("state") == "open"
+                      and "loom:ticket" in _label_names(issue))
+        threads = len(self._bot_threads(repo, number)) if drives else 0
+        return invariants.LanePull(
+            self._invariant_ref(repo, number, "pull request"), at,
+            self._invariant_ref(repo, int(issue["number"])) if issue is not None else None,
+            tuple(sorted(names)), drives, threads,
+            self._fix_queued(repo, issue, pr, threads))
+
+    def _pr_ticket(self, repo: str, pr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The issue that carries this pull request (the Refs line of its body
+        or the number in its branch), or None when it names none or names two.
+        A ticket GitHub cannot read raises, so a transient failure skips this
+        pull request instead of reporting it as a pull request no ticket
+        carries."""
+        try:
+            association = brain._ticket_association(repo, pr)
+        except ValueError as err:
+            _say("invariants: %s#%d names no one ticket: %s" % (repo, pr["number"], err))
+            return None
+        if association is None:
+            return None
+        data = self.gh.rest("GET", "/repos/%s/issues/%d" % association).data
+        return data if isinstance(data, dict) else None
+
+    def _fix_queued(self, repo: str, issue: Optional[Dict[str, Any]], pr: Dict[str, Any],
+                    threads: int) -> bool:
+        """Whether a fix round is queued on this ticket for the pull request's
+        head: hand-back's own rule. The ticket's comments are read only when
+        open threads are what a fix round would answer."""
+        if issue is None or not threads:
+            return False
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                    % (repo, int(issue["number"])))
+        return self._fix_pending(_label_names(issue), comments,
+                                 str((pr.get("head") or {}).get("sha") or ""))
 
     # -- transcript uploads ---------------------------------------------
     def _transcript_runs(self) -> List[Run]:
@@ -4751,16 +5259,40 @@ class Station:
                or (last is not None and self.now - last >= brain.REPORT_EVERY - STANDUP_LEAD))
         if not due:
             return
-        children = brain.goal_children(self.gh, repo, number)
+        loose, tree = brain.goal_tree(self.gh, repo, number)
+        children = brain._flatten(loose, tree)
         breaches = (self._open_breaches(repo, number)
                     if (repo, number) == self._invariant_goal() else None)
+        hold = self._gate_hold_for(repo, number)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
-                                          breaches,
-                                          gate_hold=self._gate_hold_for(repo, number))
+                                          breaches, gate_hold=hold,
+                                          finished=brain.finished_epics(tree))
         brain._check_written_text(body)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": body})
+        quiet = hold is None and body == self._overdue_standup_body(
+            [], None, None if breaches is None else [])
+        previous = self._last_quiet_report(comments, authors, body) if quiet else None
+        if previous is not None:
+            # Every new comment emails the goal's author; a quiet goal edits
+            # its last quiet report instead, which notifies no one.
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, previous),
+                         {"body": body + "\n" + QUIET_STAMP % now.strftime("%Y-%m-%dT%H:%MZ")})
+        else:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                         {"body": body})
         state[key] = self.now
+
+    @staticmethod
+    def _last_quiet_report(comments: List[Any], authors: List[str], quiet: str) -> Optional[int]:
+        """The id of the goal's latest report by `authors` when it is this same
+        quiet report (its stamp line aside), else None."""
+        reports = [c for c in comments if isinstance(c, dict)
+                   and tickets._login(c.get("user")).lower() in authors
+                   and str(c.get("body") or "").startswith(REPORT_MARKER)]
+        if not reports or not isinstance(reports[-1].get("id"), int):
+            return None
+        lines = str(reports[-1].get("body") or "").splitlines()
+        kept = [line for line in lines if not line.startswith(QUIET_STAMP.split("%")[0])]
+        return reports[-1]["id"] if "\n".join(kept) == quiet else None
 
     def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
         """The open loom:invariant issues filed on the goal home."""
@@ -4786,7 +5318,8 @@ class Station:
 
     def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
                               breaches: Optional[List[Dict[str, Any]]] = None,
-                              gate_hold: Optional[Dict[str, Any]] = None) -> str:
+                              gate_hold: Optional[Dict[str, Any]] = None,
+                              finished: Optional[List[Dict[str, Any]]] = None) -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
         counts = [(len(groups[k]), word) for k, word in (
@@ -4811,7 +5344,10 @@ class Station:
             + ["",
             "### Still stuck", stuck, "",
             "### Next", "In flight: %s." % rows(groups["in_flight"]),
-            "Needs difficulty: %s." % rows(groups["needs_difficulty"]), "",
+            "Needs difficulty: %s." % rows(groups["needs_difficulty"])]
+            + (["Epics with every ticket closed (check the done-when, then close): %s."
+                % rows(finished)] if finished else [])
+            + ["",
             "### Needs you", "Open asks: %s." % rows(groups["asks"]), "",
             "Written by the station from ticket data, because no brain reported in time."])
 
@@ -5228,6 +5764,7 @@ class Station:
     def _factory(self) -> factory.Factory:
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
+                               briefers=self.s.briefers,
                                review_check=self.s.review_check,
                                review_bot=self.s.review_bot,
                                limited=self.limited_lanes(),
@@ -5623,7 +6160,8 @@ class Station:
         rates = self._rates()
         if "core" in rates:
             remaining, limit, reset = rates["core"]
-            line += "; budget %d of %d left, resets %s" % (remaining, limit, self._utc(reset))
+            line += "; %sbudget %d of %d left, resets %s" % (
+                "GitHub App " if gh.auth == "app" else "", remaining, limit, self._utc(reset))
         _say(line)
         state = self._budget_state()
         state["rates"] = {r: list(v) for r, v in rates.items()}
@@ -5669,7 +6207,8 @@ class Station:
         except OSError as err:
             _say("could not record the repo scans: %s" % err)
         # Below the budget floor these wait for the reset; trees are local.
-        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.unwind_reverts, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
+        for step in (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.unwind_reverts,
+                     self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake,
                      self.post_metrics,
@@ -5707,12 +6246,23 @@ class Station:
         token = self._transcript_token()
         if token is None:
             return
-        try:
-            self.upload(url, token, records)
-        except UploadRefused as err:
-            _say("the dashboard refused the usage snapshot (%d)" % err.status)
-        except Exception as err:  # noqa: BLE001
-            _say("usage snapshot upload failed (%s)" % type(err).__name__)
+        for attempt in (1, 2):
+            try:
+                self.upload(url, token, records)
+                return
+            except UploadRefused as err:
+                _say("the dashboard refused the usage snapshot (%d)" % err.status)
+                return
+            except Exception as err:  # noqa: BLE001
+                if attempt == 1:
+                    # A dashboard rollout or a slow first snapshot drops one
+                    # upload; the second try usually lands (loom#345).
+                    time.sleep(USAGE_RETRY_PAUSE)
+                    continue
+                # post_transcript's messages carry neither URL nor token; the
+                # token is redacted anyway in case another uploader names it.
+                _say("usage snapshot upload failed twice: %s: %s"
+                     % (type(err).__name__, str(err).replace(token, "[token]")))
 
 
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
@@ -5736,8 +6286,8 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
         if gh is None:
-            from .github import token_from_env
-            gh = GitHub(token_from_env())
+            from .github import auth_from_env
+            gh = GitHub(auth_from_env())
         if gh.cache_dir is None:
             # Every GET is conditional: a list re-read each pass costs a 304.
             gh.cache_dir = os.path.join(state, "station", "etags")

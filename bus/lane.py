@@ -1,6 +1,7 @@
 """GitHub-pulled work for remote lanes."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import change_class, hunt_plan, pr_repair, tickets
-from .github import GitHub, GitHubError, token_from_env
+from .github import GitHub, GitHubError, auth_from_env
 from .labels import REMOTE_LANES
 
 CLAIM_RE = re.compile(r"^<!-- loom:remote-claim v1 ([^ ]+) ([0-9]+) ([0-9.]+) -->$")
@@ -234,6 +235,102 @@ def _git(*args: str) -> str:
     return result.stdout.strip()
 
 
+def _git_bytes(*args: str) -> bytes:
+    result = subprocess.run(["git", *args], capture_output=True, check=False)
+    if result.returncode:
+        raise OSError("git %s failed" % (args[0],))
+    return result.stdout
+
+
+def _push_commit(gh: GitHub, repo: str, local_sha: str, local_parent: str,
+                 api_parent: str) -> str:
+    """Recreate one local commit through the git-database API. Returns the new
+    remote commit SHA. Blob and tree SHAs are content-addressed, so re-running
+    recreates identical objects."""
+    tree_updates = []
+    for line in _git("diff", "--name-status", local_parent, local_sha).splitlines():
+        status, _, path = line.partition("\t")
+        if status.startswith("D"):
+            tree_updates.append({"path": path, "mode": "100644",
+                                 "type": "blob", "sha": None})
+            continue
+        blob_sha = _git("rev-parse", local_sha + ":" + path)
+        content = _git_bytes("cat-file", "blob", blob_sha)
+        made = gh.rest("POST", "/repos/%s/git/blobs" % repo, {
+            "content": base64.b64encode(content).decode("ascii"),
+            "encoding": "base64"}).data or {}
+        if made.get("sha") != blob_sha:
+            raise GitHubError("blob SHA mismatch for %s" % path)
+        mode = _git("ls-tree", local_sha, path).split()[0]
+        tree_updates.append({"path": path, "mode": mode,
+                             "type": "blob", "sha": blob_sha})
+    base_tree = _git("rev-parse", local_parent + "^{tree}")
+    new_tree = (gh.rest("POST", "/repos/%s/git/trees" % repo, {
+        "base_tree": base_tree, "tree": tree_updates}).data or {}).get("sha")
+    if new_tree != _git("rev-parse", local_sha + "^{tree}"):
+        raise GitHubError("tree SHA mismatch for commit %s" % local_sha[:12])
+    author = {
+        "name": _git("log", "-1", "--format=%an", local_sha),
+        "email": _git("log", "-1", "--format=%ae", local_sha),
+        "date": _git("log", "-1", "--format=%aI", local_sha),
+    }
+    commit = (gh.rest("POST", "/repos/%s/git/commits" % repo, {
+        "message": _git("log", "-1", "--format=%B", local_sha),
+        "tree": new_tree, "parents": [api_parent],
+        "author": author, "committer": author}).data or {})
+    if not commit.get("sha"):
+        raise GitHubError("GitHub did not return the created commit")
+    return str(commit["sha"])
+
+
+def push_branch(gh: GitHub, repo: str, number: int) -> str:
+    """Push the current branch through the git-database API and return the
+    remote HEAD SHA. The lane has no git HTTPS credential, so `git push`
+    cannot work; the API accepts the same token the GitHub client carries.
+    The current branch must be the ticket's branch. Idempotent: pushing an
+    up-to-date branch changes nothing."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    branch = tickets.branch_for(number, str(issue.get("title") or ""))
+    current = _git("branch", "--show-current")
+    if current != branch:
+        raise ValueError("current branch %r does not match the ticket branch %r"
+                         % (current, branch))
+    local_head = _git("rev-parse", "HEAD")
+    try:
+        ref = gh.rest("GET", "/repos/%s/git/refs/heads/%s"
+                      % (repo, quote(branch, safe=""))).data or {}
+        remote_head = str(((ref.get("object") or {}).get("sha")) or "")
+    except GitHubError as err:
+        if err.status != 404:
+            raise
+        remote_head = ""
+    if remote_head == local_head:
+        return local_head
+    if remote_head:
+        base, exists = remote_head, True
+    else:
+        info = gh.rest("GET", "/repos/%s" % repo).data or {}
+        default = str(info.get("default_branch") or "main")
+        base, exists = _git("merge-base", "HEAD", "origin/" + default), False
+    commits = _git("rev-list", "--reverse", base + "..HEAD").splitlines()
+    api_parent, local_parent = base, base
+    for sha in commits:
+        api_parent = _push_commit(gh, repo, sha, local_parent, api_parent)
+        local_parent = sha
+    ref_path = "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe=""))
+    if exists:
+        gh.rest("PATCH", ref_path, {"sha": api_parent, "force": False})
+    else:
+        try:
+            gh.rest("POST", "/repos/%s/git/refs" % repo,
+                    {"ref": "refs/heads/" + branch, "sha": api_parent})
+        except GitHubError as err:
+            if err.status != 422:
+                raise
+            gh.rest("PATCH", ref_path, {"sha": api_parent, "force": False})
+    return api_parent
+
+
 def _what(body: str) -> str:
     match = re.search(r"^## What\s*\n(.*?)(?=^## |\Z)", body, re.M | re.S)
     return match.group(1).strip() if match else ""
@@ -307,13 +404,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("ticket", help="OWNER/NAME#N")
     p.add_argument("--base", required=True)
     p.add_argument("--title")
+    p = sub.add_parser("push")
+    p.add_argument("ticket", help="OWNER/NAME#N")
     args = parser.parse_args(argv)
     try:
         if args.command == "claim":
             repos = [r for r in args.repos.replace(",", " ").split() if r]
             if not repos:
                 raise ValueError("claim requires --repos or LOOM_REPOS")
-            gh = GitHub(token_from_env())
+            gh = GitHub(auth_from_env())
             result = claim(gh, repos, args.lane)
             if result:
                 print(json.dumps(result))
@@ -323,15 +422,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             status_repo = args.repo or (args.repos.replace(",", " ").split() or [""])[0]
             if not tickets.REPO_RE.fullmatch(status_repo):
                 raise ValueError("heartbeat without a ticket requires --repo or LOOM_STATUS_REPO")
-            gh = GitHub(token_from_env())
+            gh = GitHub(auth_from_env())
             lane_heartbeat(gh, status_repo, args.lane)
             return 0
         if not tickets.REPO_RE.fullmatch(repo) or not raw.isdigit():
             raise ValueError("expected OWNER/NAME#N")
         number = int(raw)
-        gh = GitHub(token_from_env())
+        gh = GitHub(auth_from_env())
         if args.command == "heartbeat":
             heartbeat(gh, repo, number, args.lane)
+        elif args.command == "push":
+            sha = push_branch(gh, repo, number)
+            print(sha)
         else:
             made = open_pr(gh, repo, number, args.base, args.title)
             print(made.get("html_url", ""))

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 
-from bus import factory, revert, station
+from bus import brain, factory, revert, station
 from bus.github import Response
 
 REPO = "example-org/example-repo"
@@ -107,6 +107,11 @@ class FakeGitHub:
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
             return list(self.comments.get(int(m.group(1)), []))
+        if "labels=loom:goal&state=open" in path:
+            return list(getattr(self, "goals", []))
+        m = re.search(r"/issues/(\d+)/sub_issues", path)
+        if m:
+            return list(getattr(self, "subs", {}).get(int(m.group(1)), []))
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None, etag=None, ok=()):
@@ -150,7 +155,7 @@ class FakeGitHub:
             number = (900 if is_revert else 1000) + sum(
                 ("loom:revert" in [x["name"] for x in i["labels"]]) == is_revert
                 for i in self.filed)
-            made = dict(body, number=number, user=ME, state="open",
+            made = dict(body, number=number, id=10000 + number, user=ME, state="open",
                         labels=[{"name": x} for x in body["labels"]])
             self.filed.append(made)
             return Response(201, made)
@@ -189,6 +194,51 @@ class Base(unittest.TestCase):
     def forward_then_revert(self):
         self.go()
         return self.go(now=NOW + revert.FIX_FORWARD_WAIT)
+
+
+class RepairsEpic(Base):
+    """loom#640: revert, fix-forward and red-check tickets file under the
+    goal's standing "Factory repairs" epic."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.goals = [{"number": 30, "title": "Loom keeps goals moving", "state": "open",
+                          "labels": [{"name": "loom:goal"}]}]
+        self.gh.subs = {30: [{"number": 70, "state": "open", "title": brain.REPAIRS_TITLE,
+                              "labels": [{"name": "epic"}], "body": "Part of #30\n"}]}
+
+    def links(self, epic=70):
+        return [w[2]["sub_issue_id"] for w in self.gh.writes
+                if w[0] == "POST" and w[1].endswith("/issues/%d/sub_issues" % epic)]
+
+    def test_a_revert_and_its_fix_forward_file_under_the_repairs_epic(self):
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=2400), ago=2500)
+        self.forward_then_revert()
+        forward = [i for i in self.gh.filed if "loom:revert" not in
+                   [x["name"] for x in i["labels"]]]
+        (made,) = self.revert_tickets()
+        for ticket in forward + [made]:
+            self.assertTrue(ticket["body"].endswith("\n\nPart of #70\n"), ticket["title"])
+        self.assertEqual(sorted(self.links()), sorted(10000 + t["number"] for t in forward + [made]))
+
+    def test_a_red_check_ticket_files_under_the_repairs_epic(self):
+        self.green_base()
+        self.gh.commit("before", run("red", ago=4000, name="nightly invariants"), ago=4100)
+        self.gh.merge("m1", 41, 4, run("red", ago=3000, name="nightly invariants"),
+                      ago=3100, head_runs=(run("green", name="nightly invariants"),))
+        self.go()
+        (made,) = self.gh.filed
+        self.assertTrue(made["body"].endswith("\n\nPart of #70\n"))
+        self.assertEqual(self.links(), [10000 + made["number"]])
+
+    def test_a_repo_with_no_goal_home_files_as_before(self):
+        self.gh.goals = []
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=2400), ago=2500)
+        self.go()
+        self.assertNotIn("Part of #", self.gh.filed[0]["body"])
+        self.assertEqual(self.links(), [])
 
 
 class Bisect(Base):

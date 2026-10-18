@@ -34,21 +34,8 @@ REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots"
                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
-# The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
-# rung, lowest first. Lanes stand in for each other on the same provider:
-# codex-2 for codex, and any anthropic slot for the last rung's claude lane.
-ESCALATION = [("claude", "claude-sonnet-5-5"), ("codex", "gpt-6-sol"),
-              ("claude", "claude-opus-5-5")]
-ANTHROPIC_LANES = [x for x in LANES if x.startswith("anthropic")]
-
-
-def rung_lanes(rung: int) -> List[str]:
-    """The lanes that can run a rung (0-based), best first."""
-    lane = ESCALATION[rung][0]
-    if lane == "codex":
-        return ["codex", "codex-2"]
-    return [lane] + (ANTHROPIC_LANES if rung == len(ESCALATION) - 1 else [])
-
+# The model ladder for repeatedly stuck work is bus/factory.py LADDER, and
+# the rungs a stuck ticket climbs are its CLIMB (docs/MUSE.md).
 # name -> (6-hex color, short ASCII description)
 LABELS: Dict[str, Dict[str, str]] = {
     "loom:goal": {"color": "5319e7", "description": "The goal's home issue"},

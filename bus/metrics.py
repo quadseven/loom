@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
 
 from . import audit, proof
-from .github import GitHub, GitHubError, token_from_env
+from .github import GitHub, GitHubError, auth_from_env
 from .factory import lacks_test
 from .labels import LANES
 
@@ -112,7 +112,7 @@ def waits_main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
-        gh = GitHub(token_from_env(), cache_dir=os.path.join(home, "state", "github-cache"))
+        gh = GitHub(auth_from_env(), cache_dir=os.path.join(home, "state", "github-cache"))
         rows, bottleneck = waits_for_repos(gh, args.repos, time.time())
         print("state       median_h  worst_h  worst_ticket  n")
         for row in rows:
