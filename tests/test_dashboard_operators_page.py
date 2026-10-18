@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from dashboard import operators, shell
+from bus.github import GitHubError
 from dashboard.github import OPERATOR_CLAIMS_SECONDS, TicketStore
 
 REPO = "example-owner/app"
@@ -163,6 +164,32 @@ class OperatorsStoreTest(unittest.TestCase):
         store.refresh()
         self.assertEqual(self.claim_reads(), [])
         self.assertEqual(store.response()["operator_claims"]["items"], kept["items"])
+
+    def test_a_failed_claim_read_keeps_the_last_items_says_why_and_retries_next_pass(self):
+        store = self.store()
+        store.refresh()
+        store._snapshot["operator_claims"]["read_at"] -= OPERATOR_CLAIMS_SECONDS
+        labels = "/repos/%s/labels" % REPO
+        listed = self.gh.pages.pop(labels)
+        original = self.gh.paginate
+
+        def failing(path):
+            if path.startswith(labels):
+                raise GitHubError("label list failed")
+            return original(path)
+        self.gh.paginate = failing
+        store.refresh()
+        claims = store.response()["operator_claims"]
+        body = operators.render(claims, time.time())
+        self.assertIn("label list failed", body)
+        # The claimed non-ticket issue only the claim list finds is still shown.
+        self.assertIn("Shared cache warmup", body)
+        self.assertTrue(claims["retry"])
+        self.gh.paginate, self.gh.pages[labels] = original, listed
+        self.gh.calls.clear()
+        store.refresh()
+        self.assertEqual(len(self.claim_reads()), 2)
+        self.assertFalse(store.response()["operator_claims"]["retry"])
 
     def test_without_brief_authors_every_claim_label_is_listed_and_the_page_says_why(self):
         store = self.store(authors="")

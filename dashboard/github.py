@@ -478,24 +478,28 @@ class TicketStore:
         operator holds, from one list per foreign claim:<login> label per repo
         and the ticket and pull request records this pass already read, with
         the checks of each open linked pull request. Read again only every
-        OPERATOR_CLAIMS_SECONDS; between reads the last result is kept."""
+        OPERATOR_CLAIMS_SECONDS; between reads the last result is kept. A
+        repo whose claims could not be read keeps its last items, says why,
+        and is read again on the next pass."""
         previous = self._snapshot.get("operator_claims") or {}
         now = time.time()
-        if previous.get("read_at") and now - float(previous["read_at"]) < OPERATOR_CLAIMS_SECONDS:
+        if (previous.get("read_at") and not previous.get("retry")
+                and now - float(previous["read_at"]) < OPERATOR_CLAIMS_SECONDS):
             data["operator_claims"] = previous
             return
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             results = list(pool.map(self._claims_for_repo, self.repos))
         claimed, errors = [], []
-        for found, error in results:
-            claimed.extend(found)
+        for repo, (found, error) in zip(self.repos, results, strict=True):
             if error:
                 errors.append(error)
+                found = [item for item in previous.get("items") or [] if item.get("repo") == repo]
+            claimed.extend(found)
         rows = [row for found in (data.get("tickets") or {}).values() if found for row in found]
         items = operators.collect(claimed, rows, data.get("pull_requests") or [])
         checks = self._read_claim_checks(items, errors)
         data["operator_claims"] = {"items": items, "checks": checks, "error": "; ".join(errors),
-                                   "read_at": now, "every": OPERATOR_CLAIMS_SECONDS}
+                                   "read_at": now, "every": OPERATOR_CLAIMS_SECONDS, "retry": bool(errors)}
 
     def _claims_for_repo(self, repo: str) -> Tuple[List[Dict[str, Any]], str]:
         path = quote(repo, safe="/")

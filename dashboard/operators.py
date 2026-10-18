@@ -290,6 +290,13 @@ def _stamp(value: Any) -> float:
         return 0.0
 
 
+def _number(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _checks_text(summary: Optional[Dict[str, Any]]) -> Tuple[str, str]:
     if not summary:
         return "checks not read", "the checks of this head are read for open pull requests only"
@@ -384,7 +391,7 @@ def render(source: Optional[Dict[str, Any]], now: float, env: Optional[Dict[str,
                      % (esc(login), len(rows), _table(rows, checks, now)))
     parts.append('<p class="machine-fact operators-read">Read %s ago, every %d minutes. An issue assigned to '
                  'another operator with no <code>claim:</code> label shows here only when it is a Loom ticket '
-                 'or a pull request.</p>' % (_age(now - float(source["read_at"])),
+                 'or a pull request.</p>' % (_age(now - _number(source.get("read_at"))),
                                             int(source.get("every") or 0) // 60))
     return '<section class="operators-view">%s</section>' % "".join(parts)
 
