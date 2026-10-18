@@ -1967,11 +1967,30 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
     return lines
 
 
+# Why only a person can do it. Anything a lane, the brain or the station can
+# do with the repo, the GitHub API, logs or a diagnosis is not one of these,
+# and neither is work the unproven-work gate only delays: 174 loom:human
+# issues on 2026-10-18 were mostly such work, parked as "waiting on you".
+HUMAN_KINDS = ("money", "hardware", "account", "credential", "physical", "decision")
+HUMAN_KIND_RE = re.compile(r"\AKind:\s*(\S+)\s*\n?", re.I)
+
+
+def human_kind(ask: str) -> Tuple[str, str]:
+    """(kind, ask) from an ask whose first line is "Kind: K", K one of
+    HUMAN_KINDS; ValueError otherwise."""
+    match = HUMAN_KIND_RE.match(ask.strip())
+    kind = match.group(1).lower() if match else ""
+    if kind not in HUMAN_KINDS:
+        raise ValueError("the ask must start with a line \"Kind: K\", K one of %s: "
+                         "only a person can do it for that reason" % ", ".join(HUMAN_KINDS))
+    return kind, ask.strip()[match.end():].strip()
+
+
 def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
-    """Mark an open issue loom:human: only a person can do it. One comment
-    names the exact thing needed (money, hardware, an account, a credential,
-    a decision reserved for the operator); loom:triage, if any, comes off."""
-    ask = ask.strip()
+    """Mark an open issue loom:human: only a person can do it. The ask starts
+    with "Kind: K" (HUMAN_KINDS) and one comment names the exact thing needed;
+    loom:triage, if any, comes off."""
+    kind, ask = human_kind(ask)
     if not ask:
         raise ValueError("the ask must name the exact thing a person has to do")
     _check_written_text(ask)
@@ -1979,7 +1998,7 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     if "loom:human" in names:
         raise ValueError("#%d is already loom:human" % number)
     gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-            {"body": "%s\n%s" % (HUMAN_MARKER, ask)})
+            {"body": "%s\n%s\nKind: %s" % (HUMAN_MARKER, ask, kind)})
     if "loom:triage" in names:
         _remove_label(gh, repo, number, "loom:triage")
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})

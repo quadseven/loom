@@ -437,9 +437,14 @@ this tick"; a step with no note shows nothing there.
    `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket names it, the original gets
    `loom:rewritten` and closes as completed when the ticket is verified) or, when only a person can do it, run
-   `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
-   the exact thing needed: money, hardware, an account, a credential, or a
-   decision the goal home reserves for the operator. When an open
+   `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file starts
+   with a line `Kind: K` (one of money, hardware, account, credential,
+   physical, decision) and then names the exact thing needed. A credential is
+   a secret only the owner holds, not GitHub access, which the factory has; a
+   decision is one nobody has made yet. Never park work there: a ticket the
+   unproven-work gate only delays stays `loom:triage`, and anything a lane,
+   the brain or the station can do with the repo, the GitHub API, logs, a
+   read of a running system or a diagnosis is a brief. When an open
    `loom:human` issue turns out to be work the brain can do after all,
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays

@@ -56,7 +56,7 @@ that talks to GitHub about tickets.
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
 | `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified, then closes as completed (see Rewritten issues close with their ticket). |
-| `loom:human` | Only a person can do this; one comment names the exact thing needed (money, hardware, an account, a credential, a decision reserved for the operator). |
+| `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs-operator` | An ask for the operator (see Asks). |
