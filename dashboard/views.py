@@ -488,12 +488,18 @@ def _local_time(stamp):
     return local.strftime("%Y-%m-%d %H:%M ") + (local.tzname() or "UTC")
 
 
-def _factory_tier_text():
-    tiers = "; ".join("%s: %s" % (name.title(), ", ".join(lanes))
-                       for name, lanes in factory.TIERS.items())
-    ladder = "; ".join("%s: %s" % (", ".join(lanes), model)
-                        for lanes, model in factory.LADDER)
-    return "Factory tiers: %s. Model ladder: %s." % (tiers, ladder)
+def _factory_tables():
+    tiers = ['<table class="factory-tiers"><thead><tr><th>Tier</th><th>Lanes</th></tr></thead><tbody>']
+    for name, lanes in factory.TIERS.items():
+        tiers.append('<tr class="factory-tier"><th>%s</th><td>%s</td></tr>' %
+                     (html.escape(name.title()), html.escape(", ".join(lanes))))
+    tiers.append("</tbody></table>")
+    ladder = ['<table class="model-ladder"><thead><tr><th>Lanes</th><th>Model</th></tr></thead><tbody>']
+    for lanes, model in factory.LADDER:
+        ladder.append("<tr><td>%s</td><td>%s</td></tr>" %
+                      (html.escape(", ".join(lanes)), html.escape(model)))
+    ladder.append("</tbody></table>")
+    return "".join(tiers + ladder)
 
 
 def render_lane_usage(rows):
@@ -526,8 +532,9 @@ def render_lane_usage(rows):
 
 
 def render_lanes(data):
-    parts = ['<p class="page-lede">%s At most half of runs on Anthropic.</p><section><h2 class="label">Anthropic share of runs</h2>' %
-             html.escape(_factory_tier_text())]
+    parts = ['<section><h2 class="label">Factory tiers</h2>%s</section>' % _factory_tables(),
+             '<p class="page-lede">At most half of runs on Anthropic.</p>'
+             '<section><h2 class="label">Anthropic share of runs</h2>']
     share = data.get("anthropic_share")
     if share is None:
         parts.append('<p class="empty-state">Share is missing: no lane run totals were available.</p>')

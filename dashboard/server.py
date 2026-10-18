@@ -17,6 +17,7 @@ import ipaddress
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 
+from bus import brain as bus_brain
 from bus import tickets as bus_tickets
 
 from .github import TicketStore
@@ -1175,7 +1176,7 @@ def _hold_reason(lane, rows):
     reason = next((row["holds"][lane] for row in rows
                    if isinstance(row.get("holds"), dict) and lane in row["holds"]), "")
     if not reason:
-        return "held: the lane machine sent no reason"
+        return "no reason"
     reason = re.sub(r"^limit:\s*", "", reason)
     match = re.search(r";\s*(?:lane waits|unavailable) until (\S+)", reason)
     if not match:
@@ -1205,12 +1206,15 @@ def _lane_view_data(payload, tickets, state=None):
             age_str = views.format_age(model_info["time"])
             model_display = "%s (%s)" % (model_info["model"], age_str) if age_str else model_info["model"]
         lane_quota = _lane_quota(lane_name, usage_records)
+        reason = _hold_reason(lane_name, usage_records)
+        if item["available"] and reason == "no reason":
+            reason = "available"
 
         item.update({
             "ticket": active,
-            "model": model_display,
+            "model": model_display or bus_brain._lane_model(lane_name),
             "quota": lane_quota,
-            "reason": None if item["available"] else _hold_reason(lane_name, usage_records),
+            "reason": reason,
         })
         lanes.append(item)
 
