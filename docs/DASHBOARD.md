@@ -34,10 +34,12 @@ Keep the dashboard ingress tailnet-only; the bearer token authenticates
 uploads but does not replace the network boundary. The endpoint rejects
 uploads without that token. Transcripts live in the configured Postgres
 database in one row per ticket, lane slot, and start time, with events stored
-as JSONB. The store removes runs older than 180 days whenever it initializes,
-accepts an upload, or serves a transcript read. This bounds retained history
-during normal dashboard use; it does not depend on how lane runs generate
-their transcripts.
+as JSONB. The store removes runs older than 180 days whenever it initializes
+or accepts an upload, and commits that delete; a read never deletes. This
+bounds retained history during normal dashboard use; it does not depend on how
+lane runs generate their transcripts. Every database connection times out
+after 5 seconds and sets `statement_timeout` to 5 seconds, so a slow or locked
+database fails one read instead of holding a page.
 
 Brain memory (docs/decisions/0002, item 3) lives in the same database, in
 three tables the dashboard creates on first use: `brain_ticks` (one row per
@@ -67,7 +69,10 @@ lists merged, shipped, verified and closed ones, and `state`, `goal` and
 three records: the stored transcript, the lane pull request footer, and the
 station's claim comment (whose model follows the ladder rules). It says "not
 run yet" when none exists and "model not recorded" when the newest run names
-no model. The age in state comes from the hourly label-event read.
+no model. The newest stored run of each ticket is read once per
+background refresh pass, never by a page request, so the Floor, `/tickets` and
+`/backlog` never wait on the database; a pass that cannot read it keeps the
+last map and lists the error under the page. The age in state comes from the hourly label-event read.
 A row, and the ticket page header, carry a "held by <login>" chip when
 another operator owns the ticket: an assignee or `claim:<login>` label
 outside `LOOM_BRIEF_AUTHORS`, by the rule the station uses

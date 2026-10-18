@@ -122,17 +122,34 @@ class MemoryBackend:
         return None
 
 
+CONNECT_TIMEOUT_SECONDS = 5
+# Every statement on a dashboard connection gives up after this long, so a
+# locked or slow database fails one read instead of holding a thread (#780).
+_STATEMENT_TIMEOUT = "SET statement_timeout = 5000"
+
+
 def connect(dbapi):
     """A connection to the dashboard's database, configured by LOOM_DB_*;
-    the brain memory tables (dashboard/brain_memory.py) share it."""
+    the brain memory tables (dashboard/brain_memory.py) share it. The socket
+    times out after CONNECT_TIMEOUT_SECONDS and each statement after 5s."""
     config = {}
     for key in ("LOOM_DB_HOST", "LOOM_DB_NAME", "LOOM_DB_USER", "LOOM_DB_PASSWORD"):
         value = os.environ.get(key)
         if not value:
             raise dbapi.Error("Missing required database configuration: " + key)
         config[key] = value
-    return dbapi.connect(host=config["LOOM_DB_HOST"], database=config["LOOM_DB_NAME"],
-                         user=config["LOOM_DB_USER"], password=config["LOOM_DB_PASSWORD"])
+    conn = dbapi.connect(host=config["LOOM_DB_HOST"], database=config["LOOM_DB_NAME"],
+                         user=config["LOOM_DB_USER"], password=config["LOOM_DB_PASSWORD"],
+                         timeout=CONNECT_TIMEOUT_SECONDS)
+    try:
+        conn.cursor().execute(_STATEMENT_TIMEOUT)
+        # Committed, so the setting holds for the whole session rather than
+        # rolling back with the first transaction.
+        conn.commit()
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 class PostgresBackend:
@@ -166,11 +183,13 @@ class PostgresBackend:
         finally:
             conn.close()
 
+    # read() and get() never purge: the DELETE was never committed there, so
+    # it only took row locks on every page read (#780). initialize() and put()
+    # purge and commit.
     def read(self, query, ticket=None):
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(_PURGE)
             if query == "latest":
                 cur.execute(_LATEST, ())
             else:
@@ -190,7 +209,6 @@ class PostgresBackend:
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(_PURGE)
             cur.execute(_GET, (id_,))
             row = cur.fetchone()
             if row is None:

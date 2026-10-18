@@ -79,5 +79,84 @@ class StoreTests(unittest.TestCase):
                 self.assertIsInstance(transcripts.Store().backend, transcripts.MemoryBackend)
 
 
+class FakeDBAPI:
+    """A DB-API module double that records each connect and every statement."""
+    class Error(Exception):
+        pass
+
+    def __init__(self):
+        self.connects, self.statements, self.commits = [], [], 0
+
+    def connect(self, **kwargs):
+        self.connects.append(kwargs)
+        return _FakeConnection(self)
+
+
+class _FakeConnection:
+    def __init__(self, module):
+        self.module = module
+
+    def cursor(self):
+        return _FakeCursor(self.module)
+
+    def commit(self):
+        self.module.commits += 1
+
+    def close(self):
+        pass
+
+
+class _FakeCursor:
+    description = [("id",), ("ticket",)]
+
+    def __init__(self, module):
+        self.module = module
+
+    def execute(self, sql, params=()):
+        self.module.statements.append(sql)
+
+    def fetchall(self):
+        return [(1, "example/project#12")]
+
+    def fetchone(self):
+        return (1, "example/project#12")
+
+
+DB_ENV = {"LOOM_DB_HOST": "db.invalid", "LOOM_DB_NAME": "loom", "LOOM_DB_USER": "loom",
+          "LOOM_DB_PASSWORD": "placeholder"}
+
+
+class PostgresBackendTests(unittest.TestCase):
+    """loom#780: a read never deletes, and a connection never waits forever."""
+
+    def test_reads_run_no_delete(self):
+        module = FakeDBAPI()
+        backend = transcripts.PostgresBackend(module)
+        with patch.dict(os.environ, DB_ENV):
+            backend.read("latest")
+            backend.read("list")
+            backend.read("attempts", "example/project#12")
+            backend.get(1)
+        self.assertTrue(module.statements)
+        self.assertFalse([sql for sql in module.statements if "DELETE" in sql.upper()])
+
+    def test_initialize_and_put_still_purge_and_commit(self):
+        module = FakeDBAPI()
+        backend = transcripts.PostgresBackend(module)
+        with patch.dict(os.environ, DB_ENV):
+            backend.initialize()
+            backend.put(transcripts.validate(StoreTests().body()))
+        self.assertEqual(module.statements.count(transcripts._PURGE), 2)
+        self.assertGreaterEqual(module.commits, 2)
+
+    def test_connect_passes_a_timeout_and_sets_a_statement_timeout(self):
+        module = FakeDBAPI()
+        with patch.dict(os.environ, DB_ENV):
+            transcripts.connect(module)
+        self.assertEqual(module.connects[0]["timeout"], transcripts.CONNECT_TIMEOUT_SECONDS)
+        self.assertLessEqual(transcripts.CONNECT_TIMEOUT_SECONDS, 5)
+        self.assertEqual(module.statements[0], "SET statement_timeout = 5000")
+
+
 if __name__ == "__main__":
     unittest.main()

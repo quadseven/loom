@@ -254,7 +254,10 @@ class PostgresBackendTest(unittest.TestCase):
             store = brain_memory.Store(backend)
             self.assertEqual(store.record_tick(tick(1, [defer(5)]))["id"], 7)
             store.record_tick(tick(2, [dict(defer(5), state="done", due=None)]))
-        sql = [s for s, _ in db.statements]
+        # Each connection first sets its statement timeout and commits it (#780).
+        sessions = sum(1 for s, _ in db.statements if s == "SET statement_timeout = 5000")
+        self.assertEqual(sessions, 2)
+        sql = [s for s, _ in db.statements if not s.startswith("SET ")]
         creates = [s for s in sql if s.startswith("CREATE")]
         self.assertEqual(len(creates), len(brain_memory._SCHEMA))
         self.assertTrue(all(s.startswith("CREATE") for s in sql[:len(creates)]))
@@ -264,7 +267,7 @@ class PostgresBackendTest(unittest.TestCase):
                                    "2026-10-17T23:00:00Z")])
         closed = [p for s, p in db.statements if s.startswith("UPDATE brain_commitments")]
         self.assertEqual(closed, [(8, "2026-10-17T02:20:00Z", "example/repo#5", "merge", "")])
-        self.assertEqual(db.commits, 3)
+        self.assertEqual(db.commits, 3 + sessions)
 
     def test_a_tick_sends_its_commitments_as_one_batch_per_statement(self):
         db = FakeDb([(["id"], [(7,)])])
