@@ -1152,6 +1152,8 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        # Log data sections the verify gate already read this pass, by ticket.
+        self._evidence_text: Dict[str, str] = {}
         # This pass's factory-repair tickets over the unproven-work limit, per
         # (repo, goal): running, at a pull request, or let through (loom#767).
         self._repair_flying: Dict[Tuple[str, int], List[int]] = {}
@@ -2317,6 +2319,8 @@ class Station:
                 pool.remove((repo, issue))
                 attempts["%s#%s" % (repo, issue["number"])] = self.now
                 _write_json(path, attempts)
+                if self._no_live_evidence(repo, issue):
+                    continue
                 self._write_verify_brief(repo, lane, issue)
                 break
 
@@ -2327,8 +2331,9 @@ class Station:
         text = tickets.render_verify_brief(
             repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
         text += self._verify_github_data(repo, issue)
-        text += evidence.section(self.s.evidence_cmds, repo,
-                                 brain.live_criterion(issue.get("body"), limit=None))
+        cached = self._evidence_text.pop("%s#%d" % (repo, number), None)
+        text += cached if cached is not None else evidence.section(
+            self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None))
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
@@ -2380,11 +2385,31 @@ class Station:
             return "(withheld: the text failed the text checks)"
         return clean
 
+    def _no_live_evidence(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """True when the station's own log command finds no line naming any of
+        the ticket's live-criterion strings: the event has not happened, so a
+        verify run can only fail. The ticket is marked awaiting evidence (no
+        comment) and checked again after its cooldown. mod-overseer#922 spent a
+        run and posted a comment every 6 hours for days waiting on an event that had not happened."""
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        text, seen = evidence.gather(self.s.evidence_cmds, repo, live)
+        number = int(issue["number"])
+        # The brief quotes the same lines, so the command runs once.
+        self._evidence_text["%s#%d" % (repo, number)] = text
+        if seen is not False:
+            return False
+        if brain.AWAITING_EVIDENCE not in _label_names(issue):
+            self._await_evidence(repo, number,
+                                 "No log line names the live criterion's strings yet; the "
+                                 "station checks again in %d hours." % (VERIFY_INTERVAL // 3600))
+        _say("not verifying %s#%d yet: no log line names its live criterion" % (repo, number))
+        return True
+
     def _verify_note(self, repo: str, number: int, lane: str, why: str) -> None:
-        self._comment(repo, number, "Lane %s checked this shipped ticket for proof and could "
-                      "not verify it. %s The ticket stays shipped; it is tried again after "
-                      "%d hours." % (lane, why, VERIFY_INTERVAL // 3600))
-        _say("verify of %s#%d left it shipped: %s" % (repo, number, why))
+        # A log line, not a comment: each failed verify run emailed the
+        # operator, every 6 hours per shipped ticket (2026-10-18).
+        _say("verify of %s#%d on lane %s left it shipped: %s; tried again after %d hours"
+             % (repo, number, lane, why, VERIFY_INTERVAL // 3600))
 
     def _await_evidence(self, repo: str, number: int, missing: Any) -> None:
         """Mark a ticket a verifier found waiting on live evidence, so it does
