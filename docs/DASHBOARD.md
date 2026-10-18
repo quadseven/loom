@@ -97,16 +97,34 @@ shows only when it is a Loom ticket or a pull request.
 
 The same page groups every open issue and pull request labelled
 `needs:<login>` under that login as "Waiting on <login>", with its age and
-the ask: the first worded line of its latest comment (HTML comment markers
-dropped). Every login is listed, this Loom's own included, because the
-person named is the one who has to act; `needs:<login>` never blocks a lane.
-An item claimed by one login and waiting on another is a row in each group.
-The Floor shows a "Waiting on a person" card with each person's count,
-linking to `/operators#person-<login>`, and no card when nothing waits. The
-reads ride the same pass and interval: one open list per `needs:<login>`
-label per repo (at most 10), then one single-comment page per item whose
-`updated_at` changed since the last read (at most 30 a pass); below the
-budget floor nothing is read and the last result stays shown.
+the ask: the body's `## Ask` section when it has one, else the newest
+comment that names the ask (a `## Ask` section, a line that starts with
+"Ask", or a mention of the item's needs label), else the latest comment,
+one line, HTML comment markers dropped. Every login is listed, this Loom's
+own included, because the person named is the one who has to act;
+`needs:<login>` never blocks a lane. An item claimed by one login and
+waiting on another is a row in each group. The Floor shows a "Waiting on a
+person" card with each person's count, linking to
+`/operators#person-<login>`, and no card when nothing waits. The reads ride
+the same pass and interval: one open list per `needs:<login>` label per repo
+(at most 10), then one comment page (the last 100) per item whose
+`updated_at` changed since the last read and whose body has no `## Ask`
+(at most 30 a pass); below the budget floor nothing is read and the last
+result stays shown.
+
+`/needs-you` lists every open item that waits on a person, each once: the
+`needs-operator` issues ("waits on the operator") from Hunt's backlog
+document and the store's own read, and the `needs:<login>` items above
+("waits on <login>"), each card marked "needs a human" with its ask (the
+`## Ask` section, else the picked comment, linked). It makes no request of
+its own: the `needs:<login>` items come from the Operators pass, and a
+`needs-operator` issue with no `## Ask` in its body takes its ask from a
+comment read the same way. Chips at the top filter it with plain links:
+All, one per login with its count, and Operator (`?who=<login>`,
+`?who=operator`). A repo named bare (`app#7`, as Hunt's document does) and
+by `OWNER/NAME` (`example-owner/app#7`) is one item when only one
+configured repo has that name. The Floor's "Needs you" count is the same
+deduplicated list.
 
 `/free` lists, per repo, the open issues free for the operator named by
 `?operator=<login>` (anyone, with none), from `bus.free`, the function

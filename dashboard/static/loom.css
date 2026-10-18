@@ -291,6 +291,10 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .backlog-asks { max-width: 760px; margin: 18px 0; }
 .backlog-asks summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); font: 12px var(--font-mono); cursor: pointer; }
 .ask-missing { margin: 0; color: var(--muted); font-size: 13px; }
+.ask-head .ask-human { margin-left: auto; padding: 0 8px; border: 1px solid var(--info); border-radius: 999px; color: var(--info-on-bg); white-space: nowrap; }
+.ask-source { margin: 0; color: var(--muted); font-size: 12px; }
+.needs-filter .chip[aria-current="true"] { border-color: var(--accent); color: var(--accent-on-bg); }
+.needs-read { color: var(--muted); font-size: 12px; }
 .backlog-ask { margin: 6px 0; color: var(--body); font-size: 13px; }
 .share-track span, .quota span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .share-track i { position: absolute; left: 50%; top: -4px; height: 16px; border-left: 2px solid var(--bad); }

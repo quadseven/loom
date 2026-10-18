@@ -34,6 +34,7 @@ from . import goals as goals_view
 from . import ticket_data
 from . import tickets_table
 from . import operators as operators_view
+from . import needs_you as needs_you_view
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
@@ -285,7 +286,9 @@ def _floor(state):
         '<dt class="since-%s">%s</dt><dd>%s</dd>' % (key.replace(" ", "-"), esc(label), esc(str(since.get(key) or missing)))
         for key, label in (("well", "well"), ("not well", "not well"), ("stuck", "stuck"), ("next", "next"))))
     needs = context.get("needs_you")
-    asks = payload.get("operator_items") or []
+    asks = needs_you_view.entries(payload.get("operator_items") or [],
+                                  (payload.get("operator_claims") or {}).get("needs") or [],
+                                  getattr(state, "repos", None) or [])
     if isinstance(needs, int):
         top = asks[0] if asks else None
         needs_html = '<p><strong class="count">%d</strong> %s</p>%s<a href="/needs-you">all asks &rarr;</a>' % (
@@ -741,53 +744,29 @@ def _backlog_page(document, parsed, state):
     return page("Backlog", "backlog", "".join(out), status="Read only")
 
 
-_ASK_SECTION = re.compile(r"^##\s*Ask\s*\n(.*?)(?=^##\s|\Z)", re.M | re.S)
-
-
-def _exact_ask(item):
-    """The issue's "## Ask" section, else a one-line ask as written, else
-    None: a missing ask is shown as missing, never stood in by the title."""
-    body = str(item.get("ask") or item.get("body") or "")
-    found = _ASK_SECTION.search(body)
-    text = found.group(1).strip() if found else ("" if "\n" in body.strip() else body.strip())
-    return text if text and text != str(item.get("title") or "").strip() else None
-
-
-def _ask_card(item):
-    esc = html.escape
-    waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
-    since = item.get("created_at") or item.get("waiting_since")
-    age = views.format_age(since) if since and since != "9999" else None
-    ask = _exact_ask(item)
-    ask_html = ('<blockquote>%s</blockquote>' % esc(ask) if ask else
-                '<p class="ask-missing">No exact ask is written on the issue (no "## Ask" section).</p>')
-    return ('<article class="card ask-card"><div class="ask-head"><span>%s - needs-operator</span>'
-            '<span>%s</span></div><h2><a href="%s">%s</a></h2>%s'
-            '<p class="machine-fact">%s | unblocks %s | <a href="%s">open the issue</a></p></article>') % (
-        esc(_repo_number(item)), esc(age or "age unknown"), esc(_issue_url(item), quote=True),
-        esc(str(item.get("title") or _repo_number(item))), ask_html, waiting,
-        esc(str(item.get("unblocks", 0))), esc(_issue_url(item), quote=True))
-
-
-def _needs_you(document, state, *, source_missing=False):
+def _needs_you(document, state, *, source_missing=False, who=""):
+    """Everything waiting on a person (loom#810): needs-operator asks from
+    Hunt's document and the store, and needs:<login> items from the
+    Operators pass, each once, filtered by ?who=."""
     order = lambda item: (-_number(item.get("unblocks")), str(item.get("waiting_since", "9999")))
-    asks = {}
-    for item in list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", [])):
-        key = _repo_number(item)
-        if key:
-            asks.setdefault(key, {**item, "queue": "needs_operator"})
+    asks = list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", []))
+    response = getattr(state, "response", None)
+    claims = (response() if callable(response) else {}).get("operator_claims") or {}
+    repos = list(getattr(state, "repos", None) or [])
+    found, cards = needs_you_view.render(asks, claims, who, repos)
+    names = needs_you_view.full_names(repos + [entry["repo"] for entry in found])
+    listed = {entry["key"] for entry in found}
     backlog = {}
     for item in document.get("ready_for_human") or []:
-        key = _repo_number(item)
-        if key and key not in asks:
+        key = needs_you_view.ref_key(item.get("repo"), item.get("number"), names) if _repo_number(item) else ""
+        if key and key not in listed:
             backlog.setdefault(key, {**item, "queue": "ready_for_human"})
-    out = ['<p class="page-lede">Only what only you can do. Everything else the brain does itself.</p>']
+    out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
+           'Everything else the brain does itself.</p>']
     if source_missing:
         out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
-    if not asks:
-        out.append('<p class="empty-state">Nothing needs you right now: no open needs-operator issue.</p>')
-    out.extend(_ask_card(item) for item in sorted(asks.values(), key=order))
-    if backlog:
+    out.append(cards)
+    if backlog and not who:
         out.append('<details class="backlog-asks"><summary>From the backlog (%d), ready for a person</summary>' % len(backlog))
         for item in sorted(backlog.values(), key=order):
             waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
@@ -1056,7 +1035,8 @@ def _dispatch_backlog(handler, state, path, parsed):
         if raw is None:
             return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
         return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
-    return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
+    who = needs_you_view.who_param(parse_qs(parsed.query).get("who", [""])[0])
+    return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None, who=who))
 
 
 # Served path -> (file under static/, content type). Browsers ask for

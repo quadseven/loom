@@ -221,9 +221,9 @@ def _needs_fixture():
     gh.pages[claims] = [claimed_issue] + gh.pages[claims][1:]
     gh.pages["/repos/%s/issues?labels=needs%%3A%s&" % (REPO, THIRD)] = [claimed_issue, waiting_pr]
     gh.pages["/repos/%s/issues?labels=needs%%3A%s&" % (REPO, LOOM)] = [own_ask]
-    gh.rest_data["/repos/%s/issues/5/comments?per_page=1&page=3" % REPO] = [{
+    gh.rest_data["/repos/%s/issues/5/comments?per_page=100&page=1" % REPO] = [{"body": "Picked this up."}, {
         "body": "<!-- ccqw:handoff v1 -->\n## Exact ask: run `gh variable set FLAG --body true`\n\nMore detail."}]
-    gh.rest_data["/repos/%s/issues/20/comments?per_page=1&page=1" % REPO] = [{
+    gh.rest_data["/repos/%s/issues/20/comments?per_page=100&page=1" % REPO] = [{
         "body": "Create the App and store its key in the parameter store."}]
     return gh
 
@@ -241,7 +241,7 @@ class NeedsTest(unittest.TestCase):
         return store
 
     def needs_reads(self):
-        return [path for path in self.gh.calls if "labels=needs%3A" in path or "/comments?per_page=1" in path]
+        return [path for path in self.gh.calls if "labels=needs%3A" in path or "/comments?per_page=" in path]
 
     def group(self, body, login):
         return body.split('<details class="tickets-group" id="person-%s"' % login)[1].split("</details>")[0]
@@ -311,8 +311,8 @@ class NeedsTest(unittest.TestCase):
         self.assertEqual(sorted(self.needs_reads()), sorted([
             "/repos/%s/issues?labels=needs%%3A%s&state=open&per_page=100" % (REPO, THIRD),
             "/repos/%s/issues?labels=needs%%3A%s&state=open&per_page=100" % (REPO, LOOM),
-            "/repos/%s/issues/5/comments?per_page=1&page=3" % REPO,
-            "/repos/%s/issues/20/comments?per_page=1&page=1" % REPO]))
+            "/repos/%s/issues/5/comments?per_page=100&page=1" % REPO,
+            "/repos/%s/issues/20/comments?per_page=100&page=1" % REPO]))
         # Inside the interval: nothing is read again.
         self.gh.calls.clear()
         store.refresh()
@@ -323,7 +323,7 @@ class NeedsTest(unittest.TestCase):
         self.gh.calls.clear()
         store.refresh()
         self.assertEqual(len(self.needs_reads()), 2)
-        self.assertNotIn("/comments?per_page=1", " ".join(self.gh.calls))
+        self.assertNotIn("/comments?per_page=", " ".join(self.gh.calls))
         kept = store.response()["operator_claims"]
         self.assertIn("Exact ask", operators.render(kept, time.time()))
         # Below the budget floor: nothing is read, the last result stays shown.
@@ -341,10 +341,11 @@ class NeedsTest(unittest.TestCase):
         key = "/repos/%s/issues?labels=needs%%3A%s&" % (REPO, LOOM)
         changed = dict(self.gh.pages[key][0], updated_at=_stamp(0), comments=2)
         self.gh.pages[key] = [changed]
-        self.gh.rest_data["/repos/%s/issues/20/comments?per_page=1&page=2" % REPO] = [{"body": "Done, key stored."}]
+        self.gh.rest_data["/repos/%s/issues/20/comments?per_page=100&page=1" % REPO] = [
+            {"body": "Create the App."}, {"body": "Done, key stored."}]
         self.gh.calls.clear()
         store.refresh()
-        self.assertIn("/repos/%s/issues/20/comments?per_page=1&page=2" % REPO, self.gh.calls)
+        self.assertIn("/repos/%s/issues/20/comments?per_page=100&page=1" % REPO, self.gh.calls)
         self.assertIn("Done, key stored.", operators.render(store.response()["operator_claims"], time.time()))
 
 

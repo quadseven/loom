@@ -19,7 +19,7 @@ from bus import brain, labels, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import free_view, goals, operators, transcripts, views
+from . import free_view, goals, needs_you, operators, transcripts, views
 
 
 READ_WORKERS = 8
@@ -381,11 +381,23 @@ class TicketStore:
         count = len([row for row in humans if isinstance(row, dict) and "pull_request" not in row])
         found = [{"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
                   "html_url": issue.get("html_url"), "ask": issue.get("body") or issue.get("title", ""),
-                  "created_at": issue.get("created_at"),
+                  "body_ask": operators.body_ask(issue.get("body")),
+                  "labels": _label_names(issue), "comments": _int_or(issue.get("comments")),
+                  "created_at": issue.get("created_at"), "updated_at": issue.get("updated_at"),
                   "waiting_since": issue.get("updated_at", "9999"), "waiting_since_source": "updated",
                   "unblocks": 0, "queue": "needs_operator"}
                  for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
         return repo, found, count, ""
+
+    def _read_operator_asks(self, snapshot: Dict[str, Any], previous: List[Dict[str, Any]]) -> None:
+        """A needs-operator issue with no "## Ask" section in its body takes
+        its ask from a comment (comment_ask, comment_ask_url), read as the
+        needs:<login> asks are; a failed read is listed with the pass's
+        errors and keeps the last ask."""
+        errors: List[str] = []
+        self._read_asks(self.operator_items, previous, errors, field="comment_ask")
+        if errors:
+            snapshot["dashboard_errors"] = list(snapshot.get("dashboard_errors") or []) + errors
 
     def _init_open_issues(self) -> None:
         # repo -> open issue records for the /free page, None until read.
@@ -560,36 +572,41 @@ class TicketStore:
         issues = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100" % (path, quote(name, safe="")))
         return [issue for issue in issues if isinstance(issue, dict)]
 
-    def _read_asks(self, needs, previous, errors) -> None:
-        """Set each needs:<login> item's ask: the first line of its latest
-        comment. An item whose updated_at is unchanged keeps the last pass's
-        ask; an item with no comment has none; at most OPERATOR_ASK_READS
-        comment reads a pass (one page of one comment each), the rest keep
-        their last ask or say it is not read yet."""
+    def _read_asks(self, items, previous, errors, field: str = "ask") -> None:
+        """Set each item's ask (item[field]) and the comment it came from
+        (item[field + "_url"]): its body's "## Ask" section when it has one,
+        else operators.pick_ask over its comments. An item whose updated_at
+        is unchanged keeps the last pass's ask; an item with no comment has
+        none; at most OPERATOR_ASK_READS comment reads a pass (the last page
+        of operators.ASK_COMMENTS each), the rest keep their last ask or say
+        it is not read yet (None)."""
+        url = field + "_url"
         kept = {"%s#%s" % (item.get("repo"), item.get("number")): item for item in previous}
         reads = 0
-        for item in needs:
+        for item in items:
             old = kept.get("%s#%s" % (item.get("repo"), item.get("number"))) or {}
-            if old.get("updated_at") == item.get("updated_at") and "ask" in old:
-                item["ask"] = old["ask"]
+            if item.get("body_ask"):
+                item[field], item[url] = operators.ask_line(item["body_ask"]), ""
+            elif old.get("updated_at") == item.get("updated_at") and field in old:
+                item[field], item[url] = old[field], old.get(url) or ""
             elif not item.get("comments"):
-                item["ask"] = ""
+                item[field], item[url] = "", ""
             elif reads >= OPERATOR_ASK_READS:
-                item["ask"] = old.get("ask")
+                item[field], item[url] = old.get(field), old.get(url) or ""
             else:
                 reads += 1
-                item["ask"] = self._read_ask(item, errors, old.get("ask"))
+                item[field], item[url] = self._read_ask(item, errors, (old.get(field), old.get(url) or ""))
 
-    def _read_ask(self, item, errors, fallback) -> Optional[str]:
+    def _read_ask(self, item, errors, fallback) -> Tuple[Optional[str], str]:
+        page = (int(item["comments"]) - 1) // operators.ASK_COMMENTS + 1
         try:
-            resp = self.gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=1&page=%d" % (
-                quote(str(item["repo"]), safe="/"), int(item["number"]), int(item["comments"])))
+            resp = self.gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=%d&page=%d" % (
+                quote(str(item["repo"]), safe="/"), int(item["number"]), operators.ASK_COMMENTS, page))
         except (GitHubError, OSError, ValueError) as exc:
             errors.append("%s#%s ask: %s" % (item["repo"], item["number"], self._error_reason(exc)))
             return fallback
         found = resp.data if isinstance(resp.data, list) else []
-        latest = found[-1] if found and isinstance(found[-1], dict) else {}
-        return operators.ask_line(latest.get("body"))
+        return operators.pick_ask(found, operators.ask_names(item.get("labels") or []))
 
     def _read_claim_checks(self, items, errors) -> Dict[str, Dict[str, Any]]:
         """repo@sha -> operators.checks_summary of each open linked pull
@@ -956,15 +973,22 @@ class TicketStore:
                     snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
                     snapshot.setdefault("dashboard_errors", []).append(
                         "repeated failure invariants: " + self._error_reason(exc))
+            previous_items = self.operator_items
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
             self._read_dashboard(snapshot)
+            if not self._below_floor():
+                self._read_operator_asks(snapshot, previous_items)
             self._read_latest_runs(snapshot)
             now = time.time()
             self._refresh_waits(snapshot, now)
             self._read_open_issues(now)
             floor_context = dict(snapshot.get("floor_context") or {})
-            floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
+            # The Floor's count is every item the Needs-you page lists:
+            # needs-operator asks and needs:<login> items, each once.
+            needs = (snapshot.get("operator_claims") or {}).get("needs") or []
+            floor_context.update({"needs_you": None if ask_error else len(
+                                      needs_you.entries(self.operator_items, needs, self.repos)),
                                   "needs_you_reason": ask_error,
                                   "waits_error": self.waits_error})
             snapshot["floor_context"] = floor_context
