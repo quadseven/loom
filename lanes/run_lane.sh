@@ -1877,6 +1877,13 @@ for BRIEF in "$INBOX"/*.md; do
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
       heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    elif [ -n "$CONFIGURED_MODELS" ] &&
+         [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $ACCOUNT_QUOTA_RE ]]; then
+      LIMIT_REASON="account quota reached"
+      for candidate in $CONFIGURED_MODELS $MODEL; do
+        record_model_limit "$candidate" "$RETRY_AT" "$LIMIT_REASON"
+      done
+      heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ]; then
       LIMIT_REASON="provider limit reached"
       record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"

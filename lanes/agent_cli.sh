@@ -33,6 +33,11 @@ agent_cli() {
 LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
 KEY_STATE='expired|revoked|invalid|incorrect|disabled'
 AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)"
+# A quota on the whole account, not one model: every model of the lane is
+# limited until it resets (agy, 2026-10-18: "Individual quota reached ...
+# Resets in 67h", but only the model that ran was marked, so the lane stayed
+# available and took a claim every few minutes).
+ACCOUNT_QUOTA_RE='individual quota reached|quota (exceeded|reached) for (this|the|your) (account|project|user|organization)'
 OUT_OF_CREDIT_RE='credit balance is too low|insufficient[ _](credit|balance|funds)|payment required|(http|status|code|error)[^0-9a-z]{0,3}402([^0-9]|$)'
 NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|network error|fetch failed|connection (reset|refused|closed)|could not resolve host|overloaded|service unavailable|bad gateway|gateway timeout|internal server error|(http|status|code|error)[^0-9a-z]{0,3}(500|502|503|504|529)([^0-9]|$)'
 # When the provider says its limit lifts: an epoch after "limit reached|" or a

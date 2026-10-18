@@ -1005,6 +1005,24 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("gpt-test-low until", beat["reason"])
         self.assertGreater(beat["retry_at"], int(time.time()))
 
+    def test_an_account_quota_limits_every_model_and_takes_the_lane_offline(self):
+        # agy, 2026-10-18: "Individual quota reached ... Resets in 67h" marked
+        # only the model that ran; the lane stayed available and the station
+        # claimed a ticket on it every few minutes for an hour.
+        models = "gpt-test-high gpt-test-low"
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        result = self.run_lane(
+            LOOM_CODEX_MODELS=models, FAKE_AGENT="say",
+            FAKE_OUT="RESOURCE_EXHAUSTED (code 429): Individual quota reached. "
+                     "Resets in 67h19m45s.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("account quota reached", beat["reason"])
+        limits = (self.loom / "state" / "usage" / "codex.models").read_text()
+        self.assertIn("gpt-test-high ", limits)
+        self.assertIn("gpt-test-low ", limits)
+
     def test_ticket_model_is_not_swapped_for_a_ladder_model(self):
         self.drop_brief("T042-fix-the-thing.md",
                         BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-test-high"))
