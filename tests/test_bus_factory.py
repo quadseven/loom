@@ -201,7 +201,7 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
 
-    def go(self, limited=(), no_test_repos=(), available=None, model_limits=None):
+    def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=()):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
@@ -219,7 +219,7 @@ class Base(unittest.TestCase):
         f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
                             merge=merge, fix=fix, move=move, close=close,
                             limited=limited, no_test_repos=no_test_repos,
-                            available=available, model_limits=model_limits)
+                            available=available, model_limits=model_limits, held=held)
         f.run()
         return f
 
@@ -1417,6 +1417,24 @@ class Tickets(Base):
         self.go(available=["codex"])
         self.assertEqual((self.lane(7), self.moved, self.gh.comments[7]), ("codex", [], []))
 
+    def test_a_ticket_the_station_holds_is_never_moved_as_stalled(self):
+        # 2026-10-18: loom#633, refused every pass by the unproven-work gate,
+        # was moved between lanes with a comment each time.
+        self.stalled(7)
+        self.go(held=["%s#7" % REPO])
+        self.assertEqual((self.lane(7), self.moved, self.gh.comments[7]), ("codex", [], []))
+
+    def test_a_held_ladder_ticket_is_not_spread_off_a_busy_lane(self):
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        for n in (6, 8, 9):
+            self.gh.ticket(n, "briefed", lane="claude", body=body)
+        self.gh.ticket(7, "briefed", lane="claude", body=body)
+        self.gh.comments[7] += [{"body": factory.RUNG_MARKER % 1, "user": ME,
+                                 "created_at": iso(600)}]
+        self.go(held=["%s#7" % REPO])
+        self.assertEqual(self.lane(7), "claude")
+        self.assertEqual(self.gh.comments[7][1:], [])
+
     def test_a_held_briefed_ticket_never_counts_as_stalled(self):
         self.gh.ticket(7, "briefed", body="Not before: 2099-01-01T00:00:00Z\nDifficulty: easy\n\n## Why\nx\n")
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
@@ -1836,6 +1854,15 @@ class Helpers(unittest.TestCase):
             os.makedirs(st.state, exist_ok=True)
             st._note_held(REPO, 6, "%s#741" % REPO)
             self.assertEqual(st._factory().held, {"%s#6" % REPO})
+
+    def test_the_station_tells_the_factory_which_tickets_the_gate_refused(self):
+        with tempfile.TemporaryDirectory() as home:
+            settings = station.Settings(home, [REPO], ["alice-example"], [], factory_on=True)
+            st = station.Station(FakeGitHub(), settings, now=NOW)
+            os.makedirs(st.state, exist_ok=True)
+            st._gate_holds = {"%s#30" % REPO: {"repo": REPO, "goal": 30, "count": 64,
+                                               "limit": 60, "tickets": {633: "x"}, "idle": 0}}
+            self.assertIn("%s#633" % REPO, st._factory().held)
 
     def test_the_station_runs_the_factory_when_on_and_throttles_it(self):
         calls = []
