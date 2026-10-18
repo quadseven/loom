@@ -199,6 +199,18 @@ def _int_or(value: Any, default: int = 0) -> int:
         return default
 
 
+# The view sources one dashboard pass reads, each with the snapshot keys it
+# fills. A pass below the budget floor reads none of them and carries every
+# source an earlier pass read; source_read_at says when each was read.
+VIEW_SOURCES = {
+    "improving": ("improving", "floor_context"),
+    "lanes": ("lanes",),
+    "pull_requests": ("pull_requests", "footer_models", "footer_runs"),
+    "brain_step": ("brain_step", "brain_step_error"),
+    "comments": ("issue_comments", "review_comments", "comment_errors", "hot_spots_error"),
+}
+
+
 class TicketStore:
     def __init__(self, repos: Optional[List[str]] = None, gh: Optional[GitHub] = None,
                  budget_floor: Optional[int] = None) -> None:
@@ -349,6 +361,16 @@ class TicketStore:
                      "brain_step": None, "brain_step_error": skipped,
                      "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
                      "dashboard_errors": [skipped]})
+        # Every view source an earlier pass read keeps that read, with its
+        # read time. Emptying them showed false zeros for as long as the
+        # budget stayed low: Improving 0/0/0/0, Lanes "no loom:lanes
+        # comment", Brain "no goal journal found", Results "Lane pull
+        # requests merged 0" and a PR column of "-" (loom#779).
+        read_at = dict(self._snapshot.get("source_read_at") or {})
+        carried = [source for source in VIEW_SOURCES if read_at.get(source)]
+        for source in carried:
+            data.update({key: self._snapshot[key] for key in VIEW_SOURCES[source] if key in self._snapshot})
+        data["source_read_at"], data["sources_carried"] = read_at, carried
         # The goal cards keep the last pass that read them. Dropping them
         # here left every Goals card at "-" with "No report on this goal
         # in the last two weeks" whenever the budget dipped (2026-10-17).
@@ -420,6 +442,8 @@ class TicketStore:
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
         self._read_goal_context(data, homes, reports, metric_comments)
+        now = int(time.time())
+        data["source_read_at"], data["sources_carried"] = {source: now for source in VIEW_SOURCES}, []
 
     def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
         """Each goal home's title and the goal it rolls up into (a `Parent
@@ -775,7 +799,7 @@ class TicketStore:
             self._read_dashboard(snapshot)
             now = time.time()
             self._refresh_waits(snapshot, now)
-            floor_context = snapshot.get("floor_context", {})
+            floor_context = dict(snapshot.get("floor_context") or {})
             floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
                                   "needs_you_reason": ask_error,
                                   "waits_error": self.waits_error})
@@ -815,6 +839,8 @@ class TicketStore:
                 "issue_comments": snapshot.get("issue_comments", []),
                 "review_comments": snapshot.get("review_comments", []),
                 "hot_spots_error": snapshot.get("hot_spots_error", "the dashboard has not read its sources yet"),
+                "source_read_at": dict(snapshot.get("source_read_at") or {}),
+                "sources_carried": list(snapshot.get("sources_carried") or []),
                 "usage": usage_rows}
 
 
