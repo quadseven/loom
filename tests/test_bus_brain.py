@@ -3646,3 +3646,18 @@ class RepairsEpicTests(unittest.TestCase):
         brain.brief(gh, REPO, epic, "Repair", BODY, "codex")
         tree = brain.goal_tree(gh, REPO, 1)[1]
         self.assertNotIn(epic, [e["number"] for e in brain.finished_epics(tree)])
+
+
+class WaitLabelTests(unittest.TestCase):
+    def test_a_state_move_clears_every_wait_label(self):
+        kept = brain._moved_labels(["loom:ticket", "loom:briefed", "lane:codex", "wait:gate"],
+                                   "running", None)
+        self.assertNotIn("wait:gate", kept)
+        self.assertIn("loom:running", kept)
+
+    def test_the_wait_labels_are_managed(self):
+        from bus import labels
+        for name in ("wait:gate", "wait:model-limit", "wait:lane", "wait:incident",
+                     "wait:after", "wait:window"):
+            self.assertIn(name, labels.LABELS)
+        self.assertIn("wait:", labels.MANAGED_PREFIXES)

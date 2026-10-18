@@ -520,7 +520,7 @@ class ReconcilePullRequestTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:queued", self.fake.names(12))
-        self.assertIn("pull request #99", self.fake.comments[12][-1]["body"])
+        self.assertFalse(any("Linked pull request" in c["body"] for c in self.fake.comments[12]))
 
     def contributor_pr(self, author="dana-example", state="open", merged_at=None):
         pr = {"number": 99, "state": state, "user": {"login": author},
@@ -2399,7 +2399,8 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertEqual(self.listing("opencode-go-3"), [])
         self.assertIn("loom:queued", self.fake.names(12))
-        self.assertIn("claude-sonnet-5-5", self.fake.comments[12][-1]["body"])
+        self.assertIn("wait:lane", self.fake.names(12))
+        self.assertFalse(any("claude-sonnet-5-5" in c["body"] for c in self.fake.comments[12]))
         self.assertEqual(self.fake.issues[12]["body"], body)
 
     def test_a_mismatched_model_is_queued_even_when_no_lane_is_free(self):
@@ -2408,8 +2409,10 @@ class ClaimTest(Base):
         self.write(self.inbox("codex", "other.md"), "busy\n")
         self.run_pass()
         self.assertIn("loom:queued", self.fake.names(12))
-        self.assertEqual(self.fake.comments[12][-1]["body"],
-                         "Model claude-sonnet-5-5 waits for a free compatible lane.")
+        # A wait label, not a comment: each comment emails the operator.
+        self.assertIn("wait:lane", self.fake.names(12))
+        self.assertFalse(any("waits for a free compatible lane" in c["body"]
+                             for c in self.fake.comments[12]))
 
     def test_a_trusted_ticket_becomes_a_brief_and_is_claimed(self):
         self.fake.add(12)
@@ -2438,6 +2441,16 @@ class ClaimTest(Base):
         self.assertEqual(self.listing(), [])
         self.assertNotIn("loom:running", self.fake.names(12))
         self.assertFalse([c for c in self.fake.comments[12] if c["body"].startswith("Claimed")])
+        self.assertIn("wait:model-limit", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_a_claim_clears_the_wait_label(self):
+        self.fake.add(12)
+        self.fake.issues[12]["labels"].append({"name": "wait:model-limit"})
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertFalse([n for n in self.fake.names(12) if n.startswith("wait:")])
+        self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
 
     def test_a_limit_on_another_model_or_one_that_lifted_does_not_hold_the_claim(self):
         self.heartbeat("codex", limited_models={"model-y": int(time.time()) + 3600,
@@ -2486,7 +2499,13 @@ class ClaimTest(Base):
         self.fake.add(12, body="After: #5\n" + BODY)
         self.run_pass()
         self.assertEqual(self.listing(), [])
-        self.assertEqual(self.fake.paths("PUT"), [])
+        # One labels write says why it waits; no comment, and the next pass
+        # writes nothing, the label already being there.
+        self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
+        self.assertIn("wait:after", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+        self.run_pass()
+        self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
 
     def test_a_dependency_of_another_repo_is_read_from_there(self):
         self.fake.add_foreign("other-owner/other-repo", 5, labels=("loom:merged",))
@@ -2877,11 +2896,10 @@ class FixTest(Base):
             "loom/12-fix-the-thing is at 0123456789ab on the remote, not ba9876543210 as when "
             "the run started"])
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        body = self.fake.comments[12][-1]["body"]
-        self.assertIn("Lane codex did not push its fix to #99: the branch moved during the run "
-                      "(branch moved: loom/12-fix-the-thing is at 0123456789ab", body)
-        self.assertIn("not a failure", body)
-        self.assertNotIn("failed", body)
+        # Nothing failed, so nothing is posted: the new head's review says the rest.
+        self.assertFalse(any("did not push" in c["body"] or "failed" in c["body"]
+                             for c in self.fake.comments[12][-1:]
+                             if not c["body"].startswith("Claimed")))
         self.assertEqual(self.fake.comments[99], [])
 
     def test_a_lane_explanation_is_redacted_of_credentials_before_it_is_posted(self):
@@ -3038,10 +3056,7 @@ class RetryTest(Base):
         self.run_pass()
         self.assertNotIn("loom:failed", self.fake.names(12))
         self.assertIn("lane:codex", self.fake.names(12))
-        said = [b for b in self.bodies() if b.startswith("Lane codex")]
-        self.assertEqual(len(said), 1, said)
-        self.assertIn("Lane codex is unavailable ([limit] agent exited 3", said[0])
-        self.assertIn("This is not a failure", said[0])
+        self.assertEqual([b for b in self.bodies() if b.startswith("Lane codex")], [])
 
     def test_free_lanes_take_only_easy_tickets_on_public_repos(self):
         self.heartbeat("zen")
@@ -3462,11 +3477,8 @@ class ExpiredKeyTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:opencode-go", "loom:briefed"])
         self.assertFalse(any(b.startswith("Automatic retry") for b in self.bodies()))
         self.assertNotIn("loom:failed", self.fake.names(12))
-        said = self.bodies()[-1]
-        # The parameter itself is scrubbed here as any path is; the exact one is
-        # in the lane heartbeat and in the ask the runner files.
-        self.assertIn("could not authenticate (agent exited 1: API key expired:", said)
-        self.assertIn("not a failure", said)
+        # No comment: the runner already filed the operator one ask for the key.
+        self.assertFalse(any("could not authenticate" in b for b in self.bodies()))
 
     def test_expired_key_failures_never_flag_runaway_or_spend_an_attempt(self):
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
@@ -3521,7 +3533,8 @@ class FactoryIncidentTest(Base):
         self.heartbeat("muse")
         self.failed()
         self.run_pass()
-        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "lane:muse", "loom:running"})
+        self.assertEqual(set(self.fake.names(12)),
+                         {"loom:ticket", "lane:muse", "loom:running", "wait:incident"})
         self.assertFalse(any(b.startswith("Automatic retry") for b in self.bodies()))
         hold = [b for b in self.bodies() if "held" in b]
         self.assertEqual(len(hold), 1)
@@ -4091,12 +4104,11 @@ class OutcomeTest(Base):
 
     def test_a_limit_is_not_a_failure_and_the_ticket_goes_back_to_briefed(self):
         self.limited()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:spark", "loom:briefed"])
-        self.assertEqual(len(self.fake.comments[12]), 1)
-        body = self.fake.comments[12][0]["body"]
-        self.assertIn("Lane spark is unavailable (limit: the spark endpoint refused", body)
-        self.assertIn("not a failure", body)
-        self.assertNotIn("failed", body)
+        # A wait label instead of a comment: a comment a bounce emailed the
+        # operator dozens of times an hour (2026-10-18).
+        self.assertEqual(self.fake.names(12),
+                         ["loom:ticket", "lane:spark", "loom:briefed", "wait:model-limit"])
+        self.assertEqual(self.fake.comments[12], [])
 
     def test_a_limited_fix_brief_goes_back_to_its_pull_request(self):
         self.limited(fix_body=FIX_BODY)
@@ -6580,6 +6592,16 @@ class UnprovenGateTest(unittest.TestCase):
         self.assertEqual(self.run_pass(), 0)
         self.assertIn("loom:briefed", self.fake.names(7))
         self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_a_gated_ticket_carries_wait_gate_once_and_no_comment(self):
+        self.over_limit()
+        self.brief(7)
+        self.run_pass()
+        self.assertIn("wait:gate", self.fake.names(7))
+        self.assertEqual(self.fake.comments[7], [])
+        puts = self.fake.paths("PUT").count("/repos/%s/issues/7/labels" % REPO)
+        self.run_pass()
+        self.assertEqual(self.fake.paths("PUT").count("/repos/%s/issues/7/labels" % REPO), puts)
 
     def test_regression_revert_and_urgent_tickets_still_go_over_the_limit(self):
         for number, label in ((8, "loom:regression"), (9, "loom:revert"), (10, "loom:urgent")):
