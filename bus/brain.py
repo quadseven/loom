@@ -2044,14 +2044,26 @@ def _review_check_line(gh: GitHub, repo: str, check: str) -> str:
             % (check, len(prs), repo, ", ".join("#%s" % p["number"] for p in prs)))
 
 
-def _backlog_home(gh: GitHub, repo: str, lines: List[str]) -> Optional[int]:
+def _backlog_home(gh: GitHub, repo: str, lines: List[str],
+                  operator: Optional[str] = None,
+                  authors: Sequence[str] = ()) -> Optional[int]:
     """The repo's backlog goal home, opened when none is open; one opened
     before the loom:backlog label existed is labelled. Found by its label,
-    by the old "Backlog:" title prefix, or by its title. Appends what it did
-    to `lines`; None when GitHub named no number for a new one."""
+    by the old "Backlog:" title prefix, or by its title, among the goal homes
+    this Loom works (tickets.goal_ours): one naming another operator is that
+    operator's Loom's, not ours. A new one names `operator` on an Operator:
+    line, or, when another operator's goal home is open here, the first
+    non-app LOOM_BRIEF_AUTHORS login, so it is not every Loom's. An open one
+    without the line is left as it is, with a hint naming the line to add.
+    Appends what it did to `lines`; None when GitHub named no number for a
+    new one."""
     title = backlog_title(repo)
-    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
-    found = sorted((g for g in goals if isinstance(g, dict) and "pull_request" not in g
+    mine = list(authors) + ([operator] if operator else [])
+    goals = [g for g in gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
+             if isinstance(g, dict) and "pull_request" not in g]
+    foreign = sorted((g for g in goals if not tickets.goal_ours(g, mine)),
+                     key=lambda g: int(g.get("number") or 0))
+    found = sorted((g for g in goals if tickets.goal_ours(g, mine)
                     and (naming.is_backlog_home(g) or g.get("title") == title)),
                    key=lambda g: int(g.get("number") or 0))
     if found:
@@ -2061,8 +2073,25 @@ def _backlog_home(gh: GitHub, repo: str, lines: List[str]) -> Optional[int]:
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": [naming.BACKLOG_LABEL]})
             lines.append("backlog goal home: #%d, labelled %s" % (number, naming.BACKLOG_LABEL))
+        if tickets.goal_operator(found[0]) is None:
+            lines.append('backlog goal home: #%d names no operator, so every Loom on %s works '
+                         'it; to keep it to one, add the line "Operator: %s" above its first '
+                         'heading' % (number, repo,
+                                      operator or tickets.operator_login(authors) or "<login>"))
         return number
+    if operator is None and foreign:
+        operator = tickets.operator_login(authors)
+        if operator is None:
+            raise ValueError("%s#%s names operator %s, so a backlog goal home without an "
+                             "Operator: line would be every Loom's; pass --operator or set "
+                             "LOOM_BRIEF_AUTHORS" % (repo, foreign[0]["number"],
+                                                     tickets.goal_operator(foreign[0])))
+        lines.append("operator: %s (the first LOOM_BRIEF_AUTHORS login that is not an app), "
+                     "since #%s names operator %s"
+                     % (operator, foreign[0]["number"], tickets.goal_operator(foreign[0])))
     body = _backlog_body(repo)
+    if operator:
+        body = "Operator: %s\n\n%s" % (operator, body)
     _check_written_text(body)
     made = gh.rest("POST", "/repos/%s/issues" % repo,
                    {"title": title, "body": body,
@@ -2072,14 +2101,18 @@ def _backlog_home(gh: GitHub, repo: str, lines: List[str]) -> Optional[int]:
 
 
 def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
-            env: Optional[Dict[str, str]] = None) -> List[str]:
+            env: Optional[Dict[str, str]] = None,
+            operator: Optional[str] = None) -> List[str]:
     """Make a repo ready for Loom: the labels, one backlog goal home, a check
     that the review check runs there, and the LOOM_REPOS value with the repo
     in it. The backlog home carries loom:goal and loom:backlog; one opened
-    before that label existed gets it. A second run changes nothing. Returns
-    the lines to print."""
+    before that label existed gets it. A new one names `operator` on an
+    Operator: line (see _backlog_home). A second run changes nothing.
+    Returns the lines to print."""
     from . import factory, labels  # factory imports this module
     env = os.environ if env is None else env
+    if operator is not None and not tickets._OPERATOR_RE.match("Operator: " + operator):
+        raise ValueError("--operator %r is not a GitHub login" % operator)
     check = (review_check or env.get("LOOM_REVIEW_CHECK", "").strip()
              or factory.DEFAULT_REVIEW_CHECK)
     info = gh.rest("GET", "/repos/%s" % repo).data or {}
@@ -2087,7 +2120,7 @@ def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
                            if info.get("private") else "public")]
     changed = labels.ensure_labels(gh, repo)
     lines.append("labels: %s" % (", ".join(changed) if changed else "no changes"))
-    home = _backlog_home(gh, repo, lines)
+    home = _backlog_home(gh, repo, lines, operator, trusted_authors(env))
     if home is not None:
         lines.append("intake epic: #%d" % intake_epic(gh, repo, home))
     lines.append(_review_check_line(gh, repo, check))
@@ -3800,7 +3833,7 @@ def parser() -> argparse.ArgumentParser:
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom")
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
-    ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check")
+    ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
@@ -3890,7 +3923,7 @@ def _cmd_reply(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 def _cmd_onboard(gh: GitHub, args: argparse.Namespace) -> None:
-    for line in onboard(gh, _repo(args.repo), args.review_check):
+    for line in onboard(gh, _repo(args.repo), args.review_check, operator=args.operator):
         print(line)
 
 
