@@ -2354,12 +2354,8 @@ def move(gh: GitHub, repo: str, number: int, state: str,
                              (lane, effective_model,
                               ", ".join(model_lanes(effective_model)) or "none"))
     kept = _moved_labels(_labels(issue), state, lane)
-    proof_url = ""
-    if record is not None:
-        comment = _proof_comment(gh, repo, issue, dict(record, verified_by=verified_by))
-        posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                         {"body": comment}).data
-        proof_url = str((posted or {}).get("html_url") or "") if isinstance(posted, dict) else ""
+    proof_url = (_post_proof(gh, repo, number, issue, record, verified_by)
+                 if record is not None else "")
     if model is not None:
         _set_model(gh, repo, number, issue, model)
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
@@ -2368,6 +2364,16 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     if state == "verified":
         return settle_source(gh, repo, number, issue.get("body"), "completed", proof_url)
     return None
+
+
+def _post_proof(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
+                record: Dict[str, Any], verified_by: str) -> str:
+    """Post the proof comment for a verified move; its link, or "" when
+    GitHub gave none."""
+    comment = _proof_comment(gh, repo, issue, dict(record, verified_by=verified_by))
+    posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                     {"body": comment}).data
+    return str(posted.get("html_url") or "") if isinstance(posted, dict) else ""
 
 
 def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
