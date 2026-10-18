@@ -493,8 +493,15 @@ class GitHub:
         if body.get("state_reason", "completed") != "completed":
             return
         # Re-entering rest() for the verification GET is safe: the
-        # method != "PATCH" check above stops any recursion.
-        issue = self.rest("GET", path).data or {}
+        # method != "PATCH" check above stops any recursion. A failed read
+        # raises out of rest() before the PATCH is sent, so the close is
+        # refused; a 2xx read with no issue object in it refuses it too,
+        # rather than reading as an issue with no criteria (loom#656).
+        issue = self.rest("GET", path).data
+        if not isinstance(issue, dict):
+            raise GitHubError(
+                "refusing to close %s as completed: cannot read the issue to "
+                "check its acceptance criteria" % path)
         if "pull_request" in issue:
             return
         labels = [str(label.get("name") or "").lower()

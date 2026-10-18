@@ -2592,15 +2592,20 @@ class TriageTests(unittest.TestCase):
 class HumanAndRefsTests(unittest.TestCase):
     def test_human_posts_one_comment_and_swaps_triage_for_human(self):
         fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(201, {}), reply(200, []), reply(200, []))
-        brain.human(GitHub("t", transport=fake), REPO, 6, "Buy a test phone.\n")
-        self.assertEqual(fake.calls[1][2], {"body": brain.HUMAN_MARKER + "\nBuy a test phone."})
+        brain.human(GitHub("t", transport=fake), REPO, 6, "Kind: hardware\nBuy a test phone.\n")
+        self.assertEqual(fake.calls[1][2],
+                         {"body": brain.HUMAN_MARKER + "\nBuy a test phone.\nKind: hardware"})
         self.assertEqual(fake.calls[2][0], "DELETE")
         self.assertTrue(fake.calls[2][1].endswith("/issues/6/labels/loom%3Atriage"))
         self.assertEqual(fake.calls[3][2], {"labels": ["loom:human"]})
 
     def test_human_refusals_write_nothing(self):
-        cases = [(item(6, labels=["loom:human"]), "Buy it."), (item(6, state="closed"), "Buy it."),
-                 (item(6, pull_request={}), "Buy it."), (item(6), "  ")]
+        cases = [(item(6, labels=["loom:human"]), "Kind: money\nBuy it."),
+                 (item(6, state="closed"), "Kind: money\nBuy it."),
+                 (item(6, pull_request={}), "Kind: money\nBuy it."), (item(6), "Kind: money\n  "),
+                 # 2026-10-18: asks like these filled the digest with factory work.
+                 (item(6), "Using GitHub credentials, sort the 25 tickets into epics."),
+                 (item(6), "Kind: github\nSort the 25 tickets into epics.")]
         for issue, ask in cases:
             with self.subTest(ask=ask, issue=issue):
                 fake = Fake(reply(200, issue))

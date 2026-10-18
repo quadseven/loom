@@ -93,7 +93,8 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
         "Answer with ONE JSON object and nothing else, in one of three shapes:",
         '{"action": "brief", "title": "<one line>", "difficulty": "easy|medium|hard", '
         '"body": "<markdown>"}',
-        '{"action": "human", "ask": "<the exact thing a person has to do>"}',
+        '{"action": "human", "kind": "money|hardware|account|credential|physical|decision", '
+        '"ask": "<the exact thing a person has to do>"}',
         '{"action": "skip", "reason": "<why no ticket can be written>"}',
         "",
         "Use brief when the work can be done by changing the repo. The body holds exactly "
@@ -103,8 +104,13 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
         "sentence. Acceptance criteria has at least three checkboxes. Size is one of XS, "
         "S, M or L. Out of scope names at least one thing. Do not write header lines "
         "such as Priority, Difficulty, After or Not before; the station adds those.",
-        "Use human only when the work needs money, hardware, an account, a credential or "
-        "an operator decision.",
+        "Use human only when the work needs money, hardware, an account, a credential, "
+        "someone physically present or an operator decision nobody has made, and name that "
+        "reason as kind. A credential is a secret only the owner holds, not repository or "
+        "GitHub access, which the factory already has. Never use human for work a coding "
+        "agent or the factory can do with the repository, the GitHub API, logs, a diagnosis "
+        "or a read of a running system: sorting tickets, investigating an error and reading "
+        "logs are briefs.",
         "Use skip when the issue is unclear, already done, or not a task.",
         "Write plain ASCII text. Do not name people, hostnames, IP addresses or local paths. "
         "Do not write closing keywords such as fixes or closes next to an issue number.",
@@ -179,7 +185,10 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
             if len(ask) > ASK_MAX:
                 raise Invalid("ask is longer than %d characters" % ASK_MAX)
             brain._check_written_text(ask)
-            return "human", {"ask": ask}
+            kind = str(answer.get("kind") or "").strip().lower()
+            if kind not in brain.HUMAN_KINDS:
+                raise Invalid("kind is not one of %s" % ", ".join(brain.HUMAN_KINDS))
+            return "human", {"ask": "Kind: %s\n%s" % (kind, ask)}
         if action != "brief":
             raise Invalid("action is not brief, human or skip")
         title = _text(answer, "title").strip()
