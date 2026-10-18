@@ -419,6 +419,53 @@ class Base(unittest.TestCase):
             return []
 
 
+class StationReadBudgetTest(Base):
+    def reader(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def test_unchanged_ticket_reads_no_comments_or_events_on_second_pass(self):
+        self.fake.add(12, state="shipped")
+        first = self.reader()
+        issue = first._tickets_open(REPO)[0]
+        first._proven(REPO, 12)
+        first._shipped_stamp(REPO, issue)
+        first.end_pass()
+        self.fake.calls.clear()
+        second = self.reader()
+        issue = second._tickets_open(REPO)[0]
+        second._proven(REPO, 12)
+        second._shipped_stamp(REPO, issue)
+        paths = self.fake.paths("GET")
+        self.assertFalse([p for p in paths if "/issues/12/comments" in p
+                          or "/issues/12/events" in p])
+
+    def test_changed_ticket_comments_are_read_once_per_pass(self):
+        self.fake.add(12, state="shipped")
+        first = self.reader()
+        first._tickets_open(REPO)
+        first._proven(REPO, 12)
+        first.end_pass()
+        self.fake.issues[12]["updated_at"] = "2030-01-02T00:00:00Z"
+        self.fake.version += 1
+        self.fake.calls.clear()
+        second = self.reader()
+        second._tickets_open(REPO)
+        second._proven(REPO, 12)
+        second._proven(REPO, 12)
+        paths = self.fake.paths("GET")
+        self.assertEqual(len([p for p in paths if "/issues/12/comments" in p]), 1)
+
+    def test_comment_post_invalidates_the_ticket_read(self):
+        self.fake.add(12, state="shipped")
+        reader = self.reader()
+        reader._tickets_open(REPO)
+        reader._proven(REPO, 12)
+        reader.gh.rest("POST", "/repos/%s/issues/12/comments" % REPO, {"body": "new proof"})
+        reader._proven(REPO, 12)
+        self.assertEqual(len([p for p in self.fake.paths("GET")
+                              if "/issues/12/comments" in p]), 2)
+
+
 class ReconcilePullRequestTest(Base):
     def test_trusted_same_repo_open_pr_promotes_queued_ticket(self):
         self.fake.add(12, state="queued")
