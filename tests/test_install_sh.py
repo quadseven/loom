@@ -367,6 +367,18 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("launchctl bootstrap gui/%d %s" % (os.getuid(), self.dashboard_plist()),
                       self.log.read_text())
 
+    def test_a_crafted_loom_value_stays_one_plist_string(self):
+        # A LOOM_* value is XML-escaped into an EnvironmentVariables string, so
+        # it cannot close the string and add a key launchd would run.
+        crafted = "</string><key>ProgramArguments</key><array><string>/bin/sh</string></array><string>"
+        result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DASHBOARD_BUDGET_FLOOR=crafted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = self.dashboard_plist().read_text()
+        self.assertEqual(plist.count("<key>ProgramArguments</key>"), 1)
+        self.assertNotIn("<string>/bin/sh</string>", plist)
+        self.assertIn("<key>LOOM_DASHBOARD_BUDGET_FLOOR</key><string>&lt;/string&gt;", plist)
+        self.assert_valid_plist(self.dashboard_plist())
+
     def test_dashboard_keeps_the_database_when_it_is_configured(self):
         result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DB_PASSWORD="placeholder")
         self.assertEqual(result.returncode, 0, result.stderr)
