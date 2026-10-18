@@ -169,7 +169,7 @@ tickets and pull requests like any other work.
   `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
   for a reason the runner could catch, a step done by hand that the station
   could do, a rule a brief kept missing, a check that wasted a reply.
-- Every 2 hours, with the report, brief the single biggest such problem as a
+- Every 6 hours, with the report, brief the single biggest such problem as a
   ticket on loom#30 (or on the review bot's goal, quadseven/grug#1143, when
   the review bot caused it), with the evidence. End its Why with a
   `Noticed in <journal comment link>: "<the Friction line>"` line
@@ -463,7 +463,7 @@ this tick"; a step with no note shows nothing there.
    the step's name from the list above (lock, status, merge, verify, failed,
    asks, brief, triage, journal, unlock): the station files a ticket when one
    brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
-   Every 2 hours per goal (when status lists the goal as due or overdue),
+   Every 6 hours per goal (when status lists the goal as due or overdue),
    also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself, written as a

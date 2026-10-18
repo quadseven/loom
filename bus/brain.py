@@ -58,7 +58,7 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # Every goal owes its own report every REPORT_EVERY seconds, counted from its
 # newest valid report or, with none, from when the goal was opened. A report
 # that is one tick (REPORT_GRACE) past due is overdue.
-REPORT_EVERY = 2 * 3600
+REPORT_EVERY = 6 * 3600
 REPORT_GRACE = 30 * 60
 TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "triage", "journal", "unlock")
 RUNAWAY = "loom:runaway"

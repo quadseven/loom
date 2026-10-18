@@ -529,7 +529,7 @@ class SensitiveResumeTests(unittest.TestCase):
         g1 = [{"body": "<!-- loom:journal v1 -->\n- Measure: p95 2s\n- Shipped: #5", "createdAt": "2030-01-01T19:45:00Z", "author": bot},
               {"body": "<!-- loom:report v1 -->\n- Measure: p95 2s", "createdAt": "2030-01-01T19:00:00Z", "author": bot}]
         g2 = [{"body": "<!-- loom:journal v1 -->\n- Shipped: none", "createdAt": "2030-01-01T19:50:00Z", "author": bot},
-              {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T14:26:00Z", "author": bot}]
+              {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T10:26:00Z", "author": bot}]
         gh = GitHub("t", transport=Fake(
             reply(200, goals), reply(200, []),
             reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
@@ -538,7 +538,7 @@ class SensitiveResumeTests(unittest.TestCase):
         report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])
         self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
                       "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
-        self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T14:26:00Z, "
+        self.assertIn("#2 Stale - latest journal 2030-01-01T19:50:00Z, report 2030-01-01T10:26:00Z, "
                       "measure none, action none - report overdue (due 2030-01-01T16:26:00Z)", report)
         owed = report.split("### Reports owed before unlock")[1].split("###")[0]
         self.assertIn("#2 report OVERDUE since 2030-01-01T16:26:00Z", owed)
@@ -546,7 +546,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_only_a_marked_report_on_the_goal_advances_its_deadline(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
-        issue = {"number": 3, "created_at": "2030-01-01T17:00:00Z"}
+        issue = {"number": 3, "created_at": "2030-01-01T13:00:00Z"}
         bot = {"login": "brain-bot"}
         ignored = [
             {"body": "<!-- loom:journal v1 -->\nquoting <!-- loom:report v1 -->", "createdAt": "2030-01-01T19:55:00Z", "author": bot},
@@ -561,7 +561,7 @@ class SensitiveResumeTests(unittest.TestCase):
         marked = ignored + [{"body": "<!-- loom:report v1 -->\n- Measure: 1", "createdAt": "2030-01-01T19:58:00Z", "author": bot}]
         led = brain.goal_ledger(issue, {"comments": {"nodes": marked}}, now, ["brain-bot"])
         self.assertEqual((led["report"], led["state"], led["due"]),
-                         ("2030-01-01T19:58:00Z", "ok", "2030-01-01T21:58:00Z"))
+                         ("2030-01-01T19:58:00Z", "ok", "2030-01-02T01:58:00Z"))
 
     def test_goal_without_any_stamp_is_unknown_not_young(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
@@ -3232,6 +3232,12 @@ class LogExcerptTests(unittest.TestCase):
         lines = ["line %d" % i for i in range(100)]
         self.assertEqual(brain.log_excerpt(lines), "\n".join(lines[-brain.LOG_LINES:]))
 
+
+class ReportCadenceTest(unittest.TestCase):
+    def test_a_goal_report_is_due_every_six_hours(self):
+        # 2026-10-18: 2-hourly reports on 13 goals sent the operator about 13
+        # emails an hour; the operator chose every 6 hours.
+        self.assertEqual(brain.REPORT_EVERY, 6 * 3600)
 
 if __name__ == "__main__":
     unittest.main()

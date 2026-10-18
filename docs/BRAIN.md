@@ -1040,7 +1040,7 @@ spends up to a third of its tick on these items: it writes a proof only from
 evidence it saw in the tick, and otherwise leaves a one-line note on the
 ticket naming what evidence is missing.
 
-Every 2 hours the tick adds a five-line report with the marker
+Every 6 hours the tick adds a five-line report with the marker
 `<!-- loom:report v1 -->`: progress on the goal's measure, shipped, in
 flight, blocked, next.
 
@@ -1077,7 +1077,7 @@ homes as above.
 
 ### Report deadlines
 
-Each goal owes its own report every 2 hours, counted from its newest valid
+Each goal owes its own report every 6 hours, counted from its newest valid
 report or, with none, from when the goal was opened. A valid report is a
 comment on that goal's home that starts with the report marker, from a
 `LOOM_BRIEF_AUTHORS` login when that is set. A marker inside another
