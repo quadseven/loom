@@ -4950,12 +4950,38 @@ class TranscriptUploadTest(Base):
         return UPLOAD_TOKEN
 
     def upload(self, url, token, body):
-        if body["ticket"] in getattr(self, "refuse", ()):
+        if isinstance(body, dict) and body["ticket"] in getattr(self, "refuse", ()):
             raise station.UploadRefused(400)
         if self.fail:
             self.fail -= 1
             raise OSError("connect to %s with %s failed" % (url, token))
+        if isinstance(body, list):  # a usage snapshot, not a transcript
+            self.usage_sent = getattr(self, "usage_sent", []) + [body]
+            return
         self.sent.append((url, token, body))
+
+    def usage(self):
+        err = io.StringIO()
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             read_secret=self.read_secret, upload=self.upload)
+        with contextlib.redirect_stderr(err), \
+                mock.patch.object(station.time, "sleep") as pause:
+            st.upload_usage_limits([{"lane": "codex"}])
+        return err.getvalue(), pause
+
+    def test_a_usage_snapshot_that_fails_once_is_sent_again(self):
+        self.fail = 1
+        out, pause = self.usage()
+        self.assertEqual(self.usage_sent, [[{"lane": "codex"}]])
+        self.assertNotIn("usage snapshot upload failed", out)
+        pause.assert_called_once_with(station.USAGE_RETRY_PAUSE)
+
+    def test_a_usage_snapshot_that_fails_twice_says_why_without_the_token(self):
+        self.fail = 2
+        out, _ = self.usage()
+        self.assertEqual(getattr(self, "usage_sent", []), [])
+        self.assertIn("usage snapshot upload failed twice: OSError: connect to", out)
+        self.assertNotIn(UPLOAD_TOKEN, out)
 
     def go(self, read_secret=None):
         err = io.StringIO()
