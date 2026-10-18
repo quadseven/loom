@@ -531,35 +531,6 @@ def _local_time(stamp):
     return local.strftime("%Y-%m-%d %H:%M ") + (local.tzname() or "UTC")
 
 
-def render_lane_usage(rows):
-    """Render one compact state row for every configured factory lane."""
-    esc = html.escape
-    names = set(lane for lanes in factory.TIERS.values() for lane in lanes)
-    names.update(lane for lanes, _ in factory.LADDER for lane in lanes)
-    holds = {}
-    for row in rows:
-        if isinstance(row.get("holds"), dict):
-            holds.update(row["holds"])
-    parts = ['<table class="lane-usage"><thead><tr><th>Lane</th><th>State</th></tr></thead><tbody>']
-    for lane in sorted(names):
-        reason = str(holds.get(lane) or "")
-        if not reason:
-            state = "available"
-        elif any(word in reason.lower() for word in ("endpoint", "503", "unreachable", "down")):
-            state = "endpoint down: " + reason
-        else:
-            state = re.sub(r"^limit:\s*", "", reason)
-            match = re.search(r";\s*(?:lane waits|unavailable) until (\S+)", state)
-            if match:
-                try:
-                    state = state[:match.start()] + " until " + _local_time(match.group(1).rstrip(";"))
-                except ValueError:
-                    state = state[:match.start()] + " until " + match.group(1)
-        parts.append("<tr><th>%s</th><td>%s</td></tr>" % (esc(lane), esc(state)))
-    parts.append("</tbody></table>")
-    return "".join(parts)
-
-
 def _lane_chip(name, states):
     state = states.get(name)
     word = LANE_STATE_WORD.get(state, "no status")
@@ -662,43 +633,4 @@ def render_lanes(data):
                           "Lane pull requests counted by the model their footer names, by ticket difficulty, "
                           "most first. Bars share one scale within a difficulty.",
                           body, _plural(total, "PR") if board else ""))
-    return "".join(parts)
-
-
-def render_usage_row(row, now=None):
-    """Render one provider window with text equivalents for every visual cue."""
-    esc = html.escape
-    now = now or datetime.now(timezone.utc)
-    used = row.get("used_pct")
-    provider = esc(str(row.get("provider", "")))
-    window_label = "5 hours" if row.get("window") == "5-hour" else str(row.get("window", ""))
-    window = esc(window_label)
-    lanes = ", ".join(row.get("lanes") or []) or "no lanes listed"
-    note = esc(str(row.get("note") or ""))
-    as_of = datetime.fromisoformat(str(row["as_of"]).replace("Z", "+00:00")).astimezone(timezone.utc)
-    age_seconds = max(0, int((now - as_of).total_seconds()))
-    age = "less than a minute ago" if age_seconds < 60 else "%d minutes ago" % (age_seconds // 60)
-    stale = age_seconds > 7200
-    parts = ['<article class="card usage-card"><div class="label">%s | %s</div><h2>%s</h2><p>Lanes: %s</p>' %
-             (provider, window, window, esc(lanes))]
-    if used is None:
-        parts.append('<p><strong>Not exposed yet.</strong> %s</p>' % note)
-    else:
-        pct = max(0, min(100, float(used)))
-        remaining = max(0, 100 - pct)
-        parts.append('<div class="usage-track" role="img" aria-label="%.1f%% used, %.1f%% left"><span style="width:%.1f%%"></span></div><p>%.1f%% used / %.1f%% left</p>' % (pct, remaining, pct, pct, remaining))
-    reset = row.get("resets_at")
-    if reset:
-        try:
-            reset_at = datetime.fromisoformat(reset.replace("Z", "+00:00")).astimezone(timezone.utc)
-            seconds = int((reset_at - now).total_seconds())
-            relative = "in %dh" % (seconds // 3600) if seconds >= 3600 else "in %dm" % max(0, seconds // 60)
-            absolute = _local_time(reset)
-            parts.append('<p>Resets at %s (%s)</p>' % (esc(absolute), esc(relative)))
-        except ValueError:
-            parts.append('<p>Reset time unavailable.</p>')
-    else:
-        parts.append('<p>Reset time unavailable.</p>')
-    parts.append('<p>Source: %s</p><p>Reading: %s%s</p></article>' %
-                 (esc(str(row.get("source", ""))), age, ' <strong>Stale</strong>' if stale else ""))
     return "".join(parts)

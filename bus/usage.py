@@ -64,8 +64,31 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
                 reset = window.get("resets_in_seconds")
             if reset is None and isinstance(window.get("window_minutes"), (int, float)):
                 reset = window["window_minutes"] * 60
-            found[label] = {"used": float(used), "reset": _utc_epoch(reset, now, relative)}
+            found[label] = {"used": float(used), "reset": _utc_epoch(reset, now, relative),
+                            "minutes": _minutes(window.get("window_minutes")),
+                            "observed": _observed(item)}
     return found
+
+
+def _minutes(value: Any) -> Optional[float]:
+    """A window length in minutes, or None when codex did not give one."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _observed(item: Any) -> Optional[str]:
+    """When codex wrote the session line, in UTC: the reading's real age. The
+    record's as_of is when the station collected it, so a reading from a
+    codex that last ran days ago looked minutes old on the Usage view."""
+    stamp = item.get("timestamp") if isinstance(item, dict) else None
+    if not isinstance(stamp, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment.astimezone(timezone.utc).isoformat() if moment.tzinfo else None
 
 
 # The newest reading is at the end of the newest session file. Reading every
@@ -116,8 +139,14 @@ def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]
 
 def codex_records(lanes: List[str], sessions: Path, now: float) -> List[Dict[str, Any]]:
     found = _read_codex_sessions(sessions, now)
-    return [_record("codex", lanes, window, data["used"], None, "percent", data["reset"],
-                    "codex session logs", now) for window, data in found.items()] or [
+    records = []
+    for window, data in found.items():
+        record = _record("codex", lanes, window, data["used"], None, "percent", data["reset"],
+                         "codex session logs", now)
+        record["window_minutes"] = data["minutes"]
+        record["observed_at"] = data["observed"]
+        records.append(record)
+    return records or [
         _record("codex", lanes, "all", None, None, None, None, "codex session logs", now,
                 "rate-limit fields not found")]
 

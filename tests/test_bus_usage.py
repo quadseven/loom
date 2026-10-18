@@ -88,6 +88,28 @@ class UsageTests(unittest.TestCase):
         self.assertEqual([(row["window"], row["used_pct"]) for row in rows],
                          [("5-hour", 63.0), ("weekly", 86.0)])
 
+    def test_codex_records_carry_when_codex_wrote_the_reading_and_the_window_length(self):
+        # as_of is when the station collected the reading; a codex that last
+        # ran hours ago wrote it then, and the Usage view must say so.
+        sessions = Path(self.home) / "sessions"
+        sessions.mkdir()
+        (sessions / "current.jsonl").write_text(json.dumps({
+            "timestamp": "2026-10-14T17:35:00.250Z", "type": "event_msg",
+            "payload": {"rate_limits": {"primary": {"used_percent": 5.0, "window_minutes": 300,
+                                                    "resets_at": 1792005045}}}}) + "\n")
+        row = usage.codex_records(["codex"], sessions, 1792000000)[0]
+        self.assertEqual(row["observed_at"], "2026-10-14T17:35:00.250000+00:00")
+        self.assertEqual(row["window_minutes"], 300)
+        self.assertEqual(row["as_of"], "2026-10-14T17:46:40+00:00")
+
+    def test_codex_reading_without_a_timestamp_has_no_observed_time(self):
+        sessions = Path(self.home) / "sessions"
+        sessions.mkdir()
+        (sessions / "old.jsonl").write_text(self._limit_line(12) + "\n")
+        row = usage.codex_records(["codex"], sessions, 1000)[0]
+        self.assertIsNone(row["observed_at"])
+        self.assertEqual(row["window_minutes"], 300)
+
     def test_each_record_carries_why_its_held_lanes_are_held(self):
         state = Path(self.home) / "state" / "usage"
         state.mkdir(parents=True)
