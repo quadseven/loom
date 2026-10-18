@@ -428,8 +428,14 @@ class Settings:
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
                  ship_on_merge: Sequence[str] = (),
-                 ship_workflows: Optional[Dict[str, str]] = None) -> None:
+                 ship_workflows: Optional[Dict[str, str]] = None,
+                 no_topup: Sequence[str] = ()) -> None:
         self.home = home
+        # LOOM_NO_TOPUP: provider lanes (anthropic) whose credit the operator
+        # never tops up. Their slots held out of credit wait for the credit
+        # to renew, so the lane-held invariant skips them. Empty (the
+        # default) keeps the invariant on every held lane.
+        self.no_topup = [lane.lower() for lane in no_topup]
         # Repos whose merged tickets ship at merge (ship_on_merge), and repos
         # whose merged tickets ship when their deploy workflow succeeds on the
         # merge commit, repo to workflow file (ship_workflows).
@@ -553,7 +559,8 @@ class Settings:
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
                    ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
-                   ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")))
+                   ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")),
+                   no_topup=words("LOOM_NO_TOPUP"))
 
 
 def _ship_workflows(items: List[str]) -> Dict[str, str]:
@@ -1735,7 +1742,12 @@ class Station:
 
     def limited_lanes(self) -> List[str]:
         """Lanes whose fresh heartbeat says unavailable at a limit."""
-        out = []
+        return list(self._limit_reasons())
+
+    def _limit_reasons(self) -> Dict[str, str]:
+        """Lane -> the reason of its fresh heartbeat that says unavailable
+        at a limit."""
+        out: Dict[str, str] = {}
         for lane in LANES:
             beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                               None, strict=False)
@@ -1744,9 +1756,18 @@ class Station:
             at = beat.get("at")
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 continue
-            if beat_fresh(at, self.now) and str(beat.get("reason") or "").startswith(LIMIT):
-                out.append(lane)
+            reason = str(beat.get("reason") or "")
+            if beat_fresh(at, self.now) and reason.startswith(LIMIT):
+                out[lane] = reason
         return out
+
+    def _no_topup_lanes(self) -> Tuple[str, ...]:
+        """The lanes held out of credit on a LOOM_NO_TOPUP provider: they
+        wait for the credit to renew, as the operator chose."""
+        if not self.s.no_topup:
+            return ()
+        return tuple(lane for lane, reason in self._limit_reasons().items()
+                     if provider(lane) in self.s.no_topup and usage.OUT_OF_CREDIT in reason)
 
     def model_limits(self) -> Dict[str, Dict[str, float]]:
         """Lane -> {model: epoch its limit lifts}, from each fresh heartbeat's
@@ -5374,6 +5395,7 @@ class Station:
             except (GitHubError, OSError) as err:
                 _say("invariants: could not read %s: %s" % (name, err))
         facts.held = state["held"] = self._invariant_held(state.get("held"))
+        facts.no_topup = self._no_topup_lanes()
         facts.label_refusals = self._labeler_refusals()
         gate_held = self._invariant_gate_held(state.get("gate_held"))
         state["gate_held"] = gate_held
@@ -5391,7 +5413,8 @@ class Station:
                      default=None)
         if newest is not None:
             facts.brain_seen = state["brain_seen"] = newest
-        if any(self.now - since > invariants.HELD_MAX for since in facts.held.values()):
+        if any(self.now - since > invariants.HELD_MAX and lane not in facts.no_topup
+               for lane, since in facts.held.items()):
             try:
                 facts.queued = self._invariant_queued()
             except RateLimited:
@@ -5461,16 +5484,23 @@ class Station:
         return journals, posts
 
     def _invariant_queued(self) -> List[Tuple[invariants.Ref, Tuple[str, ...]]]:
-        """Each trusted queued ticket and the lanes of its difficulty tier."""
+        """Each trusted, truly queued ticket and the lanes of its difficulty
+        tier: loom:queued its only state label, and not another operator's.
+        A ticket still marked queued beside a later state (shipped, merged)
+        or claimed by another operator waits for no lane; counting those
+        named shipped tickets as queued (loom#399)."""
+        states = {"loom:" + name for name in brain.STATES}
         out = []
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
             for issue in self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo):
                 if (not isinstance(issue, dict) or "pull_request" in issue
-                        or "loom:queued" not in _label_names(issue)
+                        or states.intersection(_label_names(issue)) != {"loom:queued"}
                         or not tickets.brief_author_trusted(issue, self.s.authors,
-                                                            self.s.briefers)):
+                                                            self.s.briefers)
+                        or tickets.owned_elsewhere(issue, self.s.authors,
+                                                   self.s.briefers) is not None):
                     continue
                 ref = self._invariant_ref(repo, int(issue["number"]))
                 if repo not in self._publics:

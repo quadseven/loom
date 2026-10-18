@@ -638,7 +638,13 @@ Each invariant is one function returning breaches with evidence:
 - A `loom:metrics` line posted more than once for one day, or two
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
-- A lane held by a limit for over 2 hours while tickets of its tier are queued.
+- A lane held by a limit for over 2 hours while tickets of its tier are
+  queued. Only truly queued tickets count: `loom:queued` is their only state
+  label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
+  provider lanes whose credit the operator never tops up (for example
+  `anthropic`); a slot of one held out of credit is skipped, since it waits
+  for the credit to renew and nothing is briefed onto it meanwhile. Unset,
+  every held lane counts.
 - The epic shape (decision 0003): a goal home with open `loom:ticket` issues
   under no epic (one breach per goal), an epic holding more than 15 tickets,
   a goal with more open epics than its cap (6, or the goal home's
