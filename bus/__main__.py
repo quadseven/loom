@@ -4,10 +4,10 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import List, Optional
+from typing import Callable, List, Optional
 
-from . import journal, labels, lock, station
-from .github import GitHub, GitHubError, auth_from_env
+from . import app, journal, labels, lock, station
+from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
@@ -15,6 +15,21 @@ REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 def _repo(value: str) -> str:
     if not REPO_RE.fullmatch(value):
         raise argparse.ArgumentTypeError("expected OWNER/NAME, got %r" % value)
+    return value
+
+
+LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+
+
+def _login(value: str) -> str:
+    if not LOGIN_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError("expected a GitHub login, got %r" % value)
+    return value
+
+
+def _number(value: str) -> str:
+    if not value.isdigit():
+        raise argparse.ArgumentTypeError("expected a number, got %r" % value)
     return value
 
 
@@ -42,6 +57,16 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--file", required=True)
     s.add_argument("--holder", help="the brain posting a journal; adds its Tick line when missing")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
+    s = sub.add_parser("app", help="set up the Loom's own GitHub App")
+    app_sub = s.add_subparsers(dest="app_command", required=True)
+    a = app_sub.add_parser("manifest", help="print the App manifest and the page that creates it")
+    a.add_argument("--owner", required=True, type=_login, help="the user or organisation login")
+    a.add_argument("--org", action="store_true", help="the owner is an organisation")
+    a.add_argument("--name", help="the App's name (default loom-OWNER)")
+    a.add_argument("--form", action="store_true",
+                   help="print an HTML page whose one button creates the App")
+    a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
+    a.add_argument("--app-id", required=True, type=_number)
     return p
 
 
@@ -67,8 +92,24 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     return 0
 
 
-def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None) -> int:
+def _app(args: argparse.Namespace, transport: Optional[Transport],
+         sign: Optional[Callable[[bytes, str], bytes]]) -> int:
+    if args.app_command == "manifest":
+        return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout)
+    try:
+        return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign)
+    except GitHubError as err:
+        print("error: %s" % err, file=sys.stderr)
+        return 2
+
+
+def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None,
+         app_transport: Optional[Transport] = None,
+         app_sign: Optional[Callable[[bytes, str], bytes]] = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "app":
+        # No personal token: the manifest needs none, and ids signs as the App.
+        return _app(args, app_transport, app_sign)
     if args.command == "station":
         try:
             return station.run(station.Settings.from_env(), gh)

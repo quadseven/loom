@@ -201,7 +201,17 @@ logins` names every login trusted. More than three briefed tickets refused in
 an hour for one untrusted labeller file the `untrusted-labeler` invariant,
 naming the login. The App needs contents,
 issues and pull requests read and write, and checks and actions read, on the
-scanned repos. The dashboard takes the same three settings when its host has
+scanned repos. To set one up, `python3 -m bus app manifest --owner OWNER`
+(add `--org` for an organisation) prints the create page and a manifest with
+exactly those permissions and no webhook; `--form` prints an HTML page whose
+one button creates the App. Install it on the repos in `LOOM_REPOS` only and
+generate a private key; then, with the key in `LOOM_GITHUB_APP_KEY_FILE` or
+`LOOM_GITHUB_APP_KEY_SSM`, `python3 -m bus app ids --app-id N` lists the
+installations and the repos each covers, prints the `LOOM_GITHUB_APP_ID` and
+`LOOM_GITHUB_APP_INSTALLATION_ID` lines to paste, and warns about a repo in
+`LOOM_REPOS` the installation misses, one it covers outside `LOOM_REPOS`, and
+a permission Loom needs that it lacks. It never prints or writes the key or
+the tokens it mints. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
 
