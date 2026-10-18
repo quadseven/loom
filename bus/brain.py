@@ -242,7 +242,9 @@ def _goal_comments(node: Optional[Dict[str, Any]],
     those by `authors` when given."""
     allowed = {a.lower() for a in authors} if authors else None
     found = []
-    for c in ((node or {}).get("comments") or {}).get("nodes") or []:
+    # A journal edited in place counts once per tick, at the tick's time.
+    nodes = ((node or {}).get("comments") or {}).get("nodes") or []
+    for c in handoff.expand_journals(nodes, at_key="createdAt"):
         login = rest_login(c.get("author")).lower()
         at = str(c.get("createdAt") or "")
         if _stamp(at) is None or (allowed is not None and login not in allowed):
@@ -1805,7 +1807,9 @@ def _journal_brief_done(gh: GitHub, repo: str, goal: int, holder: str, line: str
     body = "\n".join([JOURNAL_MARKER, "Tick %s, %s" % (_iso(datetime.now(timezone.utc)), holder),
                       "- Briefed: %s" % url, line])
     try:
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, goal), {"body": body})
+        # Into the holder's journal of the day, edited in place (bus/journal.py).
+        from . import journal
+        journal.post(gh, repo, goal, body, holder)
     except GitHubError as exc:
         raise GitHubError("filed %s, but its brief done marker was not posted (%s); put this "
                           "line in your journal: %s" % (url, exc, line), exc.status, exc.body) from exc

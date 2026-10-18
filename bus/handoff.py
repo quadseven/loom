@@ -30,6 +30,56 @@ _MARK = re.compile(
     r'<!-- loom:(defer|done) v1 stage=([a-z]+) item=(%s)(?: rev=(%s))?(?: key=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
     % (_ITEM, _REV, _KEY, _NOTE, _HOLDER, _NOTE))
 _TICK = re.compile(r"^Tick \S+, (%s)\s*$" % _HOLDER, re.M)
+_TICK_AT = re.compile(r"^Tick (\S+), (%s)\s*$" % _HOLDER, re.M)
+# A journal edited in place (bus/journal.py post) holds one holder's ticks of
+# one UTC day: the newest at the top, the earlier ones under this block,
+# newest first. Each new comment emailed the operator; an edit does not.
+EARLIER_OPEN = "<details><summary>Earlier ticks today</summary>"
+EARLIER_CLOSE = "</details>"
+
+
+def split_journal(body: str) -> List[Tuple[str, str]]:
+    """(tick time, journal body) for each tick of a journal comment, oldest
+    first. A journal with one tick comes back whole, its time from its Tick
+    line ("" when it has none)."""
+    if not body.startswith(JOURNAL_MARKER) or EARLIER_OPEN not in body:
+        tick = _TICK_AT.search(body)
+        return [(tick.group(1) if tick else "", body)]
+    top, _, earlier = body[len(JOURNAL_MARKER):].partition(EARLIER_OPEN)
+    earlier = earlier.rsplit(EARLIER_CLOSE, 1)[0]
+    sections = [top.strip("\n")]
+    starts = [m.start() for m in _TICK_AT.finditer(earlier)]
+    ends = starts[1:] + [len(earlier)]
+    sections += [earlier[a:b].strip("\n") for a, b in zip(starts, ends, strict=True)]
+    found = []
+    for section in sections:
+        if section.strip():
+            tick = _TICK_AT.search(section)
+            found.append((tick.group(1) if tick else "", JOURNAL_MARKER + "\n" + section))
+    return sorted(found, key=lambda part: part[0])
+
+
+def expand_journals(comments: Iterable[Any], at_key: str = "at",
+                    id_key: str = "id") -> List[Any]:
+    """Each journal comment edited in place as one comment per tick, oldest
+    first, with the tick's own time under at_key: the comment keeps the
+    createdAt of its first tick, so a tick's time is its Tick line. Every
+    other comment passes through unchanged. Ticks before the newest get
+    "<id>@<time>" as their id, so readers that skip a seen id keep them."""
+    out: List[Any] = []
+    for comment in comments:
+        body = str(comment.get("body") or "").lstrip() if isinstance(comment, dict) else ""
+        if not body.startswith(JOURNAL_MARKER) or EARLIER_OPEN not in body:
+            out.append(comment)
+            continue
+        parts = split_journal(body)
+        for index, (at, part) in enumerate(parts):
+            item = dict(comment, body=part)
+            item[at_key] = at or comment.get(at_key)
+            if index < len(parts) - 1 and comment.get(id_key) is not None:
+                item[id_key] = "%s@%s" % (comment[id_key], at)
+            out.append(item)
+    return out
 
 
 class Mark(NamedTuple):
@@ -90,7 +140,8 @@ def journals(comments: Iterable[Dict[str, Any]], authors: Sequence[str]) -> List
     {"body", "at", "login"}; anything else is data, never a handoff. GitHub
     logins ignore case, so the match does too."""
     allowed = {a.lower() for a in authors}
-    found = [c for c in comments if str(c.get("login") or "").lower() in allowed
+    found = [c for c in expand_journals(comments)
+             if str(c.get("login") or "").lower() in allowed
              and str(c.get("body") or "").startswith(JOURNAL_MARKER) and c.get("at")]
     return sorted(found, key=lambda c: str(c["at"]))
 

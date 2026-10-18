@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 from . import text as _text
 from .github import GitHub
-from .handoff import _TICK
+from .handoff import (EARLIER_CLOSE, EARLIER_OPEN, JOURNAL_MARKER as _MARKER, _TICK,
+                      journal_holder, split_journal)
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 REPORT_MARKER = "<!-- loom:report v1 -->"
@@ -146,16 +147,88 @@ def _check_report_gap(gh: GitHub, repo: str, issue_number: int, now: datetime,
         raise ReportTooSoon(hold_message(held, now))
 
 
+# GitHub refuses a comment over 65536 characters; an edited journal keeps
+# under this by dropping its oldest ticks.
+JOURNAL_MAX = 60000
+
+
+def merged(new: str, old: str, limit: int = JOURNAL_MAX) -> str:
+    """The journal `new` with the ticks of `old` (the holder's journal of the
+    same day) below it under the Earlier block, newest first, dropping the
+    oldest ticks until the whole fits `limit`."""
+    earlier = [part[len(_MARKER):].strip("\n") for _, part in reversed(split_journal(old))]
+    while earlier:
+        body = "%s\n\n%s\n\n%s\n\n%s" % (new.rstrip("\n"), EARLIER_OPEN,
+                                         "\n\n".join(earlier), EARLIER_CLOSE)
+        if len(body) <= limit:
+            return body
+        earlier.pop()
+    return new
+
+
+def _self_login(gh: GitHub) -> str:
+    """The login this client posts as: the App's bot login, else the token's
+    user (read once and kept on the client)."""
+    login = gh.app_login()
+    if login:
+        return login
+    if getattr(gh, "_journal_login", None) is None:
+        data = gh.rest("GET", "/user").data
+        gh._journal_login = str((data or {}).get("login") or "") if isinstance(data, dict) else ""
+    return gh._journal_login
+
+
+def todays_journal(gh: GitHub, repo: str, issue_number: int,
+                   text: str) -> Optional[Dict[str, Any]]:
+    """This client's journal comment for the same holder on the same UTC day
+    as `text`'s Tick line, the newest such; None when there is none. One read
+    of the day's comments (since= filters on the last edit)."""
+    tick = re.search(r"^Tick (\d{4}-\d{2}-\d{2})T\S*, (\S+)\s*$", text, re.M)
+    if not tick:
+        return None
+    day, holder = tick.group(1), tick.group(2)
+    me = _self_login(gh).lower()
+    found = None
+    for c in gh.paginate("/repos/%s/issues/%d/comments?since=%sT00:00:00Z&per_page=100"
+                         % (repo, int(issue_number), day)):
+        if _mine_today(c, me, day, holder) and (
+                found is None or str(c.get("created_at")) > str(found.get("created_at"))):
+            found = c
+    return found
+
+
+def _mine_today(c: Any, me: str, day: str, holder: str) -> bool:
+    """Whether comment c is this client's (login `me`) journal for `holder`,
+    created on UTC `day`: never another login's or another holder's."""
+    if not me or not isinstance(c, dict) or c.get("id") is None:
+        return False
+    body = str(c.get("body") or "")
+    return (str((c.get("user") or {}).get("login") or "").lower() == me
+            and body.startswith(_MARKER)
+            and str(c.get("created_at") or "")[:10] == day
+            and journal_holder({"body": body}) == holder)
+
+
 def post(gh: GitHub, repo: str, issue_number: int, text: str,
          holder: Optional[str] = None, trusted: Sequence[str] = (),
          now: Optional[datetime] = None):
-    """Post a journal, report or reply. A report is refused with ReportTooSoon,
-    and nothing posted, when another report went out on the same goal home
-    within REPORT_GAP (report_hold says whose count)."""
+    """Post a journal, report or reply. A journal edits this holder's journal
+    of the same UTC day in place, newest tick first, and is posted new only
+    for the day's first tick: each new comment emails the operator
+    (2026-10-18). A report is refused with ReportTooSoon, and nothing posted,
+    when another report went out on the same goal home within REPORT_GAP
+    (report_hold says whose count)."""
     if not (text.startswith((JOURNAL_MARKER, REPORT_MARKER)) or REPLY_RE.match(text)):
         raise ValueError("comment must start with a loom journal, report or reply marker")
     if text.startswith(JOURNAL_MARKER):
         text = with_tick(text, holder)
+        _text.check(text)
+        mine = todays_journal(gh, repo, issue_number, text)
+        if mine is not None:
+            body = merged(text, str(mine.get("body") or ""))
+            _text.check(body)
+            return gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(mine["id"])),
+                           {"body": body})
     _text.check(text)
     if text.startswith(REPORT_MARKER):
         _check_report_gap(gh, repo, issue_number, now or datetime.now(timezone.utc), trusted)
