@@ -4,7 +4,8 @@ The station runs Watcher.run each pass. For each watched component
 (LOOM_WATCH, lines of name=path; by default the station log, the brain log and
 each lane's service log) it reads the lines added since the last offset and
 keeps those that say error, failed, Traceback or refused, or carry an HTTP
-4xx/5xx. Each kept line is reduced to a signature: times, numbers, hex ids,
+4xx/5xx, but not the station's hold line ("x#5 waits for #3 (failed)"), which
+is status whatever state it names. Each kept line is reduced to a signature: times, numbers, hex ids,
 repos, issue numbers and paths become placeholders, so the same error on two
 repos is one signature.
 
@@ -55,6 +56,14 @@ HTTP_RE = re.compile(
     r"|not found|method not allowed|conflict|gone|unprocessable|too many requests"
     r"|internal server error|bad gateway|service unavailable|gateway time-?out))")
 KEEP_RE = re.compile(r"(?i)error|failed|traceback|refused")
+# The station's hold line (bus/station.py _try_ticket): a ticket waiting on
+# its After: tickets, each with its state label, said once a pass. A
+# dependency in loom:failed reads "(failed)", but the hold is status, not an
+# error: a failed ticket climbs the model ladder and usually lands, and a hold
+# past 48 hours is reported to the brain by the factory (loom#645, loom#646).
+_HOLD_REF = r"[A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)?#[0-9]+ \([a-z-]+\)"
+HOLD_RE = re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ waits for "
+                     + _HOLD_REF + r"(?:, " + _HOLD_REF + r")*[ \t]*")
 TRACEBACK = "Traceback (most recent call last)"
 
 _TIME_RE = re.compile(
@@ -150,7 +159,10 @@ def redact(line: str) -> str:
 
 
 def keep(line: str) -> bool:
-    """A line worth a signature: it names an error or an HTTP 4xx/5xx."""
+    """A line worth a signature: it names an error or an HTTP 4xx/5xx. The
+    station's hold line is status, whatever state word it names."""
+    if HOLD_RE.fullmatch(_LEAD_RE.sub("", line).rstrip("\r\n")):
+        return False
     return bool(KEEP_RE.search(line) or HTTP_RE.search(line))
 
 

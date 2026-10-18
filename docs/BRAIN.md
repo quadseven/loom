@@ -223,7 +223,12 @@ lane reads. `bus.brain brief --not-before` writes `Not before: <UTC time>`;
 merged, that is, until its state label is `loom:merged`, `loom:shipped` or
 `loom:verified` (the station reconciles pull requests to that state before it
 claims anything). A named ticket that is still open without one of those
-labels holds the ticket too, and so does one that cannot be read at all. The
+labels holds the ticket too, and so does one that cannot be read at all. A
+named ticket in `loom:failed` holds as well: a failed ticket climbs the model
+ladder and usually lands, so the hold waits for it rather than failing or
+releasing this one. The station's log line for a hold names each state
+("waits for #3 (failed)"); it is status, and the log watcher files nothing for
+it. The
 hold is a claim-time rule, not a state: the ticket keeps its lane and its
 `loom:briefed` label, and the factory does not count it as stalled, so it
 climbs no rung of the model ladder.
