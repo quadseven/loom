@@ -217,6 +217,42 @@ class AcceptanceTest(StationBase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].reason, hashlib.sha256(private_value.encode()).hexdigest())
 
+    def unwritable_event_log(self):
+        """A home whose logs directory cannot be made: a plain file sits on
+        its path, so every event-log open raises an OSError."""
+        os.makedirs(self.home, exist_ok=True)
+        with open(os.path.join(self.home, "logs"), "w", encoding="utf-8") as fh:
+            fh.write("not a directory")
+
+    def test_an_event_log_that_cannot_be_written_does_not_fail_the_decision(self):
+        # loom#763: _event let a disk error escape into _refuse and the
+        # rewrite loop, so one lost log line failed the whole decision.
+        self.unwritable_event_log()
+        st = station.Station(self.gh, self.settings, now=T0)
+        orig = station._say
+        station._say = self.said.append
+        try:
+            st._event("rewrite_skipped", "no agent command for this repo", "x/y#1")
+        finally:
+            station._say = orig
+        self.assertTrue(any("event log" in line for line in self.said), self.said)
+
+    def test_an_event_log_that_cannot_be_read_leaves_only_events_unknown(self):
+        # loom#763: _invariant_facts reads each source on its own, but the
+        # event log was read outside that guard, so one unreadable log dir
+        # made every invariant find nothing this pass.
+        self.unwritable_event_log()
+        st = station.Station(self.gh, self.settings, now=T0)
+        orig = station._say
+        station._say = self.said.append
+        try:
+            facts = st._invariant_facts({})
+        finally:
+            station._say = orig
+        self.assertIsNone(facts.events)
+        self.assertIsNotNone(facts.held)
+        self.assertTrue(any("could not read events" in line for line in self.said), self.said)
+
     def test_repeated_rewrite_skip_files_once_across_two_hours(self):
         path = os.path.join(self.home, "logs", "events.jsonl")
         os.makedirs(os.path.dirname(path))
