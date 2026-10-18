@@ -802,7 +802,11 @@ LOOM_OPENCODE_GO_3_OPENCODE=/path/to/opencode2/bin/opencode lanes/mac/install.sh
 names the opencode binary; without it a lane runs `opencode` from PATH. Before
 each run the runner asks the binary for `--version`; when it prints
 `opencode v2.` the runner starts `opencode serve` with a fresh password on a
-random high loopback port inside the agent's sandbox. It allows only that
+random high loopback port (49152-65535) inside the agent's sandbox. The
+port must bind free on 127.0.0.1 when picked, and the server does not start
+if something listens on it by the time it would, so the agent never talks to
+another process's listener. When no port can be had, the run parks with the
+reason in its log. It allows only that
 port through the sandbox's loopback deny, waits up to 15 seconds for the
 server, and calls `run --server` with `--auto`. The server stops when the run
 ends, including on failure or timeout. The sandbox lets the
