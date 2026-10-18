@@ -77,6 +77,8 @@ State chips (pill, mono 12, only states with tickets) + goal chips; grid of tick
     - `role:runner log` -> **runner**, mono 11.5
     - PR review threads interleave by timestamp as **grug** (red-bordered quote) and **answered** (lane reply).
   - Running tickets append a live row (amber dot, "thinking... streaming from <slot>"); poll for new events every few seconds.
+    Only while the newest claim has no outcome yet: when that attempt ended on a limit the row says what it
+    waits for and until when, and when it failed it says so (dashboard/ticket.py attempt_status).
 - **PR**: checks list, files with +/-, grug threads (severity / open/resolved), "Across all attempts" summary (what the failing attempts had in common), and a Proof card (waiting amber / seen live green).
 
 ### Brain
