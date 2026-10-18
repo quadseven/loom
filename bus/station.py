@@ -122,7 +122,10 @@ DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
 HUMAN_HEAD = "Waiting on you"
-HUMAN_SHOWN = 15
+HUMAN_SHOWN = 5
+# A report first line whose only count is work in flight: the digest counts
+# that goal as quiet.
+IN_FLIGHT_ONLY_RE = re.compile(r"\A\d+ in flight( since the last report)?\.?\Z", re.I)
 HUMAN_TITLE_MAX = 100
 HUMAN_ASK_MAX = 140
 # When every ask does not fit in the daily notification, the full digest is a
@@ -4910,7 +4913,10 @@ class Station:
                 body = self._report_body(comment)
                 first = next((x.lstrip("#").strip() for x in body.splitlines()
                               if x.lstrip("#").strip()), "")
-                if not first or first.lower().startswith("nothing moved"):
+                if not first or first.lower().startswith("nothing moved") \
+                        or IN_FLIGHT_ONLY_RE.match(first):
+                    # Work only in flight is not news: 18 such lines made
+                    # every digest list every goal (2026-10-18).
                     quiet += 1
                     continue
                 moving.append("- **%s** %s <%s>" % (
