@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -407,6 +408,14 @@ class StationTest(StationBase):
         self.run_at(T0)
         self.assertEqual(self.gh.filed(), [], self.said)
 
+    def test_repeated_untrusted_labeler_refusals_open_the_invariant_once(self):
+        refusals = os.path.join(self.home, "state", "station", "labeler_refusals.json")
+        self.write(refusals, json.dumps({"loom-app[bot]": [T0 - 60 * n for n in range(1, 5)]}))
+        self.run_at(T0)
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        (issue,) = self.gh.filed()
+        self.assertIn("loom-app[bot]", issue["title"])
+
     def test_breaches_wait_while_the_github_budget_is_low(self):
         self.unlinked_goal()
         self.gh.rate = {"core": (10, 5000, int(T0) + 3600)}
@@ -640,6 +649,15 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(len(invariants.gate_hold(Facts(T0, gate_held={"k": hold}))), 1)
         # A claim for the goal succeeded, so the station no longer holds it.
         self.assertEqual(invariants.gate_hold(Facts(T0, gate_held={})), [])
+
+    def test_a_login_refused_three_times_in_the_hour_is_not_a_breach(self):
+        self.assertEqual(invariants.untrusted_labeler(Facts(T0, label_refusals={"x[bot]": 3})), [])
+        self.assertEqual(invariants.untrusted_labeler(Facts(T0)), [])
+
+    def test_a_login_refused_four_times_in_the_hour_names_the_login(self):
+        (b,) = invariants.untrusted_labeler(Facts(T0, label_refusals={"loom-app[bot]": 4}))
+        self.assertIn("loom-app[bot]", b.title)
+        self.assertIn("LOOM_BRIEF_AUTHORS", " ".join(b.evidence))
 
     def pull(self, at, number=534, ticket=481, labels=("loom:ticket", "loom:pr"),
              drives=True, threads=0, fix_pending=False):

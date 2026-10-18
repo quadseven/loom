@@ -330,6 +330,7 @@ class GitHub:
         self.app: Optional[AppToken] = token if isinstance(token, AppToken) else None
         # What the budget lines name: an App installation or a personal token.
         self.auth = "app" if self.app is not None else "token"
+        self._app_login: Optional[str] = None
         self._sleep = sleep
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
@@ -463,6 +464,29 @@ class GitHub:
         if not isinstance(token, str) or not token.strip():
             raise GitHubError("the installation token answer has no token", status)
         return token.strip(), data.get("expires_at")
+
+    def app_login(self) -> Optional[str]:
+        """The App's own bot login, "<slug>[bot]", read once from GET /app
+        with the App's JWT; None when this client holds a personal token.
+        This is the login GitHub gives the labels and comments the App
+        writes (loom#660)."""
+        if self.app is None:
+            return None
+        if self._app_login is None:
+            headers = {"Authorization": "Bearer " + self.app.jwt(),
+                       "Accept": "application/vnd.github+json",
+                       "X-GitHub-Api-Version": "2022-11-28",
+                       "User-Agent": "loom-bus"}
+            status, _, raw = self._transport_with_retry("GET", self._url("/app"), headers, None)
+            with self._count_lock:
+                self.kinds["app login"] = self.kinds.get("app login", 0) + 1
+            data = _json_or_none((raw or b"").decode("utf-8", "replace"))
+            slug = data.get("slug") if isinstance(data, dict) else None
+            if status != 200 or not isinstance(slug, str) or not slug.strip():
+                raise GitHubError("could not read the GitHub App's slug: GET /app -> %d" % status,
+                                  status)
+            self._app_login = slug.strip() + "[bot]"
+        return self._app_login
 
     def _send(self, method: str, url: str, headers: Dict[str, str],
               payload: Optional[bytes]) -> Tuple[int, Dict[str, str], str]:

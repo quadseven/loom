@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, proof, spend, station, tickets  # noqa: E402
-from bus.github import GitHub  # noqa: E402
+from bus.github import AppToken, GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
 AUTHORS = ["alice-example", "bob-example"]
@@ -1268,6 +1268,8 @@ class BudgetTest(Base):
             if method == "POST" and "/app/installations/" in url:
                 answer = {"token": "ghs_" + "x" * 396, "expires_at": "2099-01-01T00:00:00Z"}
                 return 201, {}, json.dumps(answer).encode()
+            if method == "GET" and url.endswith("/app"):
+                return 200, {}, json.dumps({"slug": "loom-app"}).encode()
             bearers.append(headers_in["Authorization"])
             return transport(method, url, headers_in, body)
         app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
@@ -1283,14 +1285,15 @@ class BudgetTest(Base):
         sent = []
 
         def refusing(method, url, headers_in, body):
-            sent.append((method, headers_in.get("Authorization", "")))
+            sent.append((method, url.rsplit("/", 1)[-1]))
             return 401, {}, json.dumps({"message": "Bad credentials"}).encode()
         app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
         _, err = self.passes(gh=GitHub(app, transport=refusing))
         self.assertIn("could not mint the GitHub App installation token", err)
         self.assertIn("(Bad credentials)", err)
-        # Every request was a mint: none went out with a personal token.
-        self.assertEqual({m for m, _ in sent}, {"POST"})
+        # Every request was the App's own login read or a mint: none went out
+        # with a personal token.
+        self.assertEqual(set(sent), {("GET", "app"), ("POST", "access_tokens")})
 
     def test_an_idle_repo_is_scanned_once_per_ten_minutes(self):
         start = time.time()
@@ -5991,3 +5994,51 @@ class OwnershipHelpersTest(unittest.TestCase):
             {"number": 2, "assignees": []}]
         with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS)}):
             self.assertEqual([i["number"] for i in rewrite.candidates(fake, REPO)], [2])
+
+
+class AppLoginTrustTest(Base):
+    """The Loom App's own bot login is trusted without listing it (loom#660)."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.authors = ["alice-example"]
+
+    def app_github(self):
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if method == "POST" and path.endswith("/access_tokens"):
+                return reply(201, {"token": "t", "expires_at": "2099-01-01T00:00:00Z"})
+            if method == "GET" and path == "/app":
+                return reply(200, {"slug": "loom-app"})
+            return self.fake(method, url, headers, body)
+        app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
+        return GitHub(app, transport=transport)
+
+    def brief_by(self, number, labeller):
+        self.fake.add(number, events=[labeled("loom:briefed", labeller),
+                                      labeled("lane:codex", labeller)])
+
+    def test_a_ticket_briefed_by_the_apps_bot_login_is_claimed(self):
+        self.brief_by(12, "loom-app[bot]")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(station.run(self.settings, self.app_github()), 0)
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("trusting briefing logins: alice-example loom-app[bot]", err.getvalue())
+
+    def test_without_app_settings_the_bot_login_is_not_trusted(self):
+        self.brief_by(12, "loom-app[bot]")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("trusting briefing logins: alice-example\n", err.getvalue())
+
+    def test_refusals_for_an_untrusted_labeler_are_counted_per_login(self):
+        for number in (12, 13):
+            self.brief_by(number, "stranger[bot]")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_pass()
+        path = os.path.join(self.home, "state", "station", "labeler_refusals.json")
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(len(json.load(fh)["stranger[bot]"]), 2)
