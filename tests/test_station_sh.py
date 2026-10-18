@@ -19,6 +19,11 @@ if [ "${FAKE_FAIL:-}" = 1 ]; then echo 'API rate limit exceeded' >&2; exit 1; fi
 case "$*" in
   *loom:revert*) jq -n --arg body "${FAKE_REVERTS:-}" '[{"body":$body,"labels":[]}]' ;;
   *)
+    for green in ${FAKE_GREEN:-}; do
+      case "$*" in *"$green"*)
+        printf '{"check_runs":[{"conclusion":"success","status":"completed"}]}\\n'; exit 0 ;;
+      esac
+    done
     if [ "${FAKE_CHECK_STATE:-completed}" = in_progress ]; then
       printf '{"check_runs":[{"conclusion":null,"status":"in_progress"}]}\\n'
     else
@@ -130,6 +135,27 @@ class StationScriptTest(unittest.TestCase):
         self.assertEqual(self.head(), before)
         self.assertIn("not deploying: the CI check could not be read", result.stdout)
         self.assertIn("API rate limit exceeded", result.stdout)
+
+    def test_a_pending_head_deploys_the_newest_commit_that_passed(self):
+        # 2026-10-18: merges landed faster than CI cleared them, and waiting
+        # for the head alone deployed nothing for over an hour.
+        older = self.push_change("two\n")
+        newest = self.push_change("three\n")
+        result = self.run_script(FAKE_CHECK_STATE="in_progress", FAKE_GREEN=older)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.head(), older)
+        self.assertIn("deploying %s, the newest commit unittest passed on, while %s waits"
+                      % (older[:12], newest[:12]), result.stdout)
+        self.assertEqual(self.deployed()["revision"], older)
+
+    def test_with_no_older_commit_passed_nothing_deploys(self):
+        before = self.head()
+        self.push_change("two\n")
+        self.push_change("three\n")
+        result = self.run_script(FAKE_CHECK_STATE="in_progress")
+        self.assertEqual(self.head(), before)
+        self.assertNotIn("deploy", result.stdout.replace("not deploying", ""))
+        self.assertIsNone(self.deployed())
 
     def test_a_pending_check_says_which_state_is_waiting(self):
         before = self.head()
