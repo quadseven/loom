@@ -2044,6 +2044,33 @@ def _review_check_line(gh: GitHub, repo: str, check: str) -> str:
             % (check, len(prs), repo, ", ".join("#%s" % p["number"] for p in prs)))
 
 
+def _backlog_home(gh: GitHub, repo: str, lines: List[str]) -> Optional[int]:
+    """The repo's backlog goal home, opened when none is open; one opened
+    before the loom:backlog label existed is labelled. Found by its label,
+    by the old "Backlog:" title prefix, or by its title. Appends what it did
+    to `lines`; None when GitHub named no number for a new one."""
+    title = backlog_title(repo)
+    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
+    found = sorted((g for g in goals if isinstance(g, dict) and "pull_request" not in g
+                    and (naming.is_backlog_home(g) or g.get("title") == title)),
+                   key=lambda g: int(g.get("number") or 0))
+    if found:
+        number = int(found[0]["number"])
+        lines.append("backlog goal home: #%d, already open" % number)
+        if naming.BACKLOG_LABEL not in naming.label_names(found[0]):
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": [naming.BACKLOG_LABEL]})
+            lines.append("backlog goal home: #%d, labelled %s" % (number, naming.BACKLOG_LABEL))
+        return number
+    body = _backlog_body(repo)
+    _check_written_text(body)
+    made = gh.rest("POST", "/repos/%s/issues" % repo,
+                   {"title": title, "body": body,
+                    "labels": [naming.GOAL_LABEL, naming.BACKLOG_LABEL]}).data or {}
+    lines.append("backlog goal home: #%s, created" % made.get("number"))
+    return int(made["number"]) if made.get("number") else None
+
+
 def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
             env: Optional[Dict[str, str]] = None) -> List[str]:
     """Make a repo ready for Loom: the labels, one backlog goal home, a check
@@ -2060,30 +2087,9 @@ def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
                            if info.get("private") else "public")]
     changed = labels.ensure_labels(gh, repo)
     lines.append("labels: %s" % (", ".join(changed) if changed else "no changes"))
-    title = backlog_title(repo)
-    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
-    # The home is found by its label; one opened before the label existed is
-    # found by its old title prefix, or by this title.
-    home = sorted((g for g in goals if isinstance(g, dict) and "pull_request" not in g
-                   and (naming.is_backlog_home(g) or g.get("title") == title)),
-                  key=lambda g: int(g.get("number") or 0))
-    if home:
-        lines.append("backlog goal home: #%s, already open" % home[0]["number"])
-        if naming.BACKLOG_LABEL not in naming.label_names(home[0]):
-            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(home[0]["number"])),
-                    {"labels": [naming.BACKLOG_LABEL]})
-            lines.append("backlog goal home: #%s, labelled %s"
-                         % (home[0]["number"], naming.BACKLOG_LABEL))
-    else:
-        body = _backlog_body(repo)
-        _check_written_text(body)
-        made = gh.rest("POST", "/repos/%s/issues" % repo,
-                       {"title": title, "body": body,
-                        "labels": [naming.GOAL_LABEL, naming.BACKLOG_LABEL]}).data or {}
-        lines.append("backlog goal home: #%s, created" % made.get("number"))
-        home = [made] if made.get("number") else []
-    if home:
-        lines.append("intake epic: #%d" % intake_epic(gh, repo, int(home[0]["number"])))
+    home = _backlog_home(gh, repo, lines)
+    if home is not None:
+        lines.append("intake epic: #%d" % intake_epic(gh, repo, home))
     lines.append(_review_check_line(gh, repo, check))
     repos = env.get("LOOM_REPOS", "").replace(",", " ").split()
     if repo not in repos:
