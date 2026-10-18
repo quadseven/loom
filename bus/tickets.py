@@ -45,6 +45,15 @@ def merged_before_regression_requeue(issue: Dict[str, Any], merged_at: Any,
     if not merged_at or "loom:regression" not in {
             label.get("name") for label in issue.get("labels", [])}:
         return False
+    return merged_before_requeue(merged_at, events)
+
+
+def merged_before_requeue(merged_at: Any, events: Iterable[Dict[str, Any]]) -> bool:
+    """Whether a merged PR predates the ticket's latest loom:queued or
+    loom:briefed label: the ticket was sent back for work after that merge,
+    so the merge cannot deliver it."""
+    if not merged_at:
+        return False
     requeues = [_utc_timestamp(event["created_at"]) for event in events
                 if isinstance(event, dict) and event.get("event") == "labeled"
                 and (event.get("label") or {}).get("name") in ("loom:queued", "loom:briefed")

@@ -730,6 +730,63 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:closed-unmerged", self.fake.names(12))
 
+    def merged_pr(self, number=12, author="alice-example", head_repo=REPO):
+        return {"number": 99, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                "user": {"login": author}, "body": "Why.\n\nRefs #%d\n" % number,
+                "head": {"ref": "fix/%d" % number, "repo": {"full_name": head_repo}}}
+
+    def test_a_pull_request_merged_while_the_ticket_waits_moves_it_to_merged(self):
+        # loom#784: loom#633 sat at briefed after a fix round, its pull
+        # request merged, and the ticket kept climbing the ladder.
+        for state in ("briefed", "queued"):
+            with self.subTest(state=state):
+                self.fake.add(12, state=state)
+                self.fake.pulls = [self.merged_pr()]
+                station.Station(GitHub("token", transport=self.fake),
+                                self.settings).reconcile_pull_requests()
+                self.assertIn("loom:merged", self.fake.names(12))
+                self.assertNotIn("loom:" + state, self.fake.names(12))
+                self.assertIn("Pull request #99 merged while this ticket was at loom:" + state,
+                              self.fake.comments[12][-1]["body"])
+
+    def test_a_merged_pull_request_that_may_not_deliver_moves_nothing(self):
+        cases = {
+            "untrusted author": self.merged_pr(author="stranger"),
+            "fork": self.merged_pr(head_repo="fork-owner/example-repo"),
+            "requeued after the merge": self.merged_pr(),
+            "another ticket": self.merged_pr(number=13),
+        }
+        for name, pr in cases.items():
+            with self.subTest(name):
+                self.fake.add(12, state="briefed")
+                if name == "requeued after the merge":
+                    self.fake.events[12].append(
+                        {"event": "labeled", "label": {"name": "loom:briefed"},
+                         "actor": {"login": "alice-example"},
+                         "created_at": "2030-01-03T00:00:00Z"})
+                self.fake.pulls = [pr]
+                station.Station(GitHub("token", transport=self.fake),
+                                self.settings).reconcile_pull_requests()
+                self.assertIn("loom:briefed", self.fake.names(12))
+                self.assertNotIn("loom:merged", self.fake.names(12))
+                self.assertEqual(self.fake.comments[12], [])
+
+    def test_a_contributors_merged_pull_request_delivers_the_queued_ticket_they_own(self):
+        self.fake.add(12, state="queued")
+        self.fake.issues[12]["labels"].append({"name": "claim:dana-example"})
+        self.fake.pulls = [self.contributor_pr(state="closed", merged_at="2030-01-02T00:00:00Z")]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        # The same pull request by someone who does not own the ticket.
+        self.fake.add(13, state="queued")
+        pr = self.contributor_pr(author="erin-example", state="closed",
+                                 merged_at="2030-01-02T00:00:00Z")
+        pr["body"] = "Refs #13\n"
+        self.fake.pulls = [pr]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:queued", self.fake.names(13))
+
     def test_a_refs_line_for_another_repo_does_not_link(self):
         self.fake.add(12, state="pr")
         self.fake.pulls = [{"number": 99, "state": "closed",
