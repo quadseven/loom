@@ -5527,6 +5527,17 @@ class VerifyDispatchTest(Base):
         self.assertIn("loom:shipped", self.fake.names(2))
         self.assertEqual(self.fake.paths("PUT"), [])
 
+    def test_verify_brief_carries_a_proof_template_with_every_required_key(self):
+        self.run_pass()
+        text = self.text()
+        block = re.search(r"```json\n(.*?)\n```", text, re.S)
+        self.assertIsNotNone(block)
+        template = json.loads(block.group(1))
+        self.assertLessEqual(set(proof.REQUIRED["runtime"]), set(template))
+        self.assertEqual([c["criterion"] for c in template["criteria"]],
+                         [t for _, t in proof.criteria(SHIPPED_BODY)])
+        self.assertEqual(set(template["observed"]), {"start", "end"})
+
     def test_verify_brief_quotes_each_requested_log_line_with_a_twenty_line_cap(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "the daily line shows it", "see `server ready` and `presence flag:` in the log")
