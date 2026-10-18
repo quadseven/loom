@@ -6110,6 +6110,35 @@ class VerifyDispatchTest(Base):
         self.assertIn("timed out", self.text())
         self.assertNotIn("presence flag: safe", self.text())
 
+    def test_no_log_line_for_the_live_criterion_spends_no_verify_run(self):
+        # 2026-10-18: a live criterion waiting on a rare in-game event got
+        # a verify run and an emailed comment every 6 hours for days.
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "the daily line shows it", "see `presence flag:` in the log")
+        self.settings.evidence_cmds = {REPO: "fake evidence command"}
+        with mock.patch.object(station.evidence.subprocess, "Popen") as popen:
+            popen.return_value.communicate.return_value = ("other line\n", "")
+            popen.return_value.returncode = 0
+            self.run_pass()
+        # Ticket 2 gets no run; the free slot goes to the next due ticket.
+        self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:awaiting-evidence", self.fake.names(2))
+        self.assertEqual(self.fake.comments[2], [])
+        self.assertEqual(popen.call_count, 1)
+
+    def test_a_log_line_for_the_live_criterion_hands_the_run_and_quotes_it_once(self):
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "the daily line shows it", "see `presence flag:` in the log")
+        self.settings.evidence_cmds = {REPO: "fake evidence command"}
+        with mock.patch.object(station.evidence.subprocess, "Popen") as popen:
+            popen.return_value.communicate.return_value = ("presence flag: safe\n", "")
+            popen.return_value.returncode = 0
+            self.run_pass()
+        self.assertEqual(len(self.briefs()), 1)
+        self.assertIn("presence flag: safe", self.text())
+        # The gate's read is the brief's: the command runs once per needle.
+        self.assertEqual(popen.call_count, 1)
+
     def test_repo_without_evidence_command_runs_nothing(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "the daily line shows it", "see `presence flag:` in the log")
@@ -6462,16 +6491,15 @@ class VerifyResultTest(Base):
         self.run_pass()
         self.assertEqual(proof.read(self.proofs()[0])["verified_by"], "codex/unknown")
 
-    def test_an_invalid_proof_leaves_the_ticket_shipped_with_one_note(self):
+    def test_an_invalid_proof_leaves_the_ticket_shipped_with_no_comment(self):
         self.result(self.good(criteria=[]))
         self.run_pass()
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(self.fake.issues[5]["body"], SHIPPED_BODY)
-        self.assertEqual(len(self.fake.comments[5]), 1)
-        self.assertIn("proof", self.fake.comments[5][0]["body"])
+        self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
 
-    def test_a_missing_result_names_the_missing_evidence_in_one_note(self):
+    def test_a_missing_result_names_the_missing_evidence_in_the_log(self):
         self.result({"missing": "the deployed station log for 2026-10-16"})
         # Handing the run out recorded the attempt, so the cooldown holds the
         # ticket back from a second run in this pass.
@@ -6484,15 +6512,14 @@ class VerifyResultTest(Base):
         self.assertIn("loom:awaiting-evidence", self.fake.names(5))
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
-        self.assertEqual(len(self.fake.comments[5]), 1)
-        self.assertIn("the deployed station log for 2026-10-16", self.fake.comments[5][0]["body"])
+        self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
 
     def test_a_bare_word_of_missing_evidence_does_not_earn_the_label(self):
         # The result is lane output: "missing" alone must not switch the limit off.
         self.result({"missing": "later"})
         self.run_pass()
         self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
-        self.assertEqual(len(self.fake.comments[5]), 1)
+        self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
 
     def test_a_retry_handed_out_drops_the_label_so_the_run_decides_afresh(self):
         self.fake.issues[5]["labels"].append({"name": "loom:awaiting-evidence"})
@@ -6507,18 +6534,17 @@ class VerifyResultTest(Base):
         self.run_pass()
         self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
 
-    def test_a_proof_holding_a_credential_is_refused_with_one_note(self):
+    def test_a_proof_holding_a_credential_is_refused_with_no_comment(self):
         self.result(self.good(sources=["token=abcdef0123456789"]))
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(self.fake.issues[5]["body"], SHIPPED_BODY)
-        self.assertEqual(len(self.fake.comments[5]), 1)
+        self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
 
-    def test_no_verify_json_leaves_it_shipped_with_one_note(self):
+    def test_no_verify_json_leaves_it_shipped_with_no_comment(self):
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
-        self.assertEqual(len(self.fake.comments[5]), 1)
-        self.assertIn("verify.json", self.fake.comments[5][0]["body"])
+        self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
 
 
 class UnseenLiveEvidenceTest(unittest.TestCase):
