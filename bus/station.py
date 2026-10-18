@@ -7232,7 +7232,6 @@ class Station:
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.health_intake, self.intake_friction,
-                     self.post_metrics,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -7246,6 +7245,15 @@ class Station:
                 raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("%s failed: %s" % (step.__name__, err))
+        # The day's metrics line goes out even below the budget floor: one post
+        # a day, and on 2026-10-18 the floor deferred it every pass, so the
+        # operator got no numbers for the day. Only a spent budget stops it.
+        try:
+            self.post_metrics()
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("post_metrics failed: %s" % err)
         try:
             self.watch_logs()
         except RateLimited:
