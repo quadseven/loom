@@ -276,6 +276,20 @@ def goal_ledger(issue: Dict[str, Any], node: Optional[Dict[str, Any]],
     return dict(seen, due=_iso(due), state=state)
 
 
+def _owed_line(issue: Dict[str, Any], led: Dict[str, Any], comments: List[Dict[str, Any]],
+               now: datetime, authors: Optional[Sequence[str]]) -> str:
+    """A due or overdue goal's line under "Reports owed before unlock". Any
+    App's report holds the next one back too, whether or not this brain
+    trusts the App's login: a goal the station reported 8 minutes ago is not
+    owed a second report (journal.REPORT_GAP), and journal would refuse it."""
+    held = journal.report_hold(((rest_login(c.get("author")), c.get("createdAt"), c.get("body"))
+                                for c in comments), now, authors or ())
+    if held is not None:
+        return "- #%s report HELD: %s" % (issue["number"], journal.hold_message(held, now))
+    return "- #%s report %s since %s" % (
+        issue["number"], led["state"].upper(), led["due"] or "an unknown time")
+
+
 def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime,
                 authors: Optional[Sequence[str]] = None, gh: Optional[GitHub] = None,
                 repo: str = "") -> List[str]:
@@ -305,16 +319,8 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
         comments = (node.get("comments") or {}).get("nodes") or []
-        # Any App's report holds the next one back too, whether or not this
-        # brain trusts the App's login: a goal the station reported 8 minutes
-        # ago is not owed a second report (journal.REPORT_GAP).
-        held = journal.report_hold(((rest_login(c.get("author")), c.get("createdAt"), c.get("body"))
-                                    for c in comments), now, authors or ())
-        if led["state"] != "ok" and held is not None:
-            owed.append("- #%s report HELD: %s" % (issue["number"], journal.hold_message(held, now)))
-        elif led["state"] != "ok":
-            owed.append("- #%s report %s since %s" % (
-                issue["number"], led["state"].upper(), led["due"] or "an unknown time"))
+        if led["state"] != "ok":
+            owed.append(_owed_line(issue, led, comments, now, authors))
         found = handoff.journals(
             [{"body": c.get("body"), "at": c.get("createdAt"),
               "login": rest_login(c.get("author"))} for c in comments], authors or ())
