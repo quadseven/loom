@@ -499,7 +499,7 @@ printf 'agent GH_TOKEN=%s GITHUB_TOKEN=%s\\n' "${GH_TOKEN:-none}" "${GITHUB_TOKE
 echo fixed > fix.txt
 """)
         result = self.run_lane(LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456",
-                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",
+                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",  # noqa: S108
                                GH_TOKEN="gho_operator_for_test", GITHUB_TOKEN="gho_operator_for_test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("agent GH_TOKEN=ghs_minted_for_test GITHUB_TOKEN=ghs_minted_for_test",
@@ -514,7 +514,7 @@ esac
 exec /usr/bin/python3 "$@"
 """)
         result = self.run_lane(LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456",
-                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",
+                               LOOM_GITHUB_APP_KEY_FILE="/tmp/fake-app-key",  # noqa: S108
                                GH_TOKEN="gho_operator_for_test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
