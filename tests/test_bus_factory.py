@@ -1129,6 +1129,25 @@ class Queued(Base):
         self.assertEqual(self.lane(7), "claude")
         self.assertEqual(self.gh.issues[7]["body"], body)
 
+    def test_a_ticket_held_for_a_factory_incident_does_not_fill_its_lane(self):
+        # 2026-10-18: tickets held for open factory incidents kept their
+        # running labels, so their idle lanes counted as busy for hours and
+        # every queued ticket waited for a free lane.
+        self.gh.ticket(6, "running", lane="claude")
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.queued(7, body=body)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["claude"], held=["%s#6" % REPO])
+        worker.assign_queued()
+        self.assertEqual(self.lane(7), "claude")
+
+    def test_a_running_ticket_not_held_still_fills_its_lane(self):
+        self.gh.ticket(6, "running", lane="claude")
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        self.queued(7, body=body)
+        self.assign(available=["claude"])
+        self.assertIn("loom:queued", [x["name"] for x in self.gh.issues[7]["labels"]])
+
     def test_queued_ladder_model_waits_when_only_incompatible_lanes_are_free(self):
         body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
         self.queued(7, body=body)
@@ -1774,12 +1793,20 @@ class Helpers(unittest.TestCase):
             {"LOOM_NO_TEST_REPOS": "a/b c/d"}).no_test_repos, ["a/b", "c/d"])
 
 
+    def test_the_station_tells_the_factory_which_tickets_it_holds(self):
+        with tempfile.TemporaryDirectory() as home:
+            settings = station.Settings(home, [REPO], ["alice-example"], [], factory_on=True)
+            st = station.Station(FakeGitHub(), settings, now=NOW)
+            os.makedirs(st.state, exist_ok=True)
+            st._note_held(REPO, 6, "%s#741" % REPO)
+            self.assertEqual(st._factory().held, {"%s#6" % REPO})
+
     def test_the_station_runs_the_factory_when_on_and_throttles_it(self):
         calls = []
 
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
-                         no_test_repos=(), available=None, briefers=()):
+                         no_test_repos=(), available=None, briefers=(), held=()):
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 

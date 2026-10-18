@@ -921,7 +921,8 @@ class Factory:
                  limited: Sequence[str] = (),
                  no_test_repos: Sequence[str] = (),
                  available: Optional[Sequence[str]] = None,
-                 close: Optional[Callable[..., Any]] = None) -> None:
+                 close: Optional[Callable[..., Any]] = None,
+                 held: Sequence[str] = ()) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -937,6 +938,9 @@ class Factory:
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
         self.available = None if available is None else set(available)
+        # The tickets the station held for a factory incident, "owner/repo#n":
+        # they keep their running label and lane, but no lane is working them.
+        self.held = set(held)
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         self.actions = 0
@@ -1767,10 +1771,14 @@ class Factory:
     # -- lane load -------------------------------------------------------
     def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
         """Count the briefed and running tickets on each lane, reading every
-        repo's tickets unless they are given."""
+        repo's tickets unless they are given. A ticket held for a factory
+        incident is not load: counted, it kept its idle lane from every
+        queued ticket until the incident closed (2026-10-18)."""
         if tickets is None:
             tickets = {repo: self._tickets(repo) for repo in self.repos}
-        for issue in (i for found in tickets.values() for i in found.values()):
+        for repo, issue in ((r, i) for r, found in tickets.items() for i in found.values()):
+            if "%s#%s" % (repo, issue["number"]) in self.held:
+                continue
             if (_state(issue) in ("briefed", "running")
                     or (_state(issue) == "queued" and _lane(issue) in REMOTE_LANES
                         and self._up(_lane(issue)))):
