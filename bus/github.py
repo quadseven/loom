@@ -342,6 +342,8 @@ class GitHub:
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
         self.kinds: Dict[str, int] = {}
+        self.issue_writes: set[Tuple[str, int]] = set()
+        self.comment_edits = False
         # resource (core, graphql, ...) -> (remaining, limit, reset epoch),
         # from the newest response that carried the headers.
         self.rate: Dict[str, Tuple[int, int, int]] = {}
@@ -377,6 +379,12 @@ class GitHub:
         data = _json_or_none(text)
         if method == "GET" and not etag:
             self._keep_answer(url, status, data, resp_headers)
+        if method != "GET":
+            changed = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", path)
+            if changed:
+                self.issue_writes.add((changed.group(1), int(changed.group(2))))
+            elif re.match(r"^/repos/[^/]+/[^/]+/issues/comments/\d+$", path):
+                self.comment_edits = True
         return Response(status, data, resp_headers.get("etag"), resp_headers)
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:

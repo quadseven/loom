@@ -588,6 +588,10 @@ the account, the brain included.
   same URL (kept under `$LOOM_HOME/state/station/etags`, removed after a day
   unused); GitHub does not count a `304 Not Modified` against the limit, and
   the station reuses the kept answer.
+- Ticket comments and events are also shared across consumers and passes when
+  the issue list's `updated_at` is unchanged. A write to that ticket drops
+  its kept reads. Reads without a known issue timestamp still go to GitHub.
+  Unused kept reads expire after a day.
 - A repo with a ticket in flight (briefed, running or pr at its last scan,
   or a brief for it in a lane inbox) is scanned every pass; any other repo
   at most every 10 minutes, so a ticket briefed in an idle repo can wait
@@ -605,8 +609,8 @@ the account, the brain included.
   lane pull request merged in the last 6 hours does it read further: the
   repo, its default branch's 30 newest commits, and one check-run page per
   commit from the head back to the last green one.
-- Each pass logs one line: `requests: N, M counted (by endpoint kind), K
-  answered 304 (not counted); budget R of L left, resets T`.
+- Each pass logs one line with requests by endpoint kind, counted requests
+  against a target of 500, answers that were 304, and the remaining budget.
 - Writes happen only on claims, outcomes, status changes and asks.
 - `LOOM_STATION_INTERVAL` (seconds, default 60, at least 60) sets the pass
   interval at install.
