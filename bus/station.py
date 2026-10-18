@@ -800,11 +800,20 @@ def model_lanes(model: str) -> List[str]:
             if lane not in REMOTE_LANES and lane_takes_model(lane, model)]
 
 
+def beat_fresh(at: float, now: float, window: float = HEARTBEAT_MAX_AGE) -> bool:
+    """Whether a heartbeat stamped `at` is at most `window` seconds older than
+    the pass time `now` and at most a minute ahead of the clock. A pass reads
+    beats long after it began, so a beat written since is fresh: measured
+    against `now` alone, every lane that beat in a pass's first minutes read
+    as down and the station gave no queued ticket a lane (loom#717)."""
+    return now - at <= window and at - max(now, time.time()) <= 60
+
+
 def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     """Whether a remote lane's last heartbeat still counts as up: within its
     configured beat_max (labels.REMOTE_LANES), else HEARTBEAT_MAX_AGE."""
     window = REMOTE_LANES.get(lane, {}).get("beat_max", HEARTBEAT_MAX_AGE)
-    return at is not None and -60 <= now - at <= window
+    return at is not None and beat_fresh(at, now, window)
 
 
 def needs_public_repo(lane: str, model: str) -> bool:
@@ -1445,7 +1454,7 @@ class Station:
         at = beat.get("at")
         if isinstance(at, bool) or not isinstance(at, (int, float)):
             return False
-        return -60 <= self.now - at <= HEARTBEAT_MAX_AGE
+        return beat_fresh(at, self.now)
 
     def _remote_heartbeat(self, lane: str) -> Optional[float]:
         """Latest heartbeat posted by a remote worker on the lane status issue."""
@@ -1498,8 +1507,7 @@ class Station:
             at = beat.get("at")
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 continue
-            if (-60 <= self.now - at <= HEARTBEAT_MAX_AGE
-                    and str(beat.get("reason") or "").startswith(LIMIT)):
+            if beat_fresh(at, self.now) and str(beat.get("reason") or "").startswith(LIMIT):
                 out.append(lane)
         return out
 
