@@ -11,6 +11,7 @@ lane reads; both are settled before the station claims a ticket.
 from __future__ import annotations
 
 import calendar
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -490,7 +491,33 @@ Live criterion: %s
 
 Acceptance criteria:
 %s
+
+A runtime proof template with every required key and these criteria filled in
+(replace every <...> value; keep the keys and the criterion texts as they are):
+
+```json
+%s
+```
 """
+
+
+def verify_template(criteria: List[str]) -> str:
+    """The runtime proof skeleton a verify brief shows (loom#714): lanes that
+    built the record from prose alone left out observed or environment, and
+    bus/proof.py refused the proof for its shape, not its evidence."""
+    return json.dumps({
+        "kind": "runtime",
+        "revision": "<the commit SHA on the default branch that carries the change>",
+        "environment": "<where the change ran when you observed it>",
+        "artifact": "<the log, record or output you read>",
+        "observed": {"start": "<UTC time like 2030-01-01T00:00:00Z>",
+                     "end": "<UTC time like 2030-01-01T01:00:00Z>"},
+        "sources": ["<a reference to each piece of evidence>"],
+        "criteria": [{"criterion": text, "result": "pass", "evidence": "<what shows it>"}
+                     for text in criteria],
+        "measure": {"name": "<what you measured>", "baseline": "<before>",
+                    "target": "<the goal>", "after": "<after>"},
+    }, indent=2)
 
 
 def verify_name(repo: str, number: int, stamp: int) -> str:
@@ -505,13 +532,13 @@ def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
     result is verify.json, not a pull request."""
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
-    wanted = "\n".join("- %s" % " ".join(text.split())
-                       for _, text in proof.criteria(str(issue.get("body") or "")))
+    texts = [text for _, text in proof.criteria(str(issue.get("body") or ""))]
+    wanted = "\n".join("- %s" % " ".join(text.split()) for text in texts)
     head = ["# Brief: %s" % verify_name(repo, number, stamp), "", "Repo: %s" % repo,
             "Branch: loom/verify-%d-%d" % (number, stamp), "Lane: %s" % lane,
             "Issue: %s#%d" % (repo, number), "Deliverable: verify", "",
             "# T%d: Verify %s" % (number, title), ""]
-    return "\n".join(head) + "\n" + VERIFY_BRIEF % (live, wanted)
+    return "\n".join(head) + "\n" + VERIFY_BRIEF % (live, wanted, verify_template(texts))
 
 
 def _login(value: Any) -> str:
