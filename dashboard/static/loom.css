@@ -339,6 +339,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .who-ok .dot { background: var(--good); }
 .who-ok .step-head span:first-child { color: var(--good); }
 .who-next .dot { background: var(--future); }
+.who-wait .dot { background: var(--accent); }
 .who-next .step-head span:first-child { color: var(--dim); }
 .attempts { display: flex; flex-wrap: wrap; gap: 3px; max-width: 560px; }
 .attempt-chip { display: inline-flex; flex: 1 0 34px; min-height: 44px; align-items: center; justify-content: center; padding: 0 6px; border: 1px solid transparent; border-radius: 4px; color: var(--muted); font: 10px var(--font-mono); }
@@ -357,6 +358,8 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .transcript-event.edited .tx-label { color: var(--good); }
 .transcript-event.grug .tx-label { color: var(--bad); }
 .transcript-event.answered .tx-label, .transcript-event.live .tx-label { color: var(--accent); }
+.transcript-event.waiting .tx-label { color: var(--accent); }
+.transcript-event.failed .tx-label { color: var(--bad); }
 .transcript-event p { color: var(--text); font-size: 14px; line-height: 1.55; white-space: pre-wrap; text-wrap: pretty; }
 .transcript-event em { color: var(--muted); font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; }
 .transcript-brief { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--row); color: var(--body); font-size: 13px; line-height: 1.55; }
@@ -376,6 +379,8 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .review-thread { border-color: color-mix(in oklab, var(--bad) 35%, transparent); }
 .live-row { display: flex; gap: 8px; align-items: center; color: var(--muted); font-style: italic; font-size: 13px; }
 .live-row .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.transcript-event.waiting .live-row .dot { background: var(--dim); }
+.transcript-event.failed .live-row .dot { background: var(--bad); }
 .pr-line { display: flex; justify-content: space-between; gap: 8px; font: 12px var(--font-mono); }
 .pr-line span:first-child { min-width: 0; overflow: hidden; color: var(--body); text-overflow: ellipsis; white-space: nowrap; }
 .pr-line.file span:first-child { flex: 1; }

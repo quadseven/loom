@@ -17,10 +17,18 @@ PATH_MAX = 14
 RESULT_LINES = 12
 RUNNER_LINES = 8
 CLAIM_RE = re.compile(r"^Claimed for lane (\S+)")
+CLAIM_STEP_RE = re.compile(r"^Lane (\S+) claimed it\.$")
 OPENED_RE = re.compile(r"^Lane (\S+) (opened|pushed fixes to) a pull request: \S*/pull/(\d+)")
 FAILED_RE = re.compile(r"^Lane (\S+) failed: (.+)", re.S)
 RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 MOVED_RE = re.compile(r"^Not a failure \([^)]*\): the factory moved this ticket to lane (\S+?)[,.]")
+# The station's comment when a lane handed a claim back at a limit
+# (bus/station.py _limited), and its comment when it retried on another lane.
+UNAVAILABLE_RE = re.compile(r"^Lane (\S+) is unavailable \((.+)\)\. This is not a failure", re.S)
+RETRY_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \(\w+\): moved from lane (\S+) to lane (\S+)\. "
+                      r"Lane \S+ failed: (.+)", re.S)
+PINNED_LIMIT_RE = re.compile(r"requested model (\S+) limited until (\d{4}-\d\d-\d\d)T(\d\d:\d\d)")
+UNTIL_RE = re.compile(r"until (\d{4}-\d\d-\d\d)T(\d\d:\d\d)")
 SHIPPED_RE = re.compile(r"^Shipped\b")
 PROOF_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.S)
 BAD_LINE = re.compile(r"FAIL|Error|failed|Traceback")
@@ -80,6 +88,8 @@ def _comment_step(comment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             (FAILED_RE, lambda m: {"who": "fail", "text": "Lane %s failed: %s" % (
                 m.group(1), " ".join(m.group(2).split())[:180])}),
             (MOVED_RE, lambda m: {"who": "brain", "text": "Moved to lane %s; it never ran there." % m.group(1)}),
+            (UNAVAILABLE_RE, lambda m: {"who": "wait", "text": "Lane %s handed it back: %s." % (
+                m.group(1), " ".join(m.group(2).split())[:180])}),
             (SHIPPED_RE, lambda m: {"who": "brain", "text": " ".join(body.split())[:180]})):
         match = pattern.match(body)
         if match:
@@ -110,6 +120,35 @@ def _label_step(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"who": who, "ts": event.get("created_at") or "", "text": text, "meta": ""}
 
 
+def _collapse(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A claim its lane handed straight back is one step, and a run of the
+    same step is one row with its count and time span: a lane at a limit
+    claimed one ticket 24 times in 90 minutes, a screen of identical rows."""
+    paired: List[Dict[str, Any]] = []
+    for step in steps:
+        prev = paired[-1] if paired else None
+        claim = prev and CLAIM_STEP_RE.match(prev["text"])
+        back = re.match(r"^Lane (\S+) handed it back: (.*)$", step["text"], re.S)
+        if claim and back and claim.group(1) == back.group(1):
+            paired[-1] = dict(step, ts=prev["ts"], end=step["ts"],
+                              text="Lane %s claimed it and handed it back: %s" % (back.group(1), back.group(2)))
+        else:
+            paired.append(dict(step))
+    out: List[Dict[str, Any]] = []
+    for step in paired:
+        prev = out[-1] if out else None
+        if prev and (prev["who"], prev["text"]) == (step["who"], step["text"]) and step.get("ts"):
+            prev["count"] = prev.get("count", 1) + 1
+            prev["end"] = step.get("end") or step["ts"]
+            prev["meta"] = "%d times, %s to %s UTC" % (prev["count"], _hm(prev["ts"]), _hm(prev["end"]))
+        else:
+            out.append(step)
+    for step in out:
+        step.pop("end", None)
+        step.pop("count", None)
+    return out
+
+
 def path_steps(record: Dict[str, Any], comments: List[Dict[str, Any]],
                events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The ticket's path, oldest first, from its comments and label events,
@@ -117,6 +156,7 @@ def path_steps(record: Dict[str, Any], comments: List[Dict[str, Any]],
     steps = [s for s in (_comment_step(c) for c in comments) if s]
     steps += [s for s in (_label_step(e) for e in events) if s]
     steps.sort(key=lambda s: str(s.get("ts") or ""))
+    steps = _collapse(steps)
     if len(steps) > PATH_MAX:
         hidden = len(steps) - PATH_MAX + 1
         keep = PATH_MAX // 3
@@ -365,14 +405,96 @@ def _path_pane(record, detail):
     return "".join(parts)
 
 
-def _transcript_pane(runs, selected, events, review_threads, running):
+def _utc_minute(match: "re.Match[str]", first: int) -> str:
+    return "%s %s UTC" % (match.group(first), match.group(first + 1))
+
+
+def _limit_text(lane: str, reason: str) -> str:
+    pinned = PINNED_LIMIT_RE.search(reason)
+    if pinned:
+        return "Waiting: %s is limited until %s (lane %s)." % (pinned.group(1), _utc_minute(pinned, 2), lane)
+    until = UNTIL_RE.search(reason)
+    if until:
+        return "Waiting: lane %s is at a limit until %s." % (lane, _utc_minute(until, 1))
+    return "Waiting: lane %s is at a limit (%s)." % (lane, reason)
+
+
+def _outcome_status(lane: str, reason: str, retried_on: str = "") -> Dict[str, str]:
+    """A failed attempt's status: a limit waits, anything else failed."""
+    reason = " ".join(reason.split())
+    if reason.startswith(("[limit]", "limit:")):
+        status = {"kind": "limit", "lane": lane, "text": _limit_text(lane, reason)}
+    else:
+        status = {"kind": "failed", "lane": lane,
+                  "text": "The last attempt failed on lane %s: %s" % (lane, reason[:180])}
+    if retried_on:
+        status["text"] += " Retried on lane %s." % retried_on
+    return status
+
+
+def _comment_status(body: str) -> Optional[Dict[str, str]]:
+    """The attempt status one station comment sets, or None for a comment
+    that says nothing about the newest attempt."""
+    claim = CLAIM_RE.match(body)
+    if claim:
+        return {"kind": "live", "lane": claim.group(1), "text": ""}
+    back = UNAVAILABLE_RE.match(body)
+    if back:
+        return {"kind": "limit", "lane": back.group(1), "text": _limit_text(back.group(1), back.group(2))}
+    failed = FAILED_RE.match(body)
+    if failed:
+        return _outcome_status(failed.group(1), failed.group(2))
+    retry = RETRY_RE.match(body)
+    if retry:
+        return _outcome_status(retry.group(1), retry.group(3), retry.group(2))
+    # A pull request, or a move to another lane or rung: the old lane's
+    # limit is not what it waits for now.
+    if OPENED_RE.match(body) or MOVED_RE.match(body) or RUNG_RE.search(body):
+        return {"kind": "ended", "lane": "", "text": ""}
+    return None
+
+
+def attempt_status(comments: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """What the ticket's newest attempt is doing, from the station's
+    comments: kind "live" (claimed, no outcome yet), "limit" (handed back at
+    a limit; text says until when), "failed", or "ended" (a pull request, or
+    moved on). None when no lane ever claimed it."""
+    status: Optional[Dict[str, str]] = None
+    for comment in sorted(comments, key=lambda c: str(c.get("created_at") or "")):
+        status = _comment_status(str(comment.get("body") or "").strip()) or status
+    return status
+
+
+def _is_live(running: bool, status: Optional[Dict[str, str]]) -> bool:
+    """A running label alone is not a live run: the newest attempt may have
+    ended on a limit or a failure while the ticket waits for its next claim.
+    Without the station's comments the label is all there is."""
+    if not running:
+        return False
+    return status is None or status["kind"] == "live"
+
+
+def _status_row(selected, status, live: bool, waiting: bool) -> str:
+    """The pane's last row: live, waiting on a limit, failed, or none."""
+    if live:
+        lane = (status or {}).get("lane") or (selected or {}).get("slot") or "its lane"
+        return _row("live", "", '<p class="live-row"><span class="dot"></span>working... streaming from %s</p>'
+                    % _esc(lane), "live")
+    if waiting and status and status["kind"] in ("limit", "failed"):
+        word = "waiting" if status["kind"] == "limit" else "failed"
+        return _row(word, "", '<p class="live-row"><span class="dot"></span>%s</p>' % _esc(status["text"]), word)
+    return ""
+
+
+def _transcript_pane(runs, selected, events, review_threads, running, status=None, waiting=False):
     parts = ['<section class="ticket-pane transcript-pane" data-pane="transcript">']
     if len(runs) > 1:
         parts.append('<div class="attempts">%s</div>' % "".join(_chip(run, selected) for run in runs))
     parts.append('<div class="run-line"><span>%s</span><label class="thought-toggle"><input type="checkbox" checked data-thought-toggle> thoughts</label></div>'
                  % _esc(_run_line(selected)))
+    live = _is_live(running, status)
     parts.append('<div class="run-events" data-attempt="%s" data-running="%s">' % (
-        _esc((selected or {}).get("attempt") or ""), "true" if running else "false"))
+        _esc((selected or {}).get("attempt") or ""), "true" if live else "false"))
     if selected is None:
         parts.append('<p class="empty-state">No transcript yet: no attempt has finished and been stored for this ticket.</p>')
     elif not events:
@@ -380,9 +502,7 @@ def _transcript_pane(runs, selected, events, review_threads, running):
     elif all(event.get("role") == "runner" or event.get("kind") == "log" for event in events):
         parts.append('<p class="empty-state">This attempt kept only the runner log: the lane\'s own session record was not captured.</p>')
     parts.extend(_event_rows(interleave_activity(events, review_threads)))
-    if running:
-        parts.append(_row("live", "", '<p class="live-row"><span class="dot"></span>working... streaming from %s</p>'
-                          % _esc((selected or {}).get("slot") or "its lane"), "live"))
+    parts.append(_status_row(selected, status, live, running or waiting))
     parts.append('</div></section>')
     return "".join(parts)
 
@@ -466,6 +586,13 @@ def _pr_pane(record, runs, detail):
     return "".join(parts)
 
 
+def _detail_status(detail) -> Optional[Dict[str, str]]:
+    """attempt_status of the comments ticket_data read; None without them."""
+    if detail is None or "comments" in detail.get("errors", {}):
+        return None
+    return attempt_status(detail.get("comments") or [])
+
+
 def render(record, runs, selected, events, pull_requests=(), review_threads=(), detail=None):
     """The Ticket page body. `selected` is the chosen run (a run dict, or its
     id or attempt number); `detail` is what ticket_data read from GitHub."""
@@ -479,7 +606,10 @@ def render(record, runs, selected, events, pull_requests=(), review_threads=(), 
         '<a href="?tab=%s" data-ticket-tab="%s">%s</a>' % (tab, tab, tab) for tab in ("transcript", "path", "pr")) + '</nav>')
     parts.append('<div class="ticket-columns">')
     parts.append(_path_pane(record, detail))
-    parts.append(_transcript_pane(runs, selected, events, threads if last else [], record.get("state") == "running"))
+    # A briefed ticket the station put back after a limit waits for its next
+    # claim: it says what it waits for too.
+    parts.append(_transcript_pane(runs, selected, events, threads if last else [], record.get("state") == "running",
+                                  _detail_status(detail), record.get("state") == "briefed"))
     parts.append(_pr_pane(record, runs, detail))
     parts.append('</div>')
     return ''.join(parts)

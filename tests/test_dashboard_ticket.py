@@ -234,6 +234,61 @@ class TicketPageTests(unittest.TestCase):
         self.assertIn("kept only the runner log", body)
         self.assertIn('href="?run=1&amp;tab=transcript"', body)
 
+    LIMIT_LOOP = [c for i in range(3) for c in (
+        {"body": "Claimed for lane agy (body sha256 a1fc29bcee5e)",
+         "created_at": "2026-10-18T13:%02d:07Z" % (10 + 3 * i)},
+        {"body": "Lane agy is unavailable (limit: requested model gemini-4-argon-high limited until "
+                 "2026-10-19T11:33:47Z). This is not a failure: the ticket goes to the next lane.",
+         "created_at": "2026-10-18T13:%02d:35Z" % (11 + 3 * i)})]
+
+    def running(self, comments, state="running"):
+        record = dict(RECORD, state=state, lane="agy")
+        runs = [{"id": 7, "attempt": 3, "slot": "agy", "model": "gemini-4-argon-high", "outcome": "failed"}]
+        return render(record, runs, None, [{"ts": "", "role": "runner", "kind": "log", "text": "x"}],
+                      detail={"comments": comments, "events": [], "errors": {}})
+
+    def test_a_running_ticket_whose_last_attempt_hit_a_limit_shows_waiting_not_live(self):
+        body = self.running(self.LIMIT_LOOP)
+        self.assertNotIn("working... streaming", body)
+        self.assertIn('data-running="false"', body)
+        self.assertIn("Waiting: gemini-4-argon-high is limited until 2026-10-19 11:33 UTC (lane agy).", body)
+
+    def test_a_briefed_ticket_put_back_after_a_limit_says_what_it_waits_for(self):
+        body = self.running(self.LIMIT_LOOP, state="briefed")
+        self.assertNotIn("working... streaming", body)
+        self.assertIn("Waiting: gemini-4-argon-high is limited until 2026-10-19 11:33 UTC (lane agy).", body)
+
+    def test_a_ticket_moved_off_the_limited_lane_no_longer_waits_on_it(self):
+        body = self.running(self.LIMIT_LOOP + [
+            {"body": "Not a failure (lane agy is at a limit): the factory moved this ticket to lane "
+                     "codex, in its difficulty tier.", "created_at": "2026-10-18T13:30:00Z"}], state="briefed")
+        self.assertNotIn("Waiting:", body)
+
+    def test_a_running_ticket_whose_last_attempt_failed_says_so(self):
+        body = self.running([
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": "2026-10-14T10:00:00Z"},
+            {"body": "Lane codex failed: [work] validation failed: the check exited 2 at abc",
+             "created_at": "2026-10-14T10:20:00Z"}])
+        self.assertNotIn("working... streaming", body)
+        self.assertIn("The last attempt failed on lane codex: [work] validation failed", body)
+
+    def test_a_claim_with_no_outcome_yet_is_live(self):
+        body = self.running(self.LIMIT_LOOP + [
+            {"body": "Claimed for lane agy (body sha256 a1fc29bcee5e)", "created_at": "2026-10-18T14:01:09Z"}])
+        self.assertIn("working... streaming from agy", body)
+        self.assertIn('data-running="true"', body)
+        self.assertNotIn("Waiting:", body)
+
+    def test_repeated_claims_handed_back_at_a_limit_are_one_path_row(self):
+        from dashboard.ticket import path_steps
+        steps = path_steps(dict(RECORD, state="running"), self.LIMIT_LOOP, [])
+        self.assertEqual(len(steps), 2, steps)
+        self.assertEqual(steps[0]["who"], "wait")
+        self.assertEqual(steps[0]["text"], "Lane agy claimed it and handed it back: limit: requested model "
+                                           "gemini-4-argon-high limited until 2026-10-19T11:33:47Z.")
+        self.assertEqual(steps[0]["meta"], "3 times, 13:10 to 13:17 UTC")
+        self.assertEqual(steps[0]["ts"], "2026-10-18T13:10:07Z")
+
     def test_the_pr_pane_shows_checks_files_threads_attempts_and_proof(self):
         from dashboard import ticket_data
         detail = ticket_data.TicketDetails(FakeGitHub()).get("example-owner/sample", 12)
