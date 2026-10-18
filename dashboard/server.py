@@ -52,33 +52,13 @@ def _all_tickets(state):
     footer_runs = payload.get("footer_runs")
     if footer_runs is None:
         footer_runs = views.footer_runs(payload.get("pull_requests", []))
-    tickets_table.resolve_models(rows, footer_runs=footer_runs, latest=_latest_runs(state),
+    # The newest stored run of each ticket, as the background refresh last
+    # read it (TicketStore._read_latest_runs): a request never reads the
+    # transcript database (#780), and an empty map falls back to the pull
+    # request footer and claim comments.
+    tickets_table.resolve_models(rows, footer_runs=footer_runs, latest=payload.get("latest_runs") or {},
                                  comments=payload.get("issue_comments") or [])
     return rows
-
-
-LATEST_RUNS_TTL = 60
-
-
-def _latest_runs(state):
-    """{ticket: its newest stored run} from the transcript store, read at
-    most once a minute; empty when the store is not configured or fails, so
-    the model falls back to the pull request footer and claim comments."""
-    cached = getattr(state, "_latest_runs", None)
-    if cached and time.monotonic() - cached[0] < LATEST_RUNS_TTL:
-        return cached[1]
-    store = _transcript_store(state)
-    latest = {}
-    if store is not None and hasattr(store, "latest"):
-        try:
-            latest = store.latest()
-        except (RuntimeError, *transcript_store.storage_errors()):
-            latest = {}
-    try:
-        state._latest_runs = (time.monotonic(), latest)
-    except AttributeError:
-        pass
-    return latest
 
 
 def _ticket_href(row):

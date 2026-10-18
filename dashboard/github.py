@@ -19,7 +19,7 @@ from bus import brain, labels, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import goals, views
+from . import goals, transcripts, views
 
 
 READ_WORKERS = 8
@@ -816,6 +816,7 @@ class TicketStore:
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
             self._read_dashboard(snapshot)
+            self._read_latest_runs(snapshot)
             now = time.time()
             self._refresh_waits(snapshot, now)
             floor_context = dict(snapshot.get("floor_context") or {})
@@ -828,6 +829,29 @@ class TicketStore:
             self._log_requests(now)
             if snapshot["ready"] and not current["ready"]:
                 LOG.info("first dashboard snapshot ready in %.1fs", time.monotonic() - started)
+
+    def _read_latest_runs(self, snapshot: Dict[str, Any]) -> None:
+        """{ticket: its newest stored run}, read once a pass here so no page
+        request waits on the transcript database (#780). No configured store
+        reads as empty; a failed read keeps the last pass's map and says why."""
+        store = getattr(self, "transcripts", None)
+        if store is None:
+            try:
+                store = transcripts.Store()
+            except RuntimeError:
+                snapshot["latest_runs"] = {}
+                return
+            self.transcripts = store
+        try:
+            snapshot["latest_runs"] = store.latest()
+        # Broad on purpose: this runs on the background refresh thread, and a
+        # driver error storage_errors() does not list would otherwise end the
+        # refresh loop for good instead of failing one read.
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("transcript runs read failed: %s", exc)
+            snapshot["latest_runs"] = self._snapshot.get("latest_runs", {})
+            snapshot["dashboard_errors"] = list(snapshot.get("dashboard_errors", [])) + [
+                "transcript runs: " + (self._error_reason(exc) or type(exc).__name__)]
 
     def response(self) -> Dict[str, Any]:
         with self._snapshot_lock:
@@ -845,6 +869,7 @@ class TicketStore:
                 "pull_requests": snapshot.get("pull_requests", []),
                 "footer_models": snapshot.get("footer_models"),
                 "footer_runs": snapshot.get("footer_runs"),
+                "latest_runs": snapshot.get("latest_runs", {}),
                 "state_entered": snapshot.get("state_entered", {}),
                 "wait_rows": snapshot.get("wait_rows", []),
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),

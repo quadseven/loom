@@ -47,10 +47,12 @@ class State:
         self.transcripts = transcripts.Store(transcripts.MemoryBackend())
         for run in runs:
             self.transcripts.upload(dict({"slot": "codex", "outcome": "done", "events": []}, **run))
+        # What the background refresh (TicketStore.refresh) reads once a pass.
+        self.latest_runs = self.transcripts.latest()
 
     def response(self):
         return {"tickets": self.data, "pull_requests": self.prs, "issue_comments": self.comments,
-                "state_entered": self.entered,
+                "state_entered": self.entered, "latest_runs": self.latest_runs,
                 "goal_context": {GOAL_A: {"title": "Make the app faster"},
                                  GOAL_B: {"title": "Make the app safer"}}}
 
@@ -199,6 +201,85 @@ class RunRecordsTest(unittest.TestCase):
         latest = store.latest()
         self.assertEqual({key: row["model"] for key, row in latest.items()},
                          {"example-owner/app#1": "model-b", "example-owner/app#2": "model-c"})
+
+
+class SlowTranscripts:
+    """A transcript store whose every read takes 3 seconds, like a database
+    that is slow to answer or holds a lock."""
+    def __init__(self, latest=None, error=None):
+        self.calls = 0
+        self.value, self.error = latest or {}, error
+
+    def latest(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        time.sleep(3)
+        return self.value
+
+
+class LatestRunsOffTheRequestTest(unittest.TestCase):
+    """loom#780: pages never wait on the transcript database."""
+
+    def test_a_slow_transcript_store_does_not_delay_a_tickets_render(self):
+        state = State([_row(34, "Transcript after its claim", "running", lane="spark")])
+        state.transcripts = SlowTranscripts()
+        state.latest_runs = {"example-owner/app#34": {
+            "ticket": "example-owner/app#34", "model": "model-transcript",
+            "started_at": "2026-10-16T05:00:30Z", "finished_at": "2026-10-16T06:00:00Z"}}
+        started = time.monotonic()
+        body = _tickets(state, urlsplit("/tickets"))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(state.transcripts.calls, 0)
+        self.assertEqual(_cell(body, 34, "tickets-model"), "spark / model-transcript")
+        started = time.monotonic()
+        _floor(state)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(state.transcripts.calls, 0)
+
+    def _ticket_store(self):
+        from bus.github import GitHub
+        from dashboard.github import TicketStore
+
+        def transport(method, url, headers, body):
+            return 200, {}, b"[]"
+        return TicketStore(["example-owner/app"], gh=GitHub("", transport=transport))
+
+    def test_the_background_refresh_reads_the_latest_runs_map(self):
+        store = self._ticket_store()
+        store.transcripts = transcripts.Store(transcripts.MemoryBackend())
+        store.transcripts.upload({"ticket": "example-owner/app#7", "slot": "codex", "model": "model-a",
+                                  "outcome": "done", "started_at": "2026-10-16T00:00:00Z",
+                                  "finished_at": "2026-10-16T00:10:00Z", "events": []})
+        with mock.patch.dict(os.environ, {}, clear=True):
+            store.refresh()
+        latest = store.response()["latest_runs"]
+        self.assertEqual(latest["example-owner/app#7"]["model"], "model-a")
+
+    def test_a_failed_read_keeps_the_last_map_and_says_why(self):
+        store = self._ticket_store()
+        store.transcripts = transcripts.Store(transcripts.MemoryBackend())
+        store.transcripts.upload({"ticket": "example-owner/app#7", "slot": "codex", "model": "model-a",
+                                  "outcome": "done", "started_at": "2026-10-16T00:00:00Z",
+                                  "finished_at": "2026-10-16T00:10:00Z", "events": []})
+        with mock.patch.dict(os.environ, {}, clear=True):
+            store.refresh()
+            store.transcripts = SlowTranscripts(error=OSError("connect timed out"))
+            store.refresh()
+        payload = store.response()
+        self.assertEqual(payload["latest_runs"]["example-owner/app#7"]["model"], "model-a")
+        self.assertTrue(any("connect timed out" in error for error in payload["dashboard_errors"]))
+
+    def test_a_driver_error_outside_storage_errors_never_breaks_the_refresh(self):
+        class DriverError(Exception):
+            """A driver's own error class, which storage_errors() may not list."""
+        store = self._ticket_store()
+        store.transcripts = SlowTranscripts(error=DriverError("canceling statement due to statement timeout"))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            store.refresh()
+        payload = store.response()
+        self.assertEqual(payload["latest_runs"], {})
+        self.assertTrue(any("statement timeout" in error for error in payload["dashboard_errors"]))
 
 
 if __name__ == "__main__":
