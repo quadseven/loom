@@ -69,6 +69,28 @@ BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
 STATION_INTERVAL="${LOOM_STATION_INTERVAL:-60}"
 [[ "$STATION_INTERVAL" =~ ^[0-9]+$ ]] && [ "$STATION_INTERVAL" -ge 60 ] ||
   { echo "LOOM_STATION_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
+# A GitHub App needs all of its settings or none: with only some set, the
+# station and the brain would quietly fall back to the personal token
+# (bus/github.py AppToken.from_env), so refuse and name what is missing.
+APP_KEY="${LOOM_GITHUB_APP_KEY_FILE:-}${LOOM_GITHUB_APP_KEY_SSM:-}"
+if [ -n "${LOOM_GITHUB_APP_ID:-}${LOOM_GITHUB_APP_INSTALLATION_ID:-}$APP_KEY" ]; then
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] ||
+    { echo "GitHub App half set up: LOOM_GITHUB_APP_ID is missing (set all App settings or none)" >&2; exit 1; }
+  [ -n "${LOOM_GITHUB_APP_INSTALLATION_ID:-}" ] ||
+    { echo "GitHub App half set up: LOOM_GITHUB_APP_INSTALLATION_ID is missing (set all App settings or none)" >&2; exit 1; }
+  [ -n "$APP_KEY" ] ||
+    { echo "GitHub App half set up: LOOM_GITHUB_APP_KEY_FILE or LOOM_GITHUB_APP_KEY_SSM is missing (set all App settings or none)" >&2; exit 1; }
+fi
+# The App's private key as a file: it must exist and be readable by its owner
+# only (mode 600 or narrower), like an ssh key.
+if [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; then
+  [ -f "$LOOM_GITHUB_APP_KEY_FILE" ] ||
+    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE is not a file" >&2; exit 1; }
+  # GNU stat first: BSD stat rejects -c, while GNU stat accepts -f with another meaning.
+  KEY_MODE="$(stat -c %a "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null || stat -f %Lp "$LOOM_GITHUB_APP_KEY_FILE")"
+  [ $((8#$KEY_MODE & 8#077)) -eq 0 ] ||
+    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE has mode $KEY_MODE; it must be 600 (chmod 600 $LOOM_GITHUB_APP_KEY_FILE)" >&2; exit 1; }
+fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 
@@ -185,8 +207,9 @@ done
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
 # are filed on, and the review bot's plan check, docs/LANES.md Invariants), and
 # LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM
-# (a GitHub App installation token instead of the personal one, minted from
-# the key in that SSM parameter, docs/LANES.md; all three or none). Runs from
+# or LOOM_GITHUB_APP_KEY_FILE (a GitHub App installation token instead of the
+# personal one, minted from the key in that SSM parameter or that mode-600
+# file, docs/LANES.md; all or none, checked above). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -253,6 +276,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_GITHUB_APP_ID</key><string>$(xml "${LOOM_GITHUB_APP_ID:-}")</string>
     <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
     <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
+    <key>LOOM_GITHUB_APP_KEY_FILE</key><string>$(xml "${LOOM_GITHUB_APP_KEY_FILE:-}")</string>
 $(model_env)
   </dict>
 </dict>
