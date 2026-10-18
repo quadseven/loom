@@ -1507,6 +1507,19 @@ class Station:
         os.replace(tmp, path)
         return path
 
+    def _fix_round_for(self, repo: str, ticket: Dict[str, Any], pr: int) -> bool:
+        """Whether the ticket's newest trusted loom:fix comment, after its last
+        claim, sends a lane to fix pull request `pr`. An unreadable or unusable
+        fix is no fix round."""
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, int(ticket["number"])))
+            found = self._fix_for(repo, comments)
+        except RateLimited:
+            raise
+        except (GitHubError, ValueError):
+            return False
+        return found is not None and found[0].pr == pr
+
     def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
         """Return the newest trusted fix after the last claim, regardless of
         later non-fix comments. Raises ValueError for an unusable fix."""
@@ -2835,6 +2848,12 @@ class Station:
             if not set(labels).intersection(("loom:queued", "loom:briefed")):
                 continue
             if not _linked_pr(ticket, repo, pr):
+                continue
+            if "loom:briefed" in labels and self._fix_round_for(repo, ticket, int(pr["number"])):
+                # A brain fix round moved it back to briefed for a lane to fix
+                # this very pull request: not a new link. Relabelling it pr
+                # undid the round every pass, and the brain re-briefed it
+                # (zippie#269, 2026-10-18: a flip and a comment every 3-6 min).
                 continue
             trusted, _ = self._check_trust(repo, ticket)
             if not trusted:

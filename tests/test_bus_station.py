@@ -522,6 +522,38 @@ class ReconcilePullRequestTest(Base):
         self.assertNotIn("loom:queued", self.fake.names(12))
         self.assertFalse(any("Linked pull request" in c["body"] for c in self.fake.comments[12]))
 
+    def test_a_fix_round_for_the_open_pull_request_stays_briefed(self):
+        # zippie#269, 2026-10-18: a brain fix round moved the ticket from pr
+        # to briefed for a lane to fix pull request 99; this pass read the open
+        # pull request as a new link, moved it back to pr and commented, and
+        # the brain re-briefed it, every 3 to 6 minutes.
+        self.fake.add(12, state="briefed", lane="codex")
+        self.fake.comments[12] = [{"id": 501, "user": {"login": "alice-example"},
+                                   "body": "%s\nPull request: %s#99, branch loom/12-fix\n\nFix the test."
+                                           % (tickets.FIX_MARKER, REPO),
+                                   "created_at": "2030-01-01T00:00:00Z",
+                                   "updated_at": "2030-01-01T00:00:00Z"}]
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix", "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
+    def test_a_briefed_ticket_whose_fix_names_another_pull_request_is_linked(self):
+        self.fake.add(12, state="briefed", lane="codex")
+        self.fake.comments[12] = [{"id": 501, "user": {"login": "alice-example"},
+                                   "body": "%s\nPull request: %s#98, branch loom/12-old\n\nFix."
+                                           % (tickets.FIX_MARKER, REPO),
+                                   "created_at": "2030-01-01T00:00:00Z",
+                                   "updated_at": "2030-01-01T00:00:00Z"}]
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix", "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+
     def contributor_pr(self, author="dana-example", state="open", merged_at=None):
         pr = {"number": 99, "state": state, "user": {"login": author},
               "body": "Why.\n\nRefs #12\n",
