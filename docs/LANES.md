@@ -272,7 +272,12 @@ A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
 the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
-`/grug improve`), and returns the ticket to `loom:pr`. Before a fix brief's
+`/grug improve`), and returns the ticket to `loom:pr`. A pull request that
+merges while its ticket waits at `loom:queued` or `loom:briefed` (a fix round
+sent it back and nobody took it yet, or the pull request opened and merged
+between two passes) moves the ticket to `loom:merged` with a one-line note,
+under the same author and trust rules as an open pull request, unless the
+ticket went back to queued or briefed after the merge. Before a fix brief's
 agent runs, the runner merges the default branch into the pull request's
 branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
 the agent changes nothing, and a conflict is handed to the agent with the

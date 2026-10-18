@@ -2545,7 +2545,12 @@ class Station:
                          {"labels": kept})
             ticket["labels"] = [{"name": name} for name in kept]
             self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
-        if not tickets_by_number:
+        # A ticket still at queued or briefed whose pull request merged:
+        # a brain fix round sent it back to briefed and the pull request
+        # merged before a lane took the fix, or the pull request opened and
+        # merged between two passes (loom#784).
+        unlinked = self._unlinked_tickets(repo, tickets_by_number)
+        if not tickets_by_number and not unlinked:
             return
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
@@ -2553,8 +2558,64 @@ class Station:
                               "&direction=desc&per_page=100" % repo).data
         for pr in closed if isinstance(closed, list) else []:
             if isinstance(pr, dict) and pr.get("state") == "closed":
-                pool = tickets_by_number if self._terminal_label(pr) == "loom:merged" else waiting
+                merged = self._terminal_label(pr) == "loom:merged"
+                pool = tickets_by_number if merged else waiting
                 self._reconcile_pr_ticket(repo, pr, pool)
+                if merged:
+                    self._deliver_unlinked(repo, pr, unlinked)
+
+    def _unlinked_tickets(self, repo: str,
+                          linked: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        """The repo's open tickets at loom:queued or loom:briefed that a
+        briefing login filed, by number. The open-tickets list is the verify
+        runs' own read, so a pass that reads both pays for it once; with no
+        such ticket and no loom:pr ticket, no closed pull request is read."""
+        found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        out: Dict[int, Dict[str, Any]] = {}
+        for issue in found:
+            if (isinstance(issue, dict) and "pull_request" not in issue
+                    and int(issue.get("number") or 0) not in linked
+                    and "loom:ticket" in _label_names(issue)
+                    and set(_label_names(issue)).intersection(("loom:queued", "loom:briefed"))
+                    and tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)):
+                # The trust check reads the repo owner from repository_url.
+                issue.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
+                out[int(issue["number"])] = issue
+        return out
+
+    def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
+                          unlinked: Dict[int, Dict[str, Any]]) -> None:
+        """Move a queued or briefed ticket to loom:merged when this merged
+        pull request delivers it: a same-repo branch, linked to the ticket,
+        by a trusted author of a trusted ticket or by the contributor who
+        owns it, and merged after the ticket last went to queued or briefed."""
+        number = self._pr_ticket_number(repo, pr)
+        ticket = unlinked.get(number) if number is not None else None
+        if ticket is None or not _linked_pr(ticket, repo, pr):
+            return
+        head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
+        if head_repo != repo:
+            return
+        author = tickets._login(pr.get("user"))
+        authors = {name.lower() for name in self.s.authors}
+        if author in authors:
+            if not self._check_trust(repo, ticket)[0]:
+                return
+        else:
+            owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+            if (not author or author not in owners
+                    or tickets._login(ticket.get("user")) not in authors):
+                return
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
+        if tickets.merged_before_requeue(pr.get("merged_at"), events):
+            return
+        labels = _label_names(ticket)
+        was = "loom:briefed" if "loom:briefed" in labels else "loom:queued"
+        self._reconcile_pr_ticket(repo, pr, {number: ticket})
+        if "loom:merged" in _label_names(ticket):
+            del unlinked[number]
+            self._comment(repo, number, "Pull request #%d merged while this ticket was at %s, "
+                          "so it moved to loom:merged." % (int(pr["number"]), was))
 
     def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
                             author: str) -> Optional[Dict[str, Any]]:
