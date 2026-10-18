@@ -938,6 +938,14 @@ defers. `python3 -m bus.brain resume OWNER/NAME... --holder NAME` lists the
 defers still standing whose item is open and
 unchanged, and refuses unless that holder holds the tick lock.
 
+A repo or handoff item GitHub will not show (HTTP 301 after a rename or
+transfer, 404 or 410, a 403 that is not a rate limit, a GraphQL NOT_FOUND)
+does not end `status` or `resume`: each prints `skipped <repo>: <reason>`,
+in the output and on stderr, and finishes the other repos. `resume` lists
+such repos under "Skipped repos (fix LOOM_REPOS)". Any other GitHub error
+(5xx, a rate limit, a dropped connection) still ends the command, so a
+fault never reads as an empty repo.
+
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it
 shipped and its Live criterion (the acceptance line that starts with

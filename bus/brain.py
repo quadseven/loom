@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, _next_link, auth_from_env, rest_login
+from .github import GitHub, GitHubError, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
@@ -579,6 +579,32 @@ def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def _skip_line(what: str, reason: str) -> str:
+    """The "- skipped <repo>: <reason>" line, written to stderr as well so
+    the brain's log names what it could not read."""
+    line = "skipped %s: %s" % (what, reason)
+    print(line, file=sys.stderr)
+    return "- " + line
+
+
+def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
+                      authors: Optional[Sequence[str]] = None,
+                      into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+                      check: str = "Grug - Elder") -> List[str]:
+    """_repo_section, or one skipped line when GitHub will not show the repo
+    (moved, gone or forbidden: github.unreadable), so one moved repo does
+    not end the status of every other. Any other GitHubError still ends it."""
+    try:
+        return _repo_section(gh, repo, now, bot, authors, into, check)
+    except GitHubError as err:
+        reason = unreadable(err)
+        if reason is None:
+            raise
+        if into is not None:
+            into.pop(repo, None)
+        return ["", "## %s" % repo, "", _skip_line(repo, reason)]
+
+
 def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
                   into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
@@ -712,8 +738,8 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     found: Dict[str, List[Dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         sections = list(pool.map(
-            lambda repo: _repo_section(gh, repo, now, bot, authors, found,
-                                       review_check_name(env)), repos))
+            lambda repo: _readable_section(gh, repo, now, bot, authors, found,
+                                           review_check_name(env)), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)]
     out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
@@ -3080,21 +3106,56 @@ def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
 GoalJournals = Tuple[str, Dict[str, Any], List[Dict[str, Any]], List[str]]
 
 
-def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str]
-                   ) -> List[GoalJournals]:
+def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str],
+                   skipped: Optional[Dict[str, str]] = None) -> List[GoalJournals]:
     """(repo, goal, trusted journals, logins of the journals skipped) for
-    every goal across `repos`."""
-    # Nothing is caught here: a GitHubError ends the command through main's
-    # narrow handler, so a fault never reads as a goal with no journals.
+    every goal across `repos`. With `skipped`, a repo GitHub will not show
+    (github.unreadable) is recorded there with its reason and left out."""
+    # Only an unreadable repo is caught, and it is named in the output: any
+    # other GitHubError ends the command through main's narrow handler, so a
+    # fault never reads as a goal with no journals.
     goals: List[GoalJournals] = []
     for repo in repos:
-        for issue in _issues(gh, repo):
-            if "loom:goal" not in _labels(issue):
-                continue
-            comments = _goal_home_comments(gh, repo, int(issue["number"]))
-            goals.append((repo, issue, handoff.journals(comments, authors),
-                          handoff.untrusted_journal_logins(comments, authors)))
+        try:
+            found = []
+            for issue in _issues(gh, repo):
+                if "loom:goal" not in _labels(issue):
+                    continue
+                comments = _goal_home_comments(gh, repo, int(issue["number"]))
+                found.append((repo, issue, handoff.journals(comments, authors),
+                              handoff.untrusted_journal_logins(comments, authors)))
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None or skipped is None:
+                raise
+            skipped[repo] = reason
+            continue
+        goals += found
     return goals
+
+
+def _item_revisions(gh: GitHub, items: Sequence[handoff.Mark],
+                    skipped: Dict[str, str]
+                    ) -> Tuple[Dict[Tuple[str, int], Optional[str]], Dict[Tuple[str, int], str]]:
+    """Each handoff item's revision (item_revision), and apart from those the
+    items GitHub will not show, with the reason: an item in a skipped repo,
+    or one whose read answers moved or forbidden."""
+    current: Dict[Tuple[str, int], Optional[str]] = {}
+    gone: Dict[Tuple[str, int], str] = {}
+    for m in items:
+        if m.item in current or m.item in gone:
+            continue
+        if m.item[0] in skipped:
+            gone[m.item] = skipped[m.item[0]]
+            continue
+        try:
+            current[m.item] = item_revision(gh, *m.item)
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            gone[m.item] = reason
+    return current, gone
 
 
 def _goal_home_comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
@@ -3113,35 +3174,47 @@ def _goal_home_journals(gh: GitHub, repo: str, number: int,
 def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                        found: List[Dict[str, Any]],
     latest: Optional[Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]] = None,
-                       skipped: Sequence[str] = ()) -> List[str]:
+                       skipped: Sequence[str] = (),
+                       unread: Optional[Dict[str, str]] = None) -> List[str]:
     found_marks = handoff.marks(found)
     items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
-    latest = latest or {(m.stage, m.item, m.key if m.stage == "brief" else ""): m
-                        for m in found_marks}
-    current = {m.item: item_revision(gh, *m.item) for m in items}
+    latest = latest or {_mark_key(m): m for m in found_marks}
+    current, gone = _item_revisions(gh, items, unread or {})
+    items = [m for m in items if m.item not in gone]
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
     if skipped:
         out.append("- skipped journals by logins not in LOOM_BRIEF_AUTHORS: %s"
                    % " ".join(skipped))
+    out += [_skip_line(handoff.item_ref(item), reason) for item, reason in sorted(gone.items())]
     for m in items:
-        newest = latest[(m.stage, m.item, m.key if m.stage == "brief" else "")]
-        if newest.kind == "defer" and newest != m:
-            continue
-        if newest.kind == "done":
-            out.append("- dropped %s %s: finished or closed since the defer" % (
-                m.stage, handoff.item_ref(m.item)))
-            continue
-        if m in alive:
-            item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
-            out.append("- resume %s %s (deferred by %s at %s)" % (
-                m.stage, item_text, m.holder, m.at))
-        else:
-            out.append("- dropped %s %s: %s since the defer" % (
-                m.stage, handoff.item_ref(m.item),
-                "finished or closed" if current[m.item] is None else "changed"))
+        line = _resume_item_line(m, latest[_mark_key(m)], m in alive, current[m.item])
+        if line:
+            out.append(line)
     return out
+
+
+def _mark_key(m: handoff.Mark) -> Tuple[str, Tuple[str, int], str]:
+    """The handoff a mark belongs to: its stage and item, and a brief's key."""
+    return (m.stage, m.item, m.key if m.stage == "brief" else "")
+
+
+def _resume_item_line(m: handoff.Mark, newest: handoff.Mark, alive: bool,
+                      revision: Optional[str]) -> Optional[str]:
+    """One standing defer's resume line: resumed while live, dropped once
+    done, closed or changed, and None when a newer defer replaced it."""
+    if newest.kind == "defer" and newest != m:
+        return None
+    if newest.kind == "done":
+        return "- dropped %s %s: finished or closed since the defer" % (
+            m.stage, handoff.item_ref(m.item))
+    if alive:
+        item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
+        return "- resume %s %s (deferred by %s at %s)" % (m.stage, item_text, m.holder, m.at)
+    return "- dropped %s %s: %s since the defer" % (
+        m.stage, handoff.item_ref(m.item),
+        "finished or closed" if revision is None else "changed")
 
 
 def _freshness_line(peers: List[Dict[str, Any]]) -> str:
@@ -3240,7 +3313,11 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     now = now or datetime.now(timezone.utc)
     authors = require_trusted_authors(env, "resume")
     _lock_holder(gh, lock_repo, holder, now)
-    goals = _goal_journals(gh, repos, authors)
+    unread: Dict[str, str] = {}
+    goals = _goal_journals(gh, repos, authors, unread)
+    # A moved or forbidden repo is named once and left out of every later
+    # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
+    repos = [r for r in repos if r not in unread]
     latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
     for _, _, found, _ in goals:
         for mark in handoff.marks(found):
@@ -3250,8 +3327,11 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     out = ["# Resume for %s" % holder, "", trusted_line(authors), "",
            _freshness_line(handoff.peer_journals(
                [j for _, _, found, _ in goals for j in found], holder, now))]
+    if unread:
+        out += ["", "## Skipped repos (fix LOOM_REPOS)"]
+        out += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
     for repo, issue, found, skipped in goals:
-        out += _goal_resume_lines(gh, repo, issue, found, latest, skipped)
+        out += _goal_resume_lines(gh, repo, issue, found, latest, skipped, unread)
     return "\n".join(out + _sensitive_resume_lines(gh, repos, now, env)
                       + _finished_epic_resume_lines(gh, [(r, i) for r, i, _, _ in goals])
                       + _verify_resume_lines(gh, repos, now)

@@ -91,6 +91,27 @@ def rest_login(author: Optional[Dict[str, Any]]) -> str:
     return login
 
 
+def unreadable(err: GitHubError) -> Optional[str]:
+    """Why GitHub will not show a repo or item at all, as one line: it moved
+    (301, a rename or transfer), is gone (404, 410), or is forbidden (403
+    that is not a rate limit), or a GraphQL NOT_FOUND. None for any other
+    failure (5xx, a rate limit, a dropped connection), which must still end
+    the command: only these are safe to skip and name."""
+    body = err.body or ""
+    parsed = _json_or_none(body)
+    message = str(parsed.get("message") or "") if isinstance(parsed, dict) else ""
+    if err.status in (301, 302, 307, 308):
+        return "HTTP %d %s: renamed or transferred" % (err.status, message or "moved")
+    if err.status in (404, 410):
+        return "HTTP %d %s" % (err.status, message or "not found")
+    lowered = body.lower()
+    if err.status == 403 and "rate limit" not in lowered and "abuse" not in lowered:
+        return "HTTP 403 %s" % (message or "forbidden")
+    if str(err) == "graphql errors" and '"NOT_FOUND"' in body:
+        return "GraphQL NOT_FOUND"
+    return None
+
+
 def request_kind(method: str, url: str) -> str:
     """The endpoint kind a request is counted under in the station's log."""
     path = url.split("://", 1)[-1].split("/", 1)[-1].split("?", 1)[0]
