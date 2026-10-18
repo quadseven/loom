@@ -225,6 +225,10 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .quota-row .quota { flex: 1; height: 3px; }
 .quota.low span { background: var(--bad); }
 .quota-label { color: var(--muted); font: 10px var(--font-mono); }
+.factory-tiers, .model-ladder { border-collapse: collapse; font: 12px var(--font-mono); margin: 0 0 10px; width: 100%; }
+.factory-tiers th, .factory-tiers td, .model-ladder th, .model-ladder td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; }
+.factory-tiers th:first-child { width: 90px; }
+.model-ladder { max-width: 680px; }
 .tier-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 460px), 1fr)); gap: 12px; }
 .tier-card { display: grid; gap: 11px; padding: 14px 16px; background: var(--surface); }
 .model-row { display: grid; gap: 5px; font: 12px var(--font-mono); }

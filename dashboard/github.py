@@ -166,6 +166,11 @@ def comment_record(comment: Dict[str, Any], repo: str) -> Dict[str, Any]:
     return out
 
 
+def _refresh_interval() -> int:
+    """Seconds the background thread waits between refresh passes."""
+    return max(1, int(os.environ.get("LOOM_DASHBOARD_REFRESH_SECONDS", "60")))
+
+
 def _newest_update(records: List[Dict[str, Any]], newest: Optional[str]) -> Optional[str]:
     """The newest updated_at among the records and newest; None when there is none."""
     stamps = [str(r["updated_at"]) for r in records if r.get("updated_at")]
@@ -219,6 +224,7 @@ class TicketStore:
                              if budget_floor is None else budget_floor)
         self._snapshot = {"tickets": {repo: None for repo in self.repos}, "errors": {},
                           "stale": False, "ready": False,
+                          "ticket_refreshed_at": None, "next_refresh_at": None, "stale_reason": "",
                           "improving": {"journals": [], "metrics_comments": []},
                           "lanes": [], "pull_requests": [], "dashboard_errors": [],
                           "goal_context": {},
@@ -261,7 +267,7 @@ class TicketStore:
     def start_background(self) -> None:
         if self._refresh_thread is not None:
             return
-        interval = max(1, int(os.environ.get("LOOM_DASHBOARD_REFRESH_SECONDS", "60")))
+        interval = _refresh_interval()
 
         def run() -> None:
             while not self._stop.is_set():
@@ -334,23 +340,47 @@ class TicketStore:
                  for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
         return repo, found, count, ""
 
+    def _skip_dashboard_below_floor(self, data: Dict[str, Any]) -> None:
+        reset = ("at %s UTC" % datetime.fromtimestamp(self._reset_at, timezone.utc).strftime("%H:%M")
+                 if self._reset_at else "when GitHub's request limit resets")
+        skipped = "GitHub's request budget ran low; these details refresh %s" % reset
+        data.update({"improving": {"journals": [], "metrics_comments": []},
+                     "lanes": [], "pull_requests": [],
+                     "brain_step": None, "brain_step_error": skipped,
+                     "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
+                     "dashboard_errors": [skipped]})
+        # The goal cards keep the last pass that read them. Dropping them
+        # here left every Goals card at "-" with "No report on this goal
+        # in the last two weeks" whenever the budget dipped (2026-10-17).
+        previous = self._snapshot.get("goal_context")
+        data["goal_context"] = previous or {}
+        data["goal_context_error"] = self._snapshot.get("goal_context_error", "") if previous else (
+            "GitHub goal comments were not read: the request budget ran low and no earlier pass read them; "
+            "this refreshes %s" % reset)
+
+    def _read_goal_context(self, data: Dict[str, Any], homes, reports, metric_comments) -> None:
+        rows = [row for found in data.get("tickets", {}).values() if found for row in found]
+        configured = set(self.repos) | {repo for repo, _ in homes}
+        titles, parents = self._goal_info(rows, configured)
+        epics = self._assign_epics(rows)
+        # Reports on the goal homes read in full above count too: a goal home
+        # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
+        # comment feed failed this pass.
+        unread = dict(data.get("comment_errors") or {})
+        for repo in {str(row.get("goal") or "").partition("#")[0] for row in rows if row.get("goal")}:
+            if repo not in self.repos and (repo, None) not in homes:
+                unread.setdefault(repo, "%s comments: the repo is not in LOOM_REPOS, so its comments"
+                                        " are not read" % repo)
+        data["goal_context"] = goals.goal_context(
+            rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
+            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
+            parents=parents, unread=unread, epics=epics)
+        data["goal_context_error"] = ""
+
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
         """Read optional view sources; errors stay visible without failing tickets."""
         if self._below_floor():
-            skipped = "optional view sources were not refreshed because the GitHub request budget is below its floor"
-            data.update({"improving": {"journals": [], "metrics_comments": []},
-                         "lanes": [], "pull_requests": [],
-                         "brain_step": None, "brain_step_error": skipped,
-                         "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
-                         "dashboard_errors": [skipped]})
-            # The goal cards keep the last pass that read them. Dropping them
-            # here left every Goals card at "-" with "No report on this goal
-            # in the last two weeks" whenever the budget dipped (2026-10-17).
-            previous = self._snapshot.get("goal_context")
-            data["goal_context"] = previous or {}
-            data["goal_context_error"] = self._snapshot.get("goal_context_error", "") if previous else (
-                "goal comments were not read: the GitHub request budget is below its floor"
-                " and no earlier pass read them")
+            self._skip_dashboard_below_floor(data)
             return
 
         journals, reports, metric_comments, prs, lanes = [], [], [], [], []
@@ -389,23 +419,7 @@ class TicketStore:
         data["dashboard_errors"] = errors
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
-        rows = [row for found in data.get("tickets", {}).values() if found for row in found]
-        configured = set(self.repos) | {repo for repo, _ in homes}
-        titles, parents = self._goal_info(rows, configured)
-        epics = self._assign_epics(rows)
-        # Reports on the goal homes read in full above count too: a goal home
-        # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
-        # comment feed failed this pass.
-        unread = dict(data.get("comment_errors") or {})
-        for repo in {str(row.get("goal") or "").partition("#")[0] for row in rows if row.get("goal")}:
-            if repo not in self.repos and (repo, None) not in homes:
-                unread.setdefault(repo, "%s comments: the repo is not in LOOM_REPOS, so its comments"
-                                        " are not read" % repo)
-        data["goal_context"] = goals.goal_context(
-            rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
-            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
-            parents=parents, unread=unread, epics=epics)
-        data["goal_context_error"] = ""
+        self._read_goal_context(data, homes, reports, metric_comments)
 
     def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
         """Each goal home's title and the goal it rolls up into (a `Parent
@@ -683,6 +697,40 @@ class TicketStore:
         except (GitHubError, OSError, ValueError) as exc:
             return repo, None, self._error_reason(exc)
 
+    def _stale_metadata(self, stale: bool, errors: Dict[str, str], current: Dict[str, Any]):
+        refreshed_at = current.get("ticket_refreshed_at")
+        if not stale and not errors:
+            refreshed_at = time.time()
+        below_floor = self._below_floor()
+        # Below the floor a pass reads nothing, so only GitHub's reset time
+        # ends the stale spell; without one the next refresh is unknown.
+        reset_at = (self._reset_at or None) if below_floor else int(time.time()) + _refresh_interval()
+        stale_reason = ("GitHub's request budget ran low" if below_floor else
+                        "GitHub could not refresh ticket data" if errors else "")
+        return refreshed_at, reset_at, stale_reason
+
+    def _refresh_waits(self, snapshot: Dict[str, Any], now: float) -> None:
+        if now - self._waits_refreshed_at < 3600 or self._below_floor():
+            snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+            snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+            snapshot["state_entered"] = self._snapshot.get("state_entered", {})
+            return
+        try:
+            entered = {}
+            rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered)
+            self.waits = {row["state"]: [row["median_h"]] * row["n"]
+                          for row in rows if row.get("median_h") is not None and row.get("n")}
+            snapshot["wait_rows"] = rows
+            snapshot["wait_bottleneck"] = bottleneck
+            snapshot["state_entered"] = entered
+            self.waits_error = ""
+        except (GitHubError, OSError, ValueError) as exc:
+            self.waits_error = self._error_reason(exc)
+            snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+            snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+            snapshot["state_entered"] = self._snapshot.get("state_entered", {})
+        self._waits_refreshed_at = now
+
     def refresh(self) -> None:
         with self._refresh_lock:
             started = time.monotonic()
@@ -694,32 +742,16 @@ class TicketStore:
                 operator_items, human_counts, ask_error = self.operator_items, self.human_counts, self.operator_error
             else:
                 operator_items, human_counts, ask_error = self._read_operator_items()
+            refreshed_at, reset_at, stale_reason = self._stale_metadata(stale, errors, current)
             snapshot = {"tickets": data, "errors": errors, "stale": stale,
+                        "ticket_refreshed_at": refreshed_at, "next_refresh_at": reset_at,
+                        "stale_reason": stale_reason,
                         "ready": any(rows is not None for rows in data.values())}
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
             self._read_dashboard(snapshot)
             now = time.time()
-            if now - self._waits_refreshed_at >= 3600 and not self._below_floor():
-                try:
-                    entered = {}
-                    rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered)
-                    self.waits = {row["state"]: [row["median_h"]] * row["n"]
-                                  for row in rows if row.get("median_h") is not None and row.get("n")}
-                    snapshot["wait_rows"] = rows
-                    snapshot["wait_bottleneck"] = bottleneck
-                    snapshot["state_entered"] = entered
-                    self.waits_error = ""
-                except (GitHubError, OSError, ValueError) as exc:
-                    self.waits_error = self._error_reason(exc)
-                    snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
-                    snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
-                    snapshot["state_entered"] = self._snapshot.get("state_entered", {})
-                self._waits_refreshed_at = now
-            else:
-                snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
-                snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
-                snapshot["state_entered"] = self._snapshot.get("state_entered", {})
+            self._refresh_waits(snapshot, now)
             floor_context = snapshot.get("floor_context", {})
             floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
                                   "needs_you_reason": ask_error,
@@ -738,6 +770,9 @@ class TicketStore:
         usage_rows = [row for items in getattr(store, "providers", {}).values() for row in items] if store else []
         return {"tickets": snapshot["tickets"], "errors": snapshot["errors"],
                 "stale": snapshot["stale"], "auth": self.auth,
+                "ticket_refreshed_at": snapshot.get("ticket_refreshed_at"),
+                "next_refresh_at": snapshot.get("next_refresh_at"),
+                "stale_reason": snapshot.get("stale_reason", "GitHub could not refresh ticket data"),
                 "improving": snapshot.get("improving", {}),
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),

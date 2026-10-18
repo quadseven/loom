@@ -219,6 +219,8 @@ ADOPT_TITLE_MAX = 200
 ADOPTIONS_FILE = "adoptions.json"
 # Issues another operator's Loom owns, each logged once (docs/LANES.md).
 OWNED_FILE = "owned.json"
+# The untrusted labellers a briefed ticket was refused for, with when (loom#660).
+LABELER_FILE = "labeler_refusals.json"
 ADOPT_RETRY = 600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
@@ -1111,7 +1113,9 @@ class Station:
         return bool(rec) and rec.get("updated_at") == issue.get("updated_at")
 
     def _refuse(self, repo: str, issue: Dict[str, Any], reason: str) -> None:
-        """Log a refusal once per issue and body, and remember it."""
+        """Log a refusal once per issue and body, and remember it. A refusal
+        for an untrusted labeller is also counted toward its invariant."""
+        self._note_labeller(reason)
         path = os.path.join(self.state, "untrusted.json")
         seen = _read_json(path, {})
         if not isinstance(seen, dict):
@@ -1123,6 +1127,30 @@ class Station:
             _say("not claiming %s: %s" % (key, reason))
         seen[key] = {"sha": sha, "updated_at": issue.get("updated_at")}
         _write_json(path, seen)
+
+    def _note_labeller(self, reason: str) -> None:
+        """Count a refusal for an untrusted labeller against its login, with
+        the time, in LABELER_FILE (loom#660)."""
+        login = tickets.refused_labeller(reason)
+        if login is None:
+            return
+        path = os.path.join(self.state, LABELER_FILE)
+        seen = _read_json(path, {})
+        seen = seen if isinstance(seen, dict) else {}
+        seen[login] = self._recent(seen.get(login)) + [self.now]
+        _write_json(path, seen)
+
+    def _recent(self, times: Any) -> List[float]:
+        """The refusal times in the last invariants.LABELER_WINDOW seconds."""
+        return [t for t in times if self._num(t) and 0 <= self.now - t <= invariants.LABELER_WINDOW] \
+            if isinstance(times, list) else []
+
+    def _labeler_refusals(self) -> Dict[str, int]:
+        """Untrusted labeller login -> its refusals in the last hour."""
+        seen = _read_json(os.path.join(self.state, LABELER_FILE), {})
+        seen = seen if isinstance(seen, dict) else {}
+        counts = {login: len(self._recent(times)) for login, times in seen.items()}
+        return {login: n for login, n in counts.items() if n}
 
     # -- another operator's issues (docs/LANES.md, Two Looms) -------------
     def _note_owned(self, key: str, why: str) -> None:
@@ -3295,9 +3323,10 @@ class Station:
 
     def _retry_lane(self, repo: str, issue: Dict[str, Any], failed: str, klass: str,
                     skip: set) -> Optional[str]:
-        """The next eligible lane: another slot of the failed lane's provider
-        (not after a limit, which the slots share), then RETRY_ORDER, then free
-        lanes for an easy ticket. Only available lanes whose runner takes the
+        """The next eligible lane: RETRY_ORDER, then free lanes for an easy
+        ticket, never a slot of the failed lane's provider. Its slots share the
+        model, the key and often the box, so a sibling repeats the failure (a
+        Spark that timed out, an expired opencode-go key; loom#747). Only available lanes whose runner takes the
         ticket's model and repo; an idle one before a busy one. Candidate
         eligibility is kept in _retry_eligible so this method selects by order."""
         try:
@@ -3321,8 +3350,7 @@ class Station:
         return busy
 
     def _retry_order(self, failed: str, klass: str, difficulty: Optional[str]) -> List[str]:
-        same = [lane for lane in LANES if provider(lane) == provider(failed)]
-        order = ([] if klass == "limit" else same) + RETRY_ORDER
+        order = list(RETRY_ORDER)
         if difficulty == "easy":
             order += FREE_LANES
         return order
@@ -3330,12 +3358,12 @@ class Station:
     def _retry_eligible(self, repo: str, cand: str, failed: str, klass: str, model: str,
                         public: Dict[str, bool]) -> bool:
         """Whether lane cand can take a retry: a known, available lane, not
-        the failed lane's provider after a limit, whose runner takes the
-        model and, for a public-only lane, a public repo. public caches the
-        repo lookup across candidates."""
+        the failed lane's provider, whose runner takes the model and, for a
+        public-only lane, a public repo. public caches the repo lookup across
+        candidates."""
         if cand not in LANES or not self._heartbeat_ok(cand):
             return False
-        if klass == "limit" and provider(cand) == provider(failed):
+        if provider(cand) == provider(failed):
             return False
         if model and not lane_takes_model(cand, model):
             return False
@@ -4731,6 +4759,7 @@ class Station:
             except (GitHubError, OSError) as err:
                 _say("invariants: could not read %s: %s" % (name, err))
         facts.held = state["held"] = self._invariant_held(state.get("held"))
+        facts.label_refusals = self._labeler_refusals()
         gate_held = self._invariant_gate_held(state.get("gate_held"))
         state["gate_held"] = gate_held
         facts.gate_held = {
@@ -6066,6 +6095,22 @@ class Station:
                      % (type(err).__name__, str(err).replace(token, "[token]")))
 
 
+def _trust_app_login(settings: Settings, gh: GitHub) -> None:
+    """Trust the Loom App's own bot login wherever LOOM_BRIEF_AUTHORS is, so a
+    credential change cannot leave the station refusing its own labels
+    (loom#660), and log the logins trusted. A login that cannot be read is
+    logged, and the configured logins stay as they were."""
+    try:
+        login = gh.app_login()
+    except GitHubError as err:
+        _say("could not read the GitHub App's login, so it is not trusted: %s" % err)
+        login = None
+    if login and login.lower() not in {a.lower() for a in settings.authors}:
+        settings.authors = list(settings.authors) + [login]
+    _say("trusting briefing logins: %s" % " ".join(
+        tickets.briefing_logins(settings.authors, settings.briefers)))
+
+
 def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
     """One pass. Exits 0 at once when another pass holds the lock."""
     if not settings.repos:
@@ -6089,6 +6134,7 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         if gh is None:
             from .github import auth_from_env
             gh = GitHub(auth_from_env())
+        _trust_app_login(settings, gh)
         if gh.cache_dir is None:
             # Every GET is conditional: a list re-read each pass costs a 304.
             gh.cache_dir = os.path.join(state, "station", "etags")

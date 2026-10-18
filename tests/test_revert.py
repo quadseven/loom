@@ -98,6 +98,9 @@ class FakeGitHub:
             return list(self.reverts)
         if "labels=loom:ticket&state=open" in path:
             return [i for i in self.issues.values() if i["state"] == "open"]
+        if "labels=epic&state=all" in path:
+            return [i for i in self.issues.values()
+                    if "epic" in [label["name"] for label in i.get("labels") or []]]
         m = re.search(r"labels=(loom:merged|loom:shipped)&state=open", path)
         if m:
             label = m.group(1)

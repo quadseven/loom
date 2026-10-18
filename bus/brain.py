@@ -934,12 +934,9 @@ def _direct_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
 
 def _goal_epics(gh: GitHub, repo: str, goal: int,
                 direct: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The goal's epics, open and closed: its sub-issues labelled epic, and,
-    once the goal holds GitHub's limit of sub-issues, the repo's epics whose
-    body says Part of #goal (one conditional list read, no search)."""
+    """The goal's epics, open and closed: its sub-issues labelled epic, plus
+    the repo's epics whose body says Part of #goal (one list read per walk)."""
     epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
-    if len(direct) < SUB_ISSUE_LIMIT:
-        return epics
     seen = {int(e.get("number") or 0) for e in epics}
     for item in gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
         number = int((item or {}).get("number") or 0) if isinstance(item, dict) else 0

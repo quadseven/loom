@@ -10,6 +10,8 @@ import ssl
 import statistics
 import socket
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -17,6 +19,7 @@ import ipaddress
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 
+from bus import brain as bus_brain
 from bus import tickets as bus_tickets
 
 from .github import TicketStore
@@ -78,6 +81,28 @@ def _latest_runs(state):
 
 def _ticket_href(row):
     return "/t/%s/%d" % (quote(str(row.get("repo") or ""), safe="/"), int(row.get("number") or 0))
+
+
+def _next_refresh_text(next_refresh):
+    """Format the numeric epoch timestamp as an HH:MM ET clock string for HTML
+    display; this renders page text only and never writes to GITHUB_ENV."""
+    if not isinstance(next_refresh, (int, float)) or isinstance(next_refresh, bool) or next_refresh <= 0:
+        return "once GitHub can be reached"
+    clock = datetime.fromtimestamp(next_refresh, timezone.utc).astimezone(
+        ZoneInfo("America/New_York")).strftime("%H:%M ET")
+    return "at " + clock
+
+
+def _stale_notice(payload, now=None):
+    refreshed = payload.get("ticket_refreshed_at")
+    age = ("is %d minutes old" % max(0, int(((time.time() if now is None else now) - refreshed) // 60))
+           if refreshed else "has not been read yet")
+    reason = html.escape(payload.get("stale_reason") or "GitHub could not refresh ticket data", quote=False)
+    # next_refresh_at is a numeric epoch timestamp formatted as HH:MM ET and
+    # HTML-escaped for the page banner; it is never written to GITHUB_ENV.
+    when = _next_refresh_text(payload.get("next_refresh_at"))
+    return ('<p class="stale-note">Ticket data %s: %s; it refreshes %s.</p>'
+            % (age, reason, html.escape(when)))
 
 
 def _ticket_row(row):
@@ -357,6 +382,61 @@ def _goal_epics_html(info):
     return "".join(out)
 
 
+def _goal_unproven_html(info):
+    held, limit = info.get("unproven"), info.get("unproven_limit")
+    if not (isinstance(held, int) and isinstance(limit, int)):
+        return ""
+    note = "unproven work %d/%d (merged or shipped with no standing proof)" % (held, limit)
+    if held > limit:
+        note += " - over limit: no new build tickets until the goal finishes its proof"
+    return '<p class="machine-fact">%s</p>' % html.escape(note)
+
+
+def _goal_metric_html(info, missing):
+    esc = html.escape
+    if info.get("metric") is not None:
+        prev = esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else ""
+        return '<div class="metric">%s</div><div class="machine-fact">%s%s</div>' % (
+            esc(str(info["metric"])), esc(str(info.get("unit") or "")), prev)
+    return ('<div class="metric metric-missing">not read</div>'
+            '<div class="machine-fact">verified with proof: %s</div>') % esc(
+                str(info.get("metric_reason") or missing))
+
+
+def _goal_spark_html(info):
+    history = [v for v in info.get("history", [])][-7:]
+    scale = info.get("scale") or max([v for v in history if isinstance(v, (int, float))] or [1]) or 1
+    return "".join('<i style="height:%d%%"%s></i>' % (
+        max(6, min(100, int(100 * v / scale))) if isinstance(v, (int, float)) else 6,
+        ' class="last"' if index == len(history) - 1 else "")
+        for index, v in enumerate(history))
+
+
+def _goal_card(goal, children, grouped, goal_data, missing, now):
+    esc = html.escape
+    tickets = grouped.get(goal, [])
+    info = goal_data.get(goal) or {}
+    counts = "".join('<a class="chip" href="/tickets?state=%s&amp;goal=%s">%s %d</a>' % (
+        esc(name, quote=True), quote(goal, safe=""), esc(name),
+        sum(row.get("state") == name for row in tickets)) for name in STATES
+        if any(row.get("state") == name for row in tickets))
+    title = info.get("title") or _short_ref(goal)
+    measure = info.get("measure")
+    child_html = ('<ul class="goal-children" aria-label="Smaller goals in this goal">%s</ul>' % "".join(
+        _goal_child_row(child, goal_data.get(child) or {}, grouped.get(child, []), now)
+        for child in sorted(children, key=lambda c: -len(grouped.get(c, []))))) if children else ""
+    return (
+        '<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
+        '<div class="goal-metric"><div>%s</div>'
+        '<div class="sparkline" aria-label="Last 7 days, one bar a day">%s</div></div>%s'
+        '<div class="chips">%s</div>%s%s%s<a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
+            esc(_short_ref(goal)), esc(str(title)), _goal_metric_html(info, missing),
+            _goal_spark_html(info), '<p class="machine-fact">measure: %s</p>' % esc(measure) if measure else "",
+            counts, _goal_unproven_html(info), _goal_report_html(info, missing, now),
+            _goal_epics_html(info) + child_html,
+            quote(goal, safe=""), len(tickets)))
+
+
 def _goals(state):
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
@@ -379,56 +459,13 @@ def _goals(state):
     def size(top):
         return len(grouped.get(top, [])) + sum(len(grouped.get(child, [])) for child in tree[top])
 
-    esc = html.escape
-    cards = []
-    for goal in sorted(tree, key=lambda top: -size(top)):
-        tickets = grouped.get(goal, [])
-        info = goal_data.get(goal) or {}
-        history = [v for v in info.get("history", [])][-7:]
-        scale = info.get("scale") or max([v for v in history if isinstance(v, (int, float))] or [1]) or 1
-        spark = "".join('<i style="height:%d%%"%s></i>' % (
-            max(6, min(100, int(100 * v / scale))) if isinstance(v, (int, float)) else 6,
-            ' class="last"' if index == len(history) - 1 else "")
-            for index, v in enumerate(history))
-        counts = "".join('<a class="chip" href="/tickets?state=%s&amp;goal=%s">%s %d</a>' % (
-            esc(name, quote=True), quote(goal, safe=""), esc(name),
-            sum(row.get("state") == name for row in tickets)) for name in STATES
-            if any(row.get("state") == name for row in tickets))
-        title = info.get("title") or _short_ref(goal)
-        measure = info.get("measure")
-        held, limit = info.get("unproven"), info.get("unproven_limit")
-        if isinstance(held, int) and isinstance(limit, int):
-            note = "unproven work %d/%d (merged or shipped with no standing proof)" % (held, limit)
-            if held > limit:
-                note += " - over limit: no new build tickets until the goal finishes its proof"
-            unproven_html = '<p class="machine-fact">%s</p>' % esc(note)
-        else:
-            unproven_html = ""
-        if info.get("metric") is not None:
-            metric_html = '<div class="metric">%s</div><div class="machine-fact">%s%s</div>' % (
-                esc(str(info["metric"])), esc(str(info.get("unit") or "")),
-                esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else "")
-        else:
-            metric_html = ('<div class="metric metric-missing">not read</div>'
-                           '<div class="machine-fact">verified with proof: %s</div>') % esc(
-                               str(info.get("metric_reason") or missing))
-        children = tree[goal]
-        child_html = ('<ul class="goal-children" aria-label="Smaller goals in this goal">%s</ul>' % "".join(
-            _goal_child_row(child, goal_data.get(child) or {}, grouped.get(child, []), now)
-            for child in sorted(children, key=lambda c: -len(grouped.get(c, []))))) if children else ""
-        cards.append(
-            '<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
-            '<div class="goal-metric"><div>%s</div>'
-            '<div class="sparkline" aria-label="Last 7 days, one bar a day">%s</div></div>%s'
-            '<div class="chips">%s</div>%s%s%s<a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
-                esc(_short_ref(goal)), esc(str(title)), metric_html,
-                spark, '<p class="machine-fact">measure: %s</p>' % esc(measure) if measure else "",
-                counts, unproven_html, _goal_report_html(info, missing, now),
-                _goal_epics_html(info) + child_html,
-                quote(goal, safe=""), len(tickets)))
+    cards = [_goal_card(goal, tree[goal], grouped, goal_data, missing, now)
+             for goal in sorted(tree, key=lambda top: -size(top))]
     body = ('<p class="page-lede">Each top-level goal home, with the smaller goals that roll up into it,'
             ' measured by what reached a live proof.</p><div class="goal-grid">%s</div>') % (
-        "".join(cards) or '<p class="empty-state">No goals with ticket data.</p>')
+        "".join(cards) or ('<p class="empty-state">%s.</p>' % html.escape(missing)
+                           if response.get("goal_context_error") else
+                           '<p class="empty-state">No goals with ticket data.</p>'))
     return page("Goals", "goals", body, status="snapshot")
 
 
@@ -869,7 +906,9 @@ def _handler_for(state):
             document = body if body.lstrip().lower().startswith("<!doctype html>") else (
                 "<!doctype html><meta charset=utf-8><title>Loom</title>" + body)
             if state.stale:
-                document = document.replace('<main class="page-content">', '<main class="page-content"><p class="stale-note">Showing stale ticket data.</p>')
+                payload = state.response()
+                notice = _stale_notice(payload)
+                document = document.replace('<main class="page-content">', '<main class="page-content">' + notice)
             self.send_bytes(code, document.encode("utf-8"), "text/html; charset=utf-8")
 
         def send_text(self, code, value):
@@ -1175,7 +1214,7 @@ def _hold_reason(lane, rows):
     reason = next((row["holds"][lane] for row in rows
                    if isinstance(row.get("holds"), dict) and lane in row["holds"]), "")
     if not reason:
-        return "held: the lane machine sent no reason"
+        return "no reason"
     reason = re.sub(r"^limit:\s*", "", reason)
     match = re.search(r";\s*(?:lane waits|unavailable) until (\S+)", reason)
     if not match:
@@ -1205,12 +1244,15 @@ def _lane_view_data(payload, tickets, state=None):
             age_str = views.format_age(model_info["time"])
             model_display = "%s (%s)" % (model_info["model"], age_str) if age_str else model_info["model"]
         lane_quota = _lane_quota(lane_name, usage_records)
+        reason = _hold_reason(lane_name, usage_records)
+        if item["available"] and reason == "no reason":
+            reason = "available"
 
         item.update({
             "ticket": active,
-            "model": model_display,
+            "model": model_display or bus_brain._lane_model(lane_name),
             "quota": lane_quota,
-            "reason": None if item["available"] else _hold_reason(lane_name, usage_records),
+            "reason": reason,
         })
         lanes.append(item)
 

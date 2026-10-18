@@ -120,6 +120,21 @@ class LoopTest(unittest.TestCase):
 
 
 class HeldLaneTest(unittest.TestCase):
+    def test_limit_reason_uses_dashboard_timezone_and_configured_lane_model(self):
+        from unittest.mock import patch
+        from dashboard.server import _lane_view_data
+        comment = ("<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n|---|---|---|\n"
+                   "| codex | no | 20:17Z |\n")
+        usage = [{"provider": "codex", "lanes": ["codex"], "window": "credit",
+                  "holds": {"codex": "limit: out of credit; unavailable until 2030-01-02T00:01:27Z"}}]
+        payload = {"lanes": [{"body": comment}], "pull_requests": [], "usage": usage}
+        with patch.dict("os.environ", {"LOOM_DASHBOARD_TZ": "America/New_York",
+                                        "LOOM_CODEX_MODEL": "gpt-6-sol"}, clear=True):
+            rendered = render_lanes(_lane_view_data(payload, []))
+        self.assertIn("out of credit until 2030-01-01 19:01 EST", rendered)
+        self.assertIn("gpt-6-sol", rendered)
+        self.assertNotIn("held: the lane machine sent no reason", rendered)
+
     def test_a_held_lane_names_the_reason_its_heartbeat_gave(self):
         from dashboard.server import _lane_view_data
         comment = ("<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n|---|---|---|\n"
@@ -133,7 +148,7 @@ class HeldLaneTest(unittest.TestCase):
         self.assertIn("out of credit until 2030-01-02 00:01 UTC", cards["anthropic-3"])
         self.assertNotIn("sent no reason", cards["anthropic-3"])
         # A held lane with no reason uploaded says that, never a stand-in.
-        self.assertIn("held: the lane machine sent no reason", cards["zen"])
+        self.assertIn("no reason", cards["zen"])
         self.assertNotIn("held reason missing from lane status comment", html)
 
     def test_the_upload_keeps_holds_and_refuses_bad_ones(self):

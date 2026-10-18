@@ -166,6 +166,23 @@ class DashboardTest(unittest.TestCase):
             connection.close()
         self.assertEqual(len(self.api_calls), before)
 
+    def test_stale_banner_names_age_reason_and_next_refresh(self):
+        self.store._snapshot.update({"stale": True, "ticket_refreshed_at": time.time() - 2400,
+                                     "stale_reason": "GitHub's request budget ran low",
+                                     "next_refresh_at": time.time() + 600})
+        _, _, body = self.raw_get("/")
+        page = body.decode()
+        self.assertRegex(page, r"Ticket data is 40 minutes old: GitHub's request budget ran low")
+        self.assertIn("refreshes at", page)
+        self.assertIn("ET", page)
+
+    def test_no_page_uses_internal_budget_wording(self):
+        for path in ("/", "/results", "/brain", "/hot-spots"):
+            _, _, body = self.raw_get(path)
+            page = body.decode().lower()
+            self.assertNotIn("optional view sources", page)
+            self.assertNotIn("below its floor", page)
+
     def test_conditional_request_and_budget_floor_stale_response(self):
         self.store.refresh()
         self.store.budget_floor = 20
@@ -202,6 +219,19 @@ class DashboardTest(unittest.TestCase):
         self.store.refresh()
         self.assertGreater(len(self.api_calls), before)
         self.assertFalse(self.get_json("/api/tickets")["stale"])
+
+    def test_below_the_floor_without_a_reset_time_the_next_refresh_is_unknown(self):
+        # A pass below the floor reads nothing, so "now plus the interval" is
+        # not when the data refreshes; without GitHub's reset time it is unknown.
+        self.store.refresh()
+        self.store._last_remaining, self.store.budget_floor, self.store._reset_at = 3, 20, 0
+        self.store.refresh()
+        payload = self.get_json("/api/tickets")
+        self.assertTrue(payload["stale"])
+        self.assertIsNone(payload["next_refresh_at"])
+        self.store._reset_at = int(time.time()) + 600
+        self.store.refresh()
+        self.assertEqual(self.get_json("/api/tickets")["next_refresh_at"], self.store._reset_at)
 
     def raw_get(self, path):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
@@ -515,7 +545,17 @@ class LanesAndImprovingTest(unittest.TestCase):
         from dashboard.views import render_lanes
         with patch.dict(factory.TIERS, {"easy": ("test-lane",)}):
             body = render_lanes({"lanes": [], "scoreboard": {}})
-        self.assertIn("Easy: test-lane", body)
+        self.assertIn('<table class="factory-tiers">', body)
+        self.assertIn("<th>Easy</th><td>test-lane</td>", body)
+        self.assertIn('<table class="model-ladder">', body)
+
+    def test_tier_table_has_one_row_for_each_factory_tier(self):
+        from dashboard.views import render_lanes
+        from bus import factory
+        body = render_lanes({"lanes": [], "scoreboard": {}})
+        self.assertEqual(body.count('<tr class="factory-tier">'), len(factory.TIERS))
+        for tier in factory.TIERS:
+            self.assertIn("<th>%s</th>" % tier.title(), body)
 
     def test_pull_request_footer_and_models_scoreboard(self):
         from dashboard import views
@@ -729,7 +769,8 @@ class LaneCardsTest(unittest.TestCase):
         body = render_lanes(data)
         self.assertIn("Lane cards</a> - heartbeat 20:17Z", body)
 
-    def test_pull_request_footer_shows_model_and_missing_says_model_missing(self):
+    def test_pull_request_footer_shows_model_and_configured_model_is_fallback(self):
+        from unittest.mock import patch
         from dashboard.views import render_lanes
         from dashboard.server import _lane_view_data
         comment = (
@@ -744,10 +785,11 @@ class LaneCardsTest(unittest.TestCase):
             "created_at": "2026-10-14T12:00:00Z",
         }]
         payload = {"lanes": [{"body": comment}], "pull_requests": prs, "tickets": {}}
-        data = _lane_view_data(payload, [])
+        with patch.dict("os.environ", {"LOOM_CLAUDE_MODEL": "claude-sonnet-5-5"}, clear=True):
+            data = _lane_view_data(payload, [])
         body = render_lanes(data)
         self.assertIn("gpt-6-sol", body)
-        self.assertIn("model missing", body)
+        self.assertIn("claude-sonnet-5-5", body)
 
     def test_the_runners_ticket_name_footer_names_the_lanes_model(self):
         from dashboard.views import footer, render_lanes
@@ -821,7 +863,6 @@ class LaneCardsTest(unittest.TestCase):
         self.assertIn("gpt-6-sol", body)
         self.assertIn('<div class="quota"><span style="width:42%"></span></div>', body)
         self.assertIn("quota missing", body)
-        self.assertIn("model missing", body)
 
 
 if __name__ == "__main__":

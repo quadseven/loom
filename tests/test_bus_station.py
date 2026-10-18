@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, proof, spend, station, tickets  # noqa: E402
-from bus.github import GitHub  # noqa: E402
+from bus.github import AppToken, GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
 AUTHORS = ["alice-example", "bob-example"]
@@ -1278,6 +1278,8 @@ class BudgetTest(Base):
             if method == "POST" and "/app/installations/" in url:
                 answer = {"token": "ghs_" + "x" * 396, "expires_at": "2099-01-01T00:00:00Z"}
                 return 201, {}, json.dumps(answer).encode()
+            if method == "GET" and url.endswith("/app"):
+                return 200, {}, json.dumps({"slug": "loom-app"}).encode()
             bearers.append(headers_in["Authorization"])
             return transport(method, url, headers_in, body)
         app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
@@ -1293,14 +1295,15 @@ class BudgetTest(Base):
         sent = []
 
         def refusing(method, url, headers_in, body):
-            sent.append((method, headers_in.get("Authorization", "")))
+            sent.append((method, url.rsplit("/", 1)[-1]))
             return 401, {}, json.dumps({"message": "Bad credentials"}).encode()
         app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
         _, err = self.passes(gh=GitHub(app, transport=refusing))
         self.assertIn("could not mint the GitHub App installation token", err)
         self.assertIn("(Bad credentials)", err)
-        # Every request was a mint: none went out with a personal token.
-        self.assertEqual({m for m, _ in sent}, {"POST"})
+        # Every request was the App's own login read or a mint: none went out
+        # with a personal token.
+        self.assertEqual(set(sent), {("GET", "app"), ("POST", "access_tokens")})
 
     def test_an_idle_repo_is_scanned_once_per_ten_minutes(self):
         start = time.time()
@@ -2506,23 +2509,24 @@ class RetryTest(Base):
     def bodies(self, number=12):
         return [c["body"] for c in self.fake.comments[number]]
 
-    def test_a_transient_failure_moves_to_another_slot_on_a_fresh_branch(self):
+    def test_a_transient_failure_moves_to_another_provider_on_a_fresh_branch(self):
+        # codex-2 shares codex's provider (and so its model): never the retry.
         self.heartbeat("codex-2")
         self.heartbeat("anthropic")
         self.failed()
         self.run_pass()
         retry = [b for b in self.bodies() if b.startswith("Automatic retry")]
         self.assertEqual(retry, ["Automatic retry 1 of 2 (transient): moved from lane codex to "
-                                 "lane codex-2. Lane codex failed: [transient] agent exited 1"])
-        # The same pass claims it for codex-2 as a new attempt.
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex-2", "loom:running",
+                                 "lane anthropic. Lane codex failed: [transient] agent exited 1"])
+        # The same pass claims it for anthropic as a new attempt.
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:anthropic", "loom:running",
                                                "claim:alice-example"])
         name = "example-owner.example-repo-12-r2"
-        self.assertEqual(self.listing("codex-2"), [name + ".md"])
-        with open(self.inbox("codex-2", name + ".md")) as fh:
+        self.assertEqual(self.listing("anthropic"), [name + ".md"])
+        with open(self.inbox("anthropic", name + ".md")) as fh:
             text = fh.read()
         self.assertIn("Branch: loom/12-fix-the-thing-r2\n", text)
-        self.assertIn("Lane: codex-2\n", text)
+        self.assertIn("Lane: anthropic\n", text)
         self.assertNotIn("loom:failed", self.fake.names(12))
 
     def test_runner_model_refusal_is_reported_as_transient(self):
@@ -2535,11 +2539,27 @@ class RetryTest(Base):
         self.assertIn("Automatic retry 1 of 2 (transient)", self.bodies()[-2])
 
     def test_a_retry_is_reported_once(self):
-        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
         self.failed()
         self.run_pass()
         self.run_pass()
         self.assertEqual(len([b for b in self.bodies() if b.startswith("Automatic retry")]), 1)
+
+    def test_a_spark_that_timed_out_is_not_retried_on_another_spark(self):
+        for lane in ("spark", "spark-2", "spark-4", "codex"):
+            self.heartbeat(lane)
+        self.failed(lane="spark-3", reason="[transient] agent exited 124")
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertFalse([n for n in names if n.startswith("lane:spark")], names)
+        self.assertIn("lane:codex", names)
+
+    def test_a_failure_on_one_opencode_go_slot_is_not_retried_on_another(self):
+        for lane in ("opencode-go", "opencode-go-3", "anthropic"):
+            self.heartbeat(lane)
+        self.failed(lane="opencode-go-2", reason="[transient] agent exited 1")
+        self.run_pass()
+        self.assertIn("moved from lane opencode-go-2 to lane anthropic.", self.bodies()[-2])
 
     def test_a_limit_failure_skips_the_providers_other_slots(self):
         for lane in ("anthropic", "anthropic-3", "codex"):
@@ -2640,15 +2660,15 @@ class RetryTest(Base):
                       "anthropic.", self.bodies()[-2])
 
     def test_a_failure_the_brain_saw_starts_a_new_count(self):
-        self.heartbeat("codex-2")
+        self.heartbeat("anthropic")
         self.failed()
         self.fake.comments[12][:0] = [
             {"body": "Automatic retry 1 of 2 (transient): moved from lane a to lane b. x"},
-            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane codex-2. x"},
-            {"body": "Lane codex-2 failed: [work] agent made no commit on loom/12-x"},
+            {"body": "Automatic retry 2 of 2 (transient): moved from lane b to lane anthropic. x"},
+            {"body": "Lane anthropic failed: [work] agent made no commit on loom/12-x"},
         ]
         self.run_pass()
-        self.assertIn("lane:codex-2", self.fake.names(12))
+        self.assertIn("lane:anthropic", self.fake.names(12))
 
     def test_a_retry_whose_relabel_failed_is_finished_without_a_second_comment(self):
         self.heartbeat("codex-2")
@@ -6054,3 +6074,51 @@ class OwnershipHelpersTest(unittest.TestCase):
             {"number": 2, "assignees": []}]
         with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": " ".join(AUTHORS)}):
             self.assertEqual([i["number"] for i in rewrite.candidates(fake, REPO)], [2])
+
+
+class AppLoginTrustTest(Base):
+    """The Loom App's own bot login is trusted without listing it (loom#660)."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.authors = ["alice-example"]
+
+    def app_github(self):
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if method == "POST" and path.endswith("/access_tokens"):
+                return reply(201, {"token": "t", "expires_at": "2099-01-01T00:00:00Z"})
+            if method == "GET" and path == "/app":
+                return reply(200, {"slug": "loom-app"})
+            return self.fake(method, url, headers, body)
+        app = AppToken("1", "2", lambda: "key", sign=lambda data, key: b"sig")
+        return GitHub(app, transport=transport)
+
+    def brief_by(self, number, labeller):
+        self.fake.add(number, events=[labeled("loom:briefed", labeller),
+                                      labeled("lane:codex", labeller)])
+
+    def test_a_ticket_briefed_by_the_apps_bot_login_is_claimed(self):
+        self.brief_by(12, "loom-app[bot]")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(station.run(self.settings, self.app_github()), 0)
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("trusting briefing logins: alice-example loom-app[bot]", err.getvalue())
+
+    def test_without_app_settings_the_bot_login_is_not_trusted(self):
+        self.brief_by(12, "loom-app[bot]")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("trusting briefing logins: alice-example\n", err.getvalue())
+
+    def test_refusals_for_an_untrusted_labeler_are_counted_per_login(self):
+        for number in (12, 13):
+            self.brief_by(number, "stranger[bot]")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_pass()
+        path = os.path.join(self.home, "state", "station", "labeler_refusals.json")
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(len(json.load(fh)["stranger[bot]"]), 2)
