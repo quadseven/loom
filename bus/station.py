@@ -2431,16 +2431,23 @@ class Station:
             lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
             if lane is None:
                 return False
-        # The lane is up, but not for this ticket's model until its limit
-        # lifts: a claim now is parked at once, and was re-claimed every pass
-        # (24 claims in 90 minutes). It waits briefed; the factory moves it
-        # to a lane that serves it, or it waits for the reset.
-        until = self.model_limited(lane, brief_model(lane, headers))
-        if until is not None:
-            _say("%s#%s waits: model %s is limited on lane %s until %s"
-                 % (repo, issue["number"], brief_model(lane, headers), lane, self._utc(until)))
+        if self._model_waits(repo, issue, lane, headers):
             return False
         return self._claim(repo, lane, fresh)
+
+    def _model_waits(self, repo: str, issue: Dict[str, Any], lane: str,
+                     headers: Dict[str, str]) -> bool:
+        """The lane is up, but not for this ticket's model until its limit
+        lifts: a claim now is parked at once, and was re-claimed every pass
+        (24 claims in 90 minutes). It waits briefed; the factory moves it to
+        a lane that serves it, or it waits for the reset."""
+        model = brief_model(lane, headers)
+        until = self.model_limited(lane, model)
+        if until is None:
+            return False
+        _say("%s#%s waits: model %s is limited on lane %s until %s"
+             % (repo, issue["number"], model, lane, self._utc(until)))
+        return True
 
     def _route_model_claim(self, repo: str, issue: Dict[str, Any], lane: str,
                            model: str, free: List[str]) -> Optional[str]:
