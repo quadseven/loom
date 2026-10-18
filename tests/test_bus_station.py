@@ -6530,3 +6530,50 @@ class AppLoginTrustTest(Base):
         path = os.path.join(self.home, "state", "station", "labeler_refusals.json")
         with open(path, encoding="utf-8") as fh:
             self.assertEqual(len(json.load(fh)["stranger[bot]"]), 2)
+
+
+class ModelLimitClaimTest(unittest.TestCase):
+    """zippie#264, 2026-10-18: a ticket pinned to a model the lane's runner
+    had parked as limited was claimed every pass, bounced off the limit and
+    posted two comments each time. The station now reads the runner's
+    per-model limits and leaves the ticket alone until the limit ends."""
+
+    MODEL = "gemini-4-argon-high"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = os.path.join(self._tmp.name, "loom")
+        self.fake = FakeGitHub()
+        self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS))
+        self.usage = os.path.join(self.home, "state", "usage")
+        os.makedirs(self.usage, exist_ok=True)
+        with open(os.path.join(self.usage, "agy.json"), "w") as fh:
+            json.dump({"lane": "agy", "at": int(time.time()), "available": True,
+                       "reason": ""}, fh)
+        self.fake.add(7, lane="agy", body=re.sub(r"(?m)^Model: .*$", "Model: " + self.MODEL, BODY))
+
+    def limit(self, until):
+        with open(os.path.join(self.usage, "agy.models"), "w") as fh:
+            fh.write("gemini-3.8-flash-low %d provider limit reached\n" % (time.time() + 9000))
+            fh.write("%s %d provider limit reached\n" % (self.MODEL, until))
+
+    def run_pass(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            station.run(self.settings, GitHub("token", transport=self.fake))
+        return out.getvalue()
+
+    def test_a_ticket_pinned_to_a_limited_model_is_not_claimed(self):
+        self.assertTrue(station.lane_takes_model("agy", self.MODEL))
+        self.limit(time.time() + 3600)
+        said = self.run_pass()
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+        self.assertEqual(self.fake.comments[7], [])
+        self.assertIn("model %s is limited there until" % self.MODEL, said)
+
+    def test_the_ticket_is_claimed_once_the_limit_ends(self):
+        self.limit(time.time() - 60)
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(7))

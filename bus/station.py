@@ -2392,7 +2392,39 @@ class Station:
             lane = self._route_model_claim(repo, fresh, labelled_lane, model, free)
             if lane is None:
                 return False
+        until = self._model_limited(lane, model)
+        if until is not None:
+            # The lane is up for its other models; a run would only bounce
+            # off this one's limit, two comments a pass (zippie#264,
+            # 2026-10-18: 22 bounces in 3 hours).
+            _say("not claiming %s#%s for lane %s: model %s is limited there until %s"
+                 % (repo, issue["number"], lane, model, self._utc(until)))
+            return False
         return self._claim(repo, lane, fresh)
+
+    def _model_limited(self, lane: str, model: str) -> Optional[float]:
+        """When model's limit on lane ends, if it has one now: the runner's
+        per-model limits (state/usage/<lane>.models, one "model until reason"
+        line per model, lanes/run_lane.sh)."""
+        if not model:
+            return None
+        try:
+            with open(os.path.join(self.s.home, "state", "usage", lane + ".models"),
+                      encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            parts = line.split(None, 2)
+            if len(parts) < 2 or parts[0] != model:
+                continue
+            try:
+                until = float(parts[1])
+            except ValueError:
+                continue
+            if until > self.now:
+                return until
+        return None
 
     def _route_model_claim(self, repo: str, issue: Dict[str, Any], lane: str,
                            model: str, free: List[str]) -> Optional[str]:
