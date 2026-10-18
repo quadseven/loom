@@ -50,7 +50,7 @@ from . import transcripts
 from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, _OPENER, _next_link, read_ssm
+from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -1179,6 +1179,8 @@ class Station:
             if "briefed" not in self._seen.get(repo, set()):
                 try:
                     self._poll(repo)
+                except RateLimited:
+                    raise
                 except GitHubError as err:
                     _say("could not list %s: %s" % (repo, err))
         local = self._inbox_repos()
@@ -1457,6 +1459,8 @@ class Station:
         try:
             self.gh.rest("POST", "/repos/%s/issues/%d/assignees" % (repo, number),
                          {"assignees": [login]})
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("could not assign %s#%d to %s: %s" % (repo, number, login, err))
 
@@ -1472,6 +1476,8 @@ class Station:
                 self.gh.rest("POST", "/repos/%s/labels" % repo,
                              {"name": name, "color": "c5def5",
                               "description": "Claimed by this operator's Loom or sessions"})
+            except RateLimited:
+                raise
             except GitHubError as err:
                 if err.status != 422:  # 422: the label already exists
                     _say("could not create label %s in %s: %s" % (name, repo, err))
@@ -1583,6 +1589,8 @@ class Station:
                 path = os.path.join(folder, entry)
                 try:
                     self._finish_one(lane, path)
+                except RateLimited:
+                    raise
                 except (GitHubError, ValueError, OSError) as err:
                     _say("could not finish %s: %s" % (entry, err))
 
@@ -1774,6 +1782,8 @@ class Station:
             try:
                 found = self._paginate("/repos/%s/issues?labels=%s&state=open"
                                          % (repo, RUNAWAY))
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("could not list runaway tickets in %s: %s" % (repo, err))
                 continue
@@ -1785,6 +1795,8 @@ class Station:
         for repo, issue in runaways:
             try:
                 self._release_one_runaway(repo, issue, free, dead, used)
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("could not review runaway %s#%s: %s" % (repo, issue.get("number"), err))
 
@@ -1840,6 +1852,8 @@ class Station:
         if key not in self._parents:
             try:
                 data = self.gh.rest("GET", "/repos/%s/issues/%d" % key).data
+            except RateLimited:
+                raise
             except GitHubError:
                 data = None
             self._parents[key] = data if isinstance(data, dict) else {}
@@ -1972,6 +1986,8 @@ class Station:
             try:
                 if self._try_ticket(repo, lane, issue, free):
                     return
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
 
@@ -1983,6 +1999,8 @@ class Station:
         for repo in self.scan_repos():
             try:
                 found = self._poll(repo)
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("could not list %s: %s" % (repo, err))
                 continue
@@ -2006,6 +2024,8 @@ class Station:
             return
         try:
             self._try_ticket(repo, lane, issue, free)
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("could not queue %s#%s: %s" % (repo, issue["number"], err))
 
@@ -2096,6 +2116,8 @@ class Station:
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
             pool, held = self._verify_pool(attempts)
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("could not list tickets to verify: %s" % err)
             return
@@ -2148,6 +2170,8 @@ class Station:
                                            % (repo, int(pr["number"]))).data or []
                 read.append(pr)
             pulls = read + linked[verify_data.MAX_PULLS:]
+        except RateLimited:
+            raise
         except (GitHubError, OSError, ValueError) as err:
             # Only fully read pull requests are shown after a failure.
             pulls = read
@@ -2188,6 +2212,8 @@ class Station:
         try:
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": [brain.AWAITING_EVIDENCE]})
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("could not label %s#%d as awaiting evidence: %s" % (repo, number, err))
 
@@ -2197,6 +2223,8 @@ class Station:
         try:
             self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                          % (repo, number, quote(brain.AWAITING_EVIDENCE, safe="")), ok=(404,))
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("could not clear the awaiting label on %s#%d: %s" % (repo, number, err))
 
@@ -2334,6 +2362,8 @@ class Station:
         try:
             brain.close(self.gh, repo, number, reason="completed",
                         env={"LOOM_BRIEF_AUTHORS": " ".join(self.s.authors)})
+        except RateLimited:
+            raise
         except (ValueError, GitHubError) as err:
             _say("verified but not closed %s#%d: %s" % (repo, number, self._note_text(err)))
 
@@ -2352,6 +2382,8 @@ class Station:
         if key not in self._depends:
             try:
                 self._depends[key] = self._issue(repo, number)
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("could not read %s: %s" % (key, err))
                 self._depends[key] = None
@@ -2472,6 +2504,8 @@ class Station:
                 continue
             try:
                 done = self._report(lane, kind, brief, name)
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("could not report %s: %s" % (key, err))
                 continue
@@ -2552,6 +2586,8 @@ class Station:
             if ticket is None:
                 try:
                     ticket = self._issue(repo, number)
+                except RateLimited:
+                    raise
                 except GitHubError as err:
                     if err.status == 404:
                         continue
@@ -2658,6 +2694,8 @@ class Station:
             return None
         try:
             ticket = self._issue(repo, number)
+        except RateLimited:
+            raise
         except GitHubError as err:
             if err.status in (404, 410):
                 return None
@@ -2695,6 +2733,8 @@ class Station:
             try:
                 # Both the issues and pulls fetches are covered by this repo guard.
                 self._reconcile_repo(repo)
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("could not reconcile pull requests for %s: %s" % (repo, err))
 
@@ -2714,6 +2754,8 @@ class Station:
             rec = rec if isinstance(rec, dict) else {}
             try:
                 self._adopt_repo(repo, rec)
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("could not adopt pull requests for %s: %s" % (repo, err))
             ledger[repo] = rec
@@ -2916,6 +2958,8 @@ class Station:
         for repo in [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]:
             try:
                 self._unwind_repo(repo, allowed)
+            except RateLimited:
+                raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("unwind_reverts %s failed: %s" % (repo, err))
 
@@ -3068,6 +3112,8 @@ class Station:
             how, int(pr["number"]), str(pr["merge_commit_sha"])[:12])
         try:
             brain.move(self.gh, repo, number, "shipped", note=note)
+        except RateLimited:
+            raise
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
             return False
@@ -3100,6 +3146,8 @@ class Station:
                         continue
                     try:
                         finished = self._ship_pin(deploy, pin, left)
+                    except RateLimited:
+                        raise
                     except GitHubError as err:
                         _say("could not ship pin pull request %s: %s" % (key, err))
                         continue
@@ -3228,6 +3276,8 @@ class Station:
             return
         try:
             closed_incidents = self._closed_incidents()
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("factory release: could not read the closed incidents: %s" % err)
             return
@@ -3255,6 +3305,8 @@ class Station:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
             comments = self._paginate(
                 "/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("factory release: could not read %s#%d: %s" % (repo, number, err))
             return
@@ -3704,6 +3756,8 @@ class Station:
     def _public(self, repo: str) -> bool:
         try:
             data = self.gh.rest("GET", "/repos/%s" % repo).data
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("could not read whether %s is public: %s" % (repo, err))
             return False
@@ -3775,6 +3829,8 @@ class Station:
                     continue
                 try:
                     self._answer(repo, prs, lane, m.group(1), os.path.join(folder, entry), strong)
+                except RateLimited:
+                    raise
                 except GitHubError as err:
                     # One thread's failure must not stop the rest, and the
                     # report must still be recorded: a retried report would
@@ -3803,6 +3859,8 @@ class Station:
         if settled:
             try:
                 self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
+            except RateLimited:
+                raise
             except GitHubError as err:
                 # The reply is posted; an open thread is read by the factory
                 # as a finding that survived, which is the safe side.
@@ -4051,6 +4109,8 @@ class Station:
             try:
                 items = self._paginate(
                     "/repos/%s/issues?labels=%s&state=open&per_page=100" % (repo, HUMAN))
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("could not list %s issues in %s: %s" % (HUMAN, repo, err))
                 return None
@@ -4094,6 +4154,8 @@ class Station:
                 lines.append("- %s %s" % (title, issue["html_url"]))
                 try:
                     ask = self._human_ask(repo, issue)
+                except RateLimited:
+                    raise
                 except GitHubError as err:
                     _say("could not read the ask on %s#%s: %s" % (repo, issue["number"], err))
                     return None
@@ -4110,6 +4172,8 @@ class Station:
                 continue
             try:
                 asks += [(repo, i) for i in self._poll_asks(repo)]
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
@@ -4128,6 +4192,8 @@ class Station:
                 continue
             try:
                 trust[key] = self._ask_trusted(repo, issue)
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("could not check ask %s: %s; holding sends until the next pass"
                      % (key, err))
@@ -4303,6 +4369,8 @@ class Station:
                 number = self._digest_issue(repo)
                 made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                                     {"body": page["body"]}).data
+            except RateLimited:
+                raise
             except GitHubError as err:
                 # Leave the fixed plan pending; forward_asks has already sent urgent asks.
                 _say("daily digest pending: could not post its page in %s: %s; next pass"
@@ -4332,6 +4400,8 @@ class Station:
             return None
         try:
             plan = self._plan_digest(asks, covered, today)
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("could not read the goal homes for the digest: %s; next pass" % err)
             return None
@@ -4757,6 +4827,8 @@ class Station:
             return goals
         try:
             homes = self._goal_homes()
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("could not list goal homes for triage: %s" % err)
             return None
@@ -4836,6 +4908,8 @@ class Station:
                          (key, *counts))
                 else:
                     self._run_triage(key, repo, number)
+            except RateLimited:
+                raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("triage %s failed: %s" % (key, err))
                 continue
@@ -4901,6 +4975,8 @@ class Station:
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
                 self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
                 continue
+            except RateLimited:
+                raise
             except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
                 _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
                 self._event("rewrite_failed", str(err), "%s#%d" % (repo, number))
@@ -4933,6 +5009,8 @@ class Station:
                 rec = state[key] = {}
             try:
                 budget -= self._rewrite_goal(key, repo, goal, rec, budget, cmds)
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("rewrite %s failed: %s" % (key, err))
             _write_json(path, state)
@@ -5079,15 +5157,21 @@ class Station:
         marker posts; a source that cannot be read stays None."""
         try:
             homes = self._goal_homes()
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal homes: %s" % err)
             return
         try:
             facts.shapes = [self._goal_shape(repo, g) for repo, g in homes]
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal tickets: %s" % err)
         try:
             facts.journals, facts.posts = self._invariant_comments(homes)
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the goal home comments: %s" % err)
 
@@ -5101,6 +5185,8 @@ class Station:
                                               for lane in REMOTE_LANES})):
             try:
                 setattr(facts, name, read())
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("invariants: could not read %s: %s" % (name, err))
         facts.held = state["held"] = self._invariant_held(state.get("held"))
@@ -5124,14 +5210,20 @@ class Station:
         if any(self.now - since > invariants.HELD_MAX for since in facts.held.values()):
             try:
                 facts.queued = self._invariant_queued()
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("invariants: could not read the queued tickets: %s" % err)
         try:
             facts.checks = self._invariant_checks()
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the plan checks: %s" % err)
         try:
             facts.lane_pulls = self._invariant_lane_pulls()
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the lane pull requests: %s" % err)
         return facts
@@ -5252,6 +5344,8 @@ class Station:
                 continue
             try:
                 pulls = self._open_pulls(repo)
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("invariants: could not read the open pull requests of %s: %s" % (repo, err))
                 continue
@@ -5261,6 +5355,8 @@ class Station:
                     continue
                 try:
                     out.append(self._lane_pull(repo, pr, at))
+                except RateLimited:
+                    raise
                 except GitHubError as err:
                     _say("invariants: left out pull request %s#%s, unreadable: %s"
                          % (repo, pr.get("number"), err))
@@ -5822,6 +5918,8 @@ class Station:
             return True, journal if isinstance(journal, dict) else None
         try:
             journal = self._newest_journal()
+        except RateLimited:
+            raise
         except GitHubError as err:
             _say("brain journal read failed: %s" % err)
             return False, None
@@ -6148,6 +6246,8 @@ class Station:
             numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
                                         self.now, self.s.review_check,
                                         self.s.authors).collect()
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("metrics collection failed: %s" % err)
             self._metrics_notice(today, "failure",
@@ -6265,6 +6365,8 @@ class Station:
                 issues = self._goal_issues(repo)
                 read = [(int(i["number"]), self._handoff_home_journals(repo, i, saved))
                         for i in issues]
+            except RateLimited:
+                raise
             except GitHubError as err:
                 _say("handoff packet: could not read the goal homes of %s: %s" % (repo, err))
                 unread += 1
@@ -6497,6 +6599,19 @@ class Station:
         self._told_low = True
         return True
 
+    def _budget_exhausted(self) -> bool:
+        """True when the last budget refusal's window is still open: the pass
+        does nothing until it resets, and says so in one line (loom#666).
+        The window is the client's own, or the one an earlier pass kept."""
+        kept = self._budget_state().get("limited_until")
+        until = self.gh.limited_until or (kept if isinstance(kept, int) else None)
+        if until is None or until <= self.now:
+            return False
+        self.gh.limited_until = until
+        _say("GitHub budget exhausted until %s: this pass waits for the reset"
+             % self._utc(until))
+        return True
+
     def end_pass(self) -> None:
         """Log this pass's requests, keep the rate limits for the next pass,
         and remove conditional-request answers nothing uses any more."""
@@ -6516,6 +6631,10 @@ class Station:
         _say(line)
         state = self._budget_state()
         state["rates"] = {r: list(v) for r, v in rates.items()}
+        if gh.limited_until is not None and gh.limited_until > self.now:
+            state["limited_until"] = int(gh.limited_until)
+        else:
+            state.pop("limited_until", None)
         if self.budget_low() is None:
             state.pop("told", None)
         try:
@@ -6545,22 +6664,30 @@ class Station:
                 raise GitHubError("roll family gate could not be read: %s" % err) from err
 
     def run_pass(self) -> None:
+        if self._budget_exhausted():
+            return
         self.finish_claims()
         self.report_outcomes()
         if not self._deferred():
             try:
                 self.reconcile_pull_requests()
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("pull request reconciliation failed: %s" % err)
         if not self._deferred():
             try:
                 self.hand_back()
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("hand_back failed: %s" % err)
         self.claim_new()
         if not self._deferred():
             try:
                 self.assign_queued()
+            except RateLimited:
+                raise
             except (GitHubError, OSError) as err:
                 _say("assign_queued failed: %s" % err)
         try:
@@ -6582,10 +6709,14 @@ class Station:
                 break
             try:
                 step()
+            except RateLimited:
+                raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("%s failed: %s" % (step.__name__, err))
         try:
             self.watch_logs()
+        except RateLimited:
+            raise
         except (GitHubError, OSError) as err:
             _say("watch_logs failed: %s" % err)
         try:
@@ -6633,6 +6764,8 @@ def _trust_app_login(settings: Settings, gh: GitHub) -> None:
     logged, and the configured logins stay as they were."""
     try:
         login = gh.app_login()
+    except RateLimited:
+        raise
     except GitHubError as err:
         _say("could not read the GitHub App's login, so it is not trusted: %s" % err)
         login = None
@@ -6672,6 +6805,8 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         st = Station(gh, settings, **hooks)
         try:
             st.run_pass()
+        except RateLimited as err:
+            _say("%s; the pass stopped there" % err)
         except StateError as err:
             _say("stopping: %s" % err)
             return 1
