@@ -4,9 +4,15 @@ Loom keeps an operator's goals moving by turning them into tickets and spreading
 
 ## Goals and work
 
+Titles and kind labels follow docs/NAMING.md: the label carries the kind, and a title has one leading kind word at most (`Goal:`, `Epic:`, `Map:`).
+
 **Goal**:
 A durable outcome the operator wants, defined by a home issue in the project's own repo and labelled `loom:goal`.
 _Avoid_: project, mission, objective
+
+**Backlog goal home**:
+The goal home that holds a repo's whole backlog, labelled `loom:goal` and `loom:backlog`; triage runs on it every hour.
+_Avoid_: backlog issue, Backlog: title
 
 **Goal home**:
 The issue in a project repo that states a goal, its success condition and its rules; its children are the goal's epics.

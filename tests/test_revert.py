@@ -245,6 +245,21 @@ class RepairsEpic(Base):
 
 
 class Bisect(Base):
+    def test_fix_forward_and_revert_titles_keep_their_lead_and_fit_72(self):
+        long = ("Make every lane report its spend and its limits to the station on each "
+                "run so the dashboard can show them")
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=2400), ago=2500)
+        self.gh.pulls[-1]["title"] = long
+        self.forward_then_revert()
+        forward = [i for i in self.gh.filed if i not in self.revert_tickets()]
+        titles = [forward[0]["title"], self.revert_tickets()[0]["title"]]
+        self.assertTrue(titles[0].startswith("Fix main after merge %s: Make every" % sha("m1")[:12]))
+        self.assertTrue(titles[1].startswith("Revert %s: Make every" % sha("m1")[:12]))
+        for title in titles:
+            self.assertLessEqual(len(title), 72, title)
+            self.assertTrue(title.endswith("..."), title)
+
     def test_lane_merge_gets_fix_forward_with_errors_then_revert_after_45_minutes(self):
         self.green_base()
         failed = run("red", ago=2400)

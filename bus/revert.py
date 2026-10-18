@@ -43,7 +43,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain
+from . import brain, naming
 from .factory import GREEN, REVERT_LABEL, Factory, _labels, _lane, _state, _ts
 from .github import GitHub, GitHubError
 from .tickets import DIFFICULTIES
@@ -535,8 +535,7 @@ class Reverts:
                       "the follow-up pull request merges.", "", "## Size", "S", "",
                       "## Out of scope", "- Reverting the merged change."])
         body = "\n".join(lines)[:brain.COMMENT_MAX].rstrip("\n") + "\n"
-        title = "Fix main after merge %s: %s" % (sha[:12],
-                 " ".join(str(pr.get("title") or "").split()))
+        title = naming.generated("Fix main after merge %s" % sha[:12], str(pr.get("title") or ""))
         brain._check_written_text(title + "\n" + body)
         made = self._file_repair(repo, {
             "title": title, "body": body,
@@ -591,7 +590,7 @@ class Reverts:
                 "on the default branch.\n\n## Acceptance criteria\n- [ ] The check passes "
                 "on the default branch.\n\n## Size\nS\n\n## Out of scope\n- Reverting the merge.\n"
                 % (difficulty or "easy", _failing(names), sha[:12], branch))
-        title = "Fix pre-existing red check: %s" % ", ".join(names)
+        title = naming.generated("Fix pre-existing red check", ", ".join(names))
         brain._check_written_text(title + "\n" + body)
         self._file_repair(repo, {"title": title, "body": body, "labels": labels})
         self._check_tickets.append(key)
@@ -643,7 +642,7 @@ class Reverts:
         number = ticket[1] if ticket else 0
         title = " ".join(str(pr.get("title") or "").split()) or "#%d" % int(pr["number"])
         body = self._body(branch, sha, pr, names, red_since, difficulty, number)
-        full_title = "Revert %s: %s" % (short, title)
+        full_title = naming.generated("Revert %s" % short, title)
         brain._check_written_text(full_title + "\n" + body)
         made = self._file_repair(repo, {
             "title": full_title, "body": body,

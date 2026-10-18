@@ -64,7 +64,8 @@ Rules:
   brackets, `#`, `*`, `|`, quotes) turned into spaces. Loom writes every
   section of the ticket itself; the finding's title and evidence appear only
   inside a fenced block labelled as untrusted data from the health endpoint,
-  and the ticket title is `Health: ` and the cleaned title.
+  and the ticket title is `Health: ` and the cleaned title, cut on a word to
+  72 characters (docs/NAMING.md).
 
 ## Priority
 

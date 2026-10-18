@@ -118,7 +118,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, tickets
+from . import brain, change_class, naming, tickets
 from .github import GitHub, GitHubError
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -290,7 +290,10 @@ DEFER_AFTER = 2
 # rule.
 CLASSES = change_class.CLASSES
 DEFER_LABEL = "loom:triage"
-DEFER_TITLE = "Deferred review findings from %s#%d"
+DEFER_TITLE = "Settle the review findings left from PR #%d"
+# The title before the naming standard (docs/NAMING.md): an open follow-up
+# filed under it still counts, so a pull request never gets two.
+DEFER_TITLE_LEGACY = "Deferred review findings from %s#%d"
 # A file a pull request changes is code by its extension, and a test by a
 # test or tests folder in its path or by its name.
 CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
@@ -1134,9 +1137,10 @@ class Factory:
                    picked: Sequence[Dict[str, Any]], rounds: int) -> int:
         """The open follow-up issue for this pull request's deferred findings,
         filed now unless an earlier pass already filed it."""
-        title = DEFER_TITLE % (repo, number)
+        title = DEFER_TITLE % number
+        known = (title, DEFER_TITLE_LEGACY % (repo, number))
         for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
-            if isinstance(found, dict) and found.get("title") == title and self._trusted(found):
+            if isinstance(found, dict) and found.get("title") in known and self._trusted(found):
                 return int(found["number"])
         body = ("Review findings deferred from #%d (ticket #%d) when it landed: the "
                 "review check passed on %s after %d fix round(s), and these medium or "

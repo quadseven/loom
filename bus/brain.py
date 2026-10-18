@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 from .github import GitHub, GitHubError, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
+from . import naming
 from .labels import LANES, REMOTE_LANES
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 
@@ -807,6 +808,9 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
         raise ValueError("base is not a branch name")
     if "\n" in title or "\r" in title:
         raise ValueError("title is one line")
+    if len(title) > naming.TICKET_TITLE_MAX:
+        raise ValueError("a ticket title is one outcome sentence of at most %d characters "
+                         "(docs/NAMING.md)" % naming.TICKET_TITLE_MAX)
     if any(section not in body for section in SECTIONS if section != "## Size") \
             or hunt_plan.stated_size(body) is None:
         raise ValueError("body must contain all required sections (Size as %s)"
@@ -1099,8 +1103,8 @@ _PART_OF_ANY = re.compile(r"^Part of #(\d+)\s*$", re.M)
 _EPIC_CAP_RE = re.compile(r"^Epic cap:[ \t]*(\d+)[ \t]+until[ \t]+(\d{4}-\d{2}-\d{2})[ \t]*$", re.M)
 _DONE_WHEN_RE = re.compile(r"^(?:#+[ \t]*)?Done when\b", re.M | re.I)
 _SIZE_RE = re.compile(r"^(?:#+[ \t]*)?Size\b", re.M | re.I)
-EPIC_TITLE_PREFIX = "Epic: "
-EPIC_TITLE_MAX = 72
+EPIC_TITLE_PREFIX = naming.EPIC_WORD
+EPIC_TITLE_MAX = naming.TITLE_MAX
 INTAKE_TITLE = "Epic: work that triage, rewrites and health intake find"
 INTAKE_BODY = (
     "Done when: this intake epic holds %d tickets, or every ticket in it is closed; "
@@ -1298,7 +1302,7 @@ def intake_epic(gh: GitHub, repo: str, goal: int) -> int:
 def repo_goal(gh: GitHub, repo: str) -> Optional[int]:
     """The goal home a repo's factory repairs belong to: its oldest open goal
     home that is not a backlog, else its backlog home; None without one."""
-    homes = sorted((str(i.get("title") or "").startswith("Backlog:"), int(i["number"]))
+    homes = sorted((naming.is_backlog_home(i), int(i["number"]))
                    for i in gh.paginate("/repos/%s/issues?labels=loom:goal&state=open&per_page=100"
                                         % repo)
                    if isinstance(i, dict) and "pull_request" not in i
@@ -1975,7 +1979,21 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": ["loom:human"]})
 
 
-BACKLOG_TITLE = "Backlog: every open issue in %s is worked through Loom or handed to a person"
+# The backlog goal home's title (docs/NAMING.md); the loom:backlog label, not
+# this title, is what marks it as the backlog home.
+BACKLOG_TITLE = "Goal: Loom or a person works every open %s issue"
+BACKLOG_TITLE_BARE = "Goal: Loom or a person works every open issue in this repo"
+
+
+def backlog_title(repo: str) -> str:
+    """The backlog goal home's title for the repo, at most naming.TITLE_MAX
+    characters: with owner/name, else the bare name, else no name when even
+    that does not fit."""
+    for name in (repo, repo.split("/")[-1]):
+        title = BACKLOG_TITLE % name
+        if len(title) <= naming.TITLE_MAX:
+            return title
+    return BACKLOG_TITLE_BARE
 REVIEW_SAMPLE = 5
 
 
@@ -2026,11 +2044,40 @@ def _review_check_line(gh: GitHub, repo: str, check: str) -> str:
             % (check, len(prs), repo, ", ".join("#%s" % p["number"] for p in prs)))
 
 
+def _backlog_home(gh: GitHub, repo: str, lines: List[str]) -> Optional[int]:
+    """The repo's backlog goal home, opened when none is open; one opened
+    before the loom:backlog label existed is labelled. Found by its label,
+    by the old "Backlog:" title prefix, or by its title. Appends what it did
+    to `lines`; None when GitHub named no number for a new one."""
+    title = backlog_title(repo)
+    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
+    found = sorted((g for g in goals if isinstance(g, dict) and "pull_request" not in g
+                    and (naming.is_backlog_home(g) or g.get("title") == title)),
+                   key=lambda g: int(g.get("number") or 0))
+    if found:
+        number = int(found[0]["number"])
+        lines.append("backlog goal home: #%d, already open" % number)
+        if naming.BACKLOG_LABEL not in naming.label_names(found[0]):
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": [naming.BACKLOG_LABEL]})
+            lines.append("backlog goal home: #%d, labelled %s" % (number, naming.BACKLOG_LABEL))
+        return number
+    body = _backlog_body(repo)
+    _check_written_text(body)
+    made = gh.rest("POST", "/repos/%s/issues" % repo,
+                   {"title": title, "body": body,
+                    "labels": [naming.GOAL_LABEL, naming.BACKLOG_LABEL]}).data or {}
+    lines.append("backlog goal home: #%s, created" % made.get("number"))
+    return int(made["number"]) if made.get("number") else None
+
+
 def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
             env: Optional[Dict[str, str]] = None) -> List[str]:
     """Make a repo ready for Loom: the labels, one backlog goal home, a check
     that the review check runs there, and the LOOM_REPOS value with the repo
-    in it. A second run changes nothing. Returns the lines to print."""
+    in it. The backlog home carries loom:goal and loom:backlog; one opened
+    before that label existed gets it. A second run changes nothing. Returns
+    the lines to print."""
     from . import factory, labels  # factory imports this module
     env = os.environ if env is None else env
     check = (review_check or env.get("LOOM_REVIEW_CHECK", "").strip()
@@ -2040,20 +2087,9 @@ def onboard(gh: GitHub, repo: str, review_check: Optional[str] = None,
                            if info.get("private") else "public")]
     changed = labels.ensure_labels(gh, repo)
     lines.append("labels: %s" % (", ".join(changed) if changed else "no changes"))
-    title = BACKLOG_TITLE % repo
-    goals = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Agoal" % repo)
-    home = [g for g in goals if "pull_request" not in g and g.get("title") == title]
-    if home:
-        lines.append("backlog goal home: #%s, already open" % home[0]["number"])
-    else:
-        body = _backlog_body(repo)
-        _check_written_text(body)
-        made = gh.rest("POST", "/repos/%s/issues" % repo,
-                       {"title": title, "body": body, "labels": ["loom:goal"]}).data or {}
-        lines.append("backlog goal home: #%s, created" % made.get("number"))
-        home = [made] if made.get("number") else []
-    if home:
-        lines.append("intake epic: #%d" % intake_epic(gh, repo, int(home[0]["number"])))
+    home = _backlog_home(gh, repo, lines)
+    if home is not None:
+        lines.append("intake epic: #%d" % intake_epic(gh, repo, home))
     lines.append(_review_check_line(gh, repo, check))
     repos = env.get("LOOM_REPOS", "").replace(",", " ").split()
     if repo not in repos:

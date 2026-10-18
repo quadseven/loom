@@ -41,7 +41,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import brain, text, tickets
+from . import brain, naming, text, tickets
 from .github import GitHub, GitHubError, _OPENER
 
 EVERY = 900
@@ -301,7 +301,8 @@ def ticket_body(f: Finding) -> str:
 
 
 def ticket_title(f: Finding) -> str:
-    return "Health: " + f.title
+    """"Health: <finding>", clipped to naming.TITLE_MAX."""
+    return naming.generated("Health", f.title)
 
 
 def evidence_comment(f: Finding, checked_at: str) -> str:

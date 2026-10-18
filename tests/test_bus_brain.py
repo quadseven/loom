@@ -2700,6 +2700,13 @@ class FakeRepo:
         if sub:
             self.subs.setdefault(int(sub.group(1)), []).append(payload["sub_issue_id"] - 1000)
             return reply(201, {})
+        added = re.fullmatch(r"/issues/(\d+)/labels", path)
+        if added:
+            found = [i for i in self.issues if i["number"] == int(added.group(1))]
+            if not found:
+                return reply(404, {"message": "Not Found"})
+            found[0]["labels"] += [{"name": n} for n in payload["labels"]]
+            return reply(200, found[0]["labels"])
         return None
 
     @staticmethod
@@ -2736,9 +2743,8 @@ class OnboardTests(unittest.TestCase):
         posted = [c for c in fake.writes() if c[1].endswith("/issues")]
         self.assertEqual(len(posted), 2)
         issue = posted[0][2]
-        self.assertEqual(issue["title"], "Backlog: every open issue in %s is worked "
-                         "through Loom or handed to a person" % REPO)
-        self.assertEqual(issue["labels"], ["loom:goal"])
+        self.assertEqual(issue["title"], "Goal: Loom or a person works every open %s issue" % REPO)
+        self.assertEqual(issue["labels"], ["loom:goal", "loom:backlog"])
         for part in ("## Destination", "## Metric", "## Rules", "loom:human",
                      "never closes an issue", "train on prompts"):
             self.assertIn(part, issue["body"])
@@ -2762,7 +2768,31 @@ class OnboardTests(unittest.TestCase):
         fake = FakeRepo(issues=[other], prs=[pr(7, "abc")], runs={"abc": 1})
         self.run_onboard(fake)
         self.assertEqual(len([c for c in fake.writes() if c[1].endswith("/issues")
-                              and c[2]["labels"] == ["loom:goal"]]), 1)
+                              and c[2]["labels"] == ["loom:goal", "loom:backlog"]]), 1)
+
+    def test_a_backlog_home_under_the_old_title_is_labelled_not_opened_twice(self):
+        old = {"number": 3, "state": "open", "title": "Backlog: every open issue in %s is worked through "
+               "Loom or handed to a person" % REPO, "labels": [{"name": "loom:goal"}]}
+        fake = FakeRepo(issues=[old], prs=[pr(7, "abc")], runs={"abc": 1})
+        lines = self.run_onboard(fake)
+        self.assertEqual([c for c in fake.writes() if c[1].endswith("/issues")
+                          and "loom:goal" in c[2]["labels"]], [])
+        self.assertIn(("POST", "/repos/%s/issues/3/labels" % REPO, {"labels": ["loom:backlog"]}),
+                      fake.writes())
+        self.assertIn("backlog goal home: #3, already open", lines)
+        self.assertIn("backlog goal home: #3, labelled loom:backlog", lines)
+        fake.calls = []
+        self.run_onboard(fake)
+        self.assertFalse([c for c in fake.writes() if "/issues/3/labels" in c[1]])
+
+    def test_a_retitled_backlog_home_is_found_by_its_label(self):
+        home = {"number": 3, "state": "open", "title": "Goal: the backlog reaches zero",
+                "labels": [{"name": "loom:goal"}, {"name": "loom:backlog"}]}
+        fake = FakeRepo(issues=[home], prs=[pr(7, "abc")], runs={"abc": 1})
+        lines = self.run_onboard(fake)
+        self.assertEqual([c for c in fake.writes() if c[1].endswith("/issues")
+                          and "loom:goal" in c[2]["labels"]], [])
+        self.assertIn("backlog goal home: #3, already open", lines)
 
     def test_warns_when_the_review_check_never_ran(self):
         fake = FakeRepo(prs=[pr(9, "s9"), pr(8, "s8")])
