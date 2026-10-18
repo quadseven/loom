@@ -1010,6 +1010,9 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        # This pass's factory-repair tickets over the unproven-work limit, per
+        # (repo, goal): running, at a pull request, or let through (loom#767).
+        self._repair_flying: Dict[Tuple[str, int], List[int]] = {}
         self._parents: Dict[Tuple[str, int], Dict[str, Any]] = {}
         # This pass's closed pull requests and default branches, per repo:
         # the hand-revert scan reads the same pages as the ship checks.
@@ -1705,6 +1708,7 @@ class Station:
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         # This pass's unproven-work gate refusals (loom#564).
         self._gate_holds = {}
+        self._repair_flying = {}
         # A runaway held because one dead lane kept failing it goes back to a
         # free lane of its tier on its own (loom#565), before claims.
         self._release_dead_lane_runaways(free)
@@ -1869,7 +1873,8 @@ class Station:
                        counts: Dict[Tuple[str, int], int]) -> Optional[str]:
         """Why the station must not claim this build ticket, or None when the
         claim may go (loom#483). Regressions, reverts and urgent tickets are
-        never gated: the limit holds back new work, not repairs."""
+        never gated: the limit holds back new work, not repairs. Factory-repair
+        tickets pass under their own in-flight cap (_repair_gate)."""
         names = set(_label_names(issue))
         if names & {REGRESSION, factory.REVERT_LABEL, URGENT}:
             return None
@@ -1887,9 +1892,33 @@ class Station:
         held = counts[key]
         if held <= limit:
             return None
+        if brain.is_repair(repo, issue):
+            return self._repair_gate(repo, issue, goal, held, limit)
         return ("goal #%d has %d tickets shipped without a proof "
                 "(limit %d); the goal verifies them before the station starts more"
                 % (goal, held, limit))
+
+    def _repair_gate(self, repo: str, issue: Dict[str, Any], goal: int, held: int,
+                     limit: int) -> Optional[str]:
+        """A factory-repair ticket over the unproven-work limit (loom#767): it
+        goes while fewer than brain.REPAIR_IN_FLIGHT other repair tickets of
+        the goal are running or at a pull request. One read of the goal's
+        tickets a pass; each ticket let through counts against the rest."""
+        key = (repo, goal)
+        if key not in self._repair_flying:
+            try:
+                self._repair_flying[key] = brain.goal_repairs_flying(self.gh, repo, goal)
+            except ValueError as err:
+                return "its goal #%d cannot be read: %s" % (goal, err)
+        number = int(issue["number"])
+        others = [n for n in self._repair_flying[key] if n != number]
+        if len(others) < brain.REPAIR_IN_FLIGHT:
+            if number not in self._repair_flying[key]:
+                self._repair_flying[key].append(number)
+            return None
+        return ("goal #%d has %d tickets shipped without a proof (limit %d), and %d "
+                "factory-repair tickets are in flight already (at most %d pass the limit)"
+                % (goal, held, limit, len(others), brain.REPAIR_IN_FLIGHT))
 
     def _apply_unproven_gate(self, by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]]
                              ) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:

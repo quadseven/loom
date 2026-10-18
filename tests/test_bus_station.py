@@ -6257,6 +6257,59 @@ class UnprovenGateTest(unittest.TestCase):
         self.assertEqual(self.run_pass(), 0)
         self.assertIn("loom:running", self.fake.names(7))
 
+    # loom#767: factory-repair tickets (Priority: P0, or under an epic named
+    # in LOOM_REPAIR_EPICS) pass the limit, at most two in flight at once.
+    def repair_epic(self, number=50):
+        patcher = mock.patch.dict(os.environ, {"LOOM_REPAIR_EPICS": "%s#%d" % (REPO, number)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.epic(number)
+
+    def running_repair(self, number):
+        issue = self.child(number, state="running")
+        issue["body"] = "Priority: P0\n\n## Why\nx\n\nPart of #%d\n" % self.GOAL
+        self.fake.sub_issues[self.GOAL].append(issue)
+
+    def test_a_repair_epic_child_over_the_limit_is_claimed(self):
+        self.over_limit()
+        self.repair_epic(50)
+        self.brief_under(7, 50)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_p0_ticket_over_the_limit_is_claimed(self):
+        self.over_limit()
+        self.fake.add(7, state="briefed", lane="codex",
+                      body="Priority: P0\n" + BODY + "\nPart of #%d\n" % self.GOAL)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_repair_ticket_goes_while_one_other_is_in_flight(self):
+        self.over_limit()
+        self.repair_epic(50)
+        self.running_repair(201)
+        self.brief_under(7, 50)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:running", self.fake.names(7))
+
+    def test_a_third_repair_ticket_waits_while_two_are_in_flight(self):
+        self.over_limit()
+        self.repair_epic(50)
+        self.running_repair(201)
+        self.running_repair(202)
+        self.brief_under(7, 50)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_a_ticket_under_another_epic_still_waits(self):
+        self.over_limit()
+        self.repair_epic(50)
+        self.epic(51)
+        self.brief_under(7, 51)
+        self.assertEqual(self.run_pass(), 0)
+        self.assertNotIn("loom:running", self.fake.names(7))
+
     def test_ticket_goal_reads_the_part_of_line(self):
         self.assertEqual(station._ticket_goal({"body": "x\n\nPart of #40\n"}), 40)
         self.assertEqual(station._ticket_goal({"body": "x", "parent_issue_url":

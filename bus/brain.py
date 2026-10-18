@@ -816,6 +816,59 @@ def unverified_limit(env: Optional[Dict[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 1 else DEFAULT_UNVERIFIED_LIMIT
 
 
+# Factory-repair tickets pass the unproven-work limit (loom#767): a ticket at
+# Priority: P0, or under one of the epics LOOM_REPAIR_EPICS names
+# ("owner/name#N" words). At most REPAIR_IN_FLIGHT of them per goal go over
+# the limit at once, so a repair cannot become the new pile of unproven work.
+REPAIR_IN_FLIGHT = 2
+REPAIR_STATES = ("loom:running", "loom:pr")
+
+
+def repair_epics(env: Optional[Dict[str, str]] = None) -> set:
+    """(repo, number) for each epic LOOM_REPAIR_EPICS names; malformed words
+    are skipped."""
+    raw = (os.environ if env is None else env).get("LOOM_REPAIR_EPICS", "")
+    found = set()
+    for word in raw.split():
+        match = re.fullmatch(r"([\w.-]+/[\w.-]+)#(\d+)", word)
+        if match:
+            found.add((match.group(1), int(match.group(2))))
+    return found
+
+
+def _parent_number(issue: Dict[str, Any]) -> Optional[int]:
+    """The issue a ticket names as its parent: its Part of #N line, else its
+    sub-issue link."""
+    match = re.search(r"^Part of #(\d+)(?!\d)", str(issue.get("body") or ""), re.M)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
+    return int(match.group(1)) if match else None
+
+
+def is_repair(repo: str, issue: Dict[str, Any], env: Optional[Dict[str, str]] = None) -> bool:
+    """A factory-repair ticket: Priority: P0, or a child of a repair epic."""
+    if tickets.priority_of(issue) == "P0":
+        return True
+    parent = _parent_number(issue)
+    return parent is not None and (repo, parent) in repair_epics(env)
+
+
+def repair_flying(repo: str, children: List[Dict[str, Any]],
+                  states: Sequence[str] = REPAIR_STATES,
+                  env: Optional[Dict[str, str]] = None) -> List[int]:
+    """The numbers of the goal's open repair tickets in one of `states`."""
+    return [int(c.get("number") or 0) for c in children
+            if c.get("state") == "open" and "loom:ticket" in _labels(c)
+            and any(state in _labels(c) for state in states) and is_repair(repo, c, env)]
+
+
+def goal_repairs_flying(gh: GitHub, repo: str, goal: int,
+                        env: Optional[Dict[str, str]] = None) -> List[int]:
+    """The goal's repair tickets a lane holds (running or at a pull request)."""
+    return repair_flying(repo, _goal_children(gh, repo, goal), env=env)
+
+
 def _goal_issue(gh: GitHub, repo: str, goal: int) -> Dict[str, Any]:
     """An open loom:goal issue; ValueError for anything else."""
     try:
@@ -1342,13 +1395,29 @@ def goal_unproven(gh: GitHub, repo: str, goal: int) -> int:
     return _goal_unproven(gh, repo, goal)
 
 
-def _check_goal_unproven(children: List[Dict[str, Any]], goal: int) -> None:
+def _check_goal_unproven(children: List[Dict[str, Any]], goal: int,
+                         repair_repo: Optional[str] = None,
+                         env: Optional[Dict[str, str]] = None) -> None:
+    """Refuse a brief while the goal is over its unproven-work limit. A
+    factory-repair brief (repair_repo set) passes while fewer than
+    REPAIR_IN_FLIGHT repair tickets of the goal are in flight (loom#767)."""
     count = _count_unproven(children)[0]
     limit = unverified_limit()
+    if count > limit and repair_repo is not None:
+        flying = repair_flying(repair_repo, children, IN_FLIGHT, env)
+        if len(flying) < REPAIR_IN_FLIGHT:
+            return
+        raise ValueError("goal #%d has %d tickets shipped without a proof (limit %d), and "
+                         "%d factory-repair tickets are in flight already (%s; at most %d "
+                         "pass the limit at once)"
+                         % (goal, count, limit, len(flying),
+                            ", ".join("#%d" % n for n in flying), REPAIR_IN_FLIGHT))
     if count > limit:
         raise ValueError("goal #%d has %d tickets shipped without a proof "
                          "(limit %d); verify them before briefing more build work; only a "
-                         "measured regression of a shipped ticket passes it (--regresses)"
+                         "measured regression of a shipped ticket (--regresses) or a "
+                         "factory-repair brief (--priority P0, or an epic in "
+                         "LOOM_REPAIR_EPICS) passes it"
                          % (goal, count, limit))
 
 
@@ -1637,7 +1706,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
                                  regresses, goal_issue, epic)
     children = _goal_children(gh, repo, goal, goal_issue)
     _check_goal_capacity(children, goal)
-    _check_goal_unproven(children, goal)
+    repair = priority == "P0" or (epic is not None and (repo, epic) in repair_epics(env))
+    _check_goal_unproven(children, goal, repo if repair else None, env)
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
         epic = intake_epic(gh, repo, goal)
