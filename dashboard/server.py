@@ -33,6 +33,7 @@ from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
 from . import tickets_table
+from . import operators as operators_view
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
@@ -994,6 +995,8 @@ def _dispatch_get(handler, state):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
         return _dispatch_ticket_page(handler, state, path, parsed)
+    if path == "/operators":
+        return handler.send_page(operators_view.page_html(state.response(), time.time()))
     return _dispatch_basic(handler, state, path)
 
 
