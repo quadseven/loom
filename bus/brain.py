@@ -3108,8 +3108,7 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                        unread: Optional[Dict[str, str]] = None) -> List[str]:
     found_marks = handoff.marks(found)
     items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
-    latest = latest or {(m.stage, m.item, m.key if m.stage == "brief" else ""): m
-                        for m in found_marks}
+    latest = latest or {_mark_key(m): m for m in found_marks}
     current, gone = _item_revisions(gh, items, unread or {})
     items = [m for m in items if m.item not in gone]
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
@@ -3120,22 +3119,32 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                    % " ".join(skipped))
     out += [_skip_line(handoff.item_ref(item), reason) for item, reason in sorted(gone.items())]
     for m in items:
-        newest = latest[(m.stage, m.item, m.key if m.stage == "brief" else "")]
-        if newest.kind == "defer" and newest != m:
-            continue
-        if newest.kind == "done":
-            out.append("- dropped %s %s: finished or closed since the defer" % (
-                m.stage, handoff.item_ref(m.item)))
-            continue
-        if m in alive:
-            item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
-            out.append("- resume %s %s (deferred by %s at %s)" % (
-                m.stage, item_text, m.holder, m.at))
-        else:
-            out.append("- dropped %s %s: %s since the defer" % (
-                m.stage, handoff.item_ref(m.item),
-                "finished or closed" if current[m.item] is None else "changed"))
+        line = _resume_item_line(m, latest[_mark_key(m)], m in alive, current[m.item])
+        if line:
+            out.append(line)
     return out
+
+
+def _mark_key(m: handoff.Mark) -> Tuple[str, Tuple[str, int], str]:
+    """The handoff a mark belongs to: its stage and item, and a brief's key."""
+    return (m.stage, m.item, m.key if m.stage == "brief" else "")
+
+
+def _resume_item_line(m: handoff.Mark, newest: handoff.Mark, alive: bool,
+                      revision: Optional[str]) -> Optional[str]:
+    """One standing defer's resume line: resumed while live, dropped once
+    done, closed or changed, and None when a newer defer replaced it."""
+    if newest.kind == "defer" and newest != m:
+        return None
+    if newest.kind == "done":
+        return "- dropped %s %s: finished or closed since the defer" % (
+            m.stage, handoff.item_ref(m.item))
+    if alive:
+        item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
+        return "- resume %s %s (deferred by %s at %s)" % (m.stage, item_text, m.holder, m.at)
+    return "- dropped %s %s: %s since the defer" % (
+        m.stage, handoff.item_ref(m.item),
+        "finished or closed" if revision is None else "changed")
 
 
 def _freshness_line(peers: List[Dict[str, Any]]) -> str:
