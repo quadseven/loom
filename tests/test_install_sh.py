@@ -349,7 +349,7 @@ class InstallScriptTest(unittest.TestCase):
     def test_dashboard_is_installed_on_the_given_host_with_memory_transcripts(self):
         result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DASHBOARD_HOST="127.0.0.1",
                                             LOOM_DASHBOARD_PORT="8181",
-                                            LOOM_REPOS="example-owner/sample")
+                                            LOOM_DASHBOARD_BUDGET_FLOOR="250")
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = self.dashboard_plist().read_text()
         self.assertIn("<key>KeepAlive</key><true/>", plist)
@@ -358,7 +358,7 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_DASHBOARD_HOST</key><string>127.0.0.1</string>", plist)
         self.assertIn("<key>LOOM_DASHBOARD_PORT</key><string>8181</string>", plist)
         self.assertIn("<key>LOOM_TRANSCRIPTS_MEMORY</key><string>1</string>", plist)
-        self.assertIn("<key>LOOM_REPOS</key><string>example-owner/sample</string>", plist)
+        self.assertIn("<key>LOOM_DASHBOARD_BUDGET_FLOOR</key><string>250</string>", plist)
         for key in ("LOOM_DASHBOARD_HOST", "LOOM_DASHBOARD_PORT", "LOOM_TRANSCRIPTS_MEMORY"):
             self.assertEqual(plist.count("<key>%s</key>" % key), 1, key)
         self.assertNotIn("<key>LOOM_DASHBOARD</key>", plist)
