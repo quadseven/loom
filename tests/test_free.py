@@ -233,6 +233,20 @@ class OpenIssueReadTest(unittest.TestCase):
         store._read_open_issues(10000.0 + FREE_ISSUES_SECONDS)
         self.assertEqual(len([p for p in gh.paths if "state=open" in p]), 2)
 
+    def test_every_page_of_open_issues_is_read(self):
+        pages = {"/repos/%s/issues?state=open&per_page=100" % REPO: (
+                     [_issue(1)], '<https://api.example/next>; rel="next"'),
+                 "https://api.example/next": ([_issue(2)], "")}
+        gh = mock.Mock()
+        gh.rest.side_effect = lambda method, path, *a, **k: types.SimpleNamespace(
+            data=pages[path][0], status=200, headers={"link": pages[path][1]})
+        from bus.github import GitHub
+        gh.paginate.side_effect = lambda path: GitHub.paginate(gh, path)
+        gh._paginate_from.side_effect = lambda path, first: GitHub._paginate_from(gh, path, first)
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._read_open_issues(10000.0)
+        self.assertEqual([r["number"] for r in store.open_issues[REPO]], [1, 2])
+
     def test_nothing_is_read_below_the_budget_floor(self):
         store, gh = self._store()
         store._last_remaining, store._reset_at = 10, 0

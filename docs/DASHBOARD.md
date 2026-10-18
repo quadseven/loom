@@ -98,7 +98,8 @@ shows only when it is a Loom ticket or a pull request.
 `/free` lists, per repo, the open issues free for the operator named by
 `?operator=<login>` (anyone, with none), from `bus.free`, the function
 behind `python3 -m bus.free` (docs/LANES.md, "Two Looms on shared repos").
-It reads each repo's open issues at most once an hour
+It reads every page of each repo's open issues (`GitHub.paginate`, 100 a
+page, following the `Link` header) at most once an hour
 (`FREE_ISSUES_SECONDS`), never below the budget floor, and takes the
 covering tickets from the ticket records and the comment feed every pass
 already holds. Issues whose Loom ticket is closed or merged are listed to
