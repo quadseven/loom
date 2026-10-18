@@ -2424,16 +2424,20 @@ class Station:
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
-            brain.move(self.gh, repo, number, "verified", record=record,
-                       verified_by="%s/%s" % (lane, model))
+            source = brain.move(self.gh, repo, number, "verified", record=record,
+                                verified_by="%s/%s" % (lane, model))
         except ValueError as err:
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
             return
         _say("verified %s#%d from the proof lane %s gathered" % (repo, number, lane))
+        if source:
+            _say("%s#%d: %s" % (repo, number, source))
         try:
-            brain.close(self.gh, repo, number, reason="completed",
-                        env={"LOOM_BRIEF_AUTHORS": " ".join(self.s.authors)})
+            source = brain.close(self.gh, repo, number, reason="completed",
+                                 env={"LOOM_BRIEF_AUTHORS": " ".join(self.s.authors)})
+            if source:
+                _say("%s#%d: %s" % (repo, number, source))
         except RateLimited:
             raise
         except (ValueError, GitHubError) as err:

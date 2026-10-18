@@ -55,7 +55,7 @@ that talks to GitHub about tickets.
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
-| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Refs #<number>`. The issue stays open. |
+| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed (money, hardware, an account, a credential, a decision reserved for the operator). |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -402,7 +402,8 @@ section, checkboxes under Acceptance criteria, no header lines, and passes the
 written-text check; difficulty is one of the three. A brief is filed queued
 (no lane) with `brief --refs M`; a human ask goes through `human`; a skip or
 an invalid answer writes nothing and is logged. The original issue is never
-closed, retitled or edited.
+retitled or edited; it closes with its ticket (Rewritten issues close with
+their ticket).
 
 A repo that is not public (or whose visibility cannot be read) only ever uses
 the private command, because the public one may run a provider that trains on
@@ -451,6 +452,30 @@ every criterion is checked, and the newest proof comment from a
 `LOOM_BRIEF_AUTHORS` login matches the criteria as they are now. Rewording,
 adding or removing a criterion after the proof means verifying again.
 
+### Rewritten issues close with their ticket
+
+This changed on 2026-10-18 (loom#822). Before it, a `loom:rewritten` issue
+stayed open forever, so every rewritten issue counted as open work in every
+repo. Now a ticket that names its source, with its `Rewritten from issue M.`
+line (or the `Refs #M` line rewrites carried before loom#462), settles that
+issue when it moves:
+
+- **Verified, or closed as completed:** the source closes as completed, with
+  a `<!-- loom:source v1 ... -->` comment naming the ticket and its proof
+  comment. A source with an unchecked acceptance criterion of its own stays
+  open instead, with a comment saying a person closes it, since the close
+  gate refuses it.
+- **Closed as not planned:** the source stays open, with a comment saying the
+  ticket was dropped and a person decides.
+- **A failed proof audit:** a source Loom closed for that ticket opens again,
+  and closes again when the ticket is verified again.
+
+Only the paired source is touched: open (or, for the audit, closed by Loom),
+labelled `loom:rewritten`, and carrying the rewrite comment that names this
+ticket. A `Refs #M` line to any other issue changes nothing. Each outcome is
+said once per ticket, and a GitHub failure on the source is logged, never
+raised, since the ticket has already moved.
+
 ### Proof audits
 
 A lane proof passed the shape check, which cannot tell evidence a lane read
@@ -466,7 +491,8 @@ names), then record the result:
 A pass posts a `<!-- loom:audit v1 result=pass lane=LANE -->` comment and
 leaves the ticket as it is. A fail reopens the ticket when it was closed,
 labels it `loom:audit-failed`, and moves it back to shipped with the note,
-which names what failed. The station then hands that lane no verify run for
+which names what failed; a rewritten issue Loom closed for that proof opens
+again. The station then hands that lane no verify run for
 24 hours, and the ticket is due a verify run again. Evidence you cannot read
 from where you run (a lane machine log, from Muse) is not a fail: leave the
 audit to the lane machine's tick and say so in the journal.

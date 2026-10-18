@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import GitHub, GitHubError, _next_link, auth_from_env, rest_login, unreadable
+from .github import GitHub, GitHubError, RateLimited, _next_link, auth_from_env, rest_login, unreadable
 from . import audit, change_class, handoff, hunt_plan, lock, pr_repair, proof, text, tickets
 from . import naming
 from .labels import LANES, REMOTE_LANES
@@ -66,6 +66,10 @@ STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
+# Opens the comment Loom leaves on a rewritten issue when the ticket it
+# became is verified or dropped; the rest of the line names the ticket and
+# the outcome, so the same word is never said twice.
+SOURCE_MARKER = "<!-- loom:source v1"
 TRIAGE_LIMIT = 25
 # A goal home may name the branch work merges into, when that branch is not the
 # repository's default branch. The line lives in the goal body's header area.
@@ -1675,7 +1679,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     come from the epic's goal. With refs, the ticket is a rewrite of that
     open issue: its body ends with "Rewritten from issue M." in words, and the
     original gets a comment naming the ticket and loom:rewritten in place of
-    loom:triage. The original is never closed, retitled or edited. The line is
+    loom:triage. The original is never retitled or edited here; it closes as
+    completed when the ticket is verified (settle_source). The line is
     words, not "Refs #M": lanes copy the brief's sections into their pull
     request, and the review bot's plan check then demands that the original,
     which is in no epic, belong to one (2026-10-15: muster and zippie lane
@@ -1745,7 +1750,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if refs is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, refs),
                 {"body": "%s\nRewritten as ticket #%d, which refs this issue. This issue "
-                         "stays open as it is." % (TRIAGE_MARKER, issue["number"])})
+                         "closes as completed when that ticket is verified." % (
+                             TRIAGE_MARKER, issue["number"])})
         _remove_label(gh, repo, refs, "loom:triage")
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
@@ -2318,12 +2324,13 @@ def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
          record: Optional[Dict[str, Any]] = None,
-         model: Optional[str] = None, verified_by: str = audit.BRAIN) -> None:
+         model: Optional[str] = None, verified_by: str = audit.BRAIN) -> Optional[str]:
     """Move a ticket to a state. Verified takes a proof record (bus/proof.py),
     posted on the ticket before the label changes, with verified_by naming
     who made it (the brain unless the station says which lane); no other
     state takes one. A model (briefed only) is written to the body's Model:
-    line first."""
+    line first. A verified ticket that was rewritten from an issue closes
+    that issue (settle_source); the line saying so is returned."""
     _check_move_args(state, lane, note, model)
     if (state == "verified") != (record is not None):
         raise ValueError("verified needs a proof record, and no other state takes one")
@@ -2347,14 +2354,20 @@ def move(gh: GitHub, repo: str, number: int, state: str,
                              (lane, effective_model,
                               ", ".join(model_lanes(effective_model)) or "none"))
     kept = _moved_labels(_labels(issue), state, lane)
+    proof_url = ""
     if record is not None:
         comment = _proof_comment(gh, repo, issue, dict(record, verified_by=verified_by))
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
+        posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                         {"body": comment}).data
+        proof_url = str((posted or {}).get("html_url") or "") if isinstance(posted, dict) else ""
     if model is not None:
         _set_model(gh, repo, number, issue, model)
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
     if note is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
+    if state == "verified":
+        return settle_source(gh, repo, number, issue.get("body"), "completed", proof_url)
+    return None
 
 
 def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
@@ -2691,30 +2704,35 @@ def owned_elsewhere(issue: Dict[str, Any],
 
 
 def _check_proven(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
-                  env: Optional[Dict[str, str]]) -> None:
+                  env: Optional[Dict[str, str]]) -> str:
     """A completed closure needs every criterion checked and a proof comment,
-    from a LOOM_BRIEF_AUTHORS login, made against the criteria as they are now."""
+    from a LOOM_BRIEF_AUTHORS login, made against the criteria as they are now.
+    Returns that proof comment's link ("" when GitHub gave none)."""
     body = str(issue.get("body") or "")
     proof.check_criteria(body)
     authors = trusted_authors(env)
     if not authors:
         raise ValueError("LOOM_BRIEF_AUTHORS is empty, so no proof comment can be trusted")
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-    records = [proof.read(str(c.get("body") or "")) for c in comments
-               if (c.get("user") or {}).get("login") in authors]
-    records = [r for r in records if r is not None]
-    if not records:
+    found = [(proof.read(str(c.get("body") or "")), str(c.get("html_url") or ""))
+             for c in comments if (c.get("user") or {}).get("login") in authors]
+    found = [(r, url) for r, url in found if r is not None]
+    if not found:
         raise ValueError("the ticket has no loom:proof comment; move it to verified with --proof")
-    if records[-1].get("contract") != proof.contract(body):
+    newest, url = found[-1]
+    if newest.get("contract") != proof.contract(body):
         raise ValueError("the acceptance criteria changed after the proof; verify it again")
-    proof.check(records[-1], body)
+    proof.check(newest, body)
+    return url
 
 
 def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
-          note: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> None:
+          note: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Close a ticket. Completed only once it is verified with a proof that
     still matches its criteria, all checked (never close before live
-    verification); not_planned for tickets the brain drops, with no proof."""
+    verification); not_planned for tickets the brain drops, with no proof.
+    A ticket rewritten from an issue then settles that issue
+    (settle_source); the line saying what happened to it is returned."""
     if reason not in ("completed", "not_planned"):
         raise ValueError("reason is completed or not_planned")
     if note is not None:
@@ -2725,12 +2743,147 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
         raise ValueError("only open loom:ticket issues are closed here")
     if reason == "completed" and "loom:verified" not in names:
         raise ValueError("a ticket is closed as completed only after loom:verified")
+    proof_url = ""
     if reason == "completed":
-        _check_proven(gh, repo, number, issue, env)
+        proof_url = _check_proven(gh, repo, number, issue, env)
     if note is not None:
         gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": note})
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
             {"state": "closed", "state_reason": reason})
+    return settle_source(gh, repo, number, issue.get("body"), reason, proof_url)
+
+
+_REWRITTEN_FROM = re.compile(r"^Rewritten from issue (\d+)\.[ \t]*$", re.M)
+# Rewrites before loom#462 ended the ticket with this line instead.
+_REFS_LINE = re.compile(r"^Refs #(\d+)[ \t]*$", re.M)
+
+
+def rewritten_from(body: Any) -> Optional[int]:
+    """The issue a ticket names as its source: its "Rewritten from issue M."
+    line, or the "Refs #M" line older rewrites carried. None when it names
+    none. Only a candidate: settle_source checks the pairing."""
+    text_ = str(body or "")
+    found = _REWRITTEN_FROM.search(text_) or _REFS_LINE.search(text_)
+    return int(found.group(1)) if found else None
+
+
+def _source_marker(ticket: int, outcome: str) -> str:
+    return "%s ticket=%d outcome=%s -->" % (SOURCE_MARKER, ticket, outcome)
+
+
+def _said_for(comments: List[Dict[str, Any]], ticket: int) -> Optional[str]:
+    """The newest source comment Loom left for this ticket, or None. Only
+    the newest counts, so a source reopened after a failed audit closes again
+    when the ticket is verified again."""
+    head = "%s ticket=%d " % (SOURCE_MARKER, ticket)
+    said = [str(c.get("body") or "") for c in comments
+            if str(c.get("body") or "").startswith(head)]
+    return said[-1] if said else None
+
+
+def _paired_source(gh: GitHub, repo: str, number: int, body: Any
+                   ) -> Optional[Tuple[int, Dict[str, Any], List[Dict[str, Any]]]]:
+    """The issue ticket #number was rewritten from, with its comments, when
+    the ticket names it and the issue proves the pairing: labelled
+    loom:rewritten and carrying the rewrite comment that names this ticket.
+    A "Refs #M" line to any other issue is not a source."""
+    source = rewritten_from(body)
+    if source is None or source == number:
+        return None
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, source)).data or {}
+    if "pull_request" in issue or "loom:rewritten" not in _labels(issue):
+        return None
+    comments = [c for c in gh.paginate("/repos/%s/issues/%d/comments" % (repo, source))
+                if isinstance(c, dict)]
+    said = "Rewritten as ticket #%d," % number
+    if not any(TRIAGE_MARKER in str(c.get("body") or "") and said in str(c.get("body") or "")
+               for c in comments):
+        return None
+    return source, issue, comments
+
+
+def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
+                  proof_url: str = "") -> Optional[str]:
+    """Settle the issue ticket #number was rewritten from, once the ticket is
+    verified or closed. Completed (verified, or closed as completed) closes
+    the source as completed with a comment naming the ticket and its proof;
+    a source whose own acceptance criteria are unchecked stays open with a
+    comment saying why, since the close gate refuses it. not_planned leaves
+    the source open with a comment. Each outcome is said once per ticket.
+    Returns a line saying what was done, or None when the ticket names no
+    open paired source. A GitHub failure is returned as that line, never
+    raised: the ticket has already moved by then."""
+    if reason not in ("completed", "not_planned"):
+        raise ValueError("reason is completed or not_planned")
+    try:
+        found = _paired_source(gh, repo, number, body)
+        if found is None:
+            return None
+        source, issue, comments = found
+        if issue.get("state") != "open":
+            return None
+        if reason == "not_planned":
+            outcome = "dropped"
+            words = ("Ticket #%d, rewritten from this issue, was closed as not planned. "
+                     "This issue stays open for a person to decide." % number)
+        elif any(not checked for checked, _ in proof.criteria(str(issue.get("body") or ""))):
+            outcome = "held"
+            words = ("Ticket #%d, rewritten from this issue, is verified (%s). This issue "
+                     "stays open: it has an unchecked acceptance criterion of its own, so a "
+                     "person closes it." % (number, _proof_words(number, proof_url)))
+        else:
+            outcome = "closed"
+            words = ("Ticket #%d, rewritten from this issue, is verified (%s), so this issue "
+                     "closes as completed." % (number, _proof_words(number, proof_url)))
+        marker = _source_marker(number, outcome)
+        said = _said_for(comments, number)
+        if said is None or not said.startswith(marker):
+            comment = "%s\n%s" % (marker, words)
+            _check_written_text(comment)
+            gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, source), {"body": comment})
+        elif outcome != "closed":
+            return None
+        if outcome == "closed":
+            gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, source),
+                    {"state": "closed", "state_reason": "completed"})
+            return "closed source issue #%d as completed" % source
+        return "left source issue #%d open with a comment" % source
+    except RateLimited:
+        raise
+    except (GitHubError, ValueError) as err:
+        return "source issue of #%d not settled: %s" % (number, " ".join(str(err).split())[:200])
+
+
+def _proof_words(number: int, proof_url: str) -> str:
+    if re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/issues/\d+#issuecomment-\d+", proof_url):
+        return "proof: %s" % proof_url
+    return "its proof is on ticket #%d" % number
+
+
+def reopen_source(gh: GitHub, repo: str, number: int, body: Any) -> Optional[str]:
+    """Reopen the issue ticket #number was rewritten from when Loom closed it
+    for that ticket's proof and an audit has since failed that proof. A
+    source a person closed, or one Loom never closed, is left alone."""
+    try:
+        found = _paired_source(gh, repo, number, body)
+        if found is None:
+            return None
+        source, issue, comments = found
+        said = _said_for(comments, number)
+        if issue.get("state") != "closed" or said is None or not said.startswith(
+                _source_marker(number, "closed")):
+            return None
+        reopened = _source_marker(number, "reopened")
+        comment = ("%s\nThe audit of ticket #%d failed its proof, so this issue, closed for "
+                   "that proof, is open again." % (reopened, number))
+        _check_written_text(comment)
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, source), {"state": "open"})
+        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, source), {"body": comment})
+        return "reopened source issue #%d" % source
+    except RateLimited:
+        raise
+    except (GitHubError, ValueError) as err:
+        return "source issue of #%d not reopened: %s" % (number, " ".join(str(err).split())[:200])
 
 
 def _audit_comment(result: str, record: Dict[str, Any], note: str) -> str:
@@ -2750,7 +2903,8 @@ def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
     lane made and no audit has judged (bus/audit.py). A pass leaves the
     ticket as it is. A fail reopens it when closed, labels it
     loom:audit-failed, which holds the lane's verify runs for a day, and
-    moves it back to shipped with a note naming what failed."""
+    moves it back to shipped with a note naming what failed. A rewritten
+    issue Loom closed for that proof opens again (reopen_source)."""
     if result not in audit.RESULTS:
         raise ValueError("an audit result is pass or fail")
     if not str(note or "").strip():
@@ -2771,8 +2925,10 @@ def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [audit.LABEL]})
     move(gh, repo, number, "shipped", note=comment)
-    return "audit of %s#%d failed: back to shipped, lane %s held" % (
+    said = "audit of %s#%d failed: back to shipped, lane %s held" % (
         repo, number, audit.lane_of(found[1]))
+    source = reopen_source(gh, repo, number, issue.get("body"))
+    return said if source is None else "%s; %s" % (said, source)
 
 
 FAILED_CONCLUSIONS = ("failure", "timed_out", "cancelled", "action_required", "startup_failure")
@@ -3860,7 +4016,9 @@ def _cmd_human(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     record = json.loads(_read(args.proof)) if args.proof else None
-    move(gh, repo, number, args.to, args.lane, args.note, record, args.model)
+    said = move(gh, repo, number, args.to, args.lane, args.note, record, args.model)
+    if said:
+        print(said)
 
 
 def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
@@ -3875,7 +4033,9 @@ def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
 
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
-    close(gh, repo, number, args.reason, args.note)
+    said = close(gh, repo, number, args.reason, args.note)
+    if said:
+        print(said)
 
 
 def _cmd_merge(gh: GitHub, args: argparse.Namespace) -> None:

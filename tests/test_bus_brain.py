@@ -2608,7 +2608,7 @@ class HumanAndRefsTests(unittest.TestCase):
                     brain.human(GitHub("t", transport=fake), REPO, 6, ask)
                 self.assertTrue(all(c[0] == "GET" for c in fake.calls))
 
-    def test_brief_refs_rewrites_without_touching_the_original(self):
+    def test_brief_refs_rewrites_without_closing_the_original(self):
         fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t"}),
                     reply(201, {}), reply(201, {}), reply(200, []), reply(200, []))
@@ -2619,6 +2619,7 @@ class HumanAndRefsTests(unittest.TestCase):
             "\n\nRewritten from issue 6.\n\nPart of #2\n"))
         self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
+        self.assertIn("closes as completed when that ticket is verified", fake.calls[5][2]["body"])
         self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
         self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
