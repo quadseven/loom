@@ -94,3 +94,12 @@ page that reaches back past it) and merges them by number, so a push to a
 large repository costs one page instead of every page. Once an hour the
 dashboard logs the GitHub requests it spent ("GitHub requests in the last N
 minutes: ... counted (by kind), ... not modified").
+
+`/lanes` reads top to bottom. A summary strip counts the lanes held, working
+and ready, shows the Anthropic share of lane runs against its 50% cap, and
+lists the held lanes grouped by their reason under "Needs attention". Then
+three sections, each with a one-line note: "Lanes now" (one card per lane,
+held first, then working, then ready, in slot order), "How tickets are
+routed" (the `bus/factory.py` tiers and model ladder, each lane marked with
+its state now) and "Pull requests by model" (lane pull requests counted by
+footer model, easy to hard).
