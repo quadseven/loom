@@ -220,6 +220,19 @@ class DashboardTest(unittest.TestCase):
         self.assertGreater(len(self.api_calls), before)
         self.assertFalse(self.get_json("/api/tickets")["stale"])
 
+    def test_below_the_floor_without_a_reset_time_the_next_refresh_is_unknown(self):
+        # A pass below the floor reads nothing, so "now plus the interval" is
+        # not when the data refreshes; without GitHub's reset time it is unknown.
+        self.store.refresh()
+        self.store._last_remaining, self.store.budget_floor, self.store._reset_at = 3, 20, 0
+        self.store.refresh()
+        payload = self.get_json("/api/tickets")
+        self.assertTrue(payload["stale"])
+        self.assertIsNone(payload["next_refresh_at"])
+        self.store._reset_at = int(time.time()) + 600
+        self.store.refresh()
+        self.assertEqual(self.get_json("/api/tickets")["next_refresh_at"], self.store._reset_at)
+
     def raw_get(self, path):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
         try:

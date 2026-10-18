@@ -161,6 +161,11 @@ def comment_record(comment: Dict[str, Any], repo: str) -> Dict[str, Any]:
     return out
 
 
+def _refresh_interval() -> int:
+    """Seconds the background thread waits between refresh passes."""
+    return max(1, int(os.environ.get("LOOM_DASHBOARD_REFRESH_SECONDS", "60")))
+
+
 class TicketStore:
     def __init__(self, repos: Optional[List[str]] = None, gh: Optional[GitHub] = None,
                  budget_floor: Optional[int] = None) -> None:
@@ -224,7 +229,7 @@ class TicketStore:
     def start_background(self) -> None:
         if self._refresh_thread is not None:
             return
-        interval = max(1, int(os.environ.get("LOOM_DASHBOARD_REFRESH_SECONDS", "60")))
+        interval = _refresh_interval()
 
         def run() -> None:
             while not self._stop.is_set():
@@ -594,8 +599,9 @@ class TicketStore:
             if not stale and not errors:
                 refreshed_at = time.time()
             below_floor = self._below_floor()
-            refresh_interval = max(1, int(os.environ.get("LOOM_DASHBOARD_REFRESH_SECONDS", "60")))
-            reset_at = self._reset_at if below_floor and self._reset_at else int(time.time()) + refresh_interval
+            # Below the floor a pass reads nothing, so only GitHub's reset time
+            # ends the stale spell; without one the next refresh is unknown.
+            reset_at = (self._reset_at or None) if below_floor else int(time.time()) + _refresh_interval()
             stale_reason = ("GitHub's request budget ran low" if below_floor else
                             "GitHub could not refresh ticket data" if errors else "")
             snapshot = {"tickets": data, "errors": errors, "stale": stale,

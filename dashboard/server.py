@@ -84,13 +84,14 @@ def _ticket_href(row):
 
 def _stale_notice(payload, now=None):
     refreshed = payload.get("ticket_refreshed_at")
-    age_minutes = max(0, int(((time.time() if now is None else now) - refreshed) // 60)) if refreshed else 0
+    age = ("is %d minutes old" % max(0, int(((time.time() if now is None else now) - refreshed) // 60))
+           if refreshed else "has not been read yet")
     reason = html.escape(payload.get("stale_reason") or "GitHub could not refresh ticket data", quote=False)
     next_refresh = payload.get("next_refresh_at")
-    when = (datetime.fromtimestamp(next_refresh, timezone.utc).astimezone(
-        ZoneInfo("America/New_York")).strftime("%H:%M ET") if next_refresh else "after GitHub can be reached")
-    return ('<p class="stale-note">Ticket data is %d minutes old: %s; it refreshes at %s.</p>'
-            % (age_minutes, reason, html.escape(when)))
+    when = ("at " + datetime.fromtimestamp(next_refresh, timezone.utc).astimezone(
+        ZoneInfo("America/New_York")).strftime("%H:%M ET") if next_refresh else "once GitHub can be reached")
+    return ('<p class="stale-note">Ticket data %s: %s; it refreshes %s.</p>'
+            % (age, reason, html.escape(when)))
 
 
 def _ticket_row(row):
