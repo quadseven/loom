@@ -18,6 +18,8 @@ from urllib.parse import urlencode
 from bus import brain, factory
 from bus.metrics import stamp
 
+from . import operators
+
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 IN_FLIGHT = ("queued", "briefed", "running", "pr", "failed")
 DONE = ("merged", "shipped", "verified")
@@ -141,13 +143,13 @@ def _row_html(row: Dict[str, Any], entered: Dict[str, Sequence[Any]], now: float
     pr_html = ('<a href="%s">#%s</a>' % (esc(str(pr["url"]), quote=True), esc(str(pr["number"])))
                if pr.get("url") and pr.get("number") else '<span class="tickets-none">-</span>')
     return ('<tr><td class="tickets-ticket"><a href="%s" title="%s"><span class="machine-fact">%s</span>'
-            '<span class="tickets-title">%s</span></a></td>'
+            '<span class="tickets-title">%s</span>%s</a></td>'
             '<td class="tickets-state machine-fact state-%s">%s</td>'
             '<td class="tickets-model machine-fact">%s / %s</td>'
             '<td class="tickets-age machine-fact" title="%s">%s</td>'
             '<td class="tickets-pr machine-fact">%s</td></tr>') % (
         esc(ticket_href(row), quote=True), esc(title, quote=True), esc(short_ref(_key(row))), esc(title),
-        esc(state or "unlabeled"), esc(state_text), esc(str(row.get("lane") or "no lane")), model_html,
+        operators.chip_html(row), esc(state or "unlabeled"), esc(state_text), esc(str(row.get("lane") or "no lane")), model_html,
         esc(age_title, quote=True), esc(age), pr_html)
 
 

@@ -68,6 +68,14 @@ three records: the stored transcript, the lane pull request footer, and the
 station's claim comment (whose model follows the ladder rules). It says "not
 run yet" when none exists and "model not recorded" when the newest run names
 no model. The age in state comes from the hourly label-event read.
+A row, and the ticket page header, carry a "held by <login>" chip when
+another operator owns the ticket: an assignee or `claim:<login>` label
+outside `LOOM_BRIEF_AUTHORS`, by the rule the station uses
+(`bus.tickets.owned_elsewhere`). Without `LOOM_BRIEF_AUTHORS` the dashboard
+cannot tell this Loom's logins from another operator's, so every
+`claim:<login>` label shows as a neutral chip instead. Ticket records keep
+their assignees and author, and pull request records their assignees and
+label names, for this.
 
 `/goals` shows one card per top-level goal home. A goal home rolls up into a
 bigger one through a `Parent goal: OWNER/NAME#N` line in its body or its

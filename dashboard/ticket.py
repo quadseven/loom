@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
+from . import operators
+
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified")
 # The path keeps its first and last steps when a ticket has many rounds.
@@ -370,10 +372,10 @@ def _header(record, runs):
         cls = "done" if i < current_index else ("current failed" if state == "failed" else "current") if i == current_index else ""
         strip.append('<div class="strip-step %s"><span></span><b>%s</b></div>' % (cls, _esc(name)))
     return ('<div class="ticket-header"><div class="ticket-topline"><a href="/tickets">&larr; tickets</a>'
-            '<span class="tone-%s">%s</span></div><div class="ticket-ids">%s%s</div><h2>%s</h2>'
+            '<span class="tone-%s">%s</span></div><div class="ticket-ids">%s%s%s</div><h2>%s</h2>'
             '<p class="machine-fact">%s</p><div class="state-strip" aria-label="Ticket states">%s</div></div>') % (
                 STATE_TONE.get(state, "dim"), _esc(flag), _esc(_short(repo, number)),
-                _parentage(record.get("epic"), goal),
+                _parentage(record.get("epic"), goal), operators.chip_html(record),
                 _esc(record.get("title")), _esc(" / ".join(meta)), "".join(strip))
 
 
