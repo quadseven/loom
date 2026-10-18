@@ -205,7 +205,7 @@ def _read_note(claims: Dict[str, Any]) -> str:
     read_at = _number(claims.get("read_at"))
     if not read_at:
         return "needs:&lt;login&gt; items are not read yet: they are read on the Operators pass."
-    note = "needs:&lt;login&gt; items read %s ago, every %d minutes" % (
+    note = "needs:&lt;login&gt; items read %s, every %d minutes" % (
         html.escape(views.format_age(read_at) or "-"), _number(claims.get("every")) // 60)
     if claims.get("error"):
         note += "; " + html.escape(str(claims["error"]))

@@ -151,6 +151,11 @@ class NeedsYouPageTest(unittest.TestCase):
         self.assertIn("Nothing waits on someone-else right now.", nobody)
         self.assertEqual(needs_you.who_param("bad login!"), "")
 
+    def test_the_read_note_says_when_the_needs_items_were_read_once(self):
+        self.store._snapshot["operator_claims"]["read_at"] -= 6 * 60 + 5
+        note = self.page().split('<p class="machine-fact needs-read">')[1].split("</p>")[0]
+        self.assertEqual(note, "needs:&lt;login&gt; items read 6 minutes ago, every 15 minutes.")
+
     def test_the_floor_counts_needs_login_items_too(self):
         floor = server._floor(self.store)
         card = floor.split('<span class="label">Needs you</span>')[1].split("</section>")[0]
