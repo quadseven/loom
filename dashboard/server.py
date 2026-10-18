@@ -33,6 +33,7 @@ from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
 from . import tickets_table
+from . import operators as operators_view
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
@@ -986,6 +987,8 @@ def _dispatch_get(handler, state):
         return _send_dashboard_view(handler, state, path)
     if path == "/results":
         return _dispatch_results(handler, state)
+    if path == "/free":
+        return _dispatch_free(handler, state, parsed)
     if path == "/usage":
         return _dispatch_usage(handler, state)
     if path in ("/brain", "/hot-spots"):
@@ -994,6 +997,8 @@ def _dispatch_get(handler, state):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
         return _dispatch_ticket_page(handler, state, path, parsed)
+    if path == "/operators":
+        return handler.send_page(operators_view.page_html(state.response(), time.time()))
     return _dispatch_basic(handler, state, path)
 
 
@@ -1171,6 +1176,18 @@ def _dispatch_results(handler, state):
     body = results.render_results(results.build_results(payload, datetime.now(timezone.utc)))
     return handler.send_page(page("Results", "results", body,
                                   status="stale" if payload.get("stale") else "live"))
+
+
+def _dispatch_free(handler, state, parsed):
+    from . import free_view
+    operator = free_view.operator_login((parse_qs(parsed.query).get("operator") or [""])[0])
+    payload = state.response()
+    found = free_view.build(getattr(state, "open_issues", {}) or {}, payload.get("tickets") or {},
+                            operator, payload.get("issue_comments") or [])
+    read_at = getattr(state, "open_issues_read_at", 0)
+    stamp = datetime.fromtimestamp(read_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if read_at else None
+    body = free_view.render(found, operator, stamp, getattr(state, "open_issues_error", ""))
+    return handler.send_page(page("Free to take", "free", body, status="Read only"))
 
 
 def _send_dashboard_view(handler, state, path):

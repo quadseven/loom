@@ -6,7 +6,7 @@ import re
 import sys
 from typing import Callable, List, Optional
 
-from . import app, journal, labels, lock, station
+from . import app, brain, journal, labels, lock, station
 from .github import GitHub, GitHubError, Transport, auth_from_env, openssl_sign
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
@@ -87,7 +87,12 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     repo, _, num = args.target.partition("#")
     with open(args.file, encoding="utf-8") as fh:
         text = fh.read()
-    journal.post(gh, repo, int(num), text, args.holder)
+    try:
+        journal.post(gh, repo, int(num), text, args.holder, brain.trusted_authors())
+    except journal.ReportTooSoon as held:
+        # The goal is already reported: not a failed step, so exit 0.
+        print("not posted: %s" % held)
+        return 0
     print("posted to %s" % args.target)
     return 0
 

@@ -51,8 +51,9 @@ class TrustedBriefIsBuiltTest(Pass):
         self.run_quiet()
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
         self.assertIn("loom:running", self.fake.names(12))
-        # The claim is this Loom's: assigned to and labelled for its operator.
-        self.assertEqual(tickets.assignees(self.fake.issues[12]), ["alice-example"])
+        # The claim is this Loom's: labelled for its operator. No assignment
+        # (an assignee is emailed for every comment on the ticket).
+        self.assertEqual(tickets.assignees(self.fake.issues[12]), [])
         self.assertIn("claim:alice-example", self.fake.names(12))
 
     def test_a_trusted_briefers_ticket_they_assigned_themselves_is_a_hand_off(self):

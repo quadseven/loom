@@ -4455,15 +4455,15 @@ class HumanDigestTest(AsksTest):
         self.assertEqual(len(self.sent), 1)
         self.assertTrue(self.contents()[0].startswith("Waiting on you (2):"))
 
-    def test_the_list_shows_the_15_newest_and_the_total(self):
+    def test_the_list_shows_the_5_newest_and_the_total(self):
         for n in range(100, 140):
             self.fake.add_human(n, title="Item %d" % n,
                                 created="2030-01-01T00:00:%02dZ" % (n - 100))
         self.go(NOON)
         text = "\n".join(self.contents())
-        self.assertIn("Waiting on you (the 15 newest of 40):", text)
+        self.assertIn("Waiting on you (the 5 newest of 40):", text)
         listed = re.findall(r"- Item (\d+) ", text)
-        self.assertEqual(listed, [str(n) for n in range(139, 124, -1)])
+        self.assertEqual(listed, [str(n) for n in range(139, 134, -1)])
         self.assertTrue(all(len(c) + 30 <= station.DISCORD_MAX for c in self.contents()))
         self.assertEqual(self.fake.paths("GET").count(
             "/repos/%s/issues/100/comments?per_page=100" % REPO), 0)
@@ -4590,6 +4590,20 @@ class ReportDigestTest(Base):
         self.assertEqual(len(self.sent), 2)
         self.assertIn("Loom evening digest", self.sent[1]["content"])
         self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
+
+    def test_a_goal_with_only_work_in_flight_counts_as_quiet(self):
+        # 2026-10-18: every goal reported "N in flight since the last report",
+        # so the digest listed all 18 goals as moving.
+        self.goal(40, "Goal forty")
+        self.goal(41, "Goal forty-one")
+        self.at(9, 30)
+        self.report(40, 100, "1 merged, 13 in flight since the last report.")
+        self.report(41, 101, "10 in flight since the last report.")
+        self.at(10, 1)
+        text = self.sent[0]["content"]
+        self.assertIn("Moving, 1 goal:", text)
+        self.assertIn("Quiet: 1 goal, nothing moved.", text)
+        self.assertNotIn("forty-one", text)
 
     def test_each_report_is_not_forwarded_on_its_own(self):
         self.goal(40, "Goal forty")
@@ -6577,12 +6591,16 @@ class TwoLoomsTest(Base):
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
         self.assertIn("loom:running", self.fake.names(12))
 
-    def test_a_claim_assigns_the_ticket_to_the_operator_login(self):
+    def test_a_claim_marks_the_operator_with_a_label_not_an_assignment(self):
+        # 2026-10-18: an assignee is emailed for every comment on the ticket;
+        # the claim label already tells another operator's Loom it is taken.
         self.settings.authors = ["loom-app[bot]"] + list(AUTHORS)
         self.fake.add(12)
         self.run_quiet()
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
-        self.assertEqual(tickets.assignees(self.fake.issues[12]), ["alice-example"])
+        self.assertEqual(tickets.assignees(self.fake.issues[12]), [])
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertFalse(any("/assignees" in p for p in self.fake.paths("POST")))
 
     def test_a_claim_adds_and_creates_the_operator_claim_label(self):
         self.fake.add(12)

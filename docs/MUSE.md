@@ -169,7 +169,7 @@ tickets and pull requests like any other work.
   `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
   for a reason the runner could catch, a step done by hand that the station
   could do, a rule a brief kept missing, a check that wasted a reply.
-- Every 2 hours, with the report, brief the single biggest such problem as a
+- Every 6 hours, with the report, brief the single biggest such problem as a
   ticket on loom#30 (or on the review bot's goal, quadseven/grug#1143, when
   the review bot caused it), with the evidence. End its Why with a
   `Noticed in <journal comment link>: "<the Friction line>"` line
@@ -279,7 +279,9 @@ this tick"; a step with no note shows nothing there.
    unlock" gets its report in the report step this tick, in every scope,
    including live. If the brain cannot write it, the station posts the
    data-only report once the last report is 1 hour 45 minutes old, so no
-   goal's report passes 2 hours; never hand an owed report to another brain. Each lane
+   goal's report passes 2 hours; never hand an owed report to another brain.
+   A goal listed as `report HELD` already has a report under 90 minutes old
+   (the station's included): skip it this tick. Each lane
    pull request's line ends in `READY`
    or `blocked:` and its blockers; take that verdict as given rather than
    re-deriving it from the review list.
@@ -437,9 +439,14 @@ this tick"; a step with no note shows nothing there.
    `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket names it, the original gets
    `loom:rewritten` and closes as completed when the ticket is verified) or, when only a person can do it, run
-   `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
-   the exact thing needed: money, hardware, an account, a credential, or a
-   decision the goal home reserves for the operator. When an open
+   `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file starts
+   with a line `Kind: K` (one of money, hardware, account, credential,
+   physical, decision) and then names the exact thing needed. A credential is
+   a secret only the owner holds, not GitHub access, which the factory has; a
+   decision is one nobody has made yet. Never park work there: a ticket the
+   unproven-work gate only delays stays `loom:triage`, and anything a lane,
+   the brain or the station can do with the repo, the GitHub API, logs, a
+   read of a running system or a diagnosis is a brief. When an open
    `loom:human` issue turns out to be work the brain can do after all,
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays
@@ -458,7 +465,7 @@ this tick"; a step with no note shows nothing there.
    the step's name from the list above (lock, status, merge, verify, failed,
    asks, brief, triage, journal, unlock): the station files a ticket when one
    brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
-   Every 2 hours per goal (when status lists the goal as due or overdue),
+   Every 6 hours per goal (when status lists the goal as due or overdue),
    also post the report: a separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself, written as a
@@ -483,7 +490,11 @@ this tick"; a step with no note shows nothing there.
    these. The station sends every report to the operator's phone, so it
    must stand on its own. Each goal needs its own report on its own home:
    a report on a parent goal does not cover its child goals, and a journal
-   or a report quoted inside another comment does not count.
+   or a report quoted inside another comment does not count. `journal`
+   posts no report within 90 minutes of another report on the same goal
+   home, the Loom App's included: it prints `not posted:` with that
+   report's author and time and exits 0. The goal is reported; that is not
+   a failed step.
 10. First run `python3 -m bus.brain step unlock --holder muse`. Run `python3 -m bus unlock quadseven/loom --holder muse`. Unlock after any
     failure as well.
 11. End the tick's chat reply in the same standup shape as the reports

@@ -122,7 +122,10 @@ DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
 HUMAN_HEAD = "Waiting on you"
-HUMAN_SHOWN = 15
+HUMAN_SHOWN = 5
+# A report first line whose only count is work in flight: the digest counts
+# that goal as quiet.
+IN_FLIGHT_ONLY_RE = re.compile(r"\A\d+ in flight( since the last report)?\.?\Z", re.I)
 HUMAN_TITLE_MAX = 100
 HUMAN_ASK_MAX = 140
 # When every ask does not fit in the daily notification, the full digest is a
@@ -138,12 +141,12 @@ FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place.
 QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
-# Reports come every 2 hours, so the goal homes are read at most this often,
+# Reports come every REPORT_EVERY (6 hours), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
 REPORT_CHECK = 300
-# The station's standup goes out this long before a goal's report turns two
-# hours old. Posting only once a goal was overdue (past REPORT_EVERY and its
+# The station's standup goes out this long before a goal's report turns
+# REPORT_EVERY old. Posting only once a goal was overdue (past REPORT_EVERY and its
 # grace) left every report 2.0 to 2.4 hours old before the next one, so the
 # visibility number (each goal report at most 2 hours old) could never pass.
 STANDUP_LEAD = 15 * 60
@@ -1263,7 +1266,17 @@ class Station:
 
     def _event(self, kind: str, reason: str, item: str = "", lane: str = "",
                model: str = "") -> None:
-        """Append one redacted decision event and rotate its log by UTC day."""
+        """Append one redacted decision event and rotate its log by UTC day.
+        The log is a record of decisions, not a decision: a disk error is
+        logged and the event dropped, so it cannot fail the step that made
+        the decision (loom#763)."""
+        try:
+            self._write_event(kind, reason, item, lane, model)
+        except OSError as err:
+            _say("could not write %s to the event log: %s" % (kind, err))
+
+    def _write_event(self, kind: str, reason: str, item: str, lane: str,
+                     model: str) -> None:
         directory = os.path.dirname(self.event_log)
         os.makedirs(directory, exist_ok=True)
         day = time.strftime("%Y-%m-%d", time.gmtime(self.now))
@@ -1482,7 +1495,9 @@ class Station:
         text = tickets.render_brief(repo, issue, lane, attempt, fix,
                                     checks, has_contract)
         claiming = self._write_brief(lane, name, text)
-        self._assign_operator(repo, issue)
+        # No assignment: the claim:<login> label below marks the claim for
+        # another operator's Loom (tickets.owned_elsewhere reads both), and an
+        # assignee is emailed for every comment on the ticket (2026-10-18).
         labels = [n for n in _label_names(issue) if n != BRIEFED]
         if RUNNING not in labels:
             labels.append(RUNNING)
@@ -1505,22 +1520,6 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
-
-    def _assign_operator(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Assign a claimed issue to this Loom's operator login, so another
-        operator's Loom sees the claim before it acts. A refused assignment
-        is logged and the claim goes on."""
-        login = tickets.operator_login(self.s.authors)
-        if not login or login.lower() in tickets.assignees(issue):
-            return
-        number = int(issue["number"])
-        try:
-            self.gh.rest("POST", "/repos/%s/issues/%d/assignees" % (repo, number),
-                         {"assignees": [login]})
-        except RateLimited:
-            raise
-        except GitHubError as err:
-            _say("could not assign %s#%d to %s: %s" % (repo, number, login, err))
 
     def _claim_label(self, repo: str) -> Optional[str]:
         """The claim:<operator login> label a claim adds, created in the repo
@@ -4910,7 +4909,10 @@ class Station:
                 body = self._report_body(comment)
                 first = next((x.lstrip("#").strip() for x in body.splitlines()
                               if x.lstrip("#").strip()), "")
-                if not first or first.lower().startswith("nothing moved"):
+                if not first or first.lower().startswith("nothing moved") \
+                        or IN_FLIGHT_ONLY_RE.match(first):
+                    # Work only in flight is not news: 18 such lines made
+                    # every digest list every goal (2026-10-18).
                     quiet += 1
                     continue
                 moving.append("- **%s** %s <%s>" % (
@@ -5435,8 +5437,8 @@ class Station:
         """What the invariants read, each source on its own: one that cannot
         be read stays None and its invariants find nothing this pass."""
         facts = invariants.Facts(now=self.now)
-        facts.events = self._read_events()
-        for name, read in (("runs", self._invariant_runs),
+        for name, read in (("events", self._read_events),
+                           ("runs", self._invariant_runs),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:

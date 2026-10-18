@@ -46,10 +46,12 @@ class InstallScriptTest(unittest.TestCase):
         self.lock.write_text("%s\n" % pid)
 
     def run_install(self, **env):
-        # The watched repos and status repo come only from the test: an
-        # operator's own settings in the environment would trip the owner check.
+        # The watched repos, status repo and App settings come only from the
+        # test: an operator's own settings in the environment would trip the
+        # owner check or the App check.
         full = {k: v for k, v in os.environ.items()
-                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")}
+                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")
+                and not k.startswith("LOOM_GITHUB_APP_")}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,
                     HOME=str(self.home),
                     LOOM_HOME=str(self.loom),
@@ -183,6 +185,95 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("LOOM_STATION_INTERVAL", result.stderr)
                 self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def app_key(self, mode):
+        key = self.tmp / "app-key.pem"
+        key.write_text("not a real key\n")
+        key.chmod(mode)
+        return key
+
+    def test_an_app_key_file_is_written_to_station_plist(self):
+        key = self.app_key(0o600)
+        result = self.run_install(LOOM_GITHUB_APP_ID="123",
+                                  LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                  LOOM_GITHUB_APP_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_GITHUB_APP_KEY_FILE</key><string>%s</string>" % key, plist)
+        self.assertIn("<key>LOOM_GITHUB_APP_ID</key><string>123</string>", plist)
+
+    def test_half_an_app_setup_installs_nothing(self):
+        key = self.app_key(0o600)
+        cases = {
+            "LOOM_GITHUB_APP_INSTALLATION_ID": dict(LOOM_GITHUB_APP_ID="123",
+                                                    LOOM_GITHUB_APP_KEY_SSM="/app/key"),
+            "LOOM_GITHUB_APP_ID": dict(LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                       LOOM_GITHUB_APP_KEY_FILE=str(key)),
+            "LOOM_GITHUB_APP_KEY_FILE or LOOM_GITHUB_APP_KEY_SSM":
+                dict(LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456"),
+        }
+        for missing, env in cases.items():
+            with self.subTest(missing=missing):
+                result = self.run_install(**env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(missing + " is missing", result.stderr)
+                self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_the_app_id_alone_names_the_missing_installation_id(self):
+        result = self.run_install(LOOM_GITHUB_APP_ID="123")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("LOOM_GITHUB_APP_INSTALLATION_ID", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_a_key_file_readable_by_others_is_refused(self):
+        key = self.app_key(0o644)
+        result = self.run_install(LOOM_GITHUB_APP_ID="123",
+                                  LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                  LOOM_GITHUB_APP_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(str(key), result.stderr)
+        self.assertIn("644", result.stderr)
+        self.assertIn("600", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_a_missing_key_file_is_refused(self):
+        key = self.tmp / "absent.pem"
+        result = self.run_install(LOOM_GITHUB_APP_ID="123",
+                                  LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                  LOOM_GITHUB_APP_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(str(key), result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_an_unreadable_key_file_is_refused(self):
+        # Mode 000 has no group or other bits, but the station could not read it.
+        key = self.app_key(0o000)
+        self.addCleanup(key.chmod, 0o600)
+        result = self.run_install(LOOM_GITHUB_APP_ID="123",
+                                  LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                  LOOM_GITHUB_APP_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(str(key), result.stderr)
+        self.assertIn("can read", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_a_key_file_whose_mode_cannot_be_read_is_refused(self):
+        key = self.app_key(0o600)
+        fake_stat = self.bin / "stat"
+        fake_stat.write_text("#!/usr/bin/env bash\nexit 1\n")
+        fake_stat.chmod(0o755)
+        result = self.run_install(LOOM_GITHUB_APP_ID="123",
+                                  LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                                  LOOM_GITHUB_APP_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("could not read its mode", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_no_app_settings_install_as_before(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_GITHUB_APP_ID</key><string></string>", plist)
 
     # A second operator's settings (docs/LANES.md, Two Looms on shared repos):
     # the status repo and every watched repo must belong to LOOM_REPO_OWNERS.

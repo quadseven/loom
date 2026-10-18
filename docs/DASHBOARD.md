@@ -82,6 +82,29 @@ cannot tell this Loom's logins from another operator's, so every
 their assignees and author, and pull request records their assignees and
 label names, for this.
 
+`/operators` lists every open issue and pull request in `LOOM_REPOS` that
+another operator holds, grouped by login, with its age and its linked pull
+requests (open, merged or closed, and an open one's check counts; a
+`neutral` check is not counted as passed). Loom leaves these alone. Its own
+section lists `loom:queued` "Land or supersede" tickets another operator
+claimed. The refresh pass reads it at most every 15 minutes, and never below
+the budget floor (the last read stays shown): each repo's label list, then
+one open-issue list per `claim:<login>` label outside `LOOM_BRIEF_AUTHORS`
+(every claim label when it is not set), plus the ticket and pull request
+records the pass already holds, and the check runs of at most 30 open
+linked heads. An issue assigned to another operator with no claim label
+shows only when it is a Loom ticket or a pull request.
+
+`/free` lists, per repo, the open issues free for the operator named by
+`?operator=<login>` (anyone, with none), from `bus.free`, the function
+behind `python3 -m bus.free` (docs/LANES.md, "Two Looms on shared repos").
+It reads every page of each repo's open issues (`GitHub.paginate`, 100 a
+page, following the `Link` header) at most once an hour
+(`FREE_ISSUES_SECONDS`), never below the budget floor, and takes the
+covering tickets from the ticket records and the comment feed every pass
+already holds. Issues whose Loom ticket is closed or merged are listed to
+check.
+
 `/goals` shows one card per top-level goal home. A goal home rolls up into a
 bigger one through a `Parent goal: OWNER/NAME#N` line in its body or its
 GitHub sub-issue parent, and then shows as a row inside that card. A pass
