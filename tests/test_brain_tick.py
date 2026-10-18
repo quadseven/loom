@@ -1,16 +1,20 @@
 """lanes/mac/brain.sh run as a process: a copy of the script in a temp repo
-whose origin is a local bare repo, and fake python3 (the bus lock) and
-claude commands on PATH that record their calls."""
+whose origin is a local bare repo, and fake python3 (the bus lock), agent
+CLIs (claude, codex, opencode, agy), gh and sandbox-exec commands on PATH
+that record their calls. No real agent CLI ever runs."""
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "brain.sh"
+LANES = Path(__file__).resolve().parent.parent / "lanes"
+SCRIPT = LANES / "mac" / "brain.sh"
 
 # Fake python3: `-m bus lock` exits $FAKE_LOCK (default 0), `-m bus unlock`
 # exits 0. Every call is appended to $FAKE_LOG.
@@ -27,13 +31,44 @@ fi
 exit 0
 """
 
-# Fake claude: records its arguments and working directory, then exits
-# $FAKE_CLAUDE_EXIT (default 0).
-FAKE_CLAUDE = """#!/usr/bin/env bash
-printf 'claude %s\\n' "$*" >> "$FAKE_LOG"
-printf 'cwd %s\\n' "$PWD" >> "$FAKE_LOG"
-exit "${FAKE_CLAUDE_EXIT:-0}"
+# Fake agent CLI NAME: records its arguments and working directory, prints
+# $FAKE_<NAME>_OUT, then exits $FAKE_<NAME>_EXIT (default 0).
+FAKE_AGENT = """#!/usr/bin/env bash
+printf '%(name)s %%s\\n' "$*" >> "$FAKE_LOG"
+printf 'cwd %%s\\n' "$PWD" >> "$FAKE_LOG"
+[ -z "${FAKE_%(var)s_OUT:-}" ] || printf '%%s\\n' "$FAKE_%(var)s_OUT"
+exit "${FAKE_%(var)s_EXIT:-0}"
 """
+
+# Fake opencode: a 1.x version, and a run that records its arguments and the
+# GitHub and LOOM_REPOS settings it was given. The sandboxed agent's
+# environment is emptied, so the log path is written into the script.
+FAKE_OPENCODE = """#!/usr/bin/env bash
+FAKE_LOG=@LOG@
+[ "$1" = --version ] && { echo "opencode 1.4.0"; exit 0; }
+printf 'opencode %s\\n' "$*" >> "$FAKE_LOG"
+printf 'opencode env GH_TOKEN=%s GITHUB_TOKEN=%s LOOM_REPOS=%s HOME=%s\\n' \\
+  "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" "${LOOM_REPOS:-}" "$HOME" >> "$FAKE_LOG"
+printf 'opencode cwd %s\\n' "$PWD" >> "$FAKE_LOG"
+env | grep -E '^(LOOM_|SSL_CERT_FILE=)' | sed 's/^/opencode setting /' >> "$FAKE_LOG"
+exit "${FAKE_OPENCODE_EXIT:-0}"
+"""
+
+FAKE_GH = """#!/usr/bin/env bash
+printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
+[ "$*" = "auth token" ] && echo gho_faketoken123
+exit 0
+"""
+
+# Fake sandbox-exec: saves the profile, drops "-p PROFILE" and runs the
+# command unsandboxed.
+FAKE_SANDBOX = """#!/usr/bin/env bash
+printf '%s\\n' "$2" > @PROFILE@
+shift 2
+exec "$@"
+"""
+
+AGENTS = ("claude", "codex", "agy")
 
 
 def git(*args, cwd):
@@ -49,6 +84,9 @@ class BrainTickTest(unittest.TestCase):
         self.root = self.tmp / "root"
         (self.root / "lanes" / "mac").mkdir(parents=True)
         shutil.copy(SCRIPT, self.root / "lanes" / "mac" / "brain.sh")
+        for shared in ("agent_cli.sh", "agent_sandbox.sh"):
+            if (LANES / shared).exists():
+                shutil.copy(LANES / shared, self.root / "lanes" / shared)
         (self.root / "docs").mkdir()
         (self.root / "docs" / "MUSE.md").write_text("# Muse tick instructions\n")
         git("init", "-q", "-b", "main", cwd=self.root)
@@ -59,11 +97,16 @@ class BrainTickTest(unittest.TestCase):
         git("push", "-q", "origin", "main", cwd=self.root)
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
-        for name, body in (("python3", FAKE_PYTHON), ("claude", FAKE_CLAUDE)):
+        self.log = self.tmp / "calls.log"
+        self.profile = self.tmp / "profile.sb"
+        fakes = [("python3", FAKE_PYTHON), ("gh", FAKE_GH),
+                 ("sandbox-exec", FAKE_SANDBOX.replace("@PROFILE@", shlex.quote(str(self.profile)))),
+                 ("opencode", FAKE_OPENCODE.replace("@LOG@", shlex.quote(str(self.log))))]
+        fakes += [(n, FAKE_AGENT % {"name": n, "var": n.upper()}) for n in AGENTS]
+        for name, body in fakes:
             (bin_dir / name).write_text(body)
             (bin_dir / name).chmod(0o755)
         self.home = self.tmp / "loom"
-        self.log = self.tmp / "calls.log"
         self.env = {
             "PATH": "%s:%s" % (bin_dir, os.environ["PATH"]),
             "HOME": str(self.tmp),
@@ -72,6 +115,15 @@ class BrainTickTest(unittest.TestCase):
             "LOOM_STATUS_REPO": "example/loom",
             "FAKE_LOG": str(self.log),
         }
+        # The claude lane's runner says it has usage, as on the lane machine.
+        self.usage("claude", True)
+
+    def usage(self, lane, available, reason="", age=0):
+        usage = self.home / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        (usage / ("%s.json" % lane)).write_text(json.dumps(
+            {"lane": lane, "at": int(time.time()) - age, "available": available,
+             "reason": reason}) + "\n")
 
     def tick(self, **env):
         run = subprocess.run(
@@ -221,6 +273,209 @@ class BrainTickTest(unittest.TestCase):
         run, calls = self.tick(LOOM_BRAIN_MINUTES="2")
         self.assertEqual(1, run.returncode)
         self.assertEqual([], calls)
+
+    def agent_calls(self, calls, name):
+        return [c for c in calls if c.startswith(name + " ")]
+
+    def test_claude_without_usage_hands_the_tick_to_codex(self):
+        self.usage("claude", False, "limit: provider limit reached; lane waits")
+        self.usage("codex", True)
+        run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual(0, run.returncode)
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+        codex = self.agent_calls(calls, "codex")
+        self.assertEqual(1, len(codex))
+        # The brain needs GitHub: full access and no git-repo check, unlike a
+        # lane's sandboxed run; the same prompt as the claude rung.
+        self.assertTrue(codex[0].startswith(
+            "codex exec --sandbox danger-full-access --skip-git-repo-check --model gpt-test-high "))
+        self.assertIn("%s/brain/loom/docs/MUSE.md" % self.home, codex[0])
+        self.assertIn("as holder lane-machine", codex[0])
+        self.assertIn("cwd %s/brain" % self.home, calls)
+        last, ok = self.beat()
+        self.assertEqual(("ok", "codex", "gpt-test-high"), (last["outcome"], last["lane"], last["model"]))
+        self.assertTrue(ok)
+        log = (self.home / "logs" / "brain.log").read_text()
+        self.assertIn("tick start (lane codex, model gpt-test-high, scope all)", log)
+        self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
+
+    def test_a_stale_heartbeat_has_no_usage(self):
+        # A runner that stopped writes no heartbeat; its old one does not count.
+        self.usage("claude", True, age=3600)
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+
+    def test_a_limit_failure_moves_the_tick_to_the_next_rung_once(self):
+        for lane in ("codex", "spark"):
+            self.usage(lane, True)
+        run, calls = self.tick(
+            LOOM_CODEX_MODEL="gpt-test-high", LOOM_SPARK_MODEL="spark/coder",
+            LOOM_SPARK_URL="http://spark.invalid:8000/v1",
+            FAKE_CLAUDE_EXIT="1", FAKE_CLAUDE_OUT="Claude AI usage limit reached|1792250000",
+            FAKE_CODEX_EXIT="1", FAKE_CODEX_OUT="ERROR: rate limit exceeded, try again in 2h")
+        self.assertEqual(0, run.returncode)
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+        # Once only: the third rung is not tried, though it has usage.
+        self.assertEqual([], self.agent_calls(calls, "opencode"))
+        # One lock, one unlock: the second rung runs inside the same tick.
+        self.assertEqual(1, sum(1 for c in calls if " -m bus lock " in c))
+        self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
+        last, ok = self.beat()
+        self.assertEqual(("failed", 1, "codex", "gpt-test-high"),
+                         (last["outcome"], last["exit"], last["lane"], last["model"]))
+        self.assertFalse(ok)
+        log = (self.home / "logs" / "brain.log").read_text()
+        self.assertIn("lane claude hit a limit; the tick moves to the next rung with usage", log)
+
+    def test_the_rung_after_a_limit_can_finish_the_tick(self):
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high", FAKE_CLAUDE_EXIT="1",
+                             FAKE_CLAUDE_OUT="API Error: 429 Too Many Requests")
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+        last, ok = self.beat()
+        self.assertEqual(("ok", "codex"), (last["outcome"], last["lane"]))
+        self.assertTrue(ok)
+
+    def test_a_failure_that_is_not_a_limit_stays_on_its_rung(self):
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high", FAKE_CLAUDE_EXIT="2",
+                             FAKE_CLAUDE_OUT="Error: could not read the goal home")
+        self.assertEqual([], self.agent_calls(calls, "codex"))
+        last, _ = self.beat()
+        self.assertEqual(("failed", 2, "claude"), (last["outcome"], last["exit"], last["lane"]))
+
+    def test_no_rung_with_usage_skips_with_a_reason_and_runs_nothing(self):
+        self.usage("claude", False, "limit: out of credit")
+        self.usage("spark", True)
+        run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual(0, run.returncode)
+        # No CLI and no lock: nothing was going to run.
+        self.assertEqual([], calls)
+        last, ok = self.beat()
+        self.assertEqual(("skipped", 0), (last["outcome"], last["exit"]))
+        self.assertNotIn("started", last)
+        self.assertIn("no brain lane has usage", last["reason"])
+        self.assertIn("claude: unavailable (limit: out of credit)", last["reason"])
+        self.assertIn("codex: no usage heartbeat", last["reason"])
+        self.assertIn("spark: LOOM_SPARK_URL is not set", last["reason"])
+        # Not a good tick: the station's brain-stopped check sees it go stale.
+        self.assertFalse(ok)
+
+    def test_a_rung_without_a_model_or_runner_is_passed_over(self):
+        self.usage("agy", True)
+        self.usage("codex", True)
+        run, calls = self.tick(LOOM_BRAIN_LADDER="agy codex", LOOM_CODEX_MODEL="")
+        self.assertEqual([], calls)
+        last, _ = self.beat()
+        self.assertIn("agy: no brain runner for this lane", last["reason"])
+        self.assertIn("codex: LOOM_CODEX_MODEL is not set", last["reason"])
+
+    def test_the_ladder_order_is_a_setting(self):
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+
+    def test_the_spark_rung_runs_opencode_in_the_lane_sandbox_with_a_github_token(self):
+        self.usage("claude", False, "limit: provider limit reached")
+        self.usage("spark", True)
+        run, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
+                               LOOM_SPARK_URL="http://spark.invalid:8000/v1")
+        self.assertEqual(0, run.returncode)
+        opencode = self.agent_calls(calls, "opencode")
+        self.assertTrue(opencode[0].startswith("opencode run -m spark/coder "), opencode)
+        self.assertIn("%s/brain/loom/docs/MUSE.md" % self.home, opencode[0])
+        # The token reaches the agent's environment, never its argv.
+        self.assertNotIn("gho_faketoken123", opencode[0])
+        self.assertIn("opencode env GH_TOKEN=gho_faketoken123 GITHUB_TOKEN=gho_faketoken123 "
+                      "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
+        last, _ = self.beat()
+        self.assertEqual(("ok", "spark", "spark/coder"), (last["outcome"], last["lane"], last["model"]))
+
+    def spark_tick(self, **env):
+        self.usage("claude", False, "limit: provider limit reached")
+        self.usage("spark", True)
+        return self.tick(LOOM_SPARK_MODEL="spark/coder",
+                         LOOM_SPARK_URL="http://spark.invalid:8000/v1", **env)
+
+    def test_the_spark_rung_gets_only_the_allowlisted_settings(self):
+        # Found by the automated security review: a denylist forwarded every
+        # other LOOM_* variable, keys and SSM names included.
+        _, calls = self.spark_tick(LOOM_FOO_TOKEN="foo-secret-value",
+                                   LOOM_OPENCODE_GO_KEY_SSM="/example/key",
+                                   LOOM_BRIEF_AUTHORS="example-author")
+        settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
+        self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
+        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
+        # TLS inside the sandbox, which denies the keychain server.
+        self.assertIn("opencode setting SSL_CERT_FILE=/etc/ssl/cert.pem", settings)
+        self.assertFalse(any("foo-secret-value" in c or "LOOM_FOO_TOKEN" in c for c in calls))
+        self.assertFalse(any("LOOM_OPENCODE_GO_KEY_SSM" in c for c in settings))
+        self.assertFalse(any("LOOM_SPARK_URL" in c for c in settings))
+
+    def test_the_spark_sandbox_keeps_the_checkout_git_dir_read_only(self):
+        # Found by the automated security review: with the tree at the brain
+        # folder, the checkout's .git (one level down) was writable.
+        _, calls = self.spark_tick()
+        checkout = os.path.realpath(self.home / "brain" / "loom")
+        cwd = [os.path.realpath(c[len("opencode cwd "):]) for c in calls
+               if c.startswith("opencode cwd ")]
+        self.assertEqual([checkout], cwd)
+        profile = self.profile.read_text()
+        self.assertIn('(deny file-write* (subpath "%s/.git"))' % checkout, profile)
+
+    def test_the_refresh_runs_no_hook_and_drops_what_a_run_left(self):
+        self.tick()
+        checkout = self.home / "brain" / "loom"
+        marker = self.tmp / "hook-ran"
+        hooks = self.tmp / "planted-hooks"
+        hooks.mkdir()
+        for name in ("post-merge", "post-checkout", "reference-transaction", "fsmonitor"):
+            (hooks / name).write_text("#!/bin/sh\ntouch %s\n" % shlex.quote(str(marker)))
+            (hooks / name).chmod(0o755)
+        git("config", "core.hooksPath", str(hooks), cwd=checkout)
+        git("config", "core.fsmonitor", str(hooks / "fsmonitor"), cwd=checkout)
+        (checkout / "docs" / "MUSE.md").write_text("# planted instructions\n")
+        (checkout / "planted.txt").write_text("left by a run\n")
+        (self.root / "docs" / "MUSE.md").write_text("# Muse tick instructions\nnew\n")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qam", "change", cwd=self.root)
+        git("push", "-q", "origin", "main", cwd=self.root)
+        run, _ = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(marker.exists())
+        self.assertEqual("# Muse tick instructions\nnew\n", (checkout / "docs" / "MUSE.md").read_text())
+        self.assertFalse((checkout / "planted.txt").exists())
+
+    def test_the_refresh_removes_a_nested_repository(self):
+        # Found by the automated security review: clean -fdx keeps an
+        # untracked nested repository, so a run could leave files for later.
+        self.tick()
+        nested = self.home / "brain" / "loom" / "planted"
+        nested.mkdir()
+        git("init", "-q", cwd=nested)
+        (nested / "notes.md").write_text("kept across ticks\n")
+        run, _ = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(nested.exists())
+
+    def test_a_checkout_that_will_not_reset_is_cloned_again(self):
+        self.tick()
+        checkout = self.home / "brain" / "loom"
+        git("branch", "--unset-upstream", cwd=checkout)
+        (checkout / "planted.txt").write_text("left by a run\n")
+        run, calls = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertFalse((checkout / "planted.txt").exists())
+        self.assertTrue((checkout / "docs" / "MUSE.md").exists())
+        self.assertIn("did not come clean; cloning it again",
+                      (self.home / "logs" / "brain.log").read_text())
+        # The calls log spans both ticks: the second one ran its agent too.
+        self.assertEqual(2, len(self.agent_calls(calls, "claude")))
 
     def test_settings_override_model_holder_and_minutes(self):
         _, calls = self.tick(LOOM_BRAIN_MODEL="claude-sonnet-5-5",

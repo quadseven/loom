@@ -63,6 +63,8 @@ class StoreTests(unittest.TestCase):
                      if name.startswith("_") and name.isupper() and isinstance(value, str)]
         self.assertTrue(constants)
         self.assertTrue(all(isinstance(value, str) for value in constants))
+        self.assertEqual(transcripts.RETENTION_DAYS, 180)
+        self.assertIn("now() - INTERVAL '180 days'", transcripts._PURGE)
         with patch.dict(os.environ, {"LOOM_DB_PASSWORD": "present"}, clear=True), \
                 patch.object(transcripts.importlib.util, "find_spec", return_value=None), \
                 patch.dict(sys.modules, {"pg8000": None, "pg8000.dbapi": None}):

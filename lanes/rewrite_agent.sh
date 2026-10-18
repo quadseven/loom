@@ -132,6 +132,10 @@ for i in "${!MODELS[@]}"; do
   cd "$AGENT_HOME/work" || fail "cannot enter the scratch working directory"
   case "$PROVIDER" in
     codex)
+      # The sandbox denies the keychain (com.apple.SecurityServer), which
+      # Codex's TLS check asks for, so every request failed with "workspace
+      # routing discovery failed". The system bundle verifies without it.
+      AGENT_EXTRA_ENV="SSL_CERT_FILE=/etc/ssl/cert.pem"
       api_agent - codex exec --sandbox read-only --skip-git-repo-check --json \
         --model "$MODEL_ID" - > "$OUT" ;;
     claude)

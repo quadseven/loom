@@ -7,7 +7,7 @@ import sys
 from typing import List, Optional
 
 from . import journal, labels, lock, station
-from .github import GitHub, GitHubError, token_from_env
+from .github import GitHub, GitHubError, auth_from_env
 
 REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("journal", help="post a journal or report comment")
     s.add_argument("target", type=_issue, metavar="OWNER/NAME#N")
     s.add_argument("--file", required=True)
+    s.add_argument("--holder", help="the brain posting a journal; adds its Tick line when missing")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
     return p
 
@@ -61,7 +62,7 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
     repo, _, num = args.target.partition("#")
     with open(args.file, encoding="utf-8") as fh:
         text = fh.read()
-    journal.post(gh, repo, int(num), text)
+    journal.post(gh, repo, int(num), text, args.holder)
     print("posted to %s" % args.target)
     return 0
 
@@ -79,7 +80,7 @@ def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None) -> int:
             return 2
     try:
         if gh is None:
-            gh = GitHub(token_from_env())
+            gh = GitHub(auth_from_env())
         try:
             return _run(args, gh)
         finally:

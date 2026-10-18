@@ -24,6 +24,20 @@ FOOTER_RULE = "---"
 FOOTER_PREFIX = "Loom"
 _REFS_LINE = re.compile(r"^Refs [A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+[ \t]*$", re.M)
 _ISSUE_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$")
+# The dashboard parses the footer with dashboard/views.py:FOOTER, which needs
+# lane and model as single whitespace-free tokens (a model id like
+# "openrouter/pool/laguna:free" is fine; "my model" is not). The ticket comes
+# from bus/tickets.ticket_name, already validated there. Fail here, at write
+# time, instead of shipping a PR the dashboard silently cannot attribute.
+_TOKEN_RE = re.compile(r"^\S+$")
+
+
+def _check_footer_fields(ticket, lane, model):
+    for name, value in (("ticket", ticket), ("lane", lane), ("model", model)):
+        if not value or not _TOKEN_RE.match(str(value)):
+            raise ValueError(
+                "Loom footer %s must be a single whitespace-free token, got %r"
+                % (name, value))
 
 
 def _normalise(value: str) -> str:
@@ -61,14 +75,10 @@ def _brief_section(brief: str, name: str) -> str:
 
 
 def _brief_size(brief: str) -> str:
-    """The Size section's first line as the review bot's letter (Medium ->
-    M); a size it cannot read stays as its first word, colon dropped."""
-    section = _brief_section(brief, "Size")
-    first = section.split("\n", 1)[0].strip()
-    try:
-        return hunt_plan.size_letter(first)
-    except ValueError:
-        return first.split()[0].rstrip(":") if first else ""
+    """The brief's size as the review bot's letter (Medium -> M), read the
+    way the runner reads it (hunt_plan.brief_size: a ## Size section or an
+    inline Size: line)."""
+    return hunt_plan.brief_size(brief)
 
 
 def _brief_title(brief: str) -> Optional[str]:
@@ -78,6 +88,7 @@ def _brief_title(brief: str) -> Optional[str]:
 
 def _render_generated(brief: str, lane: str, model: str, ticket: str) -> str:
     """Render the generated sections the way lanes/run_lane.sh::pr_body does."""
+    _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
     summary = _brief_section(brief, "What")
     acceptance = _brief_section(brief, "Acceptance criteria")

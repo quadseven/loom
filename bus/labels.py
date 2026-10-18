@@ -34,21 +34,8 @@ REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots"
                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
-# The model ladder for repeatedly stuck work (docs/MUSE.md): (lane, model) per
-# rung, lowest first. Lanes stand in for each other on the same provider:
-# codex-2 for codex, and any anthropic slot for the last rung's claude lane.
-ESCALATION = [("claude", "claude-sonnet-5-5"), ("codex", "gpt-6-sol"),
-              ("claude", "claude-opus-5-5")]
-ANTHROPIC_LANES = [x for x in LANES if x.startswith("anthropic")]
-
-
-def rung_lanes(rung: int) -> List[str]:
-    """The lanes that can run a rung (0-based), best first."""
-    lane = ESCALATION[rung][0]
-    if lane == "codex":
-        return ["codex", "codex-2"]
-    return [lane] + (ANTHROPIC_LANES if rung == len(ESCALATION) - 1 else [])
-
+# The model ladder for repeatedly stuck work is bus/factory.py LADDER, and
+# the rungs a stuck ticket climbs are its CLIMB (docs/MUSE.md).
 # name -> (6-hex color, short ASCII description)
 LABELS: Dict[str, Dict[str, str]] = {
     "loom:goal": {"color": "5319e7", "description": "The goal's home issue"},
@@ -64,6 +51,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:closed-unmerged": {"color": "d93f0b", "description": "Linked pull request closed without merging"},
     "loom:shipped": {"color": "2ea44f", "description": "Deployed by the project's ship owner"},
     "loom:verified": {"color": "006b75", "description": "Verified live"},
+    "loom:awaiting-evidence": {"color": "c2e0c6", "description": "Checked by a verifier: live evidence not yet seen; it does not hold the unproven limit"},
     "loom:audit-failed": {"color": "d93f0b", "description": "A lane proof failed the brain's audit; holds that lane's verify runs a day"},
     "loom:triage": {"color": "f9d0c4", "description": "Open issue not yet a ticket; the brain rewrites it"},
     "loom:rewritten": {"color": "ededed", "description": "Rewritten as a ticket that refs this issue"},

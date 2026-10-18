@@ -68,6 +68,71 @@ REDO_MARKER = "<!-- loom:redo %d -->"
 # must not be filed again if the label list lags behind it.
 BRIEFED_KEEP = 50
 
+# A revert pull request a person or the brain made by hand is seen for this
+# long after it merged; an older one the brain handles.
+HAND_REVERT_WINDOW = 7 * 86400
+# One marker per revert pull request on the ticket it undoes: the station
+# moves the ticket back once for each revert pull request.
+HAND_REVERT_MARKER = "<!-- loom:hand-revert %d -->"
+REVERT_TITLE_RE = re.compile(r'^Revert "')
+GIT_REVERT_RE = re.compile(r"\bgit revert (?:--no-edit )?([0-9a-f]{40})\b")
+REVERTS_NUM_RE = re.compile(r"\bReverts\s+(?:[\w.-]+/[\w.-]+)?#(\d+)\b")
+
+
+def is_hand_revert(pr: Dict[str, Any], now: float, default_branch: str) -> bool:
+    """A merged hand-made revert pull request: into the default branch
+    within HAND_REVERT_WINDOW, its title starting 'Revert "' or its body
+    running `git revert <sha>` (GitHub's revert button writes both)."""
+    if not isinstance(pr, dict) or not pr.get("merged_at"):
+        return False
+    if str((pr.get("base") or {}).get("ref") or "") != default_branch:
+        return False
+    if now - _ts(str(pr.get("merged_at") or "")) > HAND_REVERT_WINDOW:
+        return False
+    return bool(REVERT_TITLE_RE.match(str(pr.get("title") or ""))
+                or GIT_REVERT_RE.search(str(pr.get("body") or "")))
+
+
+def reverted_keys(pr: Dict[str, Any]) -> List[str]:
+    """How a hand-made revert names what it undoes: the commit shas from
+    `git revert` in its body, the pull request numbers from 'Reverts
+    <repo>#<n>' lines, and the title from 'Revert "<title>"'."""
+    body = str(pr.get("body") or "")
+    keys = ["sha:" + s for s in GIT_REVERT_RE.findall(body)]
+    keys += ["pr:" + n for n in REVERTS_NUM_RE.findall(body)]
+    title = str(pr.get("title") or "")
+    if REVERT_TITLE_RE.match(title):
+        keys.append("title:" + " ".join(title[len('Revert "'):].rstrip('"').split()))
+    return keys
+
+
+def undoes(hand: Dict[str, Any], pr: Dict[str, Any]) -> bool:
+    """The hand-made revert undoes the merged pull request: its body runs
+    git revert on the request's merge (or squash) commit, names it in a
+    'Reverts <repo>#<n>' line, or its title is 'Revert "<the request's
+    title>"'."""
+    keys = reverted_keys(hand)
+    if "sha:" + str(pr.get("merge_commit_sha") or "") in keys:
+        return True
+    if "pr:%d" % int(pr.get("number") or 0) in keys:
+        return True
+    return "title:" + " ".join(str(pr.get("title") or "").split()) in keys
+
+
+def why_section(body: str) -> str:
+    """The body's ## Why section, or ""."""
+    out: List[str] = []
+    inside = False
+    for line in (body or "").replace("\r", "").split("\n"):
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = line.strip() == "## Why"
+            continue
+        if inside:
+            out.append(line)
+    return "\n".join(out).strip()
+
 BODY = """Difficulty: %(difficulty)s
 
 ## Why
@@ -196,7 +261,39 @@ class Reverts:
         self._briefed: List[str] = []
         self._forwarded: Dict[str, float] = {}
         self._check_tickets: List[str] = []
+        # repo -> its goal's standing repairs epic (None: no goal, or unread).
+        self._repairs: Dict[str, Optional[int]] = {}
         self._load()
+
+    # -- where repairs are filed -----------------------------------------
+    def _repairs_epic(self, repo: str) -> Optional[int]:
+        """The repo goal's standing "Factory repairs" epic, read once a pass;
+        None when the repo has no goal home or it cannot be read, and the
+        ticket is then filed with no parent, as before."""
+        if repo not in self._repairs:
+            try:
+                goal = brain.repo_goal(self.gh, repo)
+                self._repairs[repo] = (brain.repairs_epic(self.gh, repo, goal)
+                                       if goal is not None else None)
+            except (GitHubError, ValueError, KeyError) as err:
+                _say("%s: no repairs epic for its repair tickets: %s" % (repo, err))
+                self._repairs[repo] = None
+        return self._repairs[repo]
+
+    def _file_repair(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """File a revert, fix-forward or red-check ticket under the goal's
+        repairs epic (its sub-issue, named by its Part of line)."""
+        epic = self._repairs_epic(repo)
+        if epic is not None:
+            payload = dict(payload, body=brain._with_part_of(str(payload["body"]), epic))
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo, payload).data or {}
+        if epic is not None and isinstance(made, dict):
+            try:
+                brain.file_under_epic(self.gh, repo, epic, dict(made, body=payload["body"]))
+            except GitHubError as err:
+                _say("%s#%s: filed, but not linked under repairs epic #%d: %s"
+                     % (repo, made.get("number"), epic, err))
+        return made if isinstance(made, dict) else {}
 
     # -- the decision ledger ---------------------------------------------
     def _path(self) -> str:
@@ -441,10 +538,10 @@ class Reverts:
         title = "Fix main after merge %s: %s" % (sha[:12],
                  " ".join(str(pr.get("title") or "").split()))
         brain._check_written_text(title + "\n" + body)
-        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+        made = self._file_repair(repo, {
             "title": title, "body": body,
             "labels": ["loom:ticket", "loom:briefed", "lane:" + lane, CLASS_LABEL],
-        }).data or {}
+        })
         follow_up = int(made.get("number") or 0)
         self._forwarded["%s:%s" % (repo, sha)] = self.now
         note = "Fix-forward ticket #%d is briefed on lane %s for red merge %s." % (
@@ -496,8 +593,7 @@ class Reverts:
                 % (difficulty or "easy", _failing(names), sha[:12], branch))
         title = "Fix pre-existing red check: %s" % ", ".join(names)
         brain._check_written_text(title + "\n" + body)
-        self.gh.rest("POST", "/repos/%s/issues" % repo,
-                     {"title": title, "body": body, "labels": labels})
+        self._file_repair(repo, {"title": title, "body": body, "labels": labels})
         self._check_tickets.append(key)
         self._decide(repo, "%s is red at %s; %s already red before the merge; factory ticket filed"
                      % (branch, sha[:12], ", ".join(names)))
@@ -549,10 +645,10 @@ class Reverts:
         body = self._body(branch, sha, pr, names, red_since, difficulty, number)
         full_title = "Revert %s: %s" % (short, title)
         brain._check_written_text(full_title + "\n" + body)
-        made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+        made = self._file_repair(repo, {
             "title": full_title, "body": body,
             "labels": ["loom:ticket", "loom:briefed", "lane:" + lane, REVERT_LABEL,
-                       CLASS_LABEL]}).data or {}
+                       CLASS_LABEL]})
         revert = int(made.get("number") or 0)
         self._briefed.append(sha)
         if self._factory is not None:

@@ -135,6 +135,19 @@ class ShellTests(unittest.TestCase):
         test_shared_interactive_components_have_44px_minimum_targets()
 
 
+class PageWidth(unittest.TestCase):
+    def test_page_content_fills_the_window_beside_the_nav(self):
+        # A width cap on the content column left a third of a widescreen empty
+        # (2026-10-17: 1320px of a 2056px window).
+        css = re.sub(r"/\*.*?\*/", "", (ROOT / "dashboard/static/loom.css").read_text(), flags=re.S)
+        rules = [body for selectors, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css)
+                 if ".page-content" in [part.strip() for part in selectors.split(",")]]
+        self.assertTrue(rules, "missing CSS rule for .page-content")
+        for body in rules:
+            self.assertNotRegex(body, r"(?<![\w-])(max-width|width):\s*(min\(|\d+px)",
+                                ".page-content caps its width: %s" % body.strip())
+
+
 class LabelSize(unittest.TestCase):
     def test_section_labels_inside_cards_stay_at_the_label_size(self):
         # A card's h2 rule (16px) used to outweigh .label (11px), so the Brain

@@ -184,7 +184,7 @@ class RemoteLaneTests(unittest.TestCase):
         gh = FakeGitHub()
         out = io.StringIO()
         err = io.StringIO()
-        with mock.patch("bus.lane.token_from_env", return_value="dummy"):
+        with mock.patch("bus.lane.auth_from_env", return_value="dummy"):
             with mock.patch("bus.lane.GitHub", return_value=gh):
                 with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
                     code = lane.main(["claim", "--lane", "muse", "--repos", "example/project"])

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 
-from bus import factory, revert, station
+from bus import brain, factory, revert, station
 from bus.github import Response
 
 REPO = "example-org/example-repo"
@@ -77,6 +77,20 @@ class FakeGitHub:
                                           {"name": "lane:codex"}]}
         self.comments.setdefault(ticket, [])
 
+    def hand_revert(self, name, pr, undone, ago=120, title=None, body=None,
+                    base="main"):
+        """A merged hand-made revert pull request undoing commit `undone`."""
+        self.pulls.append({
+            "number": pr,
+            "title": title if title is not None else 'Revert "Change m1"',
+            "user": ME,
+            "body": (body if body is not None
+                     else "A hand revert.\n\n## Why\nIt broke the build.\n\n"
+                          "```\ngit revert %s\n```\n" % undone),
+            "merged_at": iso(ago), "merge_commit_sha": sha(name),
+            "head": {"ref": "revert-%d" % pr, "sha": sha("head-%d" % pr)},
+            "base": {"ref": base}})
+
     # -- the client surface ----------------------------------------------
     def paginate(self, path):
         self.reads.append(path)
@@ -84,9 +98,20 @@ class FakeGitHub:
             return list(self.reverts)
         if "labels=loom:ticket&state=open" in path:
             return [i for i in self.issues.values() if i["state"] == "open"]
+        m = re.search(r"labels=(loom:merged|loom:shipped)&state=open", path)
+        if m:
+            label = m.group(1)
+            return [i for i in self.issues.values()
+                    if i.get("state") == "open" and "pull_request" not in i
+                    and label in [x["name"] for x in i.get("labels") or []]]
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
             return list(self.comments.get(int(m.group(1)), []))
+        if "labels=loom:goal&state=open" in path:
+            return list(getattr(self, "goals", []))
+        m = re.search(r"/issues/(\d+)/sub_issues", path)
+        if m:
+            return list(getattr(self, "subs", {}).get(int(m.group(1)), []))
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None, etag=None, ok=()):
@@ -120,12 +145,17 @@ class FakeGitHub:
 
     def _write(self, method, path, body):
         self.writes.append((method, path, body))
+        m = re.search(r"/issues/(\d+)/labels$", path)
+        if m and method == "PUT":
+            self.issues[int(m.group(1))]["labels"] = [
+                {"name": x} for x in body["labels"]]
+            return Response(200, {})
         if method == "POST" and path.endswith("/issues"):
             is_revert = "loom:revert" in body["labels"]
             number = (900 if is_revert else 1000) + sum(
                 ("loom:revert" in [x["name"] for x in i["labels"]]) == is_revert
                 for i in self.filed)
-            made = dict(body, number=number, user=ME, state="open",
+            made = dict(body, number=number, id=10000 + number, user=ME, state="open",
                         labels=[{"name": x} for x in body["labels"]])
             self.filed.append(made)
             return Response(201, made)
@@ -164,6 +194,51 @@ class Base(unittest.TestCase):
     def forward_then_revert(self):
         self.go()
         return self.go(now=NOW + revert.FIX_FORWARD_WAIT)
+
+
+class RepairsEpic(Base):
+    """loom#640: revert, fix-forward and red-check tickets file under the
+    goal's standing "Factory repairs" epic."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.goals = [{"number": 30, "title": "Loom keeps goals moving", "state": "open",
+                          "labels": [{"name": "loom:goal"}]}]
+        self.gh.subs = {30: [{"number": 70, "state": "open", "title": brain.REPAIRS_TITLE,
+                              "labels": [{"name": "epic"}], "body": "Part of #30\n"}]}
+
+    def links(self, epic=70):
+        return [w[2]["sub_issue_id"] for w in self.gh.writes
+                if w[0] == "POST" and w[1].endswith("/issues/%d/sub_issues" % epic)]
+
+    def test_a_revert_and_its_fix_forward_file_under_the_repairs_epic(self):
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=2400), ago=2500)
+        self.forward_then_revert()
+        forward = [i for i in self.gh.filed if "loom:revert" not in
+                   [x["name"] for x in i["labels"]]]
+        (made,) = self.revert_tickets()
+        for ticket in forward + [made]:
+            self.assertTrue(ticket["body"].endswith("\n\nPart of #70\n"), ticket["title"])
+        self.assertEqual(sorted(self.links()), sorted(10000 + t["number"] for t in forward + [made]))
+
+    def test_a_red_check_ticket_files_under_the_repairs_epic(self):
+        self.green_base()
+        self.gh.commit("before", run("red", ago=4000, name="nightly invariants"), ago=4100)
+        self.gh.merge("m1", 41, 4, run("red", ago=3000, name="nightly invariants"),
+                      ago=3100, head_runs=(run("green", name="nightly invariants"),))
+        self.go()
+        (made,) = self.gh.filed
+        self.assertTrue(made["body"].endswith("\n\nPart of #70\n"))
+        self.assertEqual(self.links(), [10000 + made["number"]])
+
+    def test_a_repo_with_no_goal_home_files_as_before(self):
+        self.gh.goals = []
+        self.green_base()
+        self.gh.merge("m1", 41, 4, run("red", ago=2400), ago=2500)
+        self.go()
+        self.assertNotIn("Part of #", self.gh.filed[0]["body"])
+        self.assertEqual(self.links(), [])
 
 
 class Bisect(Base):
@@ -412,6 +487,98 @@ class Redo(Base):
         self.landed_revert(state="pr")
         self.go()
         self.assertEqual(self.moved, [])
+
+
+class HandRevert(Base):
+    """A ticket whose merged pull requests a hand-made revert undid goes
+    back to loom:briefed on its lane (T486)."""
+
+    def st(self):
+        home = tempfile.mkdtemp()
+        settings = station.Settings(home, [REPO], ["alice-example"], ["example-org"])
+        return station.Station(self.gh, settings, now=NOW)
+
+    def beat(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.st().unwind_reverts()
+        return out.getvalue()
+
+    def merged_ticket(self, ticket=4, pr=41, name="m1", state="merged"):
+        self.gh.merge(name, pr, ticket, run("green", ago=4000), ago=4100)
+        if state != "merged":
+            self.gh.issues[ticket]["labels"] = [
+                {"name": ("loom:" + state if x["name"] == "loom:merged" else x["name"])}
+                for x in self.gh.issues[ticket]["labels"]]
+
+    def labels_of(self, ticket):
+        return [x["name"] for x in self.gh.issues[ticket]["labels"]]
+
+    def test_a_merged_ticket_whose_only_pr_is_hand_reverted_goes_back_to_its_lane(self):
+        self.merged_ticket()
+        self.gh.hand_revert("r1", 91, sha("m1"))
+        log = self.beat()
+        self.assertIn("loom:briefed", self.labels_of(4))
+        self.assertIn("lane:codex", self.labels_of(4))
+        self.assertNotIn("loom:merged", self.labels_of(4))
+        self.assertIn("undid #4", log)
+
+    def test_the_comment_names_the_revert_and_quotes_its_why(self):
+        self.merged_ticket()
+        self.gh.hand_revert("r1", 91, sha("m1"))
+        self.beat()
+        body = self.gh.comments[4][-1]["body"]
+        self.assertIn(revert.HAND_REVERT_MARKER % 91, body)
+        self.assertIn("#91", body)
+        self.assertIn("It broke the build.", body)
+
+    def test_the_move_happens_only_once_per_revert(self):
+        self.merged_ticket()
+        self.gh.hand_revert("r1", 91, sha("m1"))
+        self.beat()
+        puts = [w for w in self.gh.writes if w[0] == "PUT" and w[1].endswith("/labels")]
+        self.beat()
+        self.assertEqual([w for w in self.gh.writes if w[0] == "PUT" and w[1].endswith("/labels")],
+                         puts)
+
+    def test_a_ticket_with_two_prs_one_reverted_stays_where_it_is(self):
+        self.merged_ticket()
+        self.gh.merge("m2", 42, 4, run("green", ago=3000), ago=3100)
+        self.gh.hand_revert("r1", 91, sha("m1"))
+        log = self.beat()
+        self.assertIn("loom:merged", self.labels_of(4))
+        self.assertNotIn("undid #4", log)
+
+    def test_a_revert_outside_the_week_window_is_ignored(self):
+        self.merged_ticket()
+        self.gh.hand_revert("r1", 91, sha("m1"), ago=8 * 86400)
+        self.beat()
+        self.assertIn("loom:merged", self.labels_of(4))
+
+    def test_a_revert_into_another_branch_is_ignored(self):
+        self.merged_ticket()
+        self.gh.hand_revert("r1", 91, sha("m1"), base="release")
+        self.beat()
+        self.assertIn("loom:merged", self.labels_of(4))
+
+    def test_a_revert_named_by_title_also_undoes(self):
+        self.merged_ticket()
+        self.gh.hand_revert("r1", 91, sha("m1"), body="A hand revert with no sha.\n")
+        self.beat()
+        self.assertIn("loom:briefed", self.labels_of(4))
+
+    def test_a_shipped_ticket_without_a_proof_is_unwound_too(self):
+        self.merged_ticket(state="shipped")
+        self.gh.hand_revert("r1", 91, sha("m1"))
+        self.beat()
+        self.assertIn("loom:briefed", self.labels_of(4))
+
+    def test_a_verified_ticket_is_left_alone(self):
+        self.merged_ticket(state="shipped")
+        self.gh.issues[4]["labels"].append({"name": "loom:verified"})
+        self.gh.hand_revert("r1", 91, sha("m1"))
+        self.beat()
+        self.assertIn("loom:shipped", self.labels_of(4))
 
 
 class StationStep(Base):

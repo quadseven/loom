@@ -4,14 +4,25 @@
 #   lanes/mac/brain.sh
 #
 # launchd runs it every LOOM_BRAIN_INTERVAL seconds (lanes/mac/install.sh).
-# It takes the brain lock, refreshes its own checkout of this repo, runs the
-# claude CLI headless on docs/MUSE.md, and releases the lock, also when the
+# It takes the brain lock, refreshes its own checkout of this repo, runs an
+# agent CLI headless on docs/MUSE.md, and releases the lock, also when the
 # agent fails or times out. A lock held by anyone else (Muse, an interactive
 # session) skips the tick before any model call, so only one brain acts at a
 # time. With LOOM_REPOS empty it stays idle.
 #
+# The agent floats (docs/decisions/0002, item 2): LOOM_BRAIN_LADDER lists
+# lanes in order (default claude codex spark), and the tick runs the first
+# whose heartbeat ($LOOM_HOME/state/usage/<lane>.json, written by
+# lanes/run_lane.sh) is fresh and says available, with that lane's model:
+# LOOM_BRAIN_MODEL for claude, LOOM_CODEX_MODEL, LOOM_SPARK_MODEL. A run that
+# fails with a limit, as run_lane.sh classes it, hands the same tick to the
+# next rung that has usage, once. No rung with usage skips the tick before
+# the lock. agy has no rung: its CLI runs only as the agy lane user, which
+# cannot read this checkout or the GitHub sign-in, and as this user it would
+# read the login keychain.
+#
 # Settings: LOOM_REPOS, LOOM_STATUS_REPO (where the lock lives; default this
-# checkout's origin), LOOM_BRAIN_MODEL, LOOM_BRAIN_HOLDER, LOOM_BRAIN_MINUTES
+# checkout's origin), LOOM_BRAIN_LADDER, LOOM_BRAIN_MODEL, LOOM_BRAIN_HOLDER, LOOM_BRAIN_MINUTES
 # (the agent's hard stop, also the lock's expiry), LOOM_BRAIN_WAIT (minutes to
 # wait for a held lock: 25 for a live tick, 0 otherwise), and LOOM_BRAIN_SCOPE: all
 # (the default) or live, which leaves everything but cluster work to Muse.
@@ -21,7 +32,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 WORK="$LOOM_HOME/brain"
 LOG="$LOOM_HOME/logs/brain.log"
-MODEL="${LOOM_BRAIN_MODEL:-claude-opus-5-5}"
+CLAUDE_MODEL="${LOOM_BRAIN_MODEL:-claude-opus-5-5}"
+LADDER="${LOOM_BRAIN_LADDER:-claude codex spark}"
+# The lane and model that ran the tick; set when a rung starts.
+RUNG="" MODEL=""
 HOLDER="${LOOM_BRAIN_HOLDER:-lane-machine}"
 MINUTES="${LOOM_BRAIN_MINUTES:-40}"
 SCOPE="${LOOM_BRAIN_SCOPE:-all}"
@@ -34,33 +48,136 @@ WAIT_STEP="${LOOM_BRAIN_WAIT_STEP:-60}"
 ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)"
 LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')}"
 mkdir -p "$WORK" "$(dirname "$LOG")"
+# launchd starts with a bare PATH; the agent CLIs live in these.
+PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
 say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 
 # The station reads these to tell the operator when the brain stops ticking:
 # state/brain.json holds the last tick (outcome ok, skipped or failed, with the
 # agent's exit code), and state/brain-ok is touched by every tick that ended
-# well, a skip for a held lock included (another brain is acting). A tick
-# that ran the agent also records when the agent started and its model; the
-# station uploads that session's transcript once brain.json says it ended.
+# well, a skip for a held lock included (another brain is acting). A skip
+# with a reason (no rung has usage) is not a good tick: brain-ok goes stale
+# and the station's brain-stopped check reports it. A tick that ran the agent
+# also records when the agent started and its lane and model; the station
+# uploads that session's transcript once brain.json says it ended.
 STATE="$LOOM_HOME/state"
 STARTED=""
 beat() {
-  local extra=""
+  local extra="" reason
   if [ -n "$STARTED" ]; then
     extra=", \"started\": $STARTED"
-    [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]] && extra="$extra, \"model\": \"$MODEL\""
+    [[ "$RUNG" =~ ^[a-z][a-z0-9-]*$ ]] && extra="$extra, \"lane\": \"$RUNG\""
+    [[ "$MODEL" =~ ^[A-Za-z0-9._:/@-]+$ ]] && extra="$extra, \"model\": \"$MODEL\""
+  fi
+  if [ -n "${3:-}" ]; then
+    # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
+    reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
+    extra="$extra, \"reason\": \"$reason\""
   fi
   mkdir -p "$STATE"
   printf '{"at": %s, "outcome": "%s", "exit": %s%s}\n' "$(date +%s)" "$1" "$2" "$extra" > "$STATE/brain.json.tmp" &&
     mv "$STATE/brain.json.tmp" "$STATE/brain.json"
-  case "$1" in ok|skipped) touch "$STATE/brain-ok" ;; esac
+  case "$1:${3:-}" in ok:*|skipped:) touch "$STATE/brain-ok" ;; esac
+}
+
+# shellcheck source=lanes/agent_cli.sh
+. "$REPO_ROOT/lanes/agent_cli.sh"
+# shellcheck source=lanes/agent_sandbox.sh
+. "$REPO_ROOT/lanes/agent_sandbox.sh"
+
+# Whether lane $1 can take the tick now. Sets RUNG_MODEL, or RUNG_WHY when
+# it cannot. A heartbeat counts as the station counts it: available, and
+# written in the last 10 minutes (a runner that stopped writes none).
+rung_ready() {
+  local lane="$1" beat at now setting
+  RUNG_MODEL="" RUNG_WHY=""
+  case "$lane" in
+    claude) RUNG_MODEL="$CLAUDE_MODEL" setting=LOOM_BRAIN_MODEL ;;
+    codex) RUNG_MODEL="${LOOM_CODEX_MODEL:-}" setting=LOOM_CODEX_MODEL ;;
+    spark) RUNG_MODEL="${LOOM_SPARK_MODEL:-}" setting=LOOM_SPARK_MODEL
+      [[ "${LOOM_SPARK_URL:-}" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] ||
+        { RUNG_WHY="LOOM_SPARK_URL is not set to an http(s) base URL"; return 1; } ;;
+    *) RUNG_WHY="no brain runner for this lane"; return 1 ;;
+  esac
+  [ -n "$RUNG_MODEL" ] || { RUNG_WHY="$setting is not set"; return 1; }
+  [[ "$RUNG_MODEL" =~ ^[A-Za-z0-9._:/@-]+$ ]] || { RUNG_WHY="$setting is not a model name"; return 1; }
+  beat="$(cat "$STATE/usage/$lane.json" 2>/dev/null)" && [ -n "$beat" ] ||
+    { RUNG_WHY="no usage heartbeat"; return 1; }
+  if ! [[ "$beat" =~ \"available\":\ *true ]]; then
+    RUNG_WHY="unavailable"
+    [[ "$beat" =~ \"reason\":\ *\"([^\"]+)\" ]] && RUNG_WHY="unavailable (${BASH_REMATCH[1]})"
+    return 1
+  fi
+  [[ "$beat" =~ \"at\":\ *([0-9]+) ]] || { RUNG_WHY="usage heartbeat has no time"; return 1; }
+  at="${BASH_REMATCH[1]}" now="$(date +%s)"
+  [ $((now - at)) -le 600 ] && [ $((at - now)) -le 60 ] ||
+    { RUNG_WHY="usage heartbeat is $((now - at)) seconds old"; return 1; }
+}
+
+# Whether any rung can take the tick; when none can, LADDER_WHY holds every
+# rung's reason.
+ladder_open() {
+  local lane why=""
+  for lane in $LADDER; do
+    rung_ready "$lane" && return 0
+    why="${why:+$why; }$lane: $RUNG_WHY"
+  done
+  LADDER_WHY="${why:-LOOM_BRAIN_LADDER is empty}"
+  return 1
+}
+
+# The settings the brain's commands read (bus.brain, bus journal), passed
+# to a sandboxed rung by name. An allowlist: nothing else of this
+# environment, a key or an SSM parameter name included, reaches the agent.
+BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
+  LOOM_REPO_OWNERS LOOM_HOME
+  LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
+  LOOM_UNVERIFIED_LIMIT LOOM_MERGE_SETTLE_SECONDS)
+
+# The spark rung runs as the spark lane does: opencode inside the shared
+# sandbox, with an emptied environment and a scratch home. Its tree is the
+# brain's checkout, so the sandbox keeps that checkout's .git read-only. The
+# brain needs GitHub, so the agent gets this machine's GitHub token and the
+# settings above in its environment, never in argv.
+spark_brain() {
+  local token kv
+  token="${LOOM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+  [ -n "$token" ] || token="$(gh auth token 2> /dev/null)"
+  [ -n "$token" ] || { echo "no GitHub token for the spark brain" >&2; return 3; }
+  case "$token" in *[!A-Za-z0-9_]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
+  AGENT_HOME="$LOOM_HOME/run/brain-home"
+  rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
+  LANE=spark SKILLS="" API_KEY="" SPARK_URL="$LOOM_SPARK_URL"
+  NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
+  # The sandbox denies the keychain server, which TLS verification asks for
+  # the system roots; a CA file lets HTTPS clients verify without it.
+  AGENT_EXTRA_ENV="GH_TOKEN=$token"$'\n'"GITHUB_TOKEN=$token"$'\n'"LOOM_GITHUB_TOKEN=$token"$'\n'"SSL_CERT_FILE=/etc/ssl/cert.pem"
+  for kv in "${BRAIN_SETTINGS[@]}"; do
+    [ -n "${!kv:-}" ] || continue
+    case "${!kv}" in *$'\n'*) continue ;; esac
+    AGENT_EXTRA_ENV="$AGENT_EXTRA_ENV"$'\n'"$kv=${!kv}"
+  done
+  (cd "$WORK/loom" && opencode_run - "${LOOM_SPARK_OPENCODE:-opencode}" "$1")
+}
+
+run_rung() {
+  case "$RUNG" in
+    spark) spark_brain "$1" ;;
+    *) agent_cli "$RUNG" brain "$1" ;;
+  esac
 }
 
 [ -n "${LOOM_REPOS:-}" ] || exit 0
 [ -n "$ORIGIN" ] && [ -n "$LOCK_REPO" ] || { say "no origin remote in $REPO_ROOT, so no lock repo"; exit 1; }
 case "$SCOPE" in all|live) ;; *) say "LOOM_BRAIN_SCOPE must be all or live"; exit 1 ;; esac
 [[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -ge 5 ] || { say "LOOM_BRAIN_MINUTES must be a number of at least 5"; exit 1; }
+# No rung with usage: nothing to run, so no lock and no model call.
+if ! ladder_open; then
+  say "tick skipped: no brain lane has usage ($LADDER_WHY)"
+  beat skipped 0 "no brain lane has usage: $LADDER_WHY"
+  exit 0
+fi
 
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 
@@ -82,9 +199,22 @@ bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
 brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record lock step"
 
+# A rung may have changed the checkout (a hook, a config, an edited
+# docs/MUSE.md the next tick would follow). Each tick starts from origin's
+# head: fetched and reset with hooks and fsmonitor off, and untracked and
+# ignored files removed, nested repositories too (clean needs -f twice for
+# those). A checkout that still is not clean is deleted and cloned again, so
+# nothing a run left there runs or steers the next tick.
+wgit() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$WORK/loom" "$@"; }
 if [ -d "$WORK/loom/.git" ]; then
-  git -C "$WORK/loom" pull -q --ff-only >> "$LOG" 2>&1 || { say "could not update $WORK/loom"; beat failed 1; exit 1; }
-else
+  if ! { wgit fetch -q && wgit reset -q --hard '@{u}' && wgit clean -qffdx; } >> "$LOG" 2>&1 ||
+     ! left="$(wgit status --porcelain --ignored 2>> "$LOG")" || [ -n "$left" ]; then
+    say "$WORK/loom did not come clean; cloning it again"
+    rm -rf "$WORK/loom"
+  fi
+fi
+if [ ! -d "$WORK/loom/.git" ]; then
+  rm -rf "$WORK/loom"
   git clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; beat failed 1; exit 1; }
 fi
 
@@ -119,15 +249,40 @@ each review thread, then run bus.brain merge with its ticket when ready. Do \
 not wait for that brain's next tick. Review, merge, brief and answer asks beyond \
 those items only when resume says all GitHub stages are open to you (no other \
 brain journaled in the last 2 hours). Defer and done markers go in your \
-journal as MUSE.md says. A brief named but not written this tick is deferred \
-with the brief stage, never only in journal prose."
+journal as MUSE.md says; post each journal with python3 -m bus journal \
+OWNER/NAME#N --file FILE --holder $HOLDER so it carries your Tick line. A brief named but not written this tick is deferred \
+with the brief stage, never only in journal prose. Brief only under an \
+open epic (bus.brain brief --epic E); propose a new epic within the cap of 6 \
+open epics per goal (bus.brain epic); chart a wayfinder map for an epic whose \
+route is unclear; resolve research and task tickets alone; batch the \
+questions only the operator can answer into one daily ask, each with a \
+recommended answer."
 fi
 
-say "tick start (model $MODEL, scope $SCOPE)"
-STARTED="$(date +%s)"
-(cd "$WORK" && timeout "$((MINUTES * 60))" claude -p --model "$MODEL" \
-  --permission-mode bypassPermissions "$PROMPT" < /dev/null) >> "$LOG" 2>&1
-code=$?
-say "tick end (exit $code)"
+# The first rung with usage runs the tick. A run that fails with a limit
+# (the tail of its output, classed as run_lane.sh classes a lane's) hands it
+# to the next rung with usage, once, inside the same hard stop and lock.
+code=0 runs=0 why="" deadline=""
+for lane in $LADDER; do
+  if ! rung_ready "$lane"; then why="${why:+$why; }$lane: $RUNG_WHY"; continue; fi
+  now="$(date +%s)"
+  [ -n "$deadline" ] || deadline=$((now + MINUTES * 60))
+  if [ $((deadline - now)) -lt 300 ]; then say "no time left for lane $lane"; break; fi
+  RUNG="$lane" MODEL="$RUNG_MODEL" AGENT_TIMEOUT=$((deadline - now))
+  say "tick start (lane $RUNG, model $MODEL, scope $SCOPE)"
+  [ -n "$STARTED" ] || STARTED="$now"
+  log_start="$(wc -c < "$LOG" | tr -d ' ')"
+  (cd "$WORK" && run_rung "$PROMPT") >> "$LOG" 2>&1
+  code=$?
+  runs=$((runs + 1))
+  say "tick end (exit $code)"
+  [ "$code" -ne 0 ] && [ "$runs" -lt 2 ] || break
+  classify_failure "$code" "$(tail -c +$((log_start + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)" ""
+  [ "$FAIL_CLASS" = limit ] || break
+  say "lane $RUNG hit a limit; the tick moves to the next rung with usage"
+done
 brain step unlock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record unlock step"
-if [ "$code" = 0 ]; then beat ok 0; else beat failed "$code"; fi
+if [ "$runs" -eq 0 ]; then
+  say "tick skipped: no brain lane has usage (${why:-LOOM_BRAIN_LADDER is empty})"
+  beat skipped 0 "no brain lane has usage: ${why:-LOOM_BRAIN_LADDER is empty}"
+elif [ "$code" = 0 ]; then beat ok 0; else beat failed "$code"; fi

@@ -88,17 +88,54 @@ lane and CI cannot drift apart. Unknown lines are refused.
 `lanes/mac/brain.sh` every `LOOM_BRAIN_INTERVAL` seconds (default 1800). A
 tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
 before any model call), updates its own clone of this repo under
-`$LOOM_HOME/brain`, runs `claude -p` (model `LOOM_BRAIN_MODEL`, default the
-current Opus) on docs/MUSE.md with a hard stop of `LOOM_BRAIN_MINUTES`
-(default 40), and releases the lock, also after a failure. It logs to
+`$LOOM_HOME/brain`, runs an agent CLI on docs/MUSE.md with a hard stop of
+`LOOM_BRAIN_MINUTES` (default 40), and releases the lock, also after a
+failure. It logs to
 `$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it. A live tick waits up to `LOOM_BRAIN_WAIT` minutes (default 25) for a lock another brain holds, because it is the only tick that ships. With
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
-rest to Muse (docs/MUSE.md).
+rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
+0002): both brains take every stage under the one lock, and the defer and
+done markers keep them from repeating each other's work.
+Its prompt tells the brain to brief only under an open epic
+(`bus.brain brief --epic E`), to propose a new epic within the cap of 6 open
+epics per goal (`bus.brain epic`), to chart a wayfinder map for an epic whose
+route is unclear, to resolve research and task tickets alone, and to batch
+the questions only the operator can answer into one daily ask with
+recommended answers (docs/BRAIN.md, Filing under an epic).
 
-Each tick writes `$LOOM_HOME/state/brain.json` (how it ended) and touches
+The agent floats to whichever subscription has usage (decision 0002, item
+2). `LOOM_BRAIN_LADDER` lists lanes in order, default `claude codex spark`.
+The tick runs the first rung whose heartbeat
+(`$LOOM_HOME/state/usage/<lane>.json`, written by that lane's runner) says
+available and is at most 10 minutes old, with the lane's model and the
+same CLI invocation `lanes/run_lane.sh` uses, from the shared
+`lanes/agent_cli.sh`:
+
+| Rung | Model | Run |
+|---|---|---|
+| `claude` | `LOOM_BRAIN_MODEL` (default the current Opus) | `claude -p`, every permission prompt skipped |
+| `codex` | `LOOM_CODEX_MODEL` | `codex exec` with full access (a lane's run has no network; the brain needs GitHub) |
+| `spark` | `LOOM_SPARK_MODEL` at `LOOM_SPARK_URL` | opencode in the lane sandbox (`lanes/agent_sandbox.sh`) with the checkout as its tree, so its `.git` stays read-only; given this machine's GitHub token, a CA file for TLS and an allowlist of non-secret `LOOM_*` settings in its environment |
+
+A run that fails with a limit, as `run_lane.sh` classes a lane's failure
+from the last lines of output, hands the same tick to the next rung with
+usage, once, under the same lock and within the same hard stop. A rung with
+no model set, or a name with no runner, is passed over. agy has no rung:
+its CLI runs only as the agy lane user, which cannot read the brain's
+checkout or GitHub sign-in, and run as the operator it would read the login
+keychain. The `tick start` line in `brain.log` names the lane and model.
+Each tick resets the checkout to origin's head with hooks and fsmonitor
+off and removes untracked and ignored files, nested repositories included;
+a checkout that still is not clean is cloned again, so nothing a run left
+there runs or steers the next tick.
+
+Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the lane
+and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. The station adds a `brain` row to the lane status. The brain also
+included. When no rung has usage, the tick takes no lock and runs no CLI: it
+records `skipped` with each rung's reason and leaves `brain-ok` alone, so
+the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
 well for 2 hours it looks (at most every 10 minutes) for the newest
 `<!-- loom:journal v1 -->` comment from a `LOOM_BRIEF_AUTHORS` login on the
@@ -136,13 +173,34 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
 `GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
 
+GitHub App: with `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (the name of the SSM parameter that holds the App's
+private key, never the key itself; region `LOOM_AWS_REGION`) all set, the
+station, the brain commands and any `bus` call in that environment send an
+App installation token instead, so their requests spend the installation's
+own hourly budget, not the operator account's. The token is minted at run
+time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
+CLI (key on stdin, never on the command line or on disk), and
+`POST /app/installations/<id>/access_tokens` returns a token kept in memory
+until 5 minutes before its `expires_at`. Mints count under `app token` in the
+requests line, and the budget line reads `GitHub App budget`. With any of the
+three unset, the token above is used as before. The App needs contents,
+issues and pull requests read and write, and checks and actions read, on the
+scanned repos. The dashboard takes the same three settings when its host has
+the `openssl` and `aws` CLIs, and otherwise keeps
+`LOOM_DASHBOARD_GITHUB_TOKEN`.
+
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 It skips future `Not before:` times and tickets without a readable Difficulty.
-The latter appear in their goal's next station standup.
+The latter appear in their goal's next station standup. A pass that gives no
+queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
+being the first ticket's in that order.
 
 Lane status: every pass the station reads each lane's heartbeat (`yes` when
-available and at most 600 seconds old, else `no`) and keeps one comment on the
+available and at most 600 seconds older than the pass's start, else `no`; a
+beat written while the pass runs counts, one stamped more than a minute
+ahead of the clock does not) and keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
 only when a yes or no changes, when an anthropic run is recorded, and at
@@ -176,12 +234,18 @@ conflict alone, never climbs). Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
 starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-sol`, then
-`claude-opus-5-5`), each climb recorded as a `<!-- loom:rung N -->` comment.
+`claude-opus-5-5`, then `gemini-4-argon-high` on agy for a public repo), each
+climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
 last started; a rung whose lanes each already hold 2 briefed or running
-tickets is passed over for the next untried one, and stays untried, so a
-ticket gives up only once it has run on every rung. A ticket that failed on
-a ladder model (its `Model:` line and lane) has tried that rung. When every
+tickets is passed over for the next untried one, and stays untried. Once it
+ran on Opus or past it, only the untried strong models are left
+(`gpt-6-sol`, `gemini-4-argon-high`). A ticket that failed on a ladder model
+has tried that rung: the model a claim ran is its `Model:` line, else its
+pull request's runner footer, else the lane's `LOOM_<LANE>_MODEL`. With no
+lane of its next rung up, the ticket waits and the factory posts nothing; it
+gives up ("tried every rung") only once every rung with a lane for its repo
+was tried. When every
 untried rung is busy, it waits on the least loaded one, and a ladder ticket
 queued behind more than 2 others on its lane moves to an untried rung with a
 free lane (not a failure).
@@ -283,6 +347,63 @@ home title. A failed line is retried on the next pass; once the line is out,
 a failed thread is only logged, so the line is never posted twice. Every
 station post, through the webhook or the bot, suppresses link previews.
 
+### Two Looms on shared repos
+
+Two operators may each run a Loom against the same repos. Each Loom works
+only what is its own, and adding an operator is configuration:
+
+- An issue or pull request assigned to a GitHub login belongs to that login.
+  So does one carrying a `claim:<login>` label, which marks claims an
+  operator's own sessions make outside a Loom. A Loom acts only on ones with
+  no owner and on ones with an owner among its own logins
+  (`LOOM_BRIEF_AUTHORS`). Triage, rewrite, the factory's queue
+  routing and pull request pass, `bus.brain move`, the station's claim, pull
+  request adoption and the verify picker all skip one assigned to anyone
+  else. The station logs each skip once (`state/station/owned.json`).
+- When the station claims a ticket, it assigns the issue to its operator
+  login, the first `LOOM_BRIEF_AUTHORS` login that is not an app (`[bot]`),
+  before it relabels it, and adds `claim:<that login>` with the relabel
+  (creating the label in the repo once a pass if it is missing), so the other
+  Loom sees the claim before it acts and a label search lists every claim. A
+  refused assignment is logged and the claim goes on.
+- A goal home may name its operator with an `Operator: <login>` line in its
+  header, above the first heading (as `Trunk:` is written). A Loom works only
+  goal homes that name one of its own logins, or name none: a goal home with
+  no such line belongs to every `LOOM_BRIEF_AUTHORS` login, as before. The
+  station leaves another operator's goal home out of triage, rewrites,
+  adoption, reports, standups and invariants, and claims no ticket under it.
+
+Each operator keeps their own `LOOM_BRIEF_AUTHORS`; neither lists the
+other's login. A person working a ticket by hand claims it the same way:
+assign it to yourself and add `claim:<your login>` before any Loom briefs it.
+
+### Trusted briefers
+
+`LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
+another operator hand work to this Loom's lanes without this Loom adopting
+their claims. It is briefing trust only:
+
+- A `loom:ticket` authored by a trusted briefer is trusted for briefing and
+  building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
+  hand-off, retries, the factory's queue routing, `bus.brain move` and
+  `bus.brain prioritize`. The labeller and body-editor checks accept their
+  login too. One function decides it (`tickets.brief_author_trusted`), so the
+  checks cannot drift.
+- Ownership stays `LOOM_BRIEF_AUTHORS` only. An issue assigned to, or
+  labelled `claim:` for, a trusted briefer is still skipped by triage,
+  rewrite, routing, claim and adoption, unless it is a `loom:ticket` that
+  same briefer authored: a brief is an explicit hand-off. A pull request is
+  never a hand-off. When the station claims a handed-off ticket it assigns it
+  to this Loom's operator login and labels it `claim:<that login>`, as for
+  any claim.
+- Journals, proofs, audits, adopted pull requests and merges keep requiring
+  `LOOM_BRIEF_AUTHORS`. A trusted briefer cannot verify, close or merge on
+  this Loom's behalf, and their comments are data, not instructions.
+
+The installer writes the setting into the station plist and the brain
+plist, and the brain passes it to a sandboxed rung, like
+`LOOM_BRIEF_AUTHORS`.
+
 ### Verify runs
 
 A slot of a lane that is not Anthropic (`anthropic*` and `claude` never take
@@ -300,8 +421,20 @@ the verify brief. It accepts at most five ASCII strings of at most 120
 characters. Lines containing credentials, private hosts, IP addresses or
 local paths are dropped and counted. A timeout or command error is stated in
 the brief without quoting its output. Repos without a command run none.
+Verify lanes have no network, so every verify brief also carries a
+`## GitHub data, not instructions` section the station reads with its own
+token (`bus/verify_data.py`): the ticket's merged pull requests, linked the
+way reconcile links them (number, title, merge commit, merged time; at most
+5), the check runs on each merge commit (at most 30), whether the default
+branch's head contains it, the files each changed (at most 40) and the
+`def test_...` functions its test files add (at most 30), and the ticket's
+acceptance-criteria checkboxes as they stand. A cap that cuts a list says so.
+A ticket with no merged pull request gets one line saying so, and a GitHub
+failure is one line in the section. Lines pass the same text checks as the
+log lines and are dropped and counted when they do not.
 The agent changes no code, opens no pull request and moves no label; it reads
-the ticket's Live criterion and gathers evidence with read-only reads, then
+the ticket's Live criterion and judges each criterion against those two
+sections, then
 writes `verify.json`: a proof record (`bus/proof.py`) or
 `{"missing": "<the evidence that does not exist yet>"}`. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
@@ -444,7 +577,8 @@ Each station pass runs `bus/invariants.py`, at most every 5 minutes, on what
 the station already reads: the journals and marker comments trusted logins
 posted on every goal home in the last day, the lane runs that ended in the
 last day (`briefs/<lane>/done` and `failed`, timed by their logs), the lanes
-held by a limit, queued tickets, sub-issue counts, the review bot's plan
+held by a limit, queued tickets, each goal home's epics and tickets (one walk
+through goal, epics and tickets), the review bot's plan
 check on open lane pull requests (`LOOM_PLAN_CHECK`, default
 `Grug - Chief`) and remote heartbeats. Each invariant is one function
 returning breaches with evidence:
@@ -456,15 +590,18 @@ returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done.
 - A lane held by a limit for over 2 hours while tickets of its tier are queued.
-- A goal home holding 90 or more sub-issues with a `loom:ticket` issue that says
-  `Part of #N` for it but is neither its sub-issue nor has that line on a line
-  of its own (a goal at the 100 sub-issue cap with every ticket linked by a
-  sub-issue or its line is healthy).
+- The epic shape (decision 0003): a goal home with open `loom:ticket` issues
+  under no epic (one breach per goal), an epic holding more than 15 tickets,
+  a goal with more open epics than its cap (6, or the goal home's
+  `Epic cap: N until DATE` exception), and a closed epic that still holds
+  open tickets. These replaced the goal home sub-issue count check.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
 - A remote lane whose newest heartbeat is older than its `beat_max`.
 
-Each breach files one issue labelled `loom:triage` and `loom:invariant` on
-the invariant goal home (`LOOM_INVARIANT_GOAL`; empty means
+Each breach files one issue labelled `loom:triage` and `loom:invariant` under
+the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
+itself when that epic cannot be read) of the invariant goal home
+(`LOOM_INVARIANT_GOAL`; empty means
 `LOOM_METRICS_GOAL` when it is in the self repo, else the self repo's one
 goal home that is not a backlog), as a sub-issue and with a `Part of #N`
 line, carrying the evidence. A hidden marker holds a hash of the invariant

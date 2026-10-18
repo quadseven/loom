@@ -6,28 +6,67 @@ import json
 import ipaddress
 import logging
 import re
+import shutil
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
 from bus import brain, labels, tickets
-from bus.github import DEFAULT_API, GitHub, GitHubError
+from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
 from . import goals, views
 
 
 READ_WORKERS = 8
+# A goal home's title and parent are read again this often (seconds), and at
+# most this many goal homes are read in one pass when following parents up.
+GOAL_INFO_TTL = 3600
+GOAL_INFO_MAX = 200
+# Every pull request is read again this often (seconds); between those full
+# reads a pass reads only the pull requests updated since the last one (#686).
+PR_FULL_READ_SECONDS = 3600
+# The dashboard logs the GitHub requests it spent this often (seconds).
+REQUEST_LOG_SECONDS = 3600
 LOG = logging.getLogger(__name__)
 
 
 def repos_from_env() -> List[str]:
     return [repo for repo in os.environ.get("LOOM_REPOS", "").split()
             if tickets.REPO_RE.fullmatch(repo)]
+
+
+def app_from_env(env: Optional[Dict[str, str]] = None) -> Optional[AppToken]:
+    """The GitHub App installation token when the App settings are present
+    and this host can mint one (openssl signs the JWT; the key is a readable
+    LOOM_GITHUB_APP_KEY_FILE, or the aws CLI reads it from the parameter
+    store); else None, and the dashboard keeps its own token."""
+    try:
+        app = AppToken.from_env(env)
+    except GitHubError as exc:
+        LOG.warning("ignoring the GitHub App settings: %s", exc)
+        return None
+    if app is None:
+        return None
+    if app.key_source == "file":
+        try:
+            with open(app.key_file, "rb"):
+                pass
+        except OSError as exc:
+            # The file's name only: never its contents.
+            LOG.warning("GitHub App settings ignored: key file %s is unreadable (%s)",
+                        app.key_file, type(exc).__name__)
+            return None
+    tools = ("openssl",) if app.key_source == "file" else ("openssl", "aws")
+    missing = [tool for tool in tools if shutil.which(tool) is None]
+    if missing:
+        LOG.warning("GitHub App settings ignored: %s not installed", " and ".join(missing))
+        return None
+    return app
 
 
 def _label_names(issue: Dict[str, Any]) -> List[str]:
@@ -51,13 +90,20 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     goal = None
     if goal_match:
         goal = (goal_match.group(1) or repo) + "#" + goal_match.group(2)
+    else:
+        # No Part of line: the sub-issue parent names the epic (or goal).
+        goal = goals.issue_parent(issue)
     return {
         "repo": repo, "number": issue.get("number"), "title": issue.get("title"),
         "refs": re.findall(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)", body),
         "html_url": issue.get("html_url"),
         "state": next((name[5:] for name in names if name in labels.LABELS and name.startswith("loom:")
                         and name not in ("loom:ticket", "loom:goal", "loom:runaway")), None),
+        # The issue the ticket names: an epic or, before tickets moved under
+        # epics, a goal. TicketStore._assign_epics moves an epic here to
+        # "epic" and puts the epic's goal in "goal" (decision 0003).
         "goal": goal,
+        "epic": None,
         # Tickets are read with state=all; a closed one is history, never work.
         "open": issue.get("state", "open") != "closed",
         "closed_at": issue.get("closed_at"),
@@ -76,11 +122,84 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# What the views read from a pull request in the list (dashboard/results.py,
+# views.py, ticket_data.py and server.py) and from an issue or review comment
+# (hot_spots.py, goals.py, results.py, tickets_table.py). The list answers
+# embed the base and head repositories and the user in full: about 17 KB of
+# JSON per pull request. Kept whole, the 6,700 pull requests of 17 repos held
+# about 190 MiB and two weeks of comments about 150 MiB more, twice over while
+# a refresh built the next snapshot beside the one being served, and the
+# dashboard was killed at its 1 GiB memory limit every few refreshes
+# (2026-10-17).
+PULL_REQUEST_FIELDS = ("number", "title", "html_url", "state", "draft", "body",
+                       "created_at", "updated_at", "merged_at", "closed_at", "repo")
+COMMENT_FIELDS = ("id", "body", "created_at", "updated_at", "html_url",
+                  "issue_url", "pull_request_url", "path")
+
+
+def _user(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    return {"login": value.get("login"), "type": value.get("type")}
+
+
+def pull_request_record(pr: Dict[str, Any]) -> Dict[str, Any]:
+    """The fields of a pull request list item that the views read."""
+    out = {key: pr[key] for key in PULL_REQUEST_FIELDS if key in pr}
+    if isinstance(pr.get("user"), dict):
+        out["user"] = _user(pr["user"])
+    head, base = pr.get("head"), pr.get("base")
+    if isinstance(head, dict):
+        out["head"] = {"ref": head.get("ref"), "sha": head.get("sha")}
+    if isinstance(base, dict):
+        base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+        out["base"] = {"ref": base.get("ref"), "repo": {"full_name": base_repo.get("full_name")}}
+    return out
+
+
+def comment_record(comment: Dict[str, Any], repo: str) -> Dict[str, Any]:
+    """The fields of an issue or review comment that the views read."""
+    out = {key: comment[key] for key in COMMENT_FIELDS if key in comment}
+    if isinstance(comment.get("user"), dict):
+        out["user"] = _user(comment["user"])
+    out["repo"] = repo
+    return out
+
+
+def _newest_update(records: List[Dict[str, Any]], newest: Optional[str]) -> Optional[str]:
+    """The newest updated_at among the records and newest; None when there is none."""
+    stamps = [str(r["updated_at"]) for r in records if r.get("updated_at")]
+    if newest:
+        stamps.append(newest)
+    return max(stamps) if stamps else None
+
+
+def _unique_by_number(records) -> List[Dict[str, Any]]:
+    """The records in order, each number once (a pull request opened during a
+    full read shifts the pages, so the next page repeats one)."""
+    seen, out = set(), []
+    for record in records:
+        number = record.get("number")
+        if number is not None and number in seen:
+            continue
+        seen.add(number)
+        out.append(record)
+    return out
+
+
+def _int_or(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class TicketStore:
     def __init__(self, repos: Optional[List[str]] = None, gh: Optional[GitHub] = None,
                  budget_floor: Optional[int] = None) -> None:
         self.repos = list(repos if repos is not None else repos_from_env())
         token = os.environ.get("LOOM_DASHBOARD_GITHUB_TOKEN", "").strip()
+        app = app_from_env() if gh is None else None
         if gh is None:
             api = os.environ.get("LOOM_DASHBOARD_GITHUB_API", DEFAULT_API)
             parsed_api = urlsplit(api)
@@ -93,7 +212,7 @@ class TicketStore:
             if parsed_api.scheme != "https" and not (
                     parsed_api.scheme == "http" and loopback_test_api):
                 raise ValueError("GitHub API base must use https, or a loopback HTTP URL for tests")
-            gh = GitHub(token, api=api,
+            gh = GitHub(app if app is not None else token, api=api,
                         cache_dir=tempfile.gettempdir() + "/loom-dashboard-github-cache")
         self.gh = gh
         self.budget_floor = (int(os.environ.get("LOOM_DASHBOARD_BUDGET_FLOOR", "500"))
@@ -101,19 +220,27 @@ class TicketStore:
         self._snapshot = {"tickets": {repo: None for repo in self.repos}, "errors": {},
                           "stale": False, "ready": False,
                           "improving": {"journals": [], "metrics_comments": []},
-                          "lanes": [], "pull_requests": [], "dashboard_errors": []}
+                          "lanes": [], "pull_requests": [], "dashboard_errors": [],
+                          "goal_context": {},
+                          "goal_context_error": "the dashboard has not read its sources yet"}
         self.operator_items = []
         self.human_counts = {}
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
-        self.auth = "token" if token else "none"
+        self.auth = "app" if getattr(gh, "auth", "") == "app" else "token" if token else "none"
         self._snapshot_lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
         self._refresh_thread: Optional[threading.Thread] = None
         self._last_remaining: Optional[int] = None
+        self._reset_at = 0
         self.waits = {}
         self.waits_error = "waits have not been looked up yet"
         self._waits_refreshed_at = 0.0
+        # repo -> {"prs": records newest-created first, "newest": the newest
+        # updated_at read, "full_at": when every page was last read}.
+        self._kept_prs: Dict[str, Dict[str, Any]] = {}
+        self._kept_lock = threading.Lock()
+        self._request_mark: Optional[Tuple[float, Dict[str, int], int]] = None
 
     @property
     def data(self):
@@ -150,7 +277,14 @@ class TicketStore:
             self._refresh_thread.join(timeout=2)
 
     def _below_floor(self) -> bool:
-        return self._last_remaining is not None and self._last_remaining < self.budget_floor
+        """Whether the last reading was under the floor and GitHub has not yet
+        restored the window. A pass below the floor reads nothing, so nothing
+        updates the reading: without the reset time the dashboard stayed on
+        "stale ticket data" for a day after the budget came back (2026-10-16:
+        4,265 requests left, still latched)."""
+        if self._last_remaining is None or self._last_remaining >= self.budget_floor:
+            return False
+        return not (self._reset_at and time.time() >= self._reset_at)
 
     @staticmethod
     def _error_reason(exc: Exception) -> str:
@@ -209,6 +343,14 @@ class TicketStore:
                          "brain_step": None, "brain_step_error": skipped,
                          "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
                          "dashboard_errors": [skipped]})
+            # The goal cards keep the last pass that read them. Dropping them
+            # here left every Goals card at "-" with "No report on this goal
+            # in the last two weeks" whenever the budget dipped (2026-10-17).
+            previous = self._snapshot.get("goal_context")
+            data["goal_context"] = previous or {}
+            data["goal_context_error"] = self._snapshot.get("goal_context_error", "") if previous else (
+                "goal comments were not read: the GitHub request budget is below its floor"
+                " and no earlier pass read them")
             return
 
         journals, reports, metric_comments, prs, lanes = [], [], [], [], []
@@ -224,6 +366,14 @@ class TicketStore:
             errors.extend(found_errors)
         if status_home and tickets.REPO_RE.fullmatch(status_home):
             self._read_lane_status(status_home, lanes, errors)
+        # The comment feed keeps only LOOM_BRIEF_AUTHORS logins when that is
+        # set; the goal-home reads get the same filter here, before any view
+        # reads them (Floor standup and next move, Improving, Lanes, Goals),
+        # so a marker-shaped comment from anyone else counts nowhere.
+        trusted = {login.lower() for login in brain.trusted_authors()}
+        journals, reports, metric_comments, lanes = (
+            [c for c in found if _by_trusted(c, trusted)]
+            for found in (journals, reports, metric_comments, lanes))
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             pull_results = list(pool.map(self._pull_requests_for_repo, self.repos))
         for found, repo_errors in pull_results:
@@ -235,28 +385,105 @@ class TicketStore:
         data["pull_requests"] = prs
         # One pass at refresh, not per page (server.footer_models).
         data["footer_models"] = views.footer_models(prs)
+        data["footer_runs"] = views.footer_runs(prs)
         data["dashboard_errors"] = errors
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         self._read_hot_spot_comments(data)
         rows = [row for found in data.get("tickets", {}).values() if found for row in found]
+        configured = set(self.repos) | {repo for repo, _ in homes}
+        titles, parents = self._goal_info(rows, configured)
+        epics = self._assign_epics(rows)
+        # Reports on the goal homes read in full above count too: a goal home
+        # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
+        # comment feed failed this pass.
+        unread = dict(data.get("comment_errors") or {})
+        for repo in {str(row.get("goal") or "").partition("#")[0] for row in rows if row.get("goal")}:
+            if repo not in self.repos and (repo, None) not in homes:
+                unread.setdefault(repo, "%s comments: the repo is not in LOOM_REPOS, so its comments"
+                                        " are not read" % repo)
         data["goal_context"] = goals.goal_context(
-            rows, data.get("issue_comments", []), self._goal_titles(rows), metric_comments,
-            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc))
+            rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
+            os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
+            parents=parents, unread=unread, epics=epics)
+        data["goal_context_error"] = ""
 
-    def _goal_titles(self, rows) -> Dict[str, Optional[str]]:
-        """Each goal issue's title, read once per process (titles rarely
-        change); an unreadable goal stays None and is read again next pass."""
-        cache = self.__dict__.setdefault("_titles", {})
-        for goal in {row["goal"] for row in rows if row.get("goal")}:
-            if cache.get(goal):
+    def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+        """Each goal home's title and the goal it rolls up into (a `Parent
+        goal:` line or a sub-issue parent), read for every goal the tickets
+        name and every parent above them. A goal home is read again after
+        GOAL_INFO_TTL (a parent line can be added at any time; a conditional
+        read of an unchanged issue costs no request budget); an unreadable
+        one stays None and is read again next pass.
+
+        A parent counts only in a repo the dashboard is configured for
+        (`configured`: LOOM_REPOS and the goal-home repos), and only when it is
+        itself a goal home: a goal the tickets name, or an issue labelled
+        loom:goal. Any other parent is never read, and the goal stays
+        top-level."""
+        configured = set(self.repos) if configured is None else set(configured)
+        cache = self.__dict__.setdefault("_goal_info_cache", {})
+        named = {row["goal"] for row in rows if row.get("goal")}
+        pending = sorted(named)
+        seen = set()
+        now = time.time()
+        while pending and len(seen) < GOAL_INFO_MAX:
+            goal = pending.pop(0)
+            if goal in seen:
                 continue
-            repo, _, number = goal.partition("#")
-            try:
-                issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
-                cache[goal] = str(issue.get("title") or "") or None if isinstance(issue, dict) else None
-            except (GitHubError, OSError, ValueError):
-                cache[goal] = None
-        return dict(cache)
+            seen.add(goal)
+            entry = cache.get(goal)
+            if not entry or not entry.get("title") or now - entry.get("read_at", 0) >= GOAL_INFO_TTL:
+                entry = self._read_goal_home(goal, entry, now, configured)
+                cache[goal] = entry
+            if entry.get("parent") and entry["parent"] not in seen:
+                pending.append(entry["parent"])
+            if entry.get("is_epic") and entry.get("epic_goal") and entry["epic_goal"] not in seen:
+                pending.append(entry["epic_goal"])
+
+        def accepted(parent):
+            if not parent or parent.partition("#")[0] not in configured:
+                return None
+            return parent if parent in named or (cache.get(parent) or {}).get("is_goal") else None
+
+        titles = {goal: entry.get("title") for goal, entry in cache.items()}
+        # An epic is not a smaller goal: it never rolls up as one.
+        parents = {goal: None if entry.get("is_epic") else accepted(entry.get("parent"))
+                   for goal, entry in cache.items()}
+        return titles, parents
+
+    def _assign_epics(self, rows) -> Dict[str, Dict[str, Any]]:
+        """Move each ticket whose named issue is an epic (labelled epic) to
+        `epic`, with the epic's goal in `goal`, from the goal-home reads
+        _goal_info just made (no request of its own). Returns each epic the
+        tickets name: its title, whether it is open, and its goal."""
+        cache = self.__dict__.get("_goal_info_cache") or {}
+        epics: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            named = row.get("epic") or row.get("goal")
+            entry = cache.get(named) if named else None
+            if not entry or not entry.get("is_epic"):
+                continue
+            row["epic"], row["goal"] = named, entry.get("epic_goal")
+            epics[named] = {"title": entry.get("title"), "open": entry.get("open", True),
+                            "goal": entry.get("epic_goal")}
+        return epics
+
+    def _read_goal_home(self, goal, entry, now, configured):
+        repo, _, number = goal.partition("#")
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
+        except (GitHubError, OSError, ValueError):
+            # Keep what an earlier read found; try again next pass.
+            return dict(entry or {}, read_at=0)
+        if not isinstance(issue, dict):
+            return {"title": None, "parent": None, "is_goal": False, "read_at": 0}
+        names = [name.lower() for name in _label_names(issue)]
+        is_epic = "epic" in names and "loom:goal" not in names
+        return {"title": str(issue.get("title") or "") or None,
+                "parent": goals.parent_of(repo, issue, configured),
+                "is_goal": "loom:goal" in names, "is_epic": is_epic,
+                "epic_goal": goals.epic_goal_of(repo, issue, configured) if is_epic else None,
+                "open": issue.get("state", "open") != "closed", "read_at": now}
 
     def _read_brain_step(self, status_home):
         """The brain's tick record from the lock branch (bus.brain step --show)."""
@@ -276,14 +503,17 @@ class TicketStore:
         since = (day - 2 * HOT_SPOT_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
         trusted = {login.lower() for login in brain.trusted_authors()}
         issue_comments, review_comments, errors = [], [], []
+        comment_errors = {}
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             results = list(pool.map(lambda repo: self._comments_for_repo(repo, since, trusted), self.repos))
-        for issues, reviews, error in results:
+        for repo, (issues, reviews, error) in zip(self.repos, results, strict=True):
             issue_comments.extend(issues)
             review_comments.extend(reviews)
             if error:
                 errors.append(error)
+                comment_errors[repo] = error
         data["issue_comments"], data["review_comments"] = issue_comments, review_comments
+        data["comment_errors"] = comment_errors
         data["hot_spots_error"] = "; ".join(errors) if errors else (
             "" if self.repos else "LOOM_REPOS is not set")
 
@@ -292,10 +522,9 @@ class TicketStore:
         issues, reviews = [], []
         try:
             found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-            issues = [dict(c, repo=repo) for c in found if isinstance(c, dict) and (
-                not trusted or str((c.get("user") or {}).get("login") or "").lower() in trusted)]
+            issues = [comment_record(c, repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
             found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
-            reviews = [dict(c, repo=repo) for c in found if isinstance(c, dict)]
+            reviews = [comment_record(c, repo) for c in found if isinstance(c, dict)]
         except (GitHubError, OSError, ValueError) as exc:
             return issues, reviews, "%s comments: %s" % (repo, self._error_reason(exc))
         return issues, reviews, ""
@@ -350,12 +579,79 @@ class TicketStore:
             errors.append("%s lane status: %s" % (status_home, self._error_reason(exc)))
 
     def _read_pull_requests(self, repo, prs, errors):
+        """The repo's pull requests, newest created first.
+
+        Each page of pulls?state=all embeds the repo itself, whose pushed_at
+        changes on every push, so one push changed every page's ETag and a
+        refresh paid for all of them (2026-10-17: 40 pages a minute for the
+        largest repo). Between full reads, a pass asks for the pull requests
+        sorted by update, newest first, and stops at the first page that
+        reaches back past the newest update it already has: one page, most
+        minutes. A full read every PR_FULL_READ_SECONDS catches anything the
+        incremental reads could miss."""
+        path = quote(repo, safe="/")
+        with self._kept_lock:
+            kept = self._kept_prs.get(repo)
+        now = time.time()
         try:
-            items = self.gh.paginate_parallel("/repos/%s/pulls?state=all&per_page=100" % quote(repo, safe="/"),
-                                              workers=READ_WORKERS)
-            prs.extend(item for item in items if isinstance(item, dict))
+            if kept and kept.get("newest") and now - kept["full_at"] < PR_FULL_READ_SECONDS:
+                records = self._read_pull_requests_since(path, kept)
+                kept = dict(kept, prs=records, newest=_newest_update(records, kept["newest"]))
+            else:
+                items = self.gh.paginate_parallel("/repos/%s/pulls?state=all&per_page=100" % path,
+                                                  workers=READ_WORKERS)
+                records = _unique_by_number(
+                    pull_request_record(item) for item in items if isinstance(item, dict))
+                kept = {"prs": records, "newest": _newest_update(records, None), "full_at": now}
         except (GitHubError, OSError, ValueError) as exc:
             errors.append("%s pull requests: %s" % (repo, self._error_reason(exc)))
+            return
+        with self._kept_lock:
+            self._kept_prs[repo] = kept
+        prs.extend(kept["prs"])
+
+    def _read_pull_requests_since(self, path, kept):
+        """The kept records with every pull request updated at or after the
+        kept newest update read again, merged by number."""
+        newest = kept["newest"]
+        changed: Dict[Any, Dict[str, Any]] = {}
+        url: Optional[str] = "/repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100" % path
+        while url:
+            resp = self.gh.rest("GET", url)
+            page = [item for item in (resp.data if isinstance(resp.data, list) else [])
+                    if isinstance(item, dict)]
+            for item in page:
+                record = pull_request_record(item)
+                changed.setdefault(record.get("number"), record)
+            oldest = str(page[-1].get("updated_at") or "") if page else ""
+            # GitHub's timestamps are ISO 8601 UTC, so text order is time order.
+            if not page or not oldest or oldest < newest:
+                break
+            url = _next_link(resp.headers.get("link", ""))
+        records = []
+        for record in kept["prs"]:
+            records.append(changed.pop(record.get("number"), record))
+        # What is left was opened since: newer numbers go first.
+        fresh = sorted(changed.values(), key=lambda r: _int_or(r.get("number")), reverse=True)
+        return fresh + records
+
+    def _log_requests(self, now: float) -> None:
+        """Log the requests this dashboard spent since the last such line, so
+        its share of the hourly GitHub budget can be read from its log."""
+        kinds = dict(getattr(self.gh, "kinds", {}) or {})
+        not_modified = int(getattr(self.gh, "not_modified", 0) or 0)
+        if self._request_mark is None:
+            self._request_mark = (now, kinds, not_modified)
+            return
+        since, before, before_304 = self._request_mark
+        if now - since < REQUEST_LOG_SECONDS:
+            return
+        spent = {kind: count - before.get(kind, 0) for kind, count in kinds.items()}
+        LOG.info("GitHub requests in the last %d minutes: %d counted (%s), %d not modified",
+                 int((now - since) / 60), sum(spent.values()),
+                 ", ".join("%s %d" % (kind, n) for kind, n in sorted(spent.items()) if n) or "none",
+                 not_modified - before_304)
+        self._request_mark = (now, kinds, not_modified)
 
     def _pull_requests_for_repo(self, repo):
         prs, errors = [], []
@@ -363,9 +659,10 @@ class TicketStore:
         return prs, errors
 
     def _note_budget(self) -> None:
-        remaining = self.gh.rate.get("core", (None, 0, 0))[0]
+        remaining, _, reset = self.gh.rate.get("core", (None, 0, 0))
         if isinstance(remaining, int):
             self._last_remaining = remaining
+            self._reset_at = reset if isinstance(reset, int) else 0
 
     def _read_repos(self, data: Dict[str, Any], errors: Dict[str, str]) -> bool:
         """Read each repo into data/errors; return True if the budget floor stopped the pass."""
@@ -405,20 +702,24 @@ class TicketStore:
             now = time.time()
             if now - self._waits_refreshed_at >= 3600 and not self._below_floor():
                 try:
-                    rows, bottleneck = waits_for_repos(self.gh, self.repos, now)
+                    entered = {}
+                    rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered)
                     self.waits = {row["state"]: [row["median_h"]] * row["n"]
                                   for row in rows if row.get("median_h") is not None and row.get("n")}
                     snapshot["wait_rows"] = rows
                     snapshot["wait_bottleneck"] = bottleneck
+                    snapshot["state_entered"] = entered
                     self.waits_error = ""
                 except (GitHubError, OSError, ValueError) as exc:
                     self.waits_error = self._error_reason(exc)
                     snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
                     snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+                    snapshot["state_entered"] = self._snapshot.get("state_entered", {})
                 self._waits_refreshed_at = now
             else:
                 snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
                 snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
+                snapshot["state_entered"] = self._snapshot.get("state_entered", {})
             floor_context = snapshot.get("floor_context", {})
             floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
                                   "needs_you_reason": ask_error,
@@ -426,6 +727,7 @@ class TicketStore:
             snapshot["floor_context"] = floor_context
             with self._snapshot_lock:
                 self._snapshot = snapshot
+            self._log_requests(now)
             if snapshot["ready"] and not current["ready"]:
                 LOG.info("first dashboard snapshot ready in %.1fs", time.monotonic() - started)
 
@@ -440,10 +742,13 @@ class TicketStore:
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
                 "footer_models": snapshot.get("footer_models"),
+                "footer_runs": snapshot.get("footer_runs"),
+                "state_entered": snapshot.get("state_entered", {}),
                 "wait_rows": snapshot.get("wait_rows", []),
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),
                 "goal_context": snapshot.get("goal_context", {}),
+                "goal_context_error": snapshot.get("goal_context_error", ""),
                 "operator_items": list(self.operator_items),
                 "dashboard_errors": snapshot.get("dashboard_errors", []),
                 "brain_step": snapshot.get("brain_step"),
@@ -452,6 +757,12 @@ class TicketStore:
                 "review_comments": snapshot.get("review_comments", []),
                 "hot_spots_error": snapshot.get("hot_spots_error", "the dashboard has not read its sources yet"),
                 "usage": usage_rows}
+
+
+def _by_trusted(comment: Dict[str, Any], trusted) -> bool:
+    """Whether a comment counts: any author when no LOOM_BRIEF_AUTHORS is set,
+    else only those logins (as the comment feed reads them)."""
+    return not trusted or str((comment.get("user") or {}).get("login") or "").lower() in trusted
 
 
 def journal_next(body: str) -> Optional[str]:

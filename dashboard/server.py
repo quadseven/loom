@@ -9,6 +9,7 @@ import hmac
 import ssl
 import statistics
 import socket
+import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -25,6 +26,7 @@ from . import usage as usage_store
 from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
+from . import tickets_table
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 WAIT_STATES = ("queued", "briefed", "running", "pr", "merged", "shipped")
@@ -42,7 +44,36 @@ def _all_tickets(state):
             model = models.get("%s#%s" % (row.get("repo"), row.get("number")))
             if model:
                 row["model"] = model
+    footer_runs = payload.get("footer_runs")
+    if footer_runs is None:
+        footer_runs = views.footer_runs(payload.get("pull_requests", []))
+    tickets_table.resolve_models(rows, footer_runs=footer_runs, latest=_latest_runs(state),
+                                 comments=payload.get("issue_comments") or [])
     return rows
+
+
+LATEST_RUNS_TTL = 60
+
+
+def _latest_runs(state):
+    """{ticket: its newest stored run} from the transcript store, read at
+    most once a minute; empty when the store is not configured or fails, so
+    the model falls back to the pull request footer and claim comments."""
+    cached = getattr(state, "_latest_runs", None)
+    if cached and time.monotonic() - cached[0] < LATEST_RUNS_TTL:
+        return cached[1]
+    store = _transcript_store(state)
+    latest = {}
+    if store is not None and hasattr(store, "latest"):
+        try:
+            latest = store.latest()
+        except (RuntimeError, *transcript_store.storage_errors()):
+            latest = {}
+    try:
+        state._latest_runs = (time.monotonic(), latest)
+    except AttributeError:
+        pass
+    return latest
 
 
 def _ticket_href(row):
@@ -59,7 +90,8 @@ def _ticket_row(row):
     flag = ("attempt %s / " % html.escape(str(attempt)) if isinstance(attempt, int) and attempt > 1 else "")
     flag += html.escape(str(current or "unlabeled"))
     identifier = "%s#%s" % (row.get("repo", ""), row.get("number", ""))
-    lane_model = "%s / %s" % (row.get("lane") or "unassigned", row.get("model") or "model unknown")
+    lane_model = "%s / %s" % (row.get("lane") or "unassigned",
+                              row.get("model_text") or row.get("model") or tickets_table.NOT_RUN)
     return ('<a class="ticket-row" href="%s"><div class="ticket-top machine-fact"><span>%s</span>'
             '<span class="state-%s">%s</span></div><div class="ticket-title">%s</div>'
             '<div class="ticket-bottom"><div class="progress" aria-label="Ticket progress">%s</div>'
@@ -255,18 +287,103 @@ def _short_ref(goal):
     return goal.split("/", 1)[-1]
 
 
+def _goal_report_html(info, missing, now):
+    """The card's report line: the newest report and how old it is, "No
+    report on this goal in the last two weeks" only when the goal's reports
+    were read and none is that recent, or the source that was not read."""
+    esc = html.escape
+    if not info:
+        return '<p class="muted">report not read: %s</p>' % esc(missing)
+    report, stamp = info.get("report"), info.get("report_time")
+    when = _when(stamp)
+    ago = goals_view.age(stamp, now)
+    if info.get("report_quiet"):
+        last = " Last report %s." % when if report and when else ""
+        return "<p>No report on this goal in the last two weeks.%s</p>" % esc(last)
+    if report:
+        return '<p>%s</p><p class="machine-fact">last report %s%s</p>' % (
+            esc(report), esc(when or str(stamp)), esc(" (%s ago)" % ago) if ago else "")
+    return '<p class="muted">report not read: %s</p>' % esc(
+        str(info.get("report_reason") or "the goal home's comments were not read"))
+
+
+def _goal_child_row(goal, info, own, now):
+    """One smaller goal inside its parent's card: title, in-flight count,
+    last report age; it links to that goal's tickets."""
+    esc = html.escape
+    title = info.get("title") or _short_ref(goal)
+    flying = info.get("in_flight") if info else None
+    if flying is None:
+        flying = sum(1 for row in own if row.get("open", True) and row.get("state") in goals_view.IN_FLIGHT_STATES)
+    ago = goals_view.age(info.get("report_time"), now) if info else None
+    if ago:
+        report = "report %s ago" % ago
+    elif info and info.get("report_quiet"):
+        report = "no report in two weeks"
+    else:
+        report = "report not read"
+    return ('<li><a href="/tickets?goal=%s"><span class="goal-child-title">%s</span>'
+            '<span class="machine-fact">%s / %d in flight / %s</span></a></li>') % (
+                quote(goal, safe=""), esc(goals_view.short(str(title), 90)),
+                esc(_short_ref(goal)), flying, esc(report))
+
+
+def _goal_epic_row(epic):
+    esc = html.escape
+    return ('<li><a href="/tickets?epic=%s"><span class="goal-child-title">%s</span>'
+            '<span class="machine-fact">%s / tickets %d/%d / %d in flight</span></a></li>') % (
+                quote(epic["ref"], safe=""), esc(goals_view.short(str(epic.get("title") or _short_ref(epic["ref"])), 90)),
+                esc(_short_ref(epic["ref"])), epic.get("tickets", 0), goals_view.EPIC_TICKET_CAP,
+                epic.get("in_flight", 0))
+
+
+def _goal_epics_html(info):
+    """The goal's epics: the open ones against the cap of 6, each with its
+    tickets against 15, then the closed ones as a collapsed record."""
+    found = [e for e in (info.get("epics") or []) if isinstance(e, dict) and e.get("ref")]
+    if not found:
+        return ""
+    live = [e for e in found if e.get("open", True)]
+    done = [e for e in found if not e.get("open", True)]
+    out = ['<div class="goal-epics"><p class="machine-fact">open epics %d/%d</p>' % (len(live), goals_view.EPIC_CAP)]
+    if live:
+        out.append('<ul class="goal-children" aria-label="Open epics of this goal">%s</ul>'
+                   % "".join(_goal_epic_row(e) for e in live))
+    if done:
+        out.append('<details class="goal-epics-closed"><summary>%d closed epic%s</summary>'
+                   '<ul class="goal-children">%s</ul></details>' % (
+                       len(done), "" if len(done) == 1 else "s", "".join(_goal_epic_row(e) for e in done)))
+    out.append("</div>")
+    return "".join(out)
+
+
 def _goals(state):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
     rows = _all_tickets(state)
     grouped = {}
     for row in rows:
         if row.get("goal"):
             grouped.setdefault(row["goal"], []).append(row)
     context = getattr(state, "context", None) or {}
-    goal_data = context.get("goals") or state.response().get("goal_context") or {}
+    response = state.response()
+    goal_data = context.get("goals") or response.get("goal_context") or {}
+    if not isinstance(goal_data, dict):
+        goal_data = {}
+    # Why a goal has no record: the snapshot says, else it is not in it.
+    missing = str(response.get("goal_context_error") or
+                  "the goal is not in the last snapshot's goal data")
+    parents = {goal: (info or {}).get("parent") for goal, info in goal_data.items()}
+    tree = goals_view.rollup(list(grouped) + [g for g in goal_data if g not in grouped], parents)
+
+    def size(top):
+        return len(grouped.get(top, [])) + sum(len(grouped.get(child, [])) for child in tree[top])
+
     esc = html.escape
     cards = []
-    for goal, tickets in sorted(grouped.items(), key=lambda item: -len(item[1])):
-        info = goal_data.get(goal, {}) if isinstance(goal_data, dict) else {}
+    for goal in sorted(tree, key=lambda top: -size(top)):
+        tickets = grouped.get(goal, [])
+        info = goal_data.get(goal) or {}
         history = [v for v in info.get("history", [])][-7:]
         scale = info.get("scale") or max([v for v in history if isinstance(v, (int, float))] or [1]) or 1
         spark = "".join('<i style="height:%d%%"%s></i>' % (
@@ -278,20 +395,39 @@ def _goals(state):
             sum(row.get("state") == name for row in tickets)) for name in STATES
             if any(row.get("state") == name for row in tickets))
         title = info.get("title") or _short_ref(goal)
-        report = info.get("report")
         measure = info.get("measure")
+        held, limit = info.get("unproven"), info.get("unproven_limit")
+        if isinstance(held, int) and isinstance(limit, int):
+            note = "unproven work %d/%d (merged or shipped with no standing proof)" % (held, limit)
+            if held > limit:
+                note += " - over limit: no new build tickets until the goal finishes its proof"
+            unproven_html = '<p class="machine-fact">%s</p>' % esc(note)
+        else:
+            unproven_html = ""
+        if info.get("metric") is not None:
+            metric_html = '<div class="metric">%s</div><div class="machine-fact">%s%s</div>' % (
+                esc(str(info["metric"])), esc(str(info.get("unit") or "")),
+                esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else "")
+        else:
+            metric_html = ('<div class="metric metric-missing">not read</div>'
+                           '<div class="machine-fact">verified with proof: %s</div>') % esc(
+                               str(info.get("metric_reason") or missing))
+        children = tree[goal]
+        child_html = ('<ul class="goal-children" aria-label="Smaller goals in this goal">%s</ul>' % "".join(
+            _goal_child_row(child, goal_data.get(child) or {}, grouped.get(child, []), now)
+            for child in sorted(children, key=lambda c: -len(grouped.get(c, []))))) if children else ""
         cards.append(
             '<article class="goal-card card"><div class="machine-fact">%s</div><h2>%s</h2>'
-            '<div class="goal-metric"><div><div class="metric">%s</div><div class="machine-fact">%s%s</div></div>'
+            '<div class="goal-metric"><div>%s</div>'
             '<div class="sparkline" aria-label="Last 7 days, one bar a day">%s</div></div>%s'
-            '<div class="chips">%s</div><p>%s</p><a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
-                esc(_short_ref(goal)), esc(str(title)), esc(str(info.get("metric", "-"))),
-                esc(str(info.get("unit") or "not looked: the goal has no snapshot data")),
-                esc(" / was %s" % info["previous"]) if info.get("previous") not in (None, "") else "",
+            '<div class="chips">%s</div>%s%s%s<a href="/tickets?goal=%s">%d tickets on this goal &rarr;</a></article>' % (
+                esc(_short_ref(goal)), esc(str(title)), metric_html,
                 spark, '<p class="machine-fact">measure: %s</p>' % esc(measure) if measure else "",
-                counts, esc(report) if report else "No report on this goal in the last two weeks.",
+                counts, unproven_html, _goal_report_html(info, missing, now),
+                _goal_epics_html(info) + child_html,
                 quote(goal, safe=""), len(tickets)))
-    body = '<p class="page-lede">Each goal home, measured by what reached a live proof.</p><div class="goal-grid">%s</div>' % (
+    body = ('<p class="page-lede">Each top-level goal home, with the smaller goals that roll up into it,'
+            ' measured by what reached a live proof.</p><div class="goal-grid">%s</div>') % (
         "".join(cards) or '<p class="empty-state">No goals with ticket data.</p>')
     return page("Goals", "goals", body, status="snapshot")
 
@@ -342,14 +478,28 @@ def _issue_url(item):
     return item.get("html_url") or item.get("url") or "/tickets"
 
 
+def _child_counts(epic):
+    """(done, total) children of an epic. The Hunt agent view carries the
+    counts as `closed` and `total`; an older document lists `children`."""
+    total = epic.get("total")
+    if isinstance(total, int) and not isinstance(total, bool):
+        done = epic.get("closed")
+        done = done if isinstance(done, int) and not isinstance(done, bool) else 0
+        return max(0, min(done, total)), max(0, total)
+    children = [child for child in epic.get("children") or [] if isinstance(child, dict)]
+    done = sum(bool(child.get("closed")) or str(child.get("state", child.get("status", ""))).lower() == "closed"
+               for child in children)
+    return done, len(children)
+
+
 def _health_inspectors(document):
-    epics = document.get("epics") or []
+    epics = [epic for epic in document.get("epics") or [] if isinstance(epic, dict)]
     finished, unlinked, titles = [], [], []
     for epic in epics:
-        children = epic.get("children") or []
-        if children and all(str(child.get("state", "")).lower() == "closed" for child in children) and str(epic.get("state", "open")).lower() != "closed":
+        done, total = _child_counts(epic)
+        if total and done == total and str(epic.get("state", "open")).lower() != "closed":
             finished.append(epic)
-        for child in children:
+        for child in epic.get("children") or []:
             if not child.get("parent") and not child.get("parent_number") and not child.get("parent_url"):
                 unlinked.append(child)
         title = str(epic.get("title", ""))
@@ -371,64 +521,192 @@ def _backlog_filters(epics, parsed):
     out.append('</select></label> <button type="submit">Filter</button></form>')
     selected = [epic for epic in epics if (not repo_filter or epic.get("repo") == repo_filter)
                 and (not tier_filter or str(epic.get("tier", "")) == tier_filter)]
-    return out, selected
+    return out, selected, repo_filter
 
 
-def _render_epic(epic, states):
-    children = epic.get("children") or []
-    closed = sum(child.get("closed", False) or str(child.get("state", child.get("status", ""))).lower() == "closed" for child in children)
-    next_item = epic.get("next") or {}
-    criteria = next_item.get("criteria") or next_item.get("acceptance_criteria") or []
-    checked = sum(bool(item.get("checked")) if isinstance(item, dict) else str(item).lstrip().startswith(("[x]", "- [x]")) for item in criteria)
-    markings = epic.get("markings") or []
-    if not isinstance(markings, list):
-        markings = [markings]
-    out = ['<article class="card backlog-epic"><div class="label">%s</div><h2><a href="%s">%s</a></h2><p>%s | %s | %s</p><p>%s</p><p>Completeness: %d/%d | Next: %s (%d/%d criteria)</p><ul>' % (
-        html.escape(str(epic.get("tier", "Cave"))), html.escape(_issue_url(epic), quote=True), html.escape(_repo_number(epic)),
-        html.escape(str(epic.get("title", ""))), html.escape(str(epic.get("tier", ""))), html.escape(str(epic.get("score", ""))),
-        html.escape(str(epic.get("why", ""))), closed, len(children), html.escape(str(next_item.get("title") or next_item.get("number") or "None")), checked, len(criteria))]
-    if markings:
-        out.append('<p>%s</p>' % html.escape("Markings: " + ", ".join(str(marking) for marking in markings)))
-    for child in children:
-        key = "%s#%s" % (child.get("repo", epic.get("repo", "")), child.get("number", ""))
-        label = " | Loom: " + str(states[key]) if states.get(key) else ""
-        item = {**epic, **child}
-        out.append('<li><a href="%s">%s</a>%s</li>' % (html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item) or str(child.get("title", ""))), html.escape(label)))
-    out.append('</ul><p>Open children: %d</p></article>' % (len(children) - closed))
-    return "".join(out)
+# The ranked table shows this many epics before folding the rest into a
+# collapsed group, so the ranking fits two screens on a wide window.
+RANKED_SHOWN = 40
+EPIC_COLUMNS = ("Repo", "Epic", "Tier", "Score", "Children", "Next child", "Age")
 
 
-def _start_here(epics):
-    if not epics:
-        return ""
-    first = epics[0]
-    nxt = first.get("next") or {}
-    return '<section class="card start-here"><span class="label">Start here</span><h2>%s</h2><p><a href="%s">%s</a></p></section>' % (
-        html.escape(str(first.get("title", ""))), html.escape(_issue_url({**first, **nxt}), quote=True),
-        html.escape(str(nxt.get("title") or nxt.get("number") or "Next ticket")))
+def _short_repo(value):
+    """example-owner/app and app name the same repo: the backlog source keys
+    epics by the bare repo name, the ticket snapshot by OWNER/NAME."""
+    if isinstance(value, dict):
+        value = value.get("full_name") or value.get("name") or ""
+    return str(value or "").rsplit("/", 1)[-1]
 
 
-def _ticket_states(state):
-    return {"%s#%s" % (repo, row.get("number")): row.get("state")
-            for repo, rows in state.data.items() for row in rows or []}
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _score(epic):
+    try:
+        return float(epic.get("score"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _epic_age(epic):
+    """Time since the epic was last touched, or None when the source has no
+    date for it (the Hunt agent view carries none today)."""
+    from datetime import datetime, timezone
+    metrics = epic.get("metrics") if isinstance(epic.get("metrics"), dict) else {}
+    stamp = epic.get("updated_at") or epic.get("created_at")
+    if stamp:
+        try:
+            moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - moment).total_seconds() / 86400
+    elif isinstance(metrics.get("stale_days"), (int, float)):
+        days = float(metrics["stale_days"])
+    else:
+        return None
+    days = max(0.0, days)
+    return "%dh" % int(days * 24) if days < 1 else "%dd" % int(days)
+
+
+def _link_or_text(url, text, css=""):
+    cls = ' class="%s"' % css if css else ""
+    # The title attribute carries the full text where a narrow cell cuts it.
+    if url:
+        return '<a%s href="%s" title="%s">%s</a>' % (cls, html.escape(url, quote=True), html.escape(text, quote=True), html.escape(text))
+    return '<span%s title="%s">%s</span>' % (cls, html.escape(text, quote=True), html.escape(text))
+
+
+def _epic_row(epic):
+    esc = html.escape
+    done, total = _child_counts(epic)
+    left = total - done
+    percent = int(round(100 * done / total)) if total else 0
+    nxt = epic.get("next") if isinstance(epic.get("next"), dict) else {}
+    number = _int_or_none(nxt.get("number"))
+    if nxt:
+        label = ("#%d " % number if number is not None else "") + str(nxt.get("title") or "")
+        next_html = _link_or_text(nxt.get("html_url") or nxt.get("url"), label.strip() or "next ticket", "epic-next")
+    else:
+        next_html = '<span class="muted">no open child</span>'
+    score = _score(epic)
+    tier = epic.get("tier")
+    age = _epic_age(epic)
+    epic_number = _int_or_none(epic.get("number"))
+    title = str(epic.get("title") or "Untitled epic")
+    return ('<tr><td class="machine-fact">%s%s</td><td class="epic-title">%s</td>'
+            '<td class="machine-fact%s">%s</td><td class="machine-fact num">%s</td>'
+            '<td><span class="epic-bar" role="img" aria-label="%d of %d children done, %d open">'
+            '<i style="width:%d%%"></i></span><span class="machine-fact">%d open / %d done</span></td>'
+            '<td class="epic-next-cell">%s</td><td class="machine-fact%s">%s</td></tr>') % (
+        esc(_short_repo(epic.get("repo"))), "#%d" % epic_number if epic_number is not None else "",
+        _link_or_text(epic.get("html_url") or epic.get("url"), title),
+        "" if tier else " muted", esc(str(tier or "unjudged")),
+        esc("%.1f" % score if score is not None else "-"),
+        done, total, left, percent, left, done, next_html,
+        "" if age else " muted", esc(age or "-"))
+
+
+def _epic_table(epics, caption):
+    head = "".join('<th scope="col">%s</th>' % name for name in EPIC_COLUMNS)
+    return ('<table class="epic-table"><caption>%s</caption><thead><tr>%s</tr></thead><tbody>%s</tbody></table>' % (
+        html.escape(caption), head, "".join(_epic_row(epic) for epic in epics)))
+
+
+def _epic_members(epics):
+    """(bare repo, number) for every epic in the backlog and every child it
+    lists: the agent view lists open children and the next ticket, an older
+    document lists every child."""
+    members = set()
+    for epic in epics:
+        repo = _short_repo(epic.get("repo"))
+        members.add((repo, _int_or_none(epic.get("number"))))
+        nxt = epic.get("next") if isinstance(epic.get("next"), dict) else None
+        for child in list(epic.get("children") or []) + list(epic.get("open_children") or []) + ([nxt] if nxt else []):
+            if isinstance(child, dict):
+                members.add((_short_repo(child.get("repo") or repo), _int_or_none(child.get("number"))))
+    return members
+
+
+FINISHED_STATES = ("merged", "shipped", "verified", "closed-unmerged")
+
+
+def _outside_any_epic(rows, epics, repo_filter=""):
+    """Open tickets under no epic (decision 0003: their Part of line or
+    sub-issue parent names no epic) that no backlog epic lists as a child:
+    each one is work nobody has placed."""
+    members = _epic_members(epics)
+    found = [row for row in rows
+             if row.get("open", True) and row.get("state") not in FINISHED_STATES and not row.get("epic")
+             and (_short_repo(row.get("repo")), _int_or_none(row.get("number"))) not in members
+             and (not repo_filter or _short_repo(row.get("repo")) == _short_repo(repo_filter))]
+    return sorted(found, key=lambda row: (str(row.get("repo") or ""), _int_or_none(row.get("number")) or 0))
+
+
+def _outside_section(rows):
+    esc = html.escape
+    lede = ('<p class="backlog-note">Each open ticket below belongs to no epic. Each is an incoherence '
+            'to fix: move it under an open epic of its goal, or close it. Read from the ticket snapshot, which holds '
+            'open loom:ticket issues only; open issues without that label are not checked here.</p>')
+    if rows:
+        items = "".join('<li><a href="%s"><span class="machine-fact">%s#%s</span> %s</a><span class="machine-fact state-%s">%s</span></li>' % (
+            esc(_ticket_href(row), quote=True), esc(_short_repo(row.get("repo"))), esc(str(row.get("number", ""))),
+            esc(str(row.get("title") or "Untitled ticket")), esc(str(row.get("state") or "queued"), quote=True),
+            esc(str(row.get("state") or "unlabeled"))) for row in rows)
+        body = '<ul class="backlog-outside">%s</ul>' % items
+    else:
+        body = '<p class="empty-state">Every open ticket is in an epic.</p>'
+    return ('<section class="section backlog-outside-section"><div class="section-head"><span class="label">Outside any epic</span>'
+            '<span class="machine-fact%s">%d</span></div>%s%s</section>') % (
+        " bad" if rows else "", len(rows), lede, body)
 
 
 def _render_inspectors(document):
-    out = []
-    for title, items in _health_inspectors(document):
-        out.append('<section class="card"><h2>%s</h2><ul>' % html.escape(title))
+    groups = _health_inspectors(document)
+    out = ['<details class="backlog-group"><summary>Bookkeeping checks (%d)</summary>' % sum(len(items) for _, items in groups)]
+    for title, items in groups:
+        out.append('<h2>%s (%d)</h2><ul>' % (html.escape(title), len(items)))
         for item in items:
             out.append('<li><a href="%s">%s</a></li>' % (html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item) or str(item.get("title", "")))))
-        out.append('</ul></section>')
+        out.append('</ul>')
+    out.append('</details>')
     return "".join(out)
 
 
 def _backlog_page(document, parsed, state):
-    all_epics = document.get("epics") or []
-    out, epics = _backlog_filters(all_epics, parsed)
-    out.append(_start_here(all_epics))
-    states = _ticket_states(state)
-    out.extend(_render_epic(epic, states) for epic in epics)
+    all_epics = [epic for epic in document.get("epics") or [] if isinstance(epic, dict)]
+    form, epics, repo_filter = _backlog_filters(all_epics, parsed)
+    empty = [epic for epic in epics if _child_counts(epic)[1] == 0]
+    ranked = [epic for epic in epics if _child_counts(epic)[1] > 0]
+    # Sorted by score, highest first; the source's own order breaks ties and
+    # an epic with no score sorts last.
+    ranked.sort(key=lambda epic: (_score(epic) is None, -(_score(epic) or 0.0)))
+    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter))]
+    dated = any(_epic_age(epic) for epic in ranked)
+    out.append('<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
+               '<span class="machine-fact">%d ranked</span></div>' % len(ranked))
+    out.append('<p class="backlog-note">One row per epic with children, ranked by Hunt\'s score.%s</p>' % (
+        "" if dated else " Age shows a dash: the backlog source carries no epic dates."))
+    out.extend(form)
+    if ranked:
+        out.append(_epic_table(ranked[:RANKED_SHOWN], "Epics ranked by score"))
+        rest = ranked[RANKED_SHOWN:]
+        if rest:
+            out.append('<details class="backlog-group"><summary>Ranks %d to %d (%d more)</summary>%s</details>' % (
+                RANKED_SHOWN + 1, len(ranked), len(rest), _epic_table(rest, "Epics ranked by score, continued")))
+    else:
+        out.append('<p class="empty-state">No epic with children matches this filter.</p>')
+    out.append('</section>')
+    if empty:
+        out.append('<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
+            len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
+                _link_or_text(epic.get("html_url") or epic.get("url"), str(epic.get("title") or "Untitled epic")),
+                html.escape(_repo_number(epic))) for epic in empty)))
     out.append(_render_inspectors(document))
     return page("Backlog", "backlog", "".join(out), status="Read only")
 
@@ -501,20 +779,13 @@ def _number(value):
 
 
 def _ticket_page(state, parsed):
-    params = parse_qs(parsed.query)
     rows = _all_tickets(state)
-    filtered = [row for row in rows if (not params.get("state") or row.get("state") == params["state"][0])
-                and (not params.get("goal") or row.get("goal") == params["goal"][0])]
-    state_chips = ''.join('<a class="chip" href="/tickets?state=%s">%s %d</a>' % (
-        name, name, sum(row.get("state") == name for row in rows)) for name in STATES
-        if any(row.get("state") == name for row in rows))
-    goals = sorted({row["goal"] for row in rows if row.get("goal")})
-    goal_chips = ''.join('<a class="chip" href="/tickets?goal=%s">%s</a>' % (quote(goal, safe=""), html.escape(goal)) for goal in goals)
-    body = '<div class="chips">%s %s</div>' % (state_chips, goal_chips)
-    if filtered:
-        body += '<div class="ticket-grid">%s</div>' % ''.join(_ticket_row(row) for row in filtered)
-    else:
-        body += '<div class="empty-state"><p>No tickets match these filters.</p><a class="chip" href="/tickets">Clear filters</a></div>'
+    payload = state.response()
+    goal_data = payload.get("goal_context") or {}
+    titles = {goal: (info or {}).get("title") for goal, info in goal_data.items()} if isinstance(goal_data, dict) else {}
+    body = tickets_table.render(rows, parse_qs(parsed.query), goal_titles=titles,
+                                entered=payload.get("state_entered") or {}, now=time.time(),
+                                ticket_href=_ticket_href, short_ref=_short_ref)
     return page("Tickets", "tickets", body, status="snapshot")
 
 
@@ -624,7 +895,7 @@ def _dispatch_get(handler, state):
         return _dispatch_ticket_api(handler, state, parsed)
     if path in ("/backlog", "/backlog.json", "/needs-you"):
         return _dispatch_backlog(handler, state, path, parsed)
-    if path in ("/static/loom.css", "/static/loom.js"):
+    if path in STATIC_ASSETS:
         return _dispatch_static(handler, path)
     if path in ("/improving", "/lanes"):
         return _send_dashboard_view(handler, state, path)
@@ -697,9 +968,21 @@ def _dispatch_backlog(handler, state, path, parsed):
     return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
 
 
+# Served path -> (file under static/, content type). Browsers ask for
+# /favicon.ico whatever the page head says, so it serves the 32 px PNG.
+STATIC_ASSETS = {
+    "/static/loom.css": ("loom.css", "text/css; charset=utf-8"),
+    "/static/loom.js": ("loom.js", "text/javascript; charset=utf-8"),
+    "/static/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/static/favicon-32.png": ("favicon-32.png", "image/png"),
+    "/static/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+    "/favicon.ico": ("favicon-32.png", "image/png"),
+}
+
+
 def _dispatch_static(handler, path):
-    asset = Path(__file__).parent / "static" / path.rsplit("/", 1)[1]
-    content_type = "text/css; charset=utf-8" if path.endswith(".css") else "text/javascript; charset=utf-8"
+    name, content_type = STATIC_ASSETS[path]
+    asset = Path(__file__).parent / "static" / name
     return handler.send_bytes(200, asset.read_bytes(), content_type)
 
 
@@ -754,7 +1037,8 @@ def _dispatch_basic(handler, state, path):
 
 # The raw sources the views read in-process, served as counts: whole pull
 # requests and two weeks of comments made /api/tickets 164 MB (2026-10-15).
-RAW_SOURCES = ("pull_requests", "issue_comments", "review_comments", "footer_models")
+RAW_SOURCES = ("pull_requests", "issue_comments", "review_comments", "footer_models", "footer_runs",
+               "state_entered")
 
 
 def _api_tickets(payload):
@@ -769,7 +1053,9 @@ def _dispatch_usage(handler, state):
     now = datetime.now(timezone.utc)
     rows.sort(key=lambda row: (row.get("used_pct") is None,
                                -(float(row["used_pct"]) if row.get("used_pct") is not None else 0)))
-    body = ['<p class="empty-state">Usage limits have not been uploaded yet.</p>'] if not rows else []
+    body = ['<section><h2 class="label">Lane status</h2>%s</section>' % views.render_lane_usage(rows)]
+    if not rows:
+        body.append('<p class="empty-state">Usage limits have not been uploaded yet.</p>')
     for row in rows:
         body.append(views.render_usage_row(row, now))
     return handler.send_page(page("Usage", "usage", "".join(body), status="Live"))
@@ -891,8 +1177,15 @@ def _hold_reason(lane, rows):
     if not reason:
         return "held: the lane machine sent no reason"
     reason = re.sub(r"^limit:\s*", "", reason)
-    return re.sub(r";\s*(?:lane waits|unavailable) until (\d{4}-\d\d-\d\d)T(\d\d:\d\d)(?::\d\d)?Z",
-                  r" until \1 \2 UTC", reason)
+    match = re.search(r";\s*(?:lane waits|unavailable) until (\S+)", reason)
+    if not match:
+        return reason
+    stamp = match.group(1).rstrip(";")
+    try:
+        local = views._local_time(stamp)
+    except ValueError:
+        return reason
+    return reason[:match.start()] + " until " + local
 
 
 def _lane_view_data(payload, tickets, state=None):

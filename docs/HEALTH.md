@@ -15,13 +15,13 @@ order, instead of waiting for someone to notice and file them.
   "checked_at": "2026-10-15T13:30:00Z",
   "findings": [
     {
-      "key": "stuck-quest:member-7:the-quest",
-      "title": "Member 7 cannot finish the class quest",
-      "area": "quests",
+      "key": "stuck-checkout:member-7:the-cart",
+      "title": "Member 7 cannot finish checkout",
+      "area": "checkout",
       "affected": 1,
       "hours": 27.8,
       "impact": 27.8,
-      "evidence": "asked for help 16 times; the last party did not reach the objective",
+      "evidence": "asked for help 16 times; the last attempt did not reach the payment step",
       "since": "2026-10-14T09:40:00Z"
     }
   ]
@@ -32,7 +32,7 @@ order, instead of waiting for someone to notice and file them.
 |---|---|---|
 | `key` | `[A-Za-z0-9:._ -]{1,120}` | Stable id of one problem: the same problem has the same key on every read. Loom stores and shows only its sha1. |
 | `title` | ASCII, one line, at most 90 characters | What is wrong, in plain words. |
-| `area` | `[a-z-]{1,20}` | The part of the project (quests, dungeons, bags, ...). |
+| `area` | `[a-z-]{1,20}` | The part of the project (checkout, search, billing, ...). |
 | `affected` | number, 0 to 10000000 | How many things it hits now (members, runs, items). |
 | `hours` | number, 0 to 10000000 | How long it has lasted, in hours. |
 | `impact` | optional number, 0 to 10000000 | The project's own loss measure; without it, `affected x hours`. |
@@ -85,8 +85,8 @@ tickets first, then P0 to P3, then the oldest (docs/BRAIN.md).
 Per finding, on each read:
 
 - No open ticket carries the finding's marker
-  (`<!-- loom:health key=<sha1> -->`): it briefs one on the goal home through
-  `bus.brain brief`, with Difficulty medium, Size M, the quoted finding in
+  (`<!-- loom:health key=<sha1> -->`): it briefs one under the goal's intake
+  epic through `bus.brain brief`, with Difficulty medium, Size M, the quoted finding in
   Why, and the Live criterion "the finding is absent from the health endpoint for 24
   hours". At most 3 new tickets a pass, and never past the goal's cap
   (`LOOM_GOAL_CAP`).
@@ -94,6 +94,14 @@ Per finding, on each read:
   band, the ticket's `Priority:` line moves with it (a priority the brain
   set by hand stands until the band changes). When the numbers or the
   evidence change, it posts them, at most once every 6 hours.
+- An open ticket carries it, the ticket is shipped or verified, and the
+  finding is still reported 24 hours after `loom:shipped` was applied: the
+  fix did not work. The station re-briefs that ticket as a regression
+  through `bus.brain brief --regresses`, with the line "Regresses #N", the
+  hours since the ship, the numbers and the quoted finding. The ticket goes
+  back to the queue with `loom:regression`, inside the goal's regression
+  slot rules, at most once per ticket every 48 hours. A ticket still in a
+  build state (queued to merged) gets only the updates above.
 - The finding is gone and its ticket is open: one comment, "finding absent
   since <time>". That is the evidence the brain verifies against. The
   station never closes a ticket.

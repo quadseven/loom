@@ -22,9 +22,11 @@ build run's log, or a configuration change) plus the gates the goal's rules
 name, and those gates are read from the goal's REST endpoints. Follow the
 goal's ship and roll document step by step; when a gate stays closed and
 the rules allow an operator exception, ask for it once with the evidence
-(`bus.brain human`), and act on the answer. The lane machine's tick
-(`LOOM_BRAIN_SCOPE=live`) keeps only reads that require direct cluster or
-database access and are not served by the evidence endpoint. Never write to
+(`bus.brain human`), and act on the answer. The lane machine's tick runs
+the full tick (`LOOM_BRAIN_SCOPE=all`, decision 0002): it takes every stage
+whenever it holds the lock, and it also does the reads that require direct
+cluster or database access and are not served by the evidence endpoint.
+Never write to
 a live system except through those pull requests. When a step needs a fact
 no API serves, write what is needed on the ticket and leave it; never claim
 a live result you did not read yourself.
@@ -126,7 +128,7 @@ below; where the steps leave room, this is how to spend it.
    again; say "unchanged" and move on.
 8. Every failure the brain finds by hand becomes a factory ticket (Improving
    Loom itself), so the factory catches it next time without the brain. File
-   it in the same tick with `bus.brain brief` on the Loom goal home, quoting
+   it in the same tick with `bus.brain brief` under an open epic of the Loom goal home, quoting
    the evidence; a journal line that names a factory problem without a ticket
    number is a rule broken, and the next tick files it before anything else.
 9. Failed tickets get a decision every tick. For each ticket at loom:failed,
@@ -144,9 +146,10 @@ below; where the steps leave room, this is how to spend it.
     it with a comment when it has cleared, or labels it `loom:recurring`.
     "Watching" is not a decision.
 11. Stay inside the tick's time. Spend at most a quarter of it reading
-    (status, resume, goal homes), at most a quarter merging (when more
-    pull requests are ready, merge the oldest and defer the rest with the
-    merge stage), and the rest acting on the Priorities list. When the
+    (status, resume, goal homes), at most a quarter merging (merge every
+    ready pull request, oldest first, and defer only the ones that quarter
+    does not reach, with the merge stage), and the rest acting on the
+    Priorities list. When the
     budget runs out, defer what is left with markers; never skip a stage
     silently "on budget".
 12. The journal ends with what moved, counted: merged N, briefed N (with
@@ -216,7 +219,12 @@ live regression) and `brief` (a brief named but not written this tick).
 - Done: for each stage action you finish (a merge, a re-brief or close of a
   failed ticket, an answered ask, an admitted regression, a written brief), put the line
   from `python3 -m bus.brain done OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
-  in your journal.
+  in your journal. A written brief records its own done marker: `brief
+  --holder HOLDER` on a goal whose brief stage stands deferred posts a
+  journal on the goal home with the keyed `stage=brief` done line and the new
+  ticket, so you do not paste that line. Use `brief --resolves KEY` when more
+  than one brief defer is pending; the key is printed by `defer`. A refused
+  brief records nothing.
 - The newest marker for an item wins, and `resume` drops a defer whose
   item was closed or changed since (new commits, new comments, another
   state), so no brain repeats finished work. `status` shows, per goal and
@@ -229,10 +237,18 @@ Each `bus.brain step NAME` below may carry `--note "<one line>"`: what that
 step found or decided. The notes are the dashboard Brain view's "Thinking,
 this tick"; a step with no note shows nothing there.
 
-1. Run `python3 -m bus lock quadseven/loom --holder muse`. Stop if the lock
-   is held.
+1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30`.
+   Stop if the lock is held. The lock outlives the 25-minute tick, so no
+   other brain takes it mid-tick.
    Then run `python3 -m bus.brain step lock --holder muse`.
-2. First run `python3 -m bus.brain step status --holder muse`. Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+2. First run `python3 -m bus.brain step status --holder muse`. The first read
+   of every tick is the handoff packet: the comment marked
+   `<!-- loom:handoff v1 -->` on the Loom goal home, which the station
+   rebuilds each pass. It lists the last 5 ticks, the open defers, and the
+   Rules below with the commit they come from. Open defers of a brain no
+   longer ticking (the packet marks them open work for any brain) are
+   finished before new work, through `resume` as below.
+   Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
@@ -354,7 +370,20 @@ this tick"; a step with no note shows nothing there.
    work not merged yet (`brief --after '#5, owner/name#7'` writes the line,
    and the station holds the ticket until each of them is merged),
    regressions first, with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md`.
+   `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --holder muse`.
+   Every ticket goes under an open epic of its goal (decision 0003): `brief`
+   refuses without `--epic`, and for a closed, unlabelled or full epic (15
+   tickets). `status` lists each goal's open epics. When no open epic fits
+   the work, propose a new one within the cap of 6 open epics per goal with
+   `python3 -m bus.brain epic OWNER/NAME --goal N --title "Epic: SENTENCE" --file EPIC.md`
+   (a done-when and a size line in the body). When an epic's route is
+   unclear, chart a wayfinder map for it before filing work; resolve its
+   research and task tickets alone, and batch the questions only the
+   operator can answer into one daily ask, each with a recommended answer.
+   For each `close-epic` item resume lists (every ticket of the epic is
+   closed), check the epic's done-when and close it with
+   `python3 -m bus.brain close-epic OWNER/NAME#N --note TEXT`, or file the
+   ticket it is missing.
    Give each brief `--priority P0` to `P3` by how much it costs the goal
    while it stays unfixed (without it the ticket is P2); the station and the
    factory take P0 first. Read the Priorities and Health findings sections
@@ -374,12 +403,12 @@ this tick"; a step with no note shows nothing there.
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal, the rest get `loom:triage` and one comment naming
+   ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
    what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left, and only rewrites `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
-   `python3 -m bus.brain brief OWNER/NAME --goal N --title TITLE --file BODY.md --refs M`
+   `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket refs it, the original gets
    `loom:rewritten` and stays open) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file names
@@ -389,10 +418,15 @@ this tick"; a step with no note shows nothing there.
    remove the label and brief it the same way (`brief --refs M`). Never
    close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close.
-9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md`,
-   before unlocking. It states the goal's metrics against the last journal,
+9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md --holder muse`,
+   before unlocking. `--holder` adds the `Tick <UTC time>, muse` line after
+   the marker; without that line a peer reads the journal as another brain's
+   and stays to its resume items, and `journal` refuses it. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
+   A `- Decided: <one line>` line and a `- Model: <model>` line give the
+   handoff packet its line for this tick; without them it shows the first
+   line of prose and "model unknown".
    A step of this tick that failed or ran degraded gets its own line,
    `- Step <name>: failed <why>` or `- Step <name>: degraded <why>`, with
    the step's name from the list above (lock, status, merge, verify, failed,
@@ -440,23 +474,32 @@ Choose only lanes that lane status shows as available, by the ticket's
 Anthropic credits, easy work on the free lanes and Spark, the credit spent
 on hard work):
 
-- Easy: on a public repo muse first, then agy (the operator's priority;
-  muse runs remotely); then `spark` to `spark-4` (the local coders, two per
-  Spark box, `LOOM_SPARK_URL` and `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`,
+- Easy: `spark` to `spark-4` first (the operator's priority since
+  2026-10-17: two slots per Spark box, `LOOM_SPARK_URL` and
+  `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
   model `spark/...`, any repo, private ones included) when lane status shows
-  them available, else a
+  them available; then on a public repo muse, then agy (muse runs
+  remotely); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
   opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
   which trains on prompts).
   Never anthropic or claude for an easy ticket.
-- Medium: on a public repo muse first, then agy; then codex or opencode-go
-  (opencode-go-4 on public repos only); then a spark slot (Qwen3.8 27B, any
-  repo); an anthropic slot only when every codex, opencode-go and spark slot
-  already holds work.
-- Hard: anthropic, claude, agy (Gemini 4 Argon, public repos only) or codex,
-  never a free lane or spark. Keep the anthropic slots busy with hard work
+- Medium: a spark slot first (any repo); then on a public repo muse, then
+  agy; then codex or opencode-go (opencode-go-4 on public repos only); an
+  anthropic slot only when every spark, codex and opencode-go slot already
+  holds work.
+- Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,
+  public repos only) or codex, never a free lane. A hard ticket a spark
+  fails climbs the model ladder. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.
+
+A hard ticket with no `Model:` line runs its lane's strongest model, not the
+lane default: gpt-6-sol on codex and gemini-4-argon-high on agy (the table
+`HARD_MODELS` next to `TIERS` in bus/factory.py). A ticket pinned to
+claude-opus-5-5 on a public repo goes to agy with gemini-4-argon-high when
+every Anthropic lane is at a limit or down, never when they are merely busy
+(the table `EQUIVALENTS`), and its claim records Argon as the model it ran.
 
 When no lane of a ticket's tier is up (every one at a limit or down), the
 factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
@@ -504,7 +547,22 @@ it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
 2. the codex lane (or codex-2) with `gpt-6-sol`;
-3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
+3. `claude-opus-5-5` on the claude lane, else an anthropic slot;
+4. `gemini-4-argon-high` on agy, public repos only (the Opus equivalent and
+   agy's hard-tier model, bus/factory.py EQUIVALENTS and HARD_MODELS).
+
+A rung counts as tried once the ticket was claimed on its model. The model a
+claim ran is what ran: the `Model:` line in force (the ticket's own before the
+ladder started, then the ladder's moves), else the model the runner footer of
+its lane's pull request names (`lane <lane>, model <model>`), else the lane's
+configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
+Once a ticket ran on Opus or past it, it climbs only to the untried strong
+models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
+lane of its next rung is up, it waits with no comment; the factory says it
+tried every rung only once every rung with a lane for its repo was tried. A green, reviewed pull request is not escalated: a ticket
+whose open pull request has nothing to fix (its head is green, the review
+check passed on that head, and no review thread is open) is landed, whatever
+its fix rounds.
 
 The factory applies this ladder on its own (bus/factory.py, recorded as
 `<!-- loom:rung N -->` comments). For work the factory cannot see, such as a
@@ -516,7 +574,8 @@ factory has not already moved, in the same tick, whatever the time budget: it
 picks the lowest untried rung whose lane is free, rewrites the ticket's
 `Model:` line, swaps the lane label, comments the rung and the reason, and
 sends an open pull request back as a fix brief (`--file NOTES.md` adds your
-own notes to that brief). It refuses a ticket that is not repeatedly stuck.
+own notes to that brief). It refuses a ticket that is not repeatedly stuck,
+and one whose open pull request has nothing to fix.
 Past the third rung it adds `needs-brain` instead: rewrite the brief smaller,
 or ask the operator with one exact ask when only the operator can unblock it.
 `status` reads the history of at most 20 tickets per repo, the least recently
@@ -564,4 +623,10 @@ say-so alone:
   private repo names.
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
-- Never retry a failed step in the same tick. Stop at 15 minutes.
+- Never retry a failed step in the same tick. Stop at 25 minutes.
+- Never open a pull request for an issue that is not a Loom ticket. To get
+  code written, brief a ticket and let a lane take it. The station lands,
+  sends back and reconciles only pull requests linked to a ticket, so a pull
+  request outside one sits with no owner
+  (docs/decisions/0002-floating-brain-and-brain-memory.md). The remote pull
+  lane is the one way Muse writes code, and `bus.lane pr` links its ticket.

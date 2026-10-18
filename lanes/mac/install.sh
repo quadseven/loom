@@ -32,6 +32,7 @@ if [ -z "${LOOM_REWRITE_PRIVATE_CMD:-}" ] && [ -n "$LOOM_CODEX_MODEL" ]; then
   LOOM_REWRITE_PRIVATE_CMD="lanes/rewrite_agent.sh - codex/$LOOM_CODEX_MODEL"
 fi
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
+LOOM_MUSE_MODEL="${LOOM_MUSE_MODEL:-muse-spark-1.3}"
 LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1:free}"
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
 LOOM_OPENCODE_GO_3_MODEL="${LOOM_OPENCODE_GO_3_MODEL:-opencode-go/deepseek-v4.1-flash}"
@@ -94,6 +95,16 @@ loom_env() {
   done
 }
 
+# Each lane's model settings (LOOM_<LANE>_MODEL and LOOM_<LANE>_MODELS), for
+# the station: its factory reads what a lane ran from them when a claim had
+# no Model: line and no runner footer names it (bus/brain.py _lane_model).
+model_env() {
+  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+    case "$k" in LOOM_BRAIN_MODEL) continue ;; LOOM_*_MODEL|LOOM_*_MODELS) ;; *) continue ;; esac
+    printf '    <key>%s</key><string>%s</string>\n' "$k" "$(xml "$v")"
+  done
+}
+
 for L in "${LANES[@]}"; do
   LABEL="com.loom.$L"
   if runner_busy "$LOOM_HOME/run/$L.lock"; then
@@ -138,7 +149,9 @@ done
 # turns briefed ticket issues into local briefs and reports outcomes
 # (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
-# with LOOM_REPOS empty it stays idle. It also reads LOOM_STATUS_REPO (default:
+# with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default empty)
+# names another operator's logins whose loom:ticket briefs it builds without
+# adopting their claims (docs/LANES.md, Trusted briefers). It also reads LOOM_STATUS_REPO (default:
 # this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
 # LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
 # default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
@@ -161,10 +174,16 @@ done
 # LOOM_SELF_REPO (the repo this checkout deploys from, default LOOM_STATUS_REPO:
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and
+# LOOM_ROLL_SHIP_DOCS (goal ship documents for module source pins), and
+# LOOM_PIN_SHIP_REPOS (deployment repos whose merged pin pull requests ship
+# the tickets they deploy, docs/BRAIN.md), and
 # LOOM_EVIDENCE_CMDS (private JSON map of repo to read-only log command for
 # verify briefs, docs/LANES.md Verify runs), and
 # LOOM_INVARIANT_GOAL and LOOM_PLAN_CHECK (the goal home invariant breaches
-# are filed on, and the review bot's plan check, docs/LANES.md Invariants). Runs from
+# are filed on, and the review bot's plan check, docs/LANES.md Invariants), and
+# LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_SSM
+# (a GitHub App installation token instead of the personal one, minted from
+# the key in that SSM parameter, docs/LANES.md; all three or none). Runs from
 # this checkout, like the lanes, through
 # lanes/mac/station.sh, which first fast-forwards the checkout to its default
 # branch once that head passed CI (LOOM_DEPLOY=0 turns it off).
@@ -195,10 +214,13 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REWRITE_OPENCODE</key><string>$(xml "${LOOM_REWRITE_OPENCODE:-$HOME/.opencode/bin/opencode}")</string>
     <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
+    <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
     <key>LOOM_STATUS_REPO</key><string>$(xml "${LOOM_STATUS_REPO:-}")</string>
     <key>LOOM_SELF_REPO</key><string>$(xml "${LOOM_SELF_REPO:-}")</string>
     <key>LOOM_PIN_TARGETS</key><string>$(xml "${LOOM_PIN_TARGETS:-}")</string>
+    <key>LOOM_ROLL_SHIP_DOCS</key><string>$(xml "${LOOM_ROLL_SHIP_DOCS:-}")</string>
+    <key>LOOM_PIN_SHIP_REPOS</key><string>$(xml "${LOOM_PIN_SHIP_REPOS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
@@ -223,6 +245,10 @@ cat > "$PLIST" <<EOF
     <key>LOOM_REWRITE_CLAUDE_TOKEN_SSM</key><string>$(xml "${LOOM_REWRITE_CLAUDE_TOKEN_SSM:-}")</string>
     <key>LOOM_INVARIANT_GOAL</key><string>$(xml "${LOOM_INVARIANT_GOAL:-}")</string>
     <key>LOOM_PLAN_CHECK</key><string>$(xml "${LOOM_PLAN_CHECK:-}")</string>
+    <key>LOOM_GITHUB_APP_ID</key><string>$(xml "${LOOM_GITHUB_APP_ID:-}")</string>
+    <key>LOOM_GITHUB_APP_INSTALLATION_ID</key><string>$(xml "${LOOM_GITHUB_APP_INSTALLATION_ID:-}")</string>
+    <key>LOOM_GITHUB_APP_KEY_SSM</key><string>$(xml "${LOOM_GITHUB_APP_KEY_SSM:-}")</string>
+$(model_env)
   </dict>
 </dict>
 </plist>
@@ -237,9 +263,12 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bus station; idle unless LOOM_REPOS is set)"
 
 # The brain tick (lanes/mac/brain.sh): every LOOM_BRAIN_INTERVAL seconds
-# (default 1800), take the brain lock and run one docs/MUSE.md tick with the
-# claude CLI. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
-# LOOM_AWS_REGION and LOOM_BRAIN_* from the installing environment; with
+# (default 1800), take the brain lock and run one docs/MUSE.md tick on the
+# first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
+# usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
+# LOOM_TRUSTED_BRIEFERS,
+# LOOM_AWS_REGION, LOOM_BRAIN_* and the rungs' LOOM_CODEX_MODEL,
+# LOOM_SPARK_MODEL and LOOM_SPARK_URL from the installing environment; with
 # LOOM_REPOS empty it stays idle. LOOM_BRAIN=0 skips it and removes an
 # installed one.
 LABEL="com.loom.brain"
@@ -267,7 +296,7 @@ else
   <key>StandardErrorPath</key><string>$X_LOOM/logs/brain-service.log</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>$X_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>$X_HOME/.local/bin:$X_HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
 $(loom_env)

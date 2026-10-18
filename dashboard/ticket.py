@@ -307,6 +307,15 @@ STATE_TONE = {"queued": "dim", "briefed": "body", "running": "accent", "pr": "ac
               "shipped": "info", "verified": "good", "failed": "bad"}
 
 
+def _parentage(epic, goal):
+    """" / epic Y / goal X": where the ticket sits (decision 0003)."""
+    out = ""
+    for word, ref in (("epic", epic), ("goal", goal)):
+        if ref and "#" in str(ref):
+            out += " / %s %s" % (word, _esc(_short(*str(ref).split("#"))))
+    return out
+
+
 def _header(record, runs):
     repo, number = record.get("repo", ""), record.get("number", "")
     state = str(record.get("state") or "queued")
@@ -324,7 +333,7 @@ def _header(record, runs):
             '<span class="tone-%s">%s</span></div><div class="ticket-ids">%s%s</div><h2>%s</h2>'
             '<p class="machine-fact">%s</p><div class="state-strip" aria-label="Ticket states">%s</div></div>') % (
                 STATE_TONE.get(state, "dim"), _esc(flag), _esc(_short(repo, number)),
-                " / goal %s" % _esc(_short(*goal.split("#"))) if goal and "#" in goal else "",
+                _parentage(record.get("epic"), goal),
                 _esc(record.get("title")), _esc(" / ".join(meta)), "".join(strip))
 
 

@@ -20,6 +20,22 @@ ME = {"login": "alice-example"}
 CLAIM = {"body": "Claimed for lane claude (body sha256 0123456789ab)", "user": ME}
 ALL_RUNGS = [c for n in (1, 2, 3) for c in ({"body": factory.RUNG_MARKER % n, "user": ME}, CLAIM)]
 STRANGER = {"login": "mallory-example"}
+# Every Anthropic lane, and claude: no rung of claude-opus-5-5 is up.
+NO_OPUS = ("claude",) + factory.ANTHROPIC
+
+
+def lane_models(**models):
+    """The lanes' configured model settings (LOOM_<LANE>_MODEL) for a test,
+    and no others."""
+    env = {k: v for k, v in os.environ.items() if not re.fullmatch(r"LOOM_\w+_MODEL", k)}
+    env.update({"LOOM_%s_MODEL" % lane.upper(): model for lane, model in models.items()})
+    return mock.patch.dict(os.environ, env, clear=True)
+
+
+def footer(lane, model, number=5):
+    """A lane pull request body with the runner's footer (lanes/run_lane.sh)."""
+    return ("## Why\nx\n\n---\nLoom ticket example-org.example-repo-%d, lane %s, model %s.\n"
+            "Refs %s#%d\n" % (number, lane, model, REPO, number))
 
 
 def iso(seconds_ago):
@@ -324,7 +340,7 @@ class PullRequests(Base):
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertNotEqual(self.lane(5), "muse")
-        self.assertEqual(self.lane(5), "codex")
+        self.assertEqual(self.lane(5), "spark")
 
     def test_a_thread_that_survives_a_fix_round_climbs_to_the_first_rung(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
@@ -415,19 +431,111 @@ class PullRequests(Base):
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.moved, [(5, "failed", None)])
 
-    def test_a_move_to_a_lower_rung_than_one_reached_flags_the_ticket_runaway(self):
+    def test_a_ticket_past_opus_climbs_to_an_untried_strong_model_never_down_to_sonnet(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 3, "user": ME}, CLAIM,
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.go()
-        self.assertEqual((self.fixed, self.moved), ([], []))
-        self.assertIn("loom:runaway", [x["name"] for x in self.gh.issues[5]["labels"]])
-        self.assertEqual(self.model(5), None)
-        note = self.gh.comments[5][-1]["body"]
-        self.assertIn("Runaway: ladder move from rung 3 down to rung 1.", note)
-        self.assertIn("| Time | Lane | Model | Reason |", note)
-        self.assertNotIn("loom:rung", note)
+        self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
+        self.assertNotIn("loom:runaway", [x["name"] for x in self.gh.issues[5]["labels"]])
+        self.assertIn("rung 2, gpt-6-sol on lane codex", self.gh.comments[5][-1]["body"])
+
+    def test_on_a_public_repo_every_ladder_rung_tried_climbs_to_gemini_argon(self):
+        self.gh.private = False
+        self.gh.ticket(5, "pr", lane="claude")
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual(self.moved, [])
+        self.assertEqual((self.lane(5), self.model(5)), ("agy", "gemini-4-argon-high"))
+        self.assertIn(factory.RUNG_MARKER % 4, self.gh.comments[5][-1]["body"])
+
+    def test_the_give_up_note_names_the_models_the_ticket_ran_on(self):
+        notes = []
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"],
+                            merge=lambda *a: None, fix=lambda *a, **k: None,
+                            move=lambda gh, repo, number, state, lane=None, note=None:
+                            notes.append(note))
+        f.run()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("tried every rung", notes[0])
+        self.assertIn("ran on claude-sonnet-5-5, gpt-6-sol, claude-opus-5-5", notes[0])
+
+    def opus_runs(self, body="", private=False):
+        """Ticket #5 on lane claude with no Model: line, five runs each with a
+        fix round after it, and its pull request #50 (2026-10-17: lane claude
+        ran claude-opus-5-5 five times)."""
+        self.gh.private = private
+        self.gh.ticket(5, "pr", lane="claude")
+        for _ in range(5):
+            self.gh.comments[5] += [CLAIM, {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False, body=body)
+
+    def test_five_runs_on_a_lane_set_to_opus_are_recorded_as_opus_and_climb_to_an_untried_model(self):
+        # What ran comes from the pull request's runner footer, else from the
+        # lane's configured model; never from a fixed lane-to-model map.
+        for name, body, models in (("footer", footer("claude", "claude-opus-5-5"), {}),
+                                   ("setting", "", {"claude": "claude-opus-5-5"})):
+            with self.subTest(name), lane_models(**models):
+                self.setUp()
+                self.opus_runs(body)
+                issue, comments = dict(self.gh.issues[5]), list(self.gh.comments[5])
+                # No codex lane is up: Gemini 4 Argon high, never Opus again.
+                self.go(limited=("codex", "codex-2"))
+                self.assertEqual((self.lane(5), self.model(5)), ("agy", "gemini-4-argon-high"))
+                self.assertEqual(self.moved, [])
+                ran = factory.claim_models(issue, comments, factory.footer_run(body))
+                self.assertEqual([m for c, m in ran if c], ["claude-opus-5-5"] * 5)
+            with self.subTest(name + ", private"), lane_models(**models):
+                self.setUp()
+                self.opus_runs(body, private=True)
+                self.go()
+                self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
+
+    def test_a_fork_or_stranger_footer_or_an_unknown_model_never_steers_the_ladder(self):
+        opus = footer("claude", "claude-opus-5-5")
+        self.assertEqual(factory.footer_run(opus, env={}), ("claude", "claude-opus-5-5"))
+        self.assertIsNone(factory.footer_run(footer("claude", "claude-opus-9-9"), env={}))
+        self.assertEqual(factory.footer_run(footer("spark", "spark/local-1"),
+                                            env={"LOOM_SPARK_MODEL": "spark/local-1"}),
+                         ("spark", "spark/local-1"))
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+        own = {"user": ME, "body": opus, "head": {"repo": {"full_name": REPO}}}
+        self.assertEqual(f._footer(REPO, own), ("claude", "claude-opus-5-5"))
+        self.assertIsNone(f._footer(REPO, dict(own, user=STRANGER)))
+        self.assertIsNone(f._footer(REPO, dict(own, head={"repo": {"full_name": "someone-else/fork"}})))
+        # Ignored, the claims name no model, and the climb starts at rung 1.
+        for name, body, head in (("unknown model", footer("claude", "claude-opus-9-9"), REPO),
+                                 ("fork", opus, "someone-else/fork")):
+            with self.subTest(name), lane_models():
+                self.setUp()
+                self.opus_runs(body)
+                self.gh.pulls[50]["head"]["repo"] = {"full_name": head}
+                self.go(limited=("codex", "codex-2"))
+                self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
+
+    def test_with_no_lane_up_for_the_next_rung_the_ticket_waits_and_nothing_is_posted(self):
+        # 2026-10-17: no codex lane was free for rung 2, and the factory said it
+        # tried every rung and moved the ticket to failed.
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        posted = len(self.gh.comments[5])
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertEqual(len(self.gh.comments[5]), posted)
+        self.assertFalse([w for w in self.gh.writes if "tried every rung" in str(w)])
+        self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
+        # Once a lane of the next rung is up, it climbs there.
+        self.go(limited=NO_OPUS)
+        self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
+        self.assertEqual(self.moved, [])
 
     def test_a_runaway_ticket_is_not_climbed_or_given_up_on(self):
         self.gh.ticket(5, "pr", lane="claude")
@@ -558,6 +666,44 @@ class PullRequests(Base):
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
         self.assertEqual(self.gh.comments[50][-1]["body"], "Superseded by #51.")
         self.assertEqual(self.merged, [])
+
+    def test_old_merge_does_not_supersede_regression_pull_request(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["labels"].append({"name": "loom:regression"})
+        self.gh.events[5].append({"event": "labeled", "label": {"name": "loom:briefed"},
+                                  "created_at": iso(60)})
+        self.gh.pull(51, 5, state="closed", merged_at=iso(120), merged=True)
+        self.gh.pull(50, 5, created=30, updated=30, branch="loom/5-some-title-r2")
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+
+    def test_missing_merged_pull_details_leave_regression_pull_open(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["labels"].append({"name": "loom:regression"})
+        self.gh.pull(51, 5, state="closed", merged_at=iso(120), merged=True)
+        self.gh.pull(50, 5, branch="loom/5-some-title-r2")
+        original_get = self.gh._get
+
+        def get_without_old_pull(path):
+            if path.endswith("/pulls/51"):
+                return Response(200, None)
+            return original_get(path)
+
+        with mock.patch.object(self.gh, "_get", side_effect=get_without_old_pull):
+            self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+
+    def test_merge_after_regression_requeue_supersedes_duplicate(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["labels"].append({"name": "loom:regression"})
+        self.gh.events[5].append({"event": "labeled", "label": {"name": "loom:briefed"},
+                                  "created_at": iso(120)})
+        self.gh.pull(51, 5, state="closed", merged_at=iso(60), merged=True)
+        self.gh.pull(50, 5, created=30, updated=30, branch="loom/5-some-title-r2")
+        self.go()
+        self.assertEqual(self.closed, [(50, "Superseded by #51.")])
 
     def test_lane_pull_request_closed_when_its_closed_ticket_shipped_elsewhere(self):
         self.gh.ticket(5, "shipped")
@@ -1005,6 +1151,45 @@ class Queued(Base):
         self.assign(available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
 
+    OPUS = "Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n"
+    OUT = factory.ANTHROPIC + ("claude",)
+
+    def test_opus_pin_goes_to_agy_with_argon_when_every_anthropic_lane_is_out(self):
+        self.gh.private = False
+        self.queued(7, body=self.OPUS)
+        self.gh.comments[7] = [{"body": factory.RUNG_MARKER % 3, "user": ME}]
+        self.assign(limited=self.OUT)
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "agy", "gemini-4-argon-high"))
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("equivalent: Gemini 4 Argon high, index 53, while every Anthropic "
+                      "lane is out", note)
+        # The claim after the move ran Argon, and the opus rung stays untried.
+        comments = self.gh.comments[7] + [CLAIM]
+        self.assertEqual(factory.ran_models(self.gh.issues[7], comments),
+                         {"gemini-4-argon-high"})
+        self.assertEqual(factory.tried_rungs(comments), set())
+
+    def test_opus_pin_on_a_private_repo_waits_when_every_anthropic_lane_is_out(self):
+        self.gh.private = True
+        self.queued(7, body=self.OPUS)
+        self.assign(limited=self.OUT)
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-opus-5-5"))
+
+    def test_opus_pin_waits_when_anthropic_lanes_are_only_busy(self):
+        self.gh.private = False
+        for n, lane in enumerate(self.OUT, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.gh.ticket(30, "briefed", lane="agy")
+        self.queued(7, body=self.OPUS)
+        self.assign()
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-opus-5-5"))
+        self.gh.issues[30]["labels"][1] = {"name": "loom:merged"}
+        self.assign()
+        self.assertEqual((self.lane(7), self.model(7)), ("agy", "claude-opus-5-5"))
+
     def test_future_not_before_stays_queued(self):
         self.queued(7, body="Not before: 2099-01-01T00:00:00Z\nDifficulty: medium\n\n## Why\nx\n")
         self.assign(available=["codex"])
@@ -1033,6 +1218,28 @@ class Queued(Base):
         self.queued(7)
         self.assign(limited=["codex"], available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
+
+    def test_a_pass_that_assigns_no_queued_ticket_says_why_for_the_first(self):
+        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n", age=600)
+        self.queued(8, age=60)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=[])
+        say.assert_called_with("assigned 0 of 2 queued: %s#7 waits: no free lane takes "
+                               "model claude-opus-5-5" % REPO)
+
+    def test_a_queued_ticket_with_no_free_tier_lane_names_its_tier(self):
+        self.queued(7)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=[])
+        say.assert_called_once_with("assigned 0 of 1 queued: %s#7 waits: no free lane "
+                                    "in tier medium" % REPO)
+
+    def test_a_pass_that_assigns_a_queued_ticket_says_no_count(self):
+        self.queued(7, age=600)
+        self.queued(8, age=60)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=["codex"])
+        self.assertFalse([c for c in say.call_args_list if "assigned 0 of" in c.args[0]])
 
 
     def test_a_queued_medium_ticket_whose_tier_is_at_a_limit_falls_back(self):
@@ -1081,9 +1288,13 @@ class Tickets(Base):
         return {"body": "Lane zai failed: [work] agent made no commit and wrote no reason "
                         "on loom/%d-x" % number, "user": ME}
 
+    # Its claim on lane zai, which runs no ladder model: a claim on lane claude
+    # would count rung 1 as tried (factory.ran_rungs).
+    ZAI_CLAIM = {"body": "Claimed for lane zai (body sha256 0123456789ab)", "user": ME}
+
     def test_a_first_no_reason_no_commit_failure_climbs(self):
         self.gh.ticket(6, "failed", lane="zai")
-        self.gh.comments[6] += [CLAIM, self.no_reason_failure(6)]
+        self.gh.comments[6] += [self.ZAI_CLAIM, self.no_reason_failure(6)]
         self.go()
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
 
@@ -1104,14 +1315,14 @@ class Tickets(Base):
     def test_a_no_reason_failure_after_a_ladder_restart_climbs_again(self):
         self.gh.ticket(6, "failed", lane="zai")
         self.gh.comments[6] += [self.no_reason_failure(6), {"body": factory.RUNG_MARKER % 0, "user": ME},
-                                CLAIM, self.no_reason_failure(6)]
+                                self.ZAI_CLAIM, self.no_reason_failure(6)]
         self.go()
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
 
     def test_a_stranger_cannot_hold_a_ticket_with_a_no_reason_comment(self):
         self.gh.ticket(6, "failed", lane="zai")
         forged = dict(self.no_reason_failure(6), user=STRANGER)
-        self.gh.comments[6] += [forged, CLAIM, self.no_reason_failure(6)]
+        self.gh.comments[6] += [forged, self.ZAI_CLAIM, self.no_reason_failure(6)]
         self.go()
         self.assertEqual(self.moved, [(6, "briefed", "claude")])
 
@@ -1129,7 +1340,7 @@ class Tickets(Base):
     def test_a_briefed_ticket_nobody_claims_moves_within_its_tier(self):
         self.stalled(7)
         self.go()
-        self.assertEqual((self.lane(7), self.model(7)), ("codex-2", None))
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", None))
         self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
 
     def test_a_stalled_rung_two_ticket_moves_to_the_other_rung_two_lane(self):
@@ -1149,18 +1360,18 @@ class Tickets(Base):
     def test_a_moved_stalled_ticket_waits_a_full_stall_on_its_new_lane(self):
         self.stalled(7)
         self.go()
-        self.assertEqual(self.lane(7), "codex-2")
-        self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:codex-2"},
+        self.assertEqual(self.lane(7), "spark")
+        self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:spark"},
                                   "created_at": iso(0)})
         self.go()
-        self.assertEqual((self.lane(7), len(self.gh.comments[7])), ("codex-2", 1))
+        self.assertEqual((self.lane(7), len(self.gh.comments[7])), ("spark", 1))
 
     def test_a_moved_stalled_ticket_moves_again_after_another_stall(self):
         self.stalled(7)
         self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:codex"},
                                   "created_at": iso(factory.BRIEFED_STALL + 60)})
         self.go()
-        self.assertEqual(self.lane(7), "codex-2")
+        self.assertEqual(self.lane(7), "spark")
 
     def test_a_stall_with_no_available_lane_stays_briefed(self):
         self.stalled(7)
@@ -1265,13 +1476,15 @@ class Tickets(Base):
         self.limited_easy(limited=("spark",))
         self.assertEqual(self.lane(7), "spark-2")
 
-    def test_muse_then_agy_take_public_easy_and_medium_tickets_first(self):
-        # The operator's priority (2026-10-14): Muse's and agy's allowances
-        # are spent first; a private repo's ticket never reaches either.
-        self.assertEqual(factory.TIERS["easy"][:2], ("muse", "agy"))
-        self.assertEqual(factory.TIERS["medium"][:2], ("muse", "agy"))
-        self.assertEqual(factory.lanes_of("easy", True)[0], "spark")
-        self.assertEqual(factory.lanes_of("medium", True)[0], "codex")
+    def test_the_sparks_take_every_tier_first_then_muse_and_agy(self):
+        # The operator's priority (2026-10-17): the Sparks first in every tier;
+        # then Muse's and agy's allowances on public repos (2026-10-14). A
+        # private repo's ticket never reaches Muse or agy.
+        for tier in ("easy", "medium", "hard"):
+            self.assertEqual(factory.TIERS[tier][:4], factory.SPARKS, tier)
+        self.assertEqual(factory.TIERS["easy"][4:6], ("muse", "agy"))
+        self.assertEqual(factory.TIERS["medium"][4:6], ("muse", "agy"))
+        self.assertEqual(factory.lanes_of("medium", True)[4], "codex")
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
@@ -1300,7 +1513,7 @@ class Tickets(Base):
         self.gh.ticket(7, "briefed", lane="codex", body=body)
         self.gh.ticket(8, "briefed", lane="codex", body=body)
         self.go(limited=["codex"])
-        self.assertEqual(sorted((self.lane(7), self.lane(8))), ["codex-2", "opencode-go"])
+        self.assertEqual(sorted((self.lane(7), self.lane(8))), ["spark", "spark-2"])
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
         for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"), 20):
@@ -1359,7 +1572,7 @@ class Tickets(Base):
         self.limited_medium()
         self.assertEqual(self.lane(7), "claude")
         self.go(limited=["claude"])
-        self.assertEqual(self.lane(7), "codex")
+        self.assertEqual(self.lane(7), "spark")
         self.assertIn("in its difficulty tier", self.gh.comments[7][-1]["body"])
 
     def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
@@ -1401,6 +1614,54 @@ class Tickets(Base):
         moved = [n for n in range(1, 6) if self.lane(n) != "claude"]
         self.assertTrue(all(self.model(n) == "gpt-6-sol" for n in moved))
 
+    def escalated_after_sol(self, number, state):
+        """A ticket whose first attempts ran on gpt-6-sol (its Model: line, two
+        codex claims, no rung marker) and that the brain escalated to rung 1."""
+        self.gh.ticket(number, state, lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        sol_claim = {"body": "Claimed for lane codex (body sha256 0123456789ab)", "user": ME}
+        self.gh.comments[number] += [sol_claim, sol_claim, {
+            "body": "<!-- loom:escalate v1 -->\nEscalated to rung 1 of 3: claude-sonnet-5-5 "
+                    "on lane claude.\nReason: 2 fix rounds (attempts 2, tried gpt-6-sol).\n"
+                    "Rung: 1 claude-sonnet-5-5 claude", "user": ME}]
+
+    @lane_models(codex="gpt-6-sol")
+    def test_a_ticket_that_ran_on_sol_is_never_spread_back_to_sol(self):
+        # 2026-10-16: three attempts on gpt-6-sol with no rung marker, escalated
+        # to rung 1, then spread off the busy claude lane to gpt-6-sol again.
+        for n in range(1, 4):
+            self.gh.ticket(n, "briefed", lane="claude")
+        self.escalated_after_sol(7, "briefed")
+        self.go()
+        self.assertNotIn(self.lane(7), ("codex", "codex-2"))
+        self.assertNotEqual(self.model(7), "gpt-6-sol")
+        self.assertIn((self.lane(7), self.model(7)),
+                      [("claude", "claude-sonnet-5-5")]
+                      + [(lane, "claude-opus-5-5") for lane in factory.ANTHROPIC])
+        self.go(limited=factory.ANTHROPIC)  # rung 3 full: it waits on its rung
+        self.assertNotEqual(self.model(7), "gpt-6-sol")
+
+    @lane_models(codex="gpt-6-sol")
+    def test_a_ticket_that_ran_on_sol_climbs_past_sol_when_it_fails(self):
+        self.escalated_after_sol(7, "failed")
+        self.gh.comments[7].append(CLAIM)  # it ran on rung 1 and failed there
+        self.go()
+        self.assertEqual(self.model(7), "claude-opus-5-5")
+        self.assertIn("rung 3", self.gh.comments[7][-1]["body"])
+
+    @lane_models(claude="claude-sonnet-5-5", codex="gpt-6-sol")
+    def test_ran_models_reads_claims_the_model_line_and_markers(self):
+        sol = {"body": "Claimed for lane codex (body sha256 0123456789ab)"}
+        opus = {"body": "Model: claude-opus-5-5\n\n## Why\nx\n"}
+        self.assertEqual(factory.ran_models(opus, [CLAIM]), {"claude-opus-5-5"})
+        # With no Model: line, a claim ran on its lane's configured model.
+        self.assertEqual(factory.ran_rungs({"body": "x"}, [sol, CLAIM]), {1, 2})
+        marked = [sol, {"body": factory.RUNG_MARKER % 3}, CLAIM]
+        self.assertEqual(factory.ran_models(opus, marked), {"gpt-6-sol", "claude-opus-5-5"})
+        # A rung 0 marker starts the ladder again; an unclaimed ticket ran on nothing.
+        self.assertEqual(factory.ran_models(opus, [sol, {"body": factory.RUNG_MARKER % 0}]), set())
+        self.assertEqual(factory.ran_models(opus, []), set())
+
     def test_a_first_brief_is_never_spread(self):
         for n in range(1, 6):
             self.gh.ticket(n, "briefed", lane="claude")
@@ -1427,12 +1688,15 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.next_rung(set(), {"claude": 2}), 2)
         self.assertEqual(factory.next_rung(set(), busy), 3)
         self.assertEqual(factory.next_rung({1}, {"codex": 0}), 2)
-        self.assertEqual(factory.next_rung({3}, {}), 1)
-        self.assertEqual(factory.next_rung({1, 2, 3}, {}), 0)
+        # Past Opus only the untried strong models are left: sol, then Argon.
+        self.assertEqual(factory.next_rung({3}, {}), 2)
+        self.assertEqual(factory.next_rung({1, 2, 3}, {}), 4)
+        self.assertEqual(factory.next_rung({1, 2, 3, 4}, {}), 0)
         # Every untried rung busy: wait on the least loaded one.
-        all_busy = dict(busy, **{lane: 2 for lane in factory.ANTHROPIC})
+        all_busy = dict(busy, agy=2, **{lane: 2 for lane in factory.ANTHROPIC})
         self.assertEqual(factory.next_rung({1}, all_busy), 2)
         self.assertEqual(factory.next_rung(set(), dict(all_busy, claude=30)), 2)
+        self.assertEqual(factory.next_rung({1}, dict(all_busy, agy=0)), 4)
 
     def test_the_tiers_match_the_lane_choice_in_muse_md(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1515,7 +1779,7 @@ class Helpers(unittest.TestCase):
 
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
-                         no_test_repos=(), available=None):
+                         no_test_repos=(), available=None, briefers=()):
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
 
@@ -1552,6 +1816,49 @@ class Helpers(unittest.TestCase):
                 settings.factory_on = False
                 st.assign_queued()
                 self.assertEqual(make_factory.return_value.assign_queued.call_count, 2)
+
+
+class DeadLane(unittest.TestCase):
+    def comments(self, *bodies):
+        at = "2026-10-17T05:00:00Z"
+        return [{"body": b, "created_at": at} for b in bodies]
+
+    def test_claims_after_the_last_brief_are_the_attempts(self):
+        comments = self.comments(
+            "The station gave this queued ticket lane spark (tier medium).",
+            "Claimed for lane spark (body sha256 0123456789ab)",
+            "Not a failure (lane spark is at a limit): the factory moved this "
+            "ticket to lane codex-2, in its difficulty tier.",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)",
+            "Runaway: three attempts within six hours.")
+        self.assertEqual(factory.attempts_since_brief(comments),
+                         [(a[0], a[1], "codex-2", "") for a in
+                          factory.attempts(comments)[-2:]])
+        self.assertEqual(factory.dead_lane(comments), "codex-2")
+
+    def test_attempts_on_two_lanes_are_not_one_dead_lane(self):
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)")
+        self.assertIsNone(factory.dead_lane(comments))
+
+    def test_no_claims_is_not_one_dead_lane(self):
+        self.assertIsNone(factory.dead_lane(self.comments("Runaway: three attempts.")))
+
+    def test_a_retry_and_a_ladder_move_are_briefs(self):
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+            "codex-2. Lane codex failed: [transient] agent exited 1",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)")
+        self.assertEqual(factory.dead_lane(comments), "codex-2")
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "<!-- loom:rung 2 -->\nRepeatedly stuck (x): the factory moved this ticket "
+            "up the model ladder to rung 2, gpt-6-sol on lane codex.",
+            "Claimed for lane codex (body sha256 0123456789ab)")
+        self.assertEqual(factory.dead_lane(comments), "codex")
 
 
 if __name__ == "__main__":
