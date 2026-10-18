@@ -1988,12 +1988,18 @@ class Station:
                 and tickets.brief_author_trusted(i, self.s.authors, self.s.briefers)
                 and not self._owned_elsewhere(repo, i)]
 
-    def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]]) -> set:
+    def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]],
+                      counts: Dict[Tuple[str, int], int]) -> set:
         """The lanes a queued ticket of the repo may be given: its model's
-        lanes, else its difficulty tier's."""
+        lanes, else its difficulty tier's. A ticket the unproven-work gate
+        refuses wants no lane: holding its lanes from verify runs too left
+        the goal's shipped work stuck over the limit (2026-10-18)."""
+        limit = brain.unverified_limit()
         lanes: set = set()
         for issue in issues:
             if "loom:queued" not in _label_names(issue):
+                continue
+            if self._unproven_gate(repo, issue, limit, counts) is not None:
                 continue
             model = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
             if model:
@@ -2026,9 +2032,10 @@ class Station:
         build work could take, or a failed audit holds)."""
         held = set(self._audit_holds())
         shipped: List[Tuple[str, Dict[str, Any]]] = []
+        counts: Dict[Tuple[str, int], int] = {}
         for repo in self._verify_repos():
             issues = self._tickets_open(repo)
-            held |= self._queued_lanes(repo, issues)
+            held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
