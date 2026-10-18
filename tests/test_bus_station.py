@@ -6124,6 +6124,28 @@ class UnprovenGateTest(unittest.TestCase):
             self.assertEqual(self.run_pass(), 0)
         self.assertIn("codex", handed.call_args[0][1])
 
+    def test_a_queued_ticket_the_gate_refuses_does_not_hold_its_lanes_from_verify(self):
+        # 2026-10-18: a queued hard ticket under an over-limit goal named
+        # every lane of its tier as wanted for build work, so those lanes
+        # took no verify run either and the goal's shipped work never shrank.
+        self.over_limit()
+        for n in self.fake.sub_issues[self.GOAL]:
+            n["user"] = {"login": "alice-example"}
+        self.fake.issues[7] = {
+            "number": 7, "title": "Fix the thing", "state": "open",
+            "body": BODY + "\nPart of #%d\n" % self.GOAL,
+            "user": {"login": "alice-example"}, "created_at": "2030-01-01T00:00:00Z",
+            "updated_at": "2030-01-01T00:00:00Z",
+            "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}
+        self.fake.comments[7] = []
+        self.fake.events[7] = []
+        st = station.Station(self.gh(), self.settings)
+        st.claim_new()
+        self.assertIn("loom:queued", self.fake.names(7))
+        inbox = st.inbox("codex")
+        names = os.listdir(inbox) if os.path.isdir(inbox) else []
+        self.assertTrue(any("-verify-" in n for n in names), names)
+
     def epic(self, number, goal=None):
         self.fake.issues[number] = {"number": number, "title": "Epic: a part of the goal",
                                     "state": "open", "labels": [{"name": "epic"}],
