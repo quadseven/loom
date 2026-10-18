@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from . import audit
 from . import brain_memory
 from . import factory
+from . import friction_intake
 from . import evidence
 from . import handoff
 from . import health
@@ -423,6 +424,7 @@ class Settings:
                  report_digest: Sequence[Tuple[int, int]] = (),
                  health_urls: str = "",
                  health_every: int = health.EVERY,
+                 friction_mode: str = "",
                  evidence_cmds: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = (),
@@ -442,6 +444,10 @@ class Settings:
         # endpoint (bus/health.py, docs/HEALTH.md), read every health_every s.
         self.health_urls = health_urls
         self.health_every = health_every
+        # LOOM_FRICTION_INTAKE: "on" files a ticket for a slowdown the tick
+        # journals keep naming, "dry" logs what it would file, "" is off
+        # (bus/friction_intake.py).
+        self.friction_mode = friction_mode
         self.evidence_cmds = evidence_cmds or {}
         self.roll_ship_docs = roll_ship_docs or []
         # Local times (hour, minute) to send one digest of every goal's
@@ -549,6 +555,7 @@ class Settings:
                    evidence_cmds=_evidence_commands(env),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
+                   friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
@@ -5229,6 +5236,40 @@ class Station:
         health.Intake(self.gh, state, self.now, stamp, _say).run(sources)
         _write_json(path, state)
 
+    # -- friction intake ---------------------------------------------------
+    def intake_friction(self) -> None:
+        """File a ticket for a slowdown the tick journals on the invariant
+        goal home keep naming, at most every friction_intake.EVERY seconds
+        (bus/friction_intake.py, LOOM_FRICTION_INTAKE)."""
+        if not self.s.friction_mode:
+            return
+        path = friction_intake.ledger_path(self.s.home)
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        last = state.get("last")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < friction_intake.EVERY:
+            return
+        goal = self._invariant_goal()
+        if goal is None:
+            return
+        repo, number = goal
+        # Whole hours, so the same URL serves an hour of passes.
+        since = int((self.now - friction_intake.WINDOW) // 3600 * 3600)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+        comments = self._paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
+                                  % (repo, number, stamp))
+        journals = friction_intake.journals_from(comments, self.s.authors, self.now)
+        issues = (self._paginate("/repos/%s/issues?state=open&per_page=100" % repo)
+                  + self._paginate("/repos/%s/issues?state=closed&since=%s&per_page=100"
+                                   % (repo, stamp)))
+        intake = friction_intake.Intake(self.gh, state, self.now, _say,
+                                        write=self.s.friction_mode == "on")
+        try:
+            intake.run(repo, number, journals, issues)
+        finally:
+            _write_json(path, state)
+
     # -- log watch -------------------------------------------------------
     def watch_logs(self) -> None:
         """Read each component's new log lines and file one loom:triage issue
@@ -6890,7 +6931,7 @@ class Station:
                      self.ship_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
-                     self.health_intake,
+                     self.health_intake, self.intake_friction,
                      self.post_metrics,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
