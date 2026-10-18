@@ -3053,15 +3053,8 @@ class Station:
 
     def _ship_workflow(self, repo: str, workflow: str) -> None:
         merged = self._merged_tickets(repo)
-        if not merged:
-            return
-        branch = self._default_branch(repo)
-        if not branch:
-            return
-        data = self.gh.rest("GET", SHIP_RUNS_URL % (repo, workflow, quote(branch, safe=""))).data
-        runs = [r for r in ((data or {}).get("workflow_runs") or [] if isinstance(data, dict)
-                            else [])
-                if isinstance(r, dict) and self._deploy_run(repo, branch, r)]
+        branch = self._default_branch(repo) if merged else ""
+        runs = self._deploy_runs(repo, workflow, branch) if branch else []
         if not runs:
             return
         by_sha = {str(r["head_sha"]): r for r in runs}
@@ -3071,19 +3064,33 @@ class Station:
         for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
             if shipped >= SHIP_PER_PASS:
                 return
-            sha = str(pr["merge_commit_sha"])
-            run = by_sha.get(sha)
-            if run is None and newest is not None \
-                    and str(newest.get("created_at") or "") >= str(pr["merged_at"]) \
-                    and self._carries(repo, sha, str(newest["head_sha"])):
-                run = newest
-            if run is None:
-                continue
-            if self._ship_one(repo, number, pr,
-                              "workflow %s succeeded on %s revision %s (run %s)" % (
-                                  workflow, repo, str(run["head_sha"])[:12], run.get("id")),
-                              "workflow %s" % workflow):
+            run = self._covering_run(repo, pr, by_sha, newest)
+            if run is not None and self._ship_one(
+                    repo, number, pr,
+                    "workflow %s succeeded on %s revision %s (run %s)" % (
+                        workflow, repo, str(run["head_sha"])[:12], run.get("id")),
+                    "workflow %s" % workflow):
                 shipped += 1
+
+    def _deploy_runs(self, repo: str, workflow: str, branch: str) -> List[Dict[str, Any]]:
+        """The workflow's recent successful push runs on the repo's own
+        default branch, read once (SHIP_RUNS_URL) and checked again here."""
+        data = self.gh.rest("GET", SHIP_RUNS_URL % (repo, workflow, quote(branch, safe=""))).data
+        listed = data.get("workflow_runs") if isinstance(data, dict) else None
+        return [r for r in (listed if isinstance(listed, list) else [])
+                if isinstance(r, dict) and self._deploy_run(repo, branch, r)]
+
+    def _covering_run(self, repo: str, pr: Dict[str, Any], by_sha: Dict[str, Dict[str, Any]],
+                      newest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The deploy run that covers the pull request's merge commit: one
+        that ran on it, else the newest run when it started after the merge
+        and its revision carries the commit; None when no run does."""
+        sha = str(pr["merge_commit_sha"])
+        if sha in by_sha:
+            return by_sha[sha]
+        if str(newest.get("created_at") or "") < str(pr["merged_at"]):
+            return None
+        return newest if self._carries(repo, sha, str(newest["head_sha"])) else None
 
     @staticmethod
     def _deploy_run(repo: str, branch: str, run: Dict[str, Any]) -> bool:
