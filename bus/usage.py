@@ -64,12 +64,17 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
                 reset = window.get("resets_in_seconds")
             if reset is None and isinstance(window.get("window_minutes"), (int, float)):
                 reset = window["window_minutes"] * 60
-            minutes = window.get("window_minutes")
             found[label] = {"used": float(used), "reset": _utc_epoch(reset, now, relative),
-                            "minutes": minutes if isinstance(minutes, (int, float))
-                            and not isinstance(minutes, bool) and minutes > 0 else None,
+                            "minutes": _minutes(window.get("window_minutes")),
                             "observed": _observed(item)}
     return found
+
+
+def _minutes(value: Any) -> Optional[float]:
+    """A window length in minutes, or None when codex did not give one."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
 
 
 def _observed(item: Any) -> Optional[str]:
