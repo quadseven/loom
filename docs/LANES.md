@@ -728,6 +728,20 @@ loopback connection; they cannot query the viewer or any other local service.
   provider's weekly limit ...` with a `retry_at`) and hands the brief on as
   `[limit]`; any other answer lets the run go ahead. Another provider can
   name its own endpoint in the same setting.
+- The Usage view's meters for the free lanes (loom#812). After a ready
+  heartbeat the openrouter and workersai lanes read their provider's
+  read-only meter with the key they already hold, at most every five minutes,
+  through `bus/meter.py` (key and account id on stdin, never argv or a log),
+  into `state/usage/<slot>.meter.json`; `bus/usage.py` shows it. openrouter:
+  `GET /api/v1/key`, the key's free-model requests in the current UTC day and
+  its credit limit if it has one. workersai: the GraphQL Analytics API,
+  `aiInferenceAdaptiveGroups` `totalNeurons` for today, against
+  `LOOM_WORKERSAI_DAILY_NEURONS` (default 10000, the free allocation; reset
+  00:00 UTC); the token needs Account Analytics read besides Workers AI, or
+  Usage says the read failed and why. `LOOM_<SLOT>_METER_URL` overrides the
+  endpoint. zai and zen have no meter: Z.ai documents no usage endpoint for
+  API keys (its quota monitor covers the GLM Coding Plan only) and Zen's free
+  models take no key, so Usage says "no meter: provider exposes no usage".
 
 ### One slot on opencode 2.0
 
