@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, factory, invariants, proof, spend, station, tickets  # noqa: E402
+from bus import audit, brain, factory, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus.github import AppToken, GitHub, GitHubError  # noqa: E402
@@ -2471,7 +2471,10 @@ class ClaimTest(Base):
         puts = [p for p in self.fake.paths("PUT")]
         self.assertEqual(puts, ["/repos/%s/issues/12/labels" % REPO])
         sha = __import__("hashlib").sha256(BODY.encode()).hexdigest()[:12]
-        self.assertEqual([c["body"] for c in self.fake.comments[12]],
+        # The claim is an event on the ticket's one status comment (loom#866).
+        self.assertEqual(len(self.fake.comments[12]), 1)
+        self.assertTrue(status.is_status(self.fake.comments[12][0]["body"]))
+        self.assertEqual([c["body"] for c in status.expand(self.fake.comments[12])],
                          ["Claimed for lane codex (body sha256 %s)" % sha])
 
     def test_a_ticket_pinned_to_a_model_limited_on_its_lane_is_not_claimed(self):
@@ -2986,7 +2989,7 @@ class RetryTest(Base):
         return name
 
     def bodies(self, number=12):
-        return [c["body"] for c in self.fake.comments[number]]
+        return [c["body"] for c in status.expand(self.fake.comments[number])]
 
     def test_a_transient_failure_moves_to_another_provider_on_a_fresh_branch(self):
         # codex-2 shares codex's provider (and so its model): never the retry.
@@ -3374,7 +3377,7 @@ class DeadLaneRunawayTest(Base):
     MEDIUM = "Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n"
 
     def bodies(self, number=12):
-        return [c["body"] for c in self.fake.comments[number]]
+        return [c["body"] for c in status.expand(self.fake.comments[number])]
 
     def setUp(self):
         super().setUp()
@@ -3508,7 +3511,7 @@ class ExpiredKeyTest(Base):
         return name
 
     def bodies(self, number=12):
-        return [c["body"] for c in self.fake.comments[number]]
+        return [c["body"] for c in status.expand(self.fake.comments[number])]
 
     def test_auth_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class(self.REASON), "auth")
@@ -3557,7 +3560,7 @@ class FactoryIncidentTest(Base):
         return name
 
     def bodies(self, number=12):
-        return [c["body"] for c in self.fake.comments[number]]
+        return [c["body"] for c in status.expand(self.fake.comments[number])]
 
     def incident(self, closed_at="2030-01-01T00:10:00Z"):
         self.fake.factory_incidents = [{

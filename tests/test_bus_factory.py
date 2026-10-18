@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from bus import factory, station
+from bus import factory, station, status
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -106,7 +106,8 @@ class FakeGitHub:
             return list(self.filed)
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
-            return list(self.comments.get(int(m.group(1)), []))
+            # As the GitHub client does: a status comment reads as its events.
+            return status.expand(list(self.comments.get(int(m.group(1)), [])))
         m = re.search(r"/issues/(\d+)/events$", path)
         if m:
             return list(self.events[int(m.group(1))])
@@ -170,9 +171,17 @@ class FakeGitHub:
                     self.pulls[number]["labels"] = [
                         {"name": x} for x in dict.fromkeys(have + list(body["labels"]))]
             elif m.group(2) == "/comments":
-                self.comments.setdefault(number, []).append({"body": body["body"], "created_at": iso(0), "user": ME})
+                self.next_comment = getattr(self, "next_comment", 1000) + 1
+                self.comments.setdefault(number, []).append(
+                    {"id": self.next_comment, "body": body["body"], "created_at": iso(0), "user": ME})
             elif method == "PATCH":
                 self.issues[number]["body"] = body["body"]
+        m = re.search(r"/issues/comments/(\d+)$", path)
+        if m and method == "PATCH":
+            for found in self.comments.values():
+                for comment in found:
+                    if comment.get("id") == int(m.group(1)):
+                        comment["body"] = body["body"]
         m = re.search(r"/pulls/(\d+)$", path)
         if m and method == "PATCH":
             self.pulls[int(m.group(1))].update(body)
@@ -1412,6 +1421,25 @@ class Tickets(Base):
                                   "created_at": iso(factory.BRIEFED_STALL + 60)})
         self.go()
         self.assertEqual(self.lane(7), "spark")
+
+    def test_routine_moves_edit_the_tickets_one_status_comment(self):
+        # loom#866: zippie#264 carried 77 bot comments, one email each. Two
+        # stall moves are two events on one comment, read back as two.
+        self.stalled(7)
+        self.go()
+        self.assertEqual(self.lane(7), "spark")
+        self.gh.events[7].append({"event": "labeled", "label": {"name": "lane:spark"},
+                                  "created_at": iso(factory.BRIEFED_STALL + 60)})
+        # A full stall passes on the new lane: the first move's event ages too.
+        sticky = self.gh.comments[7][0]
+        sticky["body"] = status.render([(iso(factory.BRIEFED_STALL + 60), text)
+                                        for _, text in status.parse(sticky["body"])])
+        self.go()
+        self.assertEqual(len(self.gh.comments[7]), 1)
+        self.assertTrue(status.is_status(self.gh.comments[7][0]["body"]))
+        moves = [c["body"] for c in self.gh.paginate("/repos/%s/issues/7/comments" % REPO)
+                 if factory.STALL_MOVE_RE.match(c["body"])]
+        self.assertEqual(len(moves), 2)
 
     def test_a_stall_with_no_available_lane_stays_briefed(self):
         self.stalled(7)

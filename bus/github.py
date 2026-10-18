@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof
+from . import proof, status
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -439,6 +439,17 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        resp = self._rest(method, path, body, etag, ok)
+        if method == "GET" and status.COMMENTS_RE.search(path):
+            # A ticket's status comment reads as one comment per event, so
+            # every reader of those events sees them as before (loom#866).
+            expanded = status.expand(resp.data)
+            if expanded is not resp.data:
+                resp = Response(resp.status, expanded, resp.etag, resp.headers)
+        return resp
+
+    def _rest(self, method: str, path: str, body: Any = None,
+              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
         self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
@@ -761,7 +772,7 @@ class GitHub:
             url = nxt
             if url:
                 resp = self.rest("GET", url)
-        return items
+        return status.resort(items)
 
     def paginate_parallel(self, path: str, workers: int = 8) -> List[Any]:
         """Read known pages concurrently, preserving their page order."""
@@ -784,7 +795,7 @@ class GitHub:
             items.extend(self.paginate(next_url))
         elif final.status == 304 and isinstance(final.data, list) and len(final.data) >= _per_page(path):
             items.extend(self.paginate(_with_page(path, _page_of(last) + 1)))
-        return items
+        return status.resort(items)
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.rest("POST", "/graphql",
