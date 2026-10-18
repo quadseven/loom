@@ -249,6 +249,11 @@ With the dashboard down, the tick goes on from the goal homes. Muse's own
 ticks and defers are not rows yet; its defers still reach every brain
 through `resume`.
 
+Usage figures for a journal come from the station's live snapshot:
+`python3 -m bus.usage --live` (the dashboard's `GET /api/usage`, with the
+same read-only token). Plain `python3 -m bus.usage` reads the lane machine's
+own files and, on this VM, says it is not the lane machine instead.
+
 ## Tick
 
 Each `bus.brain step NAME` below may carry `--note "<one line>"`: what that

@@ -156,7 +156,8 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertNotIn("Source: not exposed", claude)
         asks = section(body, "usage-asks")
         self.assertIn("anthropic: 1 lane out of credit until", asks)
-        self.assertIn("the spend budget is not configured", asks)
+        self.assertIn("no API reads the prepaid balance, so set LOOM_ANTHROPIC_BUDGET_USD", asks)
+        self.assertIn("LOOM_ANTHROPIC_BUDGET_SINCE", asks)
         self.assertIn("1 of 2 lanes can take work: 1 held at a limit.", body)
 
     def test_a_snapshot_older_than_two_hours_is_marked_stale_everywhere(self):
@@ -270,6 +271,61 @@ class UsageDashboardTests(unittest.TestCase):
         store.upload([reading("codex", ["codex"], "weekly", 20)])
         self.assertEqual(store.providers["codex"][0]["used_pct"], 20)
         self.assertIn("zen", store.providers)
+
+
+    def test_a_limit_reading_says_held_until_the_reset_or_when_the_last_limit_lifted(self):
+        rows = [reading("claude", ["claude"], "limit", resets_at=(NOW + timedelta(hours=2)).isoformat(),
+                        source="lane heartbeat", note="limited: provider limit reached",
+                        observed_at=(NOW - timedelta(minutes=30)).isoformat()),
+                reading("agy", ["agy"], "limit", resets_at=(NOW - timedelta(hours=1)).isoformat(),
+                        source="lane heartbeat", note="last limit: quota",
+                        observed_at=(NOW - timedelta(hours=5)).isoformat()),
+                reading("zai", ["zai"], "limit", source="lane heartbeat", note="no limit seen")]
+        rows[0]["holds"] = {"claude": "limit: provider limit reached; lane waits until 2026-10-18T16:30:00Z"}
+        body = usage.render(usage.build(rows, NOW))
+        claude = provider_row(body, "claude")
+        self.assertIn(">Limit<", claude)
+        self.assertIn("claude limited until 2026-10-18 16:30 UTC (in 2h 0m): provider limit reached.", claude)
+        agy = provider_row(body, "agy")
+        self.assertIn("agy last limited 5h 0m ago, lifted 2026-10-18 13:30 UTC (1h 0m ago): quota.", agy)
+        self.assertIn("zai: no limit seen in its heartbeat.", provider_row(body, "zai"))
+
+    def test_each_provider_names_the_machine_its_readings_came_from(self):
+        rows = usage.validate([reading("codex", ["codex"], "weekly", 10,
+                                       (NOW + timedelta(days=1)).isoformat(), host="lane-box"),
+                               reading("zen", ["zen"], "all", host=7)])
+        self.assertEqual((rows[0]["host"], rows[1]["host"]), ("lane-box", None))
+        body = usage.render(usage.build(rows, NOW))
+        self.assertIn("collected on lane-box", provider_row(body, "codex"))
+        self.assertNotIn("collected on", provider_row(body, "zen"))
+
+    def test_get_api_usage_serves_the_live_snapshot_to_the_read_token_only(self):
+        class State:
+            pass
+
+        state = State()
+        state.usage = Store()
+        state.usage.upload([reading("codex", ["codex"], "weekly", 10)], now=NOW)
+
+        def get(auth):
+            handler = type("Handler", (), {})()
+            handler.path = "/api/usage"
+            handler.headers = Message()
+            if auth:
+                handler.headers["Authorization"] = auth
+            result = []
+            handler.send_json = lambda code, value: result.append((code, value))
+            handler.send_text = lambda code, value: result.append((code, value))
+            _dispatch_get(handler, state)
+            return result[0]
+        with patch.dict(os.environ, {"LOOM_HANDOFF_TOKEN": "YOUR_HANDOFF_TOKEN_HERE",
+                                     "LOOM_UPLOAD_TOKEN": "YOUR_UPLOAD_TOKEN_HERE"}):
+            self.assertEqual(get("")[0], 401)
+            self.assertEqual(get("Bearer wrong")[0], 401)
+            code, packet = get("Bearer YOUR_HANDOFF_TOKEN_HERE")
+        self.assertEqual(code, 200)
+        self.assertEqual(packet["received_at"], NOW.isoformat())
+        self.assertEqual([row["used_pct"] for row in packet["readings"]], [10])
 
 
 if __name__ == "__main__":

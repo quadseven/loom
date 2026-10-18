@@ -252,10 +252,11 @@ def dashboard_url(transcript_url: str, path: str) -> str:
     return urlunsplit(parts._replace(path=parts.path.removesuffix("/api/transcripts") + path))
 
 
-def fetch_handoff(url: str, token: str) -> Dict[str, Any]:
-    """GET the packet. Errors never carry the URL or the token."""
+def fetch_json(url: str, token: str, what: str = "handoff") -> Dict[str, Any]:
+    """GET one of the dashboard's bearer-token reads (the handoff packet, the
+    usage snapshot) as a JSON object. Errors never carry the URL or the token."""
     if not url.startswith("https://"):
-        raise OSError("the handoff URL is not https")
+        raise OSError("the %s URL is not https" % what)
     req = urllib.request.Request(  # noqa: S310 - https only, checked above
         url, method="GET", headers={"User-Agent": "loom-brain", "Authorization": "Bearer " + token})
     try:
@@ -265,16 +266,21 @@ def fetch_handoff(url: str, token: str) -> Dict[str, Any]:
         status, raw = err.code, b""
         err.close()
     except (urllib.error.URLError, OSError):
-        raise OSError("the handoff read failed to connect") from None
+        raise OSError("the %s read failed to connect" % what) from None
     if status != 200:
-        raise OSError("the handoff read answered %d" % status)
+        raise OSError("the %s read answered %d" % (what, status))
     try:
         packet = json.loads(raw)
     except ValueError:
-        raise OSError("the handoff packet is not JSON") from None
+        raise OSError("the %s packet is not JSON" % what) from None
     if not isinstance(packet, dict):
-        raise OSError("the handoff packet is not an object")
+        raise OSError("the %s packet is not an object" % what)
     return packet
+
+
+def fetch_handoff(url: str, token: str) -> Dict[str, Any]:
+    """GET the packet. Errors never carry the URL or the token."""
+    return fetch_json(url, token, "handoff")
 
 
 def _joined(values: Any) -> str:

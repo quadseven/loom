@@ -887,6 +887,18 @@ def _handle_transcript_post(handler, state):
         return handler.send_json(503, {"error": "transcript storage unavailable"})
 
 
+def _handle_usage_get(handler, state):
+    """The station's live usage readings, for a brain off the lane machine
+    (`python3 -m bus.usage --live`): the read-only brain token or the
+    upload token, as the handoff packet."""
+    if not _authorized(handler, BRAIN_READERS):
+        return handler.send_json(401, {"error": "unauthorized"})
+    store = getattr(state, "usage", None)
+    if store is None:
+        return handler.send_json(200, {"readings": [], "received_at": None})
+    return handler.send_json(200, store.snapshot())
+
+
 def _handle_usage_post(handler, state):
     if not _authorized(handler):
         return handler.send_json(401, {"error": "unauthorized"})
@@ -1126,6 +1138,8 @@ def _dispatch_basic(handler, state, path):
         return handler.send_json(200, _api_tickets(state.response()))
     if path == "/api/brain/handoff":
         return _handle_brain(handler, state)
+    if path == "/api/usage":
+        return _handle_usage_get(handler, state)
     return handler.send_text(404, "not found")
 
 

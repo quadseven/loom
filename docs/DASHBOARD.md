@@ -56,7 +56,10 @@ an empty text retires its source. `GET /api/brain/handoff` answers the
 handoff packet, `{ticks, commitments, rules}`: the last 5 ticks, the open
 commitments and each source's newest rules still in force. It takes the
 upload token or `LOOM_HANDOFF_TOKEN`, a separate private value that can only
-read, for brains that must not write the rules they follow.
+read, for brains that must not write the rules they follow. `GET /api/usage`
+answers the station's live usage readings, `{readings, received_at}`, to the
+same two tokens: a brain off the lane machine reads usage there
+(`python3 -m bus.usage --live`), never from its own machine's files.
 
 `/tickets` lists the tickets in flight in one table per goal home; `?done=1`
 lists merged, shipped, verified and closed ones, and `state`, `goal` and
