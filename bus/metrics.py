@@ -19,6 +19,8 @@ from .labels import LANES
 
 WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 WAIT_WINDOW = 7 * 86400
+# Ticket states a lane can still move toward a merge.
+WORKABLE = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 # A ticket in a terminal state is done, not waiting: verified is the end of the
 # line and closed-unmerged was dropped. Neither is ever the bottleneck, and the
 # Brain ranking leaves them out too. Counting verified as a queue named it the
@@ -256,6 +258,10 @@ class Totals:
     merged_by_repo: Dict[str, int] = field(default_factory=dict)
     report_ages: Dict[str, float] = field(default_factory=dict)
     goal_repos: set[str] = field(default_factory=set)
+    # Repos with an open ticket a lane can work (WORKABLE): a goal repo with
+    # none, such as a backlog goal whose every issue is done or a person's
+    # ask, has nothing to merge and is not held to a daily merge.
+    workable_repos: set[str] = field(default_factory=set)
 
 
 class Collector:
@@ -499,6 +505,9 @@ class Collector:
         if "pull_request" in issue:
             return
         labels = names(issue)
+        if (issue.get("state") == "open" and "loom:ticket" in labels
+                and any(state in labels for state in WORKABLE)):
+            total.workable_repos.add(repo)
         created = stamp(issue.get("created_at"))
         if created >= self.since and ("needs-operator" in labels or
                 self.label_time(repo, issue, "needs-operator")):
@@ -582,10 +591,13 @@ def flow_number(total: Totals) -> Number:
 
 
 def throughput_number(total: Totals) -> Number:
-    ok = (bool(total.goals) and all(total.merged_by_repo[r] for r in total.goal_repos)
+    owing = total.goal_repos & total.workable_repos
+    ok = (bool(total.goals) and all(total.merged_by_repo[r] for r in owing)
           and total.merged_tickets > 0 and total.verified * 2 >= total.merged_tickets)
     return Number("Throughput", "%s; verified %d/%d (lane %d, brain %d)" %
-                  (", ".join("%s %d" % pair for pair in total.merged_by_repo.items()),
+                  (", ".join("%s %d%s" % (repo, count, "" if repo in owing or count
+                                          else " (no work)")
+                             for repo, count in total.merged_by_repo.items()),
                    total.verified, total.merged_tickets, total.verified_lane,
                    total.verified_brain),
                   "each goal repo >=1 merge; >=50% verified", ok)
