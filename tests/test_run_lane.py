@@ -2163,16 +2163,16 @@ cat > /dev/null
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_zen_lane_runs_a_free_model_sandboxed_without_a_key(self):
         # OpenCode Zen serves its free models with no stored credential.
-        inbox, result = self.api_lane("zen", LOOM_ZEN_MODEL="opencode/space-bunny-free")
+        inbox, result = self.api_lane("zen", LOOM_ZEN_MODEL="opencode/minimax-m3.1-flash-free")
         self.assertEqual(result.returncode, 0, result.stderr)
         agent = [c for c in self.calls() if c.startswith("opencode ")]
         self.assertEqual(len(agent), 1, self.calls())
-        self.assertIn("-m opencode/space-bunny-free", agent[0])
+        self.assertIn("-m opencode/minimax-m3.1-flash-free", agent[0])
         self.assertIn("keyvar=none", agent[0])
         self.assertIn("secret=denied", agent[0])
-        self.assertIn("small=opencode/space-bunny-free", agent[0])
+        self.assertIn("small=opencode/minimax-m3.1-flash-free", agent[0])
         self.assertNotIn(f"home={self.home} ", agent[0])
-        self.assertIn("lane zen, model opencode/space-bunny-free", self.body.read_text())
+        self.assertIn("lane zen, model opencode/minimax-m3.1-flash-free", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
@@ -2185,7 +2185,7 @@ cat > /dev/null
     def test_zen_lane_refuses_a_private_repo_before_cloning(self):
         # Zen's free providers may train on prompts: public repos only.
         inbox, result = self.api_lane(
-            "zen", LOOM_ZEN_MODEL="opencode/space-bunny-free", FAKE_GH_PRIVATE="true")
+            "zen", LOOM_ZEN_MODEL="opencode/minimax-m3.1-flash-free", FAKE_GH_PRIVATE="true")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("gh api repos/example/repo --jq .private", self.calls())
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
@@ -2197,7 +2197,7 @@ cat > /dev/null
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_failed_privacy_lookup_leaves_the_brief_for_the_next_pass(self):
         inbox, result = self.api_lane(
-            "zen", LOOM_ZEN_MODEL="opencode/space-bunny-free", FAKE_GH_API_FAIL="1")
+            "zen", LOOM_ZEN_MODEL="opencode/minimax-m3.1-flash-free", FAKE_GH_API_FAIL="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
@@ -2497,7 +2497,7 @@ cat > /dev/null
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_spark_lane_refuses_a_model_from_elsewhere(self):
         inbox, _ = self.api_lane("spark", LOOM_SPARK_URL=self.SPARK["LOOM_SPARK_URL"],
-                                 LOOM_SPARK_MODEL="opencode/space-bunny-free")
+                                 LOOM_SPARK_MODEL="opencode/minimax-m3.1-flash-free")
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
@@ -3023,6 +3023,38 @@ exit %d
                 # lane that reads its key from a parameter, and codex, which
                 # reads no key here, keeps its heartbeat as it is.
                 self.assertEqual(self.beat()["available"], want != "limit")
+
+    def test_a_lane_rests_after_three_transient_failures_in_a_row(self):
+        # zen, 2026-10-19: a free model answered "Unexpected server error" to
+        # every run, and the lane kept claiming tickets for hours.
+        for n in range(3):
+            name = "T04%d-run" % n
+            self.drop_brief(name + ".md", BRIEF.replace("T042-fix-the-thing", name))
+            self.run_lane(FAKE_AGENT="say", FAKE_OUT="UnknownError: Unexpected server error",
+                          FAKE_EXIT="1")
+            beat = self.beat()
+            self.assertEqual(beat["available"], n < 2, (n, beat))
+        self.assertIn("3 transient failures in a row", beat["reason"])
+        self.assertTrue(beat["reason"].startswith("limit: "))
+        self.assertGreater(beat["retry_at"], int(time.time()) + 1700)
+        # Resting: the next pass runs no agent.
+        self.drop_brief("T049-next.md", BRIEF.replace("T042-fix-the-thing", "T049-next"))
+        self.log.write_text("")
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.beat()["available"])
+
+    def test_a_run_that_is_not_transient_clears_the_transient_count(self):
+        for n, (out, status) in enumerate((("Unexpected server error", "1"),
+                                           ("Unexpected server error", "1"),
+                                           ("Rate limit hit. Please try again in 1 minutes.", "1"),
+                                           ("Unexpected server error", "1"))):
+            name = "T05%d-run" % n
+            self.drop_brief(name + ".md", BRIEF.replace("T042-fix-the-thing", name))
+            for f in (self.loom / "state" / "usage").glob("codex.json"):
+                f.unlink()
+            self.run_lane(FAKE_AGENT="say", FAKE_OUT=out, FAKE_EXIT=status)
+        self.assertNotIn("transient failures in a row", self.beat().get("reason", ""))
 
     def test_an_expired_key_on_a_lane_that_reads_no_key_is_auth_but_not_a_hold(self):
         # codex keeps its sign-in in the CLI's own file: there is no parameter
