@@ -1012,7 +1012,11 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
 
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
-    repos only."""
+    repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
+    to its provider: spark-7 to spark-9 are spark-type slots on free providers
+    that may train (infra#5617), while spark itself takes private repos."""
+    if lane in factory.PUBLIC_ONLY:
+        return True
     lane = provider(lane)
     return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
             or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))

@@ -1375,6 +1375,9 @@ agy_skills() {
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
   case "$LANE:$MODEL" in zen:*|zai:*|agy:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
+  # tests/test_bus_station.py keeps the two lists equal).
+  case "$SLOT" in spark-7|spark-8|spark-9) return 0 ;; esac
   return 1
 }
 
