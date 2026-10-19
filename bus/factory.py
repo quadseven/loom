@@ -162,10 +162,10 @@ SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 # One slot per free provider in the spark-gateway's pool (infra#5617): spark-
 # type slots whose endpoint is the gateway's route pinned to that provider,
 # never a Spark. Operator 2026-10-19: make every free provider a lane, spend
-# its allowance and wait out each reset. spark-5 Ollama Cloud and spark-6
-# Gemma may take private repos; spark-7 NVIDIA NIM, spark-8 Kilo and spark-9
+# its allowance and wait out each reset. free-ollama Ollama Cloud and free-gemma
+# Gemma may take private repos; free-nvidia NVIDIA NIM, free-kilo Kilo and free-groq
 # Groq may train on prompts, so they are public only (PUBLIC_ONLY).
-FREE_POOL = ("spark-5", "spark-6", "spark-7", "spark-8", "spark-9")
+FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq")
 TIERS: Dict[str, Tuple[str, ...]] = {
     # The operator's priorities: Muse and agy first on public repos, so their
     # allowances are spent before the rest (2026-10-14); then the Sparks,
@@ -243,8 +243,8 @@ EQUIVALENT_RE = re.compile(r"<!-- loom:equivalent (\S+) -->")
 FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
-# spark-7, spark-8 and spark-9 are free providers that may train on prompts.
-PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse", "spark-7", "spark-8", "spark-9")
+# free-nvidia, free-kilo and free-groq are free providers that may train on prompts.
+PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.

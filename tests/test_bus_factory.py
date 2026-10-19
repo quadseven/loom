@@ -1536,7 +1536,7 @@ class Tickets(Base):
     def test_a_private_easy_ticket_at_a_limit_moves_within_its_tier(self):
         self.limited_easy()
         # The first free provider slot allowed private code (infra#5617).
-        self.assertEqual(self.lane(7), "spark-5")
+        self.assertEqual(self.lane(7), "free-ollama")
         self.assertEqual(self.model(7), None)  # the lane's own model runs it
         note = self.gh.comments[7][-1]["body"]
         self.assertIn("Not a failure (lane spark is at a limit)", note)
@@ -1549,7 +1549,7 @@ class Tickets(Base):
 
     def test_a_private_easy_ticket_never_goes_to_a_public_only_lane(self):
         self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter",
-                                "workersai", "spark-5", "spark-6"))
+                                "workersai", "free-ollama", "free-gemma"))
         self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
 
     def test_a_public_easy_ticket_may_go_to_the_muse_spark_slot_and_a_private_one_never(self):
@@ -1577,15 +1577,15 @@ class Tickets(Base):
         # private code (infra#5617), then codex.
         self.assertEqual(factory.TIERS["easy"][6:11], factory.FREE_POOL)
         self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
-        self.assertEqual(factory.lanes_of("medium", True)[4:7], ("spark-5", "spark-6", "codex"))
+        self.assertEqual(factory.lanes_of("medium", True)[4:7], ("free-ollama", "free-gemma", "codex"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
-        for lane in ("spark-7", "spark-8", "spark-9"):
+        for lane in ("free-nvidia", "free-kilo", "free-groq"):
             self.assertIn(lane, factory.PUBLIC_ONLY)
-        for lane in ("spark-5", "spark-6"):
+        for lane in ("free-ollama", "free-gemma"):
             self.assertNotIn(lane, factory.PUBLIC_ONLY)
-        self.assertNotIn("spark-7", factory.lanes_of("easy", True))
-        self.assertIn("spark-7", factory.lanes_of("easy", False))
+        self.assertNotIn("free-nvidia", factory.lanes_of("easy", True))
+        self.assertIn("free-nvidia", factory.lanes_of("easy", False))
         # Never on hard work, and never counted as a Spark.
         self.assertFalse(set(factory.FREE_POOL) & set(factory.TIERS["hard"]))
         self.assertFalse(set(factory.FREE_POOL) & set(factory.SPARKS))

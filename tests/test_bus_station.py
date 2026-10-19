@@ -3334,17 +3334,17 @@ class RetryTest(Base):
 
     def test_free_provider_slots_that_may_train_need_a_public_repo_at_every_gate(self):
         # Security review on #937: the station gate mapped a slot to its
-        # provider first, so spark-7 read as spark and took private repos.
-        for slot in ("spark-7", "spark-8", "spark-9"):
+        # provider first, so free-nvidia read as spark and took private repos.
+        for slot in ("free-nvidia", "free-kilo", "free-groq"):
             self.assertTrue(station.needs_public_repo(slot, ""), slot)
-        for slot in ("spark", "spark-2", "spark-5", "spark-6"):
+        for slot in ("spark", "spark-2", "free-ollama", "free-gemma"):
             self.assertFalse(station.needs_public_repo(slot, ""), slot)
         # The lane runner's own last check names the same slots.
         root = Path(__file__).resolve().parent.parent
         script = (root / "lanes" / "run_lane.sh").read_text()
         body = script.split("trains_on_prompts() {", 1)[1].split("\n}\n", 1)[0]
         named = set(re.search(r'case "\$SLOT" in ([\w|-]+)\)', body).group(1).split("|"))
-        self.assertEqual(named, {x for x in factory.PUBLIC_ONLY if x.startswith("spark")})
+        self.assertEqual(named, {x for x in factory.PUBLIC_ONLY if x.startswith("free-")})
 
 
 class SilentLaneTest(Base):

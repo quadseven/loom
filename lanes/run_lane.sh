@@ -63,6 +63,10 @@ SLOT="${1:?usage: run_lane.sh <lane>}"
 # The provider lane: the slot without a trailing -<n> (opencode-go stays whole).
 LANE="$SLOT"
 [[ "$SLOT" =~ -[0-9]+$ ]] && LANE="${SLOT%-*}"
+# A free provider slot (free-ollama, free-kilo, ...) is lane free: one
+# OpenAI-compatible route per provider in the spark-gateway's free pool
+# (infra#5617). Not a Spark: it shares the spark lane's endpoint handling.
+[[ "$SLOT" =~ ^free-[a-z]+$ ]] && LANE=free
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
@@ -656,10 +660,10 @@ spark_probe() {
   local code status
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
-  if [ "$status" -eq 7 ]; then LIMIT_WHY="the spark endpoint refused the connection"; return 1; fi
-  if [ "$code" = 503 ]; then LIMIT_WHY="the spark endpoint answered 503"; return 1; fi
+  if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
+  if [ "$code" = 503 ]; then LIMIT_WHY="the $LANE endpoint answered 503"; return 1; fi
   [ "$status" -eq 0 ] && return 0
-  READY_REASON="the spark endpoint did not answer (curl exit $status)"
+  READY_REASON="the $LANE endpoint did not answer (curl exit $status)"
   return 2
 }
 
@@ -1377,13 +1381,13 @@ trains_on_prompts() {
   case "$LANE:$MODEL" in zen:*|zai:*|agy:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
   # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
   # tests/test_bus_station.py keeps the two lists equal).
-  case "$SLOT" in spark-7|spark-8|spark-9) return 0 ;; esac
+  case "$SLOT" in free-nvidia|free-kilo|free-groq) return 0 ;; esac
   return 1
 }
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free) return 0 ;; esac
   return 1
 }
 
@@ -1506,7 +1510,7 @@ run_agent() {
     openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
     opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
     zen) opencode_agent - "$brief_text" ;;
-    spark) opencode_agent - "$brief_text" ;;
+    spark|free) opencode_agent - "$brief_text" ;;
     zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
@@ -1562,14 +1566,14 @@ lane_ready() {
     return
   fi
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark) cli="$(opencode_bin)" ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
-  case "$LANE" in zen) return 0 ;; spark) spark_ready; return ;; esac
+  case "$LANE" in zen) return 0 ;; spark|free) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(ssm_value "$key_ssm")"
@@ -1739,6 +1743,8 @@ for BRIEF in "$INBOX"/*.md; do
     workersai:cloudflare-workers-ai/@cf/*) ;;
     spark:spark/?*) ;;
     spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
+    free:free/?*) ;;
+    free:*) park "$BRIEF" "model $MODEL is not a free provider model (free/...)"; continue ;;
     agy:gemini-*|agy:claude-*|agy:gpt-oss-*)
       case "$MODEL" in
         *-low|*-medium|*-high) ;;
@@ -1851,7 +1857,7 @@ for BRIEF in "$INBOX"/*.md; do
   STATUS=$?
   is_api_lane && archive_transcripts
   # A spark run that ended because the box went hot is a limit, not a failure.
-  if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
+  if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi

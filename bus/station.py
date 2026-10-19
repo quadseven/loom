@@ -296,6 +296,7 @@ LANE_MODELS = {
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],
     "spark": ["spark/?*"],
+    "free": ["free/?*"],
     "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
 }
 # Operator messages in the Discord channel become notes on a goal home, and
@@ -954,8 +955,10 @@ def _clip(text: str, limit: int) -> str:
 
 
 def provider(lane: str) -> str:
-    """The provider lane of a slot (anthropic-2 -> anthropic), as the runner
-    maps it."""
+    """The provider lane of a slot (anthropic-2 -> anthropic, free-kilo ->
+    free), as the runner maps it."""
+    if re.fullmatch(r"free-[a-z]+", lane):
+        return "free"
     return re.sub(r"-[0-9]+$", "", lane)
 
 
@@ -1013,8 +1016,9 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
-    to its provider: spark-7 to spark-9 are spark-type slots on free providers
-    that may train (infra#5617), while spark itself takes private repos."""
+    to its provider: free-nvidia, free-kilo and free-groq are free provider
+    slots that may train (infra#5617), while free-ollama and free-gemma may
+    take private repos."""
     if lane in factory.PUBLIC_ONLY:
         return True
     lane = provider(lane)
