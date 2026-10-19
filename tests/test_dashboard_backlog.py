@@ -6,7 +6,10 @@ Live, the page was one tall card per epic (161 of them), each reading
 counts, not a `children` list. These pin the table, the outside-any-epic list
 and the collapsed groups.
 """
+import ast
+import inspect
 import re
+import textwrap
 import unittest
 from urllib.parse import urlsplit
 
@@ -137,6 +140,37 @@ class OutsideAnyEpic(unittest.TestCase):
         section = self.section(render(document, rows, query="?repo=other"))
         self.assertIn("Ticket 21", section)
         self.assertNotIn("Ticket 11", section)
+
+
+def cyclomatic(function):
+    """McCabe complexity counted the way the review bot's radon does: one,
+    plus one per branch, loop, handler, comprehension clause and extra
+    boolean operand."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    count = 1
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.IfExp, ast.Assert)):
+            count += 1
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            count += 1 + bool(node.orelse)
+        elif isinstance(node, ast.Try):
+            count += len(node.handlers) + bool(node.orelse)
+        elif isinstance(node, ast.BoolOp):
+            count += len(node.values) - 1
+        elif isinstance(node, ast.comprehension):
+            count += 1 + len(node.ifs)
+    return count
+
+
+class Complexity(unittest.TestCase):
+    """loom#334: _backlog_page sat at cyclomatic 17, over the review bot's
+    cap of 15. The page's ranked table and empty-epic list are their own
+    helpers now."""
+
+    def test_the_backlog_page_and_its_parts_stay_under_the_cap(self):
+        for name in ("_backlog_page", "_ranked_section", "_empty_epics"):
+            with self.subTest(function=name):
+                self.assertLess(cyclomatic(getattr(server, name)), 15)
 
 
 if __name__ == "__main__":

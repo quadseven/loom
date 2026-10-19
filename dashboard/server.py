@@ -719,10 +719,17 @@ def _backlog_page(document, parsed, state):
     # Sorted by score, highest first; the source's own order breaks ties and
     # an epic with no score sorts last.
     ranked.sort(key=lambda epic: (_score(epic) is None, -(_score(epic) or 0.0)))
-    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter))]
+    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter)),
+           _ranked_section(ranked, form), _empty_epics(empty), _render_inspectors(document)]
+    return page("Backlog", "backlog", "".join(out), status="Read only")
+
+
+def _ranked_section(ranked, form):
+    """The Epics by score section: the filter form, the top RANKED_SHOWN
+    epics as a table and the rest collapsed below it."""
     dated = any(_epic_age(epic) for epic in ranked)
-    out.append('<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
-               '<span class="machine-fact">%d ranked</span></div>' % len(ranked))
+    out = ['<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
+           '<span class="machine-fact">%d ranked</span></div>' % len(ranked)]
     out.append('<p class="backlog-note">One row per epic with children, ranked by Hunt\'s score.%s</p>' % (
         "" if dated else " Age shows a dash: the backlog source carries no epic dates."))
     out.extend(form)
@@ -735,13 +742,17 @@ def _backlog_page(document, parsed, state):
     else:
         out.append('<p class="empty-state">No epic with children matches this filter.</p>')
     out.append('</section>')
-    if empty:
-        out.append('<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
-            len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
-                _link_or_text(epic.get("html_url") or epic.get("url"), strip_kind(epic.get("title")) or "Untitled epic"),
-                html.escape(_repo_number(epic))) for epic in empty)))
-    out.append(_render_inspectors(document))
-    return page("Backlog", "backlog", "".join(out), status="Read only")
+    return "".join(out)
+
+
+def _empty_epics(empty):
+    """The collapsed list of epics tracking no children; nothing when none."""
+    if not empty:
+        return ""
+    return '<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
+        len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
+            _link_or_text(epic.get("html_url") or epic.get("url"), strip_kind(epic.get("title")) or "Untitled epic"),
+            html.escape(_repo_number(epic))) for epic in empty))
 
 
 def _needs_you(document, state, *, source_missing=False, who=""):
