@@ -62,6 +62,20 @@ class ScopeCheckTest(unittest.TestCase):
         self.assertEqual(sorted(self.stray()), [".agents/hooks.json", ".github/workflows/extra.yml",
                                                 "bin/test.txt", "test_hook.sh"])
 
+    def test_a_new_file_in_a_tracked_hidden_subdirectory_is_in_scope(self):
+        # A test beside a tracked .github script was refused (2026-10-19).
+        self.write(".github/scripts/deploy.py", "x = 1\n")
+        self.write(".github/scripts/tests/test_deploy.py", "pass\n")
+        self.base = self.commit("scripts")
+        self.write(".github/scripts/tests/test_multiarch.py", "pass\n")
+        self.write(".github/scripts/helper.py", "y = 2\n")
+        self.write(".github/actions/new/action.yml", "runs: {}\n")
+        self.write(".github/newdir/file.txt", "x\n")
+        self.write(".loom/test.txt", "x\n")
+        self.commit("work")
+        self.assertEqual(sorted(self.stray()), [".github/actions/new/action.yml",
+                                                ".github/newdir/file.txt", ".loom/test.txt"])
+
     def test_a_file_or_directory_the_brief_names_is_in_scope(self):
         self.write("test_hook.sh", "echo\n")
         self.write(".github/workflows/extra.yml", "on: push\n")
