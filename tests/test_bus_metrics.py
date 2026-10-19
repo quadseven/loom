@@ -124,6 +124,31 @@ class MetricsTest(unittest.TestCase):
         throughput = next(n for n in gh.collect() if n.name == "Throughput")
         self.assertIn("verified 3/3 (lane 2, brain 1)", throughput.line())
 
+    def test_throughput_holds_only_goal_repos_with_workable_tickets_to_a_merge(self):
+        # A backlog goal whose every issue is done or a person's ask has
+        # nothing to merge; 8 of 17 goal repos read FAIL that way (2026-10-19).
+        total = metrics.Totals(goals=2, goal_repos={"o/busy", "o/idle"},
+                               workable_repos={"o/busy"},
+                               merged_by_repo={"o/busy": 1, "o/idle": 0},
+                               merged_tickets=2, verified=1)
+        number = metrics.throughput_number(total)
+        self.assertTrue(number.passed, number.line())
+        self.assertIn("o/idle 0 (no work)", number.line())
+        total.workable_repos.add("o/idle")
+        self.assertFalse(metrics.throughput_number(total).passed)
+
+    def test_an_open_queued_ticket_holds_its_goal_repo_to_a_merge(self):
+        self.gh.pr["merged_at"] = None
+        self.gh.pr["state"] = "open"
+        throughput = next(n for n in self.numbers() if n.name == "Throughput")
+        self.assertIn("%s 0 (no work)" % REPO, throughput.line())
+        self.gh.issues.append({"number": 6, "state": "open", "created_at": iso(NOW - 500),
+                               "labels": [label("loom:ticket"), label("loom:queued")]})
+        self.gh.events[6], self.gh.comments[6] = [], []
+        throughput = next(n for n in self.numbers() if n.name == "Throughput")
+        self.assertIn("%s 0;" % REPO, throughput.line())
+        self.assertFalse(throughput.passed)
+
     def test_ticket_waits_include_reentered_state_and_current_state(self):
         events = []
         for kind, state, hours in (("labeled", "queued", 0), ("labeled", "briefed", 2),
