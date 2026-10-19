@@ -1132,6 +1132,45 @@ tracked_changes() {
   safe_git status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' '
 }
 
+# Check the trusted default branch in its own worktree when a fix branch is
+# red or has merge conflicts. The merged branch and its setup files remain
+# available for the agent. DEFAULT_EXIT is the default branch's check result.
+check_default_branch() {
+  local branch_tree="$TREE" branch_home="$CHECK_HOME" default_tree="$WORKDIR/$TICKET-default-check" rc=0
+  DEFAULT_EXIT="" DEFAULT_CHANGED=""
+  DEFAULT_REV="$(safe_git rev-parse "origin/$FIX_DEFAULT")" || {
+    SETUP_REASON="could not read the default branch revision"; return 1;
+  }
+  if ! safe_git worktree add -q --detach "$default_tree" "$DEFAULT_REV" >> "$LOG" 2>&1; then
+    SETUP_REASON="could not check out the default branch for validation"; return 1
+  fi
+  TREE="$default_tree" CHECK_HOME="$branch_home-default"
+  if ! mkdir -p "$CHECK_HOME/tmp"; then
+    SETUP_REASON="could not prepare the default branch check home"; rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+         -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
+    SETUP_REASON="default branch submodule checkout failed"; rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$C_SETUP" ]; then
+    contract_run "$C_SETUP"; rc=$?
+    [ "$rc" -eq 0 ] || SETUP_REASON="default branch setup exited $rc"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    contract_run "$C_CHECK"; DEFAULT_EXIT=$?
+    DEFAULT_CHANGED="$(tracked_changes)"
+    record default-baseline "$C_CHECK" "$DEFAULT_EXIT" "$DEFAULT_REV" \
+      "$([ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ] && echo true || echo false)" \
+      "${DEFAULT_CHANGED:+changed tracked files: $DEFAULT_CHANGED}"
+  fi
+  TREE="$branch_tree" CHECK_HOME="$branch_home"
+  rm -rf "$branch_home-default"
+  if ! safe_git worktree remove --force "$default_tree" >> "$LOG" 2>&1; then
+    SETUP_REASON="could not remove the default branch validation tree"; return 1
+  fi
+  [ "$rc" -eq 0 ]
+}
+
 # What setup and the first check leave untracked (a venv, caches) stays out
 # of the agent's commit: each path goes into .git/info/exclude, which an
 # API-lane agent cannot write.
@@ -1145,14 +1184,12 @@ exclude_untracked() {
 }
 
 # Before the agent: interpreter, submodules, setup, then the check on the
-# base (recorded, so a failure the base already had is told apart from one
-# the agent caused). A failure the repo did not cause -- the contract cannot
-# be read, the environment cannot run the check, or the check is already
-# red on the unmodified base -- is a factory incident, not a [work]
-# failure: the ticket keeps its rung. Returns 1 with SETUP_REASON when the
-# environment cannot be prepared.
+# current tree. A fix round checks the branch after merging the default
+# branch; a red result is compared with the default branch's own head.
+# Only a red default branch check is a base-check factory incident. Returns
+# 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what
+  local rc interp="" subs="" changed what baseline_rev
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -1175,6 +1212,20 @@ prepare_validation() {
   CHECK_CLI="${C_INTERP:-bash}"
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
+  if [ -n "$CONFLICTS" ]; then
+    check_default_branch || return 1
+    BASELINE_EXIT="$DEFAULT_EXIT"
+    if [ -n "$DEFAULT_CHANGED" ]; then
+      SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
+      return 1
+    fi
+    if [ "$BASELINE_EXIT" -ne 0 ]; then
+      SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
+      note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      return 1
+    fi
+    return 0
+  fi
   # C_SETUP and C_CHECK are shell on purpose, like a CI run: step. They are
   # validated in load_contract: read only from the base branch (never the
   # agent's), one line of printable ASCII, at most 1000 characters; and
@@ -1186,7 +1237,8 @@ prepare_validation() {
   fi
   contract_run "$C_CHECK"; BASELINE_EXIT=$?
   changed="$(tracked_changes)"
-  record baseline "$C_CHECK" "$BASELINE_EXIT" "$BASE" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+  baseline_rev="$(safe_git rev-parse HEAD)"
+  record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
   # A check that cannot run, or is already red, on the unmodified base is
   # the factory's problem, not the ticket's: file the incident and stop
@@ -1198,6 +1250,22 @@ prepare_validation() {
       return 1 ;;
   esac
   if [ "$BASELINE_EXIT" -ne 0 ]; then
+    if [ -n "$FIX_PR" ]; then
+      check_default_branch || return 1
+      if [ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ]; then
+        if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
+          SETUP_REASON="could not restore tracked files changed by the baseline check"
+          return 1
+        fi
+        exclude_untracked
+        return $?
+      fi
+      if [ "$DEFAULT_EXIT" -eq 0 ]; then
+        SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
+        return 1
+      fi
+      BASELINE_EXIT="$DEFAULT_EXIT"
+    fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
     note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
@@ -1400,6 +1468,7 @@ update_fix_branch() {
   if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     UPDATE_REASON="could not read the default branch"; return 1
   fi
+  FIX_DEFAULT="$default"
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
     UPDATE_REASON="could not fetch $default"; return 1
@@ -1814,13 +1883,10 @@ for BRIEF in "$INBOX"/*.md; do
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
-  # A verify run changes no code, so there is nothing to validate.
-  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
-    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
-  fi
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
   FIX_UPSTREAM=""
+  FIX_DEFAULT=""
   if [ -n "$FIX_PR" ]; then
     # BASE is taken first, so a clean merge alone counts as a change and an
     # out-of-date pull request is pushed up to date.
@@ -1832,6 +1898,10 @@ for BRIEF in "$INBOX"/*.md; do
         printf 'Resolve every conflict in those files first: keep both sides'"'"' intent, remove every conflict marker, and keep the tests green. Do not run git; the runner completes the merge.\n'
       } > "$RUN_BRIEF"
     fi
+  fi
+  # A verify run changes no code, so there is nothing to validate.
+  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
+    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 

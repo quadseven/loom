@@ -3369,6 +3369,54 @@ exit %d
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
 
+    def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        work = Path(self._tmp.name) / "pr-work"
+        (work / "fix.txt").write_text("broken\n")
+        git("add", "fix.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "Break check", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        self.advance_main("main.txt", "new main\n")
+        main = self.remote_head("main")
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null", "case \"$*\" in *'On the base it exited 1'*) ;; *) exit 9 ;; esac\n"
+            "test -f main.txt || exit 9\n"
+            "echo 'agent saw red check on merged main' >> \"$FAKE_LOG\"\n"
+            "cat > /dev/null"))
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists(), self.run_log(name + ".log"))
+        self.assertIn("agent saw red check on merged main", self.calls())
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+        self.assertFalse((self.loom / "state" / "factory_held.json").exists())
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        baseline = next(r for r in records if r["phase"] == "baseline")
+        self.assertEqual(baseline["exit"], 1)
+        self.assertNotEqual(baseline["revision"], main)
+        ancestor = subprocess.run(["git", "--git-dir", str(self.remote), "merge-base",
+                                   "--is-ancestor", main, self.FIX_BRANCH])
+        self.assertEqual(ancestor.returncode, 0)
+
+    def test_a_red_default_branch_on_a_fix_round_files_a_base_check_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        self.advance_main("fix.txt", "broken\n")
+        main = self.remote_head("main")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertIn("base check exited 1", self.run_log(name + ".log"))
+        self.assertTrue(any(c.startswith("gh issue create") for c in self.calls()))
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        self.assertTrue(any(r["revision"] == main and r["exit"] == 1 for r in records))
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_final_check_the_environment_cannot_run_is_a_factory_incident(self):
         # The baseline passes; the check's binary is gone by the final run.
