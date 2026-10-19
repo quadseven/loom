@@ -1055,7 +1055,7 @@ class ShipDeployedTest(Base):
     def test_an_adoption_ticket_ships_through_the_pull_request_its_title_names(self):
         # A "Land or supersede #N" ticket has no Refs line or loom branch on its
         # pull request: five never shipped (2026-10-19).
-        self.fake.add(12, state="merged")
+        self.fake.add(12, state="merged", body=station.adoption_body(77))
         self.fake.issues[12]["title"] = "Land or supersede #77: A fix"
         sha = "%040x" % 77
         self.fake.pulls.append({"number": 77, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
@@ -1065,6 +1065,25 @@ class ShipDeployedTest(Base):
         self.ship()
         self.assertIn("loom:shipped", self.fake.names(12))
         self.assertIn("#77", self.fake.comments[12][-1]["body"])
+
+    def test_a_title_naming_a_pull_request_is_not_trusted_without_the_adoption_body(self):
+        # A title anyone can edit must not ship a ticket by naming a merged PR.
+        self.fake.add(12, state="merged")
+        self.fake.issues[12]["title"] = "Land or supersede #77: A fix"
+        sha = "%040x" % 77
+        self.fake.pulls.append({"number": 77, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                                "merge_commit_sha": sha, "body": "A fix.", "head": {"ref": "a-fix"}})
+        self.carried.add(sha)
+        self.record_deploy()
+        self.ship()
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+        # Not looked up again on the next pass.
+        before = len(self.fake.calls)
+        self.ship()
+        later = [str(c) for c in self.fake.calls[before:]]
+        self.assertTrue(later)
+        self.assertFalse([c for c in later if "/issues/12" in c and "timeline" not in c
+                          and "labels" not in c and "comments" not in c], later)
 
     def test_a_merged_ticket_past_the_closed_pull_window_ships_via_its_cross_reference(self):
         # Three tickets merged a day before sat outside the closed-pull window
@@ -1076,7 +1095,8 @@ class ShipDeployedTest(Base):
         self.fake.pulls.append(pr)
         self.carried.add(sha)
         self.fake.timelines = {12: [{"event": "cross-referenced", "source": {"issue": {
-            "number": 88, "pull_request": {}, "repository": {"full_name": REPO}}}}]}
+            "number": 88, "pull_request": {"merged_at": "2030-01-02T00:00:00Z"},
+            "repository": {"full_name": REPO}}}}]}
         self.record_deploy()
         real = self.fake
 

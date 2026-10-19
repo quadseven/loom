@@ -226,6 +226,12 @@ JOURNAL_LOOKBACK = 24 * 3600
 DEPLOYED_FILE = "deployed.json"
 SHIP_PER_PASS = 20
 SHIP_PAGES = 5
+# A merged ticket _merged_pulls did not match: at most this many of its
+# cross-referencing merged pull requests are read, and one with no match is
+# not looked up again for SHIP_LOOKUP_RETRY (SHIP_LOOKUPS_FILE).
+SHIP_XREF_MAX = 3
+SHIP_LOOKUP_RETRY = 6 * 3600
+SHIP_LOOKUPS_FILE = "ship_lookups.json"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 # The handoff packet is rebuilt at most this often, or sooner when a brain
 # tick on this machine just ended (publish_handoff).
@@ -3495,24 +3501,44 @@ class Station:
 
     def _ticket_pull_beyond_window(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
         """The merged pull request of a merged ticket that _merged_pulls did
-        not find: the one an adoption ticket ("Land or supersede #N") names
-        in its title, else the newest merged one whose Refs line or loom
-        branch names the ticket among those that cross-reference it. Neither
-        was read, so five adoption tickets and three tickets merged a day
-        before never shipped while the station deployed their merges
-        (2026-10-19). None when there is none."""
+        not find. For an adoption ticket a trusted login filed, whose title
+        and body both name pull request #N (adoption_body), that pull request;
+        else one merged pull request among those that cross-reference the
+        ticket on the first page of its timeline, whose Refs line or loom
+        branch names it (at most SHIP_XREF_MAX read). Neither path was read,
+        so five adoption tickets and three tickets merged a day before never
+        shipped while the station deployed their merges (2026-10-19). A
+        ticket with no match is not looked up again for SHIP_LOOKUP_RETRY.
+        None when there is none."""
+        path = os.path.join(self.state, SHIP_LOOKUPS_FILE)
+        tried = _read_json(path, {}, strict=False)
+        tried = tried if isinstance(tried, dict) else {}
+        key = "%s#%d" % (repo, number)
+        last = tried.get(key)
+        if isinstance(last, (int, float)) and 0 <= self.now - last < SHIP_LOOKUP_RETRY:
+            return None
+        found: List[Dict[str, Any]] = []
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
-            adopted = re.match(r"Land or supersede #([0-9]+)\b", str((issue or {}).get("title") or ""))
-            numbers = [int(adopted.group(1))] if adopted else []
-            if not numbers:
-                for event in self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)):
-                    source = (event or {}).get("source") or {}
-                    ref = source.get("issue") or {}
-                    if (event.get("event") == "cross-referenced" and "pull_request" in ref
+            issue = issue if isinstance(issue, dict) else {}
+            title = re.match(r"Land or supersede #([0-9]+)\b", str(issue.get("title") or ""))
+            adopted = (title is not None
+                       and tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                       and "Pull request #%s is open in this repo" % title.group(1)
+                       in str(issue.get("body") or ""))
+            if adopted:
+                numbers = [int(title.group(1))]
+            else:
+                events = self.gh.rest("GET", "/repos/%s/issues/%d/timeline?per_page=100"
+                                      % (repo, number)).data
+                numbers = []
+                for event in events if isinstance(events, list) else []:
+                    ref = ((event or {}).get("source") or {}).get("issue") or {}
+                    if (event.get("event") == "cross-referenced"
+                            and (ref.get("pull_request") or {}).get("merged_at")
                             and str((ref.get("repository") or {}).get("full_name") or "") == repo):
                         numbers.append(int(ref["number"]))
-            found = []
+                numbers = numbers[-SHIP_XREF_MAX:]
             for pr_number in numbers:
                 pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data
                 if (isinstance(pr, dict) and pr.get("merged_at")
@@ -3522,9 +3548,14 @@ class Station:
         except RateLimited:
             raise
         except (GitHubError, ValueError, TypeError) as err:
-            _say("could not find the merged pull request of %s#%d: %s" % (repo, number, err))
+            _say("could not find the merged pull request of %s: %s" % (key, err))
+        if not found:
+            tried[key] = self.now
+            tried = {k: v for k, v in tried.items()
+                     if isinstance(v, (int, float)) and 0 <= self.now - v < SHIP_LOOKUP_RETRY}
+            _write_json(path, tried)
             return None
-        return max(found, key=lambda pr: str(pr["merged_at"])) if found else None
+        return max(found, key=lambda pr: str(pr["merged_at"]))
 
     def _merged_tickets(self, repo: str) -> set:
         """The numbers of the repo's open merged tickets."""
