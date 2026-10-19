@@ -6841,10 +6841,15 @@ class Station:
 
     def _silent_lanes(self) -> Dict[str, float]:
         """Local lane -> seconds since its last heartbeat, for each lane
-        without a live one (_heartbeat_ok false) that has ever reported."""
+        without a live one (_heartbeat_ok false) that has ever reported and
+        whose runner does not hold its lock with a live pid. A lane deep in a
+        long run writes no heartbeat until the run ends: counted silent, two
+        spark runs had their tickets re-queued and lane labels removed while
+        they ran, and their finished pull requests were left with no lane
+        (2026-10-19)."""
         out = {}
         for lane in LANES:
-            if lane in REMOTE_LANES or self._heartbeat_ok(lane):
+            if lane in REMOTE_LANES or self._heartbeat_ok(lane) or self._runner_alive(lane):
                 continue
             beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                               None, strict=False)

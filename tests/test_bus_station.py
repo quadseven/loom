@@ -3454,6 +3454,18 @@ class SilentLaneTest(Base):
         # A lane that never reported has no silence to measure.
         self.assertNotIn("claude", silent)
 
+    def test_a_lane_whose_runner_holds_its_lock_is_not_silent(self):
+        # A spark run writes no heartbeat until it ends (2026-10-19).
+        self.heartbeat("spark-3", age=40 * 60)
+        lock = os.path.join(self.home, "run", "spark-3.lock")
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w") as fh:
+            fh.write(str(os.getpid()))
+        self.assertNotIn("spark-3", self.station()._silent_lanes())
+        with open(os.path.join(lock, "pid"), "w") as fh:
+            fh.write("999999")
+        self.assertIn("spark-3", self.station()._silent_lanes())
+
     def test_the_lanes_found_holding_a_running_ticket_become_an_invariant_fact(self):
         st = self.station()
         st._record_silent({"codex": [(REPO, 12)]}, {"codex": 1860.0})
