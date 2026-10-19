@@ -45,7 +45,16 @@ class FakeGitHub:
         raise AssertionError(path)
 
     def rest(self, method, path, body=None, ok=()):
-        self.writes.append((method, path, body)) if method != "GET" else None
+        if method != "GET":
+            self.writes.append((method, path, body))
+        for route in (self._source_route, self._ref_route, self._contents_route,
+                      self._pull_route, self._goal_route):
+            answer = route(method, path, body)
+            if answer is not None:
+                return answer
+        raise AssertionError((method, path, body))
+
+    def _source_route(self, method, path, body):
         if path == "/repos/%s/contents/%s" % ("example-owner/project", DOC):
             return self.answer({"content": self.encoded(self.doc), "sha": "doc"})
         if path.endswith("/pulls?state=closed&sort=updated&direction=desc&per_page=100"):
@@ -55,6 +64,9 @@ class FakeGitHub:
             return self.answer({"default_branch": "main"})
         if path == "/repos/%s/pulls?state=open&per_page=100" % DEPLOY:
             return self.answer(self.pulls)
+        return None
+
+    def _ref_route(self, method, path, body):
         if path == "/repos/%s/git/ref/heads/main" % DEPLOY:
             return self.answer({"object": {"sha": "f" * 40}})
         if path.startswith("/repos/%s/git/ref/heads/" % DEPLOY):
@@ -64,13 +76,19 @@ class FakeGitHub:
         if path == "/repos/%s/git/refs" % DEPLOY:
             self.branch = dict(self.base)
             return self.answer({})
-        if path.startswith("/repos/%s/contents/" % DEPLOY):
-            file = path.split("/contents/", 1)[1].split("?", 1)[0]
-            if method == "PUT":
-                self.branch[file] = base64.b64decode(body["content"]).decode()
-                return self.answer({"commit": {"sha": "e" * 40}})
-            value = self.branch[file] if "?ref=" in path else self.base[file]
-            return self.answer({"content": self.encoded(value), "sha": "file-sha"})
+        return None
+
+    def _contents_route(self, method, path, body):
+        if not path.startswith("/repos/%s/contents/" % DEPLOY):
+            return None
+        file = path.split("/contents/", 1)[1].split("?", 1)[0]
+        if method == "PUT":
+            self.branch[file] = base64.b64decode(body["content"]).decode()
+            return self.answer({"commit": {"sha": "e" * 40}})
+        value = self.branch[file] if "?ref=" in path else self.base[file]
+        return self.answer({"content": self.encoded(value), "sha": "file-sha"})
+
+    def _pull_route(self, method, path, body):
         if path == "/repos/%s/pulls" % DEPLOY and method == "POST":
             self.pulls = [{"number": 8, "head": {"ref": body["head"], "sha": "e" * 40},
                            "html_url": "https://github.com/%s/pull/8" % DEPLOY}]
@@ -83,12 +101,15 @@ class FakeGitHub:
                 "name": "Build image",
                 "html_url": "https://github.com/%s/actions/runs/4" % DEPLOY}]
                 if self.build_ready else [])})
+        return None
+
+    def _goal_route(self, method, path, body):
         if path == "/repos/example-owner/project/issues/12/comments?per_page=100":
             return self.answer(self.comments)
         if path == "/repos/example-owner/project/issues/12/comments" and method == "POST":
             self.comments.append(body)
             return self.answer(body)
-        raise AssertionError((method, path, body))
+        return None
 
     @staticmethod
     def answer(data):

@@ -1535,7 +1535,8 @@ class Tickets(Base):
 
     def test_a_private_easy_ticket_at_a_limit_moves_within_its_tier(self):
         self.limited_easy()
-        self.assertEqual(self.lane(7), "opencode-go")
+        # The first free provider slot allowed private code (infra#5617).
+        self.assertEqual(self.lane(7), "free-ollama")
         self.assertEqual(self.model(7), None)  # the lane's own model runs it
         note = self.gh.comments[7][-1]["body"]
         self.assertIn("Not a failure (lane spark is at a limit)", note)
@@ -1547,12 +1548,14 @@ class Tickets(Base):
         self.assertFalse(any(factory.RUNG_RE.search(c["body"]) for c in self.gh.comments[7]))
 
     def test_a_private_easy_ticket_never_goes_to_a_public_only_lane(self):
-        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter", "workersai"))
+        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter",
+                                "workersai", "free-ollama", "free-gemma"))
         self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
 
     def test_a_public_easy_ticket_may_go_to_the_muse_spark_slot_and_a_private_one_never(self):
         self.gh.private = False
-        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3"))
+        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3")
+                          + factory.FREE_POOL)
         self.assertEqual(self.lane(7), "opencode-go-4")
         self.assertIn("opencode-go-4", factory.PUBLIC_ONLY)
 
@@ -1570,12 +1573,27 @@ class Tickets(Base):
             self.assertEqual(factory.TIERS[tier][:4], factory.SPARKS, tier)
         self.assertEqual(factory.TIERS["easy"][4:6], ("muse", "agy"))
         self.assertEqual(factory.TIERS["medium"][4:6], ("muse", "agy"))
-        self.assertEqual(factory.lanes_of("medium", True)[4], "codex")
+        # Then the free provider slots: on a private repo only the two allowed
+        # private code (infra#5617), then codex.
+        self.assertEqual(factory.TIERS["easy"][6:11], factory.FREE_POOL)
+        self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
+        self.assertEqual(factory.lanes_of("medium", True)[4:7], ("free-ollama", "free-gemma", "codex"))
+
+    def test_free_provider_slots_that_may_train_take_public_repos_only(self):
+        for lane in ("free-nvidia", "free-kilo", "free-groq"):
+            self.assertIn(lane, factory.PUBLIC_ONLY)
+        for lane in ("free-ollama", "free-gemma"):
+            self.assertNotIn(lane, factory.PUBLIC_ONLY)
+        self.assertNotIn("free-nvidia", factory.lanes_of("easy", True))
+        self.assertIn("free-nvidia", factory.lanes_of("easy", False))
+        # Never on hard work, and never counted as a Spark.
+        self.assertFalse(set(factory.FREE_POOL) & set(factory.TIERS["hard"]))
+        self.assertFalse(set(factory.FREE_POOL) & set(factory.SPARKS))
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
         self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-                                "openrouter", "workersai"))
+                                "openrouter", "workersai") + factory.FREE_POOL)
         self.assertEqual(self.lane(7), "zen")
 
     def test_an_easy_ticket_never_goes_to_claude_or_anthropic(self):
@@ -1609,7 +1627,8 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "spark")
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        busy = ("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4") + factory.SPARKS
+        busy = (("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
+                + factory.SPARKS + factory.FREE_POOL)
         for n, lane in enumerate(busy, 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])

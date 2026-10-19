@@ -2364,6 +2364,28 @@ class ValidationContractTest(Base):
         self.assertEqual(checks, [(".github/workflows/test.yml, step Unit tests",
                                   "python -m unittest")])
 
+    def test_pull_request_trigger_forms(self):
+        self.assertTrue(station._has_pull_request_trigger("on:\n  pull_request:\n"))
+        self.assertTrue(station._has_pull_request_trigger("on: [push, pull_request]\n"))
+        self.assertTrue(station._has_pull_request_trigger("on: [push,\n  pull_request]\n"))
+        self.assertFalse(station._has_pull_request_trigger("on:\n  push:\n"))
+        self.assertFalse(station._has_pull_request_trigger("on:\n  pull_request_target:\n"))
+
+    def test_workflow_run_steps_names_block_and_unnamed_steps(self):
+        path = ".github/workflows/test.yml"
+        workflow = ("on:\n  pull_request:\njobs:\n  test:\n    steps:\n"
+                    "      - uses: actions/checkout@v4\n"
+                    "      - name: Lint\n        run: ruff check .\n"
+                    "      - name: \"Tests\"\n        run: |\n"
+                    "          set -o pipefail\n\n          python -m unittest\n"
+                    "      - run: echo done\n"
+                    "      - name: Empty\n        run:\n")
+        self.assertEqual(station._workflow_run_steps(path, workflow), [
+            (path + ", step Lint", "ruff check ."),
+            (path + ", step Tests", "set -o pipefail python -m unittest"),
+            (path + ", step 3", "echo done"),
+        ])
+
     def test_missing_contract_files_one_ticket_and_skips_an_open_duplicate(self):
         goal = {"number": 2, "title": "Backlog: reusable repository work"}
         self.gh = GitHub("token", transport=self.fake)
@@ -3340,6 +3362,20 @@ class RetryTest(Base):
         self.assertTrue(station.needs_public_repo("agy", ""))
         self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
         self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
+
+    def test_free_provider_slots_that_may_train_need_a_public_repo_at_every_gate(self):
+        # Security review on #937: the station gate mapped a slot to its
+        # provider first, so free-nvidia read as spark and took private repos.
+        for slot in ("free-nvidia", "free-kilo", "free-groq"):
+            self.assertTrue(station.needs_public_repo(slot, ""), slot)
+        for slot in ("spark", "spark-2", "free-ollama", "free-gemma"):
+            self.assertFalse(station.needs_public_repo(slot, ""), slot)
+        # The lane runner's own last check names the same slots.
+        root = Path(__file__).resolve().parent.parent
+        script = (root / "lanes" / "run_lane.sh").read_text()
+        body = script.split("trains_on_prompts() {", 1)[1].split("\n}\n", 1)[0]
+        named = set(re.search(r'case "\$SLOT" in ([\w|-]+)\)', body).group(1).split("|"))
+        self.assertEqual(named, {x for x in factory.PUBLIC_ONLY if x.startswith("free-")})
 
 
 class SilentLaneTest(Base):
@@ -5237,6 +5273,31 @@ class ReportsTest(Base):
         body = self.fake.comments[40][-1]["body"]
         self.assertIn("Needs difficulty: #41 Needs a tier.", body)
         self.assertEqual(body.count("Needs difficulty:"), 1)
+
+    def test_one_goals_failed_standup_does_not_skip_the_other_goals(self):
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        for number in (40, 41):
+            self.add_goal(number)
+            self.comment(number, 1, "<!-- loom:report v1 -->\nold report")
+            self.fake.comments[number][0]["created_at"] = old
+        real = brain.goal_tree
+
+        def tree(gh, repo, number):
+            if number == 40:
+                raise station.GitHubError("server error", 500)
+            return real(gh, repo, number)
+
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        with mock.patch.object(brain, "goal_tree", side_effect=tree):
+            st.post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 1)
+        self.assertTrue(self.fake.comments[41][-1]["body"].startswith(station.REPORT_MARKER))
+        with open(os.path.join(st.state, "standups.json")) as fh:
+            state = json.load(fh)
+        self.assertIn("%s#41" % REPO, state)
+        self.assertNotIn("%s#40" % REPO, state)
 
     def report_aged(self, seconds):
         self.add_goal()
