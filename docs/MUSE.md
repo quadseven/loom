@@ -535,7 +535,9 @@ on hard work):
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
-  public repo `free-nvidia`, `free-kilo`, `free-groq`); then codex or opencode-go (opencode-go-4 on public repos only); an
+  public repo `free-nvidia`, `free-kilo`, `free-groq`); then the other free
+  lanes, openrouter and workersai, or on a public repo zen and zai (the
+  operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
 - Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,

@@ -180,8 +180,13 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # the model ladder, so nothing waits on them.
     "easy": SPARKS + ("muse", "agy") + FREE_POOL + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
                       "openrouter", "workersai", "zen", "zai"),
-    "medium": SPARKS + ("muse", "agy") + FREE_POOL + ("codex", "codex-2", "opencode-go", "opencode-go-2",
-                        "opencode-go-3", "opencode-go-4") + ANTHROPIC,
+    # The free lanes take medium work too, before the paid ones (operator
+    # 2026-10-19: "I always want my free tier used up"). 84 medium tickets
+    # waited a median 18.5 hours for codex while these sat idle; a ticket a
+    # free model fails still climbs the model ladder.
+    "medium": SPARKS + ("muse", "agy") + FREE_POOL + ("openrouter", "workersai", "zen", "zai")
+              + ("codex", "codex-2", "opencode-go", "opencode-go-2",
+                 "opencode-go-3", "opencode-go-4") + ANTHROPIC,
     # agy runs Gemini 4 Argon on the operator's Google plan since 2026-10-15:
     # Artificial Analysis Intelligence Index 53 at high effort, beside Claude
     # Opus 5.5 high (54) and GPT-6.1 Sol high (50), so it takes hard work on
