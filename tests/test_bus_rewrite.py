@@ -424,3 +424,26 @@ class StationRewriteTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AnswerShapeTest(unittest.TestCase):
+    """An unusable answer is described by its shape, never its words: all
+    eight Live restates and 113 rewrites failed with one message on
+    2026-10-19, and nothing said what the model had returned."""
+
+    def check(self, output, want):
+        with self.assertRaises(rewrite.Invalid) as ctx:
+            rewrite.parse_answer(output)
+        self.assertIn("the answer holds no JSON object with an action", str(ctx.exception))
+        self.assertIn(want, str(ctx.exception))
+
+    def test_each_shape_of_an_unusable_answer_is_named(self):
+        self.check("", "it was empty")
+        self.check("I cannot help with that request.", "32 characters of text")
+        self.check("Here: {not json", "with a { but no JSON")
+        self.check('{"line": "Live: x", "kind": "y"}', "a JSON object with keys kind, line")
+
+    def test_the_words_of_the_answer_never_appear(self):
+        with self.assertRaises(rewrite.Invalid) as ctx:
+            rewrite.parse_answer("secret-sounding prose about token abc123")
+        self.assertNotIn("abc123", str(ctx.exception))
+        self.assertNotIn("prose", str(ctx.exception))

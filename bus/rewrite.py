@@ -175,7 +175,31 @@ def parse_answer(output: str) -> Dict[str, Any]:
             continue
         if isinstance(value, dict) and "action" in value:
             return value
-    raise Invalid("the answer holds no JSON object with an action")
+    raise Invalid("the answer holds no JSON object with an action (%s)" % answer_shape(output))
+
+
+def answer_shape(output: str) -> str:
+    """What an unusable answer looked like, never its words: the reason can
+    reach a public issue (the repeated-failure invariant), and the model's
+    text is not checked. All eight Live restates and 113 rewrites failed
+    with one message on 2026-10-19, and nothing said whether the model
+    answered empty, in prose, or in JSON without an action."""
+    text = str(output or "")
+    if not text.strip():
+        return "it was empty"
+    decoder = json.JSONDecoder()
+    keys: List[str] = []
+    for m in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text, m.start())
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            keys = [k for k in value if isinstance(k, str) and re.fullmatch(r"[A-Za-z_]{1,20}", k)]
+            break
+    if keys:
+        return "a JSON object with keys %s" % ", ".join(sorted(keys)[:6])
+    return "%d characters of text%s" % (len(text), ", with a { but no JSON" if "{" in text else "")
 
 
 def _text(answer: Dict[str, Any], key: str) -> str:
