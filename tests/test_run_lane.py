@@ -3526,6 +3526,31 @@ exit %d
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
 
+    def test_a_base_check_incident_is_recorded_then_closed_when_the_check_passes(self):
+        red = ("interpreter: loom-test-python\n"
+               "check: loom-test-python -c 'import sys; sys.exit(2)'\n")
+        self.contract_repo(contract=red)
+        self.drop_brief()
+        self.run_contract_lane()
+        marker = self.loom / "state" / "incidents" / "example_repo-base-check"
+        self.assertEqual(marker.read_text().strip(), "99")
+        self.assertFalse(any(c.startswith("gh issue close") for c in self.calls()))
+
+    def test_a_passing_base_check_closes_the_repos_open_incident(self):
+        # Nothing closed incidents: 16 tickets sat held behind five whose
+        # checks passed again for hours (2026-10-19).
+        self.contract_repo()
+        marker = self.loom / "state" / "incidents" / "example_repo-base-check"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("41\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        closes = [c for c in self.calls() if c.startswith("gh issue close")]
+        self.assertEqual(len(closes), 1, self.calls())
+        self.assertIn("--repo quadseven/loom 41", closes[0])
+        self.assertFalse(marker.exists())
+
     def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
