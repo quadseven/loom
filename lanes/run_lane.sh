@@ -1225,7 +1225,18 @@ check_default_branch() {
   DEFAULT_REV="$(safe_git rev-parse "origin/$FIX_DEFAULT")" || {
     SETUP_REASON="could not read the default branch revision"; return 1;
   }
-  if ! safe_git worktree add -q --detach "$default_tree" "$DEFAULT_REV" >> "$LOG" 2>&1; then
+  # A local clone, not a worktree: a worktree's .git is a file naming the
+  # fix tree's .git, which the check sandbox cannot read, so every check that
+  # runs git failed there (loom's metrics tests, a false base-check incident
+  # on each loom fix round, 2026-10-19). The clone hardlinks its objects and
+  # takes the real origin, so relative submodule URLs still resolve.
+  if ! { timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+           clone -q --local --no-checkout "$branch_tree" "$default_tree" >> "$LOG" 2>&1 &&
+         git -C "$default_tree" -c core.hooksPath=/dev/null remote set-url origin \
+           "$(safe_git remote get-url origin)" >> "$LOG" 2>&1 &&
+         git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+           checkout -q --detach "$DEFAULT_REV" >> "$LOG" 2>&1; }; then
+    rm -rf "$default_tree"
     SETUP_REASON="could not check out the default branch for validation"; return 1
   fi
   TREE="$default_tree" CHECK_HOME="$branch_home-default"
@@ -1249,7 +1260,7 @@ check_default_branch() {
   fi
   TREE="$branch_tree" CHECK_HOME="$branch_home"
   rm -rf "$branch_home-default"
-  if ! safe_git worktree remove --force "$default_tree" >> "$LOG" 2>&1; then
+  if ! rm -rf "$default_tree"; then
     SETUP_REASON="could not remove the default branch validation tree"; return 1
   fi
   [ "$rc" -eq 0 ]

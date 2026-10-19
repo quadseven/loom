@@ -3565,6 +3565,30 @@ exit %d
         self.assertFalse(any(c.startswith("gh issue close") for c in self.calls()))
         self.assertTrue(marker.exists())
 
+    def test_the_default_branch_check_runs_in_a_tree_with_its_own_git_directory(self):
+        # A worktree's .git is a file naming the fix tree's .git, which the
+        # check sandbox cannot read: loom's metrics tests run git ls-files and
+        # failed there, a false base-check incident each fix round (2026-10-19).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract=CONTRACT.replace(
+            "check: test -f .prepared", "check: test -d .git && git ls-files check.py | grep -q . && test -f .prepared"))
+        name, _ = self.fix_brief()
+        work = Path(self._tmp.name) / "pr-work"
+        (work / "fix.txt").write_text("broken\n")
+        git("add", "fix.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "Break check", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()),
+                         self.run_log(name + ".log"))
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        default = next(r for r in records if r["phase"] == "default-baseline")
+        self.assertEqual(default["exit"], 0)
+        self.assertFalse(list(self.loom.glob("**/*-default-check")))
+
     def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
