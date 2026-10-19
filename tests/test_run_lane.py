@@ -3024,6 +3024,38 @@ exit %d
                 # reads no key here, keeps its heartbeat as it is.
                 self.assertEqual(self.beat()["available"], want != "limit")
 
+    def test_a_lane_rests_after_three_transient_failures_in_a_row(self):
+        # zen, 2026-10-19: a free model answered "Unexpected server error" to
+        # every run, and the lane kept claiming tickets for hours.
+        for n in range(3):
+            name = "T04%d-run" % n
+            self.drop_brief(name + ".md", BRIEF.replace("T042-fix-the-thing", name))
+            self.run_lane(FAKE_AGENT="say", FAKE_OUT="UnknownError: Unexpected server error",
+                          FAKE_EXIT="1")
+            beat = self.beat()
+            self.assertEqual(beat["available"], n < 2, (n, beat))
+        self.assertIn("3 transient failures in a row", beat["reason"])
+        self.assertTrue(beat["reason"].startswith("limit: "))
+        self.assertGreater(beat["retry_at"], int(time.time()) + 1700)
+        # Resting: the next pass runs no agent.
+        self.drop_brief("T049-next.md", BRIEF.replace("T042-fix-the-thing", "T049-next"))
+        self.log.write_text("")
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.beat()["available"])
+
+    def test_a_run_that_is_not_transient_clears_the_transient_count(self):
+        for n, (out, status) in enumerate((("Unexpected server error", "1"),
+                                           ("Unexpected server error", "1"),
+                                           ("Rate limit hit. Please try again in 1 minutes.", "1"),
+                                           ("Unexpected server error", "1"))):
+            name = "T05%d-run" % n
+            self.drop_brief(name + ".md", BRIEF.replace("T042-fix-the-thing", name))
+            for f in (self.loom / "state" / "usage").glob("codex.json"):
+                f.unlink()
+            self.run_lane(FAKE_AGENT="say", FAKE_OUT=out, FAKE_EXIT=status)
+        self.assertNotIn("transient failures in a row", self.beat().get("reason", ""))
+
     def test_an_expired_key_on_a_lane_that_reads_no_key_is_auth_but_not_a_hold(self):
         # codex keeps its sign-in in the CLI's own file: there is no parameter
         # whose value the operator could change, so the lane is not held for

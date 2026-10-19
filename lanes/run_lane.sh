@@ -514,6 +514,38 @@ post_no_change() {
 # The reason starts with the failure's class ($3, default work): the station
 # re-briefs limit and transient failures to another lane as a new attempt,
 # and leaves work failures to the brain.
+# A lane whose runs fail [transient] TRANSIENT_STRIKES times in a row rests
+# TRANSIENT_REST seconds, unavailable "at a limit", so the station stops
+# sending it tickets and the factory moves its briefed ones aside. A free
+# model answering "Unexpected server error" to every run failed 14 of zen's
+# 40 runs on 2026-10-19 while the lane kept claiming. A run that ends any
+# other way clears the count.
+TRANSIENT_STRIKES=3
+TRANSIENT_REST=1800
+TRANSIENT_FILE="$LOOM_HOME/state/usage/$SLOT.transient"
+transient_rest_until() {
+  local count until
+  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || return 1
+  [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
+}
+# Count one transient run; prints the epoch the lane rests until once the
+# count reaches TRANSIENT_STRIKES, and fails before that.
+transient_strike() {
+  local count until now
+  now="$(date +%s)"
+  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || count=0
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  count=$((count + 1))
+  if [ "$count" -ge "$TRANSIENT_STRIKES" ]; then
+    printf '0 %s\n' "$((now + TRANSIENT_REST))" > "$TRANSIENT_FILE"
+    printf '%s' "$((now + TRANSIENT_REST))"
+    return 0
+  fi
+  printf '%s 0\n' "$count" > "$TRANSIENT_FILE"
+  return 1
+}
+transient_clear() { rm -f "$TRANSIENT_FILE"; }
+
 park() {
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
   echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
@@ -1722,6 +1754,11 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_T
   fi
 done
 
+if REST_UNTIL="$(transient_rest_until)"; then
+  heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+  exit 0
+fi
+
 # A provider limit hit by an earlier pass holds until its retry time. A
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
@@ -1985,6 +2022,13 @@ for BRIEF in "$INBOX"/*.md; do
   FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
+  fi
+  if [ "$FAIL_CLASS" != transient ]; then
+    transient_clear
+  elif REST_UNTIL="$(transient_strike)"; then
+    heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+    park "$BRIEF" "agent exited $STATUS" transient
+    break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
