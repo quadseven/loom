@@ -366,7 +366,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .transcript-event.edited .tx-label { color: var(--good); }
 .transcript-event.grug .tx-label { color: var(--bad); }
 .transcript-event.answered .tx-label, .transcript-event.live .tx-label { color: var(--accent); }
-.transcript-event.waiting .tx-label { color: var(--accent); }
+.transcript-event.waiting .tx-label, .transcript-event.escalated .tx-label { color: var(--accent); }
 .transcript-event.failed .tx-label { color: var(--bad); }
 .transcript-event p { color: var(--text); font-size: 14px; line-height: 1.55; white-space: pre-wrap; text-wrap: pretty; }
 .transcript-event em { color: var(--muted); font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; }
