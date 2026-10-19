@@ -666,7 +666,10 @@ last pass: by default `logs/station.log` (as `station`), `logs/brain.log`
 `LOOM_WATCH` replaces that list with lines of `name=path`, a relative path
 being under `$LOOM_HOME`. A line counts when it says `error`, `failed`,
 `Traceback` or `refused`, or carries an HTTP 4xx or 5xx; a Python traceback
-counts once, as its exception line. Each line is reduced to a signature:
+counts once, as its exception line. A line of a GitHub Actions job log that
+an agent echoed (a seven-digit-fraction timestamp, after the job and step
+names `gh run view --log` adds) never counts: it is the run's output, and a
+green run's test names say `failed` too. Each line is reduced to a signature:
 times, numbers, hex ids and SHAs, long mixed ids, repos and issue numbers,
 paths, addresses and mentions become placeholders, so a 403 on two repos is
 one signature (the status code is kept).

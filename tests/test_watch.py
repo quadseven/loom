@@ -210,6 +210,38 @@ class FilingTest(WatchBase):
                 self.assertFalse(watch.keep(line))
         self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] example.repo-3 failed: [work] tests failed"))
 
+    def test_a_relayed_ci_log_line_is_never_a_signature(self):
+        # loom#880-#904: a brain agent read a CI run's log ("gh run view
+        # --log": job, step and a seven-digit timestamp before each line)
+        # and the passing tests' names and captured output said "failed" or
+        # "error", so about 25 issues were filed for a green run.
+        for line in (
+                "unittest\tunittest (no test may skip)\t2026-10-18T20:36:20.3598990Z "
+                "test_a_failed_proof_is_held (test_bus_brain.ProofTests."
+                "test_a_failed_proof_is_held) ... ok",
+                "unittest\tunittest (no test may skip)\t2026-10-18T20:36:21.0000001Z "
+                "factory: re-briefed failed example-owner/repo-a#3 on codex",
+                "unittest unittest (no test may skip) 2026-10-18T20:36:22.1234567Z "
+                "station: could not post to the webhook (OSError); next pass",
+                "2026-10-18T20:36:23.7654321Z ##[error]Process completed with exit code 1.",
+                "[2026-10-18T20:40:00Z] unittest\tunittest\t2026-10-18T20:36:24.0000000Z error"):
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line))
+        # The brain's own lines, with its one-second stamp, are judged as usual.
+        for line in ("[2026-10-18T20:36:20Z] brain: push failed",
+                     "brain: the CI run at 2026-10-18T20:36:20.3598990Z failed",
+                     "Error: 2026-10-18T20:36:20.3598990Z run failed"):
+            with self.subTest(line=line):
+                self.assertTrue(watch.keep(line))
+
+    def test_a_green_ci_log_read_by_the_brain_files_nothing(self):
+        for i in range(5):
+            self.append("unittest\tunittest (no test may skip)\t2026-10-18T20:36:2%d.3598990Z "
+                        "test_watch_error_%d (test_watch.FilingTest.test_watch_error_%d) ... ok"
+                        % (i, i, i))
+            self.run_at(T0 + i * 60)
+        self.assertEqual(self.gh.issues, {})
+
     def test_a_closed_issue_is_not_counted_or_filed_again(self):
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0)
