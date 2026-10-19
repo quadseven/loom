@@ -205,6 +205,17 @@ class Limits(Fixture):
         self.assertEqual(sum(e["kind"] == "text" for e in body["events"]), 600)
         self.assertEqual(sum(e["kind"] == "tool_use" for e in body["events"]), 600)
 
+    def test_every_zip_in_the_module_is_strict(self):
+        # ruff B905 (#197): limit() pairs events with its keep flags, and a
+        # length mismatch must raise rather than silently drop the tail.
+        import ast
+        source = Path(transcripts.__file__).read_text(encoding="utf-8")
+        loose = [node.lineno for node in ast.walk(ast.parse(source))
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                 and node.func.id == "zip"
+                 and not any(k.arg == "strict" for k in node.keywords)]
+        self.assertEqual(loose, [])
+
 
 class Brain(Fixture):
     def test_a_brain_tick_is_the_sessions_written_during_it(self):

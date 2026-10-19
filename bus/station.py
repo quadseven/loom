@@ -177,6 +177,9 @@ TRIAGE_INTERVAL = 3600
 # pass (each one waits on an agent command), and how long before an issue
 # whose rewrite did not produce a ticket is tried again.
 REWRITE_PER_HOUR = 5
+# A brief that has waited this long in a down lane's inbox stops blocking its
+# ticket's next claim (_return_dead_brief).
+DEAD_BRIEF_AGE = 3600
 REWRITE_PER_PASS = 5
 # Rewrites across every backlog goal in any hour: each one comments on its
 # issue or files a ticket, and both email the operator. Per goal alone, ten
@@ -295,6 +298,7 @@ LANE_MODELS = {
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],
     "spark": ["spark/?*"],
+    "free": ["free/?*"],
     "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
 }
 # Operator messages in the Discord channel become notes on a goal home, and
@@ -1001,8 +1005,10 @@ def _clip(text: str, limit: int) -> str:
 
 
 def provider(lane: str) -> str:
-    """The provider lane of a slot (anthropic-2 -> anthropic), as the runner
-    maps it."""
+    """The provider lane of a slot (anthropic-2 -> anthropic, free-kilo ->
+    free), as the runner maps it."""
+    if re.fullmatch(r"free-[a-z]+", lane):
+        return "free"
     return re.sub(r"-[0-9]+$", "", lane)
 
 
@@ -1059,7 +1065,12 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
 
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
-    repos only."""
+    repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
+    to its provider: free-nvidia, free-kilo and free-groq are free provider
+    slots that may train (infra#5617), while free-ollama and free-gemma may
+    take private repos."""
+    if lane in factory.PUBLIC_ONLY:
+        return True
     lane = provider(lane)
     return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
             or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
@@ -1637,7 +1648,8 @@ class Station:
             # is refused: the newest claim's run must end first.
             newest = tickets.ticket_name(repo, number, earlier)
             busy = [l for l in LANES
-                    if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))]
+                    if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))
+                    and not self._return_dead_brief(l, newest)]
             if busy:
                 _say("not claiming %s#%d: its brief %s is still in lane %s's inbox; next pass"
                      % (repo, number, newest, busy[0]))
@@ -1673,6 +1685,59 @@ class Station:
         goal = self._goal_of(repo, issue)
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
+        return True
+
+    def _return_dead_brief(self, lane: str, name: str) -> bool:
+        """Move a brief out of a dead lane's inbox into the inbox's returned/
+        (which nothing reads), so the ticket can be claimed on a live lane.
+        True when it was moved. A brief stays in the inbox while its run goes
+        on, so "dead" needs every sign that nothing runs there: no runner lock
+        with a live pid (lanes/run_lane.sh holds run/<lane>.lock for the whole
+        run), a heartbeat whose own time is DEAD_BRIEF_AGE old or missing (the
+        runner beats every tick, available or not: a limit or the spend floor
+        is not death), and a brief that has waited DEAD_BRIEF_AGE. A ticket
+        waited two days behind a brief in the inbox of a lane whose key had
+        expired (2026-10-18)."""
+        if self._runner_alive(lane):
+            return False
+        beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                          None, strict=False)
+        at = beat.get("at") if isinstance(beat, dict) else None
+        if isinstance(at, (int, float)) and not isinstance(at, bool) \
+                and self.now - at < DEAD_BRIEF_AGE:
+            return False
+        path = os.path.join(self.inbox(lane), name + ".md")
+        try:
+            if self.now - os.path.getmtime(path) < DEAD_BRIEF_AGE:
+                return False
+            returned = os.path.join(self.inbox(lane), "returned")
+            os.makedirs(returned, exist_ok=True)
+            os.replace(path, os.path.join(returned, name + ".md"))
+        except OSError:
+            return False
+        _say("returned brief %s from lane %s: no runner and no heartbeat for an hour"
+             % (name, lane))
+        return True
+
+    def _runner_alive(self, lane: str) -> bool:
+        """Whether lane's runner holds its lock with a live pid. A name that
+        is not one of LANES counts as alive, so it never builds a path and its
+        brief is never moved."""
+        if lane not in LANES:
+            return True
+        lock = os.path.join(self.s.home, "run", lane + ".lock")
+        try:
+            with open(os.path.join(lock, "pid")) as fh:
+                pid = int(fh.read().strip())
+        except (OSError, ValueError):
+            # A lock with no readable pid may be a runner starting up.
+            return os.path.isdir(lock)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass  # alive, owned by another user (the lane user)
         return True
 
     def _claim_label(self, repo: str) -> Optional[str]:
@@ -6132,8 +6197,15 @@ class Station:
                 and 0 <= self.now - checked < REPORT_CHECK:
             return
         state["_checked"] = self.now
+        # One goal's failure must not skip the later goals' standups, nor drop
+        # the stamps of the goals already posted this pass (loom#201).
         for repo, goal in self._goal_homes():
-            self._post_overdue_goal_standup(repo, goal, state, authors, now)
+            try:
+                self._post_overdue_goal_standup(repo, goal, state, authors, now)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("standup %s#%s failed: %s" % (repo, goal.get("number"), err))
         _write_json(state_path, state)
 
     def _post_overdue_goal_standup(self, repo: str, goal: Dict[str, Any],

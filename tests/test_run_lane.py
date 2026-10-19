@@ -104,14 +104,16 @@ if [ "$1 $2" = "pr create" ]; then
   echo "https://github.com/example/repo/pull/7"
 fi
 # Fake factory incidents: `search issues` prints $FAKE_GH_SEARCH (default
-# empty: no open incident), `issue create` prints the new issue's URL,
-# `issue comment` succeeds silently.
+# empty: no open incident), `issue create` writes its --body to
+# $FAKE_BODY.issue and prints the new issue's URL, `issue comment`
+# succeeds silently.
 if [ "$1 $2" = "search issues" ]; then
   printf '%s\n' "${FAKE_GH_SEARCH:-}"
   exit 0
 fi
 if [ "$1 $2" = "issue create" ]; then
   [ -z "${FAKE_GH_ISSUE_CREATE_FAIL:-}" ] || { echo "issue create blew up" >&2; exit 1; }
+  while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY.issue"; shift; done
   echo "https://github.com/quadseven/loom/issues/${FAKE_GH_ISSUE_NUMBER:-99}"
   exit 0
 fi
@@ -1117,12 +1119,64 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "rc=1")
         self.assertEqual(result.stderr, "")
 
-    def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
+    def test_a_limit_line_before_the_last_lines_of_output_is_still_a_limit(self):
+        # loom#934: a provider limit the CLI prints before more output is still
+        # a limit, because the runner now classifies from the whole run output;
+        # the lane stays held until the reset.
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="early-limit")
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("failed: [transient] agent exited 1", log)
-        self.assertNotIn("failed: limit", log)
+        self.assertIn("failed: [limit]", log)
+        self.assertNotIn("failed: [transient]", log)
+        self.assertNotIn("failed: [work]", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_usage_limit_followed_by_more_output_is_classed_limit(self):
+        # loom#934, grug#1186 r7 on codex-2: the limit line, then three
+        # "failed to record rollout items" lines, "tokens used" and the count,
+        # five non-blank lines after the limit. The last five lines hold none
+        # of it, so the old tail-only check logged [work] agent exited 1. The
+        # runner classifies from the whole run output: this is a limit that
+        # holds the lane, and the reason shown to people stays the short limit
+        # reason rather than the whole output.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        tail = "\n".join([
+            "ERROR: You've hit your usage limit. Try again at Oct 19th, 2026 12:07 AM.",
+            "ERROR: You've hit your usage limit. Try again at Oct 19th, 2026 12:07 AM.",
+            "failed to record rollout items",
+            "failed to record rollout items",
+            "failed to record rollout items",
+            "tokens used",
+            "42,964",
+        ])
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=tail, FAKE_EDIT="1", FAKE_EXIT="1")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [limit]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertNotIn("failed: [transient]", log)
+        reason = self.failure_line()
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertNotIn("tokens used", reason)
+        self.assertNotIn("42,964", reason)
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
+        # loom#934: the auth and transient (network) patterns still read the
+        # short tail, not the whole output. A key-expiry line buried in the
+        # agent's output -- not in its last five lines -- does not hold the lane
+        # as auth, so a ticket that is about expired keys is not read as one.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        out = "Error: API key expired\n" + "\n".join(
+            "working on step %d" % i for i in range(1, 7))
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=out, FAKE_EDIT="1", FAKE_EXIT="1")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("failed: [auth]", log)
+        self.assertIn("failed: [work]", log)
+        self.assertTrue(self.beat()["available"])
 
     def test_a_finding_that_mentions_a_rate_limit_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF + "\nThe client ignores the rate limit header.\n")
@@ -2333,6 +2387,29 @@ cat > /dev/null
                          {"context": 131072, "output": 16384})
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_free_provider_slot_is_its_own_lane_with_its_own_window(self):
+        # The free lane (infra#5617): one slot per free provider at the
+        # spark-gateway's pinned route, declared as provider "free" (never
+        # "spark"), with the ~128K window the free models serve beside a
+        # Spark window of 262144.
+        _, result = self.api_lane("free-ollama",
+                                  LOOM_FREE_OLLAMA_URL="http://gateway.example.invalid/free/ollama-cloud/v1",
+                                  LOOM_FREE_OLLAMA_MODEL="free/ollama-cloud",
+                                  LOOM_FREE_CONTEXT="120000", LOOM_FREE_OUTPUT="16384",
+                                  LOOM_SPARK_CONTEXT="262144", LOOM_SPARK_OUTPUT="32768",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("curl ") and "/free/ollama-cloud/v1/models" in c for c in calls), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertNotIn("spark", config["provider"])
+        self.assertEqual(config["model"], "free/ollama-cloud")
+        self.assertEqual(config["provider"]["free"]["options"],
+                         {"baseURL": "http://gateway.example.invalid/free/ollama-cloud/v1"})
+        self.assertEqual(config["provider"]["free"]["models"]["ollama-cloud"]["limit"],
+                         {"context": 120000, "output": 16384})
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
         _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
                                   **self.SPARK)
@@ -3333,11 +3410,12 @@ exit %d
         self.assertIn("failed: [factory]", log)
         self.assertNotIn("failed: [work]", log)
         self.assertIn("factory incident quadseven/loom#99", log)
-        # The incident names the repo and the exact failing line.
-        calls = self.log.read_text()
-        self.assertIn("gh issue create --repo quadseven/loom", calls)
-        self.assertIn("Repo: example/repo", calls)
-        self.assertIn("python: 3.12", calls)
+        # The incident names the repo and the exact failing line, in the
+        # body it is filed with (not just anywhere in the call log).
+        self.assertIn("gh issue create --repo quadseven/loom", self.log.read_text())
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertIn("Repo: example/repo", body)
+        self.assertIn("python: 3.12", body)
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
