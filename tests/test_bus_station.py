@@ -3712,6 +3712,23 @@ class FactoryIncidentTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
         self.assertTrue(any("back in the queue" in b for b in self.bodies()))
 
+    def test_a_factory_hold_and_its_release_post_no_new_comment(self):
+        # Closing five incidents released 16 tickets and sent 16 emails at
+        # once (2026-10-19): the hold and the release are status events.
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        plain = [c["body"] for c in self.fake.comments[12] if not status.is_status(c.get("body"))]
+        self.assertFalse([b for b in plain if "held:" in b or "back in the queue" in b], plain)
+        boxes = "\n".join(c["body"] for c in self.fake.comments[12]
+                          if status.is_status(c.get("body")))
+        self.assertIn("back in the queue", boxes)
+        self.assertIn("Lane muse held:", boxes)
+
     def test_a_closed_incident_without_label_requeues_its_ticket(self):
         # loom#918: the loom:factory label was not in LABELS, so the runner
         # could not apply it and the incident was filed without it. The station

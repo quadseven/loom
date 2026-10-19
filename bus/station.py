@@ -3796,7 +3796,9 @@ class Station:
             # (loom#572); a runaway label kept here held tickets for hours.
             kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-        self._comment(repo, number,
+        # A status event, not a comment: closing five incidents released 16
+        # tickets and sent 16 emails at once (2026-10-19).
+        self._routine(repo, number,
                       "Factory incident %s is closed: the ticket is back in the queue "
                       "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                           if cleared else ""))
