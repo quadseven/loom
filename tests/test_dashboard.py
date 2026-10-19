@@ -870,5 +870,33 @@ class LaneCardsTest(unittest.TestCase):
         self.assertIn("quota not reported", body)
 
 
+
+class LaneViewComplexityTest(unittest.TestCase):
+    """_lane_view_data stays orchestration: the per-lane card, the scoreboard
+    rows and the Anthropic share each live in a helper (#372)."""
+
+    @staticmethod
+    def _cyclomatic(func):
+        import ast
+        count = 1
+        for node in ast.walk(func):
+            if isinstance(node, (ast.If, ast.For, ast.While, ast.IfExp, ast.ExceptHandler,
+                                 ast.AsyncFor, ast.Assert)):
+                count += 1
+            elif isinstance(node, ast.comprehension):
+                count += 1 + len(node.ifs)
+            elif isinstance(node, ast.BoolOp):
+                count += len(node.values) - 1
+        return count
+
+    def test_lane_view_data_is_under_the_complexity_cap(self):
+        import ast
+        from pathlib import Path
+        source = (Path(__file__).resolve().parent.parent / "dashboard" / "server.py").read_text(encoding="utf-8")
+        func = next(node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.FunctionDef) and node.name == "_lane_view_data")
+        self.assertLessEqual(self._cyclomatic(func), 15)
+
+
 if __name__ == "__main__":
     unittest.main()
