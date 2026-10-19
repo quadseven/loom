@@ -4291,6 +4291,20 @@ class OutcomeTest(Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         self.assertEqual(st.limited_lanes(), ["spark"])
 
+    def test_down_lanes_are_those_with_a_fresh_unavailable_heartbeat_not_at_a_limit(self):
+        d = os.path.join(self.home, "state", "usage")
+        for lane, available, reason, age in (
+                ("opencode-go-2", False, "API key expired: renew /x/key", 0),
+                ("spark", False, "limit: the spark endpoint answered 503; unavailable until x", 0),
+                ("zai", False, "opencode not on PATH", station.HEARTBEAT_MAX_AGE + 60),
+                ("codex", True, "", 0)):
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, lane + ".json"), "w") as fh:
+                json.dump({"lane": lane, "at": int(time.time()) - age,
+                           "available": available, "reason": reason}, fh)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertEqual(st.down_lanes(), ["opencode-go-2"])
+
     def test_failed_without_a_log_line_says_so(self):
         self.finished("failed")
         self.run_pass()

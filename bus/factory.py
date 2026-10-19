@@ -948,7 +948,8 @@ class Factory:
                  close: Optional[Callable[..., Any]] = None,
                  held: Sequence[str] = (),
                  model_limits: Optional[Dict[str, Dict[str, float]]] = None,
-                 silent: Optional[Dict[str, float]] = None) -> None:
+                 silent: Optional[Dict[str, float]] = None,
+                 down: Sequence[str] = ()) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -961,6 +962,11 @@ class Factory:
         self.merge, self.fix, self.move = merge, fix, move
         self.close = close if close is not None else _default_close
         self.limited = set(limited)
+        # Lanes whose fresh heartbeat says unavailable for another reason (an
+        # expired key, a lane stopped on purpose): their briefed tickets step
+        # aside as from a limit. Left to the BRIEFED_STALL move, three tickets
+        # waited two hours on lanes whose key had expired (2026-10-19).
+        self.down = set(down)
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
         # is up while one model is limited, but not for that model.
         self.model_limits = dict(model_limits or {})
@@ -1654,7 +1660,8 @@ class Factory:
             # stalled, so it climbs nothing, and only a long hold is reported.
             self._tell_held(repo, issue, waiting)
             return
-        if _lane(issue) in self.limited or not self._serves(_lane(issue), issue_model(issue)):
+        if (_lane(issue) in self.limited or _lane(issue) in self.down
+                or not self._serves(_lane(issue), issue_model(issue))):
             self._step_aside(repo, issue)
             return
         if not self._spread(repo, issue):
@@ -1826,13 +1833,14 @@ class Factory:
         return True
 
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Move a ticket off a lane at a limit to the first free lane of its
+        """Move a ticket off a lane at a limit (or down) to the first free lane of its
         difficulty tier (or of a FALLBACK tier when none of its tier is up),
         or a ladder ticket to a free lane of its rung, with no rung marker.
         With none free it stays where it is, for the lane to take once it is
         back."""
         number = int(issue["number"])
         old = _lane(issue)
+        why = "down" if old in self.down and old not in self.limited else "at a limit"
         rung = current_rung(issue)
         fallback = ""
         if rung:
@@ -1841,8 +1849,8 @@ class Factory:
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
         if lane is None:
-            _say("%s#%d waits on lane %s, at a limit: no free lane in its %s"
-                 % (repo, number, old, "rung" if rung else "tier"))
+            _say("%s#%d waits on lane %s, %s: no free lane in its %s"
+                 % (repo, number, old, why, "rung" if rung else "tier"))
             return
         body = str(issue.get("body") or "")
         if not rung:
@@ -1853,15 +1861,15 @@ class Factory:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
         self._status_note(repo, number,
-                          "Not a failure (lane %s is at a limit): the factory moved this "
+                          "Not a failure (lane %s is %s): the factory moved this "
                           "ticket to lane %s, %s." % (
-                              old, lane, "on the same rung" if rung else
+                              old, why, lane, "on the same rung" if rung else
                               fallback or "in its difficulty tier"))
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
-        _say("moved %s#%d off lane %s, at a limit, to %s%s" % (
-            repo, number, old, lane, " (%s)" % fallback if fallback else ""))
+        _say("moved %s#%d off lane %s, %s, to %s%s" % (
+            repo, number, old, why, lane, " (%s)" % fallback if fallback else ""))
 
     # -- lane load -------------------------------------------------------
     def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
