@@ -434,7 +434,9 @@ this tick"; a step with no note shows nothing there.
    ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
    what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
-   takes what is left, and only rewrites `loom:triage` issues: take up to
+   takes what is left (the `needs-brain` ones first: the station's rewrite
+   model judged them person-only, and you decide), and only rewrites
+   `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket names it, the original gets

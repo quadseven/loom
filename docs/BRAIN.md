@@ -404,6 +404,11 @@ turning it on; each ticket filed logs `friction OWNER/NAME: filed #N`.
 ### Agent rewrites
 
 The station rewrites `loom:triage` issues without a brain tick (`bus/rewrite.py`).
+It only briefs or skips: when its model answers that only a person can do the
+work, the issue keeps `loom:triage`, gains `needs-brain` (no comment), and the
+station leaves it alone from then on; the brain decides whether it becomes a
+ticket or `loom:human`. Free rewrite models labelled factory work as
+person-only, and every `loom:human` reaches the operator's digest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
 `lanes/rewrite_agent.sh <key-ssm|-> <provider/model[,provider/model...]>`

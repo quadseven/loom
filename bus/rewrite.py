@@ -9,6 +9,7 @@ its ticket is verified.
 from __future__ import annotations
 
 import json
+import sys
 import os
 import re
 import shlex
@@ -36,6 +37,14 @@ class Invalid(Exception):
 class CommandFailure(Invalid):
     """The agent command failed before producing an answer."""
 
+
+
+# A rewrite the model thinks only a person can do waits for the brain.
+NEEDS_BRAIN = "needs-brain"
+
+
+def _names(issue: Dict[str, Any]) -> List[str]:
+    return [str(x.get("name") if isinstance(x, dict) else x) for x in issue.get("labels") or []]
 
 def command_for(public_cmd: str, private_cmd: str, private: bool) -> str:
     """The agent command for a repo, or "" when the repo is skipped. A
@@ -216,7 +225,7 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
     return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-            and not brain.owned_elsewhere(i)]
+            and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)]
 
 
 def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,
@@ -233,5 +242,11 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
         brain.brief_intake(gh, repo, goal, fields["title"], fields["body"],
                     difficulty=fields["difficulty"], refs=number)
     elif action == "human":
-        brain.human(gh, repo, number, fields["ask"])
+        # The rewrite model only proposes it: free models labelled factory
+        # work as person-only (GitHub access as "a credential", a Datadog
+        # monitor while Datadog is off), and every loom:human lands in the
+        # operator's digest. The brain decides; the issue stays loom:triage.
+        gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_BRAIN]})
+        print("rewrite: %s#%d proposed as person-only, left to the brain: %s"
+              % (repo, number, fields["ask"][:200]), file=sys.stderr)
     return action
