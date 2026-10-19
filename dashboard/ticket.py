@@ -29,6 +29,10 @@ MOVED_RE = re.compile(r"^Not a failure \([^)]*\): the factory moved this ticket 
 UNAVAILABLE_RE = re.compile(r"^Lane (\S+) is unavailable \((.+)\)\. This is not a failure", re.S)
 RETRY_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \(\w+\): moved from lane (\S+) to lane (\S+)\. "
                       r"Lane \S+ failed: (.+)", re.S)
+# The brain's comment when it escalated a stuck ticket to another rung and
+# lane (bus/brain.py ESCALATE_MARKER, escalate).
+ESCALATE_RE = re.compile(r"^<!-- loom:escalate v1 -->\s*\n(Escalated to rung \d+ of \d+: \S+ on lane (\S+?))\.?[ \t]*$"
+                         r"(?:\nReason: (.*?)[ \t]*$)?", re.M)
 PINNED_LIMIT_RE = re.compile(r"requested model (\S+) limited until (\d{4}-\d\d-\d\d)T(\d\d:\d\d)")
 UNTIL_RE = re.compile(r"until (\d{4}-\d\d-\d\d)T(\d\d:\d\d)")
 SHIPPED_RE = re.compile(r"^Shipped\b")
@@ -79,6 +83,10 @@ def _comment_step(comment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     body = str(comment.get("body") or "").strip()
     ts = comment.get("created_at") or ""
     rung = RUNG_RE.search(body)
+    escalate = ESCALATE_RE.match(body)
+    if escalate:
+        return {"who": "brain", "ts": ts, "text": "%s." % escalate.group(1),
+                "meta": " ".join((escalate.group(3) or "").split())[:180]}
     if rung:
         model = re.search(r"^Model:\s*(\S+)", body, re.M)
         return {"who": "brain", "ts": ts, "text": "Climbed the model ladder to rung %s." % rung.group(1),
@@ -449,6 +457,12 @@ def _comment_status(body: str) -> Optional[Dict[str, str]]:
     retry = RETRY_RE.match(body)
     if retry:
         return _outcome_status(retry.group(1), retry.group(3), retry.group(2))
+    # An escalation: the old lane's limit is not what it waits for now, the
+    # new lane's claim is.
+    escalate = ESCALATE_RE.match(body)
+    if escalate:
+        return {"kind": "escalated", "lane": escalate.group(2),
+                "text": "%s. Next: lane %s claims it." % (escalate.group(1), escalate.group(2))}
     # A pull request, or a move to another lane or rung: the old lane's
     # limit is not what it waits for now.
     if OPENED_RE.match(body) or MOVED_RE.match(body) or RUNG_RE.search(body):
@@ -459,8 +473,8 @@ def _comment_status(body: str) -> Optional[Dict[str, str]]:
 def attempt_status(comments: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
     """What the ticket's newest attempt is doing, from the station's
     comments: kind "live" (claimed, no outcome yet), "limit" (handed back at
-    a limit; text says until when), "failed", or "ended" (a pull request, or
-    moved on). None when no lane ever claimed it."""
+    a limit; text says until when), "failed", "escalated" (moved to a new
+    rung and lane; text names it), or "ended" (a pull request, or moved on). None when no lane ever claimed it."""
     status: Optional[Dict[str, str]] = None
     for comment in sorted(comments, key=lambda c: str(c.get("created_at") or "")):
         status = _comment_status(str(comment.get("body") or "").strip()) or status
@@ -477,13 +491,13 @@ def _is_live(running: bool, status: Optional[Dict[str, str]]) -> bool:
 
 
 def _status_row(selected, status, live: bool, waiting: bool) -> str:
-    """The pane's last row: live, waiting on a limit, failed, or none."""
+    """The pane's last row: live, waiting on a limit, failed, escalated, or none."""
     if live:
         lane = (status or {}).get("lane") or (selected or {}).get("slot") or "its lane"
         return _row("live", "", '<p class="live-row"><span class="dot"></span>working... streaming from %s</p>'
                     % _esc(lane), "live")
-    if waiting and status and status["kind"] in ("limit", "failed"):
-        word = "waiting" if status["kind"] == "limit" else "failed"
+    if waiting and status and status["kind"] in ("limit", "failed", "escalated"):
+        word = {"limit": "waiting", "failed": "failed"}.get(status["kind"], "escalated")
         return _row(word, "", '<p class="live-row"><span class="dot"></span>%s</p>' % _esc(status["text"]), word)
     return ""
 

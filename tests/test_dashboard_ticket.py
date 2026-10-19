@@ -264,6 +264,28 @@ class TicketPageTests(unittest.TestCase):
                      "codex, in its difficulty tier.", "created_at": "2026-10-18T13:30:00Z"}], state="briefed")
         self.assertNotIn("Waiting:", body)
 
+    ESCALATE = {"body": "<!-- loom:escalate v1 -->\nEscalated to rung 3 of 6: gpt-6 on lane codex.\n"
+                        "Reason: limit on agy (attempts 3, tried gemini-4-argon-high).\nRung: 3 gpt-6 codex",
+                "created_at": "2026-10-18T19:19:00Z"}
+
+    def test_an_escalated_ticket_no_longer_waits_on_the_old_lane_and_names_the_new_one(self):
+        body = self.running(self.LIMIT_LOOP + [self.ESCALATE], state="briefed")
+        self.assertNotIn("Waiting:", body)
+        self.assertNotIn("lane agy is", body)
+        self.assertIn("Escalated to rung 3 of 6: gpt-6 on lane codex. Next: lane codex claims it.", body)
+
+    def test_the_path_shows_the_escalation_as_its_own_step(self):
+        from dashboard.ticket import path_steps
+        steps = path_steps(dict(RECORD, state="briefed"), self.LIMIT_LOOP + [self.ESCALATE], [])
+        self.assertEqual([s["who"] for s in steps], ["wait", "brain", "next"], steps)
+        self.assertEqual(steps[1]["text"], "Escalated to rung 3 of 6: gpt-6 on lane codex.")
+        self.assertEqual(steps[1]["meta"], "limit on agy (attempts 3, tried gemini-4-argon-high).")
+
+    def test_a_claim_on_the_new_lane_after_an_escalation_is_live(self):
+        body = self.running(self.LIMIT_LOOP + [self.ESCALATE, {
+            "body": "Claimed for lane codex (body sha256 a1fc29bcee5e)", "created_at": "2026-10-18T19:21:00Z"}])
+        self.assertIn("working... streaming from codex", body)
+
     def test_a_running_ticket_whose_last_attempt_failed_says_so(self):
         body = self.running([
             {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": "2026-10-14T10:00:00Z"},
