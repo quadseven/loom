@@ -434,6 +434,24 @@ class Intake:
                     findings=[{"title": f.title, "area": f.area, "impact": f.impact,
                                "priority": f.priority} for f in found])
         self._refused(source, refused, ledger)
+        open_by_digest = self._update(source, found, ledger, checked)
+        # A refused finding is still reported: it is not filed, and its open
+        # ticket is not told it went absent.
+        current = {f.digest for f in found} | set(refused)
+        issues = self._absent(source.repo, open_by_digest, current, ledger,
+                              checked or self.stamp)
+        for digest in [d for d in ledger if d not in current and d not in open_by_digest]:
+            rec = ledger[digest]
+            if isinstance(rec.get("ticket"), int) \
+                    and self.now - float(rec.setdefault("gone", self.now)) < RETAIN:
+                continue
+            del ledger[digest]
+        self._post_reseen(source.repo, issues)
+
+    def _update(self, source: Source, found: List[Finding], ledger: Dict[str, Any],
+                checked: str) -> Dict[str, Dict[str, Any]]:
+        """Each finding against its open ticket, its cause's ticket, or a new
+        one; the open tickets by digest, joins included."""
         open_by_digest, by_cause = self._open_tickets(source.repo)
         # Causes briefed in this pass: their ticket is joined on the next
         # pass, once the issue list carries it.
@@ -441,19 +459,22 @@ class Intake:
         for f in found:
             rec = ledger.setdefault(f.digest, {})
             issue = open_by_digest.get(f.digest)
+            named = (f.area, cause(f.title))
             if issue is None:
-                issue = _same_cause(by_cause, "%s|%s" % (f.area, cause(f.title)))
+                issue = _same_cause(by_cause, "%s|%s" % named)
                 if issue is not None:
                     self._join(source, f, rec, issue, checked)
                     open_by_digest[f.digest] = issue
-                elif (f.area, cause(f.title)) in briefed:
+                elif named in briefed:
                     continue
             if self._finding(source, f, rec, issue, checked):
-                briefed.add((f.area, cause(f.title)))
-        # A refused finding is still reported: it is not filed, and its open
-        # ticket is not told it went absent. A ticket with several findings
-        # is told once all of them are gone.
-        current = {f.digest for f in found} | set(refused)
+                briefed.add(named)
+        return open_by_digest
+
+    def _absent(self, repo: str, open_by_digest: Dict[str, Dict[str, Any]], current: set,
+                ledger: Dict[str, Any], when: str) -> Dict[int, Dict[str, Any]]:
+        """One "finding absent" comment on each open ticket none of whose
+        findings is reported any more; the open tickets by number."""
         owned: Dict[int, List[str]] = {}
         issues: Dict[int, Dict[str, Any]] = {}
         for digest, issue in open_by_digest.items():
@@ -464,17 +485,10 @@ class Intake:
                 continue
             recs = [ledger.setdefault(d, {"ticket": number}) for d in digests]
             if not all(r.get("absent") for r in recs):
-                self._comment(source.repo, issues[number],
-                              absent_comment(checked or self.stamp))
+                self._comment(repo, issues[number], absent_comment(when))
                 for r in recs:
-                    r.setdefault("absent", checked or self.stamp)
-        for digest in [d for d in ledger if d not in current and d not in open_by_digest]:
-            rec = ledger[digest]
-            if isinstance(rec.get("ticket"), int) \
-                    and self.now - float(rec.setdefault("gone", self.now)) < RETAIN:
-                continue
-            del ledger[digest]
-        self._post_reseen(source.repo, issues)
+                    r.setdefault("absent", when)
+        return issues
 
     def _refused(self, source: Source, refused: Dict[str, str],
                  ledger: Dict[str, Any]) -> None:
