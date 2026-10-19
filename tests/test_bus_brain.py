@@ -2528,6 +2528,18 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
         self.assert_never_edited(routes)
 
+    def test_a_factory_incident_issue_is_not_triaged(self):
+        # loom#918: a factory incident is filed as a plain open issue; the
+        # backlog triage must leave it alone (no loom:triage, no comment).
+        marker = "<!-- loom:factory-incident v1 -->"
+        routes = Routes([
+            item(5, body=marker + "\nRepo: x\nKind: environment\nTicket: x#12\n"),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
     def test_the_limit_holds_and_stops_reading_pages(self):
         routes = Routes([item(n, body="old issue") for n in range(10, 40)], page=10)
         lines = self.run_triage(routes, limit=12)

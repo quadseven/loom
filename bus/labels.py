@@ -62,6 +62,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
     "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
+    "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},

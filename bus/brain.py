@@ -65,6 +65,8 @@ RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
+# The marker on a factory incident issue body (lanes/run_lane.sh files it).
+FACTORY_INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
 # Opens the comment Loom leaves on a rewritten issue when the ticket it
 # became is verified or dropped; the rest of the line names the ticket and
@@ -1911,6 +1913,10 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
     if any(name.startswith("wayfinder:") for name in names):
         # A wayfinder map or decision ticket is planning, not work for a lane.
         return "wayfinder"
+    if FACTORY_INCIDENT_MARKER in str(issue.get("body") or ""):
+        # A factory incident is filed as a plain issue; it is not a ticket
+        # the backlog should triage (loom#918).
+        return "factory incident"
     if _is_epic(issue):
         return "epic"
     return None
