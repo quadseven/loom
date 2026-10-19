@@ -47,6 +47,11 @@ NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|net
 # "reset" key, or a "retry after" / "try again in" / "resets in" duration.
 EPOCH_RE='(limit reached\||reset[a-z_-]*["'"'"': =]+)([0-9]{10})([^0-9]|$)'
 AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^a-z]|$)'
+# A daily allowance with no reset time given lifts at the next midnight UTC
+# (Workers AI: "used up your daily free allocation of 10,000 neurons";
+# OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,
+# every hour until then (2026-10-19).
+DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 
@@ -77,6 +82,8 @@ classify_failure() {
       n="${BASH_REMATCH[2]}"
       case "${BASH_REMATCH[3]}" in h*) n=$((n * 3600)) ;; m*) n=$((n * 60)) ;; esac
       RETRY_AT=$((now + n))
+    elif [[ "$whole" =~ $DAILY_RE ]]; then
+      RETRY_AT=$((now - now % 86400 + 86400))
     fi
     [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
     [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX))

@@ -3014,6 +3014,19 @@ exit %d
         self.assertIn("--label needs-operator", ask[0])
         self.assertIn("renew the codex lane sign-in", ask[0])
 
+    def test_a_daily_allowance_with_no_reset_time_holds_the_lane_until_midnight_utc(self):
+        # Retried every hour, a spent daily allowance failed a run each time.
+        self.drop_brief()
+        before = int(time.time())
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=(
+            'Too Many Requests: {"errors":[{"message":"AiError: you have used up your '
+            'daily free allocation of 10,000 neurons","code":4006}]}'))
+        after = int(time.time())
+        self.assertTrue(self.failure_line().startswith("[limit] "), self.failure_line())
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertIn(beat["retry_at"], {t - t % 86400 + 86400 for t in (before, after)})
+
     def test_a_limit_holds_the_lane_unavailable_until_the_providers_reset(self):
         reset = int(time.time()) + 7200
         self.drop_brief()
