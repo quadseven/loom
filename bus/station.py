@@ -1665,18 +1665,24 @@ class Station:
         return True
 
     def _runner_alive(self, lane: str) -> bool:
-        """Whether lane's runner holds its lock with a live pid."""
+        """Whether lane's runner holds its lock with a live pid. A name that
+        is not one of LANES counts as alive, so it never builds a path and its
+        brief is never moved."""
+        if lane not in LANES:
+            return True
+        lock = os.path.join(self.s.home, "run", lane + ".lock")
         try:
-            with open(os.path.join(self.s.home, "run", lane + ".lock", "pid")) as fh:
+            with open(os.path.join(lock, "pid")) as fh:
                 pid = int(fh.read().strip())
         except (OSError, ValueError):
-            return os.path.isdir(os.path.join(self.s.home, "run", lane + ".lock"))
+            # A lock with no readable pid may be a runner starting up.
+            return os.path.isdir(lock)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
-            return True
+            pass  # alive, owned by another user (the lane user)
         return True
 
     def _claim_label(self, repo: str) -> Optional[str]:
