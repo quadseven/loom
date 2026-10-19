@@ -3625,6 +3625,8 @@ exit %d
         funcs = re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         tmp = Path(self._tmp.name)
         home = tmp / "home"
+        tree = tmp / "tree"
+        tree.mkdir()
         localbin = home / ".local" / "bin"
         localbin.mkdir(parents=True)
         for name in ("uv", "uvx"):
@@ -3633,20 +3635,26 @@ exit %d
         (localbin / "not-uv").write_text("a secret")
         script = funcs + 'sandbox_profile "$PWD" bash check\n'
         env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "AGENT_HOME": str(tmp / "agent"),
-               "TREE": str(tmp), "CHECK_UV_BINS": f"{localbin}/uv {localbin}/uvx"}
-        result = subprocess.run(["bash", "-c", script], env=env, cwd=str(tmp),
+               "TREE": str(tree), "CHECK_UV_BINS": f"{localbin}/uv {localbin}/uvx"}
+        result = subprocess.run(["bash", "-c", script], env=env, cwd=str(tree),
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         profile = result.stdout
-        self.assertIn('(literal "%s/uv")' % localbin, profile)
-        self.assertIn('(literal "%s/uvx")' % localbin, profile)
-        self.assertNotIn('(subpath "%s")' % localbin, profile)
+        resolved_home = home.resolve()
+        resolved_localbin = localbin.resolve()
+        allow_read = next(line for line in profile.splitlines()
+                          if line.startswith("(allow file-read* "))
+        self.assertIn('(deny file-read* file-write* (subpath "%s"))' % resolved_home, profile)
+        self.assertIn('(literal "%s/uv")' % resolved_localbin, profile)
+        self.assertIn('(literal "%s/uvx")' % resolved_localbin, profile)
+        self.assertNotIn('(subpath "%s")' % resolved_localbin, allow_read)
+        self.assertNotIn('(subpath "%s")' % resolved_home, allow_read)
         self.assertNotIn("not-uv", profile)
         # The same files named for an agent run get no such allowance.
         result = subprocess.run(["bash", "-c", funcs + 'sandbox_profile "$PWD" bash\n'],
-                                env=env, cwd=str(tmp), capture_output=True, text=True)
+                                env=env, cwd=str(tree), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn(str(localbin), result.stdout)
+        self.assertNotIn(str(resolved_localbin), result.stdout)
 
 
 if __name__ == "__main__":
