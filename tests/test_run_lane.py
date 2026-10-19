@@ -3551,6 +3551,20 @@ exit %d
         self.assertIn("--repo quadseven/loom 41", closes[0])
         self.assertFalse(marker.exists())
 
+    def test_a_green_fix_branch_does_not_close_an_incident(self):
+        # A fix round's tree holds the agent's unmerged edits: only the trusted
+        # default branch passing may clear an incident.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.fix_brief()
+        marker = self.loom / "state" / "incidents" / "example_repo-base-check"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("41\n")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("gh issue close") for c in self.calls()))
+        self.assertTrue(marker.exists())
+
     def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()

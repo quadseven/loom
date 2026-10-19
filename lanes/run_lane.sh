@@ -1333,11 +1333,15 @@ prepare_validation() {
       note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
-  [ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && resolve_factory_incidents
+  # Only a pass on the trusted base clears an incident: a fix round's tree
+  # holds the agent's unmerged edits, so it counts only once the default
+  # branch itself passes (below).
+  [ -z "$FIX_PR" ] && [ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && resolve_factory_incidents
   if [ "$BASELINE_EXIT" -ne 0 ]; then
     if [ -n "$FIX_PR" ]; then
       check_default_branch || return 1
       if [ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ]; then
+        resolve_factory_incidents
         if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
           SETUP_REASON="could not restore tracked files changed by the baseline check"
           return 1
