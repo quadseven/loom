@@ -300,7 +300,12 @@ for lane in $LADDER; do
   runs=$((runs + 1))
   say "tick end (exit $code)"
   [ "$code" -ne 0 ] && [ "$runs" -lt 2 ] || break
-  classify_failure "$code" "$(tail -c +$((log_start + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)" ""
+  # Classify from the whole tick output (loom#934): a limit printed before more
+  # CLI output must still be a limit. The short tail stays the tail for the
+  # auth/transient patterns and the reason shown to people.
+  whole_output="$(tail -c +$((log_start + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  fail_tail="$(printf '%s\n' "$whole_output" | tail -n 5)"
+  classify_failure "$code" "$whole_output" "" "$fail_tail"
   [ "$FAIL_CLASS" = limit ] || break
   say "lane $RUNG hit a limit; the tick moves to the next rung with usage"
 done
