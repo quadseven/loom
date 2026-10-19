@@ -6,6 +6,13 @@ station reads each endpoint and, per finding:
 
 - files one ticket on the goal home when no open ticket carries the
   finding's marker, with Priority from its impact (affected x hours);
+- joins the open ticket of the same cause in the same area instead
+  (cause(): "Ana is stuck: X" and "3 members are stuck: X" are one problem):
+  the finding's marker is added to that ticket, so one cause keeps one
+  rolling ticket;
+- notes on the ticket, at most once every RESEEN_EVERY, how often its
+  problem was seen again (joined by another finding, or back after it went
+  absent) and when it was last seen;
 - on the open ticket, moves the Priority line when the band changes and
   posts the new numbers at most every EVIDENCE_EVERY;
 - once the finding is gone, posts one "finding absent since" comment, the
@@ -52,6 +59,12 @@ EVIDENCE_EVERY = 6 * 3600
 # REGRESS_EVERY (loom#484).
 REGRESS_AFTER = 24 * 3600
 REGRESS_EVERY = 48 * 3600
+# A ticket says at most once a day how often its problem was seen again.
+RESEEN_EVERY = 24 * 3600
+# A finding's ledger record outlives its ticket and its last report by this
+# long, so a ticket closed as not planned while the finding was quiet is still
+# known when the finding comes back.
+RETAIN = 30 * 24 * 3600
 # The ticket states whose fix is deployed. A merged ticket is not deployed
 # yet, and brain brief --regresses refuses it.
 SHIPPED_STATES = ("shipped", "verified")
@@ -62,6 +75,14 @@ MARKER = "<!-- loom:health key=%s -->"
 MARKER_RE = re.compile(r"<!-- loom:health key=([0-9a-f]{40}) -->")
 EVIDENCE_MARKER = "<!-- loom:health-evidence -->"
 ABSENT_MARKER = "<!-- loom:health-absent -->"
+RESEEN_MARKER = "<!-- loom:health-reseen -->"
+# "<who> is <state>: <what>" and "<n> members are <state>: <what>" name one
+# cause, "<state>: <what>", whoever it hits.
+_CAUSE_RE = re.compile(r".+? (?:is|are) ([a-z]+): (.+)")
+# A clipped ticket title names its cause by prefix only when that much is left.
+_CAUSE_PREFIX_MIN = 12
+# The area line ticket_body writes: a cause is one problem only inside one area.
+_AREA_LINE = re.compile(r"reports a live problem in the ([a-z-]{1,20}) area")
 # The contract's shapes. A field outside its pattern breaks the contract and
 # the whole read is "not looked" (half a list would read as cleared).
 KEY_RE = re.compile(r"[A-Za-z0-9:._ -]{1,120}")
@@ -293,7 +314,7 @@ def ticket_body(f: Finding) -> str:
         "- [ ] Live: the finding is absent from the health endpoint for 24 hours.", "",
         "## Size", "", "M", "",
         "## Out of scope", "",
-        "Other health findings: each has its own ticket.", "",
+        "Health findings of other causes: each cause has its own ticket.", "",
         "## Definition of done", "",
         "Merged, shipped, and the finding absent from the health endpoint for 24 hours "
         "(the ticket gets a comment when it goes absent).", "",
@@ -331,6 +352,24 @@ def regression_body(f: Finding, regressed: int, hours: float) -> str:
         quoted(f), "", ticket_body(f)])
 
 
+def cause(title: str) -> str:
+    """The problem a finding or ticket title names, whoever it hits: "Ana is
+    stuck: X" and "3 members are stuck: X" both name "stuck: x". Any other
+    title names itself. Lower case, with a ticket title's "Health: " lead
+    dropped."""
+    line = " ".join(str(title or "").split()).lower()
+    if line.startswith("health: "):
+        line = line[len("health: "):]
+    match = _CAUSE_RE.fullmatch(line)
+    return "%s: %s" % match.groups() if match else line
+
+
+def reseen_comment(count: int, last: str) -> str:
+    return ("%s\nSeen again %d time%s so far, last seen %s: the health endpoint reported "
+            "this ticket's problem again, and loom tracks it here instead of filing a new "
+            "ticket." % (RESEEN_MARKER, count, "" if count == 1 else "s", last))
+
+
 def absent_comment(when: str) -> str:
     return ("%s\nThe health endpoint no longer reports this finding: finding absent since "
             "%s. It verifies once it has stayed absent for 24 hours." % (ABSENT_MARKER, when))
@@ -353,6 +392,7 @@ class Intake:
         self.brief = brief
         self.filed = 0
         self.regressed: Dict[str, Any] = {}
+        self.reseen: Dict[str, Any] = {}
 
     def run(self, sources: List[Source]) -> None:
         looked = self.state.setdefault("sources", {})
@@ -363,6 +403,10 @@ class Intake:
                                             else ())
                           if isinstance(v, (int, float)) and 0 <= self.now - v < REGRESS_EVERY}
         self.state["regressed"] = self.regressed
+        reseen = self.state.get("reseen")
+        self.reseen = {k: v for k, v in (reseen.items() if isinstance(reseen, dict) else ())
+                       if isinstance(v, dict)}
+        self.state["reseen"] = self.reseen
         for stale in [k for k in list(looked) + list(keys) if k not in {s.key for s in sources}]:
             looked.pop(stale, None)
             keys.pop(stale, None)
@@ -390,20 +434,47 @@ class Intake:
                     findings=[{"title": f.title, "area": f.area, "impact": f.impact,
                                "priority": f.priority} for f in found])
         self._refused(source, refused, ledger)
-        open_by_digest = self._open_tickets(source.repo)
+        open_by_digest, by_cause = self._open_tickets(source.repo)
+        # Causes briefed in this pass: their ticket is joined on the next
+        # pass, once the issue list carries it.
+        briefed: set = set()
         for f in found:
-            self._finding(source, f, ledger.setdefault(f.digest, {}),
-                          open_by_digest.get(f.digest), checked)
+            rec = ledger.setdefault(f.digest, {})
+            issue = open_by_digest.get(f.digest)
+            if issue is None:
+                issue = _same_cause(by_cause, "%s|%s" % (f.area, cause(f.title)))
+                if issue is not None:
+                    self._join(source, f, rec, issue, checked)
+                    open_by_digest[f.digest] = issue
+                elif (f.area, cause(f.title)) in briefed:
+                    continue
+            if self._finding(source, f, rec, issue, checked):
+                briefed.add((f.area, cause(f.title)))
         # A refused finding is still reported: it is not filed, and its open
-        # ticket is not told it went absent.
+        # ticket is not told it went absent. A ticket with several findings
+        # is told once all of them are gone.
         current = {f.digest for f in found} | set(refused)
+        owned: Dict[int, List[str]] = {}
+        issues: Dict[int, Dict[str, Any]] = {}
         for digest, issue in open_by_digest.items():
-            rec = ledger.setdefault(digest, {"ticket": int(issue["number"])})
-            if digest not in current and not rec.get("absent"):
-                self._comment(source.repo, issue, absent_comment(checked or self.stamp))
-                rec["absent"] = checked or self.stamp
+            owned.setdefault(int(issue["number"]), []).append(digest)
+            issues[int(issue["number"])] = issue
+        for number, digests in sorted(owned.items()):
+            if any(d in current for d in digests):
+                continue
+            recs = [ledger.setdefault(d, {"ticket": number}) for d in digests]
+            if not all(r.get("absent") for r in recs):
+                self._comment(source.repo, issues[number],
+                              absent_comment(checked or self.stamp))
+                for r in recs:
+                    r.setdefault("absent", checked or self.stamp)
         for digest in [d for d in ledger if d not in current and d not in open_by_digest]:
+            rec = ledger[digest]
+            if isinstance(rec.get("ticket"), int) \
+                    and self.now - float(rec.setdefault("gone", self.now)) < RETAIN:
+                continue
             del ledger[digest]
+        self._post_reseen(source.repo, issues)
 
     def _refused(self, source: Source, refused: Dict[str, str],
                  ledger: Dict[str, Any]) -> None:
@@ -412,29 +483,91 @@ class Intake:
         for digest, why in sorted(refused.items()):
             rec = ledger.setdefault(digest, {})
             rec.pop("absent", None)
+            rec.pop("gone", None)
             if rec.get("refused") != why:
                 self.say("health %s: refused finding %s: %s" % (source.key, digest[:12], why))
             rec["refused"] = why
 
-    def _open_tickets(self, repo: str) -> Dict[str, Dict[str, Any]]:
+    def _open_tickets(self, repo: str) -> Tuple[Dict[str, Dict[str, Any]],
+                                                 Dict[str, Dict[str, Any]]]:
+        """The open health tickets by finding digest, and by "<area>|<cause>"
+        from the area line of their body and the cause their title names (the
+        oldest ticket of a cause)."""
         out: Dict[str, Dict[str, Any]] = {}
+        by_cause: Dict[str, Dict[str, Any]] = {}
         for issue in self.gh.paginate("/repos/%s/issues?state=open&labels=loom:ticket" % repo):
             if "pull_request" in issue:
                 continue
             # Every marker counts: one ticket can own several findings that
             # share one cause (the same problem in two places, say).
-            for digest in MARKER_RE.findall(str(issue.get("body") or "")):
+            body = str(issue.get("body") or "")
+            digests = MARKER_RE.findall(body)
+            for digest in digests:
                 out.setdefault(digest, issue)
-        return out
+            area = _AREA_LINE.search(body)
+            named = cause(str(issue.get("title") or ""))
+            if digests and area and named:
+                named = "%s|%s" % (area.group(1), named)
+                held = by_cause.get(named)
+                if held is None or int(issue["number"]) < int(held["number"]):
+                    by_cause[named] = issue
+        return out, by_cause
+
+    def _join(self, source: Source, f: Finding, rec: Dict[str, Any],
+              issue: Dict[str, Any], checked: str) -> None:
+        """Track the finding on the open ticket of its cause: add its marker
+        to the body, raise the Priority line when the finding is more urgent
+        (never lower it), and count it as seen again."""
+        number = int(issue["number"])
+        body = str(issue.get("body") or "").rstrip("\n") + "\n" + MARKER % f.digest + "\n"
+        raised = tickets.PRIORITIES.index(f.priority) \
+            < tickets.PRIORITIES.index(tickets.priority_of(issue))
+        if raised:
+            body = tickets.with_header(body, "Priority", f.priority)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number), {"body": body})
+        issue["body"] = body
+        rec.clear()
+        rec.update(ticket=number, band=f.priority, posted=[f.affected, f.evidence],
+                   commented=self.now)
+        self._seen_again(source.repo, number, checked)
+        self.say("health %s: finding %s joined #%d, the open ticket of the same cause%s"
+                 % (source.key, f.digest[:12], number,
+                    "; priority now %s" % f.priority if raised else ""))
+
+    def _seen_again(self, repo: str, number: int, checked: str) -> None:
+        entry = self.reseen.setdefault("%s#%d" % (repo, number), {})
+        entry["count"] = int(entry.get("count") or 0) + 1
+        entry["last"] = checked or self.stamp
+
+    def _post_reseen(self, repo: str, issues: Dict[int, Dict[str, Any]]) -> None:
+        """Post each open ticket's seen-again count when it grew, at most once
+        every RESEEN_EVERY; forget the tickets of this repo that closed."""
+        prefix = repo + "#"
+        for key in [k for k in self.reseen if k.startswith(prefix)]:
+            number = key[len(prefix):]
+            if not number.isdigit() or int(number) not in issues:
+                del self.reseen[key]
+                continue
+            entry = self.reseen[key]
+            count = int(entry.get("count") or 0)
+            if count > int(entry.get("posted") or 0) \
+                    and self.now - float(entry.get("noted") or 0) >= RESEEN_EVERY:
+                self._comment(repo, issues[int(number)],
+                              reseen_comment(count, str(entry.get("last") or self.stamp)))
+                entry.update(posted=count, noted=self.now)
 
     def _finding(self, source: Source, f: Finding, rec: Dict[str, Any],
-                 issue: Optional[Dict[str, Any]], checked: str) -> None:
-        rec.pop("absent", None)
+                 issue: Optional[Dict[str, Any]], checked: str) -> bool:
+        """Update the finding's open ticket, or file one. True when a ticket
+        was briefed."""
+        back = rec.pop("absent", None)
         rec.pop("refused", None)
+        rec.pop("gone", None)
         if issue is None:
-            self._file(source, f, rec)
-            return
+            return self._file(source, f, rec)
         rec["ticket"] = int(issue["number"])
+        if back:
+            self._seen_again(source.repo, int(issue["number"]), checked)
         if rec.get("band") != f.priority:
             if rec.get("band") is not None or tickets.priority_of(issue) != f.priority:
                 self._set_priority(source.repo, issue, f.priority)
@@ -445,6 +578,7 @@ class Intake:
             self._comment(source.repo, issue, evidence_comment(f, checked))
             rec.update(posted=posted, commented=self.now)
         self._regression(source, f, rec, issue)
+        return False
 
     def _regression(self, source: Source, f: Finding, rec: Dict[str, Any],
                     issue: Dict[str, Any]) -> None:
@@ -511,11 +645,11 @@ class Intake:
                 return max(stamps)
         return None
 
-    def _file(self, source: Source, f: Finding, rec: Dict[str, Any]) -> None:
+    def _file(self, source: Source, f: Finding, rec: Dict[str, Any]) -> bool:
         if self._declined(source.repo, rec):
-            return
+            return False
         if self.filed >= PER_PASS:
-            return
+            return False
         try:
             url = self.brief(self.gh, source.repo, source.goal, ticket_title(f), ticket_body(f),
                              difficulty="medium", priority=f.priority)
@@ -524,7 +658,7 @@ class Intake:
                 self.say("health %s: could not brief finding %s: %s"
                          % (source.key, f.digest[:12], err))
             rec["brief_error"] = str(err)
-            return
+            return False
         self.filed += 1
         number = url.rstrip("/").rpartition("/")[2]
         rec.clear()
@@ -532,6 +666,7 @@ class Intake:
         if number.isdigit():
             rec["ticket"] = int(number)
         self.say("health %s: briefed %s (%s)" % (source.key, url, f.priority))
+        return True
 
     def _declined(self, repo: str, rec: Dict[str, Any]) -> bool:
         """True when this finding's last ticket was closed as not planned: the
@@ -557,6 +692,20 @@ class Intake:
     def _comment(self, repo: str, issue: Dict[str, Any], body: str) -> None:
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(issue["number"])),
                      {"body": body})
+
+
+def _same_cause(by_cause: Dict[str, Dict[str, Any]], named: str) -> Optional[Dict[str, Any]]:
+    """The open ticket of this "<area>|<cause>". A title clipped with "..."
+    names its cause by the prefix, when enough of it is left."""
+    if named in by_cause:
+        return by_cause[named]
+    area = named.partition("|")[0]
+    for key, issue in sorted(by_cause.items()):
+        head = key[:-3]
+        if key.endswith("...") and len(head) - len(area) - 1 >= _CAUSE_PREFIX_MIN \
+                and named.startswith(head):
+            return issue
+    return None
 
 
 def _epoch(value: Any) -> Optional[float]:
