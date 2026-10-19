@@ -204,12 +204,20 @@ class RewriteIssueTest(Base):
         text = "Here you go:\n```json\n%s\n```\nDone." % json.dumps(BRIEF)
         self.assertEqual(self.rewrite(text), "brief")
 
-    def test_a_human_answer_labels_the_issue_with_the_ask(self):
+    def test_a_human_answer_is_left_to_the_brain_with_no_comment(self):
+        # 2026-10-18: the free rewrite model still labelled factory work as
+        # person-only after #843; each loom:human reaches the operator's
+        # digest. The model proposes, the brain decides.
         answer = {"action": "human", "kind": "money", "ask": "Buy the domain name for the site."}
         self.assertEqual(self.rewrite(answer), "human")
-        self.assertEqual(self.fake.labels, [(7, ["loom:human"])])
-        self.assertIn("Buy the domain name", self.fake.comments[0][1])
+        self.assertEqual(self.fake.labels, [(7, ["needs-brain"])])
+        self.assertEqual(self.fake.comments, [])
         self.assertEqual(self.fake.created, [])
+
+    def test_an_issue_left_to_the_brain_is_not_rewritten_again(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
+        self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
     def test_a_human_answer_without_a_person_only_kind_writes_nothing(self):
         # 2026-10-18: a free model parked "Using GitHub credentials, locate the
