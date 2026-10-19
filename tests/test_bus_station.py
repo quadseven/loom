@@ -185,7 +185,16 @@ class FakeGitHub:
             found = self.foreign.get((other.group(1), int(other.group(2))))
             return reply(200, found) if found else reply(404, {"message": "Not Found"})
         if (method == "GET" and parts.path == "/repos/%s/issues" % station.FACTORY_REPO
-                and ("labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query)):
+                and "state=closed" in parts.query):
+            # _closed_incidents lists closed issues on the factory repo and
+            # filters by the body marker. When the query also filters on the
+            # loom:factory label, the fake honours it (simulating GitHub):
+            # an incident filed without the label (loom#918) is not returned
+            # by a labels=loom:factory query, only by the marker-based list.
+            if "labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query:
+                return reply(200, [i for i in self.factory_incidents
+                                   if any(l.get("name") == "loom:factory"
+                                          for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
@@ -3562,14 +3571,16 @@ class FactoryIncidentTest(Base):
     def bodies(self, number=12):
         return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
 
-    def incident(self, closed_at="2030-01-01T00:10:00Z"):
+    def incident(self, closed_at="2030-01-01T00:10:00Z", labels=None):
+        if labels is None:
+            labels = [{"name": "loom:factory"}]
         self.fake.factory_incidents = [{
             "number": 99,
             "title": "Factory incident: %s validation environment" % REPO,
             "state": "closed", "closed_at": closed_at,
             "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: environment\n"
                      "Ticket: %s#12\n\ncheck: make check (exit 127)\n" % (REPO, REPO)),
-            "labels": [{"name": "loom:factory"}]}]
+            "labels": labels}]
 
     def test_factory_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
@@ -3604,6 +3615,20 @@ class FactoryIncidentTest(Base):
         self.failed()
         self.run_pass()
         self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertTrue(any("back in the queue" in b for b in self.bodies()))
+
+    def test_a_closed_incident_without_label_requeues_its_ticket(self):
+        # loom#918: the loom:factory label was not in LABELS, so the runner
+        # could not apply it and the incident was filed without it. The station
+        # must still find the closed incident by its body marker and re-queue
+        # the held ticket.
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident(labels=[])
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])

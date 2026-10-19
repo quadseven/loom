@@ -273,7 +273,6 @@ RETRY_MAX = 2
 # Where the runner files its validation incidents (lanes/run_lane.sh
 # FACTORY_REPO), and the marker and ticket line their bodies carry.
 FACTORY_REPO = "quadseven/loom"
-FACTORY_LABEL = "loom:factory"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
@@ -3637,10 +3636,15 @@ class Station:
             self._release_held(key, info, closed_incidents)
 
     def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
-        """Closed factory incidents the runner filed, by "owner/repo#n"."""
+        """Closed factory incidents the runner filed, by "owner/repo#n".
+
+        Incidents are found by the body marker, not the loom:factory label:
+        the label may not exist in a repo (loom#918), so filtering on it
+        loses every unlabelled incident. Closed issues are listed without the
+        label and then matched on the marker."""
         closed: Dict[str, Dict[str, Any]] = {}
         for incident in self._paginate(
-                "/repos/%s/issues?state=closed&labels=%s&per_page=100" % (FACTORY_REPO, FACTORY_LABEL)):
+                "/repos/%s/issues?state=closed&per_page=100" % FACTORY_REPO):
             if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
                 closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
         return closed

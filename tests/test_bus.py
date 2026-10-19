@@ -353,6 +353,15 @@ class LabelTests(unittest.TestCase):
         labels.ensure_labels(GitHub("tok", transport=t), REPO)
         self.assertFalse([c for c in t.calls if c[0] == "PATCH"])
 
+    def test_factory_label_is_created_when_missing(self):
+        # loom#918: the loom:factory label was not in LABELS, so ensure_labels
+        # never created it and the runner could not apply it.
+        t = Scripted(reply(200, []), *[reply(201, {})] * (len(labels.LABELS) + 5))
+        changed = labels.ensure_labels(GitHub("tok", transport=t), REPO)
+        self.assertIn("loom:factory", changed)
+        created = [json.loads(c[3])["name"] for c in t.calls if c[0] == "POST"]
+        self.assertIn("loom:factory", created)
+
 
 class LockTests(unittest.TestCase):
     def test_acquire_free(self):
