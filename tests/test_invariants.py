@@ -865,7 +865,8 @@ class InvariantTest(unittest.TestCase):
         early = Run("zen", True, T0 - 9 * 3600, "")
         fails = [Run("zen", False, T0 - i * 600, "[transient] agent exited 1") for i in range(4)]
         limited = [Run("zen", False, T0 - 5 * 600, "[limit] provider limit"),
-                   Run("zen", False, T0 - 6 * 600, "[auth] API key expired")]
+                   Run("zen", False, T0 - 6 * 600, "[auth] API key expired"),
+                   Run("zen", False, T0 - 7 * 600, "[factory] setup failed: base check exited 1")]
         self.assertEqual(invariants.lane_failing_streak(
             Facts(T0, runs=[early] + fails + limited)), [])
         recent = [Run("zen", True, T0 - 50, "")]

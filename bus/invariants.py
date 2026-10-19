@@ -409,15 +409,19 @@ def lane_no_success(f: Facts) -> List[Breach]:
 
 def lane_failing_streak(f: Facts) -> List[Breach]:
     """A lane whose newest FAILING_STREAK runs in the last day all failed,
-    a limit or an expired key aside, after a success earlier that day (a lane
-    with none is lane_no_success). On 2026-10-19 zen's free model left the
+    a limit, an expired key or a factory incident aside, after a success
+    earlier that day (a lane with none is lane_no_success). On 2026-10-19
+    zen's free model left the
     catalogue at about 12:13Z and every run after failed, while a success at
     05:00Z kept lane_no_success quiet all day."""
     if f.runs is None:
         return []
     lanes: Dict[str, List[Run]] = {}
     for r in f.runs:
-        if 0 <= f.now - r.at <= DAY and not r.reason.startswith(("[limit]", "[auth]")):
+        # A limit, an expired key or a factory incident (the repo's check or
+        # setup, not the lane) says nothing about the lane's own health: two
+        # base-check incidents counted toward zen's streak (2026-10-19).
+        if 0 <= f.now - r.at <= DAY and not r.reason.startswith(("[limit]", "[auth]", "[factory]")):
             lanes.setdefault(r.lane, []).append(r)
     out = []
     for lane, runs in sorted(lanes.items()):
