@@ -669,7 +669,13 @@ being under `$LOOM_HOME`. A line counts when it says `error`, `failed`,
 counts once, as its exception line. A line of a GitHub Actions job log that
 an agent echoed (a seven-digit-fraction timestamp, after the job and step
 names `gh run view --log` adds) never counts: it is the run's output, and a
-green run's test names say `failed` too. Each line is reduced to a signature:
+green run's test names say `failed` too. Nor does the brain's own status
+output: a stage handoff line (`- stage failed: held by ...`), a markdown
+heading of its report (`#### failed`), a ticket or goal row of the report
+(free-text titles and `REPEATEDLY STUCK` marks), a defer resume line
+(`- dropped failed ...: finished or closed since the defer`), or the tick
+record or journal comment it echoes as JSON. Anything more on such a line is
+judged as usual. Each line is reduced to a signature:
 times, numbers, hex ids and SHAs, long mixed ids, repos and issue numbers,
 paths, addresses and mentions become placeholders, so a 403 on two repos is
 one signature (the status code is kept).
@@ -681,11 +687,16 @@ lines. The examples have paths, credential shapes, mail addresses, mentions,
 private hosts, IP addresses and repo names replaced, and each must pass the
 written-text check (`bus/text.py`) or is withheld. An open `loom:triage` issue
 with the same title is counted instead of filed again. While the signature
-keeps repeating its open issue gets a count comment at most once an hour; a
-closed one is left alone. No model is involved: diagnosis is the brain's.
+keeps repeating its open issue gets a count comment at most once an hour,
+edited in place and saying when it was last seen; a closed one is left alone.
+The issue a signature was filed or counted on is remembered until it closes,
+so a signature that comes back after a quiet day is counted on that issue
+even after the brain has retitled or relabelled it: one rolling issue per
+signature. No model is involved: diagnosis is the brain's.
 
-`state/station/watch.json` keeps each log's inode and offset and each
-signature seen in the last 24 hours. The first scan starts at the end of each
+`state/station/watch.json` keeps each log's inode and offset, each
+signature seen in the last 24 hours, and each signature's open issue (at most
+500). The first scan starts at the end of each
 log; a log that is later created, rotated (a new inode) or truncated is read
 from its start. One pass reads at most 1 MB of each log, files or counts at
 most 5, and below the GitHub budget floor only reads, filing on a later

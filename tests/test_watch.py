@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import station, text, watch  # noqa: E402
+from bus import brain, handoff, station, text, watch  # noqa: E402
 from bus.github import Response  # noqa: E402
 
 LANES_REPO = "example-owner/lanes"
@@ -127,6 +127,53 @@ class SignatureTest(unittest.TestCase):
             self.assertTrue(watch.keep(line), line)
 
 
+def _brain_status_lines():
+    """The brain's own status output, made by the code that prints it: the
+    stage handoff lines (bus/handoff.py stage_lines), the ticket report with
+    its REPEATEDLY STUCK marks and state headings, the defer resume lines,
+    and the tick record bus/brain.py step prints as JSON (loom#871)."""
+    item = ("example-owner/repo-a", 590)
+    marks = [handoff.Mark("done", "failed", item, "r1", "lane-machine", "2026-10-18T06:10:04Z"),
+             handoff.Mark("defer", "merge", item, "r1", "muse", "2026-10-18T06:12:00Z"),
+             handoff.Mark("done", "merge", item, "r1", "lane-machine", "2026-10-18T06:11:00Z"),
+             handoff.Mark("defer", "merge", item, "r2", "muse", "2026-10-18T06:13:00Z")]
+    stage = handoff.stage_lines(marks)
+    history = brain.History(failed=4, fixes=2, tried=["claude"], reasons=["failed 4 times"],
+                            rung=None)
+    stuck = brain._stuck_marks({264: history}, [])
+    ticket = {"number": 264, "title": "Retry a failed push - error path", "created_at":
+              "2026-10-17T06:00:00Z", "labels": [{"name": "loom:failed"}, {"name": "lane:claude"}]}
+    from datetime import datetime, timezone
+    report = brain._ticket_lines([ticket], datetime(2026, 10, 18, 6, tzinfo=timezone.utc), stuck)
+    dropped = brain._resume_item_line(marks[0], marks[0], False, None)
+    tick = json.dumps({"holder": "lane-machine", "notes": [
+        {"step": "merge", "text": "Two PRs failed their checks", "ts": "2026-10-18T21:35:52Z"}],
+        "started_at": "2026-10-18T21:32:48Z", "step": "merge", "step_index": 4}, sort_keys=True)
+    journal = json.dumps({"body": handoff.JOURNAL_MARKER + "\nTick 2026-10-18, muse\n"
+                          "- push failed on #12"})
+    return (["  " + x for x in stage] + report + [dropped, tick, journal]
+            + ["### Reports owed before unlock", "## Loom brain tick (muse)"])
+
+
+class BrainStatusTest(unittest.TestCase):
+    def test_the_brains_status_output_is_never_kept(self):
+        lines = _brain_status_lines()
+        # The fixture really carries the words the watcher keys on.
+        self.assertTrue(any("stage failed: held by" in x for x in lines), lines)
+        self.assertTrue(any("REPEATEDLY STUCK" in x for x in lines), lines)
+        self.assertIn("#### failed", lines)
+        for line in lines + ["[2026-10-18 06:10:04] " + lines[0]]:
+            self.assertFalse(watch.keep(line), line)
+
+    def test_a_real_brain_error_is_still_kept(self):
+        for line in ("brain step write failed: GET /repos/x/y -> 502",
+                     "brain: push of abc failed for example-owner/repo-a#3",
+                     "- stage failed: Traceback in the handoff reader",
+                     "error: the journal for #12 failed to post",
+                     "{not json} request failed"):
+            self.assertTrue(watch.keep(line), line)
+
+
 class FilingTest(WatchBase):
     def test_three_hits_in_thirty_minutes_file_one_issue_and_a_fourth_adds_nothing(self):
         self.append(LINE_403)
@@ -147,6 +194,38 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 1260)
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual(self.gh.comments, [])
+
+    def test_the_brains_status_output_files_nothing(self):
+        # loom#871-#877: one tick's report filed six issues, one per line.
+        for i in range(5):
+            self.append(*_brain_status_lines())
+            self.run_at(T0 + i * 300)
+        self.assertEqual(self.gh.issues, {})
+        self.assertEqual(self.saved()["sigs"], {})
+
+    def test_a_retitled_issue_is_counted_when_its_signature_returns(self):
+        # The brain rewrites a loom:triage issue: a new title, a new label.
+        # The signature coming back a day later is the same root cause, so it
+        # counts on that issue instead of filing a twin.
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.gh.issues[1].update(title="Scans of a private repo answer 403",
+                                 labels=["loom:briefed"])
+        # The station passes every few minutes; the quiet day prunes the
+        # signature's record.
+        self.run_at(T0 + watch.DAY + 60)
+        self.assertEqual(self.saved()["sigs"], {})
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 + 2 * watch.DAY)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual([n for n, _ in self.gh.comments], [1])
+        self.assertIn("Last seen ", self.gh.comments[0][1])
+        self.gh.issues[1]["state"] = "closed"
+        self.run_at(T0 + 3 * watch.DAY + 60)
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0 + 4 * watch.DAY)
+        self.assertEqual(len(self.gh.issues), 2)
 
     def test_a_hold_on_a_failed_ticket_files_nothing(self):
         for i in range(5):
