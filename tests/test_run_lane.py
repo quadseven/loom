@@ -3585,5 +3585,77 @@ exit %d
         self.assertIn("uv=1 secret=unset", log.read_text())
 
 
+    def test_contract_run_puts_uv_and_uvx_on_the_checks_path(self):
+        # Every infra ticket held on the factory incident: the contract runs
+        # `uvx` but the lane machine keeps uv outside the runner's PATH (in
+        # ~/.local/bin), so the check exited 127 on the unmodified base.
+        # With uvx only in a scratch .local/bin under the scratch home and
+        # not on the caller's PATH, a contract check running `uvx --version`
+        # exits 0; it fails on main.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run"))
+        tmp = Path(self._tmp.name)
+        localbin = tmp / "home" / ".local" / "bin"
+        localbin.mkdir(parents=True)
+        (localbin / "uvx").write_text('#!/bin/bash\necho "uvx 0.9.0 (scratch)"\n')
+        (localbin / "uvx").chmod(0o755)
+        fakes = tmp / "fakebin"
+        fakes.mkdir()
+        (fakes / "sandbox-exec").write_text('#!/bin/bash\nshift 2\nexec "$@"\n')
+        (fakes / "sandbox-exec").chmod(0o755)
+        (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+        (fakes / "timeout").chmod(0o755)
+        script = funcs + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        log = tmp / "log"
+        env = {"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(tmp / "home"), "LOG": str(log),
+               "TREE": str(tmp), "CHECK_HOME": str(tmp), "CHECK_CLI": "bash",
+               "CHECK_TIMEOUT": "30"}
+        result = subprocess.run(["bash", "-c", script, "test", "uvx --version"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("uvx 0.9.0 (scratch)", log.read_text())
+
+    def test_the_check_profile_allows_the_uv_files_but_not_their_directory(self):
+        # The check profile lets the contract read and execute the runner's
+        # uv and uvx while still refusing every other file under the
+        # runner's home: the two binaries get file literals, their directory
+        # gets no subpath rule.
+        text = (Path(__file__).resolve().parent.parent / "lanes" / "agent_sandbox.sh").read_text()
+        funcs = re.search(r"^sandbox_profile\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        tmp = Path(self._tmp.name)
+        home = tmp / "home"
+        tree = tmp / "tree"
+        tree.mkdir()
+        localbin = home / ".local" / "bin"
+        localbin.mkdir(parents=True)
+        for name in ("uv", "uvx"):
+            (localbin / name).write_text("#!/bin/bash\n")
+            (localbin / name).chmod(0o755)
+        (localbin / "not-uv").write_text("a secret")
+        script = funcs + 'sandbox_profile "$PWD" bash check\n'
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "AGENT_HOME": str(tmp / "agent"),
+               "TREE": str(tree), "CHECK_UV_BINS": f"{localbin}/uv {localbin}/uvx"}
+        result = subprocess.run(["bash", "-c", script], env=env, cwd=str(tree),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profile = result.stdout
+        resolved_home = home.resolve()
+        resolved_localbin = localbin.resolve()
+        allow_read = next(line for line in profile.splitlines()
+                          if line.startswith("(allow file-read* "))
+        self.assertIn('(deny file-read* file-write* (subpath "%s"))' % resolved_home, profile)
+        self.assertIn('(literal "%s/uv")' % resolved_localbin, profile)
+        self.assertIn('(literal "%s/uvx")' % resolved_localbin, profile)
+        self.assertNotIn('(subpath "%s")' % resolved_localbin, allow_read)
+        self.assertNotIn('(subpath "%s")' % resolved_home, allow_read)
+        self.assertNotIn("not-uv", profile)
+        # The same files named for an agent run get no such allowance.
+        result = subprocess.run(["bash", "-c", funcs + 'sandbox_profile "$PWD" bash\n'],
+                                env=env, cwd=str(tree), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(str(resolved_localbin), result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
