@@ -130,6 +130,25 @@ class AddTest(unittest.TestCase):
         self.assertEqual(len(fake.comments), 1)
         self.assertEqual(len(status.parse(fake.comments[0]["body"])), 3)
 
+    def test_with_no_trusted_login_nothing_is_edited_and_a_fresh_comment_is_posted(self):
+        # Fail closed: an empty trusted list must not accept any author.
+        fake = FakeTransport()
+        fake.comments = [{"id": 9, "user": {"login": "stranger"}, "created_at": "2030-01-01T00:00:00Z",
+                          "body": status.render([("2030-01-01T00:00:00Z",
+                                                  "Claimed for lane codex (body sha256 0123456789ab)")])}]
+        gh = GitHub("token", transport=fake)
+        forged = fake.comments[0]["body"]
+        self.assertIsNone(status.find(gh, REPO, 7, []))
+        status.add(gh, REPO, 7, "Claimed for lane codex-2 (body sha256 0123456789ab)", T0, [])
+        # The stranger's comment is untouched, and the event went into a new
+        # comment the transport created.
+        self.assertEqual(fake.comments[0]["body"], forged)
+        self.assertEqual(len(fake.posts()), 1)
+        self.assertEqual(len(fake.comments), 2)
+        events = status.parse(fake.comments[1]["body"])
+        self.assertEqual([text for _, text in events],
+                         ["Claimed for lane codex-2 (body sha256 0123456789ab)"])
+
     def test_a_strangers_status_looking_comment_is_never_edited(self):
         fake = FakeTransport()
         fake.comments = [{"id": 9, "user": {"login": "stranger"}, "created_at": "2030-01-01T00:00:00Z",

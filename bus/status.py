@@ -116,15 +116,23 @@ def _login(comment: Any) -> str:
 def find(gh: Any, repo: str, number: int,
          trusted: Iterable[str] = ()) -> Optional[Tuple[int, List[Tuple[str, str]]]]:
     """(id, events newest first) of the ticket's status comment, the first
-    one by a trusted login (by anyone when trusted is empty); None when it
-    has none yet. The list may come back expanded (the GitHub client expands
-    status comments) or raw; both name the comment's id and author."""
-    allowed = {str(t).lower() for t in trusted}
+    one by a trusted login or this client's own (its App bot login); None
+    when it has none yet, and None when no login is allowed: a writer with
+    the right to edit any comment must never take a stranger's look-alike as
+    its own (security review, 2026-10-18). The list may come back expanded
+    (the GitHub client expands status comments) or raw; both name the
+    comment's id and author."""
+    allowed = {str(t).lower() for t in trusted if t}
+    own = getattr(gh, "_status_logins", None)
+    if callable(own):
+        allowed |= {str(t).lower() for t in own()}
+    if not allowed:
+        return None
     items = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
     events: dict = {}
     order: List[int] = []
     for comment in items if isinstance(items, list) else []:
-        if not isinstance(comment, dict) or (allowed and _login(comment) not in allowed):
+        if not isinstance(comment, dict) or _login(comment) not in allowed:
             continue
         ident = comment.get("id")
         if not isinstance(ident, int) or isinstance(ident, bool):
