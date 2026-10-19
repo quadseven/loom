@@ -6397,6 +6397,24 @@ class VerifyDispatchTest(Base):
         self.assertIn("Live: prints `the string`", self.fake.issues[2]["body"])
         self.assertEqual(self.fake.comments[2], [])
 
+    def test_restate_runs_when_the_rewrite_step_spent_its_hourly_allowance(self):
+        # Sharing one allowance, the rewrite step spent it every hour and no
+        # shipped ticket was ever restated (2026-10-19).
+        self.fake.private = False
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it")
+        self.settings.rewrite_cmd = "agent"
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.now = time.time()
+        os.makedirs(st.state, exist_ok=True)
+        with open(os.path.join(st.state, "rewrite.json"), "w") as fh:
+            json.dump({station.REWRITE_STATION_KEY: [st.now - 60] * station.REWRITE_STATION_PER_HOUR}, fh)
+        with mock.patch.object(st, "_rewrite_command", return_value="agent"), \
+             mock.patch.object(station.rewrite, "run_agent",
+                               return_value='{"action":"restate","line":"Live: prints `the string`"}'):
+            st.restate_shipped_live()
+        self.assertIn("Live: prints `the string`", self.fake.issues[2]["body"])
+
     def test_a_log_line_for_the_live_criterion_hands_the_run_and_quotes_it_once(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "prints `daily status ready`", "see `presence flag:` in the log")

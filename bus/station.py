@@ -186,6 +186,12 @@ REWRITE_PER_PASS = 5
 # backlog goals let about 80 through in ten minutes (2026-10-18).
 REWRITE_STATION_PER_HOUR = 6
 REWRITE_STATION_KEY = "_station"
+# Live-line restates have their own hourly allowance: an edit of the ticket
+# body, never a comment, so no email. Sharing REWRITE_STATION_PER_HOUR, the
+# rewrite step spent all six calls every hour and no shipped ticket was ever
+# restated (2026-10-19).
+RESTATE_PER_HOUR = 4
+RESTATE_KEY = "_live_station"
 REWRITE_RETRY = 24 * 3600
 REWRITE_TIMEOUT = 600
 # Through the bot, a report is one short line (the goal's short name and the
@@ -5539,17 +5545,17 @@ class Station:
 
     def restate_shipped_live(self) -> None:
         """Restate shipped Live lines with no searchable exact string, using
-        the rewrite command and its shared hourly station allowance."""
+        the rewrite command and its own hourly allowance (RESTATE_PER_HOUR)."""
         if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd):
             return
         path = os.path.join(self.state, "rewrite.json")
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
-        recent = [t for t in state.get(REWRITE_STATION_KEY) or []
+        recent = [t for t in state.get(RESTATE_KEY) or []
                   if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
-        state[REWRITE_STATION_KEY] = recent
-        budget = min(REWRITE_PER_PASS, REWRITE_STATION_PER_HOUR - len(recent))
+        state[RESTATE_KEY] = recent
+        budget = min(REWRITE_PER_PASS, RESTATE_PER_HOUR - len(recent))
         if budget <= 0:
             return
         tried = state.get("_live_tried")
