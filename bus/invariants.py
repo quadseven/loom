@@ -48,6 +48,9 @@ BRAIN_SILENT = 90 * 60
 # same gap bus journal and brain status hold a report back by.
 REPORT_GAP = journal.REPORT_GAP
 RUNS_MIN = 5
+# A lane whose newest this-many runs all failed, not counting a limit or an
+# expired key, is failing now even with a success earlier in the day.
+FAILING_STREAK = 5
 HELD_MAX = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
@@ -404,6 +407,35 @@ def lane_no_success(f: Facts) -> List[Breach]:
     return out
 
 
+def lane_failing_streak(f: Facts) -> List[Breach]:
+    """A lane whose newest FAILING_STREAK runs in the last day all failed,
+    a limit or an expired key aside, after a success earlier that day (a lane
+    with none is lane_no_success). On 2026-10-19 zen's free model left the
+    catalogue at about 12:13Z and every run after failed, while a success at
+    05:00Z kept lane_no_success quiet all day."""
+    if f.runs is None:
+        return []
+    lanes: Dict[str, List[Run]] = {}
+    for r in f.runs:
+        if 0 <= f.now - r.at <= DAY and not r.reason.startswith(("[limit]", "[auth]")):
+            lanes.setdefault(r.lane, []).append(r)
+    out = []
+    for lane, runs in sorted(lanes.items()):
+        runs.sort(key=lambda r: r.at, reverse=True)
+        newest = runs[:FAILING_STREAK]
+        if (len(newest) < FAILING_STREAK or any(r.done for r in newest)
+                or not any(r.done for r in runs)):
+            continue
+        since = newest[-1].at
+        out.append(Breach("lane-failing-streak", lane,
+                          "Lane %s: its last %d runs failed" % (lane, FAILING_STREAK),
+                          ("%d runs in a row failed since %s" % (FAILING_STREAK, utc(since)),
+                           "Last failure at %s: %s" % (utc(newest[0].at), public(newest[0].reason)
+                                                       or "no reason was recorded")),
+                          newest[0].at))
+    return out
+
+
 def lane_held(f: Facts) -> List[Breach]:
     """A lane held by a limit for over HELD_MAX while tickets of its tier
     are queued. A lane out of credit on an account the operator never tops
@@ -716,7 +748,8 @@ def untrusted_labeler(f: Facts) -> List[Breach]:
 
 
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
-    brain_failing, brain_silent, marker_cadence, lane_no_success, lane_held,
+    brain_failing, brain_silent, marker_cadence, lane_no_success, lane_failing_streak,
+    lane_held,
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
     plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure,

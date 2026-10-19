@@ -853,6 +853,28 @@ class InvariantTest(unittest.TestCase):
         runs.append(Run("zen", False, T0, "x"))
         self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
 
+    def test_a_lane_failing_its_last_runs_after_an_earlier_success_is_a_breach(self):
+        runs = [Run("zen", True, T0 - 9 * 3600, "")]
+        runs += [Run("zen", False, T0 - i * 600, "[transient] agent exited 1") for i in range(5)]
+        (b,) = invariants.lane_failing_streak(Facts(T0, runs=runs))
+        self.assertEqual((b.invariant, b.subject), ("lane-failing-streak", "zen"))
+        self.assertIn("last 5 runs failed", b.title)
+        self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+
+    def test_limits_expired_keys_a_recent_success_or_no_success_make_no_streak(self):
+        early = Run("zen", True, T0 - 9 * 3600, "")
+        fails = [Run("zen", False, T0 - i * 600, "[transient] agent exited 1") for i in range(4)]
+        limited = [Run("zen", False, T0 - 5 * 600, "[limit] provider limit"),
+                   Run("zen", False, T0 - 6 * 600, "[auth] API key expired")]
+        self.assertEqual(invariants.lane_failing_streak(
+            Facts(T0, runs=[early] + fails + limited)), [])
+        recent = [Run("zen", True, T0 - 50, "")]
+        self.assertEqual(invariants.lane_failing_streak(
+            Facts(T0, runs=[early] + recent + fails + [fails[0]._replace(at=T0 - 3000)])), [])
+        # Never a success all day: lane_no_success's breach, not this one.
+        self.assertEqual(invariants.lane_failing_streak(
+            Facts(T0, runs=fails + [fails[0]._replace(at=T0 - 3000)])), [])
+
     def test_a_lane_out_of_credit_on_a_no_topup_account_is_not_held(self):
         ticket = Ref("%s#5" % REPO, "#5")
         f = Facts(T0, held={"anthropic": T0 - 3 * 3600, "anthropic-2": T0 - 3 * 3600},
