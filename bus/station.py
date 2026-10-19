@@ -1936,6 +1936,24 @@ class Station:
         """Lanes whose fresh heartbeat says unavailable at a limit."""
         return list(self._limit_reasons())
 
+    def down_lanes(self) -> List[str]:
+        """Lanes whose fresh heartbeat says unavailable for a reason other
+        than a limit (an expired key, a lane stopped on purpose). A stale or
+        missing heartbeat is not counted: a lane deep in a long run can go
+        quiet without being down."""
+        out: List[str] = []
+        for lane in LANES:
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            if not isinstance(beat, dict) or beat.get("available") is not False:
+                continue
+            at = beat.get("at")
+            if isinstance(at, bool) or not isinstance(at, (int, float)):
+                continue
+            if beat_fresh(at, self.now) and not str(beat.get("reason") or "").startswith(LIMIT):
+                out.append(lane)
+        return out
+
     def _limit_reasons(self) -> Dict[str, str]:
         """Lane -> the reason of its fresh heartbeat that says unavailable
         at a limit."""
@@ -6794,7 +6812,8 @@ class Station:
                                no_test_repos=self.s.no_test_repos,
                                available=[x for x in LANES if self._heartbeat_ok(x)],
                                held=list(self._held_tickets()) + self._gate_held(),
-                               silent=self._silent_lanes())
+                               silent=self._silent_lanes(),
+                               down=self.down_lanes())
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.

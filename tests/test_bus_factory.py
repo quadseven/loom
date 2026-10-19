@@ -210,7 +210,8 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
 
-    def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None):
+    def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
+           down=()):
         def merge(gh, repo, number, ticket):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None):
@@ -229,7 +230,7 @@ class Base(unittest.TestCase):
                             merge=merge, fix=fix, move=move, close=close,
                             limited=limited, no_test_repos=no_test_repos,
                             available=available, model_limits=model_limits, held=held,
-                            silent=silent)
+                            silent=silent, down=down)
         f.run()
         return f
 
@@ -1543,6 +1544,21 @@ class Tickets(Base):
         self.assertNotIn("loom:rung", note)
         self.assertEqual(self.moved, [])
 
+    def test_a_ticket_briefed_on_a_down_lane_steps_aside_at_once(self):
+        # A lane whose key expired never claims its briefed tickets; they
+        # waited the two-hour stall before (2026-10-19).
+        self.gh.ticket(7, "briefed", lane="opencode-go-2", body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        with mock.patch("bus.factory._say") as say:
+            self.go(down=["opencode-go-2"],
+                    available=[x for x in factory.TIERS["medium"] if x != "opencode-go-2"])
+        self.assertNotEqual(self.lane(7), "opencode-go-2")
+        self.assertIn("Not a failure (lane opencode-go-2 is down)", self.gh.comments[7][-1]["body"])
+        self.assertTrue(any("off lane opencode-go-2, down, to" in c.args[0]
+                            for c in say.call_args_list), say.call_args_list)
+        self.assertEqual(self.moved, [])
+
     def test_a_limit_move_posts_no_rung_marker(self):
         self.limited_easy()
         self.assertFalse(any(factory.RUNG_RE.search(c["body"]) for c in self.gh.comments[7]))
@@ -2010,7 +2026,7 @@ class Helpers(unittest.TestCase):
         class Fake:
             def __init__(self, gh, repos, now, trusted, review_check, limited, review_bot=None,
                          no_test_repos=(), available=None, briefers=(), held=(),
-                         model_limits=None, silent=None):
+                         model_limits=None, silent=None, down=()):
                 self.silent_running, self.silent = {}, silent
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
                               tuple(no_test_repos)))
