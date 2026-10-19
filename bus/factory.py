@@ -254,6 +254,12 @@ PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse", "free-nvidia", "fre
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.
 RUNG_BUSY = 2
+# A ladder ticket whose rung has no lane serving its model for longer than
+# this (each lane down, or its model limited past it) climbs to the next
+# untried rung instead of waiting, as no failure. An account quota held a
+# rung's one lane for a day while two fix rounds and their open pull requests
+# waited on it (2026-10-19).
+RUNG_LIMIT_WAIT = 2 * 3600
 # A running ticket on a lane with no live heartbeat for this long moves off it.
 SILENT_MAX = 30 * 60
 RUNG_MARKER = "<!-- loom:rung %d -->"
@@ -1832,12 +1838,24 @@ class Factory:
         _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
         return True
 
+    def _rung_waits_long(self, repo: str, rung: int) -> bool:
+        """Whether no lane of the rung serves its model within RUNG_LIMIT_WAIT:
+        each is down, or holds the model limited past it. A lane at a limit
+        with no known end is not counted as a long wait."""
+        model = CLIMB[rung - 1][1]
+        lanes = self._rung_lanes(repo, rung)
+        return bool(lanes) and all(
+            lane in self.down
+            or self.model_limits.get(lane, {}).get(model, 0) > self.now + RUNG_LIMIT_WAIT
+            for lane in lanes)
+
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
         """Move a ticket off a lane at a limit (or down) to the first free lane of its
         difficulty tier (or of a FALLBACK tier when none of its tier is up),
         or a ladder ticket to a free lane of its rung, with no rung marker.
-        With none free it stays where it is, for the lane to take once it is
-        back."""
+        A ladder ticket whose rung serves no lane within RUNG_LIMIT_WAIT
+        climbs to its next untried rung instead. With none free it stays where
+        it is, for the lane to take once it is back."""
         number = int(issue["number"])
         old = _lane(issue)
         why = "down" if old in self.down and old not in self.limited else "at a limit"
@@ -1848,6 +1866,16 @@ class Factory:
                          and self._serves(x, CLIMB[rung - 1][1])), None)
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
+        if lane is None and rung and self._rung_waits_long(repo, rung):
+            climbed = self._climb(repo, issue, self._comments(repo, number),
+                                  "lane %s is %s for over %d hours" % (
+                                      old, why, RUNG_LIMIT_WAIT // 3600),
+                                  head="Not a failure", failed_here=False, skip=rung)
+            if climbed is not None:
+                self.load[old] = self.load.get(old, 0) - 1
+                self.actions += 1
+                _say("climbed %s#%d off lane %s, %s, to %s" % (repo, number, old, why, climbed))
+                return
         if lane is None:
             _say("%s#%d waits on lane %s, %s: no free lane in its %s"
                  % (repo, number, old, why, "rung" if rung else "tier"))
