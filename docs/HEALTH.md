@@ -30,7 +30,7 @@ order, instead of waiting for someone to notice and file them.
 
 | Field | Shape | Meaning |
 |---|---|---|
-| `key` | `[A-Za-z0-9:._ -]{1,120}` | Stable id of one problem: the same problem has the same key on every read. Loom stores and shows only its sha1. |
+| `key` | `[A-Za-z0-9:._ '-]{1,120}` | Stable id of one problem: the same problem has the same key on every read. Loom stores and shows only its sha1. The apostrophe is in the shape because names inside the product carry one; the key is never shown, so it leaks nothing. |
 | `title` | ASCII, one line, at most 90 characters | What is wrong, in plain words. |
 | `area` | `[a-z-]{1,20}` | The part of the project (checkout, search, billing, ...). |
 | `affected` | number, 0 to 10000000 | How many things it hits now (members, runs, items). |
@@ -91,6 +91,19 @@ Per finding, on each read:
   Why, and the Live criterion "the finding is absent from the health endpoint for 24
   hours". At most 3 new tickets a pass, and never past the goal's cap
   (`LOOM_GOAL_CAP`).
+- No open ticket carries the marker, but an open health ticket in the same
+  area names the same cause: the finding joins that ticket instead of filing
+  a new one. Its marker is added to the ticket's body, and the `Priority:`
+  line rises when the finding is more urgent (it never falls on a join). A
+  title's cause is the title without who it hits: "Ana is stuck: X" and "3
+  members are stuck: X" both name "stuck: X"; any other title names itself.
+  Two new findings of one cause in one pass file one ticket, and the second
+  joins it on the next pass. So one cause keeps one rolling ticket, also
+  when a key changes shape (from one per member to one per step, say).
+- A finding joins its cause's ticket, or comes back after its ticket was told
+  it went absent: the problem was seen again. The ticket gets a "Seen again
+  N times so far, last seen <time>" comment, at most once a day; the count
+  keeps growing in between and the next comment carries it.
 - An open ticket carries it: when the impact moves the finding to another
   band, the ticket's `Priority:` line moves with it (a priority the brain
   set by hand stands until the band changes). When the numbers or the
@@ -104,10 +117,13 @@ Per finding, on each read:
   slot rules, at most once per ticket every 48 hours. A ticket still in a
   build state (queued to merged) gets only the updates above.
 - The finding is gone and its ticket is open: one comment, "finding absent
-  since <time>". That is the evidence the brain verifies against. The
+  since <time>". That is the evidence the brain verifies against. A ticket
+  that carries several findings gets it once all of them are gone. The
   station never closes a ticket.
 - The finding's last ticket was closed as not planned: it is not filed
-  again. One closed as completed while the finding is still reported is
+  again. The station remembers a finding's ticket for 30 days after the
+  ticket closed and the finding went quiet, so a finding that comes back
+  inside that time is still not filed again. One closed as completed while the finding is still reported is
   filed again, because the fix did not hold.
 
 `bus.brain status` shows a Health findings section from the station's

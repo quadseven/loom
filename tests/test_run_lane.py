@@ -104,14 +104,16 @@ if [ "$1 $2" = "pr create" ]; then
   echo "https://github.com/example/repo/pull/7"
 fi
 # Fake factory incidents: `search issues` prints $FAKE_GH_SEARCH (default
-# empty: no open incident), `issue create` prints the new issue's URL,
-# `issue comment` succeeds silently.
+# empty: no open incident), `issue create` writes its --body to
+# $FAKE_BODY.issue and prints the new issue's URL, `issue comment`
+# succeeds silently.
 if [ "$1 $2" = "search issues" ]; then
   printf '%s\n' "${FAKE_GH_SEARCH:-}"
   exit 0
 fi
 if [ "$1 $2" = "issue create" ]; then
   [ -z "${FAKE_GH_ISSUE_CREATE_FAIL:-}" ] || { echo "issue create blew up" >&2; exit 1; }
+  while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY.issue"; shift; done
   echo "https://github.com/quadseven/loom/issues/${FAKE_GH_ISSUE_NUMBER:-99}"
   exit 0
 fi
@@ -2374,6 +2376,29 @@ cat > /dev/null
                          {"context": 131072, "output": 16384})
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_free_provider_slot_is_its_own_lane_with_its_own_window(self):
+        # The free lane (infra#5617): one slot per free provider at the
+        # spark-gateway's pinned route, declared as provider "free" (never
+        # "spark"), with the ~128K window the free models serve beside a
+        # Spark window of 262144.
+        _, result = self.api_lane("free-ollama",
+                                  LOOM_FREE_OLLAMA_URL="http://gateway.example.invalid/free/ollama-cloud/v1",
+                                  LOOM_FREE_OLLAMA_MODEL="free/ollama-cloud",
+                                  LOOM_FREE_CONTEXT="120000", LOOM_FREE_OUTPUT="16384",
+                                  LOOM_SPARK_CONTEXT="262144", LOOM_SPARK_OUTPUT="32768",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("curl ") and "/free/ollama-cloud/v1/models" in c for c in calls), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertNotIn("spark", config["provider"])
+        self.assertEqual(config["model"], "free/ollama-cloud")
+        self.assertEqual(config["provider"]["free"]["options"],
+                         {"baseURL": "http://gateway.example.invalid/free/ollama-cloud/v1"})
+        self.assertEqual(config["provider"]["free"]["models"]["ollama-cloud"]["limit"],
+                         {"context": 120000, "output": 16384})
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
         _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
                                   **self.SPARK)
@@ -3374,11 +3399,12 @@ exit %d
         self.assertIn("failed: [factory]", log)
         self.assertNotIn("failed: [work]", log)
         self.assertIn("factory incident quadseven/loom#99", log)
-        # The incident names the repo and the exact failing line.
-        calls = self.log.read_text()
-        self.assertIn("gh issue create --repo quadseven/loom", calls)
-        self.assertIn("Repo: example/repo", calls)
-        self.assertIn("python: 3.12", calls)
+        # The incident names the repo and the exact failing line, in the
+        # body it is filed with (not just anywhere in the call log).
+        self.assertIn("gh issue create --repo quadseven/loom", self.log.read_text())
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertIn("Repo: example/repo", body)
+        self.assertIn("python: 3.12", body)
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")

@@ -35,9 +35,6 @@ CREDENTIAL_RE = re.compile(
     r"|\b[A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_]*\s*[=:]\s*\S+")
 # The same shapes plus long unbroken token runs.
 SECRET_RE = re.compile(CREDENTIAL_RE.pattern + r"|\b[A-Za-z0-9+/_-]{32,}={0,2}")
-# Hostnames under suffixes used for private networks.
-PRIVATE_HOST_RE = re.compile(
-    r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
 
 
 def scrub_paths(text: str) -> str:

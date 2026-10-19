@@ -344,7 +344,11 @@ this tick"; a step with no note shows nothing there.
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. Tick
+4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. A
+   shipped ticket whose Live criterion names no exact string (no backticks
+   or quotes) can never be verified, by you or a lane: restate it first with
+   `python3 -m bus.brain live OWNER/NAME#N --text "Live: ... \`the log line or endpoint\` ..."`,
+   naming the string its proof will show, so the station can look for it. Tick
    each acceptance criterion in the ticket body only once you have seen it
    hold, write the proof record (docs/BRAIN.md, Proof), then run
    `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
@@ -520,13 +524,18 @@ on hard work):
   `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
   model `spark/...`, any repo, private ones included) when lane status shows
   them available; then on a public repo muse, then agy (muse runs
-  remotely); else a
+  remotely); then the free lane, one slot per free provider (`free-ollama`,
+  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`) at its pinned
+  route on the spark-gateway, each waiting out its own provider's reset
+  (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
-  which trains on prompts).
+  opencode-go-4, muse, free-nvidia, free-kilo and free-groq on public repos only
+  (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
+  are NVIDIA NIM, Kilo and Groq).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
-  agy; then codex or opencode-go (opencode-go-4 on public repos only); an
+  agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
+  public repo `free-nvidia`, `free-kilo`, `free-groq`); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
 - Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,
