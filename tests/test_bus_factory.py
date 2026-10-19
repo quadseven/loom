@@ -1727,6 +1727,21 @@ class Tickets(Base):
         self.go(model_limits={"agy": {"gemini-4-argon-high": NOW + 3600}})
         self.assertEqual((self.lane(7), self.model(7)), ("agy", "gemini-4-argon-high"))
 
+    def test_a_rung_ticket_whose_only_lane_is_limited_for_a_day_climbs(self):
+        self.gh.private = False
+        body = "Model: gemini-4-argon-high\nDifficulty: hard\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="agy", body=body)
+        with mock.patch("bus.factory._say") as say:
+            self.go(model_limits={"agy": {"gemini-4-argon-high": NOW + 86400}})
+        self.assertNotEqual(self.lane(7), "agy")
+        self.assertIn(self.model(7), factory.STRONG)
+        note = self.gh.comments[7][-1]["body"]
+        self.assertIn("Not a failure (lane agy is at a limit for over 2 hours)", note)
+        self.assertTrue(any(c.args[0].startswith("climbed %s#7 off lane agy" % REPO)
+                            for c in say.call_args_list), say.call_args_list)
+        # The rung it left was not failed on, so it stays untried.
+        self.assertEqual(self.moved, [])
+
     def test_a_ladder_ticket_at_a_limit_stays_on_its_rung(self):
         body = "Model: claude-opus-5-5\nDifficulty: easy\n\n## Why\nx\n"
         self.gh.ticket(7, "briefed", lane="claude", body=body)
