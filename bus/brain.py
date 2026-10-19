@@ -2342,6 +2342,31 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                           "note comment")
 
 
+def restate_live(gh: GitHub, repo: str, number: int, text: str,
+                 env: Optional[Dict[str, str]] = None) -> None:
+    """Replace a shipped ticket's Live acceptance line with one that names
+    the exact string its proof will show, so the station can look for it
+    before it spends a verify run (bus/evidence.py). Tickets shipped before
+    #925 state it in prose and could never be verified."""
+    text = " ".join(str(text or "").split())
+    if not re.match(r"(?i)^live\b", text):
+        raise ValueError("the new line must start with Live")
+    _check_live_criterion("- [ ] " + text)
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    if issue.get("state") != "open" or "loom:shipped" not in _labels(issue):
+        raise ValueError("only an open loom:shipped ticket has its Live criterion restated")
+    _prioritize_body(issue, None, env)
+    body = str(issue.get("body") or "")
+    found = _LIVE_LINE.search(body)
+    if not found:
+        raise ValueError("the ticket has no Live line to restate")
+    line = body[found.start():found.end()]
+    new = body[:found.start()] + line[:line.index(found.group(1))] + text + body[found.end():]
+    _check_written_text(new)
+    if new != body:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
+
+
 def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
                model: str) -> None:
     """Rewrite the ticket body's Model: line; done before the labels change so
@@ -4040,6 +4065,7 @@ def parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
+    lv = sub.add_parser("live"); lv.add_argument("ticket"); lv.add_argument("--text", required=True)
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
@@ -4117,6 +4143,11 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
         print(said)
 
 
+def _cmd_live(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    restate_live(gh, repo, number, args.text)
+
+
 def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     prioritize(gh, repo, number, args.priority, args.note, difficulty=args.difficulty)
@@ -4174,7 +4205,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
-            "prioritize": _cmd_prioritize,
+            "prioritize": _cmd_prioritize, "live": _cmd_live,
             "close": _cmd_close, "audit": _cmd_audit, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
