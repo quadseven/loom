@@ -121,7 +121,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, naming, tickets
+from . import brain, change_class, naming, status, tickets
 from .github import GitHub, GitHubError
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -1016,6 +1016,11 @@ class Factory:
                 if isinstance(i, dict) and "pull_request" not in i and "number" in i
                 and self._trusted_ticket(i)}
 
+    def _status_note(self, repo: str, number: int, text: str) -> None:
+        """A routine event on the ticket's one status comment, edited in place
+        (bus/status.py): a new comment would email the operator (loom#866)."""
+        status.add(self.gh, repo, number, text, self.now, self.trusted)
+
     def _comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
         """The ticket's comments from trusted logins only."""
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
@@ -1242,10 +1247,9 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "%s\n%s (%s): the factory moved this ticket up the "
-                    "model ladder to rung %d, %s on lane %s." % (
-                        RUNG_MARKER % rung, head, why, rung, model, lane)})
+        self._status_note(repo, number, "%s\n%s (%s): the factory moved this ticket up the "
+                          "model ladder to rung %d, %s on lane %s." % (
+                              RUNG_MARKER % rung, head, why, rung, model, lane))
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
@@ -1662,8 +1666,8 @@ class Factory:
         said = ("Not a failure (lane %s has sent no heartbeat for %d minutes): "
                 % (old, silent // 60))
         if lane is None:
-            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-                "body": said + "no lane of its tier is free, so the ticket goes back to the queue."})
+            self._status_note(repo, number,
+                              said + "no lane of its tier is free, so the ticket goes back to the queue.")
             kept = [x for x in _labels(issue) if x != "loom:running" and not x.startswith("lane:")]
             self._relabel(repo, issue, kept + ["loom:queued"])
             _say("queued %s#%d: lane %s sent no heartbeat for %d minutes"
@@ -1775,11 +1779,11 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "Not a failure (briefed %.0f hours on lane %s with no claim): the "
-                    "factory moved this ticket to lane %s, %s." % (
-                        hours, old, lane,
-                        "on the same rung" if rung else "in its difficulty tier")})
+        self._status_note(repo, number,
+                          "Not a failure (briefed %.0f hours on lane %s with no claim): the "
+                          "factory moved this ticket to lane %s, %s." % (
+                              hours, old, lane,
+                              "on the same rung" if rung else "in its difficulty tier"))
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
@@ -1835,11 +1839,11 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "Not a failure (lane %s is at a limit): the factory moved this "
-                    "ticket to lane %s, %s." % (
-                        old, lane, "on the same rung" if rung else
-                        fallback or "in its difficulty tier")})
+        self._status_note(repo, number,
+                          "Not a failure (lane %s is at a limit): the factory moved this "
+                          "ticket to lane %s, %s." % (
+                              old, lane, "on the same rung" if rung else
+                              fallback or "in its difficulty tier"))
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
@@ -1944,10 +1948,11 @@ class Factory:
         to its Model: line, so its claim records the model that ran. The note
         carries EQUIVALENT_MARKER, which leaves the pinned rung untried."""
         number = int(issue["number"])
-        self.move(self.gh, repo, number, "briefed", lane=lane, model=model,
-                  note="%s\nThe station gave this queued ticket lane %s with model %s in "
-                       "place of %s (equivalent: %s)." % (
-                           EQUIVALENT_MARKER % model, lane, model, pinned, why))
+        self.move(self.gh, repo, number, "briefed", lane=lane, model=model)
+        self._status_note(repo, number,
+                          "%s\nThe station gave this queued ticket lane %s with model %s in "
+                          "place of %s (equivalent: %s)." % (
+                              EQUIVALENT_MARKER % model, lane, model, pinned, why))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         issue["body"] = with_model(str(issue.get("body") or ""), model)
@@ -1959,18 +1964,19 @@ class Factory:
                            tier: str) -> None:
         number = int(issue["number"])
         if lane in REMOTE_LANES:
-            self.move(self.gh, repo, number, "queued", lane=lane,
-                      note="The station reserved this queued ticket for remote lane %s (tier %s)."
-                           % (lane, tier))
+            self.move(self.gh, repo, number, "queued", lane=lane)
+            self._status_note(repo, number,
+                              "The station reserved this queued ticket for remote lane %s (tier %s)."
+                              % (lane, tier))
             issue["labels"] = [{"name": x} for x in brain._moved_labels(
                 _labels(issue), "queued", lane)]
             self.load[lane] = self.load.get(lane, 0) + 1
             _say("reserved queued %s#%d for remote lane %s (tier %s)"
                  % (repo, number, lane, tier))
             return
-        self.move(self.gh, repo, number, "briefed", lane=lane,
-                  note="The station gave this queued ticket lane %s (tier %s)." %
-                       (lane, tier))
+        self.move(self.gh, repo, number, "briefed", lane=lane)
+        self._status_note(repo, number,
+                          "The station gave this queued ticket lane %s (tier %s)." % (lane, tier))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         self.load[lane] = self.load.get(lane, 0) + 1

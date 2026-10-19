@@ -44,6 +44,7 @@ from . import rewrite
 from . import roll_pin
 from . import revert
 from . import spend
+from . import status
 from . import usage
 from . import verify_data
 from . import text as _text
@@ -1113,6 +1114,10 @@ class Station:
                  head: Optional[Callable[[], str]] = None,
                  fetch: Optional[Fetcher] = None) -> None:
         self.gh = gh
+        # Status comments by the station's trusted writers read as events.
+        writers = getattr(gh, "status_authors", None)
+        if isinstance(writers, set):
+            writers |= {a.lower() for a in settings.authors}
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
@@ -1602,9 +1607,10 @@ class Station:
             labels.append(mark)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": "Claimed for lane %s (body sha256 %s)"
-                      % (lane, _sha12(issue.get("body")))})
+        # The claim marker goes on the ticket's one status comment, edited in
+        # place: a new comment emailed the operator on every claim (loom#866).
+        status.add(self.gh, repo, number, "Claimed for lane %s (body sha256 %s)"
+                   % (lane, _sha12(issue.get("body"))), self.now, self.s.authors)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         if fix:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
@@ -4040,9 +4046,10 @@ class Station:
                 return "no other eligible lane is available"
             # The comment comes first: it is the count of retries, and it tells
             # a pass that finds the relabel undone where the ticket was going.
-            self._comment(repo, number, "Automatic retry %d of %d (%s): moved from lane %s "
-                          "to lane %s. Lane %s failed: %s"
-                          % (used + 1, self.s.retry_max, klass, lane, target, lane, reason))
+            status.add(self.gh, repo, number, "Automatic retry %d of %d (%s): moved from lane %s "
+                       "to lane %s. Lane %s failed: %s"
+                       % (used + 1, self.s.retry_max, klass, lane, target, lane, reason),
+                       self.now, self.s.authors)
         labels = [n for n in names if n != RUNNING and not n.startswith("lane:")]
         labels += [BRIEFED, "lane:" + target]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})

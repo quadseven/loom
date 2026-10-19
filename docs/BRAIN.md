@@ -583,8 +583,9 @@ then the oldest:
    It must also be past its `Not before:` time, and every ticket its
    `After:` line names must be merged (see When a ticket may run).
 2. Replace its labels in one call (`loom:briefed` out, `loom:running` in;
-   everything else kept), then comment
-   `Claimed for lane <lane> (body sha256 <first 12>)`.
+   everything else kept), then add the event
+   `Claimed for lane <lane> (body sha256 <first 12>)` to the ticket's status
+   comment (see Ticket status comment).
 3. The brief from the body it hashed was written under a temporary name
    before step 2; rename it into the lane's inbox now. A pass that finds a
    temporary brief finishes that claim first, so a crash between steps
@@ -689,6 +690,21 @@ second one.
 
 The station applies the retry labels with its own login, so that login must
 be in `LOOM_BRIEF_AUTHORS`, or the trust rules refuse the retried ticket.
+
+### Ticket status comment
+
+Routine ticket events go on one comment per ticket, marked
+`<!-- loom:status v1 -->`, which the station and the factory edit in place,
+newest event first, one `- <UTC time> <text>` line per event (continuation
+lines indented two spaces). That covers a lane given to a queued ticket, a
+claim, a stall, limit or heartbeat move, a rung climb, an equivalent-model
+move and an automatic retry. A new comment emails the operator; an edit does
+not (loom#866: zippie#264 carried 77 bot comments). Outcomes (a pull request
+opened or pushed, a failure, merged, shipped, verified, an ask, a runaway
+hold) and `loom:fix` briefs stay new comments. The GitHub client
+(bus/github.py) expands a status comment in any issue-comment list into one
+comment per event, timed by its line, so every reader sees each event as the
+comment it used to be. Only a trusted login's status comment is edited.
 
 ## Polling budget
 
