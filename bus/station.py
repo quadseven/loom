@@ -6117,8 +6117,15 @@ class Station:
                 and 0 <= self.now - checked < REPORT_CHECK:
             return
         state["_checked"] = self.now
+        # One goal's failure must not skip the later goals' standups, nor drop
+        # the stamps of the goals already posted this pass (loom#201).
         for repo, goal in self._goal_homes():
-            self._post_overdue_goal_standup(repo, goal, state, authors, now)
+            try:
+                self._post_overdue_goal_standup(repo, goal, state, authors, now)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("standup %s#%s failed: %s" % (repo, goal.get("number"), err))
         _write_json(state_path, state)
 
     def _post_overdue_goal_standup(self, repo: str, goal: Dict[str, Any],
