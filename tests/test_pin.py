@@ -19,6 +19,18 @@ SPEC = {"repo": TARGET, "path": PATH, "revision_var": "LOOM_REVISION",
         "sha256_var": "LOOM_SHA256"}
 
 
+def refused(method, path, *errors):
+    """GitHub's 422 for a write it will not take, raised as the real client
+    raises it: the status line as the message and GitHub's JSON answer, with
+    its message and errors, as the body."""
+    answer = {"message": "Validation Failed",
+              "errors": [{"resource": "PullRequest", "code": "custom", "message": text}
+                         for text in errors],
+              "documentation_url": "https://docs.github.com/rest/pulls/pulls",
+              "status": "422"}
+    return GitHubError("%s %s -> 422" % (method, path), 422, json.dumps(answer))
+
+
 class FakeGitHub:
     def __init__(self):
         self.base = 'LOOM_REVISION="%s"\nLOOM_SHA256="%s"\n' % (OLD, "0" * 64)
@@ -29,6 +41,7 @@ class FakeGitHub:
         self.green = True
         self.files = [{"filename": "dashboard/server.py"}]
         self.labels = []
+        self.list_hides_pull = False
 
     def rest(self, method, path, body=None, ok=()):
         self.calls.append((method, path, body))
@@ -71,21 +84,26 @@ class FakeGitHub:
 
     def pulls(self, method, path, body):
         if path == "/repos/%s/pulls?state=open&per_page=100" % TARGET:
-            return SimpleNamespace(data=[self.pull] if self.pull else [])
+            return SimpleNamespace(data=[self.pull] if self.pull and not self.list_hides_pull else [])
         if path == "/repos/%s/pulls" % TARGET and method == "POST":
-            if body.get("base") != "main" or not body.get("head") or self.branch is None:
-                raise GitHubError("Validation Failed", 422)
-            if hunt_plan.problems(body.get("body", "")):
-                raise GitHubError("Validation Failed", 422)
-            self.created += 1
-            self.pull = {"number": 7, "head": {"ref": body["head"]}, "body": body["body"]}
-            return SimpleNamespace(data=self.pull)
+            return self.create(method, path, body)
         if path == "/repos/%s/pulls/7" % TARGET and method == "PATCH":
             if hunt_plan.problems(body.get("body", "")):
-                raise GitHubError("Validation Failed", 422)
+                raise refused(method, path, "body fails the Hunt Plan")
             self.pull["body"] = body["body"]
             return SimpleNamespace(data=self.pull)
         raise AssertionError((method, path, body))
+
+    def create(self, method, path, body):
+        if body.get("base") != "main" or not body.get("head") or self.branch is None:
+            raise refused(method, path, "base, head and a pushed head branch are required")
+        if hunt_plan.problems(body.get("body", "")):
+            raise refused(method, path, "body fails the Hunt Plan")
+        if self.pull and self.pull["head"]["ref"] == body["head"]:
+            raise refused(method, path, "A pull request already exists for %s." % body["head"])
+        self.created += 1
+        self.pull = {"number": 7, "head": {"ref": body["head"]}, "body": body["body"]}
+        return SimpleNamespace(data=self.pull)
 
 
 class PinTest(unittest.TestCase):
@@ -109,6 +127,24 @@ class PinTest(unittest.TestCase):
         writes = len([call for call in gh.calls if call[0] in ("PUT", "PATCH", "POST")])
         pin.run(gh, SOURCE, NEXT, "unittest", [SPEC], lambda _: b"archive2", logs.append)
         self.assertEqual(len([call for call in gh.calls if call[0] in ("PUT", "PATCH", "POST")]), writes)
+
+    def test_a_refused_create_raises_githubs_422_and_labels_nothing(self):
+        gh = FakeGitHub()
+        pin.run(gh, SOURCE, NEW, "unittest", [SPEC], lambda _: b"archive", lambda _: None)
+        # The open pull request sits past the first page of 100, so the pass
+        # does not see it and asks GitHub to create a second one.
+        gh.list_hides_pull = True
+        logs = []
+        with self.assertRaises(GitHubError) as caught:
+            pin.run(gh, SOURCE, NEXT, "unittest", [SPEC], lambda _: b"archive2", logs.append)
+        self.assertEqual(caught.exception.status, 422)
+        self.assertEqual(str(caught.exception), "POST /repos/%s/pulls -> 422" % TARGET)
+        answer = json.loads(caught.exception.body)
+        self.assertEqual(answer["message"], "Validation Failed")
+        self.assertIn("A pull request already exists", answer["errors"][0]["message"])
+        self.assertEqual(gh.created, 1)
+        self.assertEqual(gh.labels, [pin.PIN_LABEL])
+        self.assertFalse(any("opened pull request" in line for line in logs), logs)
 
     def test_changed_tarball_or_red_ci_opens_nothing_and_logs_reason(self):
         for red in (False, True):
