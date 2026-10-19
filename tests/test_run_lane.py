@@ -2324,6 +2324,29 @@ cat > /dev/null
                          {"context": 131072, "output": 16384})
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_free_provider_slot_is_its_own_lane_with_its_own_window(self):
+        # The free lane (infra#5617): one slot per free provider at the
+        # spark-gateway's pinned route, declared as provider "free" (never
+        # "spark"), with the ~128K window the free models serve beside a
+        # Spark window of 262144.
+        _, result = self.api_lane("free-ollama",
+                                  LOOM_FREE_OLLAMA_URL="http://gateway.example.invalid/free/ollama-cloud/v1",
+                                  LOOM_FREE_OLLAMA_MODEL="free/ollama-cloud",
+                                  LOOM_FREE_CONTEXT="120000", LOOM_FREE_OUTPUT="16384",
+                                  LOOM_SPARK_CONTEXT="262144", LOOM_SPARK_OUTPUT="32768",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("curl ") and "/free/ollama-cloud/v1/models" in c for c in calls), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertNotIn("spark", config["provider"])
+        self.assertEqual(config["model"], "free/ollama-cloud")
+        self.assertEqual(config["provider"]["free"]["options"],
+                         {"baseURL": "http://gateway.example.invalid/free/ollama-cloud/v1"})
+        self.assertEqual(config["provider"]["free"]["models"]["ollama-cloud"]["limit"],
+                         {"context": 120000, "output": 16384})
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
         _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
                                   **self.SPARK)

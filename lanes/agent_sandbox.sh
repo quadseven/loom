@@ -148,17 +148,27 @@ opencode_config() {
   # The spark lane's provider is the local endpoint, declared here: an
   # OpenAI-compatible provider named spark at LOOM_SPARK_URL (checked in
   # spark_ready), serving the one model after "spark/". No key.
-  local provider="" id="${MODEL#spark/}" permission="${OPENCODE_PERMISSION:-}"
+  # The free lane (a free provider's route on the spark-gateway) is declared the
+  # same way, as provider free serving the model after "free/".
+  local provider="" id="${MODEL#*/}" permission="${OPENCODE_PERMISSION:-}"
   [ -n "$permission" ] || permission='{"external_directory": "deny"}'
   # The window the endpoint serves (LOOM_SPARK_CONTEXT, LOOM_SPARK_OUTPUT;
   # whole numbers, else the vLLM defaults below). A window smaller than the
   # server's makes the agent compact and lose its place on a large repo: the
   # first sparkles run (2026-10-14) re-read files 190 times in 32K and
   # committed nothing, against a server serving 262144.
-  local ctx="${LOOM_SPARK_CONTEXT:-32768}" out="${LOOM_SPARK_OUTPUT:-4096}"
+  local ctx="${LOOM_SPARK_CONTEXT:-32768}" out="${LOOM_SPARK_OUTPUT:-4096}" v
+  # A lane or slot may serve its own window (the free lane's providers serve
+  # about 128K beside a Spark's 262144):
+  # LOOM_<SLOT>_CONTEXT and LOOM_<SLOT>_OUTPUT come first.
+  if declare -F lane_setting > /dev/null; then
+    v="$(lane_setting CONTEXT)"; [ -n "$v" ] && ctx="$v"
+    v="$(lane_setting OUTPUT)"; [ -n "$v" ] && out="$v"
+  fi
   [[ "$ctx" =~ ^[1-9][0-9]{3,6}$ ]] || ctx=32768
   [[ "$out" =~ ^[1-9][0-9]{2,5}$ ]] || out=4096
   [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
+  [ "$LANE" = free ] && provider=", \"provider\": {\"free\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Free provider pool\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": $permission$provider}"
 }
