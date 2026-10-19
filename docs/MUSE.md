@@ -344,7 +344,11 @@ this tick"; a step with no note shows nothing there.
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. Tick
+4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. A
+   shipped ticket whose Live criterion names no exact string (no backticks
+   or quotes) can never be verified, by you or a lane: restate it first with
+   `python3 -m bus.brain live OWNER/NAME#N --text "Live: ... \`the log line or endpoint\` ..."`,
+   naming the string its proof will show, so the station can look for it. Tick
    each acceptance criterion in the ticket body only once you have seen it
    hold, write the proof record (docs/BRAIN.md, Proof), then run
    `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`

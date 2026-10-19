@@ -3285,6 +3285,42 @@ class LiveCriterionTest(unittest.TestCase):
     def test_a_body_with_no_live_criterion_is_left_alone(self):
         brain._check_live_criterion(self.body("A test fails without the change"))
 
+class RestateLiveTest(unittest.TestCase):
+    """Tickets shipped before #925 state their Live criterion in prose and
+    can never be verified; the brain restates it naming the string."""
+
+    BODY = ("## Acceptance criteria\n- [ ] A test fails without the fix\n"
+            "- [ ] Live: the logs show it working after deploy\n\n## Size\nS\n")
+    ENV = {"LOOM_BRIEF_AUTHORS": "trusted"}
+
+    def issue(self, labels=("loom:ticket", "loom:shipped"), body=None):
+        return {"state": "open", "body": self.BODY if body is None else body,
+                "labels": [{"name": n} for n in labels], "user": {"login": "trusted"}}
+
+    def test_a_shipped_ticket_gets_its_live_line_replaced_in_place(self):
+        fake = Fake(reply(200, self.issue()), reply(200, {}))
+        brain.restate_live(GitHub("t", transport=fake), REPO, 8,
+                           "Live: the station log shows `deployed` within a pass", env=self.ENV)
+        self.assertEqual(fake.calls[1][0], "PATCH")
+        self.assertEqual(fake.calls[1][2]["body"], self.BODY.replace(
+            "Live: the logs show it working after deploy",
+            "Live: the station log shows `deployed` within a pass"))
+
+    def test_refusals_make_no_writes(self):
+        cases = [
+            (self.issue(), "Live: the logs show it"),                       # names no string
+            (self.issue(), "live: the station log shows `deployed`"),        # not read as Live
+            (self.issue(), "The station log shows `deployed`"),             # not a Live line
+            (self.issue(labels=("loom:ticket", "loom:merged")), "Live: `deployed` shows"),
+            (self.issue(body="## Acceptance criteria\n- [ ] a\n"), "Live: `deployed` shows"),
+        ]
+        for issue, text in cases:
+            with self.subTest(text=text):
+                fake = Fake(reply(200, issue))
+                with self.assertRaises(ValueError):
+                    brain.restate_live(GitHub("t", transport=fake), REPO, 8, text, env=self.ENV)
+                self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
 
 if __name__ == "__main__":
     unittest.main()
