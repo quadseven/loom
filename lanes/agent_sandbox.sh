@@ -54,11 +54,29 @@ sandbox_profile() {
   case "$home/" in "$cli_root"/*) echo "refusing sandbox: $cli_real sits at or above HOME" >&2; return 1 ;; esac
   allow_rw="(subpath \"$tree\") (subpath \"$(cd "$AGENT_HOME" && pwd -P)\")"
   allow_ro="(subpath \"$cli_root\") (literal \"$cli_link\")"
+  # The check profile (only $3 = check, never an agent run) lets a contract
+  # reach the runner's uv and uvx: contract_run names their exact paths in
+  # CHECK_UV_BINS (space-separated, no spaces in the paths). Those two
+  # files only, never the directory that holds them: no subpath rule is
+  # added for it, and the ancestor literals below grant metadata only.
+  local uv_file uv_real uv_files=""
+  if [ "${3:-}" = check ] && [ -n "${CHECK_UV_BINS:-}" ]; then
+    for uv_file in $CHECK_UV_BINS; do
+      # shellcheck disable=SC1003 # matching a literal backslash
+      case "$uv_file" in *'"'*|*'\'*)
+        echo "refusing sandbox: unsafe uv path $uv_file" >&2; return 1 ;; esac
+      uv_real="$(realpath "$uv_file" 2>/dev/null)" || uv_real=""
+      [ -n "$uv_real" ] && [ -r "$uv_real" ] ||
+        { echo "refusing sandbox: uv binary not readable $uv_file" >&2; return 1; }
+      allow_ro="$allow_ro (literal \"$uv_real\")"
+      uv_files="$uv_files $uv_real"
+    done
+  fi
   # The skill snapshot: readable, never writable, wherever LOOM_HOME lives.
   [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
 (deny file-write* (subpath \"$skills\"))
 "
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"}; do
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
       meta="$meta (literal \"$p\")"

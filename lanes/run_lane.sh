@@ -1110,9 +1110,25 @@ note_factory_incident() {  # kind, detail, reason_var_name
 # branch, and contract_command_ok refuses (exit 125, nothing run) any string
 # that is not one bounded line of printable ASCII.
 contract_run() {
-  local profile
+  local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins=""
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
-  profile="$(AGENT_HOME="$CHECK_HOME" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
+  # A contract that runs `uvx` failed every check with 127 on the unmodified
+  # base: the lane machine keeps uv and uvx in the runner's .local/bin,
+  # outside the runner's PATH, and the check sandbox refused to read them.
+  # Find both with command -v, falling back to the runner's .local/bin,
+  # put their directories on the check's PATH, and name their exact paths
+  # in CHECK_UV_BINS so the check profile allows those two files only.
+  for tool in uv uvx; do
+    uv_bin="$(command -v "$tool" 2>/dev/null)" || uv_bin=""
+    [ -x "$uv_bin" ] || uv_bin="$HOME/.local/bin/$tool"
+    [ -x "$uv_bin" ] || continue
+    uv_bin="$(realpath "$uv_bin" 2>/dev/null)" && [ -n "$uv_bin" ] || continue
+    uv_dir="$(dirname "$uv_bin")"
+    case ":$uv_path_dirs:" in *":$uv_dir:"*) ;; *)
+      uv_path_dirs="${uv_path_dirs:+$uv_path_dirs:}$uv_dir" ;; esac
+    uv_bins="${uv_bins:+$uv_bins }$uv_bin"
+  done
+  profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
   # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
   (
     cd "$TREE" || exit 125
@@ -1123,7 +1139,7 @@ contract_run() {
     # python3 on an arm64 host without Rosetta) made uv exit 2 before any
     # test, so every muster lane run failed on the unmodified base
     # (2026-10-16).
-    export PATH="$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
+    export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < /dev/null
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
