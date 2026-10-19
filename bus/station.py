@@ -3796,7 +3796,9 @@ class Station:
             # (loom#572); a runaway label kept here held tickets for hours.
             kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-        self._comment(repo, number,
+        # A status event, not a comment: closing five incidents released 16
+        # tickets and sent 16 emails at once (2026-10-19).
+        self._routine(repo, number,
                       "Factory incident %s is closed: the ticket is back in the queue "
                       "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                           if cleared else ""))
@@ -4074,7 +4076,7 @@ class Station:
             self._note_held(repo, number,
                             "%s#%s" % (match.group(1), match.group(2)) if match else None)
             self._set_wait(repo, self._issue(repo, number), "incident")
-            self._comment(repo, number,
+            self._routine(repo, number,
                           "Lane %s held: %s. The ticket keeps its rung and returns to the "
                           "queue when the factory incident closes." % (lane, bare))
             _say("held %s#%d for the factory: %s" % (repo, number, reason))
@@ -4094,7 +4096,7 @@ class Station:
             # rounds in 77 minutes on 2026-10-14. A transient failure retries.
             state = "loom:failed" if klass == "work" else "loom:pr"
             self._relabel(repo, number, state)
-            self._comment(repo, number, "Lane %s failed: %s. This was a fix round on pull "
+            self._routine(repo, number, "Lane %s failed: %s. This was a fix round on pull "
                           "request #%s; the ticket is back at %s and the pull request "
                           "is unchanged." % (lane, reason, fix_pr, state))
             _say("reported %s#%d fix failed, back to %s: %s" % (repo, number, state, reason))
@@ -4113,9 +4115,17 @@ class Station:
                 return True
             note = ". Not retried: %s." % note
         self._relabel(repo, number, "loom:failed")
-        self._comment(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
+        self._routine(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _routine(self, repo: str, number: int, text: str) -> None:
+        """A lane failure or factory hold the factory acts on by itself, as an
+        event in the ticket's status comment: an edit sends no email. Each one
+        was a new comment, an email apiece (an infra ticket, 2026-10-19). The
+        GitHub client expands status events, so the attempt table still reads
+        "Lane X failed:" lines (factory.attempts)."""
+        status.add(self.gh, repo, number, text, self.now, self.s.authors)
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
         """Hold a ticket after the same consecutive failure or three attempts in

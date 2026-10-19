@@ -3712,6 +3712,23 @@ class FactoryIncidentTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
         self.assertTrue(any("back in the queue" in b for b in self.bodies()))
 
+    def test_a_factory_hold_and_its_release_post_no_new_comment(self):
+        # Closing five incidents released 16 tickets and sent 16 emails at
+        # once (2026-10-19): the hold and the release are status events.
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        plain = [c["body"] for c in self.fake.comments[12] if not status.is_status(c.get("body"))]
+        self.assertFalse([b for b in plain if "held:" in b or "back in the queue" in b], plain)
+        boxes = "\n".join(c["body"] for c in self.fake.comments[12]
+                          if status.is_status(c.get("body")))
+        self.assertIn("back in the queue", boxes)
+        self.assertIn("Lane muse held:", boxes)
+
     def test_a_closed_incident_without_label_requeues_its_ticket(self):
         # loom#918: the loom:factory label was not in LABELS, so the runner
         # could not apply it and the incident was filed without it. The station
@@ -4309,6 +4326,14 @@ class OutcomeTest(Base):
         self.finished("failed")
         self.run_pass()
         self.assertIn("no reason was recorded", self.fake.comments[12][0]["body"])
+
+    def test_a_lane_failure_is_a_status_event_not_a_new_comment(self):
+        # Each "Lane X failed" was a new comment and an email (2026-10-19).
+        self.finished("failed")
+        self.run_pass()
+        (only,) = self.fake.comments[12]
+        self.assertTrue(status.is_status(only["body"]), only["body"])
+        self.assertIn("Lane codex failed:", only["body"])
 
     def test_reports_survive_a_restart_of_the_station(self):
         self.finished("done")
