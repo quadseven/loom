@@ -70,6 +70,17 @@ TRACEBACK = "Traceback (most recent call last)"
 # fault to file. loom#467 counted zen's "[transient] agent exited 124" lines
 # 26 times, one emailed comment each (2026-10-18).
 CLASSED_RE = re.compile(r"\bfailed: \[(?:transient|limit)\]")
+# A line of a GitHub Actions job log that an agent read and echoed: "gh run
+# view --log" puts the job and the step before each line's timestamp, which
+# has seven fraction digits (the raw step log has the stamp alone). It is
+# the CI run's output, not the component's own error: a green run's test
+# names and captured output say "failed" and "error", and loom#880-#904 were
+# about 25 issues filed for one passing suite (2026-10-18). A failing run is
+# reported by its own check. The job and step names carry no colon, so a
+# line that only quotes such a stamp ("brain: ... at <stamp> failed") is
+# still judged.
+CI_LOG_RE = re.compile(r"(?:[^:\r\n]{0,160}\s)?[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+                       r"\.[0-9]{7}Z(?=\s|$)")
 
 _TIME_RE = re.compile(
     r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?"
@@ -165,10 +176,13 @@ def redact(line: str) -> str:
 
 def keep(line: str) -> bool:
     """A line worth a signature: it names an error or an HTTP 4xx/5xx. The
-    station's hold line is status, whatever state word it names."""
+    station's hold line is status, whatever state word it names, and a
+    relayed CI log line is the run's output (CI_LOG_RE)."""
     if HOLD_RE.fullmatch(_LEAD_RE.sub("", line).rstrip("\r\n")):
         return False
     if CLASSED_RE.search(line):
+        return False
+    if CI_LOG_RE.match(_LEAD_RE.sub("", line)):
         return False
     return bool(KEEP_RE.search(line) or HTTP_RE.search(line))
 
