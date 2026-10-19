@@ -253,6 +253,10 @@ class RewriteIssueTest(Base):
     def test_a_body_without_checkboxes_writes_nothing(self):
         self.assert_writes_nothing(dict(BRIEF, body=BODY.replace("- [ ] ", "- ")))
 
+    def test_a_prose_live_criterion_writes_nothing(self):
+        prose = BODY.replace("- [ ] ", "- [ ] Live: the logs show it working after deploy\n- [ ] ", 1)
+        self.assert_writes_nothing(dict(BRIEF, body=prose))
+
     def test_a_bad_difficulty_writes_nothing(self):
         self.assert_writes_nothing(dict(BRIEF, difficulty="impossible"))
 

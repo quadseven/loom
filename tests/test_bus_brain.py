@@ -3263,6 +3263,29 @@ class ReportCadenceTest(unittest.TestCase):
         # emails an hour; the operator chose every 6 hours.
         self.assertEqual(brain.REPORT_EVERY, 6 * 3600)
 
+class LiveCriterionTest(unittest.TestCase):
+    """2026-10-18: 3 of 72 merged tickets verified; most verify runs found no
+    evidence for a Live criterion written as prose, so the station had no
+    string to look for in its logs."""
+
+    def body(self, live):
+        return ("## Why\nx\n\n## What\ny\n\n## Acceptance criteria\n- [ ] a\n- [ ] b\n"
+                "- [ ] %s\n\n## Size\nS\n\n## Out of scope\nz\n" % live)
+
+    def test_a_prose_live_criterion_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "names no exact string"):
+            brain._check_live_criterion(self.body(
+                "Live: the station log for the 24 hours after deploy shows it working"))
+
+    def test_a_live_criterion_naming_a_string_passes(self):
+        brain._check_live_criterion(self.body(
+            "Live: the station log shows `deployed` within a pass of the merge"))
+        brain._check_live_criterion(self.body('Live: "/api/v2/health" reports no finding'))
+
+    def test_a_body_with_no_live_criterion_is_left_alone(self):
+        brain._check_live_criterion(self.body("A test fails without the change"))
+
+
 if __name__ == "__main__":
     unittest.main()
 
