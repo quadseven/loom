@@ -80,27 +80,37 @@ def tracks_cannot_grow(value):
                for track in tracks)
 
 
+def _rule_problems(selector, body, rules):
+    """What lets one rule's element grow wider than its track."""
+    found = []
+    if declaration(body, "display") == "grid":
+        columns = [declaration(b, "grid-template-columns") for s, b in rules if s == selector]
+        if not any(tracks_cannot_grow(value) for value in columns if value):
+            found.append("%s is a grid whose track grows with its widest child" % selector)
+    if declaration(body, "white-space") == "nowrap" and declaration(body, "overflow") != "hidden":
+        found.append("%s never wraps and does not clip" % selector)
+    return found
+
+
+def _wrap_problems(rules):
+    """The header and columns break long words; check names wrap."""
+    found = []
+    for selector in (".ticket-header", ".ticket-columns"):
+        if not any(s == selector and declaration(b, "overflow-wrap") == "anywhere" for s, b in rules):
+            found.append("%s does not break long words (overflow-wrap: anywhere)" % selector)
+    if any(s == ".pr-line span:first-child" and declaration(b, "white-space") == "nowrap" for s, b in rules):
+        found.append("check names are cut to one line instead of wrapping")
+    return found
+
+
 def problems(css, classes):
     rules = css_rules(css)
     found = []
     for selector, body in rules:
         styled = last_classes(selector)
-        if not styled or not styled <= classes:
-            continue
-        if declaration(body, "display") == "grid":
-            columns = [declaration(b, "grid-template-columns") for s, b in rules if s == selector]
-            if not any(tracks_cannot_grow(value) for value in columns if value):
-                found.append("%s is a grid whose track grows with its widest child" % selector)
-        white_space = declaration(body, "white-space")
-        if white_space == "nowrap" and declaration(body, "overflow") != "hidden":
-            found.append("%s never wraps and does not clip" % selector)
-    for selector in (".ticket-header", ".ticket-columns"):
-        if not any(s == selector and declaration(b, "overflow-wrap") == "anywhere" for s, b in rules):
-            found.append("%s does not break long words (overflow-wrap: anywhere)" % selector)
-    for selector, body in rules:
-        if selector == ".pr-line span:first-child" and declaration(body, "white-space") == "nowrap":
-            found.append("check names are cut to one line instead of wrapping")
-    return found
+        if styled and styled <= classes:
+            found.extend(_rule_problems(selector, body, rules))
+    return found + _wrap_problems(rules)
 
 
 class TicketPageWidth(unittest.TestCase):
