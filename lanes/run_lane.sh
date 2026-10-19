@@ -1866,19 +1866,23 @@ for BRIEF in "$INBOX"/*.md; do
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
   FAIL_CLASS=work
-  FAILURE_OUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)"
+  # The whole run output (from LOG_START), for the limit and credit patterns;
+  # the short tail (its last five non-blank lines), kept for the reason shown
+  # to people and for the auth/transient patterns (loom#934).
+  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
-    classify_failure "$STATUS" "$FAILURE_OUT" "$EDITED"
+    classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
     # this lane the retry. The rest of the inbox waits for the reset.
-    if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
+    if [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
       heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ] &&
-         [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $ACCOUNT_QUOTA_RE ]]; then
+         [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $ACCOUNT_QUOTA_RE ]]; then
       LIMIT_REASON="account quota reached"
       for candidate in $CONFIGURED_MODELS $MODEL; do
         record_model_limit "$candidate" "$RETRY_AT" "$LIMIT_REASON"

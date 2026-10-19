@@ -1114,12 +1114,64 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "rc=1")
         self.assertEqual(result.stderr, "")
 
-    def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
+    def test_a_limit_line_before_the_last_lines_of_output_is_still_a_limit(self):
+        # loom#934: a provider limit the CLI prints before more output is still
+        # a limit, because the runner now classifies from the whole run output;
+        # the lane stays held until the reset.
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="early-limit")
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("failed: [transient] agent exited 1", log)
-        self.assertNotIn("failed: limit", log)
+        self.assertIn("failed: [limit]", log)
+        self.assertNotIn("failed: [transient]", log)
+        self.assertNotIn("failed: [work]", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_usage_limit_followed_by_more_output_is_classed_limit(self):
+        # loom#934, grug#1186 r7 on codex-2: the limit line, then three
+        # "failed to record rollout items" lines, "tokens used" and the count,
+        # five non-blank lines after the limit. The last five lines hold none
+        # of it, so the old tail-only check logged [work] agent exited 1. The
+        # runner classifies from the whole run output: this is a limit that
+        # holds the lane, and the reason shown to people stays the short limit
+        # reason rather than the whole output.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        tail = "\n".join([
+            "ERROR: You've hit your usage limit. Try again at Oct 19th, 2026 12:07 AM.",
+            "ERROR: You've hit your usage limit. Try again at Oct 19th, 2026 12:07 AM.",
+            "failed to record rollout items",
+            "failed to record rollout items",
+            "failed to record rollout items",
+            "tokens used",
+            "42,964",
+        ])
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=tail, FAKE_EDIT="1", FAKE_EXIT="1")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [limit]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertNotIn("failed: [transient]", log)
+        reason = self.failure_line()
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertNotIn("tokens used", reason)
+        self.assertNotIn("42,964", reason)
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
+        # loom#934: the auth and transient (network) patterns still read the
+        # short tail, not the whole output. A key-expiry line buried in the
+        # agent's output -- not in its last five lines -- does not hold the lane
+        # as auth, so a ticket that is about expired keys is not read as one.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        out = "Error: API key expired\n" + "\n".join(
+            "working on step %d" % i for i in range(1, 7))
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=out, FAKE_EDIT="1", FAKE_EXIT="1")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("failed: [auth]", log)
+        self.assertIn("failed: [work]", log)
+        self.assertTrue(self.beat()["available"])
 
     def test_a_finding_that_mentions_a_rate_limit_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF + "\nThe client ignores the rate limit header.\n")
