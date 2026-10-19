@@ -947,10 +947,16 @@ lookup leaves the brief for the next pass. The rule covers:
 ## API lanes: zen, zai
 
 - `zen`: OpenCode Zen free models through opencode, `-m opencode/<id>-free`
-  (default `opencode/space-bunny-free`). Zen serves its free models with no
-  stored credential, so the lane reads no key; the agent's environment holds
-  no provider key at all. opencode sends Zen's `x-opencode-session` header
-  itself.
+  (default `opencode/minimax-m3.1-flash-free`). Zen serves its free models
+  with no stored credential, so the lane reads no key; the agent's
+  environment holds no provider key at all. opencode sends Zen's
+  `x-opencode-session` header itself, and Zen refuses free-tier calls from
+  any other client (FreeTierError). Zen rotates its free models often: on
+  2026-10-19 `space-bunny-free` had left the catalogue, and zen runs
+  failed "Unexpected server error". Check `https://opencode.ai/zen/v1/models`
+  for the current `-free` ids before changing the default, and try a
+  candidate with `opencode run -m opencode/<id>` (that day
+  `minimax-m3.1-flash-free` answered in seconds; three others hung).
 - `zai`: Z.ai's free Flash models through opencode's `zai` provider,
   `zai/glm-4.7-flash` (default) or `zai/glm-4.5-flash`. GLM-5.3 Flash and
   the FlashX models are paid and refused. The key comes from SSM
