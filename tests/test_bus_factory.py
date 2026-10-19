@@ -1301,9 +1301,9 @@ class Queued(Base):
                                     "(tier medium, fallback: no medium lane is up)" % REPO)
         self.queued(8)
         self.assign(limited=factory.TIERS["medium"])
-        # The Sparks are medium lanes too, so the easy fallback is the next
-        # easy lane that is not.
-        self.assertEqual(self.lane(8), "openrouter")
+        # Every easy lane is a medium lane too since the free lanes take
+        # medium work (2026-10-19), so with claude taken there is no fallback.
+        self.assertEqual(factory._state(self.gh.issues[8]), "queued")
 
 
 class Tickets(Base):
@@ -1577,7 +1577,17 @@ class Tickets(Base):
         # private code (infra#5617), then codex.
         self.assertEqual(factory.TIERS["easy"][6:11], factory.FREE_POOL)
         self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
-        self.assertEqual(factory.lanes_of("medium", True)[4:7], ("free-ollama", "free-gemma", "codex"))
+        self.assertEqual(factory.lanes_of("medium", True)[4:7],
+                         ("free-ollama", "free-gemma", "openrouter"))
+
+    def test_the_free_lanes_take_medium_work_before_the_paid_codex_lanes(self):
+        # Operator 2026-10-19: "I always want my free tier used up".
+        medium = factory.TIERS["medium"]
+        for lane in ("openrouter", "workersai", "zen", "zai"):
+            self.assertLess(medium.index(lane), medium.index("codex"))
+        # On a private repo the public-only ones are skipped.
+        self.assertEqual(factory.lanes_of("medium", True)[4:9],
+                         ("free-ollama", "free-gemma", "openrouter", "workersai", "codex"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
         for lane in ("free-nvidia", "free-kilo", "free-groq"):
@@ -1628,7 +1638,7 @@ class Tickets(Base):
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
         busy = (("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
-                + factory.SPARKS + factory.FREE_POOL)
+                + factory.SPARKS + factory.FREE_POOL + ("openrouter", "workersai", "zen", "zai"))
         for n, lane in enumerate(busy, 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])
@@ -1655,17 +1665,22 @@ class Tickets(Base):
 
     def test_with_claude_busy_a_medium_ticket_falls_back_to_a_free_easy_lane(self):
         self.limited_medium(busy=("claude",))
-        self.assertEqual(self.lane(7), "openrouter")
-        self.assertIn("fallback: no medium lane is up", self.gh.comments[7][-1]["body"])
+        # The free lanes are medium lanes since 2026-10-19, so when every
+        # medium lane is limited they are limited too: the ticket waits.
+        self.assertEqual(self.lane(7), "codex")
 
     def test_a_private_ticket_never_falls_back_to_a_public_only_lane(self):
-        busy = ("claude",) + factory.SPARKS + ("openrouter", "workersai")
-        self.limited_medium(busy=busy)
-        self.assertEqual(self.lane(7), "codex")  # waits; zen, zai and agy are public only
-        self.setUp()
-        self.gh.private = False
-        self.limited_medium(busy=busy)
-        self.assertEqual(self.lane(7), "zen")
+        # A private ticket with codex at a limit and the other private-safe
+        # medium lanes busy waits; zen and zai are public only.
+        body = "Difficulty: medium\n\n## Why\nx\n"
+        self.gh.ticket(7, "briefed", lane="codex", body=body)
+        busy = (factory.SPARKS + ("free-ollama", "free-gemma", "openrouter", "workersai",
+                                  "codex-2", "opencode-go", "opencode-go-2", "opencode-go-3")
+                + factory.ANTHROPIC)
+        for n, lane in enumerate(busy, 20):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.go(limited=["codex"])
+        self.assertNotIn(self.lane(7), ("zen", "zai", "agy", "muse", "opencode-go-4"))
 
     def test_a_medium_lane_that_is_up_but_busy_is_waited_for(self):
         self.gh.ticket(7, "briefed", lane="codex")
