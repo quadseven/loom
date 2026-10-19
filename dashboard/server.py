@@ -719,10 +719,17 @@ def _backlog_page(document, parsed, state):
     # Sorted by score, highest first; the source's own order breaks ties and
     # an epic with no score sorts last.
     ranked.sort(key=lambda epic: (_score(epic) is None, -(_score(epic) or 0.0)))
-    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter))]
+    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter)),
+           _ranked_section(ranked, form), _empty_epics(empty), _render_inspectors(document)]
+    return page("Backlog", "backlog", "".join(out), status="Read only")
+
+
+def _ranked_section(ranked, form):
+    """The Epics by score section: the filter form, the top RANKED_SHOWN
+    epics as a table and the rest collapsed below it."""
     dated = any(_epic_age(epic) for epic in ranked)
-    out.append('<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
-               '<span class="machine-fact">%d ranked</span></div>' % len(ranked))
+    out = ['<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
+           '<span class="machine-fact">%d ranked</span></div>' % len(ranked)]
     out.append('<p class="backlog-note">One row per epic with children, ranked by Hunt\'s score.%s</p>' % (
         "" if dated else " Age shows a dash: the backlog source carries no epic dates."))
     out.extend(form)
@@ -735,13 +742,17 @@ def _backlog_page(document, parsed, state):
     else:
         out.append('<p class="empty-state">No epic with children matches this filter.</p>')
     out.append('</section>')
-    if empty:
-        out.append('<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
-            len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
-                _link_or_text(epic.get("html_url") or epic.get("url"), strip_kind(epic.get("title")) or "Untitled epic"),
-                html.escape(_repo_number(epic))) for epic in empty)))
-    out.append(_render_inspectors(document))
-    return page("Backlog", "backlog", "".join(out), status="Read only")
+    return "".join(out)
+
+
+def _empty_epics(empty):
+    """The collapsed list of epics tracking no children; nothing when none."""
+    if not empty:
+        return ""
+    return '<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
+        len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
+            _link_or_text(epic.get("html_url") or epic.get("url"), strip_kind(epic.get("title")) or "Untitled epic"),
+            html.escape(_repo_number(epic))) for epic in empty))
 
 
 def _needs_you(document, state, *, source_missing=False, who=""):
@@ -1286,36 +1297,31 @@ def _hold_reason(lane, rows, now=None):
     return reason[:match.start()] + " until " + local
 
 
-def _lane_view_data(payload, tickets, state=None):
-    lane_rows = _merge_lane_rows(payload.get("lanes", []))
-    prs = payload.get("pull_requests", [])
-    newest_pr_for_lane = _newest_lane_models(prs)
-    usage_records = _usage_rows(payload, state)
+def _lane_card(item, tickets, newest_pr_for_lane, usage_records):
+    """One lane's card: its row plus the active ticket, model, quota and reason."""
+    lane_name = item["lane"]
+    active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
+                   and ticket.get("state") in ("running", "pr")), None)
+    model_info = newest_pr_for_lane.get(lane_name)
+    model_display = None
+    if model_info:
+        age_str = views.format_age(model_info["time"])
+        model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
+                         if age_str else model_info["model"])
+    reason = _hold_reason(lane_name, usage_records)
+    if item["available"] and reason == "no reason":
+        reason = "available"
+    item.update({
+        "ticket": active,
+        "model": model_display or bus_brain._lane_model(lane_name),
+        "quota": _lane_quota(lane_name, usage_records),
+        "reason": reason,
+    })
+    return item
 
-    lanes = []
-    for item in lane_rows:
-        lane_name = item["lane"]
-        active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
-                       and ticket.get("state") in ("running", "pr")), None)
-        model_info = newest_pr_for_lane.get(lane_name)
-        model_display = None
-        if model_info:
-            age_str = views.format_age(model_info["time"])
-            model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
-                             if age_str else model_info["model"])
-        lane_quota = _lane_quota(lane_name, usage_records)
-        reason = _hold_reason(lane_name, usage_records)
-        if item["available"] and reason == "no reason":
-            reason = "available"
 
-        item.update({
-            "ticket": active,
-            "model": model_display or bus_brain._lane_model(lane_name),
-            "quota": lane_quota,
-            "reason": reason,
-        })
-        lanes.append(item)
-
+def _scoreboard_rows(prs, tickets):
+    """The lane pull requests with a footer, each tagged with its ticket's tier."""
     tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
     prepared = []
     for pr in prs:
@@ -1324,12 +1330,26 @@ def _lane_view_data(payload, tickets, state=None):
             continue
         ticket = tickets_by_ref.get(parsed[:2])
         prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
+    return prepared
+
+
+def _anthropic_share(payload):
+    """The Anthropic percentage from the newest metrics comment's Spread line."""
     metric_rows = views.parse_metrics(payload.get("improving", {}).get("metrics_comments", []))
-    share = None
-    if metric_rows:
-        spread = metric_rows[0][1].get("Spread", {}).get("value", "")
-        match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
-        if match and int(match.group(2)):
-            share = round(100 * int(match.group(1)) / int(match.group(2)))
-    return {"lanes": lanes, "scoreboard": views.build_scoreboard(prepared),
-            "anthropic_share": share}
+    if not metric_rows:
+        return None
+    spread = metric_rows[0][1].get("Spread", {}).get("value", "")
+    match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
+    if match and int(match.group(2)):
+        return round(100 * int(match.group(1)) / int(match.group(2)))
+    return None
+
+
+def _lane_view_data(payload, tickets, state=None):
+    prs = payload.get("pull_requests", [])
+    newest_pr_for_lane = _newest_lane_models(prs)
+    usage_records = _usage_rows(payload, state)
+    lanes = [_lane_card(item, tickets, newest_pr_for_lane, usage_records)
+             for item in _merge_lane_rows(payload.get("lanes", []))]
+    return {"lanes": lanes, "scoreboard": views.build_scoreboard(_scoreboard_rows(prs, tickets)),
+            "anthropic_share": _anthropic_share(payload)}

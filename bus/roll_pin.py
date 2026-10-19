@@ -31,11 +31,15 @@ def specs_from_env(raw: str) -> list[dict[str, str]]:
         if not sep or not REPO.fullmatch(goal_repo) or not number.isdigit() \
                 or not REPO.fullmatch(item["repo"]) or not _path(item["path"]):
             raise ValueError("invalid roll ship document")
-        gate_url = item.get("gate_url")
-        if gate_url is not None and (not isinstance(gate_url, str) or
-                urlsplit(gate_url).scheme != "https" or not urlsplit(gate_url).hostname):
+        if not _valid_gate_url(item.get("gate_url")):
             raise ValueError("roll gate_url must be an https URL")
     return data
+
+
+def _valid_gate_url(gate_url: Any) -> bool:
+    return gate_url is None or (isinstance(gate_url, str) and
+                                urlsplit(gate_url).scheme == "https" and
+                                bool(urlsplit(gate_url).hostname))
 
 
 def _path(value: str) -> bool:
@@ -234,42 +238,47 @@ def _merged_build(gh: GitHub, goal: str, deploy: str, revision: str,
                        revision, workflow)
 
 
-def _update(gh: GitHub, goal: str, deploy: str, source: dict[str, Any],
-            revision: str, workflow: str) -> None:
-    branch = _branch(goal)
-    base = gh.rest("GET", "/repos/%s" % deploy).data["default_branch"]
-    pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % deploy).data or []
-    active = next((pr for pr in pulls if (pr.get("head") or {}).get("ref") == branch), None)
+def _changed_text_pins(gh: GitHub, deploy: str, source: dict[str, Any], revision: str,
+                       active: dict[str, Any] | None) -> list[dict[str, str]]:
+    """The text pins the pull request carries: every one while it is open,
+    else only those whose base file does not already name the revision."""
     changed = []
-    text_pins = [pin for pin in source["pins"] if pin.get("kind", "env") != "gitlink"]
-    gitlinks = [pin for pin in source["pins"] if pin.get("kind") == "gitlink"]
-    for pin in text_pins:
+    for pin in source["pins"]:
+        if pin.get("kind", "env") == "gitlink":
+            continue
         text, _ = _content(gh, deploy, pin["path"])
-        updated = _replace_text(text, pin, revision)
-        if text != updated or active:
-            changed.append((pin, updated))
-    if gitlinks and not active:
+        if text != _replace_text(text, pin, revision) or active:
+            changed.append(pin)
+    return changed
+
+
+def _stale_gitlinks(gh: GitHub, deploy: str, source: dict[str, Any], base: str,
+                    revision: str, active: dict[str, Any] | None) -> list[dict[str, str]]:
+    """The gitlink pins to set: every one while the pull request is open,
+    else only those whose base commit does not already point at the revision."""
+    gitlinks = [pin for pin in source["pins"] if pin.get("kind") == "gitlink"]
+    if not gitlinks or active:
+        return gitlinks
+    base_ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s" %
+                       (deploy, quote(base, safe=""))).data
+    base_sha = base_ref["object"]["sha"]
+    return [pin for pin in gitlinks
+            if _gitlink_sha(gh, deploy, base_sha, pin["path"]) != revision]
+
+
+def _ensure_branch(gh: GitHub, deploy: str, branch: str, base: str) -> None:
+    existing = gh.rest("GET", "/repos/%s/git/ref/heads/%s" %
+                       (deploy, quote(branch, safe="")), ok=(404,))
+    if existing.status == 404:
         base_ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s" %
                            (deploy, quote(base, safe=""))).data
-        base_sha = base_ref["object"]["sha"]
-        gitlinks = [pin for pin in gitlinks
-                    if _gitlink_sha(gh, deploy, base_sha, pin["path"]) != revision]
-    if not changed and not gitlinks:
-        return
-    if active:
-        current = []
-        for pin, _ in changed:
-            text, sha = _content(gh, deploy, pin["path"], branch)
-            current.append((pin, text, sha))
-    else:
-        existing = gh.rest("GET", "/repos/%s/git/ref/heads/%s" %
-                           (deploy, quote(branch, safe="")), ok=(404,))
-        if existing.status == 404:
-            base_ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s" %
-                               (deploy, quote(base, safe=""))).data
-            gh.rest("POST", "/repos/%s/git/refs" % deploy,
-                    {"ref": "refs/heads/" + branch, "sha": base_ref["object"]["sha"]})
-        current = [(pin, *_content(gh, deploy, pin["path"], branch)) for pin, _ in changed]
+        gh.rest("POST", "/repos/%s/git/refs" % deploy,
+                {"ref": "refs/heads/" + branch, "sha": base_ref["object"]["sha"]})
+
+
+def _write_text_pins(gh: GitHub, deploy: str, branch: str, pins: list[dict[str, str]],
+                     revision: str) -> bool:
+    current = [(pin, *_content(gh, deploy, pin["path"], branch)) for pin in pins]
     wrote = False
     for pin, text, sha in current:
         updated = _replace_text(text, pin, revision)
@@ -278,22 +287,46 @@ def _update(gh: GitHub, goal: str, deploy: str, source: dict[str, Any],
                     {"message": "Update roll source pin", "content": base64.b64encode(
                         updated.encode()).decode(), "sha": sha, "branch": branch})
             wrote = True
-    wrote = _set_gitlinks(gh, deploy, branch, gitlinks, revision) or wrote
-    title = "Pin roll source to %s" % revision[:12]
-    plan = ("## Why\nA merged module change needs a server build.\n\n"
+    return wrote
+
+
+def _pull_plan(revision: str) -> str:
+    return ("## Why\nA merged module change needs a server build.\n\n"
             "## Summary\nUpdate only the source pins declared by the goal ship document.\n\n"
             "## Acceptance criteria\n- [ ] Source pins name `%s`.\n"
             "- [ ] Only locations named by the ship document changed.\n"
             "- [ ] Review the build before merging.\n\nSize: S\n\n"
             "## Out of scope\n- Merging, proving or deploying this pull request.\n" % revision)
-    if active:
-        if wrote:
-            gh.rest("PATCH", "/repos/%s/pulls/%s" % (deploy, active["number"]),
-                    {"title": title, "body": plan})
-        pr = active
-    else:
-        pr = gh.rest("POST", "/repos/%s/pulls" % deploy,
-                     {"title": title, "head": branch, "base": base, "body": plan}).data
+
+
+def _open_or_refresh(gh: GitHub, deploy: str, branch: str, base: str, revision: str,
+                     active: dict[str, Any] | None, wrote: bool) -> dict[str, Any]:
+    title = "Pin roll source to %s" % revision[:12]
+    if active is None:
+        return gh.rest("POST", "/repos/%s/pulls" % deploy,
+                       {"title": title, "head": branch, "base": base,
+                        "body": _pull_plan(revision)}).data
+    if wrote:
+        gh.rest("PATCH", "/repos/%s/pulls/%s" % (deploy, active["number"]),
+                {"title": title, "body": _pull_plan(revision)})
+    return active
+
+
+def _update(gh: GitHub, goal: str, deploy: str, source: dict[str, Any],
+            revision: str, workflow: str) -> None:
+    branch = _branch(goal)
+    base = gh.rest("GET", "/repos/%s" % deploy).data["default_branch"]
+    pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % deploy).data or []
+    active = next((pr for pr in pulls if (pr.get("head") or {}).get("ref") == branch), None)
+    changed = _changed_text_pins(gh, deploy, source, revision, active)
+    gitlinks = _stale_gitlinks(gh, deploy, source, base, revision, active)
+    if not changed and not gitlinks:
+        return
+    if not active:
+        _ensure_branch(gh, deploy, branch, base)
+    wrote = _write_text_pins(gh, deploy, branch, changed, revision)
+    wrote = _set_gitlinks(gh, deploy, branch, gitlinks, revision) or wrote
+    pr = _open_or_refresh(gh, deploy, branch, base, revision, active, wrote)
     _post_build(gh, goal, deploy, pr, branch, revision, workflow)
 
 

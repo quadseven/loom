@@ -63,6 +63,10 @@ SLOT="${1:?usage: run_lane.sh <lane>}"
 # The provider lane: the slot without a trailing -<n> (opencode-go stays whole).
 LANE="$SLOT"
 [[ "$SLOT" =~ -[0-9]+$ ]] && LANE="${SLOT%-*}"
+# A free provider slot (free-ollama, free-kilo, ...) is lane free: one
+# OpenAI-compatible route per provider in the spark-gateway's free pool
+# (infra#5617). Not a Spark: it shares the spark lane's endpoint handling.
+[[ "$SLOT" =~ ^free-[a-z]+$ ]] && LANE=free
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
@@ -656,10 +660,10 @@ spark_probe() {
   local code status
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
-  if [ "$status" -eq 7 ]; then LIMIT_WHY="the spark endpoint refused the connection"; return 1; fi
-  if [ "$code" = 503 ]; then LIMIT_WHY="the spark endpoint answered 503"; return 1; fi
+  if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
+  if [ "$code" = 503 ]; then LIMIT_WHY="the $LANE endpoint answered 503"; return 1; fi
   [ "$status" -eq 0 ] && return 0
-  READY_REASON="the spark endpoint did not answer (curl exit $status)"
+  READY_REASON="the $LANE endpoint did not answer (curl exit $status)"
   return 2
 }
 
@@ -1148,6 +1152,45 @@ tracked_changes() {
   safe_git status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' '
 }
 
+# Check the trusted default branch in its own worktree when a fix branch is
+# red or has merge conflicts. The merged branch and its setup files remain
+# available for the agent. DEFAULT_EXIT is the default branch's check result.
+check_default_branch() {
+  local branch_tree="$TREE" branch_home="$CHECK_HOME" default_tree="$WORKDIR/$TICKET-default-check" rc=0
+  DEFAULT_EXIT="" DEFAULT_CHANGED=""
+  DEFAULT_REV="$(safe_git rev-parse "origin/$FIX_DEFAULT")" || {
+    SETUP_REASON="could not read the default branch revision"; return 1;
+  }
+  if ! safe_git worktree add -q --detach "$default_tree" "$DEFAULT_REV" >> "$LOG" 2>&1; then
+    SETUP_REASON="could not check out the default branch for validation"; return 1
+  fi
+  TREE="$default_tree" CHECK_HOME="$branch_home-default"
+  if ! mkdir -p "$CHECK_HOME/tmp"; then
+    SETUP_REASON="could not prepare the default branch check home"; rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+         -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
+    SETUP_REASON="default branch submodule checkout failed"; rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$C_SETUP" ]; then
+    contract_run "$C_SETUP"; rc=$?
+    [ "$rc" -eq 0 ] || SETUP_REASON="default branch setup exited $rc"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    contract_run "$C_CHECK"; DEFAULT_EXIT=$?
+    DEFAULT_CHANGED="$(tracked_changes)"
+    record default-baseline "$C_CHECK" "$DEFAULT_EXIT" "$DEFAULT_REV" \
+      "$([ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ] && echo true || echo false)" \
+      "${DEFAULT_CHANGED:+changed tracked files: $DEFAULT_CHANGED}"
+  fi
+  TREE="$branch_tree" CHECK_HOME="$branch_home"
+  rm -rf "$branch_home-default"
+  if ! safe_git worktree remove --force "$default_tree" >> "$LOG" 2>&1; then
+    SETUP_REASON="could not remove the default branch validation tree"; return 1
+  fi
+  [ "$rc" -eq 0 ]
+}
+
 # What setup and the first check leave untracked (a venv, caches) stays out
 # of the agent's commit: each path goes into .git/info/exclude, which an
 # API-lane agent cannot write.
@@ -1161,14 +1204,12 @@ exclude_untracked() {
 }
 
 # Before the agent: interpreter, submodules, setup, then the check on the
-# base (recorded, so a failure the base already had is told apart from one
-# the agent caused). A failure the repo did not cause -- the contract cannot
-# be read, the environment cannot run the check, or the check is already
-# red on the unmodified base -- is a factory incident, not a [work]
-# failure: the ticket keeps its rung. Returns 1 with SETUP_REASON when the
-# environment cannot be prepared.
+# current tree. A fix round checks the branch after merging the default
+# branch; a red result is compared with the default branch's own head.
+# Only a red default branch check is a base-check factory incident. Returns
+# 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what
+  local rc interp="" subs="" changed what baseline_rev
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -1191,6 +1232,20 @@ prepare_validation() {
   CHECK_CLI="${C_INTERP:-bash}"
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
+  if [ -n "$CONFLICTS" ]; then
+    check_default_branch || return 1
+    BASELINE_EXIT="$DEFAULT_EXIT"
+    if [ -n "$DEFAULT_CHANGED" ]; then
+      SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
+      return 1
+    fi
+    if [ "$BASELINE_EXIT" -ne 0 ]; then
+      SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
+      note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      return 1
+    fi
+    return 0
+  fi
   # C_SETUP and C_CHECK are shell on purpose, like a CI run: step. They are
   # validated in load_contract: read only from the base branch (never the
   # agent's), one line of printable ASCII, at most 1000 characters; and
@@ -1202,7 +1257,8 @@ prepare_validation() {
   fi
   contract_run "$C_CHECK"; BASELINE_EXIT=$?
   changed="$(tracked_changes)"
-  record baseline "$C_CHECK" "$BASELINE_EXIT" "$BASE" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+  baseline_rev="$(safe_git rev-parse HEAD)"
+  record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
   # A check that cannot run, or is already red, on the unmodified base is
   # the factory's problem, not the ticket's: file the incident and stop
@@ -1214,6 +1270,22 @@ prepare_validation() {
       return 1 ;;
   esac
   if [ "$BASELINE_EXIT" -ne 0 ]; then
+    if [ -n "$FIX_PR" ]; then
+      check_default_branch || return 1
+      if [ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ]; then
+        if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
+          SETUP_REASON="could not restore tracked files changed by the baseline check"
+          return 1
+        fi
+        exclude_untracked
+        return $?
+      fi
+      if [ "$DEFAULT_EXIT" -eq 0 ]; then
+        SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
+        return 1
+      fi
+      BASELINE_EXIT="$DEFAULT_EXIT"
+    fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
     note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
@@ -1391,12 +1463,15 @@ agy_skills() {
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
   case "$LANE:$MODEL" in zen:*|zai:*|agy:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
+  # tests/test_bus_station.py keeps the two lists equal).
+  case "$SLOT" in free-nvidia|free-kilo|free-groq) return 0 ;; esac
   return 1
 }
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free) return 0 ;; esac
   return 1
 }
 
@@ -1416,6 +1491,7 @@ update_fix_branch() {
   if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     UPDATE_REASON="could not read the default branch"; return 1
   fi
+  FIX_DEFAULT="$default"
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
     UPDATE_REASON="could not fetch $default"; return 1
@@ -1519,7 +1595,7 @@ run_agent() {
     openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
     opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
     zen) opencode_agent - "$brief_text" ;;
-    spark) opencode_agent - "$brief_text" ;;
+    spark|free) opencode_agent - "$brief_text" ;;
     zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
@@ -1575,14 +1651,14 @@ lane_ready() {
     return
   fi
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark) cli="$(opencode_bin)" ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
-  case "$LANE" in zen) return 0 ;; spark) spark_ready; return ;; esac
+  case "$LANE" in zen) return 0 ;; spark|free) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(ssm_value "$key_ssm")"
@@ -1752,6 +1828,8 @@ for BRIEF in "$INBOX"/*.md; do
     workersai:cloudflare-workers-ai/@cf/*) ;;
     spark:spark/?*) ;;
     spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
+    free:free/?*) ;;
+    free:*) park "$BRIEF" "model $MODEL is not a free provider model (free/...)"; continue ;;
     agy:gemini-*|agy:claude-*|agy:gpt-oss-*)
       case "$MODEL" in
         *-low|*-medium|*-high) ;;
@@ -1830,13 +1908,10 @@ for BRIEF in "$INBOX"/*.md; do
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
-  # A verify run changes no code, so there is nothing to validate.
-  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
-    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
-  fi
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
   FIX_UPSTREAM=""
+  FIX_DEFAULT=""
   if [ -n "$FIX_PR" ]; then
     # BASE is taken first, so a clean merge alone counts as a change and an
     # out-of-date pull request is pushed up to date.
@@ -1848,6 +1923,10 @@ for BRIEF in "$INBOX"/*.md; do
         printf 'Resolve every conflict in those files first: keep both sides'"'"' intent, remove every conflict marker, and keep the tests green. Do not run git; the runner completes the merge.\n'
       } > "$RUN_BRIEF"
     fi
+  fi
+  # A verify run changes no code, so there is nothing to validate.
+  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
+    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
@@ -1864,7 +1943,7 @@ for BRIEF in "$INBOX"/*.md; do
   STATUS=$?
   is_api_lane && archive_transcripts
   # A spark run that ended because the box went hot is a limit, not a failure.
-  if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
+  if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
@@ -1882,19 +1961,23 @@ for BRIEF in "$INBOX"/*.md; do
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
   FAIL_CLASS=work
-  FAILURE_OUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)"
+  # The whole run output (from LOG_START), for the limit and credit patterns;
+  # the short tail (its last five non-blank lines), kept for the reason shown
+  # to people and for the auth/transient patterns (loom#934).
+  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
-    classify_failure "$STATUS" "$FAILURE_OUT" "$EDITED"
+    classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
     # this lane the retry. The rest of the inbox waits for the reset.
-    if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
+    if [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
       heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ] &&
-         [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $ACCOUNT_QUOTA_RE ]]; then
+         [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $ACCOUNT_QUOTA_RE ]]; then
       LIMIT_REASON="account quota reached"
       for candidate in $CONFIGURED_MODELS $MODEL; do
         record_model_limit "$candidate" "$RETRY_AT" "$LIMIT_REASON"

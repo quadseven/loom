@@ -104,14 +104,16 @@ if [ "$1 $2" = "pr create" ]; then
   echo "https://github.com/example/repo/pull/7"
 fi
 # Fake factory incidents: `search issues` prints $FAKE_GH_SEARCH (default
-# empty: no open incident), `issue create` prints the new issue's URL,
-# `issue comment` succeeds silently.
+# empty: no open incident), `issue create` writes its --body to
+# $FAKE_BODY.issue and prints the new issue's URL, `issue comment`
+# succeeds silently.
 if [ "$1 $2" = "search issues" ]; then
   printf '%s\n' "${FAKE_GH_SEARCH:-}"
   exit 0
 fi
 if [ "$1 $2" = "issue create" ]; then
   [ -z "${FAKE_GH_ISSUE_CREATE_FAIL:-}" ] || { echo "issue create blew up" >&2; exit 1; }
+  while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY.issue"; shift; done
   echo "https://github.com/quadseven/loom/issues/${FAKE_GH_ISSUE_NUMBER:-99}"
   exit 0
 fi
@@ -244,6 +246,9 @@ printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secr
 if printf '#!/bin/sh\\ntouch "%s/hooked"\\n' "$real_home" > .git/hooks/pre-commit 2>/dev/null \\
    && chmod +x .git/hooks/pre-commit 2>/dev/null; then hook=planted; else hook=denied; fi
 printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
+# Outside the real HOME, the tree and the scratch home: the sandbox refuses it.
+if : > "$real_home/../escaped" 2>/dev/null; then out=written; else out=denied; fi
+printf 'out=%s\\n' "$out" >> "$TMPDIR/agent.log"
 printf 'config=%s\\n' "${OPENCODE_CONFIG_CONTENT:-none}" >> "$TMPDIR/agent.log"
 # A brief carrying AGENT_FAIL=1 ends the run with an error, as a dropped
 # connection would.
@@ -1114,12 +1119,64 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "rc=1")
         self.assertEqual(result.stderr, "")
 
-    def test_a_limit_line_before_the_last_lines_of_output_is_not_a_limit(self):
+    def test_a_limit_line_before_the_last_lines_of_output_is_still_a_limit(self):
+        # loom#934: a provider limit the CLI prints before more output is still
+        # a limit, because the runner now classifies from the whole run output;
+        # the lane stays held until the reset.
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="early-limit")
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
-        self.assertIn("failed: [transient] agent exited 1", log)
-        self.assertNotIn("failed: limit", log)
+        self.assertIn("failed: [limit]", log)
+        self.assertNotIn("failed: [transient]", log)
+        self.assertNotIn("failed: [work]", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_usage_limit_followed_by_more_output_is_classed_limit(self):
+        # loom#934, grug#1186 r7 on codex-2: the limit line, then three
+        # "failed to record rollout items" lines, "tokens used" and the count,
+        # five non-blank lines after the limit. The last five lines hold none
+        # of it, so the old tail-only check logged [work] agent exited 1. The
+        # runner classifies from the whole run output: this is a limit that
+        # holds the lane, and the reason shown to people stays the short limit
+        # reason rather than the whole output.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        tail = "\n".join([
+            "ERROR: You've hit your usage limit. Try again at Oct 19th, 2026 12:07 AM.",
+            "ERROR: You've hit your usage limit. Try again at Oct 19th, 2026 12:07 AM.",
+            "failed to record rollout items",
+            "failed to record rollout items",
+            "failed to record rollout items",
+            "tokens used",
+            "42,964",
+        ])
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=tail, FAKE_EDIT="1", FAKE_EXIT="1")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("failed: [limit]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertNotIn("failed: [transient]", log)
+        reason = self.failure_line()
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertNotIn("tokens used", reason)
+        self.assertNotIn("42,964", reason)
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()))
+
+    def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
+        # loom#934: the auth and transient (network) patterns still read the
+        # short tail, not the whole output. A key-expiry line buried in the
+        # agent's output -- not in its last five lines -- does not hold the lane
+        # as auth, so a ticket that is about expired keys is not read as one.
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        out = "Error: API key expired\n" + "\n".join(
+            "working on step %d" % i for i in range(1, 7))
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT=out, FAKE_EDIT="1", FAKE_EXIT="1")
+        log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+        self.assertNotIn("failed: [auth]", log)
+        self.assertIn("failed: [work]", log)
+        self.assertTrue(self.beat()["available"])
 
     def test_a_finding_that_mentions_a_rate_limit_is_not_a_limit(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF + "\nThe client ignores the rate limit header.\n")
@@ -1544,6 +1601,8 @@ cat > /dev/null
         self.assertIn("lo=denied", agent[0])
         # A hook planted in the tree's .git would run when the runner commits.
         self.assertIn("hook=denied", self.calls())
+        self.assertIn("out=denied", self.calls())
+        self.assertFalse((self.home.parent / "escaped").exists())
         self.assertIn("fds=ok", self.calls())
         self.assertFalse((self.home / "hooked").exists())
         # opencode's helper (title) agent must not fall back to a paid model.
@@ -1584,19 +1643,25 @@ cat > /dev/null
         profile = Path(profile_file).read_text()
         self.assertIn('(deny network-outbound (remote ip "localhost:*"))', profile)
         self.assertNotRegex(profile, r'\(allow network-outbound \(remote ip "localhost:\d+"\)\)')
+        # Outbound: every port denied, then the provider's HTTPS port.
+        self.assertEqual(re.findall(r'\((allow|deny) network-outbound \(remote ip "\*:([^"]+)"\)\)', profile),
+                         [("deny", "*"), ("allow", "443")])
         writes = [line for line in profile.splitlines() if "file-write*" in line]
         scratch = home.resolve()
-        self.assertEqual(len(writes), 3)
-        self.assertEqual(writes[0], f'(deny file-read* file-write* (subpath "{self.home.resolve()}"))')
+        self.assertEqual(len(writes), 5)
+        self.assertEqual(writes[0], '(deny file-write* (subpath "/"))')
+        self.assertTrue(writes[1].startswith('(allow file-write* (literal "/dev/null")'), writes[1])
+        self.assertNotIn("subpath", writes[1])
+        self.assertEqual(writes[2], f'(deny file-read* file-write* (subpath "{self.home.resolve()}"))')
         allowed = re.fullmatch(
             r'\(allow file-read\* file-write\* \(subpath "(.+)"\) \(subpath "(.+)"\)\)',
-            writes[1],
+            writes[3],
         )
         self.assertIsNotNone(allowed)
         tree, profile_scratch = allowed.groups()
         self.assertTrue(tree.endswith("/worktrees/T042-fix-the-thing"), tree)
         self.assertEqual(profile_scratch, str(scratch))
-        self.assertEqual(writes[2], f'(deny file-write* (subpath "{tree}/.git"))')
+        self.assertEqual(writes[4], f'(deny file-write* (subpath "{tree}/.git"))')
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -2320,6 +2385,29 @@ cat > /dev/null
         config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
         self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
                          {"context": 131072, "output": 16384})
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_free_provider_slot_is_its_own_lane_with_its_own_window(self):
+        # The free lane (infra#5617): one slot per free provider at the
+        # spark-gateway's pinned route, declared as provider "free" (never
+        # "spark"), with the ~128K window the free models serve beside a
+        # Spark window of 262144.
+        _, result = self.api_lane("free-ollama",
+                                  LOOM_FREE_OLLAMA_URL="http://gateway.example.invalid/free/ollama-cloud/v1",
+                                  LOOM_FREE_OLLAMA_MODEL="free/ollama-cloud",
+                                  LOOM_FREE_CONTEXT="120000", LOOM_FREE_OUTPUT="16384",
+                                  LOOM_SPARK_CONTEXT="262144", LOOM_SPARK_OUTPUT="32768",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any(c.startswith("curl ") and "/free/ollama-cloud/v1/models" in c for c in calls), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertNotIn("spark", config["provider"])
+        self.assertEqual(config["model"], "free/ollama-cloud")
+        self.assertEqual(config["provider"]["free"]["options"],
+                         {"baseURL": "http://gateway.example.invalid/free/ollama-cloud/v1"})
+        self.assertEqual(config["provider"]["free"]["models"]["ollama-cloud"]["limit"],
+                         {"context": 120000, "output": 16384})
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
@@ -3322,11 +3410,12 @@ exit %d
         self.assertIn("failed: [factory]", log)
         self.assertNotIn("failed: [work]", log)
         self.assertIn("factory incident quadseven/loom#99", log)
-        # The incident names the repo and the exact failing line.
-        calls = self.log.read_text()
-        self.assertIn("gh issue create --repo quadseven/loom", calls)
-        self.assertIn("Repo: example/repo", calls)
-        self.assertIn("python: 3.12", calls)
+        # The incident names the repo and the exact failing line, in the
+        # body it is filed with (not just anywhere in the call log).
+        self.assertIn("gh issue create --repo quadseven/loom", self.log.read_text())
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertIn("Repo: example/repo", body)
+        self.assertIn("python: 3.12", body)
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
@@ -3368,6 +3457,54 @@ exit %d
         calls = self.log.read_text()
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
+
+    def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        work = Path(self._tmp.name) / "pr-work"
+        (work / "fix.txt").write_text("broken\n")
+        git("add", "fix.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "Break check", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        self.advance_main("main.txt", "new main\n")
+        main = self.remote_head("main")
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null", "case \"$*\" in *'On the base it exited 1'*) ;; *) exit 9 ;; esac\n"
+            "test -f main.txt || exit 9\n"
+            "echo 'agent saw red check on merged main' >> \"$FAKE_LOG\"\n"
+            "cat > /dev/null"))
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists(), self.run_log(name + ".log"))
+        self.assertIn("agent saw red check on merged main", self.calls())
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+        self.assertFalse((self.loom / "state" / "factory_held.json").exists())
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        baseline = next(r for r in records if r["phase"] == "baseline")
+        self.assertEqual(baseline["exit"], 1)
+        self.assertNotEqual(baseline["revision"], main)
+        ancestor = subprocess.run(["git", "--git-dir", str(self.remote), "merge-base",
+                                   "--is-ancestor", main, self.FIX_BRANCH])
+        self.assertEqual(ancestor.returncode, 0)
+
+    def test_a_red_default_branch_on_a_fix_round_files_a_base_check_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        name, _ = self.fix_brief()
+        self.advance_main("fix.txt", "broken\n")
+        main = self.remote_head("main")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertIn("base check exited 1", self.run_log(name + ".log"))
+        self.assertTrue(any(c.startswith("gh issue create") for c in self.calls()))
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        self.assertTrue(any(r["revision"] == main and r["exit"] == 1 for r in records))
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_final_check_the_environment_cannot_run_is_a_factory_incident(self):

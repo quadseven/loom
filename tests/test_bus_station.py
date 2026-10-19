@@ -185,7 +185,16 @@ class FakeGitHub:
             found = self.foreign.get((other.group(1), int(other.group(2))))
             return reply(200, found) if found else reply(404, {"message": "Not Found"})
         if (method == "GET" and parts.path == "/repos/%s/issues" % station.FACTORY_REPO
-                and ("labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query)):
+                and "state=closed" in parts.query):
+            # _closed_incidents lists closed issues on the factory repo and
+            # filters by the body marker. When the query also filters on the
+            # loom:factory label, the fake honours it (simulating GitHub):
+            # an incident filed without the label (loom#918) is not returned
+            # by a labels=loom:factory query, only by the marker-based list.
+            if "labels=loom%3Afactory" in parts.query or "labels=loom:factory" in parts.query:
+                return reply(200, [i for i in self.factory_incidents
+                                   if any(l.get("name") == "loom:factory"
+                                          for l in i.get("labels", []))])
             return reply(200, self.factory_incidents)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if rest == "issues/900/comments" and method == "POST":
@@ -2355,6 +2364,28 @@ class ValidationContractTest(Base):
         self.assertEqual(checks, [(".github/workflows/test.yml, step Unit tests",
                                   "python -m unittest")])
 
+    def test_pull_request_trigger_forms(self):
+        self.assertTrue(station._has_pull_request_trigger("on:\n  pull_request:\n"))
+        self.assertTrue(station._has_pull_request_trigger("on: [push, pull_request]\n"))
+        self.assertTrue(station._has_pull_request_trigger("on: [push,\n  pull_request]\n"))
+        self.assertFalse(station._has_pull_request_trigger("on:\n  push:\n"))
+        self.assertFalse(station._has_pull_request_trigger("on:\n  pull_request_target:\n"))
+
+    def test_workflow_run_steps_names_block_and_unnamed_steps(self):
+        path = ".github/workflows/test.yml"
+        workflow = ("on:\n  pull_request:\njobs:\n  test:\n    steps:\n"
+                    "      - uses: actions/checkout@v4\n"
+                    "      - name: Lint\n        run: ruff check .\n"
+                    "      - name: \"Tests\"\n        run: |\n"
+                    "          set -o pipefail\n\n          python -m unittest\n"
+                    "      - run: echo done\n"
+                    "      - name: Empty\n        run:\n")
+        self.assertEqual(station._workflow_run_steps(path, workflow), [
+            (path + ", step Lint", "ruff check ."),
+            (path + ", step Tests", "set -o pipefail python -m unittest"),
+            (path + ", step 3", "echo done"),
+        ])
+
     def test_missing_contract_files_one_ticket_and_skips_an_open_duplicate(self):
         goal = {"number": 2, "title": "Backlog: reusable repository work"}
         self.gh = GitHub("token", transport=self.fake)
@@ -2653,6 +2684,62 @@ class ClaimTest(Base):
                    self.inbox("claude", "failed", "example-owner.example-repo-12.md"))
         self.run_pass()
         self.assertEqual(self.listing(), ["example-owner.example-repo-12-r2.md"])
+
+    def test_a_stale_brief_in_a_down_lanes_inbox_is_returned_and_the_ticket_claimed(self):
+        # 2026-10-18: a brief sat two days in the inbox of a
+        # lane whose key had expired, and no other lane could claim the ticket.
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane claude (body sha256 0123456789ab)"})
+        stale = self.inbox("claude", "example-owner.example-repo-12.md")
+        self.write(stale, "never run\n")
+        old = time.time() - 2 * station.DEAD_BRIEF_AGE
+        os.utime(stale, (old, old))
+        self.run_pass()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(self.inbox("claude", "returned", "example-owner.example-repo-12.md")))
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12-r2.md"])
+
+    def stale_claude_brief(self):
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane claude (body sha256 0123456789ab)"})
+        stale = self.inbox("claude", "example-owner.example-repo-12.md")
+        self.write(stale, "running\n")
+        old = time.time() - 2 * station.DEAD_BRIEF_AGE
+        os.utime(stale, (old, old))
+        return stale
+
+    def test_a_brief_under_a_live_runner_lock_is_never_returned(self):
+        # The brief stays in the inbox while its run goes on; the runner holds
+        # run/<lane>.lock with its pid for the whole run.
+        stale = self.stale_claude_brief()
+        lock = os.path.join(self.home, "run", "claude.lock")
+        os.makedirs(lock)
+        self.write(os.path.join(lock, "pid"), "%d\n" % os.getpid())
+        self.run_pass()
+        self.assertTrue(os.path.exists(stale))
+        self.assertIn("loom:briefed", self.fake.names(12))
+
+    def test_a_lane_at_a_limit_with_a_fresh_heartbeat_keeps_its_brief(self):
+        # Unavailable is not dead: a limit or the spend floor still beats.
+        stale = self.stale_claude_brief()
+        usage = os.path.join(self.home, "state", "usage")
+        os.makedirs(usage, exist_ok=True)
+        with open(os.path.join(usage, "claude.json"), "w") as fh:
+            json.dump({"lane": "claude", "at": int(time.time()), "available": False,
+                       "reason": "limit: provider limit reached"}, fh)
+        self.run_pass()
+        self.assertTrue(os.path.exists(stale))
+
+    def test_a_stale_brief_in_a_live_lanes_inbox_still_blocks(self):
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane codex (body sha256 0123456789ab)"})
+        stale = self.inbox("codex", "example-owner.example-repo-12.md")
+        self.write(stale, "running\n")
+        old = time.time() - 2 * station.DEAD_BRIEF_AGE
+        os.utime(stale, (old, old))
+        self.run_pass()
+        self.assertTrue(os.path.exists(stale))
+        self.assertIn("loom:briefed", self.fake.names(12))
 
     def test_a_second_pass_after_a_304_also_polls_for_pr_reviews(self):
         self.fake.add(12, author="stranger")
@@ -3332,6 +3419,20 @@ class RetryTest(Base):
         self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
         self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
 
+    def test_free_provider_slots_that_may_train_need_a_public_repo_at_every_gate(self):
+        # Security review on #937: the station gate mapped a slot to its
+        # provider first, so free-nvidia read as spark and took private repos.
+        for slot in ("free-nvidia", "free-kilo", "free-groq"):
+            self.assertTrue(station.needs_public_repo(slot, ""), slot)
+        for slot in ("spark", "spark-2", "free-ollama", "free-gemma"):
+            self.assertFalse(station.needs_public_repo(slot, ""), slot)
+        # The lane runner's own last check names the same slots.
+        root = Path(__file__).resolve().parent.parent
+        script = (root / "lanes" / "run_lane.sh").read_text()
+        body = script.split("trains_on_prompts() {", 1)[1].split("\n}\n", 1)[0]
+        named = set(re.search(r'case "\$SLOT" in ([\w|-]+)\)', body).group(1).split("|"))
+        self.assertEqual(named, {x for x in factory.PUBLIC_ONLY if x.startswith("free-")})
+
 
 class SilentLaneTest(Base):
     """A running ticket on a lane with no heartbeat for 30 minutes (loom#538):
@@ -3562,14 +3663,16 @@ class FactoryIncidentTest(Base):
     def bodies(self, number=12):
         return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
 
-    def incident(self, closed_at="2030-01-01T00:10:00Z"):
+    def incident(self, closed_at="2030-01-01T00:10:00Z", labels=None):
+        if labels is None:
+            labels = [{"name": "loom:factory"}]
         self.fake.factory_incidents = [{
             "number": 99,
             "title": "Factory incident: %s validation environment" % REPO,
             "state": "closed", "closed_at": closed_at,
             "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: environment\n"
                      "Ticket: %s#12\n\ncheck: make check (exit 127)\n" % (REPO, REPO)),
-            "labels": [{"name": "loom:factory"}]}]
+            "labels": labels}]
 
     def test_factory_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
@@ -3604,6 +3707,20 @@ class FactoryIncidentTest(Base):
         self.failed()
         self.run_pass()
         self.incident()
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
+        self.assertTrue(any("back in the queue" in b for b in self.bodies()))
+
+    def test_a_closed_incident_without_label_requeues_its_ticket(self):
+        # loom#918: the loom:factory label was not in LABELS, so the runner
+        # could not apply it and the incident was filed without it. The station
+        # must still find the closed incident by its body marker and re-queue
+        # the held ticket.
+        self.heartbeat("muse")
+        self.failed()
+        self.run_pass()
+        self.incident(labels=[])
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             self.run_pass()
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:muse", "loom:queued"])
@@ -5212,6 +5329,31 @@ class ReportsTest(Base):
         body = self.fake.comments[40][-1]["body"]
         self.assertIn("Needs difficulty: #41 Needs a tier.", body)
         self.assertEqual(body.count("Needs difficulty:"), 1)
+
+    def test_one_goals_failed_standup_does_not_skip_the_other_goals(self):
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        for number in (40, 41):
+            self.add_goal(number)
+            self.comment(number, 1, "<!-- loom:report v1 -->\nold report")
+            self.fake.comments[number][0]["created_at"] = old
+        real = brain.goal_tree
+
+        def tree(gh, repo, number):
+            if number == 40:
+                raise station.GitHubError("server error", 500)
+            return real(gh, repo, number)
+
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        with mock.patch.object(brain, "goal_tree", side_effect=tree):
+            st.post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 1)
+        self.assertTrue(self.fake.comments[41][-1]["body"].startswith(station.REPORT_MARKER))
+        with open(os.path.join(st.state, "standups.json")) as fh:
+            state = json.load(fh)
+        self.assertIn("%s#41" % REPO, state)
+        self.assertNotIn("%s#40" % REPO, state)
 
     def report_aged(self, seconds):
         self.add_goal()

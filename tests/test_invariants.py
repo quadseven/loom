@@ -535,7 +535,7 @@ class StationTest(StationBase):
     def test_each_epic_shape_opens_its_invariant_once_and_clearing_closes_it(self):
         cases = {
             "ticket-outside-epic": (lambda: self.gh.subs.update({(REPO, GOAL): [ticket(7)]}),
-                                    "has 1 open tickets under no epic"),
+                                    "1 open tickets sit under no epic across 1 goal homes"),
             "epic-over-cap": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(40)],
                 (REPO, 40): [ticket(n, state="closed") for n in range(50, 66)]}),
@@ -594,7 +594,7 @@ class StationTest(StationBase):
         st = self.run_at(T0)
         number = self.gh.filed()[0]["number"]
         body = st._overdue_standup_body([], None, st._open_breaches(REPO, GOAL))
-        self.assertIn("Invariants broken: #%d Goal home #30 has 1 open tickets under no epic."
+        self.assertIn("Invariants broken: #%d 1 open tickets sit under no epic across 1 goal homes."
                       % number, body)
         self.assertNotIn("Invariants broken", st._overdue_standup_body([], None))
 
@@ -627,6 +627,85 @@ class FilerTest(unittest.TestCase):
         self.file(invariants.Breach("goal-full", "x/y#2", "Another", ("line",), T0))
         self.assertEqual(len([i for i in self.gh.issues.values()
                               if i.get("title") == brain.REPAIRS_TITLE]), 1)
+
+    def rolling(self, title, evidence, at=T0):
+        return invariants.Breach("ticket-outside-epic", invariants.OUTSIDE_EPIC_SUBJECT,
+                                 title, tuple(evidence), at, rolling=True)
+
+    def test_a_rolling_breach_updates_its_one_issue_in_place(self):
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",)))
+        (number,) = self.gh.issues
+        self.assertIn("Last seen by the station: %s" % invariants.utc(T0),
+                      self.gh.issues[number]["body"])
+        # Unchanged a pass later: nothing is written, not even the last-seen line.
+        writes = len(self.gh.writes)
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",), at=T0 + 300), now=T0 + 300)
+        self.assertEqual(len(self.gh.writes), writes)
+        # A new ticket outside an epic: the same issue is rewritten, none is filed.
+        self.file(self.rolling("2 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 2 open, #7, #8",), at=T0 + 600), now=T0 + 600)
+        self.assertEqual(list(self.gh.issues), [number])
+        issue = self.gh.issues[number]
+        self.assertEqual(issue["title"], "2 open tickets sit under no epic across 1 goal homes")
+        self.assertIn("Goal home #30: 2 open, #7, #8", issue["body"])
+        self.assertNotIn("1 open, #7\n", issue["body"])
+        self.assertIn("Last seen by the station: %s" % invariants.utc(T0 + 600), issue["body"])
+        self.assertRegex(issue["body"], invariants.MARKER_RE)
+        self.assertTrue(issue["body"].rstrip().endswith("Part of #%d" % GOAL))
+
+    def test_a_closed_rolling_issue_reopens_with_the_current_list(self):
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",)))
+        (number,) = self.gh.issues
+        self.gh.issues[number].update(state="closed", closed_at=stamp(T0 + 60))
+        self.file(self.rolling("3 open tickets sit under no epic across 2 goal homes",
+                               ("Goal home #30: 2 open, #7, #8",), at=T0 + 30), now=T0 + 30)
+        self.assertEqual(self.gh.issues[number]["state"], "closed")
+        self.file(self.rolling("3 open tickets sit under no epic across 2 goal homes",
+                               ("Goal home #30: 2 open, #7, #8",), at=T0 + 120), now=T0 + 120)
+        issue = self.gh.issues[number]
+        self.assertEqual(issue["state"], "open")
+        self.assertIn("2 open, #7, #8", issue["body"])
+        self.assertEqual(list(self.gh.issues), [number])
+
+    def test_an_old_per_goal_issue_is_folded_into_the_rolling_one(self):
+        old = invariants.Breach("ticket-outside-epic", "%s#30" % REPO,
+                                "Goal home #30 has 1 open tickets under no epic", ("x",), T0)
+        self.file(old)
+        (old_number,) = self.gh.issues
+        self.gh.issues[old_number].update(labels=[{"name": x} for x in invariants.LABELS])
+        # Another invariant's quiet issue is left to the usual clear rule.
+        other = invariants.Breach("lane-held", "zen", "Lane zen held", ("x",), T0)
+        self.file(other)
+        other_number = max(self.gh.issues)
+        self.gh.issues[other_number].update(labels=[{"name": x} for x in invariants.LABELS])
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",), at=T0 + 300), now=T0 + 300)
+        rolling = self.state[self.rolling("t", ()).key]
+        self.assertEqual(self.gh.issues[old_number]["state"], "closed")
+        (note,) = self.gh.comments[(REPO, old_number)]
+        self.assertIn("#%d" % rolling, note["body"])
+        self.assertNotIn("cleared", note["body"])
+        self.assertEqual(self.gh.issues[rolling]["state"], "open")
+        self.assertEqual(self.gh.issues[other_number]["state"], "open")
+
+    def test_an_old_per_goal_issue_waits_while_the_rolling_issue_stays_closed(self):
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",)))
+        (rolling,) = self.gh.issues
+        self.gh.issues[rolling].update(state="closed", closed_at=stamp(T0 + 600))
+        old = invariants.Breach("ticket-outside-epic", "%s#30" % REPO,
+                                "Goal home #30 has 1 open tickets under no epic", ("x",), T0)
+        self.file(old)
+        old_number = max(self.gh.issues)
+        self.gh.issues[old_number].update(labels=[{"name": x} for x in invariants.LABELS])
+        # Evidence older than the close: nothing reopens, so nothing folds.
+        self.file(self.rolling("1 open tickets sit under no epic across 1 goal homes",
+                               ("Goal home #30: 1 open, #7",), at=T0 + 300), now=T0 + 300)
+        self.assertEqual(self.gh.issues[rolling]["state"], "closed")
+        self.assertEqual(self.gh.issues[old_number]["state"], "open")
 
     def test_a_long_breach_title_is_clipped_to_72_and_kept_whole_in_the_body(self):
         long = ("Repeated rewrite skip for one hour: the agent answered with no brief "
@@ -802,11 +881,30 @@ class InvariantTest(unittest.TestCase):
             invariants.EpicShape(Ref("%s#41" % REPO, "#41"), True, 1, ()),
             invariants.EpicShape(Ref("%s#42" % REPO, "#42"), False, 2, (t7,))), (t7,))
         f = Facts(T0, shapes=[bad])
-        self.assertEqual([b.subject for b in invariants.ticket_outside_epic(f)], [self.goal.key])
+        (outside,) = invariants.ticket_outside_epic(f)
+        self.assertEqual(outside.subject, invariants.OUTSIDE_EPIC_SUBJECT)
         self.assertEqual([b.subject for b in invariants.epic_over_cap(f)], [e40.key])
         self.assertEqual([b.subject for b in invariants.goal_epics_over_cap(f)], [self.goal.key])
         self.assertEqual([b.subject for b in invariants.closed_epic_open_tickets(f)],
                          ["%s#42" % REPO])
+
+    def test_tickets_outside_an_epic_in_many_goals_are_one_rolling_breach(self):
+        """One rolling breach for every goal home, not one issue per goal:
+        the sweep found 18 issues for this one cause (infra#5613)."""
+        other = Ref("%s#12" % OTHER, "Goal home issue 12 of a private repo")
+        shapes = [invariants.GoalShape(self.goal, 6, (), (Ref("%s#7" % REPO, "#7"),)),
+                  invariants.GoalShape(other, 6, (), tuple(
+                      Ref("%s#%d" % (OTHER, n), "a private ticket %d" % n) for n in (1, 2)))]
+        (b,) = invariants.ticket_outside_epic(Facts(T0, shapes=shapes))
+        self.assertTrue(b.rolling)
+        self.assertEqual(b.subject, invariants.OUTSIDE_EPIC_SUBJECT)
+        self.assertIn("3 open tickets", b.title)
+        self.assertIn("2 goal homes", b.title)
+        self.assertTrue(any(self.goal.label in line and "#7" in line for line in b.evidence))
+        self.assertTrue(any(other.label in line and "2 open" in line for line in b.evidence))
+        # The same key whatever the goals: a new goal joins the one issue.
+        (alone,) = invariants.ticket_outside_epic(Facts(T0, shapes=shapes[:1]))
+        self.assertEqual(alone.key, b.key)
 
     def test_a_plan_check_that_passed_or_failed_recently_is_not_a_breach(self):
         pr = Ref("%s#7" % REPO, "pull request #7")

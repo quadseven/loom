@@ -1,0 +1,124 @@
+"""The API-lane agent's Seatbelt profile (lanes/agent_sandbox.sh): outbound
+connections only to its provider's port, writes only to its tree and scratch
+home. The agy lane and the validation run keep their own rules (Refs #575)."""
+
+import os
+import socket
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from tests import sandbox_caps
+
+SANDBOX = Path(__file__).resolve().parent.parent / "lanes" / "agent_sandbox.sh"
+WRITE_DENY = '(deny file-write* (subpath "/"))'
+NET_DENY = '(deny network-outbound (remote ip "*:*"))'
+
+# Run inside the api profile: try each write and the loopback connection, and
+# print what happened. $1 is the tree, $2 a path outside it, $3 a local port.
+CONFINED_PROBE = r"""
+w() { if : > "$1" 2> /dev/null; then echo "$2=written"; else echo "$2=denied"; fi; }
+w "$1/edit.txt" tree
+w "$AGENT_HOME/tmp/scratch.txt" scratch
+w "$2" outside
+w /dev/null devnull
+if /usr/bin/nc -z -w 1 127.0.0.1 "$3" > /dev/null 2>&1; then echo lo=reachable; else echo lo=denied; fi
+"""
+
+
+class AgentSandboxTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.home = self.root / "home"
+        self.tree = self.root / "tree"
+        self.scratch = self.root / "scratch"
+        for d in (self.home, self.tree, self.scratch / "tmp"):
+            d.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def bash(self, script, *args, lane="opencode-go", **env):
+        full = dict(os.environ, HOME=str(self.home), AGENT_HOME=str(self.scratch), LANE=lane,
+                    SKILLS=str(self.root / "no-skills"), **env)
+        return subprocess.run(["bash", "-c", '. "$1"; shift; ' + script, "bash", str(SANDBOX),
+                               str(self.tree), *args],
+                              capture_output=True, text=True, env=full, timeout=60)
+
+    def profile(self, mode, lane="opencode-go", **env):
+        result = self.bash('sandbox_profile "$1" bash "$2"', mode, lane=lane, **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_an_api_agent_may_write_only_its_tree_and_scratch_home(self):
+        lines = self.profile("api").splitlines()
+        self.assertEqual(lines[2], WRITE_DENY)
+        self.assertTrue(lines[3].startswith("(allow file-write* "), lines[3])
+        self.assertIn('(literal "/dev/null")', lines[3])
+        self.assertNotIn("subpath", lines[3])
+        allowed = f'(allow file-read* file-write* (subpath "{self.tree}") (subpath "{self.scratch}"))'
+        self.assertGreater(lines.index(allowed), 3)
+
+    def test_an_api_agent_may_connect_only_to_its_providers_port(self):
+        lines = self.profile("api").splitlines()
+        allows = [line for line in lines if line.startswith("(allow network-outbound (remote ip")]
+        self.assertEqual(allows, ['(allow network-outbound (remote ip "*:443"))'])
+        self.assertGreater(lines.index(allows[0]), lines.index(NET_DENY))
+
+    def test_the_spark_lane_also_reaches_its_endpoints_port(self):
+        cases = {"http://spark.example.invalid:8000/v1": ["443", "8000"],
+                 "http://spark.example.invalid/v1": ["443", "80"],
+                 "https://spark.example.invalid/v1": ["443"],
+                 "https://spark.example.invalid:443": ["443"]}
+        for url, ports in cases.items():
+            with self.subTest(url=url):
+                profile = self.profile("api", lane="spark", SPARK_URL=url)
+                allowed = [line.split('"*:')[1].split('"')[0] for line in profile.splitlines()
+                           if line.startswith('(allow network-outbound (remote ip "*:')]
+                self.assertEqual(allowed, ports)
+
+    def test_a_spark_url_without_a_usable_port_is_refused(self):
+        for url in ("http://spark.example.invalid:0/v1", "http://spark.example.invalid:70000/v1",
+                    "http://spark.example.invalid:/v1", "spark.example.invalid:8000"):
+            with self.subTest(url=url):
+                result = self.bash('sandbox_profile "$1" bash api', lane="spark", SPARK_URL=url)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("refusing sandbox: no usable port in the spark URL", result.stderr)
+
+    def test_the_agy_lane_and_the_validation_run_keep_their_rules(self):
+        for mode in ("", "check"):
+            with self.subTest(mode=mode):
+                profile = self.profile(mode)
+                self.assertNotIn(WRITE_DENY, profile)
+                self.assertNotIn(NET_DENY, profile)
+                self.assertIn('(deny network-outbound (remote ip "localhost:*"))', profile)
+
+    def test_an_unknown_mode_is_refused(self):
+        result = self.bash('sandbox_profile "$1" bash agent')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("refusing sandbox: unknown mode agent", result.stderr)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
+    def test_inside_the_api_profile_writes_and_connections_stay_confined(self):
+        outside = self.root / "outside"
+        with socket.socket() as service:
+            service.bind(("127.0.0.1", 0))
+            service.listen(1)
+            port = str(service.getsockname()[1])
+            result = self.bash(
+                'p="$(sandbox_profile "$1" bash api)" || exit 9\n'
+                'TMPDIR="$AGENT_HOME/tmp" sandbox-exec -p "$p" /bin/bash -c "$2" probe "$1" "$3" "$4"',
+                CONFINED_PROBE, str(outside), port)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(),
+                         ["tree=written", "scratch=written", "outside=denied", "devnull=written", "lo=denied"])
+        self.assertFalse(outside.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
