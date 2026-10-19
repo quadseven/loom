@@ -730,7 +730,9 @@ Each invariant is one function returning breaches with evidence:
   for the credit to renew and nothing is briefed onto it meanwhile. Unset,
   every held lane counts.
 - The epic shape (decision 0003): a goal home with open `loom:ticket` issues
-  under no epic (one breach per goal), an epic holding more than 15 tickets,
+  under no epic (one rolling issue for every goal, a line per goal home,
+  rewritten in place while the list changes; the older per-goal issues are
+  closed as folded into it), an epic holding more than 15 tickets,
   a goal with more open epics than its cap (6, or the goal home's
   `Epic cap: N until DATE` exception), and a closed epic that still holds
   open tickets. These replaced the goal home sub-issue count check.

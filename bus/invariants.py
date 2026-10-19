@@ -10,8 +10,9 @@ pass is None, and the invariants that need it find nothing.
 Filer files each breach as one loom:invariant issue on the factory's goal
 home, deduplicated by invariant and subject: a breach whose issue is open
 files nothing, and one whose issue was closed reopens it only for evidence
-newer than the close. Adding an invariant is one function in INVARIANTS plus
-a test.
+newer than the close. A rolling breach (ticket-outside-epic) is one issue for
+its whole cause, and its open issue is rewritten in place whenever what it
+lists changes. Adding an invariant is one function in INVARIANTS plus a test.
 
 Everything here is written to a public repo. A subject in another repo comes
 in as a Ref whose label is already public (a private repo is named in words),
@@ -91,6 +92,13 @@ MARKER_RE = re.compile(r"<!-- loom:invariant v1 key=([a-z-]+/[0-9a-f]{12}) -->")
 # Issues filed plus issues reopened in one pass.
 WRITES_MAX = 5
 SHOWN = 5
+# The one subject of the rolling ticket-outside-epic breach: every goal home
+# with tickets under no epic is a line in one issue, not an issue of its own
+# (one backlog sweep found 18 issues for this one cause).
+OUTSIDE_EPIC_SUBJECT = "every goal home"
+# The line of a rolling issue that changes every pass; it is left out when
+# the body is compared, so an unchanged list writes nothing.
+LAST_SEEN = "Last seen by the station: %s."
 LINE_MAX = 300
 WITHHELD = "(withheld: the line fails the written-text check)"
 
@@ -248,6 +256,9 @@ class Breach:
     evidence: Tuple[str, ...]
     # The newest evidence: a closed issue reopens only for a later breach.
     at: float
+    # One issue for the whole cause, its title and body rewritten in place
+    # while it is open and what it lists changes.
+    rolling: bool = False
 
     @property
     def key(self) -> str:
@@ -424,19 +435,26 @@ def _refs(found: Sequence[Ref]) -> str:
 
 
 def ticket_outside_epic(f: Facts) -> List[Breach]:
-    """A goal with open loom:ticket issues that sit under no epic: every
-    ticket belongs to an epic (decision 0003). One breach per goal."""
+    """Goals with open loom:ticket issues that sit under no epic: every
+    ticket belongs to an epic (decision 0003). One rolling breach for all
+    goals, a line per goal, so one cause is one issue however many goals
+    it touches."""
     if f.shapes is None:
         return []
-    return [Breach("ticket-outside-epic", shape.goal.key,
-                   "Goal home %s has %d open tickets under no epic"
-                   % (shape.goal.label, len(shape.outside)),
-                   ("Open tickets that are the goal's own children, not an epic's: %s"
-                    % _refs(shape.outside),
-                    "Move each under an open epic of the goal (its sub-issue, with a "
-                    "Part of line naming the epic)"),
-                   f.now)
-            for shape in f.shapes if shape.outside]
+    shapes = [shape for shape in f.shapes if shape.outside]
+    if not shapes:
+        return []
+    total = sum(len(shape.outside) for shape in shapes)
+    lines = tuple("%s: %d open, %s" % (shape.goal.label, len(shape.outside),
+                                       _refs(shape.outside)) for shape in shapes)
+    return [Breach("ticket-outside-epic", OUTSIDE_EPIC_SUBJECT,
+                   "%d open tickets sit under no epic across %d goal homes"
+                   % (total, len(shapes)),
+                   ("Open tickets that are a goal's own children, not an epic's, "
+                    "by goal home:",) + lines +
+                   ("Move each under an open epic of its goal (its sub-issue, with a "
+                    "Part of line naming the epic)",),
+                   f.now, rolling=True)]
 
 
 def epic_over_cap(f: Facts) -> List[Breach]:
@@ -748,6 +766,8 @@ class Filer:
         self.write = write
         self.writes = 0
         self._listed: Optional[Dict[str, int]] = None
+        # Rolling breach key -> its issue, once this pass has it open.
+        self._rolling_open: Dict[str, int] = {}
 
     def _listing(self) -> Dict[str, int]:
         """Breach key -> issue number for every loom:invariant issue, open or
@@ -788,14 +808,34 @@ class Filer:
         return self._repairs
 
     def _body(self, b: Breach) -> str:
+        rolling = (["", "One rolling issue for this cause: the station rewrites this list "
+                        "in place while it changes.", LAST_SEEN % utc(b.at)]
+                   if b.rolling else [])
         return "\n".join(
             [MARKER % b.key,
              "The station found one of the factory's own invariants broken: %s." % b.title,
-             "", "Evidence:"] + self._evidence(b) +
+             "", "Evidence:"] + self._evidence(b) + rolling +
             ["", "Invariant: `%s` (bus/invariants.py), checked every station pass. Filed "
                  "without a model: this says what broke, not why. Rewrite it as a ticket "
                  "that fixes the cause." % b.invariant,
              "", "Part of #%d" % self._home()])
+
+    def _refresh(self, b: Breach, number: int, issue: Dict[str, Any]) -> None:
+        """Rewrite a rolling breach's open issue when its title or list
+        changed; the last-seen line alone is no reason to write."""
+        title = naming.clip(b.title)
+        body = self._body(b)
+
+        def steady(text: Any) -> str:
+            return "\n".join(line for line in str(text or "").replace("\r\n", "\n").split("\n")
+                             if not line.startswith(LAST_SEEN.split("%")[0]))
+        if issue.get("title") == title and steady(issue.get("body")) == steady(body):
+            return
+        _text.check(title + "\n" + body)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"title": title, "body": body})
+        self.writes += 1
+        self.say("invariants: updated %s#%d: %s" % (self.repo, number, title))
 
     def _file(self, b: Breach) -> None:
         # The body quotes the whole breach; the title is clipped to the
@@ -832,6 +872,31 @@ class Filer:
         return [c for c in self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100"
                                             % (self.repo, number)) if isinstance(c, dict)]
 
+    def _rolled_into(self, key: str, current: Dict[str, Breach]) -> Optional[int]:
+        """The open rolling issue an older issue of the same invariant now
+        lives in (the per-goal ticket-outside-epic issues), or None."""
+        invariant = key.split("/", 1)[0]
+        for b in current.values():
+            number = self._rolling_open.get(b.key)
+            if b.rolling and b.invariant == invariant and b.key != key and number is not None:
+                return number
+        return None
+
+    def _fold(self, number: int, into: int, comments: List[Dict[str, Any]]) -> None:
+        """Close an issue whose breach is now one line of rolling issue
+        #into: not cleared, only listed there."""
+        body = ("Folded into #%d, the one rolling issue for this invariant: it lists "
+                "this subject with the others and is updated in place." % into)
+        if not any(("Folded into #%d" % into) in str(c.get("body", "")) for c in comments):
+            _text.check(body)
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
+                         {"body": body})
+            self.writes += 1
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"state": "closed", "state_reason": "not_planned"})
+        self.writes += 1
+        self.say("invariants: folded %s#%d into #%d" % (self.repo, number, into))
+
     def _clear_stale(self, current: Dict[str, Breach]) -> None:
         for key, number in self._listing().items():
             if self.writes >= WRITES_MAX:
@@ -846,34 +911,49 @@ class Filer:
             if "loom:triage" not in labels:
                 continue
             comments = self._comments(number)
-            breaches = [_epoch(issue.get("created_at"))]
-            breaches += [_epoch(c.get("created_at")) for c in comments
-                         if "Broken again after this was closed:" in str(c.get("body", ""))]
-            times = [at for at in breaches if at is not None]
-            if not times or self.now - max(times) < CLEAR_AFTER:
-                continue
-            recent = [at for at in times if 0 <= self.now - at <= RECURRING_AFTER]
-            if len(recent) >= 3:
-                if "loom:recurring" not in labels:
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                                 {"labels": labels + ["loom:recurring"]})
-                    self.writes += 1
-                continue
-            if self.writes + 2 > WRITES_MAX:
+            into = self._rolled_into(key, current)
+            if into is not None and into != number:
+                # Still broken, so no clear wait: its goal is a line of #into.
+                if self.writes + 2 > WRITES_MAX:
+                    return
+                self._fold(number, into, comments)
+            elif not self._close_quiet(number, issue, labels, comments):
                 return
-            body = ("The invariant cleared by %s; its last breach was observed at %s, "
-                    "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
-            already_explained = any("The invariant cleared by " in str(c.get("body", ""))
-                                    for c in comments)
-            if not already_explained:
-                _text.check(body)
-                self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                             {"body": body})
+
+    def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
+                     comments: List[Dict[str, Any]]) -> bool:
+        """Close an open triage issue whose breach has been gone CLEAR_AFTER,
+        or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
+        False when the pass has no writes left for it."""
+        breaches = [_epoch(issue.get("created_at"))]
+        breaches += [_epoch(c.get("created_at")) for c in comments
+                     if "Broken again after this was closed:" in str(c.get("body", ""))]
+        times = [at for at in breaches if at is not None]
+        if not times or self.now - max(times) < CLEAR_AFTER:
+            return True
+        recent = [at for at in times if 0 <= self.now - at <= RECURRING_AFTER]
+        if len(recent) >= 3:
+            if "loom:recurring" not in labels:
+                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                             {"labels": labels + ["loom:recurring"]})
                 self.writes += 1
-            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                         {"state": "closed", "state_reason": "not_planned"})
+            return True
+        if self.writes + 2 > WRITES_MAX:
+            return False
+        body = ("The invariant cleared by %s; its last breach was observed at %s, "
+                "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
+        already_explained = any("The invariant cleared by " in str(c.get("body", ""))
+                                for c in comments)
+        if not already_explained:
+            _text.check(body)
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
+                         {"body": body})
             self.writes += 1
-            self.say("invariants: closed cleared %s#%d" % (self.repo, number))
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"state": "closed", "state_reason": "not_planned"})
+        self.writes += 1
+        self.say("invariants: closed cleared %s#%d" % (self.repo, number))
+        return True
 
     def _one(self, b: Breach) -> None:
         known = self.state.get(b.key)
@@ -883,13 +963,22 @@ class Filer:
         if number is None or issue is None:
             self.state.pop(b.key, None)
             self._file(b)
+            if b.rolling:
+                self._rolling_open[b.key] = self.state[b.key]
             return
         self.state[b.key] = number
         if issue.get("state") == "open":
+            if b.rolling:
+                self._rolling_open[b.key] = number
+                self._refresh(b, number, issue)
             return
         closed = _epoch(issue.get("closed_at"))
         if closed is None or b.at > closed:
             self._reopen(b, number)
+            if b.rolling:
+                self._rolling_open[b.key] = number
+                if self.writes < WRITES_MAX:
+                    self._refresh(b, number, issue)
 
     def run(self, breaches: Iterable[Breach]) -> None:
         current = {b.key: b for b in breaches}
