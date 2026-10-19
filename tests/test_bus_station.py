@@ -2685,6 +2685,62 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertEqual(self.listing(), ["example-owner.example-repo-12-r2.md"])
 
+    def test_a_stale_brief_in_a_down_lanes_inbox_is_returned_and_the_ticket_claimed(self):
+        # 2026-10-18: a brief sat two days in the inbox of a
+        # lane whose key had expired, and no other lane could claim the ticket.
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane claude (body sha256 0123456789ab)"})
+        stale = self.inbox("claude", "example-owner.example-repo-12.md")
+        self.write(stale, "never run\n")
+        old = time.time() - 2 * station.DEAD_BRIEF_AGE
+        os.utime(stale, (old, old))
+        self.run_pass()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(self.inbox("claude", "returned", "example-owner.example-repo-12.md")))
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12-r2.md"])
+
+    def stale_claude_brief(self):
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane claude (body sha256 0123456789ab)"})
+        stale = self.inbox("claude", "example-owner.example-repo-12.md")
+        self.write(stale, "running\n")
+        old = time.time() - 2 * station.DEAD_BRIEF_AGE
+        os.utime(stale, (old, old))
+        return stale
+
+    def test_a_brief_under_a_live_runner_lock_is_never_returned(self):
+        # The brief stays in the inbox while its run goes on; the runner holds
+        # run/<lane>.lock with its pid for the whole run.
+        stale = self.stale_claude_brief()
+        lock = os.path.join(self.home, "run", "claude.lock")
+        os.makedirs(lock)
+        self.write(os.path.join(lock, "pid"), "%d\n" % os.getpid())
+        self.run_pass()
+        self.assertTrue(os.path.exists(stale))
+        self.assertIn("loom:briefed", self.fake.names(12))
+
+    def test_a_lane_at_a_limit_with_a_fresh_heartbeat_keeps_its_brief(self):
+        # Unavailable is not dead: a limit or the spend floor still beats.
+        stale = self.stale_claude_brief()
+        usage = os.path.join(self.home, "state", "usage")
+        os.makedirs(usage, exist_ok=True)
+        with open(os.path.join(usage, "claude.json"), "w") as fh:
+            json.dump({"lane": "claude", "at": int(time.time()), "available": False,
+                       "reason": "limit: provider limit reached"}, fh)
+        self.run_pass()
+        self.assertTrue(os.path.exists(stale))
+
+    def test_a_stale_brief_in_a_live_lanes_inbox_still_blocks(self):
+        self.fake.add(12)
+        self.fake.comments[12].append({"body": "Claimed for lane codex (body sha256 0123456789ab)"})
+        stale = self.inbox("codex", "example-owner.example-repo-12.md")
+        self.write(stale, "running\n")
+        old = time.time() - 2 * station.DEAD_BRIEF_AGE
+        os.utime(stale, (old, old))
+        self.run_pass()
+        self.assertTrue(os.path.exists(stale))
+        self.assertIn("loom:briefed", self.fake.names(12))
+
     def test_a_second_pass_after_a_304_also_polls_for_pr_reviews(self):
         self.fake.add(12, author="stranger")
         self.run_pass()
