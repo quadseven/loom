@@ -65,6 +65,11 @@ _HOLD_REF = r"[A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)?#[0-9]+ \([a-z-]+\)"
 HOLD_RE = re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ waits for "
                      + _HOLD_REF + r"(?:, " + _HOLD_REF + r")*[ \t]*")
 TRACEBACK = "Traceback (most recent call last)"
+# A lane run the runner already classed as transient or as a limit: the
+# station retries or holds it (bus/station.py), so it is never a factory
+# fault to file. loom#467 counted zen's "[transient] agent exited 124" lines
+# 26 times, one emailed comment each (2026-10-18).
+CLASSED_RE = re.compile(r"\bfailed: \[(?:transient|limit)\]")
 
 _TIME_RE = re.compile(
     r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?"
@@ -162,6 +167,8 @@ def keep(line: str) -> bool:
     """A line worth a signature: it names an error or an HTTP 4xx/5xx. The
     station's hold line is status, whatever state word it names."""
     if HOLD_RE.fullmatch(_LEAD_RE.sub("", line).rstrip("\r\n")):
+        return False
+    if CLASSED_RE.search(line):
         return False
     return bool(KEEP_RE.search(line) or HTTP_RE.search(line))
 
@@ -381,7 +388,8 @@ class Watcher:
     def _count_body(self, rec: Dict[str, Any]) -> str:
         return "\n".join([
             MARKER,
-            "Seen %d more times since the last count." % (rec["total"] - rec.get("told_total", 0)),
+            "Seen %d more times since the last count (this comment is edited in place)."
+            % (rec["total"] - rec.get("told_total", 0)),
             "",
             "Last example:",
             "```text",
@@ -439,10 +447,25 @@ class Watcher:
         return "filed"
 
     def _count(self, rec: Dict[str, Any]) -> str:
+        """One count comment per issue, edited in place each hour after the
+        first: an edit sends no email, a new comment does."""
         body = self._count_body(rec)
         _text.check(body)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, rec["issue"]),
-                     {"body": body})
+        comment = rec.get("count_comment")
+        if isinstance(comment, int) and not isinstance(comment, bool):
+            try:
+                self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (self.repo, comment),
+                             {"body": body})
+                self.writes += 1
+                self._told(rec)
+                return "counted"
+            except GitHubError as err:
+                if err.status != 404:
+                    raise
+        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, rec["issue"]),
+                            {"body": body}).data
+        if isinstance(made, dict) and isinstance(made.get("id"), int):
+            rec["count_comment"] = int(made["id"])
         self.writes += 1
         self._told(rec)
         return "counted"

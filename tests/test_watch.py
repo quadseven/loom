@@ -27,6 +27,7 @@ class FakeGH:
     def __init__(self):
         self.issues = {}
         self.comments = []
+        self.edits = []
         self.calls = []
 
     def rest(self, method, path, body=None):
@@ -38,6 +39,10 @@ class FakeGH:
         if method == "POST" and path.endswith("/comments"):
             self.comments.append((int(path.split("/")[-2]), (body or {})["body"]))
             return Response(201, {"id": len(self.comments)})
+        if method == "PATCH" and "/issues/comments/" in path:
+            ident = int(path.rsplit("/", 1)[1])
+            self.edits.append((ident, (body or {})["body"]))
+            return Response(200, {"id": ident})
         if method == "GET":
             number = int(path.rsplit("/", 1)[1])
             return Response(200, self.issues.get(number))
@@ -183,6 +188,27 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 3 * 3600)
         self.assertEqual(len(self.gh.comments), 1)
         self.assertEqual(len(self.gh.issues), 1)
+
+    def test_later_counts_edit_the_one_count_comment_in_place(self):
+        # loom#467, 2026-10-18: 26 "Seen N more times" comments, one email each.
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0)
+        self.append(LINE_403, LINE_403)
+        self.run_at(T0 + 3600)
+        self.append(LINE_403)
+        self.run_at(T0 + 2 * 3600)
+        self.append(LINE_403)
+        self.run_at(T0 + 3 * 3600)
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual([ident for ident, _ in self.gh.edits], [1, 1])
+        self.assertIn("Seen 1 more times", self.gh.edits[-1][1])
+
+    def test_a_lane_failure_classed_transient_or_limit_is_never_a_signature(self):
+        for line in ("[2026-10-18T22:50:36Z] example.repo-3 failed: [transient] agent exited 124",
+                     "[2026-10-18T22:50:36Z] example.repo-3 failed: [limit] agent exited 3: limit"):
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line))
+        self.assertTrue(watch.keep("[2026-10-18T22:50:36Z] example.repo-3 failed: [work] tests failed"))
 
     def test_a_closed_issue_is_not_counted_or_filed_again(self):
         self.append(LINE_403, LINE_403, LINE_403)
