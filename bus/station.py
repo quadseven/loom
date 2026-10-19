@@ -1114,6 +1114,10 @@ class Station:
                  head: Optional[Callable[[], str]] = None,
                  fetch: Optional[Fetcher] = None) -> None:
         self.gh = gh
+        # Status comments by the station's trusted writers read as events.
+        writers = getattr(gh, "status_authors", None)
+        if isinstance(writers, set):
+            writers |= {a.lower() for a in settings.authors}
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook

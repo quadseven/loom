@@ -405,6 +405,10 @@ class GitHub:
         # What the budget lines name: an App installation or a personal token.
         self.auth = "app" if self.app is not None else "token"
         self._app_login: Optional[str] = None
+        # Logins whose status comments read as events (bus/status.py): this
+        # client's own App bot login is added on first use; a caller adds its
+        # trusted writers (the station its LOOM_BRIEF_AUTHORS).
+        self.status_authors: set = set()
         self._sleep = sleep
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
@@ -443,7 +447,7 @@ class GitHub:
         if method == "GET" and status.COMMENTS_RE.search(path):
             # A ticket's status comment reads as one comment per event, so
             # every reader of those events sees them as before (loom#866).
-            expanded = status.expand(resp.data)
+            expanded = status.expand(resp.data, self._status_logins())
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
@@ -576,6 +580,19 @@ class GitHub:
         if not isinstance(token, str) or not token.strip():
             raise GitHubError("the installation token answer has no token", status)
         return token.strip(), data.get("expires_at")
+
+    def _status_logins(self) -> set:
+        """Who may write status comments this client expands: its trusted
+        writers and, on an App, its own bot login."""
+        logins = {a.lower() for a in self.status_authors}
+        if self.app is not None:
+            try:
+                login = self.app_login()
+            except GitHubError:
+                login = None
+            if login:
+                logins.add(login.lower())
+        return logins
 
     def app_login(self) -> Optional[str]:
         """The App's own bot login, "<slug>[bot]", read once from GET /app

@@ -2474,7 +2474,7 @@ class ClaimTest(Base):
         # The claim is an event on the ticket's one status comment (loom#866).
         self.assertEqual(len(self.fake.comments[12]), 1)
         self.assertTrue(status.is_status(self.fake.comments[12][0]["body"]))
-        self.assertEqual([c["body"] for c in status.expand(self.fake.comments[12])],
+        self.assertEqual([c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)],
                          ["Claimed for lane codex (body sha256 %s)" % sha])
 
     def test_a_ticket_pinned_to_a_model_limited_on_its_lane_is_not_claimed(self):
@@ -2989,7 +2989,7 @@ class RetryTest(Base):
         return name
 
     def bodies(self, number=12):
-        return [c["body"] for c in status.expand(self.fake.comments[number])]
+        return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
 
     def test_a_transient_failure_moves_to_another_provider_on_a_fresh_branch(self):
         # codex-2 shares codex's provider (and so its model): never the retry.
@@ -3377,7 +3377,7 @@ class DeadLaneRunawayTest(Base):
     MEDIUM = "Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n"
 
     def bodies(self, number=12):
-        return [c["body"] for c in status.expand(self.fake.comments[number])]
+        return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
 
     def setUp(self):
         super().setUp()
@@ -3511,7 +3511,7 @@ class ExpiredKeyTest(Base):
         return name
 
     def bodies(self, number=12):
-        return [c["body"] for c in status.expand(self.fake.comments[number])]
+        return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
 
     def test_auth_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class(self.REASON), "auth")
@@ -3560,7 +3560,7 @@ class FactoryIncidentTest(Base):
         return name
 
     def bodies(self, number=12):
-        return [c["body"] for c in status.expand(self.fake.comments[number])]
+        return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
 
     def incident(self, closed_at="2030-01-01T00:10:00Z"):
         self.fake.factory_incidents = [{

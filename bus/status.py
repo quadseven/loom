@@ -64,17 +64,28 @@ def render(events: List[Tuple[str, str]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def expand(items: Any) -> Any:
-    """An issue-comment list with each status comment replaced by one
-    pseudo-comment per event (its body the event's text, its created_at and
-    updated_at the event's time, everything else the comment's), sorted by
-    time when any was expanded. Any other value passes through unchanged."""
-    if not isinstance(items, list) or not any(
-            isinstance(c, dict) and is_status(c.get("body")) for c in items):
+def _author(comment: Dict[str, Any]) -> str:
+    user = comment.get("user")
+    return str(user.get("login") or "").lower() if isinstance(user, dict) else ""
+
+
+def expand(items: Any, authors: Iterable[str] = ()) -> Any:
+    """An issue-comment list with each status comment written by one of
+    `authors` replaced by one pseudo-comment per event (its body the event's
+    text, its created_at and updated_at the event's time, everything else the
+    comment's), sorted by time when any was expanded. A status-looking comment
+    by anyone else stays one opaque comment: its event times are its own
+    words, and expanding them would let a stranger forge when a claim or a
+    retry happened. Any other value passes through unchanged."""
+    allowed = {a.lower() for a in authors if a}
+    if not allowed or not isinstance(items, list) or not any(
+            isinstance(c, dict) and is_status(c.get("body")) and _author(c) in allowed
+            for c in items):
         return items
     out: List[Any] = []
     for comment in items:
-        if not (isinstance(comment, dict) and is_status(comment.get("body"))):
+        if not (isinstance(comment, dict) and is_status(comment.get("body"))
+                and _author(comment) in allowed):
             out.append(comment)
             continue
         for at, text in reversed(parse(str(comment.get("body") or ""))):

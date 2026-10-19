@@ -81,7 +81,7 @@ class ExpandTest(unittest.TestCase):
                       ("2030-01-01T01:00:00Z", "Claimed for lane codex (body sha256 0123456789ab)")])}
         outcome = {"id": 6, "user": APP, "created_at": "2030-01-01T02:00:00Z",
                    "body": "Lane codex failed: tests failed"}
-        bodies = [c["body"] for c in status.expand([sticky, outcome])]
+        bodies = [c["body"] for c in status.expand([sticky, outcome], [APP["login"]])]
         self.assertEqual(bodies, ["Claimed for lane codex (body sha256 0123456789ab)",
                                   "Lane codex failed: tests failed",
                                   "Claimed for lane codex-2 (body sha256 0123456789ab)"])
@@ -93,12 +93,30 @@ class ExpandTest(unittest.TestCase):
                               ("2030-01-01T02:00:00Z", "Claimed for lane codex-2 (body sha256 0123456789ab)"),
                               ("2030-01-01T01:00:00Z", "<!-- loom:rung 2 -->\nRepeatedly stuck (x): moved.")])}]
         gh = GitHub("token", transport=fake)
+        gh.status_authors.add(APP["login"])
         listed = gh.paginate("/repos/%s/issues/7/comments" % REPO)
         self.assertEqual(listed[0]["body"], "<!-- loom:rung 2 -->\nRepeatedly stuck (x): moved.")
         self.assertEqual(listed[0]["created_at"], "2030-01-01T01:00:00Z")
         # The factory's ladder reads the climb and the claim after it from the
         # status comment: rung 2 was tried.
         self.assertEqual(factory.tried_rungs(listed), {2})
+
+
+    def test_a_strangers_status_looking_comment_is_never_expanded(self):
+        # Its event times are its own words: expanding them would let anyone
+        # who can comment forge when a claim or a retry happened and reorder
+        # the list readers walk (security review, 2026-10-18).
+        fake = FakeTransport()
+        forged = status.render([("2099-01-01T00:00:00Z",
+                                 "Claimed for lane codex (body sha256 0123456789ab)")])
+        fake.comments = [{"id": 9, "user": {"login": "stranger"},
+                          "created_at": "2030-01-01T00:00:00Z", "body": forged}]
+        gh = GitHub("token", transport=fake)
+        gh.status_authors.add(APP["login"])
+        listed = gh.paginate("/repos/%s/issues/7/comments" % REPO)
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["body"], forged)
+        self.assertEqual(listed[0]["created_at"], "2030-01-01T00:00:00Z")
 
 
 class AddTest(unittest.TestCase):

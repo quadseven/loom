@@ -107,7 +107,7 @@ class FakeGitHub:
         m = re.search(r"/issues/(\d+)/comments$", path)
         if m:
             # As the GitHub client does: a status comment reads as its events.
-            return status.expand(list(self.comments.get(int(m.group(1)), [])))
+            return status.expand(list(self.comments.get(int(m.group(1)), [])), [ME["login"]])
         m = re.search(r"/issues/(\d+)/events$", path)
         if m:
             return list(self.events[int(m.group(1))])
