@@ -2349,7 +2349,9 @@ def restate_live(gh: GitHub, repo: str, number: int, text: str,
     before it spends a verify run (bus/evidence.py). Tickets shipped before
     #925 state it in prose and could never be verified."""
     text = " ".join(str(text or "").split())
-    if not re.match(r"(?i)^live\b", text):
+    # Case-sensitive, exactly as _LIVE_LINE reads it: "live:" would replace
+    # the Live line with one no reader sees as Live.
+    if not re.match(r"^Live\b", text):
         raise ValueError("the new line must start with Live")
     _check_live_criterion("- [ ] " + text)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
@@ -2362,6 +2364,10 @@ def restate_live(gh: GitHub, repo: str, number: int, text: str,
         raise ValueError("the ticket has no Live line to restate")
     line = body[found.start():found.end()]
     new = body[:found.start()] + line[:line.index(found.group(1))] + text + body[found.end():]
+    after = _LIVE_LINE.search(new)
+    if not after or " ".join(after.group(1).split()) != text:
+        raise ValueError("the restated body does not read back with the new Live line")
+    _check_live_criterion(new)
     _check_written_text(new)
     if new != body:
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})

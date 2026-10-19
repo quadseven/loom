@@ -3309,6 +3309,7 @@ class RestateLiveTest(unittest.TestCase):
     def test_refusals_make_no_writes(self):
         cases = [
             (self.issue(), "Live: the logs show it"),                       # names no string
+            (self.issue(), "live: the station log shows `deployed`"),        # not read as Live
             (self.issue(), "The station log shows `deployed`"),             # not a Live line
             (self.issue(labels=("loom:ticket", "loom:merged")), "Live: `deployed` shows"),
             (self.issue(body="## Acceptance criteria\n- [ ] a\n"), "Live: `deployed` shows"),
