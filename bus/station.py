@@ -178,6 +178,11 @@ TRIAGE_INTERVAL = 3600
 # whose rewrite did not produce a ticket is tried again.
 REWRITE_PER_HOUR = 5
 REWRITE_PER_PASS = 5
+# Rewrites across every backlog goal in any hour: each one comments on its
+# issue or files a ticket, and both email the operator. Per goal alone, ten
+# backlog goals let about 80 through in ten minutes (2026-10-18).
+REWRITE_STATION_PER_HOUR = 6
+REWRITE_STATION_KEY = "_station"
 REWRITE_RETRY = 24 * 3600
 REWRITE_TIMEOUT = 600
 # Through the bot, a report is one short line (the goal's short name and the
@@ -5375,20 +5380,29 @@ class Station:
         if not isinstance(state, dict):
             state = {}
         goals = self._rewrite_goals()
-        for stale in [k for k in state if k not in {g[0] for g in goals}]:
+        recent = [t for t in state.get(REWRITE_STATION_KEY) or []
+                  if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
+        for stale in [k for k in state
+                      if k != REWRITE_STATION_KEY and k not in {g[0] for g in goals}]:
             del state[stale]
-        budget = REWRITE_PER_PASS
+        state[REWRITE_STATION_KEY] = recent
+        budget = min(REWRITE_PER_PASS, REWRITE_STATION_PER_HOUR - len(recent))
+        if budget <= 0:
+            return
         cmds: Dict[str, str] = {}
         for key, repo, goal in goals:
             rec = state.get(key)
             if not isinstance(rec, dict):
                 rec = state[key] = {}
+            used = 0
             try:
-                budget -= self._rewrite_goal(key, repo, goal, rec, budget, cmds)
+                used = self._rewrite_goal(key, repo, goal, rec, budget, cmds)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
                 _say("rewrite %s failed: %s" % (key, err))
+            budget -= used
+            recent.extend([self.now] * used)
             _write_json(path, state)
             if budget <= 0 or self._deferred():
                 break

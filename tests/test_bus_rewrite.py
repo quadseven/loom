@@ -352,6 +352,21 @@ class StationRewriteTest(Base):
         self.run_station(self.station(cmd=cmd, now=1800))
         self.assertEqual(self.fake.requests, [])
 
+    def test_the_station_wide_hourly_cap_binds_across_passes(self):
+        # 2026-10-18: per-goal caps alone let about 80 rewrites through in ten
+        # minutes across ten backlog goals, each one emailing the operator.
+        for n in range(1, 9):
+            self.fake.add_triage(n, created="2030-01-%02dT00:00:00Z" % n)
+        cmd = self.agent({"action": "skip", "reason": "later"})
+        with mock.patch.object(station, "REWRITE_STATION_PER_HOUR", 3):
+            self.run_station(self.station(cmd=cmd))
+            self.assertEqual(self.fake.read_comments(), [1, 2, 3])
+            self.fake.requests.clear()
+            self.run_station(self.station(cmd=cmd, now=600))
+            self.assertEqual(self.fake.requests, [])
+            self.run_station(self.station(cmd=cmd, now=3700))
+            self.assertEqual(self.fake.read_comments(), [4, 5, 6])
+
     def test_the_next_hour_takes_the_next_five_and_skips_the_ones_just_tried(self):
         for n in range(1, 9):
             self.fake.add_triage(n, created="2030-01-%02dT00:00:00Z" % n)
