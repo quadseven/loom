@@ -917,35 +917,43 @@ class Filer:
                 if self.writes + 2 > WRITES_MAX:
                     return
                 self._fold(number, into, comments)
-                continue
-            breaches = [_epoch(issue.get("created_at"))]
-            breaches += [_epoch(c.get("created_at")) for c in comments
-                         if "Broken again after this was closed:" in str(c.get("body", ""))]
-            times = [at for at in breaches if at is not None]
-            if not times or self.now - max(times) < CLEAR_AFTER:
-                continue
-            recent = [at for at in times if 0 <= self.now - at <= RECURRING_AFTER]
-            if len(recent) >= 3:
-                if "loom:recurring" not in labels:
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                                 {"labels": labels + ["loom:recurring"]})
-                    self.writes += 1
-                continue
-            if self.writes + 2 > WRITES_MAX:
+            elif not self._close_quiet(number, issue, labels, comments):
                 return
-            body = ("The invariant cleared by %s; its last breach was observed at %s, "
-                    "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
-            already_explained = any("The invariant cleared by " in str(c.get("body", ""))
-                                    for c in comments)
-            if not already_explained:
-                _text.check(body)
-                self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
-                             {"body": body})
+
+    def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
+                     comments: List[Dict[str, Any]]) -> bool:
+        """Close an open triage issue whose breach has been gone CLEAR_AFTER,
+        or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
+        False when the pass has no writes left for it."""
+        breaches = [_epoch(issue.get("created_at"))]
+        breaches += [_epoch(c.get("created_at")) for c in comments
+                     if "Broken again after this was closed:" in str(c.get("body", ""))]
+        times = [at for at in breaches if at is not None]
+        if not times or self.now - max(times) < CLEAR_AFTER:
+            return True
+        recent = [at for at in times if 0 <= self.now - at <= RECURRING_AFTER]
+        if len(recent) >= 3:
+            if "loom:recurring" not in labels:
+                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                             {"labels": labels + ["loom:recurring"]})
                 self.writes += 1
-            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                         {"state": "closed", "state_reason": "not_planned"})
+            return True
+        if self.writes + 2 > WRITES_MAX:
+            return False
+        body = ("The invariant cleared by %s; its last breach was observed at %s, "
+                "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
+        already_explained = any("The invariant cleared by " in str(c.get("body", ""))
+                                for c in comments)
+        if not already_explained:
+            _text.check(body)
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, number),
+                         {"body": body})
             self.writes += 1
-            self.say("invariants: closed cleared %s#%d" % (self.repo, number))
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
+                     {"state": "closed", "state_reason": "not_planned"})
+        self.writes += 1
+        self.say("invariants: closed cleared %s#%d" % (self.repo, number))
+        return True
 
     def _one(self, b: Breach) -> None:
         known = self.state.get(b.key)
