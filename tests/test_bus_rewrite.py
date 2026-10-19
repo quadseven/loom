@@ -441,9 +441,14 @@ class AnswerShapeTest(unittest.TestCase):
         self.check("I cannot help with that request.", "32 characters of text")
         self.check("Here: {not json", "with a { but no JSON")
         self.check('{"line": "Live: x", "kind": "y"}', "a JSON object with keys kind, line")
+        self.check('{"line": "Live: x", "leakedSecretName": 1}', "keys line and 1 other key(s)")
+        self.check('{"zzz": 1}', "a JSON object with no expected key and 1 other key(s)")
 
     def test_the_words_of_the_answer_never_appear(self):
         with self.assertRaises(rewrite.Invalid) as ctx:
             rewrite.parse_answer("secret-sounding prose about token abc123")
         self.assertNotIn("abc123", str(ctx.exception))
         self.assertNotIn("prose", str(ctx.exception))
+        with self.assertRaises(rewrite.Invalid) as ctx:
+            rewrite.parse_answer('{"tokenabc123": 1}')
+        self.assertNotIn("abc123", str(ctx.exception))

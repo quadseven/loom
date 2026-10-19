@@ -178,8 +178,14 @@ def parse_answer(output: str) -> Dict[str, Any]:
     raise Invalid("the answer holds no JSON object with an action (%s)" % answer_shape(output))
 
 
+# Keys an answer is expected to carry; only these are named in answer_shape.
+ANSWER_KEYS = frozenset({"action", "line", "title", "body", "ask", "reason", "difficulty",
+                         "kind", "epic", "priority", "size"})
+
+
 def answer_shape(output: str) -> str:
-    """What an unusable answer looked like, never its words: the reason can
+    """What an unusable answer looked like, never its words (only keys from
+    ANSWER_KEYS are named; others are counted): the reason can
     reach a public issue (the repeated-failure invariant), and the model's
     text is not checked. All eight Live restates and 113 rewrites failed
     with one message on 2026-10-19, and nothing said whether the model
@@ -195,10 +201,14 @@ def answer_shape(output: str) -> str:
         except ValueError:
             continue
         if isinstance(value, dict):
-            keys = [k for k in value if isinstance(k, str) and re.fullmatch(r"[A-Za-z_]{1,20}", k)]
+            keys = [str(k) for k in value]
             break
     if keys:
-        return "a JSON object with keys %s" % ", ".join(sorted(keys)[:6])
+        known = sorted(k for k in keys if k in ANSWER_KEYS)
+        others = len(keys) - len(known)
+        return "a JSON object with %s%s" % (
+            "keys %s" % ", ".join(known) if known else "no expected key",
+            " and %d other key(s)" % others if others else "")
     return "%d characters of text%s" % (len(text), ", with a { but no JSON" if "{" in text else "")
 
 
