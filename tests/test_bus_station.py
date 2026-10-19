@@ -2278,8 +2278,9 @@ class CorruptStateTest(Base):
         # Reconciliation, PR review polling, the goal scan, the hand-revert
         # scan's merged and shipped lists, and the invariant check's read of
         # open pull requests (their plan checks) still run, and so does
-        # reconciliation's read of the open tickets (loom#784).
-        self.assertEqual(self.run_pass().requests, 8)
+        # reconciliation's read of the open tickets (loom#784) and the
+        # done-ticket close step's.
+        self.assertEqual(self.run_pass().requests, 9)
 
 
 class TicketsTest(unittest.TestCase):
@@ -2750,9 +2751,10 @@ class ClaimTest(Base):
         # even when the repo has no loom:pr ticket. PR review and hand-revert
         # scans add their usual reads. It also reads the open tickets, to
         # find a queued or briefed one a merged pull request delivers
-        # (loom#784; a conditional read the verify runs share).
+        # (loom#784; a conditional read the verify runs share, which the
+        # done-ticket close step reuses: one more request, no more calls).
         self.assertEqual(len(self.fake.calls), first + 6)
-        self.assertEqual(gh.requests, 8)
+        self.assertEqual(gh.requests, 9)
         self.assertEqual(gh.not_modified, 1)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
@@ -6229,6 +6231,33 @@ HOUR = 3600
 def shipped_at(age_hours):
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_hours * HOUR))
     return [dict(labeled("loom:shipped", "alice-example"), created_at=stamp)]
+
+
+class CloseDoneTest(Base):
+    """The operator's close rule (2026-10-19): a shipped ticket whose Live
+    line names nothing a log search can find closes; one that names a string
+    stays for a verify run."""
+
+    def test_a_shipped_ticket_with_no_searchable_live_string_closes(self):
+        self.fake.private = False
+        no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
+        self.fake.add(1, lane="codex", body=no_needle, state="shipped")
+        self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped")
+        self.fake.add(3, lane="codex", body=no_needle, state="shipped")
+        self.fake.issues[3]["labels"].append({"name": "loom:regression"})
+        self.fake.add(4, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
+                      state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertEqual(self.fake.issues[1]["state_reason"], "completed")
+        self.assertEqual(self.fake.issues[2]["state"], "open")   # evidence can find its string
+        self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
+        self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line at all
+        self.assertIn("force-close", self.fake.names(1))
+        self.assertNotIn("force-close", self.fake.names(2))
+        plain = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
+        self.assertEqual(plain, [])
 
 
 class VerifyDispatchTest(Base):

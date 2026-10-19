@@ -191,6 +191,12 @@ REWRITE_STATION_KEY = "_station"
 # rewrite step spent all six calls every hour and no shipped ticket was ever
 # restated (2026-10-19).
 RESTATE_PER_HOUR = 4
+# Done tickets closed per pass (close_done_tickets), so a backlog of them
+# drains over a few passes instead of one burst of API writes.
+CLOSE_DONE_PER_PASS = 25
+# A ticket carrying one of these stays open for the brain whatever its state.
+CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
+CLOSE_DONE_LABEL = "force-close"
 RESTATE_KEY = "_live_station"
 REWRITE_RETRY = 24 * 3600
 REWRITE_TIMEOUT = 600
@@ -5543,6 +5549,55 @@ class Station:
             if budget <= 0 or self._deferred():
                 break
 
+    def close_done_tickets(self) -> None:
+        """Close each done ticket, by the operator's rule (2026-10-19): a
+        shipped one whose Live line names no string a log search can find (its
+        pull request merged on green checks and the review bot to get there).
+        A Live line that names one keeps the ticket open for a verify run, and
+        a verified ticket closes through brain.close on the verify path, which
+        checks its criteria. Done tickets never closed: 199 sat shipped and
+        the backlog grew all week though the work was finished."""
+        if self._deferred():
+            return
+        left = CLOSE_DONE_PER_PASS
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                if left <= 0:
+                    return
+                why = self._done_reason(issue)
+                if not why:
+                    continue
+                number = int(issue["number"])
+                try:
+                    self._routine(repo, number, "Closed: %s. Not verified live; its criteria "
+                                  "were not ticked one by one." % why)
+                    # force-close is the close-completeness guard's escape hatch:
+                    # this close is by rule, not a claim that each box was seen to
+                    # hold. Without it the guard reopened 46 of 175 such closes,
+                    # each with an email (2026-10-19).
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                                 {"labels": [CLOSE_DONE_LABEL]})
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                                 {"state": "closed", "state_reason": "completed"})
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not close done %s#%d: %s" % (repo, number, err))
+                    continue
+                left -= 1
+                _say("closed done %s#%d: %s" % (repo, number, why))
+
+    @staticmethod
+    def _done_reason(issue: Dict[str, Any]) -> str:
+        """Why the ticket is done and may close, or "" to leave it open."""
+        labels = set(_label_names(issue))
+        if issue.get("state") != "open" or labels & set(CLOSE_DONE_HOLDS):
+            return ""
+        if "loom:shipped" in labels and "loom:verified" not in labels and not live_needles(issue.get("body")):
+            return ("shipped after merging on green checks, and its Live line names "
+                    "nothing a log search can find")
+        return ""
+
     def restate_shipped_live(self) -> None:
         """Restate shipped Live lines with no searchable exact string, using
         the rewrite command and its own hourly allowance (RESTATE_PER_HOUR)."""
@@ -7506,7 +7561,7 @@ class Station:
                      self.ship_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
-                     self.restate_shipped_live,
+                     self.close_done_tickets, self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
