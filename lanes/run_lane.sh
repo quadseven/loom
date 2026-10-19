@@ -1110,6 +1110,27 @@ open_issue() {
     --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
     -- "$1" 2>>"$LOG" | head -1
 }
+# Each open incident this machine filed or updated, one file per repo and
+# kind holding its number, so a run whose check passes can close it without
+# a search. Nothing closed incidents: 16 tickets sat held behind five whose
+# checks had passed again for hours (2026-10-19).
+INCIDENT_DIR="$LOOM_HOME/state/incidents"
+incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
+# Close this repo's environment and base-check incidents once the check has
+# passed on the unmodified base; the station then releases their tickets.
+resolve_factory_incidents() {
+  local kind file number
+  for kind in environment base-check; do
+    file="$(incident_file "$kind")"
+    [ -f "$file" ] || continue
+    number="$(tr -cd '0-9' < "$file")"
+    if [ -n "$number" ]; then
+      gh issue close --repo "$FACTORY_REPO" "$number" \
+        --comment "Cleared: the check passed on the unmodified base in $TICKET." >>"$LOG" 2>&1 || continue
+    fi
+    rm -f "$file"
+  done
+}
 file_factory_incident() {  # kind, detail
   local kind="$1" detail="$2" title body number existing
   title="Factory incident: $REPO validation $kind"
@@ -1129,6 +1150,7 @@ file_factory_incident() {  # kind, detail
     case "$number" in ''|*[!0-9]*) number="" ;; esac
   fi
   if [ -n "$number" ]; then
+    mkdir -p "$INCIDENT_DIR" && printf '%s\n' "$number" > "$(incident_file "$kind")"
     printf 'factory incident %s#%s' "$FACTORY_REPO" "$number"
   else
     printf 'factory incident filing failed'
@@ -1311,10 +1333,15 @@ prepare_validation() {
       note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
+  # Only a pass on the trusted base clears an incident: a fix round's tree
+  # holds the agent's unmerged edits, so it counts only once the default
+  # branch itself passes (below).
+  [ -z "$FIX_PR" ] && [ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && resolve_factory_incidents
   if [ "$BASELINE_EXIT" -ne 0 ]; then
     if [ -n "$FIX_PR" ]; then
       check_default_branch || return 1
       if [ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ]; then
+        resolve_factory_incidents
         if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
           SETUP_REASON="could not restore tracked files changed by the baseline check"
           return 1
