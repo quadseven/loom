@@ -520,13 +520,17 @@ on hard work):
   `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
   model `spark/...`, any repo, private ones included) when lane status shows
   them available; then on a public repo muse, then agy (muse runs
-  remotely); else a
+  remotely); then the free provider slots `spark-5` to `spark-9`, one per
+  provider at the spark-gateway's pinned free route, each waiting out its
+  own reset (spark-5 Ollama Cloud and spark-6 Gemma on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
-  which trains on prompts).
+  opencode-go-4, muse, spark-7, spark-8 and spark-9 on public repos only
+  (opencode-go-4 is Muse Spark, which trains on prompts; spark-7 to spark-9
+  are NVIDIA NIM, Kilo and Groq).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
-  agy; then codex or opencode-go (opencode-go-4 on public repos only); an
+  agy; then a free provider slot (`spark-5` to `spark-9`, the last three on
+  public repos only); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
 - Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,

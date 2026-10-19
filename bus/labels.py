@@ -24,7 +24,14 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # LOOM_SPARK_4_URL): each box served three requests at once on
          # 2026-10-16, so a second slot runs beside the first instead of
          # queueing (operator: use the Sparks much more).
-         "spark-3", "spark-4"]
+         "spark-3", "spark-4",
+         # One slot per free provider in the spark-gateway's pool (infra#5617),
+         # each a spark-type slot at the gateway's pinned free route, waiting
+         # out its own provider's reset. Not Sparks. spark-5 Ollama Cloud and
+         # spark-6 Gemma (both allowed private code, /free/<provider>/v1);
+         # spark-7 NVIDIA NIM, spark-8 Kilo and spark-9 Groq (public repos
+         # only, /free-public/<provider>/v1).
+         "spark-5", "spark-6", "spark-7", "spark-8", "spark-9"]
 LANES = LANES + SLOTS
 # Remote lanes pull ticket work from GitHub and have no local station inbox.
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs

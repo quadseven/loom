@@ -155,7 +155,13 @@ opencode_config() {
   # server's makes the agent compact and lose its place on a large repo: the
   # first sparkles run (2026-10-14) re-read files 190 times in 32K and
   # committed nothing, against a server serving 262144.
-  local ctx="${LOOM_SPARK_CONTEXT:-32768}" out="${LOOM_SPARK_OUTPUT:-4096}"
+  local ctx="${LOOM_SPARK_CONTEXT:-32768}" out="${LOOM_SPARK_OUTPUT:-4096}" v
+  # A slot may serve a smaller window (spark-5 and spark-6, the free pool):
+  # LOOM_<SLOT>_CONTEXT and LOOM_<SLOT>_OUTPUT come first.
+  if declare -F lane_setting > /dev/null; then
+    v="$(lane_setting CONTEXT)"; [ -n "$v" ] && ctx="$v"
+    v="$(lane_setting OUTPUT)"; [ -n "$v" ] && out="$v"
+  fi
   [[ "$ctx" =~ ^[1-9][0-9]{3,6}$ ]] || ctx=32768
   [[ "$out" =~ ^[1-9][0-9]{2,5}$ ]] || out=4096
   [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"

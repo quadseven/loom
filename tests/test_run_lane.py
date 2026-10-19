@@ -2322,6 +2322,19 @@ cat > /dev/null
                          {"context": 131072, "output": 16384})
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_spark_slot_may_serve_its_own_smaller_window(self):
+        # The free provider slots (spark-5 to spark-9, infra#5617) serve about
+        # 128K, beside a Spark window of 262144 set for the whole lane.
+        _, result = self.api_lane("spark-5", LOOM_SPARK_5_URL=self.SPARK["LOOM_SPARK_URL"],
+                                  LOOM_SPARK_CONTEXT="262144", LOOM_SPARK_OUTPUT="32768",
+                                  LOOM_SPARK_5_CONTEXT="120000", LOOM_SPARK_5_OUTPUT="16384",
+                                  **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(next(c for c in self.calls() if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["models"]["coder-test"]["limit"],
+                         {"context": 120000, "output": 16384})
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
         _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
                                   **self.SPARK)

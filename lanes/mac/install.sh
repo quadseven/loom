@@ -52,6 +52,23 @@ LOOM_SPARK_URL="${LOOM_SPARK_URL:-}"
 LOOM_SPARK_2_URL="${LOOM_SPARK_2_URL:-}"
 LOOM_SPARK_3_URL="${LOOM_SPARK_3_URL:-}"
 LOOM_SPARK_4_URL="${LOOM_SPARK_4_URL:-}"
+# The free provider slots (spark-5 to spark-9): the spark-gateway's free route
+# pinned to one provider each, with the smaller window the free models serve.
+LOOM_SPARK_5_URL="${LOOM_SPARK_5_URL:-}"
+LOOM_SPARK_6_URL="${LOOM_SPARK_6_URL:-}"
+LOOM_SPARK_7_URL="${LOOM_SPARK_7_URL:-}"
+LOOM_SPARK_8_URL="${LOOM_SPARK_8_URL:-}"
+LOOM_SPARK_9_URL="${LOOM_SPARK_9_URL:-}"
+LOOM_SPARK_5_CONTEXT="${LOOM_SPARK_5_CONTEXT:-120000}"
+LOOM_SPARK_5_OUTPUT="${LOOM_SPARK_5_OUTPUT:-16384}"
+LOOM_SPARK_6_CONTEXT="${LOOM_SPARK_6_CONTEXT:-120000}"
+LOOM_SPARK_6_OUTPUT="${LOOM_SPARK_6_OUTPUT:-16384}"
+LOOM_SPARK_7_CONTEXT="${LOOM_SPARK_7_CONTEXT:-120000}"
+LOOM_SPARK_7_OUTPUT="${LOOM_SPARK_7_OUTPUT:-16384}"
+LOOM_SPARK_8_CONTEXT="${LOOM_SPARK_8_CONTEXT:-120000}"
+LOOM_SPARK_8_OUTPUT="${LOOM_SPARK_8_OUTPUT:-16384}"
+LOOM_SPARK_9_CONTEXT="${LOOM_SPARK_9_CONTEXT:-120000}"
+LOOM_SPARK_9_OUTPUT="${LOOM_SPARK_9_OUTPUT:-16384}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
 # The context and output window the spark endpoint serves (lanes/agent_sandbox.sh).
 LOOM_SPARK_CONTEXT="${LOOM_SPARK_CONTEXT:-32768}"
@@ -59,6 +76,7 @@ LOOM_SPARK_OUTPUT="${LOOM_SPARK_OUTPUT:-4096}"
 export LOOM_CODEX_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
   LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_AGY_EFFORT LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_3_URL LOOM_SPARK_4_URL LOOM_SPARK_MODEL \
+  LOOM_SPARK_5_URL LOOM_SPARK_5_CONTEXT LOOM_SPARK_5_OUTPUT LOOM_SPARK_6_URL LOOM_SPARK_6_CONTEXT LOOM_SPARK_6_OUTPUT LOOM_SPARK_7_URL LOOM_SPARK_7_CONTEXT LOOM_SPARK_7_OUTPUT LOOM_SPARK_8_URL LOOM_SPARK_8_CONTEXT LOOM_SPARK_8_OUTPUT LOOM_SPARK_9_URL LOOM_SPARK_9_CONTEXT LOOM_SPARK_9_OUTPUT \
   LOOM_SPARK_CONTEXT LOOM_SPARK_OUTPUT
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -144,7 +162,8 @@ mkdir -p "$AGENTS" "$LOOM_HOME/logs"
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
-  codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4)
+  codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4
+  spark-5 spark-6 spark-7 spark-8 spark-9)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
