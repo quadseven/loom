@@ -2364,6 +2364,28 @@ class ValidationContractTest(Base):
         self.assertEqual(checks, [(".github/workflows/test.yml, step Unit tests",
                                   "python -m unittest")])
 
+    def test_pull_request_trigger_forms(self):
+        self.assertTrue(station._has_pull_request_trigger("on:\n  pull_request:\n"))
+        self.assertTrue(station._has_pull_request_trigger("on: [push, pull_request]\n"))
+        self.assertTrue(station._has_pull_request_trigger("on: [push,\n  pull_request]\n"))
+        self.assertFalse(station._has_pull_request_trigger("on:\n  push:\n"))
+        self.assertFalse(station._has_pull_request_trigger("on:\n  pull_request_target:\n"))
+
+    def test_workflow_run_steps_names_block_and_unnamed_steps(self):
+        path = ".github/workflows/test.yml"
+        workflow = ("on:\n  pull_request:\njobs:\n  test:\n    steps:\n"
+                    "      - uses: actions/checkout@v4\n"
+                    "      - name: Lint\n        run: ruff check .\n"
+                    "      - name: \"Tests\"\n        run: |\n"
+                    "          set -o pipefail\n\n          python -m unittest\n"
+                    "      - run: echo done\n"
+                    "      - name: Empty\n        run:\n")
+        self.assertEqual(station._workflow_run_steps(path, workflow), [
+            (path + ", step Lint", "ruff check ."),
+            (path + ", step Tests", "set -o pipefail python -m unittest"),
+            (path + ", step 3", "echo done"),
+        ])
+
     def test_missing_contract_files_one_ticket_and_skips_an_open_duplicate(self):
         goal = {"number": 2, "title": "Backlog: reusable repository work"}
         self.gh = GitHub("token", transport=self.fake)

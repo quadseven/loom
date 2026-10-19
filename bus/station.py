@@ -672,6 +672,54 @@ def _ship_workflows(items: List[str]) -> Dict[str, str]:
     return found
 
 
+_PULL_REQUEST_TRIGGER = re.compile(
+    r"(?m)^\s*pull_request\s*(?::|,|\])|^\s*on:\s*\[[^\]]*pull_request")
+
+
+def _has_pull_request_trigger(workflow: str) -> bool:
+    """Whether a workflow's text runs on pull_request."""
+    return bool(_PULL_REQUEST_TRIGGER.search(workflow))
+
+
+def _block_scalar(lines: List[str], index: int, indent: int) -> Tuple[str, int]:
+    """Join a run: | block's lines deeper than indent; return it and the next index."""
+    block = []
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        block.append(line.strip())
+        index += 1
+    return " ".join(part for part in block if part), index
+
+
+def _workflow_run_steps(path: str, workflow: str) -> List[Tuple[str, str]]:
+    """Each non-empty run step of a workflow as (where it comes from, command)."""
+    lines = workflow.splitlines()
+    found: List[Tuple[str, str]] = []
+    index = 0
+    step_name = ""
+    run_number = 0
+    while index < len(lines):
+        line = lines[index]
+        if re.match(r"^\s*-\s+", line):
+            step_name = ""
+        named = re.match(r"^\s*-\s*name:\s*(.+?)\s*$", line)
+        if named:
+            step_name = named.group(1).strip("\"'")
+        index += 1
+        match = re.match(r"^\s*(?:-\s*)?run:\s*(.*)$", line)
+        if not match:
+            continue
+        run_number += 1
+        command = match.group(1).strip()
+        if command in ("|", ">", "|-", ">-"):
+            command, index = _block_scalar(lines, index, len(line) - len(line.lstrip()))
+        if command:
+            found.append(("%s, step %s" % (path, step_name or str(run_number)), command))
+    return found
+
+
 def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
     try:
         commands = json.loads(env.get("LOOM_EVIDENCE_CMDS", "{}") or "{}")
@@ -1667,41 +1715,8 @@ class Station:
             if not path.endswith((".yml", ".yaml")):
                 continue
             workflow = self._contents_text(repo, path)
-            has_pull_request = workflow is not None and bool(re.search(
-                r"(?m)^\s*pull_request\s*(?::|,|\])|^\s*on:\s*\[[^\]]*pull_request",
-                workflow))
-            if not has_pull_request:
-                continue
-            lines = workflow.splitlines()
-            index = 0
-            step_name = ""
-            run_number = 0
-            while index < len(lines):
-                if re.match(r"^\s*-\s+", lines[index]):
-                    step_name = ""
-                named = re.match(r"^\s*-\s*name:\s*(.+?)\s*$", lines[index])
-                if named:
-                    step_name = named.group(1).strip("\"'")
-                match = re.match(r"^\s*(?:-\s*)?run:\s*(.*)$", lines[index])
-                if not match:
-                    index += 1
-                    continue
-                run_number += 1
-                command = match.group(1).strip()
-                indent = len(lines[index]) - len(lines[index].lstrip())
-                index += 1
-                if command in ("|", ">", "|-", ">-"):
-                    block = []
-                    while index < len(lines):
-                        line = lines[index]
-                        if line.strip() and len(line) - len(line.lstrip()) <= indent:
-                            break
-                        block.append(line.strip())
-                        index += 1
-                    command = " ".join(part for part in block if part)
-                if command:
-                    source = "%s, step %s" % (path, step_name or str(run_number))
-                    found.append((source, command))
+            if workflow is not None and _has_pull_request_trigger(workflow):
+                found.extend(_workflow_run_steps(path, workflow))
         return False, found
 
     def file_validation_contracts(self) -> None:
