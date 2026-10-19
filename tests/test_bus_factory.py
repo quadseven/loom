@@ -2124,5 +2124,25 @@ class DeadLane(unittest.TestCase):
         self.assertEqual(factory.dead_lane(comments), "codex")
 
 
+class LaneKinds(unittest.TestCase):
+    """What each lane costs (loom#968): the Tiers page marks every tier and
+    ladder entry free, own hardware, subscription or never-paid."""
+
+    def test_every_lane_in_the_tiers_and_the_ladder_has_a_kind(self):
+        named = {lane for lanes in factory.TIERS.values() for lane in lanes}
+        named |= {lane for lanes, _ in factory.LADDER for lane in lanes}
+        missing = sorted(lane for lane in named if lane not in factory.LANE_KINDS)
+        self.assertEqual(missing, [])
+        self.assertEqual(set(factory.LANE_KINDS.values()) - set(factory.KINDS), set())
+
+    def test_sparks_are_own_hardware_and_the_free_pool_is_free(self):
+        self.assertEqual({factory.LANE_KINDS[lane] for lane in factory.SPARKS}, {"own-hardware"})
+        self.assertEqual({factory.LANE_KINDS[lane] for lane in factory.FREE_POOL}, {"free"})
+        self.assertEqual({factory.LANE_KINDS[lane] for lane in factory.ANTHROPIC}, {"never-paid"})
+        self.assertEqual(factory.LANE_KINDS["claude"], "subscription")
+        self.assertEqual(factory.lane_kind("anthropic-9"), "never-paid")
+        self.assertIsNone(factory.lane_kind("no-such-lane"))
+
+
 if __name__ == "__main__":
     unittest.main()

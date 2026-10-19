@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -81,6 +82,21 @@ _ATTEMPTS = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, b
 _LATEST = ("SELECT DISTINCT ON (ticket) id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at "
            "FROM transcripts ORDER BY ticket, started_at DESC")
 _GET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE id=%s"
+# Run outcomes per lane and model over the last 7 days and the last 24 hours,
+# with the median run time, for the Tiers and allowances page (loom#968). A
+# numbered slot counts with its lane (codex-2 with codex), and the slots are
+# listed. Brain ticks are not lane runs. No percent sign: pg8000's format
+# paramstyle reads one as a placeholder.
+_OUTCOMES = ("SELECT regexp_replace(slot, '-[0-9]+$', '') AS lane, model, outcome, "
+             "array_agg(DISTINCT slot) AS slots, "
+             "count(*) FILTER (WHERE started_at >= now() - interval '24 hours') AS runs_24h, "
+             "count(*) AS runs_7d, "
+             "percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM finished_at - started_at)::float8) "
+             "FILTER (WHERE started_at >= now() - interval '24 hours') AS p50_24h_s, "
+             "percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM finished_at - started_at)::float8) "
+             "AS p50_7d_s "
+             "FROM transcripts WHERE started_at >= now() - interval '7 days' AND left(ticket, 6) <> 'brain/' "
+             "GROUP BY 1, model, outcome")
 RETENTION_DAYS = 180
 _PURGE = "DELETE FROM transcripts WHERE started_at < now() - INTERVAL '%d days'" % RETENTION_DAYS  # noqa: S608 - RETENTION_DAYS is a fixed integer constant, not user input.
 
@@ -117,6 +133,30 @@ class MemoryBackend:
 
     def get(self, id_: int):
         return next((dict(r) for r in self.rows if r["id"] == id_), None)
+
+    def outcomes(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """What _OUTCOMES answers, from the rows in memory."""
+        now = now or datetime.now(timezone.utc)
+        groups: Dict[tuple, Dict[str, List[float]]] = {}
+        for r in self.rows:
+            if r["ticket"].startswith("brain/"):
+                continue
+            started = datetime.fromisoformat(r["started_at"].replace("Z", "+00:00"))
+            age = (now - started).total_seconds()
+            if age > 7 * 86400:
+                continue
+            took = (datetime.fromisoformat(r["finished_at"].replace("Z", "+00:00")) - started).total_seconds()
+            lane = re.sub(r"-[0-9]+$", "", r["slot"])
+            group = groups.setdefault((lane, r["model"], r["outcome"]), {"24h": [], "7d": [], "slots": set()})
+            group["slots"].add(r["slot"])
+            group["7d"].append(took)
+            if age <= 86400:
+                group["24h"].append(took)
+        return [{"lane": lane, "model": model, "outcome": outcome, "slots": sorted(g["slots"]),
+                 "runs_24h": len(g["24h"]), "runs_7d": len(g["7d"]),
+                 "p50_24h_s": statistics.median(g["24h"]) if g["24h"] else None,
+                 "p50_7d_s": statistics.median(g["7d"]) if g["7d"] else None}
+                for (lane, model, outcome), g in groups.items()]
 
     def initialize(self):
         return None
@@ -205,6 +245,17 @@ class PostgresBackend:
         finally:
             conn.close()
 
+    def outcomes(self, now=None):
+        """_OUTCOMES, timed by the database's own clock (now is unused)."""
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(_OUTCOMES, ())
+            names = [column[0] for column in cur.description]
+            return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
     def get(self, id_):
         conn = self._connect()
         try:
@@ -277,6 +328,22 @@ class Store:
 
     def get(self, id_):
         return plain(self.backend.get(id_))
+
+    def model_outcomes(self, now=None):
+        """[{lane, model, outcome, slots, runs_24h, runs_7d, p50_24h_s,
+        p50_7d_s}]: lane runs per lane (its numbered slots with it), model
+        and outcome over the last 7 days and the last 24 hours, with each
+        window's median run time in seconds."""
+        out = []
+        for row in self.backend.outcomes(now):
+            item = dict(row)
+            for key in ("runs_24h", "runs_7d"):
+                item[key] = int(item.get(key) or 0)
+            for key in ("p50_24h_s", "p50_7d_s"):
+                item[key] = None if item.get(key) is None else float(item[key])
+            item["slots"] = [str(slot) for slot in item.get("slots") or []]
+            out.append(item)
+        return out
 
     def latest(self):
         """{ticket: its newest run} over every ticket with a stored run."""

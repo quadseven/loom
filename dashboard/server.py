@@ -990,6 +990,8 @@ def _dispatch_get(handler, state):
         return _dispatch_free(handler, state, parsed)
     if path == "/usage":
         return _dispatch_usage(handler, state)
+    if path == "/tiers":
+        return _dispatch_tiers(handler, state)
     if path in ("/brain", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
     if path in ("/", "/goals", "/tickets"):
@@ -1150,6 +1152,58 @@ def _dispatch_usage(handler, state):
     models = {lane: model for lane in lanes for model in [bus_brain._lane_model(lane)] if model}
     data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models)
     return handler.send_page(page("Usage", "usage", usage_store.render(data),
+                                  status="stale" if payload.get("stale") else "live"))
+
+
+def _tiers_usage(state, now):
+    """The station's usage readings as a Tiers page source envelope: stale
+    when none has arrived since the dashboard started, or the newest is older
+    than the Usage page's limit."""
+    store = getattr(state, "usage", None)
+    received = getattr(store, "received_at", None)
+    envelope = {"name": "Usage readings", "configured": True, "missing": "", "data": None,
+                "last_good_at": None, "stale": True,
+                "error": "no usage snapshot since the dashboard started (the station uploads one each pass)"}
+    if received is None:
+        return envelope
+    age = (now - received).total_seconds()
+    envelope.update(data=[row for items in store.providers.values() for row in items],
+                    last_good_at=received.timestamp(), stale=age > usage_store.STALE_AFTER,
+                    error="" if age <= usage_store.STALE_AFTER else "no station upload in %dh" % (age // 3600))
+    return envelope
+
+
+def _tiers_station(state, payload):
+    """The running Loom tickets the dashboard already holds, as a Tiers page
+    source envelope: stale with the ticket snapshot."""
+    read = any(rows is not None for rows in (payload.get("tickets") or {}).values())
+    runs = []
+    if read:
+        entered = payload.get("state_entered") or {}
+        for row in _all_tickets(state):
+            if row.get("state") == "running" and row.get("open", True):
+                runs.append({"repo": row.get("repo"), "number": row.get("number"), "title": row.get("title"),
+                             "lane": row.get("lane"), "model": row.get("run_model") or row.get("model"),
+                             "age": tickets_table.age_in_state(row, entered, time.time())[0],
+                             "html_url": row.get("html_url")})
+    stale = bool(payload.get("stale")) or not read
+    return {"name": "Station tickets", "configured": True, "missing": "", "data": runs if read else None,
+            "last_good_at": payload.get("ticket_refreshed_at"), "stale": stale,
+            "error": (payload.get("stale_reason") or "GitHub could not refresh ticket data") if read and stale
+            else ("" if read else "ticket data not read yet")}
+
+
+def _dispatch_tiers(handler, state):
+    """The Tiers and allowances page (loom#968), from the background reads:
+    a request never reads the gateway, Grug or the database."""
+    from . import tiers, tiers_sources
+    now = datetime.now(timezone.utc)
+    payload = state.response() if hasattr(state, "response") else {}
+    background = getattr(state, "tier_sources", None)
+    snapshot = background.snapshot() if background is not None else tiers_sources.empty_snapshot()
+    sources = dict(snapshot, usage=_tiers_usage(state, now), station=_tiers_station(state, payload))
+    body = tiers.render(tiers.build(sources, now))
+    return handler.send_page(page("Tiers and allowances", "tiers", body,
                                   status="stale" if payload.get("stale") else "live"))
 
 

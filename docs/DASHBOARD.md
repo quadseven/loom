@@ -145,6 +145,49 @@ covering tickets from the ticket records and the comment feed every pass
 already holds. Issues whose Loom ticket is closed or merged are listed to
 check.
 
+`/tiers` (Tiers and allowances, loom#968) shows the whole tier system in
+one page. "Tiers" lists Loom's easy, medium and hard lanes in order and the
+model ladder (`TIERS` and `LADDER` in `bus/factory.py`), each lane with the
+model it runs and its kind from `LANE_KINDS`: own hardware (the Sparks),
+free, subscription or never paid (a prepaid credit the operator does not top
+up), then Grug's review order. "Providers and models" has one row per
+provider and model: the gateway's rows (calls, per target and model) and
+Loom's own lane runs (per lane and model, a numbered slot with its lane).
+Each row has its allowance state (available; cooling until a time, with the
+window; the tightest fresh meter's amount left; or benched with the reason)
+and its hits, success rate and median latency over 24 hours and 7 days.
+Success is ok out of the hits that were not limits, so a row whose every hit
+was a limit reads "n/a", not 0%. "Live now" lists the running Loom tickets,
+the gateway's calls in flight and Grug's reviews in flight.
+
+Its sources are read once a background refresh pass, side by side, each with
+a 5 second timeout, never by a page request (`dashboard/tiers_sources.py`):
+
+- `LOOM_GATEWAY_URL`: the inference gateway's base URL inside the
+  dashboard's own network, no token. `GET /ui/stats?window=24h` and
+  `?window=7d` give the per provider and model counts and the breaker lanes
+  cooling now (`open`), the gateway half of allowance state; `GET /ui/state`
+  gives `inflight`. Unset, those panels say so.
+- `LOOM_GRUG_STATS_URL` and the optional bearer token
+  `LOOM_GRUG_STATS_TOKEN`: Grug's stats endpoint, read for an `inflight`
+  list of `{persona, repo, pr, model, started_at}` and its review order
+  (`tiers`, `review_order` or `order`: model names, or objects with `model`
+  and `backend`). Unset, the Grug panels say "not configured yet"; with no
+  order listed, the order says it is waiting for Grug's endpoint.
+- The transcript store: lane runs per lane, model and outcome over the last
+  7 days and 24 hours, with the median run time (`Store.model_outcomes`).
+  Brain ticks are not counted.
+- The usage readings the station uploads (`POST /api/usage`): Loom lanes'
+  holds and meters, the Loom half of allowance state.
+- The ticket snapshot: the open tickets labelled `loom:running`.
+
+Each source keeps its last good answer and when it was read. A read that
+fails, times out or answers 503 (the gateway's ledger is off) marks that
+source stale: its panel says so with the error and the last good read time
+and keeps showing the last good figures, while the rest of the page renders
+as usual. A source with no answer at all leaves its cells "unknown", never
+zero. A redirect is not followed, and an answer over 4 MiB is refused.
+
 `/goals` shows one card per top-level goal home. A goal home rolls up into a
 bigger one through a `Parent goal: OWNER/NAME#N` line in its body or its
 GitHub sub-issue parent, and then shows as a row inside that card. A pass

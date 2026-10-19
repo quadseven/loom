@@ -193,6 +193,26 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # public repos (agy stays public only).
     "hard": SPARKS + ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
 }
+# What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
+# own-hardware (the Sparks), free (a free provider's allowance), subscription
+# (a plan with a usage window: claude, codex, opencode-go, agy on the
+# operator's Google plan, muse) or never-paid (a prepaid API credit the
+# operator does not top up, LOOM_NO_TOPUP: the anthropic slots). Every lane
+# TIERS and LADDER name has one (tests/test_bus_factory.py LaneKinds).
+KINDS = ("own-hardware", "free", "subscription", "never-paid")
+LANE_KINDS: Dict[str, str] = {
+    **{lane: "own-hardware" for lane in SPARKS},
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai")},
+    **{lane: "subscription" for lane in ("claude", "codex", "codex-2", "opencode-go", "opencode-go-2",
+                                         "opencode-go-3", "opencode-go-4", "agy", "muse")},
+    **{lane: "never-paid" for lane in ANTHROPIC},
+}
+
+
+def lane_kind(lane: str) -> Optional[str]:
+    """LANE_KINDS for a lane or a numbered slot of one (anthropic-9 is an
+    anthropic slot); None for a lane it does not know."""
+    return LANE_KINDS.get(lane) or LANE_KINDS.get(re.sub(r"-[0-9]+$", "", lane))
 # The strongest model each lane has, for a hard ticket with no Model: line
 # (bus/tickets.py render_brief writes it into the brief, so run_lane.sh runs
 # it instead of the lane default). Artificial Analysis Intelligence Index at

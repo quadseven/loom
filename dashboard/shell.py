@@ -14,6 +14,7 @@ VIEWS = (
     ("improving", "Improving", "/improving"),
     ("lanes", "Lanes and models", "/lanes"),
     ("usage", "Usage", "/usage"),
+    ("tiers", "Tiers and allowances", "/tiers"),
     ("operators", "Operators", "/operators"),
     ("needs-you", "Needs you", "/needs-you"),
     ("free", "Free to take", "/free"),
