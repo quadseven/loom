@@ -131,7 +131,7 @@ def limit(body: Dict[str, Any]) -> Dict[str, Any]:
             break
         keep[i] = False
         total -= _size(events[i]) + 1
-    return dict(body, events=[e for e, k in zip(events, keep) if k])
+    return dict(body, events=[e for e, k in zip(events, keep, strict=True) if k])
 
 
 def _utc(at: float) -> str:
