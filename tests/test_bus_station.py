@@ -5260,6 +5260,31 @@ class ReportsTest(Base):
         self.assertIn("Needs difficulty: #41 Needs a tier.", body)
         self.assertEqual(body.count("Needs difficulty:"), 1)
 
+    def test_one_goals_failed_standup_does_not_skip_the_other_goals(self):
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        for number in (40, 41):
+            self.add_goal(number)
+            self.comment(number, 1, "<!-- loom:report v1 -->\nold report")
+            self.fake.comments[number][0]["created_at"] = old
+        real = brain.goal_tree
+
+        def tree(gh, repo, number):
+            if number == 40:
+                raise station.GitHubError("server error", 500)
+            return real(gh, repo, number)
+
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        with mock.patch.object(brain, "goal_tree", side_effect=tree):
+            st.post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 1)
+        self.assertTrue(self.fake.comments[41][-1]["body"].startswith(station.REPORT_MARKER))
+        with open(os.path.join(st.state, "standups.json")) as fh:
+            state = json.load(fh)
+        self.assertIn("%s#41" % REPO, state)
+        self.assertNotIn("%s#40" % REPO, state)
+
     def report_aged(self, seconds):
         self.add_goal()
         self.comment(40, 1, "<!-- loom:report v1 -->\nearlier report")
