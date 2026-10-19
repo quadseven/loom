@@ -841,6 +841,22 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
                          "bot's plan checks: " + "; ".join(found))
 
 
+def _check_live_criterion(body: str) -> None:
+    """A Live criterion names at least one exact string the station can look
+    for: a log line, field or endpoint in backticks or double quotes. Without
+    one, no verify brief carries log data and the ticket can only stay
+    shipped (2026-10-18: 3 of 72 merged tickets verified, most refused for
+    missing evidence on criteria written as prose)."""
+    found = _LIVE_LINE.search(body or "")
+    if not found:
+        return
+    from .evidence import needles
+    if not needles(found.group(1)):
+        raise ValueError("the Live criterion names no exact string the station can look "
+                         "for: put the log line, field or endpoint it means in backticks, "
+                         "for example `overseer: summoned` or `/api/v2/health`")
+
+
 def plan_problems(body: str) -> List[str]:
     """What the pull request body a lane generates from this brief would
     fail in the review bot's plan checks (bus/hunt_plan.py), with the Size
@@ -4064,6 +4080,9 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
                          "epics are listed by bus.brain status; open one with bus.brain epic)")
     body = _read(args.file)
     _check_brief_difficulty(body, args.lane, args.difficulty)
+    # Hand-written briefs only: health and friction intake are verified by
+    # the station's own absence tracking, not by a log string.
+    _check_live_criterion(body)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,

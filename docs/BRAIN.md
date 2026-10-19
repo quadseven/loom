@@ -188,7 +188,14 @@ findings section.
 checks (bus/hunt_plan.py mirrors them: Why of at least 5 words, at least 3
 non-empty Acceptance criteria bullets, a Size of XS, S, M or L, a non-empty
 Out of scope), and files a Size written as a word (Small, Medium, Large) as
-its letter. Triage counts the same checks as missing sections. The size may
+its letter. `brief` (and the station's rewrite step) also refuses a Live
+criterion (the acceptance line that starts with "Live") that names no exact
+string in backticks or double quotes; health and friction intake tickets are
+verified by the station's own absence tracking and are exempt. The string is
+the log line, field or endpoint the proof will show, for example
+`overseer: summoned` or `/api/v2/health`. The station searches its log
+command for that string before it spends a verify run (bus/evidence.py), so
+a criterion written as prose can never be verified. Triage counts the same checks as missing sections. The size may
 be a `## Size` section or one line of its own, `Size: XS|S|M|L` (any case,
 optionally bold); triage, `brief`, the rewrite check, the runner and PR
 repair all read it through `hunt_plan.stated_size`. The runner
