@@ -30,7 +30,7 @@ order, instead of waiting for someone to notice and file them.
 
 | Field | Shape | Meaning |
 |---|---|---|
-| `key` | `[A-Za-z0-9:._ -]{1,120}` | Stable id of one problem: the same problem has the same key on every read. Loom stores and shows only its sha1. |
+| `key` | `[A-Za-z0-9:._ '-]{1,120}` | Stable id of one problem: the same problem has the same key on every read. Loom stores and shows only its sha1. The apostrophe is in the shape because names inside the product carry one; the key is never shown, so it leaks nothing. |
 | `title` | ASCII, one line, at most 90 characters | What is wrong, in plain words. |
 | `area` | `[a-z-]{1,20}` | The part of the project (checkout, search, billing, ...). |
 | `affected` | number, 0 to 10000000 | How many things it hits now (members, runs, items). |

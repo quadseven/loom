@@ -213,6 +213,26 @@ class Intake(Base):
                 with self.assertRaises(health.NotLooked):
                     health.findings(doc)
 
+    def test_a_key_with_an_apostrophe_is_read_and_its_finding_returned(self):
+        # A live key carrying an apostrophe blinded intake to every finding of
+        # its goal: one key outside the shape made the whole read "not looked".
+        key = "stuck:Waiting on Member 7's card"
+        item = finding(key=key, title="Member 7's card is never charged")
+        found, refused = health.findings({"findings": [item]})
+        self.assertEqual([f.key for f in found], [key])
+        self.assertEqual(refused, {})
+        self.doc["findings"] = [item]
+        self.run_once()
+        self.assertEqual(len(self.briefs), 1)
+        self.assertEqual(self.said, ["health %s#1: briefed https://github.com/%s/issues/100 (P1)"
+                                     % (REPO, REPO)])
+
+    def test_a_key_with_a_character_outside_the_contract_is_still_not_looked(self):
+        for key in ("stuck:Waiting on Member `7` card", "stuck:Waiting on Member 7\ncard"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(health.NotLooked, "finding field key"):
+                    health.findings({"findings": [finding(key=key)]})
+
     def test_text_that_could_leak_refuses_the_finding_without_a_scrub(self):
         leaks = ["see https://example.com/x", "visit www.example", "host 10.0.0.12 is down",
                  "the box at srv-1.example.lan", "mail ops@example.com", "ask the bot @someone",

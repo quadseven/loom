@@ -64,7 +64,11 @@ EVIDENCE_MARKER = "<!-- loom:health-evidence -->"
 ABSENT_MARKER = "<!-- loom:health-absent -->"
 # The contract's shapes. A field outside its pattern breaks the contract and
 # the whole read is "not looked" (half a list would read as cleared).
-KEY_RE = re.compile(r"[A-Za-z0-9:._ -]{1,120}")
+# The key's characters reach no public surface: only its sha1 is stored and
+# shown, so an apostrophe in a name the endpoint's own vocabulary uses (an item,
+# a plan, a possessive) leaks nothing, and refusing one blinded intake to every
+# finding of the goal (loom#850).
+KEY_RE = re.compile(r"[A-Za-z0-9:._ '-]{1,120}")
 AREA_RE = re.compile(r"[a-z-]{1,20}")
 TIME_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 NUMBER_MAX = 1e7
