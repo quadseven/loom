@@ -6163,6 +6163,7 @@ class VerifyDueTest(unittest.TestCase):
     def test_oldest_shipped_proofless_ticket_and_six_hour_cooldown(self):
         def item(number, shipped_at, **extra):
             return (REPO, {"number": number, "state": "open", "shipped_at": shipped_at,
+                           "body": "- [ ] Live: prints `status ready`",
                            "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}],
                            **extra})
         tickets = [item(2, 200), item(1, 100), item(3, 50, has_proof=True)]
@@ -6174,9 +6175,17 @@ class VerifyDueTest(unittest.TestCase):
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]}
         self.assertEqual(station.verify_due([(REPO, issue)], {}, 99999), [])
 
+    def test_verify_due_skips_live_lines_without_exact_strings(self):
+        missing = {"number": 4, "state": "open", "shipped_at": 1,
+                   "body": "- [ ] Live: the status appears", "labels": [
+                       {"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+        exact = dict(missing, number=5, body='- [ ] Live: prints `ready`')
+        self.assertEqual([i["number"] for _, i in station.verify_due(
+            [(REPO, missing), (REPO, exact)], {}, 99999)], [5])
+
 
 SHIPPED_BODY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
-                "- [ ] A test passes\n- [ ] Live: the daily line shows it\n")
+                "- [ ] A test passes\n- [ ] Live: prints `daily status ready`\n")
 HOUR = 3600
 
 
@@ -6226,7 +6235,7 @@ class VerifyDispatchTest(Base):
 
     def test_verify_brief_quotes_each_requested_log_line_with_a_twenty_line_cap(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
-            "the daily line shows it", "see `server ready` and `presence flag:` in the log")
+            "prints `daily status ready`", "see `server ready` and `presence flag:` in the log")
         script = os.path.join(self._tmp.name, "evidence.py")
         self.write(script, "import os\n" "needle = os.environ['LOOM_EVIDENCE_NEEDLE']\n"
                    "for n in range(25): print(f'{needle} line {n}')\n")
@@ -6241,7 +6250,7 @@ class VerifyDispatchTest(Base):
 
     def test_unsafe_log_lines_are_dropped_and_counted(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
-            "the daily line shows it", "see `presence flag:` in the log")
+            "prints `daily status ready`", "see `presence flag:` in the log")
         self.settings.evidence_cmds = {REPO: "printf 'presence flag: safe\\npresence flag: token=abc123\\npresence flag: node.home\\n'"}
         self.run_pass()
         brief = self.text()
@@ -6252,7 +6261,7 @@ class VerifyDispatchTest(Base):
 
     def test_log_needles_after_the_brief_live_summary_are_still_requested(self):
         live = "see " + "details " * 45 + "`late line`"
-        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("the daily line shows it", live)
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("prints `daily status ready`", live)
         self.settings.evidence_cmds = {
             REPO: "printf '%s observed\\n' \"$LOOM_EVIDENCE_NEEDLE\""}
         self.run_pass()
@@ -6260,7 +6269,7 @@ class VerifyDispatchTest(Base):
 
     def test_double_quoted_live_strings_are_searched_like_backticked_ones(self):
         live = 'the log shows "pin bumped" and `server ready`, not `grep "inner"`'
-        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("the daily line shows it", live)
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("prints `daily status ready`", live)
         self.settings.evidence_cmds = {
             REPO: "printf '%s observed\\n' \"$LOOM_EVIDENCE_NEEDLE\""}
         self.run_pass()
@@ -6274,7 +6283,7 @@ class VerifyDispatchTest(Base):
     def test_at_most_five_ascii_short_strings_are_searched(self):
         values = ["one", "two", "three", "four", "five", "six", "x" * 121, "caf\u00e9"]
         live = "see " + " ".join("`%s`" % value for value in values)
-        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("the daily line shows it", live)
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("prints `daily status ready`", live)
         self.settings.evidence_cmds = {
             REPO: "printf '%s observed\\n' \"$LOOM_EVIDENCE_NEEDLE\""}
         self.run_pass()
@@ -6286,7 +6295,7 @@ class VerifyDispatchTest(Base):
 
     def test_evidence_timeout_quotes_nothing_and_says_so(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
-            "the daily line shows it", "see `presence flag:` in the log")
+            "prints `daily status ready`", "see `presence flag:` in the log")
         self.settings.evidence_cmds = {REPO: "fake evidence command"}
         with mock.patch.object(station.evidence.subprocess, "Popen") as popen, \
              mock.patch.object(station.evidence.os, "killpg") as kill:
@@ -6305,7 +6314,9 @@ class VerifyDispatchTest(Base):
         # 2026-10-18: a live criterion waiting on a rare in-game event got
         # a verify run and an emailed comment every 6 hours for days.
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
-            "the daily line shows it", "see `presence flag:` in the log")
+            "prints `daily status ready`", "see `presence flag:` in the log")
+        self.fake.issues[1]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it")
         self.settings.evidence_cmds = {REPO: "fake evidence command"}
         with mock.patch.object(station.evidence.subprocess, "Popen") as popen:
             popen.return_value.communicate.return_value = ("other line\n", "")
@@ -6317,9 +6328,41 @@ class VerifyDispatchTest(Base):
         self.assertEqual(self.fake.comments[2], [])
         self.assertEqual(popen.call_count, 1)
 
+    def test_verify_pool_never_hands_ticket_with_unsearchable_live_line(self):
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.now = time.time() + 1
+        with mock.patch.object(st, "_shipped_stamp", return_value=1), \
+             mock.patch.object(st, "_proven", return_value=False):
+            pool, _ = st._verify_pool({})
+        self.assertNotIn(2, [issue["number"] for _, issue in pool])
+        self.fake.issues[1]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "prints `status ready`")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.now = time.time() + 1
+        with mock.patch.object(st, "_shipped_stamp", return_value=1), \
+             mock.patch.object(st, "_proven", return_value=False):
+            pool, _ = st._verify_pool({})
+        self.assertIn(1, [issue["number"] for _, issue in pool])
+
+    def test_restate_live_uses_rewrite_command_and_does_not_comment(self):
+        self.fake.private = False
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it")
+        self.settings.rewrite_cmd = "agent"
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.now = time.time()
+        with mock.patch.object(st, "_rewrite_goals", return_value=[]), \
+             mock.patch.object(st, "_rewrite_command", return_value="agent"), \
+             mock.patch.object(station.rewrite, "run_agent", return_value='{"action":"restate","line":"Live: prints `the string`"}'):
+            st.restate_shipped_live()
+        self.assertIn("Live: prints `the string`", self.fake.issues[2]["body"])
+        self.assertEqual(self.fake.comments[2], [])
+
     def test_a_log_line_for_the_live_criterion_hands_the_run_and_quotes_it_once(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
-            "the daily line shows it", "see `presence flag:` in the log")
+            "prints `daily status ready`", "see `presence flag:` in the log")
         self.settings.evidence_cmds = {REPO: "fake evidence command"}
         with mock.patch.object(station.evidence.subprocess, "Popen") as popen:
             popen.return_value.communicate.return_value = ("presence flag: safe\n", "")
@@ -6332,7 +6375,7 @@ class VerifyDispatchTest(Base):
 
     def test_repo_without_evidence_command_runs_nothing(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
-            "the daily line shows it", "see `presence flag:` in the log")
+            "prints `daily status ready`", "see `presence flag:` in the log")
         with mock.patch.object(station.evidence.subprocess, "Popen") as run:
             self.run_pass()
         run.assert_not_called()
@@ -6475,7 +6518,7 @@ class VerifyDispatchTest(Base):
         data = self.github_data()
         self.assertEqual(data.count("pull request"), 1)
         self.assertIn("- No merged pull request names this ticket.", data)
-        self.assertIn("- [ ] Live: the daily line shows it", data)
+        self.assertIn("- [ ] Live: prints `daily status ready`", data)
 
     def test_a_github_failure_is_one_line_and_the_brief_still_goes_out(self):
         self.merged(77, "d" * 40)
@@ -6578,7 +6621,7 @@ class VerifyResultTest(Base):
                "observed": {"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T01:00:00Z"},
                "sources": ["https://example.com/logs/1"],
                "criteria": [{"criterion": "A test passes", "result": "pass", "evidence": "ci"},
-                            {"criterion": "Live: the daily line shows it", "result": "pass",
+                            {"criterion": "Live: prints `daily status ready`", "result": "pass",
                              "evidence": "daily line seen at 2026-10-15T14:11Z"}]}
         out.update(changes)
         return out
