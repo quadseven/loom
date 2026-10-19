@@ -208,6 +208,9 @@ class FakeGitHub:
             self.issues[n]["labels"] = [lab for lab in self.issues[n]["labels"]
                                         if lab["name"] != unquote(gone.group(2))]
             return reply(200, [])
+        tl = re.match(r"issues/(\d+)/timeline$", rest)
+        if method == "GET" and tl:
+            return reply(200, getattr(self, "timelines", {}).get(int(tl.group(1)), []))
         m = re.match(r"issues/(\d+)(?:/(\w+))?$", rest)
         if m:
             return self._issue_call(method, int(m.group(1)), m.group(2), data)
@@ -216,6 +219,10 @@ class FakeGitHub:
             return reply(201, data)
         if method == "GET" and rest == "pulls":
             return reply(200, self.pulls)
+        one = re.match(r"pulls/(\d+)$", rest)
+        if method == "GET" and one:
+            hit = [p for p in self.pulls if p.get("number") == int(one.group(1))]
+            return reply(200, hit[0]) if hit else reply(404, {"message": "Not Found"})
         if method == "GET" and rest.startswith("compare/"):
             base = rest[len("compare/"):].split("...", 1)[0]
             return reply(200, {"status": "ahead" if base in self.carried else "behind"})
@@ -1044,6 +1051,41 @@ class ShipDeployedTest(Base):
     def ship(self, transport=None):
         gh = GitHub("token", transport=transport or self.fake)
         station.Station(gh, self.settings, ancestor=self.ancestor).ship_deployed()
+
+    def test_an_adoption_ticket_ships_through_the_pull_request_its_title_names(self):
+        # A "Land or supersede #N" ticket has no Refs line or loom branch on its
+        # pull request: five never shipped (2026-10-19).
+        self.fake.add(12, state="merged")
+        self.fake.issues[12]["title"] = "Land or supersede #77: A fix"
+        sha = "%040x" % 77
+        self.fake.pulls.append({"number": 77, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                                "merge_commit_sha": sha, "body": "A fix.", "head": {"ref": "a-fix"}})
+        self.carried.add(sha)
+        self.record_deploy()
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertIn("#77", self.fake.comments[12][-1]["body"])
+
+    def test_a_merged_ticket_past_the_closed_pull_window_ships_via_its_cross_reference(self):
+        # Three tickets merged a day before sat outside the closed-pull window
+        # and never shipped (2026-10-19).
+        self.fake.add(12, state="merged")
+        sha = "%040x" % 88
+        pr = {"number": 88, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+              "merge_commit_sha": sha, "body": "Refs %s#12" % REPO, "head": {"ref": "loom/12-fix"}}
+        self.fake.pulls.append(pr)
+        self.carried.add(sha)
+        self.fake.timelines = {12: [{"event": "cross-referenced", "source": {"issue": {
+            "number": 88, "pull_request": {}, "repository": {"full_name": REPO}}}}]}
+        self.record_deploy()
+        real = self.fake
+
+        def transport(method, url, headers, body):
+            if "/pulls?state=closed" in url:  # outside the window: the list misses it
+                return (200, {}, b"[]")
+            return real(method, url, headers, body)
+        self.ship(transport=transport)
+        self.assertIn("loom:shipped", self.fake.names(12))
 
     def test_a_ticket_the_deployed_revision_carries_ships_with_the_revision_in_its_note(self):
         self.merged(12, 99)

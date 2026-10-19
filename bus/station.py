@@ -3476,6 +3476,10 @@ class Station:
         if not merged:
             return
         latest = self._merged_pulls(repo, merged)
+        for number in sorted(merged - set(latest))[:SHIP_PER_PASS]:
+            pr = self._ticket_pull_beyond_window(repo, number)
+            if pr is not None:
+                latest[number] = pr
         groups = self._ticket_pulls(repo, set(latest))
         hands = self._hand_reverts(repo, self._closed_pulls(repo))
         carried = sorted((str(pr["merged_at"]), number, pr)
@@ -3488,6 +3492,39 @@ class Station:
                            "the station deployed revision %s at %s" % (
                                revision[:12], self._utc(at)),
                            "deployed %s" % revision[:12])
+
+    def _ticket_pull_beyond_window(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
+        """The merged pull request of a merged ticket that _merged_pulls did
+        not find: the one an adoption ticket ("Land or supersede #N") names
+        in its title, else the newest merged one whose Refs line or loom
+        branch names the ticket among those that cross-reference it. Neither
+        was read, so five adoption tickets and three tickets merged a day
+        before never shipped while the station deployed their merges
+        (2026-10-19). None when there is none."""
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+            adopted = re.match(r"Land or supersede #([0-9]+)\b", str((issue or {}).get("title") or ""))
+            numbers = [int(adopted.group(1))] if adopted else []
+            if not numbers:
+                for event in self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)):
+                    source = (event or {}).get("source") or {}
+                    ref = source.get("issue") or {}
+                    if (event.get("event") == "cross-referenced" and "pull_request" in ref
+                            and str((ref.get("repository") or {}).get("full_name") or "") == repo):
+                        numbers.append(int(ref["number"]))
+            found = []
+            for pr_number in numbers:
+                pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data
+                if (isinstance(pr, dict) and pr.get("merged_at")
+                        and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))
+                        and (adopted or self._pr_ticket_number(repo, pr) == number)):
+                    found.append(pr)
+        except RateLimited:
+            raise
+        except (GitHubError, ValueError, TypeError) as err:
+            _say("could not find the merged pull request of %s#%d: %s" % (repo, number, err))
+            return None
+        return max(found, key=lambda pr: str(pr["merged_at"])) if found else None
 
     def _merged_tickets(self, repo: str) -> set:
         """The numbers of the repo's open merged tickets."""
