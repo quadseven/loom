@@ -83,10 +83,6 @@ def _comment_step(comment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     body = str(comment.get("body") or "").strip()
     ts = comment.get("created_at") or ""
     rung = RUNG_RE.search(body)
-    escalate = ESCALATE_RE.match(body)
-    if escalate:
-        return {"who": "brain", "ts": ts, "text": "%s." % escalate.group(1),
-                "meta": " ".join((escalate.group(3) or "").split())[:180]}
     if rung:
         model = re.search(r"^Model:\s*(\S+)", body, re.M)
         return {"who": "brain", "ts": ts, "text": "Climbed the model ladder to rung %s." % rung.group(1),
@@ -100,10 +96,12 @@ def _comment_step(comment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             (MOVED_RE, lambda m: {"who": "brain", "text": "Moved to lane %s; it never ran there." % m.group(1)}),
             (UNAVAILABLE_RE, lambda m: {"who": "wait", "text": "Lane %s handed it back: %s." % (
                 m.group(1), " ".join(m.group(2).split())[:180])}),
+            (ESCALATE_RE, lambda m: {"who": "brain", "text": "%s." % m.group(1),
+                                     "meta": " ".join((m.group(3) or "").split())[:180]}),
             (SHIPPED_RE, lambda m: {"who": "brain", "text": " ".join(body.split())[:180]})):
         match = pattern.match(body)
         if match:
-            return dict(build(match), ts=ts, meta="")
+            return dict({"meta": ""}, **build(match), ts=ts)
     if body.startswith("<!-- loom:fix"):
         threads = len(re.findall(r"^### Thread ", body, re.M))
         found = len(re.findall(r"^### Check: ", body, re.M))
