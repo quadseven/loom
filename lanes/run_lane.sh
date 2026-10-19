@@ -932,6 +932,16 @@ record_model_limit() {
     printf '%s %s %s\n' "$model" "$ends" "$(printf '%s' "$why" | tr -cd '[:alnum:] ._:-')"; } > "$tmp"
   mv "$tmp" "$MODEL_LIMIT_FILE"
 }
+# The epoch the last of the lane's configured models comes off its limit;
+# fails when one of them is not limited now.
+all_models_limited_until() {
+  local model ends last=0
+  for model in $CONFIGURED_MODELS; do
+    ends="$(model_limit_until "$model")" || return 1
+    [ "$ends" -gt "$last" ] && last="$ends"
+  done
+  [ "$last" -gt 0 ] && printf '%s' "$last"
+}
 ladder_reason() {
   local models="$1" model ends why="" first=1
   for model in $models; do
@@ -1733,6 +1743,13 @@ if ! lane_ready; then
   # A limited lane, or one whose key expired, still passes over its inbox, to
   # hand every brief on.
   [ -n "$LIMITED" ] || [ -n "$AUTH_HELD" ] || exit 0
+elif [ -n "$CONFIGURED_MODELS" ] && ALL_LIMITED_UNTIL="$(all_models_limited_until)"; then
+  # Every model of the lane's ladder is limited: the lane is unavailable
+  # until the last lifts. Said available, the station claimed a ticket here
+  # every few minutes that failed at once on "all models limited" (agy, an
+  # account quota on all four of its models, 2026-10-19).
+  LIMITED=1
+  heartbeat false "limit: all models limited: $(ladder_reason "$CONFIGURED_MODELS")" "$ALL_LIMITED_UNTIL"
 else
   heartbeat true ""
   lane_meter
