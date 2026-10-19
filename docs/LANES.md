@@ -75,8 +75,9 @@ lane and CI cannot drift apart. Unknown lines are refused.
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
   recovered.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
-  HOME (`run/<lane>-check`), under `sandbox-exec`, with network but no
-  access to the runner's HOME. A machine without `sandbox-exec` fails setup
+  HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
+  runner's HOME, but with the network and the writes outside HOME a step's
+  setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
@@ -777,7 +778,8 @@ Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
 lists under its own name and reads as its lane. It binds localhost only and
 answers only localhost Host headers; the viewer itself sends nothing off
 the machine (the uploads above do). API-lane agents run on the same machine, so their sandbox denies every
-loopback connection; they cannot query the viewer or any other local service.
+loopback connection outside their provider's port (443, and the spark endpoint's on the spark lane); they
+cannot query the viewer or any other local service.
 
 ## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
 
@@ -793,6 +795,18 @@ loopback connection; they cannot query the viewer or any other local service.
   tree but cannot read credentials, push, open, or merge; the runner does
   that with the machine's own credentials. Without `sandbox-exec` an API lane
   reports itself unavailable.
+- Writes go only to the worktree (its `.git` stays read-only) and the scratch
+  home, plus the device nodes every CLI opens (`/dev/null`, `/dev/fd/*` and a
+  few more): nothing outside HOME is writable either, `/tmp`, the runner's
+  temp directory and Homebrew's prefix included.
+- Outbound connections go only to the provider's port: 443 (the provider's
+  HTTPS API, which also carries the CLI's own model catalogue and package
+  fetches), plus on the spark lane the port of `LOOM_SPARK_URL`. Every other
+  port, on any host, is refused. A Seatbelt profile cannot name a host, and on
+  the same port it cannot tell loopback from a remote address, so 443 stays
+  open on loopback as well; every other loopback port stays closed. DNS goes
+  through the system resolver's socket. The agy lane and the validation run
+  keep the network and their writes outside HOME.
 - A brief whose branch already has a PR in any state moves to `done/`
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
@@ -995,8 +1009,9 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - opencode against a vLLM server you run yourself, through a custom
   OpenAI-compatible provider named `spark`. `LOOM_SPARK_URL` is its base URL
-  (e.g. `http://your-spark.internal:8000/v1`, reachable from the lane machine
-  but not on its loopback, which the sandbox denies); it takes no key.
+  (e.g. `http://your-spark.internal:8000/v1`, reachable from the lane machine;
+  besides 443 the agent's sandbox opens only that URL's port, the scheme's
+  default when it names none); it takes no key.
   Models are `spark/<served model id>`, from the brief's `Model:` line or
   `LOOM_SPARK_MODEL`.
 - One slot: the server serves one stream at a time.

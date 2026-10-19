@@ -244,6 +244,9 @@ printf 'opencode %s | keyvar=%s key=%s home=%s ssh=%s ghtoken=%s fakelog=%s secr
 if printf '#!/bin/sh\\ntouch "%s/hooked"\\n' "$real_home" > .git/hooks/pre-commit 2>/dev/null \\
    && chmod +x .git/hooks/pre-commit 2>/dev/null; then hook=planted; else hook=denied; fi
 printf 'hook=%s\\n' "$hook" >> "$TMPDIR/agent.log"
+# Outside the real HOME, the tree and the scratch home: the sandbox refuses it.
+if : > "$real_home/../escaped" 2>/dev/null; then out=written; else out=denied; fi
+printf 'out=%s\\n' "$out" >> "$TMPDIR/agent.log"
 printf 'config=%s\\n' "${OPENCODE_CONFIG_CONTENT:-none}" >> "$TMPDIR/agent.log"
 # A brief carrying AGENT_FAIL=1 ends the run with an error, as a dropped
 # connection would.
@@ -1544,6 +1547,8 @@ cat > /dev/null
         self.assertIn("lo=denied", agent[0])
         # A hook planted in the tree's .git would run when the runner commits.
         self.assertIn("hook=denied", self.calls())
+        self.assertIn("out=denied", self.calls())
+        self.assertFalse((self.home.parent / "escaped").exists())
         self.assertIn("fds=ok", self.calls())
         self.assertFalse((self.home / "hooked").exists())
         # opencode's helper (title) agent must not fall back to a paid model.
@@ -1584,19 +1589,25 @@ cat > /dev/null
         profile = Path(profile_file).read_text()
         self.assertIn('(deny network-outbound (remote ip "localhost:*"))', profile)
         self.assertNotRegex(profile, r'\(allow network-outbound \(remote ip "localhost:\d+"\)\)')
+        # Outbound: every port denied, then the provider's HTTPS port.
+        self.assertEqual(re.findall(r'\((allow|deny) network-outbound \(remote ip "\*:([^"]+)"\)\)', profile),
+                         [("deny", "*"), ("allow", "443")])
         writes = [line for line in profile.splitlines() if "file-write*" in line]
         scratch = home.resolve()
-        self.assertEqual(len(writes), 3)
-        self.assertEqual(writes[0], f'(deny file-read* file-write* (subpath "{self.home.resolve()}"))')
+        self.assertEqual(len(writes), 5)
+        self.assertEqual(writes[0], '(deny file-write* (subpath "/"))')
+        self.assertTrue(writes[1].startswith('(allow file-write* (literal "/dev/null")'), writes[1])
+        self.assertNotIn("subpath", writes[1])
+        self.assertEqual(writes[2], f'(deny file-read* file-write* (subpath "{self.home.resolve()}"))')
         allowed = re.fullmatch(
             r'\(allow file-read\* file-write\* \(subpath "(.+)"\) \(subpath "(.+)"\)\)',
-            writes[1],
+            writes[3],
         )
         self.assertIsNotNone(allowed)
         tree, profile_scratch = allowed.groups()
         self.assertTrue(tree.endswith("/worktrees/T042-fix-the-thing"), tree)
         self.assertEqual(profile_scratch, str(scratch))
-        self.assertEqual(writes[2], f'(deny file-write* (subpath "{tree}/.git"))')
+        self.assertEqual(writes[4], f'(deny file-write* (subpath "{tree}/.git"))')
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
