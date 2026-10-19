@@ -400,6 +400,9 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
     due = []
     for repo, issue in issues:
         labels = _label_names(issue)
+        needles = live_needles(issue.get("body"))
+        if needles is not None and not needles:
+            continue
         key = "%s#%s" % (repo, issue.get("number"))
         if (issue.get("state") != "open" or "loom:ticket" not in labels
                 or "loom:shipped" not in labels or "loom:verified" in labels
@@ -412,6 +415,14 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
     return sorted(due, key=lambda item: (
         float(item[1].get("shipped_at", 0) or 0),
         item[0], int(item[1].get("number", 0))))
+
+
+def live_needles(body: Optional[str]) -> Optional[List[str]]:
+    """Needles for a Live criterion, or None when the ticket has no Live line."""
+    live = brain.live_criterion(body, limit=None)
+    if live == "(no Live criterion on the ticket)":
+        return None
+    return evidence.needles(live)
 
 
 def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:
@@ -2396,6 +2407,12 @@ class Station:
             issues = self._tickets_open(repo)
             held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
+        unsearchable = sum(1 for _, issue in shipped
+                           if "loom:shipped" in _label_names(issue)
+                           and live_needles(issue.get("body")) == [])
+        if unsearchable:
+            _say("skipped %d shipped tickets whose Live criterion names no exact string" %
+                 unsearchable)
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
@@ -5485,7 +5502,8 @@ class Station:
         recent = [t for t in state.get(REWRITE_STATION_KEY) or []
                   if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
         for stale in [k for k in state
-                      if k != REWRITE_STATION_KEY and k not in {g[0] for g in goals}]:
+                      if k not in (REWRITE_STATION_KEY, "_live_tried")
+                      and k not in {g[0] for g in goals}]:
             del state[stale]
         state[REWRITE_STATION_KEY] = recent
         budget = min(REWRITE_PER_PASS, REWRITE_STATION_PER_HOUR - len(recent))
@@ -5508,6 +5526,67 @@ class Station:
             _write_json(path, state)
             if budget <= 0 or self._deferred():
                 break
+
+    def restate_shipped_live(self) -> None:
+        """Restate shipped Live lines with no searchable exact string, using
+        the rewrite command and its shared hourly station allowance."""
+        if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd):
+            return
+        path = os.path.join(self.state, "rewrite.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        recent = [t for t in state.get(REWRITE_STATION_KEY) or []
+                  if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
+        state[REWRITE_STATION_KEY] = recent
+        budget = min(REWRITE_PER_PASS, REWRITE_STATION_PER_HOUR - len(recent))
+        if budget <= 0:
+            return
+        tried = state.get("_live_tried")
+        if not isinstance(tried, dict):
+            tried = state["_live_tried"] = {}
+        cmds: Dict[str, str] = {}
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                if budget <= 0 or self._deferred():
+                    break
+                labels = _label_names(issue)
+                live = brain.live_criterion(issue.get("body"), limit=None)
+                if ("loom:shipped" not in labels
+                        or live == "(no Live criterion on the ticket)"
+                        or live_needles(issue.get("body"))):
+                    continue
+                key = "%s#%s" % (repo, issue["number"])
+                last = tried.get(key)
+                if isinstance(last, (int, float)) and 0 <= self.now - last < REWRITE_RETRY:
+                    continue
+                cmd = self._rewrite_command(repo, cmds)
+                if not cmd:
+                    continue
+                tried[key] = self.now
+                recent.append(self.now)
+                budget -= 1
+                prompt = ("Rewrite the shipped ticket's Live criterion. Return one JSON object "
+                          'with "action":"restate" and a "line" string: one complete Live: '
+                          "line naming an exact string the merged pull request makes the live "
+                          "system print or serve. "
+                          "Do not include markdown or explanation.\n\nTitle: %s\nBody:\n%s" %
+                          (issue.get("title", ""), issue.get("body", "")))
+                try:
+                    answer = rewrite.parse_answer(rewrite.run_agent(cmd, prompt, REWRITE_TIMEOUT))
+                    line = answer.get("line")
+                    if not isinstance(line, str):
+                        raise rewrite.Invalid("the answer has no Live line")
+                    brain.restate_live(self.gh, repo, int(issue["number"]), line,
+                                       env={"LOOM_BRIEF_AUTHORS": ",".join(self.s.authors),
+                                            "LOOM_BRIEFERS": ",".join(self.s.briefers)})
+                except RateLimited:
+                    raise
+                except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
+                    _say("could not restate the Live criterion of %s: %s" % (key, err))
+                    continue
+                _say("restated the Live criterion of %s" % key)
+            _write_json(path, state)
 
     # -- health findings -------------------------------------------------
     def health_intake(self) -> None:
@@ -7406,6 +7485,7 @@ class Station:
                      self.ship_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
