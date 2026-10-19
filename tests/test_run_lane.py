@@ -104,14 +104,16 @@ if [ "$1 $2" = "pr create" ]; then
   echo "https://github.com/example/repo/pull/7"
 fi
 # Fake factory incidents: `search issues` prints $FAKE_GH_SEARCH (default
-# empty: no open incident), `issue create` prints the new issue's URL,
-# `issue comment` succeeds silently.
+# empty: no open incident), `issue create` writes its --body to
+# $FAKE_BODY.issue and prints the new issue's URL, `issue comment`
+# succeeds silently.
 if [ "$1 $2" = "search issues" ]; then
   printf '%s\n' "${FAKE_GH_SEARCH:-}"
   exit 0
 fi
 if [ "$1 $2" = "issue create" ]; then
   [ -z "${FAKE_GH_ISSUE_CREATE_FAIL:-}" ] || { echo "issue create blew up" >&2; exit 1; }
+  while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_BODY.issue"; shift; done
   echo "https://github.com/quadseven/loom/issues/${FAKE_GH_ISSUE_NUMBER:-99}"
   exit 0
 fi
@@ -3322,11 +3324,12 @@ exit %d
         self.assertIn("failed: [factory]", log)
         self.assertNotIn("failed: [work]", log)
         self.assertIn("factory incident quadseven/loom#99", log)
-        # The incident names the repo and the exact failing line.
-        calls = self.log.read_text()
-        self.assertIn("gh issue create --repo quadseven/loom", calls)
-        self.assertIn("Repo: example/repo", calls)
-        self.assertIn("python: 3.12", calls)
+        # The incident names the repo and the exact failing line, in the
+        # body it is filed with (not just anywhere in the call log).
+        self.assertIn("gh issue create --repo quadseven/loom", self.log.read_text())
+        body = Path(f"{self.body}.issue").read_text()
+        self.assertIn("Repo: example/repo", body)
+        self.assertIn("python: 3.12", body)
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")
