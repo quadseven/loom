@@ -461,32 +461,41 @@ class GitHub:
         cached = self._cached(url) if method == "GET" and not etag else None
         headers, payload = self._request(body, etag or (cached or {}).get("etag"))
         status, resp_headers, text = self._send(method, url, headers, payload)
-        if status == 401 and self.app is not None:
-            # A revoked or early-expired installation token: mint a new one next.
-            self.app.invalidate()
-        if not (200 <= status < 300 or status == 304 or status in ok):
-            raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
+        self._check_status(method, path, status, text, ok)
         if status == 304 and cached is not None:
             return self._from_cache(url, cached, resp_headers)
         data = _json_or_none(text)
         if method == "GET" and not etag:
             self._keep_answer(url, status, data, resp_headers)
         if method != "GET":
-            changed = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", path)
-            if changed:
-                self.issue_writes.add((changed.group(1), int(changed.group(2))))
-            elif re.match(r"^/repos/[^/]+/[^/]+/issues/comments/\d+$", path):
-                # An edited comment's answer names its issue: mark that one
-                # changed. Only an edit that names none spoils every cached read;
-                # the station edits a comment every pass (loom#722).
-                owner = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$",
-                                  str((data or {}).get("issue_url") or "")
-                                  if isinstance(data, dict) else "")
-                if owner:
-                    self.issue_writes.add((owner.group(1), int(owner.group(2))))
-                else:
-                    self.comment_edits = True
+            self._note_write(path, data)
         return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    def _check_status(self, method: str, path: str, status: int, text: str,
+                      ok: Tuple[int, ...]) -> None:
+        """Raise GitHubError for an answer the caller did not accept."""
+        if status == 401 and self.app is not None:
+            # A revoked or early-expired installation token: mint a new one next.
+            self.app.invalidate()
+        if not (200 <= status < 300 or status == 304 or status in ok):
+            raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
+
+    def _note_write(self, path: str, data: Any) -> None:
+        """Mark the issue a write changed, so its cached reads are dropped."""
+        changed = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", path)
+        if changed:
+            self.issue_writes.add((changed.group(1), int(changed.group(2))))
+        elif re.match(r"^/repos/[^/]+/[^/]+/issues/comments/\d+$", path):
+            # An edited comment's answer names its issue: mark that one
+            # changed. Only an edit that names none spoils every cached read;
+            # the station edits a comment every pass (loom#722).
+            owner = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$",
+                              str((data or {}).get("issue_url") or "")
+                              if isinstance(data, dict) else "")
+            if owner:
+                self.issue_writes.add((owner.group(1), int(owner.group(2))))
+            else:
+                self.comment_edits = True
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
         """Refuse a PATCH that would close an issue as completed while its
