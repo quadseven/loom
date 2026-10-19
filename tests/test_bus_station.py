@@ -4310,6 +4310,14 @@ class OutcomeTest(Base):
         self.run_pass()
         self.assertIn("no reason was recorded", self.fake.comments[12][0]["body"])
 
+    def test_a_lane_failure_is_a_status_event_not_a_new_comment(self):
+        # Each "Lane X failed" was a new comment and an email (2026-10-19).
+        self.finished("failed")
+        self.run_pass()
+        (only,) = self.fake.comments[12]
+        self.assertTrue(status.is_status(only["body"]), only["body"])
+        self.assertIn("Lane codex failed:", only["body"])
+
     def test_reports_survive_a_restart_of_the_station(self):
         self.finished("done")
         self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
