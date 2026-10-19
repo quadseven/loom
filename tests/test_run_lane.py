@@ -1028,6 +1028,29 @@ class LaneRunnerTest(unittest.TestCase):
         self.assertIn("gpt-test-high ", limits)
         self.assertIn("gpt-test-low ", limits)
 
+    def test_a_pass_with_no_brief_stays_unavailable_while_every_model_is_limited(self):
+        # agy, 2026-10-19: a quota on all four of its models; each pass with an
+        # empty inbox said available, and the station claimed a ticket there
+        # every few minutes that failed at once (rounds 10 to 12 of one ticket).
+        now = int(time.time())
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / "codex.models").write_text(
+            "gpt-test-high %d account-quota\ngpt-test-low %d account-quota\n"
+            % (now + 3600, now + 7200))
+        result = self.run_lane(LOOM_CODEX_MODELS="gpt-test-high gpt-test-low")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: all models limited: gpt-test-high until"),
+                        beat["reason"])
+        self.assertEqual(beat["retry_at"], now + 7200)
+        # One model off its limit makes the lane available again.
+        (self.loom / "state" / "usage" / "codex.models").write_text(
+            "gpt-test-high %d account-quota\n" % (now + 3600))
+        self.run_lane(LOOM_CODEX_MODELS="gpt-test-high gpt-test-low")
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertTrue(beat["available"])
+
     def test_ticket_model_is_not_swapped_for_a_ladder_model(self):
         self.drop_brief("T042-fix-the-thing.md",
                         BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-test-high"))
