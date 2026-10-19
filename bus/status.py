@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Dict, Any, Iterable, List, Optional, Tuple
 
 MARKER = "<!-- loom:status v1 -->"
 HEAD = ("Loom status for this ticket, newest first. Routine events are edited in "
@@ -78,7 +78,8 @@ def expand(items: Any) -> Any:
             out.append(comment)
             continue
         for at, text in reversed(parse(str(comment.get("body") or ""))):
-            item = dict(comment, body=text, created_at=at, updated_at=at)
+            item: Dict[str, Any] = dict(comment)
+            item.update(body=text, created_at=at, updated_at=at)
             item[EXPANDED] = True
             out.append(item)
     return resort(out)
