@@ -1286,36 +1286,31 @@ def _hold_reason(lane, rows, now=None):
     return reason[:match.start()] + " until " + local
 
 
-def _lane_view_data(payload, tickets, state=None):
-    lane_rows = _merge_lane_rows(payload.get("lanes", []))
-    prs = payload.get("pull_requests", [])
-    newest_pr_for_lane = _newest_lane_models(prs)
-    usage_records = _usage_rows(payload, state)
+def _lane_card(item, tickets, newest_pr_for_lane, usage_records):
+    """One lane's card: its row plus the active ticket, model, quota and reason."""
+    lane_name = item["lane"]
+    active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
+                   and ticket.get("state") in ("running", "pr")), None)
+    model_info = newest_pr_for_lane.get(lane_name)
+    model_display = None
+    if model_info:
+        age_str = views.format_age(model_info["time"])
+        model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
+                         if age_str else model_info["model"])
+    reason = _hold_reason(lane_name, usage_records)
+    if item["available"] and reason == "no reason":
+        reason = "available"
+    item.update({
+        "ticket": active,
+        "model": model_display or bus_brain._lane_model(lane_name),
+        "quota": _lane_quota(lane_name, usage_records),
+        "reason": reason,
+    })
+    return item
 
-    lanes = []
-    for item in lane_rows:
-        lane_name = item["lane"]
-        active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
-                       and ticket.get("state") in ("running", "pr")), None)
-        model_info = newest_pr_for_lane.get(lane_name)
-        model_display = None
-        if model_info:
-            age_str = views.format_age(model_info["time"])
-            model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
-                             if age_str else model_info["model"])
-        lane_quota = _lane_quota(lane_name, usage_records)
-        reason = _hold_reason(lane_name, usage_records)
-        if item["available"] and reason == "no reason":
-            reason = "available"
 
-        item.update({
-            "ticket": active,
-            "model": model_display or bus_brain._lane_model(lane_name),
-            "quota": lane_quota,
-            "reason": reason,
-        })
-        lanes.append(item)
-
+def _scoreboard_rows(prs, tickets):
+    """The lane pull requests with a footer, each tagged with its ticket's tier."""
     tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
     prepared = []
     for pr in prs:
@@ -1324,12 +1319,26 @@ def _lane_view_data(payload, tickets, state=None):
             continue
         ticket = tickets_by_ref.get(parsed[:2])
         prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
+    return prepared
+
+
+def _anthropic_share(payload):
+    """The Anthropic percentage from the newest metrics comment's Spread line."""
     metric_rows = views.parse_metrics(payload.get("improving", {}).get("metrics_comments", []))
-    share = None
-    if metric_rows:
-        spread = metric_rows[0][1].get("Spread", {}).get("value", "")
-        match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
-        if match and int(match.group(2)):
-            share = round(100 * int(match.group(1)) / int(match.group(2)))
-    return {"lanes": lanes, "scoreboard": views.build_scoreboard(prepared),
-            "anthropic_share": share}
+    if not metric_rows:
+        return None
+    spread = metric_rows[0][1].get("Spread", {}).get("value", "")
+    match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
+    if match and int(match.group(2)):
+        return round(100 * int(match.group(1)) / int(match.group(2)))
+    return None
+
+
+def _lane_view_data(payload, tickets, state=None):
+    prs = payload.get("pull_requests", [])
+    newest_pr_for_lane = _newest_lane_models(prs)
+    usage_records = _usage_rows(payload, state)
+    lanes = [_lane_card(item, tickets, newest_pr_for_lane, usage_records)
+             for item in _merge_lane_rows(payload.get("lanes", []))]
+    return {"lanes": lanes, "scoreboard": views.build_scoreboard(_scoreboard_rows(prs, tickets)),
+            "anthropic_share": _anthropic_share(payload)}
