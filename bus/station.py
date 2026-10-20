@@ -2948,9 +2948,48 @@ class Station:
                      {"labels": kept})
         ticket["labels"] = [{"name": name} for name in kept]
 
+    def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
+        """Move each open adoption ticket to loom:merged once the pull
+        request its title and body name has merged, freeing its lane. A
+        target still open, or closed unmerged, leaves the ticket: its job is
+        then to supersede that pull request (loom#1020)."""
+        waiting = ("loom:queued", "loom:briefed", "loom:running", "loom:answered")
+        for issue in open_tickets:
+            if (not isinstance(issue, dict) or "pull_request" in issue
+                    or not set(_label_names(issue)).intersection(waiting)):
+                continue
+            number = self._adopted_pull_number(issue)
+            if number is None:
+                continue
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+            if isinstance(pr, dict) and self._terminal_label(pr) == "loom:merged":
+                self._move_adoption_to_merged(repo, issue, pr)
+
+    def _move_adoption_to_merged(self, repo: str, ticket: Dict[str, Any],
+                                 pr: Dict[str, Any]) -> None:
+        """Move an adoption ticket to loom:merged with a note naming the
+        merged target, its merge commit and time, and drop the lane label."""
+        number = int(ticket["number"])
+        states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
+        kept = [name for name in _label_names(ticket)
+                if name not in states and not name.startswith(("lane:", "wait:"))]
+        kept.append("loom:merged")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+        note = ("Pull request #%d merged at %s (merge commit %s), so this Land or supersede "
+                "ticket moved to loom:merged." % (
+                    int(pr["number"]), str(pr.get("merged_at") or "").replace("T", " "),
+                    str(pr.get("merge_commit_sha") or "")[:12]))
+        self._comment(repo, number, note)
+        _say("moved %s#%d to loom:merged: land-or-supersede target #%d merged"
+             % (repo, number, int(pr["number"])))
+
     def _reconcile_repo(self, repo: str) -> None:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
+        open_tickets = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        self._reconcile_adoptions(repo, open_tickets)
         # Only a closed pull request changes a ticket. Those PRs are the most
         # recently updated closed ones, so one page of them is read, never the
         # repo's whole PR history. A merged one delivers the ticket even while
@@ -3012,7 +3051,7 @@ class Station:
         # a brain fix round sent it back to briefed and the pull request
         # merged before a lane took the fix, or the pull request opened and
         # merged between two passes (loom#784).
-        unlinked = self._unlinked_tickets(repo, tickets_by_number)
+        unlinked = self._unlinked_tickets(repo, tickets_by_number, open_tickets)
         if not tickets_by_number and not unlinked:
             return
         waiting = {n: t for n, t in tickets_by_number.items()
@@ -3027,13 +3066,12 @@ class Station:
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
 
-    def _unlinked_tickets(self, repo: str,
-                          linked: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
+                          found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
         """The repo's open tickets at loom:queued or loom:briefed that a
         briefing login filed, by number. The open-tickets list is the verify
         runs' own read, so a pass that reads both pays for it once; with no
         such ticket and no loom:pr ticket, no closed pull request is read."""
-        found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         out: Dict[int, Dict[str, Any]] = {}
         for issue in found:
             if (isinstance(issue, dict) and "pull_request" not in issue
