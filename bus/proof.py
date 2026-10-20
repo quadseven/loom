@@ -6,6 +6,8 @@ carries the record and a hash of the ticket's acceptance criteria, so a
 completed closure can read it back and refuse when the criteria changed.
 The record also says who made it: verified_by is "brain" or, for a proof the
 station applied from a lane's verify run, "<lane>/<model>" (bus/audit.py).
+A station-applied proof also carries the facts the station read from GitHub
+itself (station_facts), so the close evidence does not rest on the lane's prose.
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ import hashlib
 import json
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 PROOF_MARKER = "<!-- loom:proof v1 -->"
 KINDS = ("runtime", "docs")
@@ -29,6 +31,12 @@ _CRITERIA_HEADING = "## Acceptance criteria"
 _BOX = re.compile(r"^\s*[-*] \[([ xX])\]\s+(.*?)\s*$")
 _SHA = re.compile(r"[0-9a-f]{7,40}")
 _RECORD = re.compile(r"^```json\n(.*?)\n```$", re.S | re.M)
+FACTS_KEY = "station_facts"
+# Evidence prose that says every check passed: "all checks passed", "every
+# check passed", "all CI succeeded", "checks green".
+_ALL_PASSED = re.compile(
+    r"\b(?:all|every)\s+(?:the\s+)?(?:checks?|CI)\s+(?:(?:are|were|is|was|have)\s+)?"
+    r"(?:passed|green|succeeded)\b|\bchecks?\s+(?:are\s+|were\s+)?green\b", re.I)
 
 
 def criteria(body: str) -> List[Tuple[bool, str]]:
@@ -147,9 +155,11 @@ def _line(value: Any) -> str:
     return " ".join(str(value).split())
 
 
-def render(record: Dict[str, Any], body: str) -> str:
-    """The proof comment: a readable summary, then the record with the
-    acceptance contract it was checked against."""
+def render(record: Dict[str, Any], body: str, facts: Sequence[str] = ()) -> str:
+    """The proof comment: a readable summary, the facts the station checked
+    itself when it gives any, then the record with the acceptance contract it
+    was checked against. Only the station's facts are stored as station_facts:
+    a record that carries its own is not believed."""
     lines = [PROOF_MARKER, "Proof (%s) at revision %s" % (record["kind"], record["revision"])]
     if "verified_by" in record:
         # In code: a model name such as provider/@org/model is no mention.
@@ -161,13 +171,36 @@ def render(record: Dict[str, Any], body: str) -> str:
         lines.append("Measure %s: baseline %s, target %s, after %s" % tuple(
             _line(m[key]) for key in MEASURE_FIELDS))
     lines.append("Observed %s to %s" % (record["observed"]["start"], record["observed"]["end"]))
+    facts = [_line(x) for x in facts]
+    if facts:
+        lines += ["", "Checked by the station:"] + ["- %s" % x for x in facts]
     lines += ["", "Criteria:"]
     lines += ["- pass: %s (%s)" % (_line(x["criterion"]), _line(x["evidence"]))
               for x in record["criteria"]]
     lines += ["", "Sources:"] + ["- %s" % _line(x) for x in record["sources"]]
     stored = dict(record, contract=contract(body))
+    stored.pop(FACTS_KEY, None)
+    if facts:
+        stored[FACTS_KEY] = facts
     lines += ["", "```json", json.dumps(stored, indent=2, sort_keys=True), "```"]
     return "\n".join(lines) + "\n"
+
+
+def contradicts(record: Dict[str, Any], failing_checks: Mapping[str, str]) -> str:
+    """Why the record's evidence contradicts the checks the station read, or
+    "". failing_checks maps each check run whose conclusion is not success or
+    skipped to that conclusion; evidence that says every check passed while
+    one of them exists is not believed."""
+    if not failing_checks:
+        return ""
+    results = record.get("criteria")
+    claims = any(isinstance(item, dict) and _ALL_PASSED.search(str(item.get("evidence", "")))
+                 for item in results) if isinstance(results, list) else False
+    if not claims:
+        return ""
+    name = sorted(failing_checks)[0]
+    return "evidence says every check passed but %s concluded %s" % (
+        _line(name), _line(failing_checks[name]))
 
 
 def read(comment: str) -> Optional[Dict[str, Any]]:

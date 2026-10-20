@@ -497,7 +497,10 @@ The move posts the record as a `<!-- loom:proof v1 -->` comment with a hash
 of the criteria texts (not their check marks), then sets the label. The
 posted record says who made it: `"verified_by": "brain"` for a brain's move,
 whatever the file says, and `"verified_by": "<lane>/<model>"` for a proof the
-station applied from a lane's verify run (docs/LANES.md, Verify runs).
+station applied from a lane's verify run (docs/LANES.md, Verify runs). A
+station-applied proof also carries the facts the station read from GitHub
+itself, under `Checked by the station:` and as `station_facts`; a brain
+proof carries none. The contract hash does not cover them.
 `close` refuses a completed closure unless the ticket is `loom:verified`,
 every criterion is checked, and the newest proof comment from a
 `LOOM_BRIEF_AUTHORS` login matches the criteria as they are now. Rewording,

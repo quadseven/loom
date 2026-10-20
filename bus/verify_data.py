@@ -4,6 +4,9 @@ Verify lanes run with no network, so the station reads the facts a verifier
 needs (the ticket's merged pull requests, the checks on each merge commit,
 whether the default branch carries it, the files and added tests) and writes
 them into the brief. Every line passes the log section's text checks.
+The same reads give the facts the station writes into a lane proof's comment
+(close_facts) and the checks a lane's evidence may not call passed
+(failing_checks).
 """
 from __future__ import annotations
 
@@ -19,6 +22,9 @@ MAX_FILES = 40
 MAX_TESTS = 30
 MAX_CHECKS = 30
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+# A check run that concluded this way passed; any other conclusion, or a run
+# still going, did not.
+PASSED = ("success", "skipped")
 # An added test function, at module level or as a method of a test class.
 TEST_DEF_RE = re.compile(r"^\+(?:    )?def (test_[A-Za-z0-9_]+)\s*\(", re.M)
 # A test name or file path the station extracted itself, made of short
@@ -134,3 +140,76 @@ def _pull_lines(branch: str, pr: Dict[str, Any]) -> List[Line]:
         len(tests), ", the first %d shown" % MAX_TESTS if len(tests) > MAX_TESTS else ""), ""))
     lines.extend(_name_line("        - ", name) for name in tests[:MAX_TESTS])
     return lines
+
+
+def _read(pulls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The pull requests the station read in full (they carry check_runs),
+    newest first."""
+    return sorted((pr for pr in pulls if isinstance(pr, dict) and "check_runs" in pr),
+                  key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
+
+
+def _latest(runs: Any) -> List[Dict[str, Any]]:
+    """The newest run of each check name: a re-run replaces the run before it."""
+    newest: Dict[str, Dict[str, Any]] = {}
+    for run in runs or []:
+        if not isinstance(run, dict) or not _clean(run.get("name")):
+            continue
+        name = _clean(run.get("name"))
+        old = newest.get(name)
+        if old is None or int(run.get("id") or 0) >= int(old.get("id") or 0):
+            newest[name] = run
+    return list(newest.values())
+
+
+def _outcome(run: Dict[str, Any]) -> str:
+    return _clean(run.get("conclusion") or run.get("status")) or "unknown"
+
+
+def failing_checks(pulls: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Each check run on a read pull request's merge commit whose newest run
+    concluded other than success or skipped (or has not concluded), with that
+    outcome."""
+    found: Dict[str, str] = {}
+    for pr in _read(pulls):
+        for run in _latest(pr.get("check_runs")):
+            outcome = _outcome(run)
+            if outcome not in PASSED:
+                found.setdefault(_clean(run.get("name")), outcome)
+    return found
+
+
+def close_facts(branch: str, pulls: List[Dict[str, Any]], error: str = "") -> List[str]:
+    """The lines a lane proof's comment carries under "Checked by the
+    station": one per read pull request (number, merged time, merge commit,
+    whether the default branch's head contains it, the newest outcome of each
+    check run), from the same data as the verify brief. A line that fails the
+    text checks is dropped."""
+    lines: List[Line] = []
+    if error:
+        lines.append(("GitHub could not be read (%s); pull request facts may be missing."
+                      % _clean(error), ""))
+    read = _read(pulls)
+    if not read and not error and not pulls:
+        lines.append(("No merged pull request names this ticket.", ""))
+    for pr in read[:MAX_PULLS]:
+        sha = str(pr.get("merge_commit_sha") or "")
+        on_branch: Optional[bool] = pr.get("on_branch")
+        runs = _latest(pr.get("check_runs"))
+        checks = ", ".join("%s %s" % (_clean(run.get("name")), _outcome(run))
+                           for run in runs[:MAX_CHECKS])
+        if len(runs) > MAX_CHECKS:
+            checks += ", and %d more" % (len(runs) - MAX_CHECKS)
+        lines.append(("PR #%d merged at %s as %s; the head of %s %s it; %s" % (
+            int(pr.get("number") or 0), _clean(pr.get("merged_at")) or "unknown",
+            sha or "an unknown commit", branch or "the default branch",
+            {True: "contains", False: "does not contain"}.get(on_branch,
+                                                             "is not known to contain"),
+            "checks: " + checks if checks else "no check runs on the merge commit"),
+            sha if COMMIT_RE.fullmatch(sha) else ""))
+    unread = len([pr for pr in pulls if isinstance(pr, dict)]) - len(read[:MAX_PULLS])
+    if unread > 0:
+        lines.append(("%d more merged pull request%s not read." % (
+            unread, " was" if unread == 1 else "s were"), ""))
+    return [line for line, value in lines
+            if evidence.safe_line(line, [value] if value else [])]

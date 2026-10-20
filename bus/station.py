@@ -2537,6 +2537,16 @@ class Station:
         station reads the ticket's merged pull requests, linked the way
         reconcile links them, with their checks, files and added tests. A
         GitHub failure is one line in the section, never a lost brief."""
+        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
+
+    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True
+                           ) -> Tuple[str, List[Dict[str, Any]], str]:
+        """(default branch, the ticket's merged pull requests, GitHub error)
+        as bus/verify_data.py takes them: the newest MAX_PULLS read in full
+        with their merge commit's check runs, whether the branch's head
+        contains it and, when files is true, their files. After a failure
+        only the fully read ones are returned, with the error."""
         branch, pulls, error = "", [], ""
         read: List[Dict[str, Any]] = []
         try:
@@ -2552,8 +2562,9 @@ class Station:
                 pr["check_runs"] = (runs.get("check_runs") if isinstance(runs, dict) else []) or []
                 pr["on_branch"] = self._carries(repo, sha, quote(branch, safe="/")) \
                     if branch else None
-                pr["files"] = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
-                                           % (repo, int(pr["number"]))).data or []
+                if files:
+                    pr["files"] = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
+                                               % (repo, int(pr["number"]))).data or []
                 read.append(pr)
             pulls = read + linked[verify_data.MAX_PULLS:]
         except RateLimited:
@@ -2563,9 +2574,9 @@ class Station:
             pulls = read
             error = "status %d" % err.status if isinstance(err, GitHubError) and err.status \
                 else type(err).__name__
-            _say("could not read GitHub data for the verify brief of %s#%s: %s"
+            _say("could not read GitHub data for the verify of %s#%s: %s"
                  % (repo, issue.get("number"), error))
-        return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
+        return branch, pulls, error
 
     @staticmethod
     def _note_text(raw: Any) -> str:
@@ -2736,7 +2747,10 @@ class Station:
                      model: str) -> None:
         """Check the record with bus/proof.py, tick the criteria and move the
         ticket to verified with it, marked verified_by "<lane>/<model>"; a
-        refused record leaves the ticket shipped with one note."""
+        refused record leaves the ticket shipped with one note. The station
+        reads the merged pull requests' facts itself: evidence that says every
+        check passed when one did not is refused, and the proof comment
+        carries those facts, so the close does not rest on the lane's prose."""
         issue = self._issue(repo, number)
         names = _label_names(issue)
         if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
@@ -2749,7 +2763,14 @@ class Station:
         except ValueError as err:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
             return
-        if _text.CREDENTIAL_RE.search(proof.render(record, ticked)):
+        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        contradiction = proof.contradicts(record, verify_data.failing_checks(pulls))
+        if contradiction:
+            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(
+                contradiction))
+            return
+        facts = verify_data.close_facts(branch, pulls, error)
+        if _text.CREDENTIAL_RE.search(proof.render(record, ticked, facts)):
             self._verify_note(repo, number, lane, "Its proof holds text shaped like a credential.")
             return
         unseen = unseen_live_evidence(record)
@@ -2759,7 +2780,7 @@ class Station:
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
             source = brain.move(self.gh, repo, number, "verified", record=record,
-                                verified_by="%s/%s" % (lane, model))
+                                verified_by="%s/%s" % (lane, model), facts=facts)
         except ValueError as err:
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))

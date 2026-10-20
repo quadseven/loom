@@ -2396,9 +2396,10 @@ def _check_revision(gh: GitHub, repo: str, revision: str) -> None:
 
 
 def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
-                   record: Dict[str, Any]) -> str:
-    """Check a proof record against the ticket and return the comment for it.
-    Runtime work is verified once shipped; documentation once merged."""
+                   record: Dict[str, Any], facts: Sequence[str] = ()) -> str:
+    """Check a proof record against the ticket and return the comment for it,
+    with the facts the station checked when it gives any. Runtime work is
+    verified once shipped; documentation once merged."""
     names = _labels(issue)
     if "loom:ticket" not in names:
         raise ValueError("only a loom:ticket is verified")
@@ -2409,7 +2410,7 @@ def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
         raise ValueError("a %s ticket is verified only from %s" % (
             record["kind"], " or ".join(x.split(":")[1] for x in ready)))
     _check_revision(gh, repo, record["revision"])
-    comment = proof.render(record, body)
+    comment = proof.render(record, body, facts)
     _check_written_text(comment)
     return comment
 
@@ -2468,10 +2469,12 @@ def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any
 def move(gh: GitHub, repo: str, number: int, state: str,
          lane: Optional[str] = None, note: Optional[str] = None,
          record: Optional[Dict[str, Any]] = None,
-         model: Optional[str] = None, verified_by: str = audit.BRAIN) -> Optional[str]:
+         model: Optional[str] = None, verified_by: str = audit.BRAIN,
+         facts: Sequence[str] = ()) -> Optional[str]:
     """Move a ticket to a state. Verified takes a proof record (bus/proof.py),
     posted on the ticket before the label changes, with verified_by naming
-    who made it (the brain unless the station says which lane); no other
+    who made it (the brain unless the station says which lane) and the facts
+    the station read from GitHub itself (none for a brain proof); no other
     state takes one. A model (briefed only) is written to the body's Model:
     line first. A verified ticket that was rewritten from an issue closes
     that issue (settle_source); the line saying so is returned."""
@@ -2498,7 +2501,7 @@ def move(gh: GitHub, repo: str, number: int, state: str,
                              (lane, effective_model,
                               ", ".join(model_lanes(effective_model)) or "none"))
     kept = _moved_labels(_labels(issue), state, lane)
-    proof_url = (_post_proof(gh, repo, number, issue, record, verified_by)
+    proof_url = (_post_proof(gh, repo, number, issue, record, verified_by, facts)
                  if record is not None else "")
     if model is not None:
         _set_model(gh, repo, number, issue, model)
@@ -2511,10 +2514,10 @@ def move(gh: GitHub, repo: str, number: int, state: str,
 
 
 def _post_proof(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
-                record: Dict[str, Any], verified_by: str) -> str:
+                record: Dict[str, Any], verified_by: str, facts: Sequence[str] = ()) -> str:
     """Post the proof comment for a verified move; its link, or "" when
     GitHub gave none."""
-    comment = _proof_comment(gh, repo, issue, dict(record, verified_by=verified_by))
+    comment = _proof_comment(gh, repo, issue, dict(record, verified_by=verified_by), facts)
     posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                      {"body": comment}).data
     return str(posted.get("html_url") or "") if isinstance(posted, dict) else ""

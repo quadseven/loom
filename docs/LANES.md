@@ -558,7 +558,15 @@ to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, ticks the criteria and moves the ticket to verified with the
 proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
-run recorded no model). A refused record, a missing result or no
+run recorded no model). Before it moves the ticket, the station reads the
+merged pull requests again, as for the brief: a record whose criterion
+evidence says every check passed ("all checks passed", "checks green") while
+the newest run of a check on a merge commit concluded other than success or
+skipped is refused. The proof comment then carries a `Checked by the
+station:` section, one line per merged pull request with its merged time,
+merge commit, whether the default branch's head contains it and each check's
+newest outcome, stored in the record as `station_facts`; a record that brings
+its own `station_facts` is not believed. A refused record, a missing result or no
 `verify.json` leaves the ticket shipped with one note on it. The run is
 counted like any lane run, and the Spread line also shows how many were
 verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a
