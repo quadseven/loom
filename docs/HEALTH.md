@@ -120,6 +120,14 @@ Per finding, on each read:
   since <time>". That is the evidence the brain verifies against. A ticket
   that carries several findings gets it once all of them are gone. The
   station never closes a ticket.
+- The finding is gone, its ticket is `loom:shipped` and the finding has
+  stayed gone 24 hours counted from the later of the absent stamp and the
+  ship: one proof comment naming the absent stamp, the ship time, the last
+  `checked_at` read and the goal (never the URL). A finding that went absent
+  before the ship counts from the ship, and the comment says so; one that
+  returns restarts the window. The next verify run takes such a ticket first
+  and quotes the comment in its brief; the station ticks no criterion, so
+  the pull request criteria are still judged by the verifier.
 - The finding's last ticket was closed as not planned: it is not filed
   again. The station remembers a finding's ticket for 30 days after the
   ticket closed and the finding went quiet, so a finding that comes back
