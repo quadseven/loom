@@ -1,0 +1,55 @@
+name: check.workflow-hygiene
+
+# Runs the fleet's public workflow-hygiene linter on every pull request that
+# touches this repo's workflows, and fails the pull request on any violation
+# (an unpinned action, an unbounded curl, a job with no timeout, a
+# github.event value pasted into a run: script). Before this, test.yml used
+# floating action tags and nothing in this repo's CI noticed.
+#
+# The linter lives in quadseven/infra-public and is pinned here by SHA; bump
+# the pin to pick up newly ported rules.
+
+on:
+  pull_request:
+    branches: [main]
+    # Every file the pinned linter reads is under .github/: workflows, every
+    # .sh, and composite actions' action.yml.
+    paths:
+      - '.github/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Fetch the pinned public linter
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: quadseven/infra-public
+          ref: 2ee764949a68bed6a1b4b3bcd6785a251f49da8f
+          path: .hygiene/infra-public
+          persist-credentials: false
+
+      # The scanned-file count is asserted, not just the exit status: a glob
+      # that silently matched nothing would also print "clean". 3 is the
+      # workflow count when this check was added (test.yml, this file and
+      # check.leak-scan.yml). Lower it only when workflows are removed.
+      - name: Lint workflows
+        run: |
+          set -euo pipefail
+          out=$(python3 .hygiene/infra-public/.github/scripts/workflow_hygiene.py) || { echo "$out"; exit 1; }
+          echo "$out"
+          n=$(printf '%s\n' "$out" | sed -n 's/.*clean (\([0-9][0-9]*\) files checked.*/\1/p')
+          if [ -z "$n" ] || [ "$n" -lt 3 ]; then
+            echo "::error::workflow-hygiene scanned ${n:-no} files, expected at least 3 - a sweep that matches nothing must not pass as clean"
+            exit 1
+          fi
