@@ -149,7 +149,8 @@ spark_brain() {
   token="${LOOM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
   [ -n "$token" ] || token="$(gh auth token 2> /dev/null)"
   [ -n "$token" ] || { echo "no GitHub token for the spark brain" >&2; return 3; }
-  case "$token" in *[!A-Za-z0-9_]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
+  # An App installation token is ghs_ and a JWT-like body with dots and dashes.
+  case "$token" in *[!A-Za-z0-9_.-]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
   AGENT_HOME="$LOOM_HOME/run/brain-home"
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
   LANE=spark SKILLS="" API_KEY="" SPARK_URL="$LOOM_SPARK_URL"
@@ -212,7 +213,7 @@ if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   [ "$MINUTES" -le 50 ] ||
     { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
   unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
-  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_]+$ ]]; then
+  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
     beat failed 1
     exit 1
