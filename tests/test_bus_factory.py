@@ -584,32 +584,13 @@ class PullRequests(Base):
         self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
                        {"expected_head_sha": "sha50"}), self.gh.writes)
 
-    def test_a_refused_update_goes_back_for_a_fix_round_like_a_conflict(self):
-        # 2026-10-20: an update that cannot be applied cleanly goes back for
-        # a fix round, as a conflict does, instead of silently waiting.
+    def test_a_refused_update_waits_for_the_next_pass(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
         self.gh.behind[50] = 1
         self.gh.update_status = 422
         f = self.go()
-        self.assertEqual(self.merged, [])
-        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
-        self.assertEqual(f.actions, 1)
-
-    def test_an_updated_pull_request_lands_on_a_later_pass_once_green(self):
-        # First pass: the pull request is behind, so it is updated, not
-        # merged. Second pass: its new head is up to date and green, so it
-        # merges with no further update call.
-        self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5)
-        self.gh.behind[50] = 3
-        self.go()
-        self.assertEqual((self.merged, self.fixed), ([], []))
-        self.assertEqual(len(self.gh.writes), 1)
-        self.gh.behind[50] = 0
-        self.go()
-        self.assertEqual(self.merged, [(50, (REPO, 5))])
-        self.assertEqual(len(self.gh.writes), 1)
+        self.assertEqual((self.merged, self.fixed, f.actions), ([], [], 0))
 
     def test_each_repo_lands_one_pull_request_a_pass_oldest_first(self):
         self.gh.ticket(5, "pr")

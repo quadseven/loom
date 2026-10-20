@@ -195,6 +195,14 @@ RESTATE_PER_HOUR = 4
 # drains over a few passes instead of one burst of API writes.
 CLOSE_DONE_PER_PASS = 25
 # A ticket carrying one of these stays open for the brain whatever its state.
+# An open loom:rewritten source whose ticket is closed is settled at most
+# once an hour, this many a run (settle_orphan_sources); a source's ticket is
+# read from its rewrite comment once and kept in SOURCES_FILE.
+SETTLE_EVERY = 3600
+SETTLE_PER_RUN = 25
+SOURCES_FILE = "sources.json"
+SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
+REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
 CLOSE_DONE_LABEL = "force-close"
 RESTATE_KEY = "_live_station"
@@ -5706,6 +5714,94 @@ class Station:
                 left -= 1
                 _say("closed done %s#%d: %s" % (repo, number, why))
 
+    def settle_orphan_sources(self) -> None:
+        """Settle each open loom:rewritten issue whose ticket is closed. A
+        source was settled only when its ticket was verified or closed
+        through brain.close, so a ticket the done close or a person closed
+        left its source open: 87 such sources counted as open backlog on
+        2026-10-20. A ticket closed as completed closes its source; one
+        closed as not planned leaves it open with a comment."""
+        path = os.path.join(self.state, SOURCES_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < SETTLE_EVERY:
+            return
+        pairs = state.get("pairs") if isinstance(state.get("pairs"), dict) else {}
+        left = SETTLE_PER_RUN
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    return
+                left -= self._settle_repo_sources(repo, pairs, left)
+            state["_at"] = self.now
+        finally:
+            state["pairs"] = pairs
+            _write_json(path, state)
+
+    def _settle_repo_sources(self, repo: str, pairs: Dict[str, Any], left: int) -> int:
+        """Settle up to `left` of the repo's orphaned sources; how many were."""
+        sources = [i for i in self._paginate(
+            "/repos/%s/issues?labels=loom:rewritten&state=open" % repo)
+            if isinstance(i, dict) and "pull_request" not in i]
+        if not sources:
+            return 0
+        listed = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        still_open = {int(i["number"]) for i in listed if isinstance(i, dict)}
+        done = 0
+        for source in sources:
+            if done >= left:
+                break
+            key = "%s#%d" % (repo, int(source["number"]))
+            if key not in pairs:
+                pairs[key] = self._rewritten_as(repo, int(source["number"]))
+            ticket = pairs[key]
+            if isinstance(ticket, int) and ticket and ticket not in still_open:
+                done += self._settle_source_of(repo, key, ticket, pairs)
+        return done
+
+    def _settle_source_of(self, repo: str, key: str, ticket: int,
+                          pairs: Dict[str, Any]) -> int:
+        """Settle the source of a ticket not listed open: 1 when something
+        was said or done, else 0. A source with nothing left to do is
+        recorded as 0 in `pairs` and not read again."""
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket)).data or {}
+        if issue.get("state") != "closed":
+            return 0
+        labels = set(_label_names(issue))
+        completed = issue.get("state_reason") == "completed"
+        # Closed as completed settles the source only when the ticket's work
+        # landed, the close rule's bar; any other completed close is left for
+        # a person.
+        if ("loom:ticket" not in labels
+                or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                or (completed and not labels & set(SETTLE_LANDED))):
+            pairs[key] = 0
+            return 0
+        said = brain.settle_source(self.gh, repo, ticket, issue.get("body"),
+                                   "completed" if completed else "not_planned",
+                                   unproven=completed)
+        if said is None or not completed:
+            pairs[key] = 0  # nothing more to do for this source
+        if said is None:
+            return 0
+        _say("settled the source of %s#%d: %s" % (repo, ticket, said))
+        return 1
+
+    def _rewritten_as(self, repo: str, number: int) -> int:
+        """The ticket the newest rewrite comment by a briefing login names, 0
+        for none: anyone may comment on a public issue."""
+        authors = {author.lower() for author in self.s.authors}
+        found = 0
+        for comment in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
+            if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
+                continue
+            body = str(comment.get("body") or "")
+            match = REWRITTEN_AS_RE.search(body)
+            if brain.TRIAGE_MARKER in body and match:
+                found = int(match.group(1))
+        return found
+
     @staticmethod
     def _done_reason(issue: Dict[str, Any]) -> str:
         """Why the ticket is done and may close, or "" to leave it open."""
@@ -7680,7 +7776,8 @@ class Station:
                      self.ship_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
-                     self.close_done_tickets, self.restate_shipped_live,
+                     self.close_done_tickets, self.settle_orphan_sources,
+                     self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
