@@ -33,7 +33,7 @@ if [ -z "${LOOM_REWRITE_PRIVATE_CMD:-}" ] && [ -n "$LOOM_CODEX_MODEL" ]; then
 fi
 LOOM_CLAUDE_MODEL="${LOOM_CLAUDE_MODEL:-claude-opus-5-5}"
 LOOM_MUSE_MODEL="${LOOM_MUSE_MODEL:-muse-spark-1.3}"
-LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/poolside/laguna-s-2.1:free}"
+LOOM_OPENROUTER_MODEL="${LOOM_OPENROUTER_MODEL:-openrouter/cohere/north-mini-code:free}"
 LOOM_OPENCODE_GO_MODEL="${LOOM_OPENCODE_GO_MODEL:-opencode-go/kimi-k2.7-code}"
 LOOM_OPENCODE_GO_3_MODEL="${LOOM_OPENCODE_GO_3_MODEL:-opencode-go/deepseek-v4.1-flash}"
 LOOM_OPENCODE_GO_4_MODEL="${LOOM_OPENCODE_GO_4_MODEL:-opencode-go/muse-spark-1.3-contributor}"

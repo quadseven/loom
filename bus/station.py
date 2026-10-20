@@ -3115,6 +3115,19 @@ class Station:
                 out[int(issue["number"])] = issue
         return out
 
+    def _deliver_trusted_author(self, repo: str, ticket: Dict[str, Any],
+                                    pr: Dict[str, Any]) -> bool:
+        """Whether the pull request author may deliver the ticket: a trusted
+        author of a trusted ticket, or the contributor who owns it and whose
+        ticket a trusted login filed."""
+        author = tickets._login(pr.get("user"))
+        authors = {name.lower() for name in self.s.authors}
+        if author in authors:
+            return self._check_trust(repo, ticket)[0]
+        owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+        return bool(author and author in owners
+                    and tickets._login(ticket.get("user")) in authors)
+
     def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
                           unlinked: Dict[int, Dict[str, Any]]) -> None:
         """Move a queued or briefed ticket to loom:merged when this merged
@@ -3128,16 +3141,8 @@ class Station:
         head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
         if head_repo != repo:
             return
-        author = tickets._login(pr.get("user"))
-        authors = {name.lower() for name in self.s.authors}
-        if author in authors:
-            if not self._check_trust(repo, ticket)[0]:
-                return
-        else:
-            owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
-            if (not author or author not in owners
-                    or tickets._login(ticket.get("user")) not in authors):
-                return
+        if not self._deliver_trusted_author(repo, ticket, pr):
+            return
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
             return
@@ -6638,8 +6643,9 @@ class Station:
             return
         state["_checked"] = self.now
         # One goal's failure must not skip the later goals' standups, nor drop
-        # the stamps of the goals already posted this pass (loom#201).
-        for repo, goal in self._goal_homes():
+        # the stamps of the goals already posted this pass (loom#201), and one
+        # unreadable repo must not skip the other repos' goals (loom#1071).
+        for repo, goal in self._readable_goal_homes():
             try:
                 self._post_overdue_goal_standup(repo, goal, state, authors, now)
             except RateLimited:
@@ -7003,6 +7009,29 @@ class Station:
                            if tickets.REPO_RE.fullmatch(repo)
                            for issue in self._goal_issues(repo)]
         return self._goals
+
+    def _readable_goal_homes(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """(repo, issue) for every open loom:goal issue in the LOOM_REPOS
+        repos that can be read. A repo whose goal list fails is skipped with
+        one log line (loom#1071); only a complete list is kept for
+        _goal_homes, which must never route a note from a partial one."""
+        if self._goals is not None:
+            return self._goals
+        homes: List[Tuple[str, Dict[str, Any]]] = []
+        complete = True
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                homes += [(repo, issue) for issue in self._goal_issues(repo)]
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("standup: skipped %s: %s" % (repo, err))
+                complete = False
+        if complete:
+            self._goals = homes
+        return homes
 
     def _goal_for(self, text: str) -> Optional[Tuple[str, int, str, bool]]:
         """(repo, number, link, named) of the goal the message names: an

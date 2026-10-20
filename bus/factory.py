@@ -141,6 +141,17 @@ DEFAULT_REVIEW_CHECK = "Grug - Elder"
 # The review bot's login as GraphQL reports it (an app, without "[bot]").
 DEFAULT_REVIEW_BOT = "grug-tribe"
 BOT_FIXED_PREFIX = "Fixed in "
+# The review bot's check output title that means it did not finish every part
+# of the diff ("WARN Elder review coverage partial", "WARN Grug eyes clouded").
+# A lane cannot finish someone else's review by editing code, so the factory
+# asks the bot to look at the head again instead of sending the pull request
+# back for a fix round it cannot close.
+PARTIAL_REVIEW_TITLES = ("WARN Elder review coverage partial",
+                         "WARN Grug eyes clouded")
+# Posted once per head commit on a pull request whose only failing check is a
+# partial review, so a second partial result on the same head goes back.
+REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
+REVIEW_AGAIN = "/grug improve"
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The slots that draw on one API credit: an empty credit holds all of them.
@@ -355,6 +366,8 @@ LEAK_DIFF_MARK = "--- PR diff ---"
 LEAK_TEXT_MARK = "--- title and body ---"
 LEAK_HIT_RE = re.compile(r"^\s*\S+:(\d+)\s+\[([\w-]+)\]\s")
 LEAK_REF_RULE = "private-issue-ref"
+CRITERION_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+?)\s*$")
+NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
 # The scanner's cross-repo reference shape: [owner/]name#N.
 SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
                          r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
@@ -808,6 +821,55 @@ def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
     return [w for bad, w in ((not brain._checks_green(details), "failing checks"),
                              (not brain._threads_resolved(details), "open review threads"),
                              (full.get("mergeable") is False, "a conflict")) if bad]
+
+
+def acceptance_criteria(body: str) -> List[str]:
+    """Checkbox criteria in the Acceptance criteria section."""
+    found = []
+    active = False
+    for line in (body or "").splitlines():
+        if line.strip() == "## Acceptance criteria":
+            active = True
+            continue
+        if active and line.startswith("## "):
+            break
+        match = CRITERION_RE.match(line)
+        if active and match:
+            found.append(("x" if match.group(1).lower() == "x" else "") +
+                         " " + match.group(2).strip())
+    return found
+
+
+def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
+    """Ticket criteria that a lane PR leaves unticked, excluding Live checks."""
+    ticket = acceptance_criteria(ticket_body)
+    pull = acceptance_criteria(pull_body)
+    states = {}
+    for criterion in pull:
+        checked, _, text = criterion.partition(" ")
+        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
+        states[clean] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
+    missing = []
+    for criterion in ticket:
+        _, _, text = criterion.partition(" ")
+        if text.casefold().startswith("live:"):
+            continue
+        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
+        checked, not_built = states.get(clean, (False, False))
+        if not checked and not not_built:
+            missing.append(text)
+    return missing
+
+
+def not_built_criteria(ticket_body: str, pull_body: str) -> List[str]:
+    """Ticket criteria explicitly marked not built with a reason in a PR."""
+    ticket = [item.partition(" ")[2] for item in acceptance_criteria(ticket_body)]
+    marked = {NOT_BUILT_RE.sub("", item.partition(" ")[2]).strip().casefold()
+              for item in acceptance_criteria(pull_body)
+              if NOT_BUILT_RE.search(item.partition(" ")[2])}
+    return [item for item in ticket
+            if not item.strip().casefold().startswith("live:")
+            and item.strip().casefold() in marked]
 
 
 def is_code(path: str) -> bool:
@@ -1505,7 +1567,8 @@ class Factory:
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and (
                 self._repair_body_leak(repo, number, full, issue, comments, sha)
-                or self._run_again(repo, number, sha)):
+                or self._run_again(repo, number, sha)
+                or self._review_again(repo, number, full, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
@@ -1559,11 +1622,36 @@ class Factory:
                           sensitive: bool = False) -> None:
         """Land a clean, reviewed pull request, or send it back when it
         changes code without a test. A clean sensitive one waits for the brain."""
-        if self._needs_test(repo, number, issue):
+        missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
+        if missing:
+            self._send_back(repo, full, issue, comments,
+                            "unticked acceptance criteria; build these or mark each "
+                            "not built with a reason: " + "; ".join(missing))
+        elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
         elif not sensitive:
+            self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue)
+
+    def _file_criterion_follow_up(self, repo: str, number: int,
+                                  issue: Dict[str, Any], full: Dict[str, Any]) -> None:
+        """File a ticket for criteria explicitly marked not built in a lane PR."""
+        criteria = not_built_criteria(str(issue.get("body") or ""),
+                                      str(full.get("body") or ""))
+        if not criteria:
+            return
+        title = "Complete criteria left from PR #%d" % number
+        if any(isinstance(found, dict) and found.get("title") == title
+               for found in self.gh.paginate("/repos/%s/issues?labels=loom:ticket" % repo)):
+            return
+        body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
+                "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
+                "\n".join("- [ ] " + item for item in criteria) +
+                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" %
+                int(issue["number"]))
+        self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]})
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
@@ -1587,6 +1675,32 @@ class Factory:
             self.gh.rest("POST", "/repos/%s/actions/runs/%s/rerun-failed-jobs" % (repo, run_id))
         self.actions += 1
         _say("re-ran failed jobs on %s#%d once before sending it back" % (repo, number))
+        return True
+
+    def _review_again(self, repo: str, number: int, full: Dict[str, Any],
+                      sha: str) -> bool:
+        """Ask the review bot to look at this head again, once per head
+        commit, when the only failing check is a partial review a lane cannot
+        fix by editing code. False when a marker for this head is already on
+        the pull request (a second partial result goes to the usual paths)."""
+        failed = [r for r in self._runs.get(sha, [])
+                  if r.get("conclusion") not in GREEN]
+        review = [r for r in failed if r.get("name") == self.review_check]
+        if len(review) != 1 or len(failed) != 1:
+            return False
+        title = str((review[0].get("output") or {}).get("title") or "")
+        if not any(title.startswith(mark) for mark in PARTIAL_REVIEW_TITLES):
+            return False
+        marker = REVIEW_AGAIN_MARKER % sha
+        for comment in self.gh.paginate(
+                "/repos/%s/issues/%d/comments" % (repo, number)):
+            if marker in str(comment.get("body") or ""):
+                return False
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                     {"body": "%s\n%s" % (marker, REVIEW_AGAIN)})
+        self.actions += 1
+        _say("asked the review bot to review %s#%d again after a partial review"
+             % (repo, number))
         return True
 
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:

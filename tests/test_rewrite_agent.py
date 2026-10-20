@@ -204,7 +204,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(result.stdout, ANSWER + "\n")
         self.assertEqual(Path(str(self.agent_log) + ".stdin").read_text(), prompt.rstrip("\n"))
         argv = self.agent()["argv"]
-        self.assertEqual(argv, f"run -m {MODEL} --format json")
+        self.assertEqual(argv, f"run -m {MODEL} --print-logs --log-level ERROR --format json")
         self.assertNotIn("Rewrite this", argv)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -287,7 +287,7 @@ class RewriteAgentTest(unittest.TestCase):
         self.assertEqual(result.stdout, ANSWER + "\n")
         self.assertIn(first, result.stderr)
         self.assertIn("rate", result.stderr.lower())
-        self.assertIn(f"run -m {second} --format json", self.agent()["argv"])
+        self.assertIn(f"run -m {second} --print-logs --log-level ERROR --format json", self.agent()["argv"])
 
     def test_bad_entry_in_model_list_is_refused_before_any_run(self):
         result = self.run_wrapper(args=("loom/test/key", MODEL + ",someprovider/model"))
@@ -309,7 +309,7 @@ class RewriteAgentTest(unittest.TestCase):
         result = self.run_wrapper()
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = self.agent()["argv"]
-        self.assertRegex(argv, rf"^run --server http://127\.0\.0\.1:\d+ --auto -m {re.escape(MODEL)} --format json$")
+        self.assertRegex(argv, rf"^run --server http://127\.0\.0\.1:\d+ --auto -m {re.escape(MODEL)} --print-logs --log-level ERROR --format json$")
         self.assertNotIn("--standalone", argv)
 
     def test_the_lanes_and_the_rewriter_share_one_sandbox(self):

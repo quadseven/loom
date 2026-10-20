@@ -5601,6 +5601,43 @@ class ReportsTest(Base):
         self.assertIn("%s#41" % REPO, state)
         self.assertNotIn("%s#40" % REPO, state)
 
+    UNREADABLE = "example-owner/unreadable"
+
+    def unreadable_first(self):
+        """A GitHub whose first LOOM_REPOS repo answers 404 for its goal list,
+        like a private repo the token cannot see (loom#1071)."""
+        self.settings.repos = [self.UNREADABLE, REPO]
+        listing = "/repos/%s/issues" % self.UNREADABLE
+
+        def transport(method, url, headers, body):
+            if urlsplit(url).path == listing:
+                return reply(404, {"message": "Not Found"})
+            return self.fake(method, url, headers, body)
+        return GitHub("token", transport=transport)
+
+    def test_one_unreadable_repo_does_not_skip_the_other_repos_standups(self):
+        self.add_goal()
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+                time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        st = station.Station(self.unreadable_first(), self.settings, now=time.time())
+        with mock.patch.object(station, "_say") as say:
+            st.post_overdue_standups()
+        self.assertTrue(self.fake.comments[40][-1]["body"].startswith(station.REPORT_MARKER))
+        skipped = [c.args[0] for c in say.call_args_list
+                   if c.args[0].startswith("standup: skipped")]
+        self.assertEqual(len(skipped), 1)
+        self.assertTrue(skipped[0].startswith("standup: skipped %s: " % self.UNREADABLE))
+        self.assertIn("404", skipped[0])
+
+    def test_note_routing_still_refuses_a_partial_goal_list(self):
+        self.add_goal()
+        st = station.Station(self.unreadable_first(), self.settings, now=time.time())
+        st.post_overdue_standups()
+        with self.assertRaises(station.GitHubError):
+            st._goal_for("%s#40 a note" % REPO)
+
     def report_aged(self, seconds):
         self.add_goal()
         self.comment(40, 1, "<!-- loom:report v1 -->\nearlier report")
