@@ -200,6 +200,8 @@ CLOSE_DONE_PER_PASS = 25
 # read from its rewrite comment once and kept in SOURCES_FILE.
 SETTLE_EVERY = 3600
 SETTLE_PER_RUN = 25
+REPO_ACCESS_EVERY = 3600
+REPO_ACCESS_FILE = "repo_access.json"
 SOURCES_FILE = "sources.json"
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
@@ -7802,6 +7804,59 @@ class Station:
         except OSError as err:
             _say("could not keep the GitHub budget: %s" % err)
 
+    def check_repo_access(self) -> bool:
+        """Check registered repositories hourly and keep unreadable ones out of this pass."""
+        path = os.path.join(self.state, REPO_ACCESS_FILE)
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        readable = []
+        for repo in self.s.repos:
+            record = state.get(repo)
+            due = (not isinstance(record, dict) or not isinstance(record.get("checked"), (int, float))
+                   or self.now - record["checked"] >= REPO_ACCESS_EVERY)
+            if due:
+                try:
+                    self.gh.rest("GET", "/repos/%s" % repo)
+                    record = {"checked": self.now, "readable": True}
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    if err.status not in (403, 404):
+                        if err.status == 401:
+                            _say("repo access check could not authenticate: %s" % err)
+                            return False
+                        record = {"checked": self.now, "readable": True}
+                        state[repo] = record
+                        readable.append(repo)
+                        continue
+                    record = {"checked": self.now, "readable": False}
+                    _say("Loom App cannot read %s; skipped until access returns" % repo)
+                    self._repo_access_ask(repo, state)
+                state[repo] = record
+            if record.get("readable"):
+                readable.append(repo)
+                state.pop("_asked:" + repo, None)
+        self.s.repos = readable
+        _write_json(path, state)
+        return True
+
+    def _repo_access_ask(self, repo: str, state: Dict[str, Any]) -> None:
+        """File one operator ask per unreadable period in the status repository."""
+        key = "_asked:" + repo
+        if state.get(key):
+            return
+        home = self.s.status_repo
+        if not home:
+            return
+        made = self.gh.rest("POST", "/repos/%s/issues" % home, {
+            "title": "Give the Loom App access to %s" % repo,
+            "body": "## Ask\nGive the Loom App access to `%s` so station steps can run there." % repo,
+            "labels": [NEEDS_OPERATOR]}).data
+        if not isinstance(made, dict) or "number" not in made:
+            raise GitHubError("no operator access ask was created in %s" % home)
+        state[key] = int(made["number"])
+
     def roll_source_pins(self) -> None:
         if self.s.roll_ship_docs:
             try:
@@ -7814,6 +7869,8 @@ class Station:
 
     def run_pass(self) -> None:
         if self._budget_exhausted():
+            return
+        if not self.check_repo_access():
             return
         self.finish_claims()
         self.report_outcomes()

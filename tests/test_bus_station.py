@@ -2460,7 +2460,7 @@ class CorruptStateTest(Base):
         # open pull requests (their plan checks) still run, and so does
         # reconciliation's read of the open tickets (loom#784) and the
         # done-ticket close step's, and the hourly read of rewritten sources.
-        self.assertEqual(self.run_pass().requests, 10)
+        self.assertEqual(self.run_pass().requests, 11)
 
 
 class TicketsTest(unittest.TestCase):
@@ -6475,6 +6475,62 @@ class CloseDoneTest(Base):
         self.assertNotIn("force-close", self.fake.names(2))
         plain = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
         self.assertEqual(plain, [])
+
+    def test_unreadable_registered_repo_does_not_block_done_close(self):
+        second = "example-owner/second-repo"
+        self.settings.repos.append(second)
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
+                      state="shipped")
+        transport = self.fake
+        def request(method, url, headers, body):
+            if urlsplit(url).path == "/repos/" + second:
+                return reply(404, {"message": "Not Found"})
+            return transport(method, url, headers, body)
+        gh = GitHub("token", transport=request)
+        st = station.Station(gh, self.settings, now=10000)
+        st.run_pass()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+
+    def test_unreadable_repo_is_rechecked_after_an_hour(self):
+        second = "example-owner/second-repo"
+        self.settings.repos.append(second)
+        unreadable = {True}
+        def request(method, url, headers, body):
+            if urlsplit(url).path == "/repos/" + second:
+                return reply(404 if unreadable.pop() else 200,
+                             {"message": "Not Found"} if unreadable else {"full_name": second})
+            return self.fake(method, url, headers, body)
+        gh = GitHub("token", transport=request)
+        first = station.Station(gh, self.settings, now=10000)
+        first.check_repo_access()
+        self.assertNotIn(second, self.settings.repos)
+        unreadable.add(False)
+        second_pass = station.Station(gh, station.Settings(self.home, [REPO, second],
+                                                             list(AUTHORS), list(OWNERS)),
+                                      now=10000 + 3601)
+        second_pass.check_repo_access()
+        self.assertIn(second, second_pass.s.repos)
+
+    def test_unreadable_repo_files_one_operator_access_ask(self):
+        second = "example-owner/second-repo"
+        self.settings.repos.append(second)
+        self.settings.status_repo = REPO
+        asks = []
+        def request(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/" + second:
+                return reply(404, {"message": "Not Found"})
+            if method == "POST" and path == "/repos/%s/issues" % REPO:
+                payload = json.loads(body)
+                asks.append(payload)
+                return reply(201, {"number": 99})
+            return self.fake(method, url, headers, body)
+        st = station.Station(GitHub("token", transport=request), self.settings, now=10000)
+        st.check_repo_access()
+        self.assertEqual(len(asks), 1)
+        self.assertIn("needs-operator", asks[0]["labels"])
+        self.assertIn(second, asks[0]["title"])
 
 
 class SettleOrphanSourcesTest(Base):
