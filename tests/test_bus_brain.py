@@ -1600,6 +1600,19 @@ class FixTests(unittest.TestCase):
         self.assertIn(brain.BRAIN_FIX_MARKER, posted[2]["body"])
         self.assertFalse(any(c[0] == "PUT" for c in fake.calls))
 
+    def test_fix_takes_a_failed_ticket_back_to_its_lane(self):
+        # A runaway hold leaves its ticket failed (the station's run ended);
+        # the brain's "brief problem" decision sends the fix to the lane.
+        runs = {"check_runs": []}
+        threads = {"reviewThreads": {"nodes": []}}
+        fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("failed")),
+                    reply(200, runs), reply(200, {"statuses": []}),
+                    reply(200, {"data": {"repository": {"pullRequest": threads}}}),
+                    reply(201, {}), reply(200, []))
+        brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "fix this")
+        put = next(c for c in fake.calls if c[0] == "PUT")
+        self.assertEqual(put[2], {"labels": ["loom:ticket", "lane:codex", "custom", "loom:briefed"]})
+
     def test_pending_brain_fix_is_replaced_by_the_newest_until_a_claim(self):
         comments = [
             {"user": {"login": "alice-example"},

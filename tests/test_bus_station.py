@@ -3538,6 +3538,12 @@ class RetryTest(Base):
         self.assertEqual(table.count("\n| %s |" % at), 3)
         self.assertIn("| codex-2 | model-x | - |", table)
         self.assertIn("| codex | model-x | [work] agent made no commit", table)
+        # The run is over: the held ticket is failed, never left running on a
+        # lane with no brief. A ticket in another repo sat loom:running 8 hours
+        # after its hold was lifted, the brain reading it as a live claim
+        # (2026-10-20).
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("loom:failed", self.fake.names(12))
 
     def test_attempts_that_ended_transient_or_limit_do_not_count_toward_runaway(self):
         self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
@@ -3655,7 +3661,10 @@ class RetryTest(Base):
             {"body": "Claimed for lane codex-2 (body sha256 0123456789ab)", "created_at": now, "user": {"login": "alice-example"}}]
         self.run_pass()
         self.assertIn("loom:runaway", self.fake.names(12))
-        self.assertNotIn("loom:failed", self.fake.names(12))
+        # Held failed: the factory leaves a runaway alone until the brain
+        # clears the hold, then climbs it like any failed ticket.
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
         table = self.bodies()[-1]
         self.assertIn("Runaway: repeated failure reason.", table)
         self.assertIn("| %s | codex | model-x | %s |" % (old, reason), table)

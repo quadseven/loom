@@ -3263,8 +3263,9 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
         (ticket[0] == repo, "ticket and pull request must be in the same repository"),
         (_ticket_association(repo, pr) == ticket, "pull request is not linked to the ticket"),
         (issue.get("state") == "open" and "loom:ticket" in names, "ticket is not an open loom:ticket"),
-        (bool({"loom:briefed", "loom:running", "loom:pr"} & set(names)),
-         "ticket is not loom:briefed, loom:running or loom:pr"),
+        # A failed ticket is one a runaway hold left after its run ended.
+        (bool({"loom:briefed", "loom:running", "loom:pr", "loom:failed"} & set(names)),
+         "ticket is not loom:briefed, loom:running, loom:pr or loom:failed"),
         (sum(1 for x in names if x.startswith("lane:")) == 1, "ticket must have exactly one lane label"),
     ]
     for ok, reason in rules:
@@ -3343,8 +3344,8 @@ def fix(gh: GitHub, repo: str, number: int, ticket: Tuple[str, int], notes: str,
     threads = _open_threads(gh, repo, number)
     body = _fix_body(repo, number, pr["head"]["ref"], notes, checks, threads)
     state = next((x.split(":", 1)[1] for x in _labels(issue)
-                  if x in ("loom:briefed", "loom:running", "loom:pr")), "pr")
-    kept = _moved_labels(_labels(issue), "briefed", lane) if state == "pr" else None
+                  if x in ("loom:briefed", "loom:running", "loom:pr", "loom:failed")), "pr")
+    kept = _moved_labels(_labels(issue), "briefed", lane) if state in ("pr", "failed") else None
     if model is not None:
         _set_model(gh, ticket[0], ticket[1], issue, model)
     posted = gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket, {"body": body})

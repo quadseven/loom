@@ -4392,6 +4392,12 @@ class Station:
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
         if self._flag_repeated_failure(repo, number, lane, reason):
+            # The run is over, so the held ticket waits failed, as any work
+            # failure does. Left loom:running on a lane with no brief, it read
+            # as a live claim: the brain lifted the hold "until the live claim
+            # resolves", and the ticket sat 8 hours with nothing running
+            # (2026-10-20).
+            self._relabel(repo, number, "loom:failed")
             return True
         # Thermal-limit briefs carry "limit:" with or without a class and
         # return to the factory. Provider limits have a class but no marker,
