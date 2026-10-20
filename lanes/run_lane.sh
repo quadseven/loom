@@ -1232,7 +1232,9 @@ check_default_branch() {
   # takes the real origin, so relative submodule URLs still resolve. The fix
   # tree is shallow, so git ignores --local and copies only its branches:
   # the fetch brings origin's default branch across, which a conflicting
-  # round has not merged (2026-10-20).
+  # round has not merged (2026-10-20). A checkout that still fails is the
+  # runner's fault, not the ticket's: a factory incident, so the round
+  # spends no ladder attempt and never counts toward the runaway hold.
   if ! { timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            clone -q --local --no-checkout "$branch_tree" "$default_tree" >> "$LOG" 2>&1 &&
          timeout "$NET_TIMEOUT" git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
@@ -1242,7 +1244,9 @@ check_default_branch() {
          git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            checkout -q --detach "$DEFAULT_REV" >> "$LOG" 2>&1; }; then
     rm -rf "$default_tree"
-    SETUP_REASON="could not check out the default branch for validation"; return 1
+    SETUP_REASON="could not check out the default branch for validation"
+    note_factory_incident environment "could not check out $FIX_DEFAULT at $DEFAULT_REV for validation" SETUP_REASON
+    return 1
   fi
   TREE="$default_tree" CHECK_HOME="$branch_home-default"
   if ! mkdir -p "$CHECK_HOME/tmp"; then

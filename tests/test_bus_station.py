@@ -3479,6 +3479,20 @@ class RetryTest(Base):
         self.run_pass()
         self.assertNotIn("loom:runaway", self.fake.names(12))
 
+    def test_attempts_whose_default_branch_checkout_failed_do_not_count_toward_runaway(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        claim = "Claimed for lane %s (body sha256 0123456789ab)"
+        setup = ("Lane %s failed: [factory] setup failed: could not check out the default branch "
+                 "for validation; factory incident quadseven/loom#99; the agent did not run")
+        self.fake.comments[12][:] = [
+            dict({"body": claim % "codex"}, **who), dict({"body": setup % "codex"}, **who),
+            dict({"body": claim % "codex-2"}, **who), dict({"body": setup % "codex-2"}, **who),
+            dict({"body": claim % "codex"}, **who)]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
     def test_a_runaway_comment_says_how_many_attempts_it_left_out(self):
         self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
