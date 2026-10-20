@@ -1675,37 +1675,15 @@ class Station:
             self._refuse(repo, issue, str(err))
             return False
         fix, fix_comment_id = fix_source if fix_source else (None, None)
-
-        # A fix brief goes out only once every finding has a disposition.
-        if fix is not None:
-            # Only parsing sits in the try: parse_findings raises ValueError
-            # solely through Finding() (its regexes admit only known
-            # dispositions and numeric lines, so in practice a malformed ID),
-            # and err names the cause. A ValueError from refusing is not
-            # caught here and so cannot be reported as a bad finding.
-            try:
-                findings = fix.findings_list
-            except ValueError as err:
-                self._refuse(repo, issue, "invalid pre-roll finding: %s" % err)
-                return False
-            undispositioned = [f.id for f in findings if not f.disposition]
-            if undispositioned:
-                self._refuse(repo, issue, "pre-roll findings without dispositions: %s" % ",".join(undispositioned))
-                return False
+        refusal = self._fix_refusal(fix)
+        if refusal:
+            self._refuse(repo, issue, refusal)
+            return False
 
         earlier = sum(1 for c in comments
                       if isinstance(c, dict) and CLAIM_RE.fullmatch(str(c.get("body") or "").strip()))
-        if earlier:
-            # Two lanes on one ticket push to one branch, and the later push
-            # is refused: the newest claim's run must end first.
-            newest = tickets.ticket_name(repo, number, earlier)
-            busy = [l for l in LANES
-                    if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))
-                    and not self._return_dead_brief(l, newest)]
-            if busy:
-                _say("not claiming %s#%d: its brief %s is still in lane %s's inbox; next pass"
-                     % (repo, number, newest, busy[0]))
-                return False
+        if earlier and self._newest_brief_busy(repo, number, earlier):
+            return False
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
@@ -1715,14 +1693,8 @@ class Station:
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
         # assignee is emailed for every comment on the ticket (2026-10-18).
-        labels = [n for n in _label_names(issue) if n != BRIEFED and not n.startswith(WAIT)]
-        if RUNNING not in labels:
-            labels.append(RUNNING)
-        mark = self._claim_label(repo)
-        if mark and mark not in [n.lower() for n in labels]:
-            labels.append(mark)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                     {"labels": labels})
+                     {"labels": self._claimed_labels(repo, issue)})
         # The claim marker goes on the ticket's one status comment, edited in
         # place: a new comment emailed the operator on every claim (loom#866).
         status.add(self.gh, repo, number, "Claimed for lane %s (body sha256 %s)"
@@ -1738,6 +1710,50 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _fix_refusal(self, fix: Optional[tickets.Fix]) -> Optional[str]:
+        """Why a fix brief cannot go out yet, or None when it can (no fix, or
+        every finding parses and has a disposition)."""
+        if fix is None:
+            return None
+        # Only parsing sits in the try: parse_findings raises ValueError
+        # solely through Finding() (its regexes admit only known
+        # dispositions and numeric lines, so in practice a malformed ID),
+        # and err names the cause. The caller refuses outside any try, so a
+        # ValueError from refusing cannot be reported as a bad finding.
+        try:
+            findings = fix.findings_list
+        except ValueError as err:
+            return "invalid pre-roll finding: %s" % err
+        undispositioned = [f.id for f in findings if not f.disposition]
+        if undispositioned:
+            return "pre-roll findings without dispositions: %s" % ",".join(undispositioned)
+        return None
+
+    def _newest_brief_busy(self, repo: str, number: int, earlier: int) -> bool:
+        """Whether the brief of the newest of `earlier` claims still waits or
+        runs in a live lane's inbox. Two lanes on one ticket push to one
+        branch, and the later push is refused: the newest claim's run must
+        end first. A dead lane's brief is returned, so it does not count."""
+        newest = tickets.ticket_name(repo, number, earlier)
+        busy = [l for l in LANES
+                if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))
+                and not self._return_dead_brief(l, newest)]
+        if busy:
+            _say("not claiming %s#%d: its brief %s is still in lane %s's inbox; next pass"
+                 % (repo, number, newest, busy[0]))
+        return bool(busy)
+
+    def _claimed_labels(self, repo: str, issue: Dict[str, Any]) -> List[str]:
+        """The issue's labels once claimed: briefed and wait labels dropped,
+        the running label and this operator's claim label added."""
+        labels = [n for n in _label_names(issue) if n != BRIEFED and not n.startswith(WAIT)]
+        if RUNNING not in labels:
+            labels.append(RUNNING)
+        mark = self._claim_label(repo)
+        if mark and mark not in [n.lower() for n in labels]:
+            labels.append(mark)
+        return labels
 
     def _return_dead_brief(self, lane: str, name: str) -> bool:
         """Move a brief out of a dead lane's inbox into the inbox's returned/
