@@ -2445,7 +2445,9 @@ for BRIEF in "$INBOX"/*.md; do
     # text that branch's own CI accepts and the scan of a lane's change flags.
     SCAN_RANGE="$BASE..HEAD"
     [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
-    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" 2>&1)"; then
+    # The repo's own issue refs (OWNER/NAME#N and NAME#N in code or tests)
+    # name nothing private; the scanner exempts exactly this repo for them.
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$SCAN_RANGE" --allow-repo-ref "$REPO" 2>&1)"; then
       park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
       continue
     fi
