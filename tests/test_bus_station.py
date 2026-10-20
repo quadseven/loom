@@ -302,6 +302,8 @@ class FakeGitHub:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:shipped" in self.names(i["number"])])
         if "labels=loom:rewritten&" in query:
+            if getattr(self, "rewritten_status", 200) != 200:
+                return reply(self.rewritten_status, {"message": "Not Found"})
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:rewritten" in self.names(i["number"])])
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
@@ -6491,6 +6493,33 @@ class SettleOrphanSourcesTest(Base):
         self.assertEqual(len(self.fake.comments[1]), 1)
         self.assertEqual(len(self.fake.comments[2]), 1)
 
+    def test_the_cap_holds_for_the_hour_not_the_pass(self):
+        self.fake.private = False
+        for n in (1, 2):
+            self.ticket(10 + n, n, "closed", "completed")
+            self.source(n, 10 + n)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        # A second repo after the cap is reached (the fake serves one repo).
+        with mock.patch.object(station, "SETTLE_PER_RUN", 1), \
+                mock.patch.object(st, "_verify_repos", return_value=[REPO, REPO]):
+            st.settle_orphan_sources()
+            st.settle_orphan_sources()
+            self.assertEqual(sorted(self.fake.issues[n]["state"] for n in (1, 2)),
+                             ["closed", "open"])
+            st.now += station.SETTLE_EVERY
+            st.settle_orphan_sources()
+        self.assertEqual([self.fake.issues[n]["state"] for n in (1, 2)], ["closed", "closed"])
+
+    def test_a_repo_github_refuses_is_logged_and_the_run_still_waits_an_hour(self):
+        self.fake.rewritten_status = 404
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        lists = [p for p in self.fake.paths("GET") if "labels=loom:rewritten" in p]
+        st.settle_orphan_sources()
+        self.assertEqual([p for p in self.fake.paths("GET") if "labels=loom:rewritten" in p],
+                         lists)
+        self.assertEqual(len(lists), 1)
+
     def test_it_runs_once_an_hour_and_reads_each_rewrite_comment_once(self):
         self.fake.private = False
         self.ticket(12, 2)
@@ -7704,3 +7733,90 @@ class BudgetExhaustedTest(unittest.TestCase):
             gh.rest("GET", "/repos/%s/issues" % REPO)
         self.assertNotIsInstance(caught.exception, github_module.RateLimited)
         self.assertIsNone(gh.limited_until)
+
+
+class RemoteClaimCountTest(unittest.TestCase):
+    """One unreadable repo no longer stops every station pass (loom#1079).
+
+    The station's App token answers 404 for private repos it cannot see;
+    the remote claim count must skip just those repos and the heartbeat
+    must still write its cache so later callers in the pass do not read
+    again and raise again.
+    """
+
+    STATUS_REPO = "example-owner/status-repo"
+    READABLE = "example-owner/readable"
+    UNREADABLE = "example-owner/unreadable"
+
+    class Fake:
+        """Answers the remote heartbeat and per-repo claim reads; one repo
+        404s every read of its issues, like a repo the token cannot see."""
+
+        def __init__(self, outer):
+            self.outer = outer
+            self.calls = []
+
+        def rest(self, method, path, data=None, ok=()):
+            self.calls.append((method, path))
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?labels=%s" % (self.outer.STATUS_REPO,
+                                                   station.LANES_LABEL))):
+                return mock.Mock(status=200, data=[{"number": 9}])
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?state=open&labels=loom:running,lane:muse"
+                    % self.outer.UNREADABLE)):
+                raise GitHubError("Not Found", status=404,
+                                  body='{"message": "Not Found"}')
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?state=open&labels=loom:running,lane:muse"
+                    % self.outer.READABLE)):
+                return mock.Mock(status=200, data=[{"number": 7}])
+            raise AssertionError("unexpected %s %s" % (method, path))
+
+        def paginate(self, path):
+            if path == "/repos/%s/issues/9/comments" % self.outer.STATUS_REPO:
+                return [{"body": "<!-- loom:remote-heartbeat v1 muse %d -->"
+                                 % int(self.outer.now)}]
+            raise AssertionError("unexpected paginate %s" % path)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z",
+                                                 "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(
+            os.path.join(self.temp.name, "loom"),
+            [self.READABLE, self.UNREADABLE],
+            list(AUTHORS), list(OWNERS), status_repo=self.STATUS_REPO,
+            anthropic=spend.Budget())
+        self.gh = self.Fake(self)
+
+    def runner(self):
+        return station.Station(self.gh, self.settings, now=self.now)
+
+    def test_one_unreadable_repo_is_skipped_not_fatal(self):
+        counts, readable = self.runner()._read_remote_claim_count("muse")
+        self.assertEqual((counts, readable), (1, 1))
+
+    def test_skip_is_logged_once(self):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.runner()._read_remote_claim_count("muse")
+        lines = [line for line in out.getvalue().splitlines()
+                 if "remote claims: skipped" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(self.UNREADABLE, lines[0])
+
+    def test_a_server_error_still_fails_the_pass(self):
+        def fail(method, path, data=None, ok=()):
+            raise GitHubError("boom", status=500)
+        self.gh.rest = fail
+        with self.assertRaises(GitHubError):
+            self.runner()._read_remote_claim_count("muse")
+
+    def test_lanes_body_builds_and_shows_remote_claims(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner = self.runner()
+            body = runner._lanes_body(runner._lane_rows())
+        self.assertIn("Remote claims: muse 1/1", body)

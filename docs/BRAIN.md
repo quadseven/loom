@@ -522,8 +522,8 @@ issue when it moves:
   and closes again when the ticket is verified again.
 - **Closed with no proof** (the station's done close, or a person's close):
   once an hour the station reads each open `loom:rewritten` issue, and one
-  whose ticket is closed settles by the ticket's close reason, up to 25 a
-  run. Only a rewrite comment by a `LOOM_BRIEF_AUTHORS` login pairs them,
+  whose ticket is closed settles by the ticket's close reason, up to 25 an
+  hour; a repo GitHub refuses is logged and skipped. Only a rewrite comment by a `LOOM_BRIEF_AUTHORS` login pairs them,
   and only a `loom:ticket` a briefing login wrote. A ticket closed as
   completed whose work landed (merged, shipped or verified) closes the source
   as completed, labelled `force-close` when its own criteria are unchecked,

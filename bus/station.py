@@ -53,7 +53,7 @@ from . import transcripts
 from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm
+from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, unreadable
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -1939,11 +1939,19 @@ class Station:
             value = cached.get("heartbeat")
             return value if isinstance(value, (int, float)) else None
         heartbeat = self._read_remote_heartbeat(lane)
-        counts = self._read_remote_claim_count(lane) if heartbeat is not None else 0
-        if not isinstance(saved, dict):
-            saved = {}
-        saved[lane] = {"checked_at": self.now, "heartbeat": heartbeat, "claims": counts}
-        _write_json(os.path.join(self.state, "remote-status.json"), saved)
+        counts, repos = (0, 0)
+        try:
+            if heartbeat is not None:
+                counts, repos = self._read_remote_claim_count(lane)
+        finally:
+            # Always written once the heartbeat was read: a failed count
+            # read must not leave every later caller in the pass reading
+            # again and raising again.
+            if not isinstance(saved, dict):
+                saved = {}
+            saved[lane] = {"checked_at": self.now, "heartbeat": heartbeat,
+                           "claims": counts, "repos": repos}
+            _write_json(os.path.join(self.state, "remote-status.json"), saved)
         return heartbeat
 
     def _read_remote_heartbeat(self, lane: str) -> Optional[float]:
@@ -4673,15 +4681,30 @@ class Station:
         cached = saved.get(lane) if isinstance(saved, dict) else None
         return int(cached.get("claims", 0)) if isinstance(cached, dict) else 0
 
-    def _read_remote_claim_count(self, lane: str) -> int:
+    def _read_remote_claim_count(self, lane: str) -> Tuple[int, int]:
+        """(claimed tickets, repos read) across the station's repo list.
+
+        A repo GitHub reports as unreadable (moved, gone, or not granted to
+        the token) is skipped with one log line, so one unreadable repo no
+        longer stops the whole pass. Any other GitHub failure still raises.
+        """
         count = 0
+        readable = 0
         for repo in self.s.repos:
-            found = self.gh.rest("GET", "/repos/%s/issues?state=open&labels=loom:running,lane:%s"
-                                 % (repo, lane)).data
+            try:
+                found = self.gh.rest("GET", "/repos/%s/issues?state=open&labels=loom:running,lane:%s"
+                                     % (repo, lane)).data
+            except GitHubError as err:
+                why = unreadable(err)
+                if why is None:
+                    raise
+                _say("remote claims: skipped %s: %s" % (repo, why))
+                continue
+            readable += 1
             if isinstance(found, list):
                 count += sum(1 for item in found if isinstance(item, dict)
                              and "pull_request" not in item)
-        return count
+        return count, readable
 
     def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
         for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
@@ -5740,13 +5763,22 @@ class Station:
             return
         pairs = state.get("pairs") if isinstance(state.get("pairs"), dict) else {}
         left = SETTLE_PER_RUN
+        # The run is stamped however it ends: at the cap, deferred, or past a
+        # repo GitHub refused. Stamped only on a full run, it ran every pass,
+        # so the cap held per pass and 91 sources settled in minutes, and a
+        # repo the App could not read stopped every run (2026-10-20).
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
-                    return
-                left -= self._settle_repo_sources(repo, pairs, left)
-            state["_at"] = self.now
+                    break
+                try:
+                    left -= self._settle_repo_sources(repo, pairs, left)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not settle the sources of %s: %s" % (repo, err))
         finally:
+            state["_at"] = self.now
             state["pairs"] = pairs
             _write_json(path, state)
 
