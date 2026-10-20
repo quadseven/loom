@@ -70,8 +70,9 @@ class FakeGitHub:
     def pull(self, number, ticket, created=3600, mergeable=True, green=True,
              resolved=True, runs=(("unittest", "completed"), (factory.DEFAULT_REVIEW_CHECK, "completed")),
              updated=3600, files=("bus/a.py", "tests/test_a.py"), labels=(),
-             branch=None, state="open", merged_at=None, merged=False, user=ME, body=""):
-        sha = "sha%d" % number
+             branch=None, state="open", merged_at=None, merged=False, user=ME, body="",
+             sha=None):
+        sha = sha or "sha%d" % number
         self.files[number] = list(files)
         ref = branch if branch is not None else ("loom/%d-some-title" % ticket)
         self.pulls[number] = {
@@ -624,6 +625,23 @@ class PullRequests(Base):
         # Once per head commit: the next pass asks no more.
         self.go(limited=("codex", "codex-2") + NO_OPUS)
         self.assertEqual(len(self.gh.comments[50]), 1)
+
+    def test_a_new_head_commit_is_asked_again(self):
+        # The marker carries the head commit, so a new head is a new ask: the
+        # review bot judges the answer on the head it can see.
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.answered_thread()
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual(len(self.gh.comments[50]), 1)
+        self.gh.pull(50, 5, resolved=False, sha="sha50b")
+        self.answered_thread()
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual(len(self.gh.comments[50]), 2)
+        self.assertIn(factory.IMPROVE_MARKER % "sha50b", self.gh.comments[50][1]["body"])
 
     def test_a_lane_up_for_the_next_rung_climbs_and_the_review_bot_is_not_asked(self):
         self.gh.ticket(5, "pr", lane="claude",

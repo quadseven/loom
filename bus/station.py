@@ -4489,8 +4489,29 @@ class Station:
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
+    def _settle_answer(self, repo: str, pr: int, thread_id: str, node: Dict[str, Any],
+                       strong: bool) -> bool:
+        """Resolve the thread the answer was posted on when the round ran on a
+        ladder model and the thread is the review bot's own medium or low
+        finding. False when it does not settle, and false when the resolve
+        fails: the reply is posted, and an open thread is read by the factory
+        as a finding that survived, which is the safe side."""
+        root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
+        if not (strong and _bot_minor(root, self.s.review_bot)):
+            return False
+        try:
+            self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
+            return False
+        return True
+
     def _answer(self, repo: str, prs: Set[int], lane: str, thread_id: str, path: str,
                 strong: bool) -> None:
+        """Post the lane's answer as the reply on its thread, and resolve the
+        thread when the answer settles it."""
         said = _read_answer(path)
         node = (self.gh.graphql(THREAD_QUERY, {"id": thread_id}) or {}).get("node") or {}
         pr = next((n for n in sorted(prs) if _open_on(node, repo, n)), None)
@@ -4504,18 +4525,7 @@ class Station:
             _say("answer to %s on %s#%d not posted: %s" % (thread_id, repo, pr, err))
             return
         self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
-        root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
-        settled = strong and _bot_minor(root, self.s.review_bot)
-        if settled:
-            try:
-                self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
-            except RateLimited:
-                raise
-            except GitHubError as err:
-                # The reply is posted; an open thread is read by the factory
-                # as a finding that survived, which is the safe side.
-                settled = False
-                _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
+        settled = self._settle_answer(repo, pr, thread_id, node, strong)
         _say("posted lane %s's answer on %s#%d thread %s%s" % (
             lane, repo, pr, thread_id, " and resolved it" if settled else ""))
 
