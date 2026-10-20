@@ -103,14 +103,14 @@ class ReconcileTest(unittest.TestCase):
         summary = os.path.join(self._tmp.name, "summary.md")
         with open(summary, "w", encoding="utf-8") as fh:
             fh.write("## Acceptance criteria\n- [x] The thing works\n"
-                     "- [x] A test covers everything, see 10.1.2.3\n"
-                     "- [ ] Nothing else changes; not built: see 10.0.0.5\n"
+                     "- [x] A test covers everything, see 192.0.2.3\n"
+                     "- [ ] Nothing else changes; not built: see 192.0.2.5\n"
                      "- [x] An extra criterion\n")
         result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
                                      "codex", "gpt-test", "T42", summary_path=summary)
         self.assertIn("## Acceptance criteria\n- [x] The thing works\n- [ ] A test covers the thing\n"
                       "- [ ] Nothing else changes\n\n", result["body"])
-        for unsafe in ("10.1.2.3", "10.0.0.5", "extra"):
+        for unsafe in ("192.0.2.3", "192.0.2.5", "extra"):
             self.assertNotIn(unsafe, result["body"])
 
     def test_a_plain_not_built_reason_is_kept(self):
