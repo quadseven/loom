@@ -3062,6 +3062,15 @@ exit %d
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()) + 86000)
 
+    def test_a_lane_with_no_transient_count_writes_nothing_to_its_service_log(self):
+        # 2026-10-20: every pass read the missing count file with the stderr
+        # redirect after the input one, so bash printed "No such file or
+        # directory" first; each lane's service log held about 1000 such lines.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
+        self.assertNotIn(".transient", result.stderr)
+        self.assertNotIn(".transient", result.stdout)
+
     def test_a_run_that_is_not_transient_clears_the_transient_count(self):
         for n, (out, status) in enumerate((("Unexpected server error", "1"),
                                            ("Unexpected server error", "1"),
@@ -3640,6 +3649,28 @@ exit %d
         default = next(r for r in records if r["phase"] == "default-baseline")
         self.assertEqual((default["exit"], default["revision"]), (0, self.remote_head("main")))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_default_branch_checkout_that_still_fails_is_a_factory_incident_not_work(self):
+        # A [work] failure here spent a ladder attempt, and counted toward
+        # the runaway hold, for a fault in the runner's own clone (2026-10-20).
+        real_git = shutil.which("git")
+        self.write_tool(self.bin / "git", "#!/bin/sh\ncase \" $* \" in *\" checkout -q --detach \"*) "
+                        "echo 'fatal: unable to read tree' >&2; exit 128;; esac\n"
+                        f"exec {shlex.quote(real_git)} \"$@\"\n")
+        self.contract_repo(contract=CONTRACT.replace(
+            "setup: loom-test-python -c 'open(\".prepared\", \"w\").write(\"ok\")'\n", "").replace(
+            "test -f .prepared && ", ""))
+        name, _ = self.fix_brief()
+        self.advance_main("first.txt", "main's version\n")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        log = self.run_log(name + ".log")
+        self.assertIn("failed: [factory] setup failed: could not check out the default branch", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+        self.assertFalse(list(self.loom.glob("**/*-default-check")))
 
     def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
