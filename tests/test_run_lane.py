@@ -459,7 +459,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
         self.write_tool(self.bin / "copilot", FAKE_AGENT.replace(
             'printf \'%s %s\\n\' "$(basename "$0")" "$*" >> "$FAKE_LOG"',
-            'printf \'copilot %s | token=%s | home=%s\\n\' "$*" "${COPILOT_GITHUB_TOKEN:-}" "$HOME" >> "$FAKE_LOG"'))
+            'printf \'copilot %s | token=%s | home=%s\\n\' "$*" "${COPILOT_GITHUB_TOKEN:-}" "$HOME" >> "$TMPDIR/agent.log"'))
         self.write_tool(self.bin / "aws", FAKE_AWS)
         self.write_tool(self.bin / "curl", FAKE_CURL)
         self.scanner = root / "check_private_leaks.py"
