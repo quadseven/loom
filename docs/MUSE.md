@@ -2,11 +2,17 @@
 
 At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
-Run every command from that checkout. Set `LOOM_GITHUB_TOKEN`,
-`LOOM_REPOS` (space separated `OWNER/NAME` values) and `LOOM_BRIEF_AUTHORS`
-(the login or logins that brief tickets and post proofs, the same value the
-station uses). Without it `prioritize`, `close`, verified moves and merges
-refuse every ticket as untrusted. Use `muse` as your lock
+Run every command from that checkout. Set the Loom Brain App's
+`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (or `LOOM_GITHUB_APP_KEY_FILE`), so every write is the
+brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
+for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
+values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
+post proofs, the same value the station uses). Without it `prioritize`,
+`close`, verified moves and merges refuse every ticket as untrusted. With a
+personal `LOOM_GITHUB_TOKEN`, every issue a `bus` or `bus.brain` command opens
+or comments on is unsubscribed for that person afterwards, so later bot
+comments there send them no email; an @mention still does. Use `muse` as your lock
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
@@ -435,8 +441,8 @@ this tick"; a step with no note shows nothing there.
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
-   what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
+   ticket under the goal's intake epic, the rest get `loom:triage` (no comment;
+   the printed line names what is missing). Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left (the `needs-brain` ones first: the station's rewrite
    model judged them person-only, and you decide), and only rewrites
@@ -611,7 +617,11 @@ configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
 Once a ticket ran on Opus or past it, it climbs only to the untried strong
 models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
 lane of its next rung is up, it waits with no comment; the factory says it
-tried every rung only once every rung with a lane for its repo was tried. A green, reviewed pull request is not escalated: a ticket
+tried every rung only once every rung with a lane for its repo was tried. The
+one exception is a pull request whose open thread carries a lane's answer: the
+factory asks the review bot to judge that answer (`/grug improve` on the pull
+request, once per head commit) instead of waiting with nothing to move it
+(docs/LANES.md). A green, reviewed pull request is not escalated: a ticket
 whose open pull request has nothing to fix (its head is green, the review
 check passed on that head, and no review thread is open) is landed, whatever
 its fix rounds.

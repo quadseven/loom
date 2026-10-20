@@ -35,6 +35,16 @@ complexity 15, no swallowed errors, no dead code, docs in step, ASCII
 only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
+Before pushing a branch or opening a pull request on a public repository, the
+lane runner uses infra-public's `check_private_leaks.py` in shape-only mode on
+the diff and generated pull request body. Set `LOOM_LEAK_SCANNER` to that
+script's path when it is not at `../infra-public/.github/scripts/check_private_leaks.py`
+relative to the Loom checkout. A missing scanner or a hit blocks the push.
+Private repositories skip this scan. Test IP addresses in public changes must
+use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
+`203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
+range bound must appear.
+
 ## Validation contract
 
 A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
@@ -177,7 +187,13 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 flags `loom:runaway`, and every lane that bills that key stays unavailable
 with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
 `retry_at`, until the value at that parameter changes. The runner opens one
-`needs-operator` ask on the factory repo naming that parameter. It reads
+`needs-operator` ask on the factory repo naming that parameter. opencode
+lanes run with `--print-logs --log-level ERROR`, because opencode's own
+output says only "UnknownError: Unexpected server error" for every provider
+fault: the logged error shows an upstream 429 (a limit) or a model opencode
+no longer offers (`ProviderModelNotFoundError`, which it reports for a model
+models.dev marks deprecated). A missing model is a limit on that model for
+24 hours, with `model <id> not found by the agent CLI` in the heartbeat. It reads
 `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
@@ -221,6 +237,28 @@ a permission Loom needs that it lacks. It never prints or writes the key or
 the tokens it mints. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
+
+The station, the brain and the lanes each post as their own App, never as
+the operator (loom#1142). The installer writes the station's App
+(`LOOM_GITHUB_APP_*`) into the station and dashboard, `LOOM_LANES_GITHUB_APP_*`
+into every lane and `LOOM_BRAIN_GITHUB_APP_*` into the brain, each as that
+launchd job's own `LOOM_GITHUB_APP_*`; the brain keeps the station's App until
+it has its own, and half an App's settings install nothing.
+`python3 -m bus app token` prints the installation token of the App those
+settings name, and fails with no output without them. A lane with the
+settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
+start of each run and again after its agent (a token lasts an hour), clones
+over https with `gh` as git's credential helper, and runs its agent without
+the token, the App settings or that helper; a failed mint parks the run
+`[transient]` before anything is posted. `lanes/mac/brain.sh` mints once per
+tick, after the lock, and gives every rung that token as `GH_TOKEN`,
+`GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
+`LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
+login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
+`LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
+admit the lanes' login for lane pull requests to run.
+A new App is easiest made from
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -288,6 +326,12 @@ answer as the reply on its thread, redacted and text-checked. The station
 resolves the thread only when the round ran on a ladder model and the thread
 is the review bot's own medium or low finding; any other answered thread
 stays open, and the factory reads it as a finding that survived.
+An answered thread that survives and leaves its ticket with no lane up for
+its next rung does not wait with nothing to move it: the factory asks the
+review bot to judge the answer instead, commenting `/grug improve` on the
+pull request once per head commit, so Elder re-reviews the head with the
+reply in view. It clears the head if the answer holds, and keeps the finding
+if it does not, and the ticket then waits for its rung as before.
 A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
@@ -729,7 +773,8 @@ Each invariant is one function returning breaches with evidence:
   provider lanes whose credit the operator never tops up (for example
   `anthropic`); a slot of one held out of credit is skipped, since it waits
   for the credit to renew and nothing is briefed onto it meanwhile. Unset,
-  every held lane counts.
+  every held lane counts. A hold whose reset has passed is no hold: the lane
+  is free again, as the Usage view reads the same heartbeat.
 - The epic shape (decision 0003): a goal home with open `loom:ticket` issues
   under no epic (one rolling issue for every goal, a line per goal home,
   rewritten in place while the list changes; the older per-goal issues are
@@ -830,10 +875,22 @@ cannot query the viewer or any other local service.
   `x-opencode-session`), the runner sends one `max_tokens` 1 request for the
   run's model before each run, and again after a run that timed out (exit
   124). The key goes to curl on stdin, never in argv or a log. A 429 naming
-  `GoUsageLimitError` holds the lane 12 hours (heartbeat `limit: the
-  provider's weekly limit ...` with a `retry_at`) and hands the brief on as
-  `[limit]`; any other answer lets the run go ahead. Another provider can
-  name its own endpoint in the same setting.
+  `GoUsageLimitError` holds the lane until the reset the provider's
+  `Retry-After` header gives (heartbeat `limit: the provider's weekly limit
+  ...` with a `retry_at`) and hands the brief on as `[limit]`; a provider that
+  gives no reset holds the lane for a week, the fallback for a window the
+  runner does not know. Any other answer lets the run go ahead. Another
+  provider can name its own endpoint in the same setting.
+- A lane held by such a limit asks the provider again every 30 minutes and
+  comes back as soon as it serves the lane again, because the provider's
+  allowance refills while the lane sleeps (OpenCode Go refills 20% of a
+  model's allowance every 5 hours). It asks about the model the probe found at
+  a limit, and only for a hold the probe itself took: a hold the agent CLI
+  recorded (a model it no longer offers, a spent allowance) stands, for no
+  probe says otherwise. On 2026-10-20 the four opencode-go slots stayed held
+  for days (the provider's `Retry-After` was never read, so every limit fell
+  back to a week) and the lane-held invariant fired while 33 tickets of the
+  tier waited.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
   read-only meter with the key they already hold, at most every five minutes,

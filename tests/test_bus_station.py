@@ -302,6 +302,8 @@ class FakeGitHub:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:shipped" in self.names(i["number"])])
         if "labels=loom:rewritten&" in query:
+            if getattr(self, "rewritten_status", 200) != 200:
+                return reply(self.rewritten_status, {"message": "Not Found"})
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:rewritten" in self.names(i["number"])])
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
@@ -1317,7 +1319,7 @@ class ShipRuleTest(Base):
             # check of event, branch and head repository is what is tested.
             return reply(200, {"workflow_runs": [r for r in self.runs
                                                  if r["conclusion"] == "success"]})
-        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO,
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9A-Za-z_./-]+)$" % REPO,
                            parts.path)
         if compare:
             self.compares.append(compare.groups())
@@ -1421,6 +1423,64 @@ class ShipRuleTest(Base):
             settings = station.Settings.from_env(env)
         self.assertEqual(settings.ship_on_merge, [REPO, "example-owner/second"])
         self.assertEqual(settings.ship_workflows, {REPO: "deploy.k8s.yml"})
+
+    def test_a_pull_request_a_later_revert_undid_ships_on_no_step(self):
+        # loom#1077: a revert titled "Revert #99: ..." whose body cites the
+        # first 10 characters of PR 99's merge commit must keep every ship
+        # step from shipping ticket 12 by PR 99.
+        self.settings.ship_on_merge = [REPO]
+        self.settings.ship_workflows = {REPO: self.WORKFLOW}
+        sha = self.merged(12, 99)
+        rsha = "%040x" % 101
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T02:00:00Z",
+                                "merge_commit_sha": rsha,
+                                "title": "Revert #99: undo the change",
+                                "body": "A hand revert.\n\n## Why\nIt broke the build.\n\n"
+                                        "```\ngit revert --no-edit %s\n```\n" % sha[:10],
+                                "head": {"ref": "revert-101"}, "base": {"ref": "main"}})
+        self.carried.add((rsha, "main"))
+        self.carried.add((rsha, "f" * 40))
+        self.deploy_run("f" * 40, created="2030-01-02T03:00:00Z")
+        self.carried.add((sha, "f" * 40))
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_revert_citing_only_a_short_commit_prefix_also_blocks_shipping(self):
+        # The title names nothing revertable (no Revert #N, no quoted
+        # title); only the 10-character commit in the body identifies the
+        # undone pull request.
+        self.settings.ship_on_merge = [REPO]
+        sha = self.merged(12, 99)
+        rsha = "%040x" % 101
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T02:00:00Z",
+                                "merge_commit_sha": rsha,
+                                "title": "Revert the deploy config tweak",
+                                "body": "git revert --no-edit %s\n\n## Why\nIt broke.\n" % sha[:10],
+                                "head": {"ref": "revert-101"}, "base": {"ref": "main"}})
+        self.carried.add((rsha, "main"))
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_refs_line_with_trailing_words_links_the_ticket(self):
+        # loom#1077: "Refs #12 (part of goal #512)" still names ticket 12,
+        # so the ticket's pull request is found and ships on merge.
+        self.assertEqual(station._refs_numbers(
+            REPO, "Why.\n\nRefs #12 (part of goal #512)\n"), [12])
+        self.assertEqual(station._refs_numbers(REPO, "Refs #12\n"), [12])
+        self.settings.ship_on_merge = [REPO]
+        self.fake.add(12, state="merged")
+        sha = "%040x" % 77
+        self.fake.pulls.append({"number": 77, "state": "closed",
+                                "merged_at": "2030-01-02T00:00:00Z",
+                                "merge_commit_sha": sha, "title": "Fix the thing",
+                                "body": "Refs #12 (part of goal #512)",
+                                "head": {"ref": "fix-a-thing"}})
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
 
 
 DEPLOY = "example-owner/deploy"
@@ -1884,8 +1944,7 @@ class TriageTest(Base):
                              now=self.start)
         with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
             st.triage_backlogs()
-        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT,
-                                       comment_limit=5)
+        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT)
         self.assertIn("loom:queued", self.fake.names(102))
         triage_json = os.path.join(self.home, "state", "station", "triage.json")
         with open(triage_json) as fh:
@@ -1898,7 +1957,7 @@ class TriageTest(Base):
         with open(rewrite_json) as fh:
             self.assertIn("%s#31" % REPO, json.load(fh))
 
-    def test_fallback_goal_waits_at_three_queued_and_caps_not_ready_comments(self):
+    def test_fallback_goal_waits_at_three_queued_and_triages_without_comments(self):
         self.fake.add_goal(31, title="Ship the thing")
         for number in range(100, 106):
             self.fake.add_open_issue(number, body="It is slow.", created="2030-01-%02dT00:00:00Z" % (number - 90))
@@ -1922,8 +1981,9 @@ class TriageTest(Base):
         with mock.patch.object(st.gh, "paginate", side_effect=lambda path: (
                 [] if "labels=loom:queued" in path else original_paginate(path))):
             st.triage_backlogs()
-        comments = [p for p in self.fake.paths("POST") if p.endswith("/comments")]
-        self.assertEqual(len(comments), 5)
+        self.assertEqual([p for p in self.fake.paths("POST") if p.endswith("/comments")], [])
+        self.assertEqual([n for n in range(100, 106) if "loom:triage" in self.fake.names(n)],
+                         list(range(100, 106)))
 
     def test_below_the_budget_floor_triage_is_deferred(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
@@ -3137,14 +3197,14 @@ class FixTest(Base):
         self.assertIn("> The thread is stale; <path> measures 5.", said)
         self.assertNotIn("rsync", said)
         self.assertNotIn("start, lane", said)
-        self.assertEqual(again, station.REVIEW_AGAIN)
+        self.assertEqual(again, factory.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
     def test_a_fix_with_nothing_to_change_is_recognised_under_its_failure_class(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] x failed: [work] agent made no commit on loom/12-fix-the-thing"])
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        self.assertEqual(self.fake.comments[99][-1]["body"], station.REVIEW_AGAIN)
+        self.assertEqual(self.fake.comments[99][-1]["body"], factory.REVIEW_AGAIN)
     def test_a_fix_whose_branch_moved_goes_back_to_its_pull_request_not_a_failure(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: branch moved: "
@@ -3415,6 +3475,20 @@ class RetryTest(Base):
             dict({"body": "Lane codex failed: [transient] agent exited 1"}, **who),
             dict({"body": claim % "codex-2"}, **who),
             dict({"body": "Lane codex-2 failed: [limit] agent exited 1: provider limit reached"}, **who),
+            dict({"body": claim % "codex"}, **who)]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_attempts_whose_default_branch_checkout_failed_do_not_count_toward_runaway(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        claim = "Claimed for lane %s (body sha256 0123456789ab)"
+        setup = ("Lane %s failed: [factory] setup failed: could not check out the default branch "
+                 "for validation; factory incident quadseven/loom#99; the agent did not run")
+        self.fake.comments[12][:] = [
+            dict({"body": claim % "codex"}, **who), dict({"body": setup % "codex"}, **who),
+            dict({"body": claim % "codex-2"}, **who), dict({"body": setup % "codex-2"}, **who),
             dict({"body": claim % "codex"}, **who)]
         self.run_pass()
         self.assertNotIn("loom:runaway", self.fake.names(12))
@@ -5444,6 +5518,49 @@ class ReportsTest(Base):
         self.assertTrue(self.fake.edits[0].startswith(quiet + "\n"))
         self.assertNotIn("2026-01-01T00:00Z", self.fake.edits[0])
 
+    def test_a_quiet_standup_edits_its_quiet_report_past_a_brain_report(self):
+        # gemini-plugin-cc, 2026-10-20: the brain reported between the
+        # station's quiet reports, so each one was the newest report only
+        # until the next, and every "Nothing moved" went out as a new email.
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        quiet = st._overdue_standup_body([], None)
+        self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
+        self.comment(40, 6, station.REPORT_MARKER + "\nSame as the last report: the backlog is empty.")
+        for c in self.fake.comments[40]:
+            c["created_at"] = old
+        st.post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 2)  # nothing posted, so no email
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertTrue(self.fake.edits[0].startswith(quiet + "\n"))
+
+    def test_a_standup_that_repeats_an_earlier_one_edits_it_instead_of_posting(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.fake.sub_issues[40] = [
+            {"number": 41, "title": "Waiting its turn", "state": "open", "updated_at": old,
+             "created_at": old, "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}]
+        self.comment(40, 1, station.REPORT_MARKER + "\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        st.post_overdue_standups()
+        first = self.fake.comments[40][-1]["body"]
+        self.assertIn("Waiting its turn", first)
+        self.fake.comments[40][-1].update(id=7, created_at=old)  # as GitHub returns it
+        self.comment(40, 99, station.REPORT_MARKER + "\nThe brain's own report.")
+        self.fake.comments[40][-1]["created_at"] = old
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time() + brain.REPORT_EVERY).post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 3)
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertTrue(self.fake.edits[0].startswith(first + "\n"))
+        self.assertIn("Unchanged as of", self.fake.edits[0])
+
     def test_a_standup_after_a_report_that_was_not_quiet_is_posted(self):
         self.add_goal()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
@@ -5527,6 +5644,43 @@ class ReportsTest(Base):
             state = json.load(fh)
         self.assertIn("%s#41" % REPO, state)
         self.assertNotIn("%s#40" % REPO, state)
+
+    UNREADABLE = "example-owner/unreadable"
+
+    def unreadable_first(self):
+        """A GitHub whose first LOOM_REPOS repo answers 404 for its goal list,
+        like a private repo the token cannot see (loom#1071)."""
+        self.settings.repos = [self.UNREADABLE, REPO]
+        listing = "/repos/%s/issues" % self.UNREADABLE
+
+        def transport(method, url, headers, body):
+            if urlsplit(url).path == listing:
+                return reply(404, {"message": "Not Found"})
+            return self.fake(method, url, headers, body)
+        return GitHub("token", transport=transport)
+
+    def test_one_unreadable_repo_does_not_skip_the_other_repos_standups(self):
+        self.add_goal()
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+                time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        st = station.Station(self.unreadable_first(), self.settings, now=time.time())
+        with mock.patch.object(station, "_say") as say:
+            st.post_overdue_standups()
+        self.assertTrue(self.fake.comments[40][-1]["body"].startswith(station.REPORT_MARKER))
+        skipped = [c.args[0] for c in say.call_args_list
+                   if c.args[0].startswith("standup: skipped")]
+        self.assertEqual(len(skipped), 1)
+        self.assertTrue(skipped[0].startswith("standup: skipped %s: " % self.UNREADABLE))
+        self.assertIn("404", skipped[0])
+
+    def test_note_routing_still_refuses_a_partial_goal_list(self):
+        self.add_goal()
+        st = station.Station(self.unreadable_first(), self.settings, now=time.time())
+        st.post_overdue_standups()
+        with self.assertRaises(station.GitHubError):
+            st._goal_for("%s#40 a note" % REPO)
 
     def report_aged(self, seconds):
         self.add_goal()
@@ -6432,6 +6586,33 @@ class SettleOrphanSourcesTest(Base):
         self.assertEqual(self.fake.issues[2]["state"], "open")
         self.assertEqual(len(self.fake.comments[1]), 1)
         self.assertEqual(len(self.fake.comments[2]), 1)
+
+    def test_the_cap_holds_for_the_hour_not_the_pass(self):
+        self.fake.private = False
+        for n in (1, 2):
+            self.ticket(10 + n, n, "closed", "completed")
+            self.source(n, 10 + n)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        # A second repo after the cap is reached (the fake serves one repo).
+        with mock.patch.object(station, "SETTLE_PER_RUN", 1), \
+                mock.patch.object(st, "_verify_repos", return_value=[REPO, REPO]):
+            st.settle_orphan_sources()
+            st.settle_orphan_sources()
+            self.assertEqual(sorted(self.fake.issues[n]["state"] for n in (1, 2)),
+                             ["closed", "open"])
+            st.now += station.SETTLE_EVERY
+            st.settle_orphan_sources()
+        self.assertEqual([self.fake.issues[n]["state"] for n in (1, 2)], ["closed", "closed"])
+
+    def test_a_repo_github_refuses_is_logged_and_the_run_still_waits_an_hour(self):
+        self.fake.rewritten_status = 404
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        lists = [p for p in self.fake.paths("GET") if "labels=loom:rewritten" in p]
+        st.settle_orphan_sources()
+        self.assertEqual([p for p in self.fake.paths("GET") if "labels=loom:rewritten" in p],
+                         lists)
+        self.assertEqual(len(lists), 1)
 
     def test_it_runs_once_an_hour_and_reads_each_rewrite_comment_once(self):
         self.fake.private = False
@@ -7646,3 +7827,90 @@ class BudgetExhaustedTest(unittest.TestCase):
             gh.rest("GET", "/repos/%s/issues" % REPO)
         self.assertNotIsInstance(caught.exception, github_module.RateLimited)
         self.assertIsNone(gh.limited_until)
+
+
+class RemoteClaimCountTest(unittest.TestCase):
+    """One unreadable repo no longer stops every station pass (loom#1079).
+
+    The station's App token answers 404 for private repos it cannot see;
+    the remote claim count must skip just those repos and the heartbeat
+    must still write its cache so later callers in the pass do not read
+    again and raise again.
+    """
+
+    STATUS_REPO = "example-owner/status-repo"
+    READABLE = "example-owner/readable"
+    UNREADABLE = "example-owner/unreadable"
+
+    class Fake:
+        """Answers the remote heartbeat and per-repo claim reads; one repo
+        404s every read of its issues, like a repo the token cannot see."""
+
+        def __init__(self, outer):
+            self.outer = outer
+            self.calls = []
+
+        def rest(self, method, path, data=None, ok=()):
+            self.calls.append((method, path))
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?labels=%s" % (self.outer.STATUS_REPO,
+                                                   station.LANES_LABEL))):
+                return mock.Mock(status=200, data=[{"number": 9}])
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?state=open&labels=loom:running,lane:muse"
+                    % self.outer.UNREADABLE)):
+                raise GitHubError("Not Found", status=404,
+                                  body='{"message": "Not Found"}')
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?state=open&labels=loom:running,lane:muse"
+                    % self.outer.READABLE)):
+                return mock.Mock(status=200, data=[{"number": 7}])
+            raise AssertionError("unexpected %s %s" % (method, path))
+
+        def paginate(self, path):
+            if path == "/repos/%s/issues/9/comments" % self.outer.STATUS_REPO:
+                return [{"body": "<!-- loom:remote-heartbeat v1 muse %d -->"
+                                 % int(self.outer.now)}]
+            raise AssertionError("unexpected paginate %s" % path)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z",
+                                                 "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(
+            os.path.join(self.temp.name, "loom"),
+            [self.READABLE, self.UNREADABLE],
+            list(AUTHORS), list(OWNERS), status_repo=self.STATUS_REPO,
+            anthropic=spend.Budget())
+        self.gh = self.Fake(self)
+
+    def runner(self):
+        return station.Station(self.gh, self.settings, now=self.now)
+
+    def test_one_unreadable_repo_is_skipped_not_fatal(self):
+        counts, readable = self.runner()._read_remote_claim_count("muse")
+        self.assertEqual((counts, readable), (1, 1))
+
+    def test_skip_is_logged_once(self):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.runner()._read_remote_claim_count("muse")
+        lines = [line for line in out.getvalue().splitlines()
+                 if "remote claims: skipped" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(self.UNREADABLE, lines[0])
+
+    def test_a_server_error_still_fails_the_pass(self):
+        def fail(method, path, data=None, ok=()):
+            raise GitHubError("boom", status=500)
+        self.gh.rest = fail
+        with self.assertRaises(GitHubError):
+            self.runner()._read_remote_claim_count("muse")
+
+    def test_lanes_body_builds_and_shows_remote_claims(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner = self.runner()
+            body = runner._lanes_body(runner._lane_rows())
+        self.assertIn("Remote claims: muse 1/1", body)

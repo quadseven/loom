@@ -2552,21 +2552,21 @@ class TriageTests(unittest.TestCase):
         self.assert_never_edited(routes)
 
     def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
+        # 2026-10-20: a "not a ticket yet" comment on each one emailed the
+        # issue's author 161 times in a morning; the label and the station's
+        # log line say it without a notification.
         no_boxes = BODY.replace("- [ ] ", "")
         routes = Routes([item(6, body="It is slow.\n## Why\nusers wait"), item(7, body=no_boxes),
                          item(8, body=None)])
-        self.run_triage(routes)
+        lines = self.run_triage(routes)
         self.assertEqual(routes.labelled(), {6: ["loom:triage"], 7: ["loom:triage"], 8: ["loom:triage"]})
-        comments = {int(c[1].split("/issues/")[1].split("/")[0]): c[2]["body"]
-                    for c in routes.calls if c[1].endswith("/comments")}
-        self.assertIn("Missing: What, Acceptance criteria, Size (a ## Size section or a "
-                      "Size: XS|S|M|L line), Out of scope.", comments[6])
-        self.assertNotIn("Why", comments[6].split("Missing:")[1].split(".")[0])
-        self.assertIn("Missing: checkboxes under Acceptance criteria.", comments[7])
-        self.assertIn("Missing: Why, What", comments[8])
-        for body in comments.values():
-            self.assertTrue(body.startswith(brain.TRIAGE_MARKER))
-            text.check(body)
+        self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
+        self.assertEqual(lines, [
+            "#6 loom:triage, missing What, Acceptance criteria, Size (a ## Size section or a "
+            "Size: XS|S|M|L line), Out of scope",
+            "#7 loom:triage, missing checkboxes under Acceptance criteria",
+            "#8 loom:triage, missing Why, What, Acceptance criteria, Size (a ## Size section or a "
+            "Size: XS|S|M|L line), Out of scope"])
         self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST" for c in routes.calls))
         self.assert_never_edited(routes)
 
@@ -3035,7 +3035,7 @@ class OnboardTests(unittest.TestCase):
 
     def test_command_line_prints_the_lines(self):
         fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
-        with unittest.mock.patch.object(brain, "GitHub", lambda token: GitHub(token, transport=fake)), \
+        with unittest.mock.patch.object(brain, "GitHub", lambda token, **kw: GitHub(token, transport=fake)), \
                 unittest.mock.patch.object(brain, "auth_from_env", lambda: "t"), \
                 unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""}), \
                 unittest.mock.patch("sys.stdout") as out:

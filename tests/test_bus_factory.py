@@ -243,6 +243,43 @@ class Base(unittest.TestCase):
 
 
 class PullRequests(Base):
+    def test_a_pull_request_with_unbuilt_non_live_criteria_goes_back(self):
+        criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        pr_criteria = ("- [x] A1\n- [x] A2\n" +
+                       "\n".join("- [ ] " + item for item in criteria[2:]) + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_pull_request_with_every_non_live_criterion_ticked_lands(self):
+        criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        pr_criteria = ("\n".join("- [x] " + item for item in criteria[:5]) +
+                       "\n- [ ] " + criteria[5] + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_not_built_criterion_creates_a_follow_up_and_does_not_block_landing(self):
+        criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        pr_criteria = ("\n".join("- [x] " + item for item in criteria[:4]) +
+                       "\n- [ ] A5; not built: requires a later integration\n" +
+                       "- [ ] " + criteria[5] + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
+
     def test_a_ready_pull_request_is_merged(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
@@ -560,6 +597,57 @@ class PullRequests(Base):
         self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
         self.assertEqual(self.moved, [])
 
+    def answered_thread(self, number=50, lane="codex", login="alice-example"):
+        """The pull request's only open thread, with a lane's answer on it."""
+        self.gh.details[number]["reviewThreads"]["nodes"] = [{
+            "id": "PRRT_1", "isResolved": False,
+            "comments": {"nodes": [{
+                "author": {"__typename": "User", "login": login},
+                "body": "Lane %s answered this finding instead of changing the code:"
+                        "\n\nThis finding does not apply to the current code" % lane}]}}]
+
+    def test_an_answered_thread_with_no_lane_up_asks_the_review_bot_to_judge_the_answer(self):
+        # 2026-10-19: grug#1189 waited from 18:25Z with no lane up for its next
+        # rung, and its only open thread carried a lane's answer nothing judged.
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.answered_thread()
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        # It still waits for its rung, and the review bot is asked to judge the
+        # answer instead.
+        self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
+        self.assertEqual(len(self.gh.comments[50]), 1)
+        self.assertIn("/grug improve", self.gh.comments[50][0]["body"])
+        # Once per head commit: the next pass asks no more.
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual(len(self.gh.comments[50]), 1)
+
+    def test_a_lane_up_for_the_next_rung_climbs_and_the_review_bot_is_not_asked(self):
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.answered_thread()
+        self.go(limited=NO_OPUS)
+        self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
+        self.assertEqual(self.gh.comments.get(50, []), [])
+
+    def test_a_stranger_s_answer_on_a_thread_asks_nothing(self):
+        # The answer is the App's own, so a stranger's words on a thread are
+        # data and never move the pull request.
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.answered_thread(login="mallory-example")
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual(self.gh.comments.get(50, []), [])
+
     def test_a_runaway_ticket_is_not_climbed_or_given_up_on(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.issues[5]["labels"].append({"name": "loom:runaway"})
@@ -698,6 +786,38 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(len(self.fixed), 1)
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+
+    def test_a_partial_review_asks_for_improve_instead_of_a_fix_round(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "WARN Elder review coverage partial"},
+             "details_url": "https://github.com/%s/actions/runs/79/job/1" % REPO}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
+        self.assertTrue(any("/grug improve" in body for body in bodies))
+        self.assertTrue(any(factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
+
+    def test_a_second_partial_review_on_the_same_head_is_sent_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "WARN Grug eyes clouded"},
+             "details_url": "https://github.com/%s/actions/runs/80/job/1" % REPO}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        improve = [c for c in self.gh.comments[50]
+                   if "/grug improve" in str(c.get("body") or "")]
+        self.assertEqual(len(improve), 1)
+        # The same head, still partial: back to the usual fix round.
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(len([c for c in self.gh.comments[50]
+                              if "/grug improve" in str(c.get("body") or "")]), 1)
 
     def test_pull_requests_of_tickets_not_in_pr_are_left_alone(self):
         self.gh.ticket(5, "briefed")
@@ -1305,6 +1425,14 @@ class Queued(Base):
         self.queued(7)
         self.assign(limited=["codex"], available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
+
+    def test_a_queued_ticket_of_the_opencode_go_tier_takes_that_lane(self):
+        # 2026-10-20: the opencode-go lane was held by a limit for days while
+        # the tickets of its tier queued; once the lane comes back it takes
+        # that queued work.
+        self.queued(7)
+        self.assign(available=["opencode-go"])
+        self.assertEqual(self.lane(7), "opencode-go")
 
     def test_a_pass_that_assigns_no_queued_ticket_says_why_for_the_first(self):
         self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n", age=600)

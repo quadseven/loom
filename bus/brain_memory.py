@@ -54,6 +54,10 @@ RULES_PATH = "/api/brain/rules"
 COMMITMENTS_PATH = "/api/brain/commitments"
 FETCH_TIMEOUT = 30
 FETCH_MAX = 4 * 1024 * 1024
+# A read that failed on the wire is tried again after these pauses (seconds).
+FETCH_RETRY_DELAYS = (2.0, 6.0)
+# Statuses that warrant a retry (matching GitHub client).
+FETCH_RETRY_STATUSES = (502, 503, 504)
 # The rendered packet goes into a brain's prompt.
 PACKET_MAX = 60000
 _FIELD = re.compile(r"^- (Shipped|Briefed|Waiting): *(.*?)\s*$", re.M)
@@ -254,19 +258,28 @@ def dashboard_url(transcript_url: str, path: str) -> str:
 
 def fetch_json(url: str, token: str, what: str = "handoff") -> Dict[str, Any]:
     """GET one of the dashboard's bearer-token reads (the handoff packet, the
-    usage snapshot) as a JSON object. Errors never carry the URL or the token."""
+    usage snapshot) as a JSON object. Errors never carry the URL or the token.
+    Retries on connection failures and 5xx server errors."""
     if not url.startswith("https://"):
         raise OSError("the %s URL is not https" % what)
     req = urllib.request.Request(  # noqa: S310 - https only, checked above
         url, method="GET", headers={"User-Agent": "loom-brain", "Authorization": "Bearer " + token})
-    try:
-        with _OPENER.open(req, timeout=FETCH_TIMEOUT) as resp:  # noqa: S310
-            status, raw = resp.status, resp.read(FETCH_MAX)
-    except urllib.error.HTTPError as err:
-        status, raw = err.code, b""
-        err.close()
-    except (urllib.error.URLError, OSError):
-        raise OSError("the %s read failed to connect" % what) from None
+    for attempt in range(len(FETCH_RETRY_DELAYS) + 1):
+        try:
+            with _OPENER.open(req, timeout=FETCH_TIMEOUT) as resp:  # noqa: S310
+                status, raw = resp.status, resp.read(FETCH_MAX)
+        except urllib.error.HTTPError as err:
+            status, raw = err.code, b""
+            err.close()
+        except (urllib.error.URLError, OSError):
+            if attempt == len(FETCH_RETRY_DELAYS):
+                raise OSError("the %s read failed to connect" % what) from None
+            time.sleep(FETCH_RETRY_DELAYS[attempt])
+            continue
+        if status in FETCH_RETRY_STATUSES and attempt < len(FETCH_RETRY_DELAYS):
+            time.sleep(FETCH_RETRY_DELAYS[attempt])
+            continue
+        break
     if status != 200:
         raise OSError("the %s read answered %d" % (what, status))
     try:

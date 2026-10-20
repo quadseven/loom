@@ -54,7 +54,7 @@ that talks to GitHub about tickets.
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
-| `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
+| `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
 | `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, or a deploy or roll window. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
@@ -308,9 +308,9 @@ asks and anything with a `loom:` label. A ready issue (Why, What,
 Acceptance criteria with checkboxes, Size and Out of scope, and a body the
 runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N's intake epic, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
-for a later run. Any other issue gets `loom:triage` and one comment naming
-what is missing. Triage writes labels, sub-issue links and that comment
-only: it never closes or retitles an issue, and edits nothing but the one
+for a later run. Any other issue gets `loom:triage`, and the station's log
+line names what is missing. Triage writes labels and sub-issue links
+only, and posts no comment: it never closes or retitles an issue, and edits nothing but the one
 line below, because an automated pass over old issues over-calls work as
 done.
 
@@ -522,8 +522,8 @@ issue when it moves:
   and closes again when the ticket is verified again.
 - **Closed with no proof** (the station's done close, or a person's close):
   once an hour the station reads each open `loom:rewritten` issue, and one
-  whose ticket is closed settles by the ticket's close reason, up to 25 a
-  run. Only a rewrite comment by a `LOOM_BRIEF_AUTHORS` login pairs them,
+  whose ticket is closed settles by the ticket's close reason, up to 25 an
+  hour; a repo GitHub refuses is logged and skipped. Only a rewrite comment by a `LOOM_BRIEF_AUTHORS` login pairs them,
   and only a `loom:ticket` a briefing login wrote. A ticket closed as
   completed whose work landed (merged, shipped or verified) closes the source
   as completed, labelled `force-close` when its own criteria are unchecked,

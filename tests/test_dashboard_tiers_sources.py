@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dashboard import tiers_sources  # noqa: E402
+from tests import sandbox_caps  # noqa: E402
 
 STATS = {"window": "24h", "generated_at": 1792421800,
          "ledger": {"enabled": True, "queued": 0, "written": 9, "dropped": 0,
@@ -144,6 +145,7 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(envelope.missing, "LOOM_GRUG_STATS_URL is not set")
 
 
+@unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
 class FetchTests(unittest.TestCase):
     def setUp(self):
         self.upstream = Upstream()

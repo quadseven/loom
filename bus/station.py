@@ -53,7 +53,7 @@ from . import transcripts
 from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm
+from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, unreadable
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -112,9 +112,6 @@ LIMIT = "limit:"
 # push moved the pull request's branch during the run. Not a failure: the
 # ticket goes back to loom:pr, and the factory judges the new head.
 BRANCH_MOVED = "branch moved:"
-# Asks the review bot to review a pull request's head again; it resolves the
-# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
-REVIEW_AGAIN = "/grug improve"
 LANE_SAID_MAX = 2500
 PATH_RE = _text.PATH_RE
 SECRET_RE = _text.SECRET_RE
@@ -153,8 +150,10 @@ MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
-# The last line of a quiet standup the station edits in place.
+# The last line of a quiet standup the station edits in place, and of a
+# standup that repeats an earlier one word for word.
 QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
+SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
 # Reports come every REPORT_EVERY (6 hours), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
@@ -1100,6 +1099,16 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     return at is not None and beat_fresh(at, now, window)
 
 
+def hold_expired(beat: Dict[str, Any], now: float) -> bool:
+    """Whether a lane's limit hold has run out: the reset it names is in the
+    past. A beat with no reset has no known end, so its hold stands. The Usage
+    view reads the same heartbeat the same way (bus/usage.py _limit_hold)."""
+    until = beat.get("retry_at")
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return False
+    return until <= now
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
@@ -1147,8 +1156,9 @@ def _fix_round_limit() -> int:
 
 def _refs_numbers(repo: str, body: str) -> List[int]:
     """The ticket numbers a pull request body names with a `Refs` line, in
-    the full `Refs OWNER/NAME#N` form or the same-repo `Refs #N` form."""
-    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)[ \t]*$" % re.escape(repo),
+    the full `Refs OWNER/NAME#N` form or the same-repo `Refs #N` form; the
+    line may carry trailing words after the number."""
+    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)\b" % re.escape(repo),
                                        body, re.M)]
 
 
@@ -1938,11 +1948,19 @@ class Station:
             value = cached.get("heartbeat")
             return value if isinstance(value, (int, float)) else None
         heartbeat = self._read_remote_heartbeat(lane)
-        counts = self._read_remote_claim_count(lane) if heartbeat is not None else 0
-        if not isinstance(saved, dict):
-            saved = {}
-        saved[lane] = {"checked_at": self.now, "heartbeat": heartbeat, "claims": counts}
-        _write_json(os.path.join(self.state, "remote-status.json"), saved)
+        counts, repos = (0, 0)
+        try:
+            if heartbeat is not None:
+                counts, repos = self._read_remote_claim_count(lane)
+        finally:
+            # Always written once the heartbeat was read: a failed count
+            # read must not leave every later caller in the pass reading
+            # again and raising again.
+            if not isinstance(saved, dict):
+                saved = {}
+            saved[lane] = {"checked_at": self.now, "heartbeat": heartbeat,
+                           "claims": counts, "repos": repos}
+            _write_json(os.path.join(self.state, "remote-status.json"), saved)
         return heartbeat
 
     def _read_remote_heartbeat(self, lane: str) -> Optional[float]:
@@ -1993,7 +2011,8 @@ class Station:
 
     def _limit_reasons(self) -> Dict[str, str]:
         """Lane -> the reason of its fresh heartbeat that says unavailable
-        at a limit."""
+        at a limit. A hold whose reset has passed is no hold: the lane is
+        free again, as the Usage view reads the same heartbeat."""
         out: Dict[str, str] = {}
         for lane in LANES:
             beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
@@ -2004,7 +2023,8 @@ class Station:
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 continue
             reason = str(beat.get("reason") or "")
-            if beat_fresh(at, self.now) and reason.startswith(LIMIT):
+            if beat_fresh(at, self.now) and reason.startswith(LIMIT) \
+                    and not hold_expired(beat, self.now):
                 out[lane] = reason
         return out
 
@@ -3092,6 +3112,19 @@ class Station:
                 out[int(issue["number"])] = issue
         return out
 
+    def _deliver_trusted_author(self, repo: str, ticket: Dict[str, Any],
+                                    pr: Dict[str, Any]) -> bool:
+        """Whether the pull request author may deliver the ticket: a trusted
+        author of a trusted ticket, or the contributor who owns it and whose
+        ticket a trusted login filed."""
+        author = tickets._login(pr.get("user"))
+        authors = {name.lower() for name in self.s.authors}
+        if author in authors:
+            return self._check_trust(repo, ticket)[0]
+        owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+        return bool(author and author in owners
+                    and tickets._login(ticket.get("user")) in authors)
+
     def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
                           unlinked: Dict[int, Dict[str, Any]]) -> None:
         """Move a queued or briefed ticket to loom:merged when this merged
@@ -3105,16 +3138,8 @@ class Station:
         head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
         if head_repo != repo:
             return
-        author = tickets._login(pr.get("user"))
-        authors = {name.lower() for name in self.s.authors}
-        if author in authors:
-            if not self._check_trust(repo, ticket)[0]:
-                return
-        else:
-            owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
-            if (not author or author not in owners
-                    or tickets._login(ticket.get("user")) not in authors):
-                return
+        if not self._deliver_trusted_author(repo, ticket, pr):
+            return
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
             return
@@ -3643,18 +3668,26 @@ class Station:
     # -- shipping on merge or on a deploy workflow --------------------------
     def ship_merged(self) -> None:
         """Move the open merged tickets of each LOOM_SHIP_ON_MERGE repo to
-        loom:shipped: nothing deploys those repos, so the merge is the ship."""
+        loom:shipped: nothing deploys those repos, so the merge is the ship.
+        A pull request a later merged pull request reverted is skipped, as
+        the pin step does."""
         for repo in [r for r in self.s.ship_on_merge if tickets.REPO_RE.fullmatch(r)]:
             try:
                 merged = self._merged_tickets(repo)
                 if not merged:
                     continue
-                latest = self._merged_pulls(repo, merged)
+                seen: List[Dict[str, Any]] = []
+                latest = self._merged_pulls(repo, merged, seen)
             except GitHubError as err:
                 _say("could not ship merged tickets of %s: %s" % (repo, err))
                 continue
+            branch = self._default_branch(repo)
             ordered = sorted((str(pr["merged_at"]), number, pr) for number, pr in latest.items())
             for _, number, pr in ordered[:SHIP_PER_PASS]:
+                if branch and self._reverted(repo, pr, seen, branch):
+                    _say("%s#%d stays merged: pull request #%d was reverted" % (
+                        repo, number, int(pr["number"])))
+                    continue
                 self._ship_one(repo, number, pr,
                                "%s ships on merge (LOOM_SHIP_ON_MERGE); pull request #%d "
                                "merged at %s" % (repo, int(pr["number"]),
@@ -3682,13 +3715,16 @@ class Station:
             return
         by_sha = {str(r["head_sha"]): r for r in runs}
         newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
-        latest = self._merged_pulls(repo, merged)
+        seen: List[Dict[str, Any]] = []
+        latest = self._merged_pulls(repo, merged, seen)
         shipped = 0
         for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
             if shipped >= SHIP_PER_PASS:
                 return
             run = self._covering_run(repo, pr, by_sha, newest)
-            if run is not None and self._ship_one(
+            if run is None or self._reverted(repo, pr, seen, str(run["head_sha"])):
+                continue
+            if self._ship_one(
                     repo, number, pr,
                     "workflow %s succeeded on %s revision %s (run %s)" % (
                         workflow, repo, str(run["head_sha"])[:12], run.get("id")),
@@ -3846,17 +3882,16 @@ class Station:
     def _reverted(self, repo: str, pr: Dict[str, Any], seen: List[Dict[str, Any]],
                   revision: str) -> bool:
         """A later merged pull request the revision carries reverts this one:
-        its body says "Reverts <repo>#<n>" or its title is 'Revert "<title>"',
-        the forms GitHub's revert button writes."""
-        number, title = int(pr["number"]), str(pr.get("title") or "")
-        body = re.compile(r"\bReverts\s+(?:%s)?#%d\b" % (re.escape(repo), number))
+        a hand-made revert of it (its body says "Reverts <repo>#<n>", its
+        title is 'Revert #<n>' or 'Revert "<title>"', or its body runs git
+        revert on the pull request's merge commit, full or short), the
+        forms GitHub's revert button and the revert pass write."""
         for other in seen:
             if other is pr or str(other.get("merged_at")) <= str(pr["merged_at"]):
                 continue
-            if body.search(str(other.get("body") or "")) or (
-                    title and str(other.get("title") or "") == 'Revert "%s"' % title):
-                if self._carries(repo, str(other["merge_commit_sha"]), revision):
-                    return True
+            if revert.undoes(other, pr) \
+                    and self._carries(repo, str(other["merge_commit_sha"]), revision):
+                return True
         return False
 
     def hand_back(self) -> None:
@@ -4475,8 +4510,8 @@ class Station:
         pr = next((n for n in sorted(prs) if _open_on(node, repo, n)), None)
         if not said or pr is None:
             return
-        body = "Lane %s answered this finding instead of changing the code:\n\n%s" % (
-            lane, "\n".join("> " + line for line in said.splitlines()))
+        body = "Lane %s %s\n\n%s" % (
+            lane, factory.ANSWER_REPLY, "\n".join("> " + line for line in said.splitlines()))
         try:
             _text.check(body)
         except ValueError as err:
@@ -4517,7 +4552,7 @@ class Station:
             body = ("Lane %s made no change for this fix; its explanation did not "
                     "pass the text checks and is in the lane log." % lane)
         self._comment(repo, pr, body)
-        self._comment(repo, pr, os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN)
+        self._comment(repo, pr, factory.review_again())
         self._relabel(repo, number, "loom:pr")
         self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
                       "on the pull request; the review bot was asked to review it again."
@@ -4662,15 +4697,30 @@ class Station:
         cached = saved.get(lane) if isinstance(saved, dict) else None
         return int(cached.get("claims", 0)) if isinstance(cached, dict) else 0
 
-    def _read_remote_claim_count(self, lane: str) -> int:
+    def _read_remote_claim_count(self, lane: str) -> Tuple[int, int]:
+        """(claimed tickets, repos read) across the station's repo list.
+
+        A repo GitHub reports as unreadable (moved, gone, or not granted to
+        the token) is skipped with one log line, so one unreadable repo no
+        longer stops the whole pass. Any other GitHub failure still raises.
+        """
         count = 0
+        readable = 0
         for repo in self.s.repos:
-            found = self.gh.rest("GET", "/repos/%s/issues?state=open&labels=loom:running,lane:%s"
-                                 % (repo, lane)).data
+            try:
+                found = self.gh.rest("GET", "/repos/%s/issues?state=open&labels=loom:running,lane:%s"
+                                     % (repo, lane)).data
+            except GitHubError as err:
+                why = unreadable(err)
+                if why is None:
+                    raise
+                _say("remote claims: skipped %s: %s" % (repo, why))
+                continue
+            readable += 1
             if isinstance(found, list):
                 count += sum(1 for item in found if isinstance(item, dict)
                              and "pull_request" not in item)
-        return count
+        return count, readable
 
     def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
         for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
@@ -5548,8 +5598,7 @@ class Station:
                         "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
                     if len(queued if isinstance(queued, list) else []) >= 3:
                         continue
-                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT,
-                                         comment_limit=5)
+                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
                     counts = (sum(" queued under #" in line for line in lines),
                               sum(" loom:triage" in line for line in lines),
                               sum(" held:" in line for line in lines))
@@ -5729,13 +5778,22 @@ class Station:
             return
         pairs = state.get("pairs") if isinstance(state.get("pairs"), dict) else {}
         left = SETTLE_PER_RUN
+        # The run is stamped however it ends: at the cap, deferred, or past a
+        # repo GitHub refused. Stamped only on a full run, it ran every pass,
+        # so the cap held per pass and 91 sources settled in minutes, and a
+        # repo the App could not read stopped every run (2026-10-20).
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
-                    return
-                left -= self._settle_repo_sources(repo, pairs, left)
-            state["_at"] = self.now
+                    break
+                try:
+                    left -= self._settle_repo_sources(repo, pairs, left)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not settle the sources of %s: %s" % (repo, err))
         finally:
+            state["_at"] = self.now
             state["pairs"] = pairs
             _write_json(path, state)
 
@@ -6581,8 +6639,9 @@ class Station:
             return
         state["_checked"] = self.now
         # One goal's failure must not skip the later goals' standups, nor drop
-        # the stamps of the goals already posted this pass (loom#201).
-        for repo, goal in self._goal_homes():
+        # the stamps of the goals already posted this pass (loom#201), and one
+        # unreadable repo must not skip the other repos' goals (loom#1071).
+        for repo, goal in self._readable_goal_homes():
             try:
                 self._post_overdue_goal_standup(repo, goal, state, authors, now)
             except RateLimited:
@@ -6623,29 +6682,36 @@ class Station:
         brain._check_written_text(body)
         quiet = hold is None and body == self._overdue_standup_body(
             [], None, None if breaches is None else [])
-        previous = self._last_quiet_report(comments, authors, body) if quiet else None
+        previous = self._last_same_report(comments, authors, body)
         if previous is not None:
-            # Every new comment emails the goal's author; a quiet goal edits
-            # its last quiet report instead, which notifies no one.
+            # Every new comment emails the goal's author; a report that says
+            # what an earlier one said edits that one instead, which notifies
+            # no one, even when a brain's report came in between.
+            stamp = QUIET_STAMP if quiet else SAME_STAMP
             self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, previous),
-                         {"body": body + "\n" + QUIET_STAMP % now.strftime("%Y-%m-%dT%H:%MZ")})
+                         {"body": body + "\n" + stamp % now.strftime("%Y-%m-%dT%H:%MZ")})
         else:
             self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                          {"body": body})
         state[key] = self.now
 
     @staticmethod
-    def _last_quiet_report(comments: List[Any], authors: List[str], quiet: str) -> Optional[int]:
-        """The id of the goal's latest report by `authors` when it is this same
-        quiet report (its stamp line aside), else None."""
-        reports = [c for c in comments if isinstance(c, dict)
-                   and tickets._login(c.get("user")).lower() in authors
-                   and str(c.get("body") or "").startswith(REPORT_MARKER)]
-        if not reports or not isinstance(reports[-1].get("id"), int):
-            return None
-        lines = str(reports[-1].get("body") or "").splitlines()
-        kept = [line for line in lines if not line.startswith(QUIET_STAMP.split("%")[0])]
-        return reports[-1]["id"] if "\n".join(kept) == quiet else None
+    def _last_same_report(comments: List[Any], authors: List[str], body: str) -> Optional[int]:
+        """The id of the goal's latest report by `authors` that says `body`
+        (its stamp line aside), else None. Reports in between do not matter:
+        the brain's reports on the same goal never match the station's."""
+        stamps = tuple(stamp.split("%")[0] for stamp in (QUIET_STAMP, SAME_STAMP))
+        for comment in reversed(comments):
+            if not isinstance(comment, dict) or not isinstance(comment.get("id"), int) \
+                    or tickets._login(comment.get("user")).lower() not in authors:
+                continue
+            text = str(comment.get("body") or "")
+            if not text.startswith(REPORT_MARKER):
+                continue
+            kept = [line for line in text.splitlines() if not line.startswith(stamps)]
+            if "\n".join(kept) == body:
+                return comment["id"]
+        return None
 
     def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
         """The open loom:invariant issues filed on the goal home."""
@@ -6946,6 +7012,29 @@ class Station:
                            if tickets.REPO_RE.fullmatch(repo)
                            for issue in self._goal_issues(repo)]
         return self._goals
+
+    def _readable_goal_homes(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """(repo, issue) for every open loom:goal issue in the LOOM_REPOS
+        repos that can be read. A repo whose goal list fails is skipped with
+        one log line (loom#1071); only a complete list is kept for
+        _goal_homes, which must never route a note from a partial one."""
+        if self._goals is not None:
+            return self._goals
+        homes: List[Tuple[str, Dict[str, Any]]] = []
+        complete = True
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                homes += [(repo, issue) for issue in self._goal_issues(repo)]
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("standup: skipped %s: %s" % (repo, err))
+                complete = False
+        if complete:
+            self._goals = homes
+        return homes
 
     def _goal_for(self, text: str) -> Optional[Tuple[str, int, str, bool]]:
         """(repo, number, link, named) of the goal the message names: an

@@ -1941,23 +1941,16 @@ def _oldest_open_issues(gh: GitHub, repo: str):
         url = _next_link(resp.headers.get("link", ""))
 
 
-def _triage_comment(missing: List[str]) -> str:
-    return ("%s\nLoom triage: this issue is not a ticket yet. Missing: %s.\n\n"
-            "The brain will write a ticket from it that refs this issue, or label it "
-            "loom:human if only a person can do it. This issue stays open as it is."
-            % (TRIAGE_MARKER, ", ".join(missing)))
-
-
-def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
-          comment_limit: Optional[int] = None) -> List[str]:
+def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
     anything with a loom: label. A ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
-    the goal, while the goal has room; the rest get loom:triage and one
-    comment naming what is missing. A ready issue goes under the goal's
-    intake epic (intake_epic). Only labels, sub-issue links, that comment and
+    the goal, while the goal has room; the rest get loom:triage, and the
+    returned line names what is missing. No comment: each one emailed the
+    issue's author, and 161 older issues got one on 2026-10-20. A ready issue goes under the goal's
+    intake epic (intake_epic). Only labels, sub-issue links and
     an intake epic when one is needed are written, plus a Part of line at the
     end of a ready issue's body when GitHub refuses the sub-issue link: an issue is never closed or
     retitled, and nothing else in it is edited.
@@ -1971,7 +1964,6 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
     briefers = trusted_briefers()
     lines: List[str] = []
     done = 0
-    comments = 0
     intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
     for issue in _oldest_open_issues(gh, repo):
         if done >= limit:
@@ -2002,11 +1994,6 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
             intake = (intake[0], intake[1] + 1)
             lines.append("#%d queued under #%d" % (number, intake[0]))
         else:
-            if comment_limit is None or comments < comment_limit:
-                comment = _triage_comment(missing)
-                _check_written_text(comment)
-                gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
-                comments += 1
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:triage"]})
             lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
@@ -3628,6 +3615,18 @@ def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     return out if due else out + ["- none"]
 
 
+def _sensitive_head(gh: GitHub, repo: str, pr: Dict[str, Any]
+                    ) -> Tuple[str, Dict[str, Any]]:
+    """The head sha and pull request details for a sensitive resume check,
+    preferring the GraphQL head oid and falling back to the REST head sha."""
+    owner, name = repo.split("/", 1)
+    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
+                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
+    details = (data.get("repository") or {}).get("p") or {}
+    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    return sha, details
+
+
 def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
                      check: str) -> Optional[Dict[str, Any]]:
     """A needs-brain sensitive pull request older than 2 hours whose checks
@@ -3644,11 +3643,7 @@ def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
         return None
     if ticket is None:
         return None
-    owner, name = repo.split("/", 1)
-    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
-                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
-    details = (data.get("repository") or {}).get("p") or {}
-    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    sha, details = _sensitive_head(gh, repo, pr)
     if not _checks_green(details) or not sha or not _review_check_passed(gh, repo, sha, check):
         return None
     return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details}
@@ -4279,7 +4274,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gh: Optional[GitHub] = None
     try:
         args = parser().parse_args(argv)
-        gh = GitHub(auth_from_env())
+        gh = GitHub(auth_from_env(), unsubscribe=True)
         # Status comments by the trusted writers read as events (bus/status.py).
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
         COMMANDS[args.command](gh, args)
