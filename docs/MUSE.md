@@ -702,7 +702,7 @@ say-so alone:
   `gh issue comment` or a raw API comment for it. Evidence whose blocker kind
   has no issue of exactly that kind goes to the goal home's journal, never to
   the closest open issue: a comment there emails people about an issue the
-  evidence does not belong to (quadseven/wow-overseer#872, 2026-10-20). A new
+  evidence does not belong to (loom#1241, 2026-10-20). A new
   kind gets its own issue when the goal's rules say so.
 - Never open a pull request for an issue that is not a Loom ticket. To get
   code written, brief a ticket and let a lane take it. The station lands,

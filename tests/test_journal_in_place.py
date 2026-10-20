@@ -90,7 +90,7 @@ class WriterTests(unittest.TestCase):
         self.assertEqual([m for m, _, _ in fake.writes()], ["POST"])
 
     def test_a_loose_tick_header_is_replaced_never_stacked(self):
-        # quadseven/wow-overseer#872, 2026-10-20 23:12Z: the brain wrote
+        # loom#1241, 2026-10-20 23:12Z, on a project issue: the brain wrote
         # "Tick 2026-10-20 23:07Z, muse" (a space, not one token), the writer
         # did not see a Tick line and put its own on top, so the journal
         # opened with two tick headers.
@@ -153,7 +153,7 @@ class WriterTests(unittest.TestCase):
 
 class InstructionTests(unittest.TestCase):
     """The brain picks where its evidence goes in prose, so its instructions
-    carry the rule: on quadseven/wow-overseer#872 it filed vendor-wait
+    carry the rule: on 2026-10-20 (loom#1241) it filed vendor-wait
     evidence on a banker-wait issue "as the closest open kind"."""
 
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
