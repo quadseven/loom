@@ -541,6 +541,38 @@ ticket. A `Refs #M` line to any other issue changes nothing. Each outcome is
 said once per ticket, and a GitHub failure on the source is logged, never
 raised, since the ticket has already moved.
 
+### Operator-claimed issues close when their pull requests merge
+
+Pull requests never carry a closing keyword, so an issue an operator session
+files or claims (a `claim:<login>` label, no `loom:` label) had nothing to
+close it once its pull request merged: about 60 stayed open in one day
+(loom#1204). Once an hour the station reads each open issue carrying a
+`claim:` label (`bus/claimed.py`). It leaves alone any issue with a `loom:`,
+`needs:`, `needs-`, `ready-for-human`, `wontfix` or `awaiting-live-check`
+label, an epic (`epic` label, an `Epic:` title or sub-issues), and one with
+no acceptance boxes. The rest settle only when every pull request whose
+`Refs` line names the issue is merged into the default branch, the review
+check (`LOOM_REVIEW_CHECK`) concluded success on its head (neutral is not a
+pass), every other check on the head concluded success or skipped, and no
+open pull request names the issue. Then:
+
+- **Every box asks for merged code or tests:** one comment starting
+  `<!-- loom:claimed-settle v1 -->` states each pull request, its merge
+  commit, each head check's conclusion by name, and the test functions it
+  added that the default branch still defines; the boxes are ticked and the
+  issue is closed as completed. A comment already there is not posted again.
+- **A box asks for live, deployed or production behaviour, a time window or
+  an observed event:** the issue gets the `awaiting-live-check` label once and
+  stays open for a person. The test is wide on purpose: a box wrongly read as
+  live only labels the issue.
+
+`LOOM_SETTLE_CLAIMED` picks the mode. Unset or `dry` (the default) logs
+`settle-claimed: would close OWNER/NAME#N ...` or `would label ...` and writes
+nothing, so a dry run can be read in the station log first; `on` writes; `off`
+skips the step. `LOOM_SETTLE_CLAIMED_MAX` (default 10) caps the issues settled
+a run, and writes are at least 3 seconds apart. Turning writes on is the
+operator's call: set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
+
 ### Proof audits
 
 A lane proof passed the shape check, which cannot tell evidence a lane read
