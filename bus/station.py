@@ -2537,7 +2537,22 @@ class Station:
         station reads the ticket's merged pull requests, linked the way
         reconcile links them, with their checks, files and added tests. A
         GitHub failure is one line in the section, never a lost brief."""
-        branch, pulls, error = "", [], ""
+        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        if error:
+            _say("could not read GitHub data for the verify brief of %s#%s: %s"
+                 % (repo, issue.get("number"), error))
+        return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
+
+    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True
+                           ) -> Tuple[str, List[Dict[str, Any]], str]:
+        """(default branch, merged pull requests, error) for a ticket: its
+        pull requests linked the way reconcile links them, newest first, the
+        newest verify_data.MAX_PULLS read in full (check runs on the merge
+        commit, whether the branch carries it and, when files is set, the
+        changed files). After a GitHub failure only fully read pull requests
+        are returned, with the failure as "status N" or the error's name;
+        the verify brief and the done close both use these reads."""
+        branch = ""
         read: List[Dict[str, Any]] = []
         try:
             branch = self._default_branch(repo)
@@ -2552,20 +2567,17 @@ class Station:
                 pr["check_runs"] = (runs.get("check_runs") if isinstance(runs, dict) else []) or []
                 pr["on_branch"] = self._carries(repo, sha, quote(branch, safe="/")) \
                     if branch else None
-                pr["files"] = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
-                                           % (repo, int(pr["number"]))).data or []
+                if files:
+                    pr["files"] = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
+                                               % (repo, int(pr["number"]))).data or []
                 read.append(pr)
-            pulls = read + linked[verify_data.MAX_PULLS:]
+            return branch, read + linked[verify_data.MAX_PULLS:], ""
         except RateLimited:
             raise
         except (GitHubError, OSError, ValueError) as err:
-            # Only fully read pull requests are shown after a failure.
-            pulls = read
-            error = "status %d" % err.status if isinstance(err, GitHubError) and err.status \
-                else type(err).__name__
-            _say("could not read GitHub data for the verify brief of %s#%s: %s"
-                 % (repo, issue.get("number"), error))
-        return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
+            return branch, read, ("status %d" % err.status
+                                  if isinstance(err, GitHubError) and err.status
+                                  else type(err).__name__)
 
     @staticmethod
     def _note_text(raw: Any) -> str:
@@ -5737,12 +5749,15 @@ class Station:
 
     def close_done_tickets(self) -> None:
         """Close each done ticket, by the operator's rule (2026-10-19): a
-        shipped one whose Live line names no string a log search can find (its
-        pull request merged on green checks and the review bot to get there).
-        A Live line that names one keeps the ticket open for a verify run, and
-        a verified ticket closes through brain.close on the verify path, which
-        checks its criteria. Done tickets never closed: 199 sat shipped and
-        the backlog grew all week though the work was finished."""
+        shipped one whose Live line names no string a log search can find.
+        The status text states each linked pull request's merge and the
+        conclusion of every check run on its merge commit, as read now: the
+        merge gate lets a review check conclude neutral, so a fixed "merged
+        on green checks" was wrong on most closes (2026-10-20). A Live line
+        that names one keeps the ticket open for a verify run, and a verified
+        ticket closes through brain.close on the verify path, which checks
+        its criteria. Done tickets never closed: 199 sat shipped and the
+        backlog grew all week though the work was finished."""
         if self._deferred():
             return
         left = CLOSE_DONE_PER_PASS
@@ -5754,9 +5769,14 @@ class Station:
                 if not why:
                     continue
                 number = int(issue["number"])
+                # A failed read is said in the text; it never stops the close.
+                branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+                if error:
+                    _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
                 try:
-                    self._routine(repo, number, "Closed: %s. Not verified live; its criteria "
-                                  "were not ticked one by one." % why)
+                    self._routine(repo, number, "Closed: %s. %s Not verified live; its criteria "
+                                  "were not ticked one by one."
+                                  % (why, verify_data.close_facts(branch, pulls, error)))
                     # force-close is the close-completeness guard's escape hatch:
                     # this close is by rule, not a claim that each box was seen to
                     # hold. Without it the guard reopened 46 of 175 such closes,
@@ -5877,8 +5897,7 @@ class Station:
         if issue.get("state") != "open" or labels & set(CLOSE_DONE_HOLDS):
             return ""
         if "loom:shipped" in labels and "loom:verified" not in labels and not live_needles(issue.get("body")):
-            return ("shipped after merging on green checks, and its Live line names "
-                    "nothing a log search can find")
+            return "shipped, and its Live line names nothing a log search can find"
         return ""
 
     def restate_shipped_live(self) -> None:
