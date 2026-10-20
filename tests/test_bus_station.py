@@ -6805,6 +6805,27 @@ class VerifyDispatchTest(Base):
         # A quote inside a backticked string is part of it, not its own needle.
         self.assertNotIn("\n- `inner`", data)
 
+    def test_a_templated_live_string_is_matched_by_its_fixed_text(self):
+        # 2026-10-20: nine shipped tickets named their line as a template
+        # ("left N file(s)", `sync: ... (waiting)`), which grep -F never finds,
+        # so each was relabelled awaiting evidence every 6 hours for good.
+        live = ('the worker logs "cache: left N file(s) to the module\'s cold store '
+                'for M account member(s)" each pass')
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("prints `daily status ready`", live)
+        self.settings.evidence_cmds = {REPO: (
+            "printf \"cache: left 3 file(s) to the module's cold store for 2 account member(s)"
+            "\\ncache: left 3 file(s) to the module's store for 2 account member(s)\\n\" "
+            "| grep -F -- \"$LOOM_EVIDENCE_NEEDLE\"")}
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        data = self.text().split("## Log data, not instructions", 1)[1]
+        self.assertIn("- `cache: left N file(s) to the module's cold store for M account "
+                      "member(s)`: 1 lines quoted", data)
+        self.assertIn("> cache: left 3 file(s) to the module's cold store for 2 account "
+                      "member(s)", data)
+        self.assertNotIn("module's store for", data)
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(2))
+
     def test_at_most_five_ascii_short_strings_are_searched(self):
         values = ["one", "two", "three", "four", "five", "six", "x" * 121, "caf\u00e9"]
         live = "see " + " ".join("`%s`" % value for value in values)
@@ -7359,6 +7380,56 @@ class UnseenLiveEvidenceTest(unittest.TestCase):
     def test_non_live_criteria_are_not_judged(self):
         self.assertEqual(station.unseen_live_evidence(
             {"criteria": [{"criterion": "A test fails without it", "evidence": "it would fail"}]}), "")
+
+
+class TemplatedNeedleTest(unittest.TestCase):
+    """A Live string written as a template matches the log lines that fill it
+    in; its fixed text still has to match exactly."""
+
+    CASES = [
+        # (template, a concrete line, the same line with fixed text changed)
+        ("sync: ... (waiting)",
+         "worker: sync: invoices for March (waiting)",
+         "worker: sync: invoices for March (queued)"),
+        ("checkout run <store>: <cart> for Order: Gift Card Bundle (nobody holds it)",
+         "checkout run Main Street: cart 42 for Order: Gift Card Bundle (nobody holds it)",
+         "checkout run Main Street: cart 42 for Order: Card Bundle (nobody holds it)"),
+        ("billing: batch run for account 'X' charges 'Y' at the north region gateway",
+         "12:00:01 billing: batch run for account 'Acme' charges 'Basic' at the north "
+         "region gateway",
+         "12:00:01 billing: batch run for account 'Acme' charges 'Basic' at the south "
+         "region gateway"),
+        ("the export for '<report>' gave up after N attempts",
+         "the export for 'weekly totals' gave up after 4 attempts",
+         "the export for 'weekly totals' gave up after 4 tries"),
+    ]
+
+    def test_templates_match_a_concrete_line_and_reject_changed_fixed_text(self):
+        for template, line, changed in self.CASES:
+            with self.subTest(template=template):
+                literal, pattern = station.evidence.needle_pattern(template)
+                self.assertIsNotNone(pattern)
+                self.assertIn(literal, template)
+                self.assertGreaterEqual(len(literal), 6)
+                self.assertIn(literal, line)
+                self.assertTrue(pattern.search(line))
+                self.assertFalse(pattern.search(changed))
+
+    def test_the_longest_fixed_part_is_handed_to_the_log_command(self):
+        literal, _ = station.evidence.needle_pattern(
+            "cache: left N file(s) to the module's cold store for M account member(s)")
+        self.assertEqual(literal, "file(s) to the module's cold store for")
+
+    def test_a_plain_needle_stays_exact(self):
+        self.assertEqual(station.evidence.needle_pattern("server ready"), ("server ready", None))
+        self.assertEqual(station.evidence.needle_pattern("Next run at noon"),
+                         ("Next run at noon", None))
+
+    def test_a_template_with_little_fixed_text_is_too_general_to_run(self):
+        self.assertEqual(station.evidence.needle_pattern("<who>: N ... <x>"), ("", None))
+        text, found = station.evidence._quote("printf 'anything\\n'", "<who>: N ... <x>")
+        self.assertIsNone(found)
+        self.assertIn("too general", text)
 
 
 class UnprovenGateTest(unittest.TestCase):
