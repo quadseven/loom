@@ -300,7 +300,10 @@ FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
-# than a wait behind a busy lane"). The last rung takes the work regardless.
+# than a wait behind a busy lane that is up"). Only lanes that are up and serve
+# the rung's model count: an idle lane at a limit made rung 3 look free while
+# its only up lane was the busy claude lane (2026-10-19). The last rung takes
+# the work regardless.
 RUNG_BUSY = 2
 # A ladder ticket whose rung has no lane serving its model for longer than
 # this (each lane down, or its model limited past it) climbs to the next
@@ -845,16 +848,24 @@ def climb_rungs(tried: set, reached: int = 0) -> List[int]:
 
 
 def next_rung(tried: set, load: Dict[str, int], eligible: Optional[set] = None,
-              reached: int = 0) -> int:
+              reached: int = 0,
+              lanes: Optional[Dict[int, Tuple[str, ...]]] = None) -> int:
     """The lowest rung of climb_rungs with a lane under RUNG_BUSY
-    (docs/MUSE.md: a higher rung rather than a wait behind a busy lane), else
-    the one whose least-loaded lane holds the least, to wait there. 0 when
-    none is left. Waiting on the lowest rung instead queued 33 tickets on the
-    one claude lane on 2026-10-13 while six other ladder slots sat idle."""
-    untried = [n for n in climb_rungs(tried, reached) if eligible is None or n in eligible]
+    (docs/MUSE.md: a higher rung rather than a wait behind a busy lane that
+    is up), else the one whose least-loaded lane holds the least, to wait
+    there. 0 when none is left. Waiting on the lowest rung instead queued 33
+    tickets on the one claude lane on 2026-10-13 while six other ladder slots
+    sat idle. `lanes`, when given, maps each rung to the lanes that may serve
+    it now (Factory._up_lanes): only those count toward its load, and a rung
+    with none is passed over. Counting every CLIMB lane made rung 3 look free
+    through the idle anthropic slots while they were out of credit."""
+    untried = [n for n in climb_rungs(tried, reached)
+               if (eligible is None or n in eligible) and (lanes is None or lanes.get(n))]
     if not untried:
         return 0
-    least = {n: min(load.get(lane, 0) for lane in CLIMB[n - 1][0]) for n in untried}
+    least = {n: min(load.get(lane, 0)
+                    for lane in (CLIMB[n - 1][0] if lanes is None else lanes[n]))
+             for n in untried}
     free = [n for n in untried if least[n] < RUNG_BUSY]
     return free[0] if free else min(untried, key=lambda n: (least[n], n))
 
@@ -1365,6 +1376,13 @@ class Factory:
             lanes = tuple(lane for lane in lanes if lane not in PUBLIC_ONLY)
         return lanes
 
+    def _up_lanes(self, repo: str) -> Dict[int, Tuple[str, ...]]:
+        """Each CLIMB rung's lanes that may serve it now for this repo: up,
+        not at a limit, and with no limit on the rung's model there."""
+        return {n: tuple(lane for lane in self._rung_lanes(repo, n)
+                         if self._up(lane) and self._serves(lane, CLIMB[n - 1][1]))
+                for n in range(1, len(CLIMB) + 1)}
+
     def _rungs_left(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                     footer: Optional[Tuple[str, str]] = None) -> List[int]:
         """The rungs the ticket may still climb to that have a lane for its
@@ -1384,10 +1402,9 @@ class Factory:
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
         tried, reached = self._tried(issue, comments, failed_here, footer)
-        up = {n: tuple(lane for lane in self._rung_lanes(repo, n)
-                       if self._up(lane) and self._serves(lane, CLIMB[n - 1][1]))
-              for n in range(1, len(CLIMB) + 1)}
-        rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached)
+        up = self._up_lanes(repo)
+        rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached,
+                         lanes=up)
         if not rung:
             return None
         lanes, model = up[rung], CLIMB[rung - 1][1]
@@ -2021,16 +2038,28 @@ class Factory:
 
     def _spread(self, repo: str, issue: Dict[str, Any]) -> bool:
         """A ladder ticket waiting behind more than RUNG_BUSY others on its
-        lane moves to an untried rung with a free lane. Not a failure; the
-        rung it leaves stays on its record. True when it moved."""
+        lane moves to an untried rung with a free lane that is up. Not a
+        failure; the rung it leaves stays on its record. True when it moved.
+        A lane down or at a limit holds no tickets, so counting it made a rung
+        look free whose only up lane was busy: one ticket flipped between
+        rung 2 on codex-2 and rung 3 on claude 8 times in 90 minutes and was
+        never claimed (2026-10-20). The target's least-loaded up lane must be
+        another lane holding fewer than this lane less one, so a move always
+        shortens the wait and the next pass cannot move it back."""
         here = current_rung(issue)
         old = _lane(issue)
-        if not here or self.load.get(old, 0) <= RUNG_BUSY:
+        waiting = self.load.get(old, 0)
+        if not here or waiting <= RUNG_BUSY:
             return False
         comments = self._comments(repo, int(issue["number"]))
         tried, reached = self._tried(issue, comments, failed_here=False)
-        if not any(min(self.load.get(lane, 0) for lane in CLIMB[n - 1][0]) < RUNG_BUSY
-                   for n in climb_rungs(tried | {here}, reached) if self._rung_lanes(repo, n)):
+        up = self._up_lanes(repo)
+
+        def shorter(lanes: Tuple[str, ...]) -> bool:
+            lane = pick_lane(lanes, self.load)
+            return lane != old and self.load.get(lane, 0) < min(RUNG_BUSY, waiting - 1)
+
+        if not any(shorter(up[n]) for n in climb_rungs(tried | {here}, reached) if up[n]):
             return False
         lane = self._climb(repo, issue, comments, "%d tickets wait on lane %s"
                            % (self.load.get(old, 0), old), head="Not a failure",
