@@ -1944,8 +1944,7 @@ class TriageTest(Base):
                              now=self.start)
         with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
             st.triage_backlogs()
-        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT,
-                                       comment_limit=5)
+        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT)
         self.assertIn("loom:queued", self.fake.names(102))
         triage_json = os.path.join(self.home, "state", "station", "triage.json")
         with open(triage_json) as fh:
@@ -1958,7 +1957,7 @@ class TriageTest(Base):
         with open(rewrite_json) as fh:
             self.assertIn("%s#31" % REPO, json.load(fh))
 
-    def test_fallback_goal_waits_at_three_queued_and_caps_not_ready_comments(self):
+    def test_fallback_goal_waits_at_three_queued_and_triages_without_comments(self):
         self.fake.add_goal(31, title="Ship the thing")
         for number in range(100, 106):
             self.fake.add_open_issue(number, body="It is slow.", created="2030-01-%02dT00:00:00Z" % (number - 90))
@@ -1982,8 +1981,9 @@ class TriageTest(Base):
         with mock.patch.object(st.gh, "paginate", side_effect=lambda path: (
                 [] if "labels=loom:queued" in path else original_paginate(path))):
             st.triage_backlogs()
-        comments = [p for p in self.fake.paths("POST") if p.endswith("/comments")]
-        self.assertEqual(len(comments), 5)
+        self.assertEqual([p for p in self.fake.paths("POST") if p.endswith("/comments")], [])
+        self.assertEqual([n for n in range(100, 106) if "loom:triage" in self.fake.names(n)],
+                         list(range(100, 106)))
 
     def test_below_the_budget_floor_triage_is_deferred(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)

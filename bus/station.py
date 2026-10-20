@@ -5589,8 +5589,7 @@ class Station:
                         "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
                     if len(queued if isinstance(queued, list) else []) >= 3:
                         continue
-                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT,
-                                         comment_limit=5)
+                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
                     counts = (sum(" queued under #" in line for line in lines),
                               sum(" loom:triage" in line for line in lines),
                               sum(" held:" in line for line in lines))
