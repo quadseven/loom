@@ -33,7 +33,10 @@ agent_cli() {
 # the short tail (the last five non-blank lines), so a ticket that is about
 # expired keys or network errors is not read as a fault, and the reason shown
 # to people stays the short tail.
-LIMIT_RE='usage limit|rate[ _-]?limit|quota|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
+# A bare "quota" is no limit: a timed-out agent's git log or a file it read
+# can say it, and three Spark lanes were held an hour on a commit subject
+# (2026-10-20). Providers say the quota is reached, exceeded or exhausted.
+LIMIT_RE='usage limit|rate[ _-]?limit|quota (reached|exceeded|exhausted|resets?)|exceeded (your |the )?(current )?quota|resource[ _]exhausted|too many requests|insufficient[ _](credit|balance|funds)|credit balance is too low|payment required|(http|status|code|error)[^0-9a-z]{0,3}(429|402)([^0-9]|$)'
 KEY_STATE='expired|revoked|invalid|incorrect|disabled'
 AUTH_RE="($KEY_STATE)[ _-]*api[ _-]*key|api[ _-]*key([ _-]*(is|was|has|been|are))*[ _-]*($KEY_STATE)|(http|status|code|error)[^0-9a-z]{0,3}401([^0-9]|\$)"
 # A quota on the whole account, not one model: every model of the lane is
