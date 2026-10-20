@@ -6418,6 +6418,21 @@ class SettleOrphanSourcesTest(Base):
         self.assertEqual(self.fake.issues[3]["state"], "open")
         self.assertIn("not planned", self.fake.comments[3][-1]["body"])
 
+    def test_a_strangers_comment_or_an_unlanded_close_settles_nothing(self):
+        self.fake.private = False
+        self.ticket(11, 1, "closed", "completed")
+        self.source(1, 11)
+        self.fake.comments[1][0]["user"] = {"login": "stranger-example"}
+        self.ticket(12, 2, "closed", "completed")
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "lane:codex"}]
+        self.source(2, 12)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+        self.assertEqual(len(self.fake.comments[1]), 1)
+        self.assertEqual(len(self.fake.comments[2]), 1)
+
     def test_it_runs_once_an_hour_and_reads_each_rewrite_comment_once(self):
         self.fake.private = False
         self.ticket(12, 2)

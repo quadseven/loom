@@ -201,6 +201,7 @@ CLOSE_DONE_PER_PASS = 25
 SETTLE_EVERY = 3600
 SETTLE_PER_RUN = 25
 SOURCES_FILE = "sources.json"
+SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
 CLOSE_DONE_LABEL = "force-close"
@@ -5751,7 +5752,18 @@ class Station:
                     issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket)).data or {}
                     if issue.get("state") != "closed":
                         continue
+                    labels = set(_label_names(issue))
+                    if ("loom:ticket" not in labels or not tickets.brief_author_trusted(
+                            issue, self.s.authors, self.s.briefers)):
+                        pairs[key] = 0
+                        continue
+                    # Closed as completed settles the source only when the
+                    # ticket's work landed, the close rule's bar; any other
+                    # completed close is left for a person.
                     completed = issue.get("state_reason") == "completed"
+                    if completed and not labels & set(SETTLE_LANDED):
+                        pairs[key] = 0
+                        continue
                     said = brain.settle_source(self.gh, repo, ticket, issue.get("body"),
                                                "completed" if completed else "not_planned",
                                                unproven=completed)
@@ -5766,10 +5778,14 @@ class Station:
             _write_json(path, state)
 
     def _rewritten_as(self, repo: str, number: int) -> int:
-        """The ticket the source's newest rewrite comment names, 0 for none."""
+        """The ticket the newest rewrite comment by a briefing login names, 0
+        for none: anyone may comment on a public issue."""
+        authors = {author.lower() for author in self.s.authors}
         found = 0
         for comment in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
-            body = str((comment or {}).get("body") or "") if isinstance(comment, dict) else ""
+            if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
+                continue
+            body = str(comment.get("body") or "")
             match = REWRITTEN_AS_RE.search(body)
             if brain.TRIAGE_MARKER in body and match:
                 found = int(match.group(1))

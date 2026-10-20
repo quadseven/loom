@@ -523,9 +523,12 @@ issue when it moves:
 - **Closed with no proof** (the station's done close, or a person's close):
   once an hour the station reads each open `loom:rewritten` issue, and one
   whose ticket is closed settles by the ticket's close reason, up to 25 a
-  run. Closed as completed closes the source as completed, labelled
-  `force-close` when its own criteria are unchecked, by the same rule that
-  closed the ticket. A source Loom already said something about for that
+  run. Only a rewrite comment by a `LOOM_BRIEF_AUTHORS` login pairs them,
+  and only a `loom:ticket` a briefing login wrote. A ticket closed as
+  completed whose work landed (merged, shipped or verified) closes the source
+  as completed, labelled `force-close` when its own criteria are unchecked,
+  by the same rule that closed the ticket; one whose work never landed is
+  left for a person. A source Loom already said something about for that
   ticket is left alone. Before 2026-10-20 these sources stayed open: 87 of
   them counted as open work.
 
