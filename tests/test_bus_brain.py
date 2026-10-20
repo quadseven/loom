@@ -3769,6 +3769,47 @@ class EpicFilingTests(unittest.TestCase):
         self.assertNotEqual(nxt, first)
         self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
 
+    def intake_epics(self, fake, held):
+        """Open intake epics #60, #61, ... under goal #1, oldest first, each
+        holding the given number of tickets."""
+        for i, count in enumerate(held):
+            number = 60 + i
+            fake.issues[number] = dict(item(number, body="Part of #1\n", labels=["epic"]),
+                                       title=brain.INTAKE_TITLE)
+            fake.subs[1].append(number)
+            fake.subs[number] = []
+            for t in range(count):
+                ticket = 100 * (i + 1) + t
+                fake.issues[ticket] = item(ticket, labels=["loom:ticket", "loom:merged"])
+                fake.subs[number].append(ticket)
+
+    def test_intake_files_under_the_newest_intake_epic_with_room(self):
+        # 2026-10-19: intake kept refilling the goal's oldest intake epic, so
+        # tickets moved into it later took it past the cap.
+        fake = GoalRepo()
+        self.intake_epics(fake, [3, 5])
+        gh = GitHub("t", transport=fake)
+        self.assertEqual(brain.intake_epic(gh, REPO, 1), 61)
+        url = brain.brief_intake(gh, REPO, 1, "Ticket", BODY, "codex")
+        self.assertIn(int(url.rsplit("/", 1)[1]), fake.subs[61])
+        self.assertEqual(len(fake.subs[60]), 3)
+        self.assertEqual(fake.created()[1:], [])  # the ticket only: no new epic
+
+    def test_past_a_full_newest_intake_epic_intake_takes_the_next_newest(self):
+        fake = GoalRepo()
+        self.intake_epics(fake, [3, 14, brain.EPIC_TICKET_CAP])
+        self.assertEqual(brain.intake_epic(GitHub("t", transport=fake), REPO, 1), 61)
+
+    def test_intake_opens_a_new_epic_when_every_intake_epic_is_full(self):
+        fake = GoalRepo()
+        self.intake_epics(fake, [brain.EPIC_TICKET_CAP, brain.EPIC_TICKET_CAP + 4])
+        gh = GitHub("t", transport=fake)
+        nxt = brain.intake_epic(gh, REPO, 1)
+        self.assertNotIn(nxt, (60, 61))
+        self.assertEqual(fake.issues[nxt]["title"], brain.INTAKE_TITLE)
+        self.assertEqual([len(fake.subs[n]) for n in (60, 61)],
+                         [brain.EPIC_TICKET_CAP, brain.EPIC_TICKET_CAP + 4])
+
 
 class CloseEpicTests(unittest.TestCase):
     """loom#638: the brain closes a finished epic with a one-line note."""
