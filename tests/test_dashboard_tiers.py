@@ -20,6 +20,7 @@ from dashboard import tiers, tiers_sources  # noqa: E402
 from dashboard.tiers_sources import SourceState  # noqa: E402
 from dashboard.server import _dispatch_get  # noqa: E402
 from dashboard.shell import VIEWS  # noqa: E402
+from tests import sandbox_caps  # noqa: E402
 
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
 T = NOW.timestamp()
@@ -529,6 +530,7 @@ class Route(unittest.TestCase):
         self.assertIn("LOOM_GATEWAY_URL is not set", handler.result[1])
 
 
+@unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
 class OneRefresh(unittest.TestCase):
     """Live now shows a Loom run, a gateway call and a Grug review within one
     refresh pass of the background sources."""
