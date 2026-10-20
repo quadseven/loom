@@ -3669,7 +3669,7 @@ class SilentLaneTest(Base):
         self.assertEqual((run.lane, run.silent_for, run.at), ("codex", 1860.0, st.now))
         self.assertEqual(len(run.tickets), 1)
         (breach,) = invariants.silent_lane(invariants.Facts(st.now, silent_runs=[run]))
-        self.assertIn("codex", breach.title)
+        self.assertTrue(any(line.startswith("codex:") for line in breach.evidence))
 
     def test_nothing_found_records_nothing(self):
         st = self.station()
