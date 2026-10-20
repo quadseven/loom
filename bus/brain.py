@@ -1322,15 +1322,18 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
 
 
 def intake_epic(gh: GitHub, repo: str, goal: int) -> int:
-    """The goal's open intake epic with room for a ticket, opened (within the
-    epic cap) when there is none: where triage, rewrites, health intake,
-    validation contracts and adoption file their tickets."""
+    """The goal's newest open intake epic holding fewer than EPIC_TICKET_CAP
+    tickets, opened (within the epic cap) when none has room: where triage,
+    rewrites, health intake, validation contracts and adoption file their
+    tickets. The newest, so intake never refills an older epic that tickets
+    may since have been moved into (2026-10-19: one held 19)."""
     _, tree = goal_tree(gh, repo, goal)
-    for found, held in tree:
-        if (found.get("state", "open") == "open"
-                and str(found.get("title") or "") == INTAKE_TITLE):
-            if len(held) < EPIC_TICKET_CAP:  # goal_tree already read its tickets
-                return int(found["number"])
+    roomy = [int(found["number"]) for found, held in tree
+             if found.get("state", "open") == "open"
+             and str(found.get("title") or "") == INTAKE_TITLE
+             and len(held) < EPIC_TICKET_CAP]  # goal_tree already read its tickets
+    if roomy:
+        return max(roomy)
     made = file_epic(gh, repo, goal, INTAKE_TITLE, INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
