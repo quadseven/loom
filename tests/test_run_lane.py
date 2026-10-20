@@ -797,6 +797,17 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(sorted(p.name for p in cwd.iterdir()), [])
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_a_denied_temp_directory_still_classes_the_change(self):
+        # The same failed mktemp left the change unclassed: the pull request
+        # lost its Intent class and file counts, sensitive paths included.
+        self.write_tool(self.bin / "mktemp", FAKE_SANDBOXED_MKTEMP)
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        intent = self.body.read_text().split("## Why", 1)[0]
+        self.assertIn("Fix the thing so it works", intent)
+        self.assertIn("Files: 1", intent)
+
     def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="no-change",
