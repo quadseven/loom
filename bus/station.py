@@ -112,9 +112,6 @@ LIMIT = "limit:"
 # push moved the pull request's branch during the run. Not a failure: the
 # ticket goes back to loom:pr, and the factory judges the new head.
 BRANCH_MOVED = "branch moved:"
-# Asks the review bot to review a pull request's head again; it resolves the
-# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
-REVIEW_AGAIN = "/grug improve"
 LANE_SAID_MAX = 2500
 PATH_RE = _text.PATH_RE
 SECRET_RE = _text.SECRET_RE
@@ -4494,8 +4491,8 @@ class Station:
         pr = next((n for n in sorted(prs) if _open_on(node, repo, n)), None)
         if not said or pr is None:
             return
-        body = "Lane %s answered this finding instead of changing the code:\n\n%s" % (
-            lane, "\n".join("> " + line for line in said.splitlines()))
+        body = "Lane %s %s\n\n%s" % (
+            lane, factory.ANSWER_REPLY, "\n".join("> " + line for line in said.splitlines()))
         try:
             _text.check(body)
         except ValueError as err:
@@ -4536,7 +4533,7 @@ class Station:
             body = ("Lane %s made no change for this fix; its explanation did not "
                     "pass the text checks and is in the lane log." % lane)
         self._comment(repo, pr, body)
-        self._comment(repo, pr, os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN)
+        self._comment(repo, pr, factory.review_again())
         self._relabel(repo, number, "loom:pr")
         self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
                       "on the pull request; the review bot was asked to review it again."

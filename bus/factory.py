@@ -65,6 +65,13 @@ Neither needs a model:
   2026-10-13 were the bot's own "Fixed in" threads).
 - A round where the lane made no change and explained why waits for the
   review it asked for, up to REVIEW_GRACE, before the round is judged.
+- A pull request whose open thread carries a lane's answer to a finding, and
+  whose ticket has no lane up for its next rung, does not wait with nothing
+  to move it: the review bot is asked to judge the answer (`/grug improve`,
+  once per head commit), so it re-reviews the head with the reply in view. It
+  clears the head if the answer holds, and keeps the finding if it does not
+  (2026-10-19: grug#1189 waited from 18:25Z on an answered thread nothing
+  judged).
 - A failed ticket climbs the ladder, but only once for a run that committed
   nothing and wrote no reason (lanes/run_lane.sh NO_REASON): at the second
   such failure it is left failed with needs-brain for the brain, since a
@@ -122,7 +129,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import brain, change_class, labels, naming, status, tickets
-from .github import GitHub, GitHubError
+from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
 
@@ -141,6 +148,17 @@ DEFAULT_REVIEW_CHECK = "Grug - Elder"
 # The review bot's login as GraphQL reports it (an app, without "[bot]").
 DEFAULT_REVIEW_BOT = "grug-tribe"
 BOT_FIXED_PREFIX = "Fixed in "
+# Asks the review bot to review a pull request's head again; it resolves the
+# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
+REVIEW_AGAIN = "/grug improve"
+# The reply a lane posts on a review thread when it answered the finding
+# instead of changing the code (bus/station.py writes it). The factory reads
+# the same words to know a thread was answered and not settled.
+ANSWER_REPLY = "answered this finding instead of changing the code:"
+ANSWER_RE = re.compile(r"^Lane [A-Za-z0-9_.-]+ %s" % re.escape(ANSWER_REPLY))
+# The marker on the comment that asks the review bot to judge an answer: it
+# carries the head commit, so the ask happens once per head.
+IMPROVE_MARKER = "<!-- loom:improve-head %s -->"
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The slots that draw on one API credit: an empty credit holds all of them.
@@ -478,6 +496,32 @@ def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
 
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
     return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
+
+
+def lane_answered(comment: Dict[str, Any], trusted: set) -> bool:
+    """A lane's answer to a finding, posted as the reply on its thread by a
+    trusted login (bus/station.py writes it as the App)."""
+    return (rest_login(comment.get("author")).lower() in trusted
+            and bool(ANSWER_RE.match(str(comment.get("body") or ""))))
+
+
+def answered_threads(threads: Sequence[Dict[str, Any]], trusted: set) -> List[str]:
+    """The open threads a lane answered instead of changing the code: the
+    thread carries the answer as one of its replies."""
+    out = []
+    for t in threads:
+        if t.get("isResolved"):
+            continue
+        nodes = (t.get("comments") or {}).get("nodes") or []
+        if any(lane_answered(c, trusted) for c in nodes):
+            out.append(str(t.get("id")))
+    return out
+
+
+def review_again() -> str:
+    """The comment that asks the review bot to review a pull request's head
+    again (LOOM_REVIEW_AGAIN overrides the default)."""
+    return os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN
 
 
 def asked_threads(comments: Sequence[Dict[str, Any]]) -> set:
@@ -1067,7 +1111,8 @@ class Factory:
         status.add(self.gh, repo, number, text, self.now, self.trusted)
 
     def _comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
-        """The ticket's comments from trusted logins only."""
+        """An issue's comments (a ticket's or a pull request's) from trusted
+        logins only."""
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return [c for c in data if isinstance(c, dict) and self._trusted(c)]
 
@@ -1171,13 +1216,16 @@ class Factory:
                    for r in self._runs.get(sha, []))
 
     # -- writes ----------------------------------------------------------
-    def _resolve_bot_fixed(self, repo: str, number: int) -> None:
+    def _threads(self, repo: str, number: int) -> List[Dict[str, Any]]:
+        """The pull request's review threads, with their replies."""
         owner, name = repo.split("/", 1)
         data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
                                                "number": number}) or {}
-        threads = ((((data.get("repository") or {}).get("pullRequest") or {})
-                    .get("reviewThreads") or {}).get("nodes") or [])
-        picked = bot_fixed(threads, self.review_bot)
+        return ((((data.get("repository") or {}).get("pullRequest") or {})
+                 .get("reviewThreads") or {}).get("nodes") or [])
+
+    def _resolve_bot_fixed(self, repo: str, number: int) -> None:
+        picked = bot_fixed(self._threads(repo, number), self.review_bot)
         for thread_id in picked:
             self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
         if picked:
@@ -1219,11 +1267,7 @@ class Factory:
         """Defer the open medium and low findings of a reviewed, green pull
         request to a follow-up issue, then resolve them. True when it did.
         With `immediate` (docs, tests, or a revert) they defer at once."""
-        owner, name = repo.split("/", 1)
-        data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
-                                               "number": number}) or {}
-        threads = ((((data.get("repository") or {}).get("pullRequest") or {})
-                    .get("reviewThreads") or {}).get("nodes") or [])
+        threads = self._threads(repo, number)
         rounds = fixes_of(comments)
         picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
@@ -1327,7 +1371,13 @@ class Factory:
                 if self._rungs_left(repo, issue, comments, footer):
                     # Not past the ladder: no lane of an untried rung is up.
                     # It waits, with no comment, and climbs on a later pass.
-                    _say("%s#%d waits: no lane is up for its next rung" % (repo, number))
+                    # An answered thread is judged by the review bot instead:
+                    # it re-reviews the head with the reply in view.
+                    asked = self._ask_reviewer(repo, pr)
+                    note = ("; the review bot was asked to judge the answer on #%d"
+                            % int(pr["number"])) if asked else ""
+                    _say("%s#%d waits: no lane is up for its next rung%s"
+                         % (repo, number, note))
                     return
                 tried, _ = self._tried(issue, comments, footer=footer)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
@@ -1346,6 +1396,27 @@ class Factory:
                      TEST_NOTES if no_test else FIX_NOTES)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
+
+    def _ask_reviewer(self, repo: str, pr: Dict[str, Any]) -> bool:
+        """Ask the review bot to judge a lane's answer on a pull request whose
+        ticket has no lane up for its next rung. It re-reviews the head with
+        the reply in view: it clears the head if the answer holds, and keeps
+        the finding if it does not. The ask happens once per head commit, so
+        a ticket that waits does not ask again and again. True when it asked.
+        """
+        number = int(pr["number"])
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha:
+            return False
+        marker = IMPROVE_MARKER % sha
+        if any(marker in str(c.get("body") or "") for c in self._comments(repo, number)):
+            return False  # this head was asked already
+        if not answered_threads(self._threads(repo, number), self.trusted):
+            return False  # nothing was answered: the finding stands on its own
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                     {"body": "%s\n\n%s" % (review_again(), marker)})
+        self.actions += 1
+        return True
 
     # -- the three kinds of stuck ----------------------------------------
     def _footer(self, repo: str, pr: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
