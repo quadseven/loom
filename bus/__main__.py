@@ -52,7 +52,7 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("unlock", help="release the brain tick lock")
     s.add_argument("repo", type=_repo, metavar="OWNER/NAME")
     s.add_argument("--holder", required=True)
-    s = sub.add_parser("journal", help="post a journal or report comment")
+    s = sub.add_parser("journal", help="post a journal, report or reply comment; a file with no marker is a journal tick")
     s.add_argument("target", type=_issue, metavar="OWNER/NAME#N")
     s.add_argument("--file", required=True)
     s.add_argument("--holder", help="the brain posting a journal; adds its Tick line when missing")

@@ -1101,7 +1101,11 @@ posts the day's first tick and edits that comment for every later tick, the
 new tick at the top and the earlier ticks of the day under a
 `<details><summary>Earlier ticks today</summary>` block, newest first,
 dropping the oldest past 60000 characters. A new comment emails the operator
-and an edit does not. Readers split an edited journal back into its ticks,
+and an edit does not. `bus journal --holder NAME` also takes a file with no
+marker, the brain's evidence or a note for that issue, and journals it as a
+tick the same way, and it replaces a hand-written tick header after the
+marker (`Tick 2026-10-20 23:07Z, muse`) with the canonical line instead of
+stacking two. Readers split an edited journal back into its ticks,
 each at the time on its Tick line (`bus.handoff.expand_journals`). Each tick
 looks like this:
 
