@@ -6541,6 +6541,51 @@ class CloseDoneTest(Base):
         plain = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
         self.assertEqual(plain, [])
 
+    def close_text(self, number):
+        return "\n".join(c["body"] for c in self.fake.comments[number]
+                         if status.is_status(c.get("body")))
+
+    def test_the_done_close_names_a_neutral_review_check(self):
+        # The merge gate lets a non-sensitive pull request land with the
+        # review check neutral, so the close may not say "green checks".
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
+                      state="shipped")
+        sha = "d" * 40
+        self.fake.pulls.append({"number": 41, "state": "closed", "title": "Fix",
+                                "merged_at": "2030-01-02T00:00:00Z", "merge_commit_sha": sha,
+                                "head": {"ref": "a-fix"}, "body": "Refs %s#1\n" % REPO})
+        self.fake.carried.add(sha)
+        self.fake.check_runs[sha] = [
+            {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral",
+             "completed_at": "2030-01-02T00:05:00Z"},
+            {"name": "unittest", "status": "completed", "conclusion": "success",
+             "completed_at": "2030-01-02T00:04:00Z"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        text = self.close_text(1)
+        self.assertIn("Grug - Elder neutral", text)
+        self.assertIn("PR #41 merged", text)
+        self.assertNotIn("green checks", text)
+        self.assertNotIn("green", text)
+
+    def test_the_done_close_still_closes_when_checks_cannot_be_read(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
+                      state="shipped")
+        sha = "e" * 40
+        self.fake.pulls.append({"number": 42, "state": "closed", "title": "Fix",
+                                "merged_at": "2030-01-02T00:00:00Z", "merge_commit_sha": sha,
+                                "head": {"ref": "loom/1-fix"}, "body": ""})
+        self.fake.check_runs_status = 502
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        text = self.close_text(1)
+        self.assertIn("could not be read (status 502)", text)
+        self.assertNotIn("green", text)
+
     def test_unreadable_registered_repo_does_not_block_done_close(self):
         second = "example-owner/second-repo"
         self.settings.repos.append(second)
