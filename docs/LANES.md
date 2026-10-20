@@ -562,7 +562,8 @@ run recorded no model). Before it moves the ticket, the station reads the
 merged pull requests again, as for the brief: a record whose criterion
 evidence says every check passed ("all checks passed", "checks green") while
 the newest run of a check on a merge commit concluded other than success or
-skipped is refused. The proof comment then carries a `Checked by the
+skipped is refused, and so is any record when GitHub cannot be read for
+them (the ticket is tried again after its cooldown). The proof comment then carries a `Checked by the
 station:` section, one line per merged pull request with its merged time,
 merge commit, whether the default branch's head contains it and each check's
 newest outcome, stored in the record as `station_facts`; a record that brings

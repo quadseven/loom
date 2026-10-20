@@ -179,6 +179,30 @@ def failing_checks(pulls: List[Dict[str, Any]]) -> Dict[str, str]:
     return found
 
 
+def _containment(branch: str, on_branch: Optional[bool]) -> str:
+    return "the head of %s %s it" % (
+        branch or "the default branch",
+        {True: "contains", False: "does not contain"}.get(on_branch, "is not known to contain"))
+
+
+def _checks_text(runs: List[Dict[str, Any]]) -> str:
+    checks = ", ".join("%s %s" % (_clean(run.get("name")), _outcome(run))
+                       for run in runs[:MAX_CHECKS])
+    if len(runs) > MAX_CHECKS:
+        checks += ", and %d more" % (len(runs) - MAX_CHECKS)
+    return "checks: " + checks if checks else "no check runs on the merge commit"
+
+
+def _fact_line(branch: str, pr: Dict[str, Any]) -> Line:
+    """One read pull request's facts, and its merge commit when it is one."""
+    sha = str(pr.get("merge_commit_sha") or "")
+    line = "PR #%d merged at %s as %s; %s; %s" % (
+        int(pr.get("number") or 0), _clean(pr.get("merged_at")) or "unknown",
+        sha or "an unknown commit", _containment(branch, pr.get("on_branch")),
+        _checks_text(_latest(pr.get("check_runs"))))
+    return line, sha if COMMIT_RE.fullmatch(sha) else ""
+
+
 def close_facts(branch: str, pulls: List[Dict[str, Any]], error: str = "") -> List[str]:
     """The lines a lane proof's comment carries under "Checked by the
     station": one per read pull request (number, merged time, merge commit,
@@ -189,25 +213,11 @@ def close_facts(branch: str, pulls: List[Dict[str, Any]], error: str = "") -> Li
     if error:
         lines.append(("GitHub could not be read (%s); pull request facts may be missing."
                       % _clean(error), ""))
-    read = _read(pulls)
+    read = _read(pulls)[:MAX_PULLS]
     if not read and not error and not pulls:
         lines.append(("No merged pull request names this ticket.", ""))
-    for pr in read[:MAX_PULLS]:
-        sha = str(pr.get("merge_commit_sha") or "")
-        on_branch: Optional[bool] = pr.get("on_branch")
-        runs = _latest(pr.get("check_runs"))
-        checks = ", ".join("%s %s" % (_clean(run.get("name")), _outcome(run))
-                           for run in runs[:MAX_CHECKS])
-        if len(runs) > MAX_CHECKS:
-            checks += ", and %d more" % (len(runs) - MAX_CHECKS)
-        lines.append(("PR #%d merged at %s as %s; the head of %s %s it; %s" % (
-            int(pr.get("number") or 0), _clean(pr.get("merged_at")) or "unknown",
-            sha or "an unknown commit", branch or "the default branch",
-            {True: "contains", False: "does not contain"}.get(on_branch,
-                                                             "is not known to contain"),
-            "checks: " + checks if checks else "no check runs on the merge commit"),
-            sha if COMMIT_RE.fullmatch(sha) else ""))
-    unread = len([pr for pr in pulls if isinstance(pr, dict)]) - len(read[:MAX_PULLS])
+    lines.extend(_fact_line(branch, pr) for pr in read)
+    unread = len([pr for pr in pulls if isinstance(pr, dict)]) - len(read)
     if unread > 0:
         lines.append(("%d more merged pull request%s not read." % (
             unread, " was" if unread == 1 else "s were"), ""))

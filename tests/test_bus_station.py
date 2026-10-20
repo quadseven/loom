@@ -7297,6 +7297,18 @@ class VerifyResultTest(Base):
         self.assertIn("every check passed but Grug - Guard concluded neutral",
                       " ".join(str(c) for c in say.call_args_list))
 
+    def test_a_proof_whose_pull_request_facts_cannot_be_read_is_not_applied(self):
+        # Unread facts could hide the neutral check: no close on prose alone.
+        self.merged_with_neutral_guard()
+        self.fake.check_runs_status = 500
+        self.result(self.good())
+        with mock.patch("bus.station._say") as say:
+            self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(self.proofs(), [])
+        self.assertIn("could not read the merged pull requests (status 500)",
+                      " ".join(str(c) for c in say.call_args_list))
+
     def test_the_proof_comment_carries_the_facts_the_station_checked(self):
         sha = self.merged_with_neutral_guard()
         self.result(self.good())

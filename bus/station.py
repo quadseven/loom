@@ -2764,7 +2764,11 @@ class Station:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
             return
         branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
-        contradiction = proof.contradicts(record, verify_data.failing_checks(pulls))
+        # Facts the station could not read cannot back a close: it tries again
+        # after the cooldown rather than sign the lane's prose alone.
+        contradiction = ("the station could not read the merged pull requests (%s)" % error
+                         if error else
+                         proof.contradicts(record, verify_data.failing_checks(pulls)))
         if contradiction:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(
                 contradiction))
