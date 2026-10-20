@@ -558,7 +558,12 @@ to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, ticks the criteria and moves the ticket to verified with the
 proof, marked `"verified_by": "<lane>/<model>"` (`<lane>/unknown` when the
-run recorded no model). A refused record, a missing result or no
+run recorded no model). It refuses a record whose revision does not contain
+the merge commit of each linked pull request merged into the default branch
+(the compare API), or whose observed window starts before the newest of them
+merged: a stale build or evidence read before the fix proves nothing. A
+GitHub error on that check leaves the ticket shipped, and a ticket with no
+linked merged pull request is left to the close rule. A refused record, a missing result or no
 `verify.json` leaves the ticket shipped with one note on it. The run is
 counted like any lane run, and the Spread line also shows how many were
 verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a

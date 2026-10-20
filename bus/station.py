@@ -2732,6 +2732,35 @@ class Station:
             return "unknown"
         return model
 
+    def _proof_mismatch(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]) -> str:
+        """Why a lane's proof does not prove the ticket's merged change, or ""
+        when it does: its revision must contain the merge commit of each linked
+        merged pull request (the ones the verify brief shows), and its observed
+        window must not start before the newest of them merged. A stale build,
+        or evidence read before the fix landed, proves nothing about the fix.
+        A ticket with no linked merged pull request is left to the close rule,
+        and a pull request merged into another branch is not counted."""
+        branch = self._default_branch(repo)
+        linked = sorted((pr for pr in self._closed_pulls(repo) if _linked_pr(issue, repo, pr)
+                         and str((pr.get("base") or {}).get("ref") or branch) == branch),
+                        key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
+        linked = linked[:verify_data.MAX_PULLS]
+        if not linked:
+            return ""
+        revision = str(record["revision"]).strip()
+        for pr in linked:
+            sha = str(pr["merge_commit_sha"])
+            if not self._carries(repo, sha, revision):
+                return "revision %s does not contain the merge commit %s of PR #%d" % (
+                    revision[:12], sha[:12], int(pr["number"]))
+        newest = linked[0]
+        start = str(record["observed"]["start"])
+        merged, began = self._epoch(str(newest["merged_at"])), self._epoch(start)
+        if merged is not None and began is not None and began < merged:
+            return "the observed window starts %s before PR #%d merged at %s" % (
+                start, int(newest["number"]), newest["merged_at"])
+        return ""
+
     def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any],
                      model: str) -> None:
         """Check the record with bus/proof.py, tick the criteria and move the
@@ -2755,6 +2784,17 @@ class Station:
         unseen = unseen_live_evidence(record)
         if unseen:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % unseen)
+            return
+        try:
+            mismatch = self._proof_mismatch(repo, issue, record)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            self._verify_note(repo, number, lane, "could not check the proof's revision "
+                              "against its merged pull requests: %s" % self._note_text(err))
+            return
+        if mismatch:
+            self._verify_note(repo, number, lane, "Its proof was refused: %s." % mismatch)
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
