@@ -2761,6 +2761,19 @@ class Station:
                 start, int(newest["number"]), newest["merged_at"])
         return ""
 
+    def _merge_refusal(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]) -> str:
+        """The verify note for a proof that does not prove the merged change,
+        or "" when it does. A GitHub error other than a rate limit leaves the
+        ticket shipped with a note, never verified on an unchecked revision."""
+        try:
+            mismatch = self._proof_mismatch(repo, issue, record)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            return ("could not check the proof's revision against its merged pull requests: "
+                    "%s" % self._note_text(err))
+        return "Its proof was refused: %s." % mismatch if mismatch else ""
+
     def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any],
                      model: str) -> None:
         """Check the record with bus/proof.py, tick the criteria and move the
@@ -2785,16 +2798,9 @@ class Station:
         if unseen:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % unseen)
             return
-        try:
-            mismatch = self._proof_mismatch(repo, issue, record)
-        except RateLimited:
-            raise
-        except GitHubError as err:
-            self._verify_note(repo, number, lane, "could not check the proof's revision "
-                              "against its merged pull requests: %s" % self._note_text(err))
-            return
-        if mismatch:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % mismatch)
+        refusal = self._merge_refusal(repo, issue, record)
+        if refusal:
+            self._verify_note(repo, number, lane, refusal)
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
