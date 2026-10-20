@@ -492,7 +492,10 @@ top of your work directory. It holds exactly one of:
    and criteria: one {criterion, result, evidence} per acceptance criterion
    below, in order, with the criterion text copied exactly and result "pass".
    A runtime record also needs environment, artifact, and measure {name,
-   baseline, target, after}.
+   baseline, target, after}. The revision must be a merge commit the GitHub
+   data section shows, or a later commit on the default branch, and
+   observed.start must not be before that pull request merged: the station
+   refuses a proof of a stale build or of evidence seen before the merge.
 2. {"missing": "<the evidence that does not exist yet>"} when you cannot
    prove every criterion. Name the evidence precisely; do not guess.
 
