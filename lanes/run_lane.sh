@@ -1576,6 +1576,8 @@ final_validation() {
 # A run that failed validation keeps its edits: they are committed and pushed
 # to a side branch, never to the ticket's branch or an open pull request.
 preserve_unvalidated() {
+
+}
   local side
   side="$BRANCH-unvalidated-$(date +%s)"
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
@@ -2312,7 +2314,17 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "agent exited $STATUS: $AUTH_WHY" auth
     break
   fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
+if [ "$STATUS" -eq 124 ] && [ "$EDITED" = edited ]; then
+  side="${BRANCH}-timedout-$(date +%s)"
+  if git -C "$TREE" push -q origin "$BRANCH:refs/heads/$side" >> "$LOG" 2>&1; then
+    park "$BRIEF" "agent exited 124; edits saved to branch $side" transient
+  else
+    park "$BRIEF" "agent exited 124; push to $side failed; edits remain on lane tree" transient
+  fi
+  continue
+fi
+if [ "$STATUS" -ne 0 ]; then
+  park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.
