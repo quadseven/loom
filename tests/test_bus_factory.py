@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from bus import factory, station, status
+from bus import factory, labels, station, status
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
 
@@ -2122,6 +2122,38 @@ class DeadLane(unittest.TestCase):
             "up the model ladder to rung 2, gpt-6-sol on lane codex.",
             "Claimed for lane codex (body sha256 0123456789ab)")
         self.assertEqual(factory.dead_lane(comments), "codex")
+
+
+class LaneKinds(unittest.TestCase):
+    """What each lane costs (loom#968): the Tiers page marks every tier and
+    ladder entry free, own hardware, subscription or never-paid."""
+
+    def test_every_lane_in_the_tiers_and_the_ladder_has_a_kind(self):
+        named = {lane for lanes in factory.TIERS.values() for lane in lanes}
+        named |= {lane for lanes, _ in factory.LADDER for lane in lanes}
+        missing = sorted(lane for lane in named if factory.lane_kind(lane) is None)
+        self.assertEqual(missing, [])
+        self.assertEqual(set(factory.LANE_KINDS.values()) - set(factory.KINDS), set())
+
+    def test_lane_kinds_lists_base_lanes_only(self):
+        # A numbered slot takes its lane's kind through lane_kind.
+        slots = sorted(lane for lane in factory.LANE_KINDS if labels.base_lane(lane) != lane)
+        self.assertEqual(slots, [])
+
+    def test_a_slot_maps_to_its_lane_by_one_rule(self):
+        self.assertEqual(labels.base_lane("anthropic-7"), "anthropic")
+        self.assertEqual(labels.base_lane("opencode-go-3"), "opencode-go")
+        self.assertEqual(labels.base_lane("spark-2"), "spark")
+        # A free provider slot is its own lane: its name has no number.
+        self.assertEqual(labels.base_lane("free-kilo"), "free-kilo")
+
+    def test_sparks_are_own_hardware_and_the_free_pool_is_free(self):
+        self.assertEqual({factory.lane_kind(lane) for lane in factory.SPARKS}, {"own-hardware"})
+        self.assertEqual({factory.lane_kind(lane) for lane in factory.FREE_POOL}, {"free"})
+        self.assertEqual({factory.lane_kind(lane) for lane in factory.ANTHROPIC}, {"never-paid"})
+        self.assertEqual(factory.lane_kind("claude"), "subscription")
+        self.assertEqual(factory.lane_kind("anthropic-9"), "never-paid")
+        self.assertIsNone(factory.lane_kind("no-such-lane"))
 
 
 if __name__ == "__main__":

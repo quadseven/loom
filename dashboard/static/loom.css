@@ -714,3 +714,42 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .operators-ask { color: var(--body); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
 .waiting-on { margin: 6px 0 10px; padding: 0; list-style: none; }
 .waiting-on li { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+/* Tiers and allowances page (loom#968): the tier lists side by side, one
+   dense table of provider and model rows that stacks into a card per row on
+   a phone (each cell labelled), and the three Live now lists. */
+.tiers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: 14px 18px; }
+.tiers-tier h3, .tiers-live h3 { margin: 0 0 6px; color: var(--text); font-size: 13px; font-weight: 600; }
+.tiers-entries { margin: 0; padding-left: 22px; color: var(--muted); font-size: 12.5px; }
+.tiers-entry { padding: 3px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.tiers-lane { color: var(--text); font-family: var(--font-mono); }
+.tiers-model { color: var(--body); font-family: var(--font-mono); }
+.tiers-rung { color: var(--muted); font: 11px var(--font-mono); }
+.tiers-kind { display: inline-block; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font: 10.5px var(--font-mono); white-space: nowrap; }
+.tiers-kind-own-hardware { border-color: var(--good); color: var(--good-on-bg); }
+.tiers-kind-free { border-color: var(--info); color: var(--info-on-bg); }
+.tiers-kind-subscription { border-color: var(--accent); color: var(--accent-on-bg); }
+.tiers-kind-never-paid { border-color: var(--bad); color: var(--bad-on-bg); }
+.tiers-note { margin: 0 0 8px; color: var(--muted-on-bg); font-size: 13px; }
+.tiers-stale { margin: 0 0 8px; font-size: 13px; }
+.tiers-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tiers-table th, .tiers-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.tiers-table thead th { color: var(--dim-on-bg); font: 500 10.5px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+.tiers-table tbody th { color: var(--text); font-family: var(--font-mono); font-weight: 500; }
+.tiers-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tiers-table td.tiers-unknown { color: var(--muted); }
+.tiers-table .tiers-allowance { color: var(--body); overflow-wrap: anywhere; }
+.tiers-cooling .tiers-allowance, .tiers-metered .tiers-allowance { color: var(--accent-on-bg); }
+.tiers-benched .tiers-allowance { color: var(--bad-on-bg); }
+.tiers-live-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 14px 18px; }
+.tiers-live-list { margin: 0; padding: 0; list-style: none; }
+.tiers-live-list li { padding: 5px 0; border-bottom: 1px solid var(--line); color: var(--body); font-size: 13px; overflow-wrap: anywhere; }
+.tiers-live-title { color: var(--body); }
+@media (max-width: 959px) {
+  .tiers-table, .tiers-table tbody, .tiers-table tr, .tiers-table th, .tiers-table td { display: block; }
+  .tiers-table thead { display: none; }
+  .tiers-table tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .tiers-table th, .tiers-table td { padding: 0; border: 0; }
+  .tiers-table tbody th, .tiers-table td.tiers-allowance { grid-column: 1 / -1; }
+  .tiers-table td::before { display: block; color: var(--muted); font: 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; content: attr(data-label); }
+  .tiers-live-list li > a { display: inline-flex; min-height: 44px; align-items: center; }
+}

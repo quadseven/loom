@@ -121,7 +121,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, naming, status, tickets
+from . import brain, change_class, labels, naming, status, tickets
 from .github import GitHub, GitHubError
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -193,6 +193,26 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # public repos (agy stays public only).
     "hard": SPARKS + ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
 }
+# What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
+# own-hardware (the Sparks), free (a free provider's allowance), subscription
+# (a plan with a usage window: claude, codex, opencode-go, agy on the
+# operator's Google plan, muse) or never-paid (a prepaid API credit the
+# operator does not top up, LOOM_NO_TOPUP: the anthropic slots). Every lane
+# TIERS and LADDER name has one (tests/test_bus_factory.py LaneKinds). Base
+# lanes only: a numbered slot takes its lane's kind (lane_kind).
+KINDS = ("own-hardware", "free", "subscription", "never-paid")
+LANE_KINDS: Dict[str, str] = {
+    "spark": "own-hardware",
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai")},
+    **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
+    "anthropic": "never-paid",
+}
+
+
+def lane_kind(lane: str) -> Optional[str]:
+    """LANE_KINDS for a lane or a numbered slot of one (anthropic-9 is an
+    anthropic slot, labels.base_lane); None for a lane it does not know."""
+    return LANE_KINDS.get(labels.base_lane(lane))
 # The strongest model each lane has, for a hard ticket with no Model: line
 # (bus/tickets.py render_brief writes it into the brief, so run_lane.sh runs
 # it instead of the lane default). Artificial Analysis Intelligence Index at
@@ -608,7 +628,7 @@ def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
     when none rewrote it since (lanes/run_lane.sh runs a brief's Model: line
     as it is). A claim with no Model: line in force ran on the model the
     runner footer of its lane's pull request names (`footer`, (lane, model)),
-    else on its lane's configured model setting (bus/brain.py _lane_model),
+    else on its lane's configured model setting (bus/brain.py lane_model),
     else on a model nothing names. Never a fixed lane-to-model map: on
     2026-10-17 five runs on lane claude used claude-opus-5-5 while the ladder
     recorded claude-sonnet-5-5 and gave up with two strong models untried.
@@ -630,7 +650,7 @@ def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
         claim = CLAIMED_RE.fullmatch(body.strip())
         if claim:
             lane = claim.group(1)
-            ran = footer[1] if footer and footer[0] == lane else brain._lane_model(lane)
+            ran = footer[1] if footer and footer[0] == lane else brain.lane_model(lane)
             out.append((comments[i], current or ran))
     return out
 

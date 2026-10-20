@@ -19,7 +19,7 @@ from bus import brain, handoff, labels, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import free_view, goals, needs_you, operators, transcripts, views
+from . import free_view, goals, needs_you, operators, tiers_sources, transcripts, views
 
 
 READ_WORKERS = 8
@@ -308,6 +308,9 @@ class TicketStore:
         self._kept_prs: Dict[str, Dict[str, Any]] = {}
         self._kept_lock = threading.Lock()
         self._request_mark: Optional[Tuple[float, Dict[str, int], int]] = None
+        # The Tiers and allowances page's sources (the gateway, Grug, run
+        # outcomes), read once a pass below, never by a page request.
+        self.tier_sources = tiers_sources.TierSources(runs_store=self._runs_store)
 
     @property
     def data(self):
@@ -1034,6 +1037,7 @@ class TicketStore:
             if not self._below_floor():
                 self._read_operator_asks(snapshot, previous_items)
             self._read_latest_runs(snapshot)
+            self.tier_sources.refresh()
             now = time.time()
             self._refresh_waits(snapshot, now)
             self._read_open_issues(now)
@@ -1051,6 +1055,14 @@ class TicketStore:
             self._log_requests(now)
             if snapshot["ready"] and not current["ready"]:
                 LOG.info("first dashboard snapshot ready in %.1fs", time.monotonic() - started)
+
+    def _runs_store(self) -> Any:
+        """The transcript store; RuntimeError when none is configured."""
+        store = getattr(self, "transcripts", None)
+        if store is None:
+            store = transcripts.Store()
+            self.transcripts = store
+        return store
 
     def _read_latest_runs(self, snapshot: Dict[str, Any]) -> None:
         """{ticket: its newest stored run}, read once a pass here so no page

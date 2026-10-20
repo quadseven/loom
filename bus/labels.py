@@ -1,6 +1,7 @@
 """The label set from docs/BRAIN.md and an idempotent way to create it."""
 from __future__ import annotations
 
+import re
 from typing import Dict, List
 from urllib.parse import quote
 
@@ -33,6 +34,15 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # only, /free-public/<provider>/v1).
          "free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq"]
 LANES = LANES + SLOTS
+
+
+def base_lane(slot: str) -> str:
+    """The lane a numbered slot belongs to (anthropic-2 -> anthropic, spark-3
+    -> spark), as run_lane.sh maps it; a free provider slot such as free-kilo
+    has no number and is its own lane. bus.factory.lane_kind and the
+    dashboard's run outcomes (dashboard/transcripts.py) both use it."""
+    return re.sub(r"-[0-9]+$", "", slot)
+
 # Remote lanes pull ticket work from GitHub and have no local station inbox.
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
 # on its own schedule (about every 30 minutes), not every minute like a
