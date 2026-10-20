@@ -6084,6 +6084,9 @@ class Station:
                             left -= 1
                             _say("closed done %s#%d: %s" % (repo, number, close_reason))
                             continue
+                    # If the evidence source starts before or during the window,
+                    # do not close the ticket (it will stay open for a verify run).
+                    continue
                 # Normal close for tickets without a time window or with an
                 # open window.
                 branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)

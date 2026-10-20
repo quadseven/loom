@@ -6790,11 +6790,61 @@ class CloseDoneTest(Base):
         text = self.close_text(1)
         self.assertIn("2026-03-01", text)
         self.assertIn("2026-04-01", text)
-        # Live criteria still open or covered by the evidence source should remain open
-        self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped")
+    
+    def test_a_shipped_ticket_with_a_time_window_covered_by_evidence_remains_open(self):
+        # A shipped ticket whose Live line names a time window that is covered by
+        # the evidence source remains open because the Live line can still find evidence.
+        self.fake.private = False
+        # Create a log file with a modification time of 2026-02-15 (inside the window)
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        # Set the modification time to 2026-02-15 (inside the window)
+        log_timestamp = time.mktime(time.struct_time((2026, 2, 15, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (log_timestamp, log_timestamp))
+        # Update settings to use this log file
+        self.settings.evidence_cmds = {REPO: log_path}
+        
+        # Live line with a time window that is covered by the log
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-03-01"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
-        # Ticket 2 should remain open because the Live line can still find evidence
-        self.assertEqual(self.fake.issues[2]["state"], "open")
+        # Ticket 1 should remain open because the window is covered by the evidence source
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+    
+    def test_a_shipped_ticket_with_no_time_window_remains_open(self):
+        # A shipped ticket with no Live time window remains open as today.
+        self.fake.private = False
+        # Create a log file
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        # Set the modification time to 2026-04-01
+        log_timestamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (log_timestamp, log_timestamp))
+        # Update settings to use this log file
+        self.settings.evidence_cmds = {REPO: log_path}
+        
+        # Live line with no time window at all
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready`"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        # Ticket 1 should remain open because there's no time window to check
+        self.assertEqual(self.fake.issues[1]["state"], "open")
 
     def test_the_done_close_names_a_neutral_review_check(self):
         # The merge gate lets a non-sensitive pull request land with the
