@@ -2786,11 +2786,26 @@ class Station:
                     "%s" % self._note_text(err))
         return "Its proof was refused: %s." % mismatch if mismatch else ""
 
+    def _proof_facts(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]
+                     ) -> Tuple[str, List[str]]:
+        """(why the lane's evidence contradicts the merged pull requests'
+        checks, or "", the facts the proof comment carries). Facts the station
+        could not read cannot back a close: it tries again after the cooldown
+        rather than sign the lane's prose alone."""
+        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        if error:
+            return "the station could not read the merged pull requests (%s)" % error, []
+        return (proof.contradicts(record, verify_data.failing_checks(pulls)),
+                verify_data.proof_facts(branch, pulls))
+
     def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any],
                      model: str) -> None:
         """Check the record with bus/proof.py, tick the criteria and move the
         ticket to verified with it, marked verified_by "<lane>/<model>"; a
-        refused record leaves the ticket shipped with one note."""
+        refused record leaves the ticket shipped with one note. The station
+        reads the merged pull requests' facts itself: evidence that says every
+        check passed when one did not is refused, and the proof comment
+        carries those facts, so the close does not rest on the lane's prose."""
         issue = self._issue(repo, number)
         names = _label_names(issue)
         if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
@@ -2814,10 +2829,15 @@ class Station:
         if refusal:
             self._verify_note(repo, number, lane, refusal)
             return
+        contradiction, facts = self._proof_facts(repo, issue, record)
+        if contradiction:
+            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(
+                contradiction))
+            return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:
             source = brain.move(self.gh, repo, number, "verified", record=record,
-                                verified_by="%s/%s" % (lane, model))
+                                verified_by="%s/%s" % (lane, model), facts=facts)
         except ValueError as err:
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))

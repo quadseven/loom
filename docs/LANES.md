@@ -563,7 +563,17 @@ the merge commit of each linked pull request merged into the default branch
 (the compare API), or whose observed window starts before the newest of them
 merged: a stale build or evidence read before the fix proves nothing. A
 GitHub error on that check leaves the ticket shipped, and a ticket with no
-linked merged pull request is left to the close rule. A refused record, a missing result or no
+linked merged pull request is left to the close rule. The station also reads
+the merged pull requests again, as for the brief: a record whose criterion
+evidence says every check passed ("all checks passed", "checks green") while
+the newest run of a check on a merge commit concluded other than success or
+skipped is refused, and so is any record when GitHub cannot be read for
+them (the ticket is tried again after its cooldown). The proof comment then
+carries a `Checked by the station:` section, one line per merged pull
+request, the same sentence the done close writes (merged time, merge commit,
+each check that did not conclude success or skipped, whether the default
+branch contains it), stored in the record as `station_facts`; a record that
+brings its own `station_facts` is not believed. A refused record, a missing result or no
 `verify.json` leaves the ticket shipped with one note on it. The run is
 counted like any lane run, and the Spread line also shows how many were
 verify runs. The brain audits lane proofs (docs/BRAIN.md, Proof audits): a

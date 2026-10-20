@@ -7341,6 +7341,60 @@ class VerifyResultTest(Base):
         self.run_pass()
         self.assertEqual(proof.read(self.proofs()[0])["verified_by"], "codex/unknown")
 
+    def merged_with_neutral_guard(self):
+        """Ticket 5's merged pull request, whose merge commit has a neutral Guard."""
+        sha = "c" * 40
+        self.fake.pulls.append({
+            "number": 31, "state": "closed", "title": "Fix the thing",
+            "merged_at": "2029-12-31T00:00:00Z", "merge_commit_sha": sha,
+            "head": {"ref": "x"}, "body": "Change.\n\nRefs %s#5\n" % REPO})
+        self.fake.carried.add(sha)
+        self.fake.check_runs[sha] = [
+            {"id": 1, "name": "unittest", "status": "completed", "conclusion": "success"},
+            {"id": 2, "name": "Grug - Guard", "status": "completed", "conclusion": "neutral"}]
+        return sha
+
+    def test_evidence_that_every_check_passed_against_a_neutral_check_is_refused(self):
+        # A lane wrote "every check passed" while the brief listed a neutral
+        # Guard: the station refuses it rather than post the sentence as proof.
+        self.merged_with_neutral_guard()
+        criteria = self.good()["criteria"]
+        criteria[0] = dict(criteria[0], evidence="every check passed on the merge commit")
+        self.result(self.good(criteria=criteria))
+        with mock.patch("bus.station._say") as say:
+            self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertNotIn("loom:verified", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "open")
+        self.assertEqual(self.proofs(), [])
+        self.assertIn("every check passed but Grug - Guard concluded neutral",
+                      " ".join(str(c) for c in say.call_args_list))
+
+    def test_a_proof_whose_pull_request_facts_cannot_be_read_is_not_applied(self):
+        # Unread facts could hide the neutral check: no close on prose alone.
+        self.merged_with_neutral_guard()
+        self.fake.check_runs_status = 500
+        self.result(self.good())
+        with mock.patch("bus.station._say") as say:
+            self.run_pass()
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertEqual(self.proofs(), [])
+        self.assertIn("could not read the merged pull requests (status 500)",
+                      " ".join(str(c) for c in say.call_args_list))
+
+    def test_the_proof_comment_carries_the_facts_the_station_checked(self):
+        sha = self.merged_with_neutral_guard()
+        self.result(self.good())
+        self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        posted = self.proofs()[0]
+        self.assertIn("Checked by the station:", posted)
+        self.assertIn("Grug - Guard neutral", posted)
+        facts = proof.read(posted)["station_facts"]
+        self.assertEqual(len(facts), 1)
+        self.assertIn("PR #31 merged 2029-12-31T00:00:00Z as %s" % sha[:12], facts[0])
+        self.assertIn("main contains it: yes", facts[0])
+
     def test_an_invalid_proof_leaves_the_ticket_shipped_with_no_comment(self):
         self.result(self.good(criteria=[]))
         self.run_pass()
