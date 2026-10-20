@@ -59,14 +59,13 @@ def child_env(test_dir: Path) -> dict[str, str]:
     return env
 
 
-def work_items(modules: list[str], test_dir: Path,
-               shard_size: int) -> list[tuple[str, list[str], int]]:
+def work_items(modules: list[str], test_dir: Path, shard_size: int) -> list[tuple[str, list[str]]]:
     """Split each module with more than shard_size tests into round-robin shards.
 
     One module bounded the step's wall time: test_run_lane holds over 200
     tests, each building its own temporary repo in setUp, so its tests can run
     in separate processes. Every other module runs whole by name, as before.
-    Each item is (header, unittest arguments, test count)."""
+    Each item is (header, unittest arguments)."""
     listed = subprocess.run([sys.executable, "-B", "-c", LIST_IDS, *modules],
                             cwd=test_dir.parent, env=child_env(test_dir),
                             text=True, capture_output=True)
@@ -78,12 +77,11 @@ def work_items(modules: list[str], test_dir: Path,
     for module in modules:
         ids = found.get(module)
         if not ids or len(ids) <= shard_size:
-            items.append((module, [module], len(ids or ())))
+            items.append((module, [module]))
             continue
         count = math.ceil(len(ids) / shard_size)
         for index in range(count):
-            shard = ids[index::count]
-            items.append(("%s [%d/%d]" % (module, index + 1, count), shard, len(shard)))
+            items.append(("%s [%d/%d]" % (module, index + 1, count), ids[index::count]))
     return items
 
 
@@ -111,11 +109,11 @@ def main() -> int:
     total = 0
     max_workers = min(len(items), os.cpu_count() or 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        # Largest first, so a big module's shards start at once instead of
-        # queuing behind the small modules and finishing last.
-        order = sorted(range(len(items)), key=lambda index: -items[index][2])
-        futures = {index: pool.submit(run_module, items[index][1], test_dir) for index in order}
-        results = [(items[index][0], futures[index].result()) for index in range(len(items))]
+        # Discovery order, not most-tests first: test count does not predict
+        # time. Most-tests first queued test_dashboard (43 tests, 610s on the
+        # macOS runner) behind the 53-test shards and made the step 140s
+        # slower (run 39471928241).
+        results = list(pool.map(lambda item: (item[0], run_module(item[1], test_dir)), items))
 
     for header, result in results:
         output = result.stdout + result.stderr
