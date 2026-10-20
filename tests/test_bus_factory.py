@@ -575,14 +575,32 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.model(6), "gpt-6-sol")
 
+    def test_a_ready_pull_request_up_to_date_with_main_merges_with_no_update_call(self):
+        # Acceptance: a ready pull request that is up to date with main
+        # merges as before, with no update call.
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        with mock.patch("bus.factory._say") as say:
+            self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertNotIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
+                          {"expected_head_sha": "sha50"}), self.gh.writes)
+        for call in say.call_args_list:
+            self.assertNotIn("up to date", call.args[0])
+
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
         self.gh.behind[50] = 3
-        self.go()
+        with mock.patch("bus.factory._say") as say:
+            self.go()
         self.assertEqual(self.merged, [])
         self.assertIn(("PUT", "/repos/%s/pulls/50/update-branch" % REPO,
                        {"expected_head_sha": "sha50"}), self.gh.writes)
+        # One log line per update.
+        say.assert_called_once_with(
+            "brought %s#50 up to date with its base; it lands once its checks "
+            "and review pass on the new head" % REPO)
 
     def test_a_refused_update_goes_back_for_a_fix_round_like_a_conflict(self):
         # 2026-10-20: an update that cannot be applied cleanly goes back for
