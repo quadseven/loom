@@ -527,7 +527,7 @@ TRANSIENT_REST=1800
 TRANSIENT_FILE="$LOOM_HOME/state/usage/$SLOT.transient"
 transient_rest_until() {
   local count until
-  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || return 1
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || return 1
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 # Count one transient run; prints the epoch the lane rests until once the
@@ -535,7 +535,7 @@ transient_rest_until() {
 transient_strike() {
   local count until now
   now="$(date +%s)"
-  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || count=0
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || count=0
   [[ "$count" =~ ^[0-9]+$ ]] || count=0
   count=$((count + 1))
   if [ "$count" -ge "$TRANSIENT_STRIKES" ]; then
