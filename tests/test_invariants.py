@@ -811,6 +811,22 @@ class FilerTest(unittest.TestCase):
                                           for label in issue["labels"]])
         self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 0)
 
+    def test_a_quiet_issue_closed_and_broken_again_says_why_it_closes_the_second_time(self):
+        # loom#651 closed a second time with no word: the first close's note
+        # counted as the explanation (2026-10-20).
+        self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
+        number = next(iter(self.gh.issues))
+        issue = self.gh.issues[number]
+        issue.update(created_at=stamp(T0 - 3 * 86400), labels=[{"name": x} for x in invariants.LABELS])
+        self.gh.comments[(REPO, number)] = [
+            {"body": "The invariant cleared by then; its last breach was observed earlier.",
+             "created_at": stamp(T0 - 2 * 86400)},
+            {"body": "Broken again after this was closed: evidence", "created_at": stamp(T0 - 7 * 3600)},
+        ]
+        invariants.Filer(self.gh, REPO, GOAL, self.state, T0, self.said.append).run([])
+        self.assertEqual(issue["state"], "closed")
+        self.assertEqual(sum("cleared" in c.get("body", "") for c in self.gh.comments[(REPO, number)]), 2)
+
     def test_quiet_triage_issue_closes_once_and_rewritten_issue_is_untouched(self):
         self.file(self.breach(at=T0 - 7 * 3600), now=T0 - 7 * 3600)
         number = next(iter(self.gh.issues))
@@ -895,6 +911,19 @@ class InvariantTest(unittest.TestCase):
         runs.append(Run("zen", True, T0, ""))
         runs.append(Run("zen", False, T0, "x"))
         self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+
+    def test_runs_that_ended_at_a_limit_an_expired_key_or_a_factory_incident_are_no_breach(self):
+        # Every run agy made for a day ended at its plan's quota; the lane was
+        # out of quota, which lane_held reports, not broken (loom#651, 2026-10-20).
+        for reason in ("[limit] limit: all models limited: gemini until tomorrow",
+                       "[auth] API key expired", "[factory] setup failed: base check exited 1"):
+            with self.subTest(reason=reason):
+                runs = [Run("agy", False, T0 - i * 600, reason) for i in range(34)]
+                self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+        runs = [Run("agy", False, T0 - i * 600, "[limit] provider limit") for i in range(30)]
+        runs += [Run("agy", False, T0 - i * 600 - 300, "[work] agent made no commit") for i in range(5)]
+        (b,) = invariants.lane_no_success(Facts(T0, runs=runs))
+        self.assertEqual(b.title, "Lane agy: 5 runs in 24 hours and none done")
 
     def test_a_lane_failing_its_last_runs_after_an_earlier_success_is_a_breach(self):
         runs = [Run("zen", True, T0 - 9 * 3600, "")]
