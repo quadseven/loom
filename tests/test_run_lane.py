@@ -98,6 +98,10 @@ if [ "$1 $2" = "pr edit" ]; then
   done
   exit 0
 fi
+if [ "$1 $2" = "pr comment" ] && [ -n "${FAKE_COMMENT:-}" ]; then
+  while [ $# -gt 0 ]; do [ "$1" = "--body" ] && printf '%s' "$2" > "$FAKE_COMMENT"; shift; done
+  exit 0
+fi
 if [ "$1 $2" = "pr create" ]; then
   [ -z "${FAKE_GH_CREATE_FAIL:-}" ] || { echo "pr create blew up" >&2; exit 1; }
   case " $* " in *" --label "*) [ -z "${FAKE_GH_NO_LABELS:-}" ] || { echo "could not add label: 'class:logic' not found" >&2; exit 1; } ;; esac
@@ -972,9 +976,27 @@ print('leak guard: clean (shape patterns only)')
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-r2", heads)
         comment = [c for c in calls if c.startswith("gh pr comment")]
-        self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex pushed "
-                                   "fixes for: Check: lint; Thread PRRT_1 (comment 11) at a.py:3"])
+        # The call log keeps the comment's first line (the full text has its own test).
+        self.assertEqual(comment, ["gh pr comment 7 -R example/repo --body Lane codex "
+                                   "(gpt-test-default) pushed 1 commit for: Check: lint; "
+                                   "Thread PRRT_1 (comment 11) at a.py:3"])
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_comment_says_what_was_pushed_and_what_happens_next(self):
+        # 2026-10-20: "Lane claude pushed fixes for: the findings on the
+        # ticket" told the reader nothing about a round that merged main.
+        self.fix_brief()
+        comment = Path(self._tmp.name) / "comment.md"
+        self.run_lane(FAKE_GH_EXISTING="7", FAKE_COMMENT=str(comment))
+        head = self.remote_head(self.FIX_BRANCH)
+        text = comment.read_text()
+        self.assertTrue(text.startswith("Lane codex (gpt-test-default) pushed 1 commit for: "
+                                        "Check: lint; Thread PRRT_1 (comment 11) at a.py:3\n"), text)
+        subject = subprocess.run(["git", "--git-dir", str(self.remote), "log", "-1", "--format=%s",
+                                  head], capture_output=True, text=True, check=True).stdout.strip()
+        self.assertIn("- `%s` `%s`" % (head[:7], subject), text)
+        self.assertIn("CI and review run again on the new head; the factory lands the "
+                      "pull request once they pass.", text)
 
     def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
         self.fix_brief()

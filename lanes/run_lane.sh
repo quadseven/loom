@@ -380,6 +380,16 @@ fix_items() {
         END {print out}' "$1" | cut -c1-500
 }
 
+# A fix round's commits for its PR comment: at most ten, each hash and
+# subject in a code span, so nothing a subject says renders or mentions anyone.
+pushed_commits() {
+  safe_git log --format='%h%x09%s' "$BASE..HEAD" 2>> "$LOG" | head -10 |
+    while IFS=$'\t' read -r sha subject; do
+      subject="$(printf '%s' "$subject" | tr -d '`[:cntrl:]' | cut -c1-120)"
+      printf -- '- `%s` `%s`\n' "$sha" "$subject"
+    done
+}
+
 # Keep agent-authored review replies outside the commit. The agent cannot call
 # GitHub from its sandbox; only the runner posts these after the push succeeds.
 capture_replies() {
@@ -2517,7 +2527,16 @@ for BRIEF in "$INBOX"/*.md; do
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
-      COMMENT="Lane $SLOT pushed fixes for: ${ITEMS:-the findings on the ticket}"
+      # 2026-10-20: "pushed fixes for: the findings on the ticket" told the
+      # reader nothing; the comment says what went up and what happens next.
+      PUSHED="$(safe_git rev-list --count "$BASE..HEAD" 2>> "$LOG")"
+      CHECKED="CI and review run again on the new head; the factory lands the pull request once they pass."
+      [ -n "$VALIDATED" ] && CHECKED="The repo's check passed at ${VALIDATED##* }. $CHECKED"
+      COMMENT="Lane $SLOT ($MODEL) pushed ${PUSHED:-the} commit$([ "$PUSHED" = 1 ] || echo s) for: ${ITEMS:-the fix round on the ticket}
+
+$(pushed_commits)
+
+$CHECKED"
     elif [ "$METADATA_CHANGED" -eq 0 ]; then
       COMMENT="Lane $SLOT answered the review threads for: ${ITEMS:-the findings on the ticket}"
     else
