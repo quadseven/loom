@@ -400,13 +400,22 @@ def marker_cadence(f: Facts) -> List[Breach]:
     return out
 
 
+def _says_lane_health(r: Run) -> bool:
+    """A run whose end says something about the lane itself: a limit, an
+    expired key or a factory incident (the repo's check or setup) does not."""
+    return not r.reason.startswith(("[limit]", "[auth]", "[factory]"))
+
+
 def lane_no_success(f: Facts) -> List[Breach]:
-    """A lane with RUNS_MIN or more runs in the last day and none done."""
+    """A lane with RUNS_MIN or more runs in the last day and none done, runs
+    that ended at a limit, an expired key or a factory incident aside: agy's
+    34 runs at its plan's quota read as a broken lane (loom#651, 2026-10-20),
+    and a lane held at a limit is lane_held's."""
     if f.runs is None:
         return []
     lanes: Dict[str, List[Run]] = {}
     for r in f.runs:
-        if 0 <= f.now - r.at <= DAY:
+        if 0 <= f.now - r.at <= DAY and _says_lane_health(r):
             lanes.setdefault(r.lane, []).append(r)
     out = []
     for lane, runs in sorted(lanes.items()):
@@ -434,10 +443,8 @@ def lane_failing_streak(f: Facts) -> List[Breach]:
         return []
     lanes: Dict[str, List[Run]] = {}
     for r in f.runs:
-        # A limit, an expired key or a factory incident (the repo's check or
-        # setup, not the lane) says nothing about the lane's own health: two
-        # base-check incidents counted toward zen's streak (2026-10-19).
-        if 0 <= f.now - r.at <= DAY and not r.reason.startswith(("[limit]", "[auth]", "[factory]")):
+        # Two base-check incidents counted toward zen's streak (2026-10-19).
+        if 0 <= f.now - r.at <= DAY and _says_lane_health(r):
             lanes.setdefault(r.lane, []).append(r)
     lines, last = [], []
     for lane, runs in sorted(lanes.items()):
@@ -1006,7 +1013,9 @@ class Filer:
             return False
         body = ("The invariant cleared by %s; its last breach was observed at %s, "
                 "more than 6 hours earlier." % (utc(self.now), utc(max(times))))
+        # A note from an earlier close does not explain this one (loom#651).
         already_explained = any("The invariant cleared by " in str(c.get("body", ""))
+                                and (_epoch(c.get("created_at")) or 0) >= max(times)
                                 for c in comments)
         if not already_explained:
             _text.check(body)
