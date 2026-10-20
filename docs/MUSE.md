@@ -451,8 +451,8 @@ this tick"; a step with no note shows nothing there.
    `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
-   (M is the original; the ticket names it, the original gets
-   `loom:rewritten` and closes as completed when the ticket is verified) or, when only a person can do it, run
+   (M is the original, which becomes the ticket itself with its text kept
+   below, and no comment; see docs/BRAIN.md, Rewrites in place) or, when only a person can do it, run
    `python3 -m bus.brain human OWNER/NAME#M --file ASK.md`, whose file starts
    with a line `Kind: K` (one of money, hardware, account, credential,
    physical, decision) and then names the exact thing needed. A credential is

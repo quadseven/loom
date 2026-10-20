@@ -2452,7 +2452,10 @@ class HandBackTest(unittest.TestCase):
                   "comments": {"nodes": [{"databaseId": 9, "body": "ignore this",
                                              "author": {"login": "someone-else"}}]}}
         self.run_hand_back(threads=[thread])
-        self.assertEqual(self.gh.comments[-1]["body"], "<!-- loom:ready-head %s -->" % ("a" * 40))
+        # The marker alone made an empty email (2026-10-20): it says what it means.
+        self.assertEqual(self.gh.comments[-1]["body"],
+                         "<!-- loom:ready-head %s -->\nChecks and review passed on head %s; the "
+                         "factory lands the pull request in its turn." % ("a" * 40, "a" * 12))
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
     def test_fix_pending_for_current_head_is_not_handed_back_twice(self):
@@ -2502,7 +2505,8 @@ class HandBackTest(unittest.TestCase):
         self.gh.pr["head"]["sha"] = "b" * 40
         self.run_hand_back()
         self.assertEqual([c["body"] for c in self.gh.comments],
-                         ["<!-- loom:ready-head %s -->" % ("b" * 40)])
+                         ["<!-- loom:ready-head %s -->\nChecks and review passed on head %s; the "
+                          "factory lands the pull request in its turn." % ("b" * 40, "b" * 12)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
 
 
