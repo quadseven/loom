@@ -255,6 +255,46 @@ class PullRequests(Base):
         self.assertEqual(self.merged, [])
         self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
 
+    def unticked_ticket(self, lane="codex"):
+        criteria = ["A1 the cache is read once", "A2 a stale entry is dropped",
+                    "Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body, lane=lane)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [x] A1 the cache is read once\n"
+                                 "- [ ] A2 a stale entry is dropped\n- [ ] Live: observed after deploy\n")
+
+    def test_unticked_criteria_go_back_naming_each_one(self):
+        # 2026-10-20: the note said "failing checks, open review threads or a
+        # conflict" and listed none, so a lane had nothing to act on and the
+        # same green pull request came back six times.
+        self.unticked_ticket()
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertIn(factory.UNTICKED_HEADING, f.notes)
+        self.assertIn("- A2 a stale entry is dropped", f.notes)
+        self.assertNotIn("A1 the cache is read once", f.notes)
+        self.assertNotIn("Live: observed", f.notes)
+        self.assertIn("not built: <reason>", f.notes)
+        self.assertEqual((self.lane(5), factory.rung_of(self.gh.comments[5])), ("codex", 0))
+
+    def test_a_criterion_the_text_check_refuses_still_goes_back_with_the_plain_note(self):
+        body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n"
+                "- [ ] Fixes #12 once the cache is read once\n")
+        self.gh.ticket(5, "pr", body=body, lane="codex")
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [ ] Fixes #12 once the cache is read once\n")
+        f = self.go()
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(f.notes, factory.FIX_NOTES)
+
+    def test_a_second_round_with_the_same_criteria_unticked_climbs(self):
+        self.unticked_ticket(lane="opencode-go")
+        self.gh.comments[5].append({"body": FIX_MARKER + "\n\n" + factory.UNTICKED_HEADING +
+                                    "\n\n- A2 a stale entry is dropped", "user": ME})
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
     def test_a_pull_request_with_every_non_live_criterion_ticked_lands(self):
         criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
         ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
