@@ -35,6 +35,16 @@ complexity 15, no swallowed errors, no dead code, docs in step, ASCII
 only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
+Before pushing a branch or opening a pull request on a public repository, the
+lane runner uses infra-public's `check_private_leaks.py` in shape-only mode on
+the diff and generated pull request body. Set `LOOM_LEAK_SCANNER` to that
+script's path when it is not at `../infra-public/.github/scripts/check_private_leaks.py`
+relative to the Loom checkout. A missing scanner or a hit blocks the push.
+Private repositories skip this scan. Test IP addresses in public changes must
+use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
+`203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
+range bound must appear.
+
 ## Validation contract
 
 A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
