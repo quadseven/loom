@@ -666,13 +666,22 @@ When the runner finishes, the station finds the brief in `done/` or
 - Limited (a reason starting `limit:` after its class, the spark lane's
   guard refusing work for a while): not a failure, and not one of the
   automatic retries below. Label `loom:briefed` again (`loom:pr` for a fix
-  brief), comment that the lane is unavailable; the factory moves a ticket
-  briefed on a lane whose heartbeat says `limit:` to the next rung at once.
+  brief) and record the status event `Lane <lane> stopped: [limit] <reason>`;
+  the factory moves a ticket briefed on a lane whose heartbeat says `limit:`
+  to the next rung at once.
 - An expired key (an `[auth]` reason): not a failure, not an attempt, and
   never a runaway, whatever else the ticket has been through. Label
-  `loom:briefed` again (`loom:pr` for a fix brief) and comment that the lane
-  could not authenticate; the factory moves the ticket to a lane whose key
-  works.
+  `loom:briefed` again (`loom:pr` for a fix brief) and record the status
+  event `Lane <lane> stopped: [auth] <reason>`; the factory moves the ticket
+  to a lane whose key works. A fix round whose branch moved during the run
+  goes back to `loom:pr` with `Lane <lane> stopped: [transient] branch
+  moved: ...`.
+- Runaway count: a claim's ending is the first of these after it: a `Lane
+  <lane> failed:` line, an automatic retry (its `Lane <lane> failed:` reason),
+  a factory hold (`Lane <lane> held:`, a `[factory]` ending) or a `Lane <lane>
+  stopped:` event. A claim that ended `[transient]`, `[limit]`, `[auth]` or
+  `[factory]` is not a work attempt and never counts toward a runaway; a stop
+  is never worded `failed:`, so failure counts do not read it.
 
 The runner starts each failure reason with its class: `[limit]` (a usage,
 rate or quota limit, or an HTTP 429 or 402 from the provider), `[auth]` (a
@@ -721,7 +730,8 @@ Routine ticket events go on one comment per ticket, marked
 newest event first, one `- <UTC time> <text>` line per event (continuation
 lines indented two spaces). That covers a lane given to a queued ticket, a
 claim, a stall, limit or heartbeat move, a rung climb, an equivalent-model
-move and an automatic retry. A new comment emails the operator; an edit does
+move, an automatic retry, a lane failure or factory hold the factory acts on
+itself, and a lane stop (a limit, an expired key, a moved branch). A new comment emails the operator; an edit does
 not (loom#866: zippie#264 carried 77 bot comments). Outcomes (a pull request
 opened or pushed, a failure, merged, shipped, verified, an ask, a runaway
 hold) and `loom:fix` briefs stay new comments. The GitHub client

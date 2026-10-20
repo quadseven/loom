@@ -2295,6 +2295,34 @@ class DeadLane(unittest.TestCase):
             "Claimed for lane codex (body sha256 0123456789ab)")
         self.assertEqual(factory.dead_lane(comments), "codex")
 
+    def test_a_retry_a_hold_and_a_stop_end_their_attempts_with_their_class(self):
+        # Since status events (loom#866) these endings do not start "Lane X
+        # failed:", and the runaway detector counted each claim as work.
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+            "codex-2. Lane codex failed: [transient] agent exited 1",
+            "Claimed for lane codex-2 (body sha256 0123456789ab)",
+            "Lane codex-2 held: setup failed: could not check out the default branch; "
+            "factory incident quadseven/loom#99; the agent did not run. The ticket keeps "
+            "its rung and returns to the queue when the factory incident closes.",
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Lane codex stopped: [limit] provider limit reached",
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Lane codex stopped: [auth] the provider refused the key",
+            "Claimed for lane codex (body sha256 0123456789ab)")
+        reasons = [a[3] for a in factory.attempts(comments)]
+        self.assertEqual(reasons[0], "[transient] agent exited 1")
+        self.assertTrue(reasons[1].startswith("[factory] setup failed:"), reasons[1])
+        self.assertEqual(reasons[2:], ["[limit] provider limit reached",
+                                       "[auth] the provider refused the key", ""])
+
+    def test_a_stopped_line_without_a_class_is_not_an_ending(self):
+        comments = self.comments(
+            "Claimed for lane codex (body sha256 0123456789ab)",
+            "Lane codex stopped: [work] something else")
+        self.assertEqual([a[3] for a in factory.attempts(comments)], [""])
+
 
 class LaneKinds(unittest.TestCase):
     """What each lane costs (loom#968): the Tiers page marks every tier and

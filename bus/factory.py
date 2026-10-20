@@ -326,6 +326,16 @@ NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 # bus/station.py's note on a failed run, and the runner's reason when a run
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
+# Other endings of a claim, each read as a classed reason (loom#572): since
+# status events (loom#866) these lines do not start "Lane X failed:". An
+# automatic retry carries the failed lane's classed reason after its move; a
+# factory-incident hold is a [factory] ending; and bus/station.py's limit,
+# auth and branch-moved paths record "Lane X stopped: [class] ...", worded so
+# that no reader of FAILED_RE counts it as a failure.
+RETRY_ENDED_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \([a-z]+\): moved from lane "
+                            r"\S+ to lane \S+\. Lane \S+ failed: ")
+HELD_RE = re.compile(r"^Lane \S+ held: ")
+STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:limit|auth|transient)\] )")
 CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
 # The runner's footer on a lane pull request (lanes/run_lane.sh pr_body,
 # rewritten by bus/pr_repair.py on each fix round): the lane and the model the
@@ -734,12 +744,24 @@ def issue_model(issue: Dict[str, Any]) -> str:
     return match.group(1) if match else "unspecified"
 
 
+def _ending(body: str) -> Optional[str]:
+    """The classed reason a comment ends the attempt before it with, or None
+    when it ends none: a "Lane X failed:" line or one of the other endings
+    (RETRY_ENDED_RE, HELD_RE, STOPPED_RE)."""
+    for rx in (FAILED_RE, RETRY_ENDED_RE, STOPPED_RE):
+        match = rx.match(body)
+        if match:
+            return body[match.end():]
+    held = HELD_RE.match(body)
+    return "[factory] " + body[held.end():] if held else None
+
+
 def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[Any]]:
     """Each claim as [epoch, time, lane, reason it failed], oldest first, from
-    the claim and "Lane X failed:" comments. An attempt takes the failure that
-    followed it, or "" when none was recorded. With `reset_at` given, a
-    comment it matches starts a new segment: only the last segment's claims
-    are returned."""
+    the claim comments and the endings that followed them (_ending). An
+    attempt takes the first ending after it, or "" when none was recorded.
+    With `reset_at` given, a comment it matches starts a new segment: only the
+    last segment's claims are returned."""
     found: List[List[Any]] = []
     for comment in comments:
         body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
@@ -750,16 +772,16 @@ def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[An
         at = _ts(comment.get("created_at")) if claim else 0.0
         if claim and at:
             found.append([int(at), str(comment["created_at"]), claim.group(1), ""])
-        failure = FAILED_RE.match(body)
-        if failure and found and not found[-1][3]:
-            found[-1][3] = body[failure.end():]
+        ending = _ending(body)
+        if ending and found and not found[-1][3]:
+            found[-1][3] = ending
     return found
 
 
 def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
     """Each claim as (epoch, time, lane, reason it failed), oldest first, from
-    the claim and "Lane X failed:" comments. An attempt takes the failure that
-    followed it, or "" when none was recorded; with `current` given, the last
+    the claim comments and their endings (_attempt_rows). An attempt takes the
+    ending that followed it, or "" when none was recorded; with `current` given, the last
     attempt is the one being reported and takes that reason."""
     found = _attempt_rows(comments)
     if found and current:
