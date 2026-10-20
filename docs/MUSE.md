@@ -2,11 +2,17 @@
 
 At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
-Run every command from that checkout. Set `LOOM_GITHUB_TOKEN`,
-`LOOM_REPOS` (space separated `OWNER/NAME` values) and `LOOM_BRIEF_AUTHORS`
-(the login or logins that brief tickets and post proofs, the same value the
-station uses). Without it `prioritize`, `close`, verified moves and merges
-refuse every ticket as untrusted. Use `muse` as your lock
+Run every command from that checkout. Set the Loom Brain App's
+`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (or `LOOM_GITHUB_APP_KEY_FILE`), so every write is the
+brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
+for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
+values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
+post proofs, the same value the station uses). Without it `prioritize`,
+`close`, verified moves and merges refuse every ticket as untrusted. With a
+personal `LOOM_GITHUB_TOKEN`, every issue a `bus` or `bus.brain` command opens
+or comments on is unsubscribed for that person afterwards, so later bot
+comments there send them no email; an @mention still does. Use `muse` as your lock
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 
@@ -344,7 +350,11 @@ this tick"; a step with no note shows nothing there.
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. Tick
+4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. A
+   shipped ticket whose Live criterion names no exact string (no backticks
+   or quotes) can never be verified, by you or a lane: restate it first with
+   `python3 -m bus.brain live OWNER/NAME#N --text "Live: ... \`the log line or endpoint\` ..."`,
+   naming the string its proof will show, so the station can look for it. Tick
    each acceptance criterion in the ticket body only once you have seen it
    hold, write the proof record (docs/BRAIN.md, Proof), then run
    `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
@@ -431,10 +441,12 @@ this tick"; a step with no note shows nothing there.
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
-   what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
+   ticket under the goal's intake epic, the rest get `loom:triage` (no comment;
+   the printed line names what is missing). Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
-   takes what is left, and only rewrites `loom:triage` issues: take up to
+   takes what is left (the `needs-brain` ones first: the station's rewrite
+   model judged them person-only, and you decide), and only rewrites
+   `loom:triage` issues: take up to
    5 per tick and, for each, either write the ticket with
    `python3 -m bus.brain brief OWNER/NAME --epic E --title TITLE --file BODY.md --refs M`
    (M is the original; the ticket names it, the original gets
@@ -452,7 +464,9 @@ this tick"; a step with no note shows nothing there.
    close an issue or mark one done from triage: an old issue that looks finished stays
    open for a person to close.
 9. First run `python3 -m bus.brain step journal --holder muse`. Write the journal with `python3 -m bus journal OWNER/NAME#N --file JOURNAL.md --holder muse`,
-   before unlocking. `--holder` adds the `Tick <UTC time>, muse` line after
+   before unlocking. The day's first tick posts the journal; every later
+   tick that day edits that comment in place, newest tick first, so the
+   operator gets no email per tick. `--holder` adds the `Tick <UTC time>, muse` line after
    the marker; without that line a peer reads the journal as another brain's
    and stays to its resume items, and `journal` refuses it. It states the goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
@@ -516,13 +530,20 @@ on hard work):
   `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
   model `spark/...`, any repo, private ones included) when lane status shows
   them available; then on a public repo muse, then agy (muse runs
-  remotely); else a
+  remotely); then the free lane, one slot per free provider (`free-ollama`,
+  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`) at its pinned
+  route on the spark-gateway, each waiting out its own provider's reset
+  (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4 and muse on public repos only (opencode-go-4 is Muse Spark,
-  which trains on prompts).
+  opencode-go-4, muse, free-nvidia, free-kilo and free-groq on public repos only
+  (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
+  are NVIDIA NIM, Kilo and Groq).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
-  agy; then codex or opencode-go (opencode-go-4 on public repos only); an
+  agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
+  public repo `free-nvidia`, `free-kilo`, `free-groq`); then the other free
+  lanes, openrouter and workersai, or on a public repo zen and zai (the
+  operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
 - Hard: a spark slot first, then anthropic, claude, agy (Gemini 4 Argon,
@@ -596,7 +617,11 @@ configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
 Once a ticket ran on Opus or past it, it climbs only to the untried strong
 models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
 lane of its next rung is up, it waits with no comment; the factory says it
-tried every rung only once every rung with a lane for its repo was tried. A green, reviewed pull request is not escalated: a ticket
+tried every rung only once every rung with a lane for its repo was tried. The
+one exception is a pull request whose open thread carries a lane's answer: the
+factory asks the review bot to judge that answer (`/grug improve` on the pull
+request, once per head commit) instead of waiting with nothing to move it
+(docs/LANES.md). A green, reviewed pull request is not escalated: a ticket
 whose open pull request has nothing to fix (its head is green, the review
 check passed on that head, and no review thread is open) is landed, whatever
 its fix rounds.

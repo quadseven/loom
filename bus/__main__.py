@@ -65,6 +65,8 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("--name", help="the App's name (default loom-OWNER)")
     a.add_argument("--form", action="store_true",
                    help="print an HTML page whose one button creates the App")
+    app_sub.add_parser("token", help="print the installation token of the App the "
+                       "LOOM_GITHUB_APP_* settings name, for gh and git (loom#1142)")
     a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
     a.add_argument("--app-id", required=True, type=_number)
     return p
@@ -102,6 +104,8 @@ def _app(args: argparse.Namespace, transport: Optional[Transport],
     if args.app_command == "manifest":
         return app.print_manifest(args.owner, args.org, args.name, args.form, sys.stdout)
     try:
+        if args.app_command == "token":
+            return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign)
         return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign)
     except GitHubError as err:
         print("error: %s" % err, file=sys.stderr)
@@ -126,7 +130,7 @@ def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None,
             return 2
     try:
         if gh is None:
-            gh = GitHub(auth_from_env())
+            gh = GitHub(auth_from_env(), unsubscribe=True)
         try:
             return _run(args, gh)
         finally:

@@ -242,6 +242,28 @@ class DashboardTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_a_refresh_reads_the_tier_sources_and_the_tiers_page_reads_none(self):
+        # loom#968: the gateway, Grug and the run outcomes are read on the
+        # background pass, never by a page request.
+        class Counting:
+            def __init__(self):
+                self.refreshes = 0
+
+            def refresh(self, now=None):
+                self.refreshes += 1
+
+            def snapshot(self, now=None):
+                return {}
+
+        counting = Counting()
+        self.store.tier_sources = counting
+        self.store.refresh()
+        self.assertEqual(counting.refreshes, 1)
+        status, _, body = self.raw_get("/tiers")
+        self.assertEqual(status, 200)
+        self.assertIn("Tiers and allowances", body.decode())
+        self.assertEqual(counting.refreshes, 1)
+
     def test_the_dashboard_has_a_favicon_in_every_form_a_browser_asks_for(self):
         status, kind, body = self.raw_get("/static/favicon.svg")
         self.assertEqual((status, kind), (200, "image/svg+xml"))
@@ -868,6 +890,34 @@ class LaneCardsTest(unittest.TestCase):
         self.assertIn("gpt-6-sol", body)
         self.assertIn('<span class="quota" aria-hidden="true"><span style="width:42%"></span></span>', body)
         self.assertIn("quota not reported", body)
+
+
+
+class LaneViewComplexityTest(unittest.TestCase):
+    """_lane_view_data stays orchestration: the per-lane card, the scoreboard
+    rows and the Anthropic share each live in a helper (#372)."""
+
+    @staticmethod
+    def _cyclomatic(func):
+        import ast
+        count = 1
+        for node in ast.walk(func):
+            if isinstance(node, (ast.If, ast.For, ast.While, ast.IfExp, ast.ExceptHandler,
+                                 ast.AsyncFor, ast.Assert)):
+                count += 1
+            elif isinstance(node, ast.comprehension):
+                count += 1 + len(node.ifs)
+            elif isinstance(node, ast.BoolOp):
+                count += len(node.values) - 1
+        return count
+
+    def test_lane_view_data_is_under_the_complexity_cap(self):
+        import ast
+        from pathlib import Path
+        source = (Path(__file__).resolve().parent.parent / "dashboard" / "server.py").read_text(encoding="utf-8")
+        func = next(node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.FunctionDef) and node.name == "_lane_view_data")
+        self.assertLessEqual(self._cyclomatic(func), 15)
 
 
 if __name__ == "__main__":

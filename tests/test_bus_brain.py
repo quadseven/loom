@@ -553,7 +553,7 @@ class SensitiveResumeTests(unittest.TestCase):
                   "created_at": "2029-12-01T00:00:00Z"}]
         bot = {"login": "brain-bot"}
         app = {"__typename": "Bot", "login": "example-loom"}
-        g2 = [{"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T14:26:00Z", "author": bot},
+        g2 = [{"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T10:26:00Z", "author": bot},
               {"body": "<!-- loom:report v1 -->\nNothing moved since the last report.",
                "createdAt": "2030-01-01T19:52:00Z", "author": app}]
         gh = GitHub("t", transport=Fake(
@@ -561,7 +561,7 @@ class SensitiveResumeTests(unittest.TestCase):
             reply(200, {"data": {"repository": {"g2": {"comments": {"nodes": g2}}}}}),
             reply(200, []), reply(200, []), reply(200, [])))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])
-        self.assertIn("#2 Stale - latest journal none, report 2030-01-01T14:26:00Z", report)
+        self.assertIn("#2 Stale - latest journal none, report 2030-01-01T10:26:00Z", report)
         owed = report.split("### Reports owed before unlock")[1].split("###")[0]
         self.assertIn("#2 report HELD: example-loom[bot] posted a report on this goal home at "
                       "2030-01-01T19:52:00Z, 8 minutes ago", owed)
@@ -945,6 +945,98 @@ class SensitiveResumeTests(unittest.TestCase):
         url2 = brain.brief(GitHub("t", transport=fake2), REPO, EPIC, "Ticket", BODY, "codex", base="explicit")
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
+
+    def test_brief_remote_lane_on_public_repo_files_queued(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": False}),
+                     reply(201, {"id": 202, "number": 202,
+                                "html_url": "https://example.com/ticket"}),
+                     reply(201, {}))
+        gh = GitHub("t", transport=fake)
+        url = brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
+        self.assertEqual(url, "https://example.com/ticket")
+        payload = fake.calls[3][2]
+        self.assertEqual(payload["labels"], ["loom:ticket", "loom:queued", "lane:muse"])
+
+    def test_brief_remote_lane_refuses_private_repo_before_filing(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": True}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "this repo is private"):
+            brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
+        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+    def test_brief_remote_lane_refuses_hard_tier(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": False}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "hard.*not one of"):
+            brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "hard")
+        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+    def test_brief_local_lane_still_files_briefed(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(201, {"id": 202, "number": 202,
+                                "html_url": "https://example.com/ticket"}),
+                     reply(201, {}))
+        gh = GitHub("t", transport=fake)
+        brain.brief(gh, REPO, EPIC, "Ticket", BODY, "codex", "hard")
+        self.assertEqual(fake.calls[2][2]["labels"], ["loom:ticket", "loom:briefed", "lane:codex"])
+
+    def test_brief_remote_lane_refuses_missing_difficulty(self):
+        no_diff = BODY.replace("## Why\nwhy", "## Why\ndiff")
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": False}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "difficulty.*not one of"):
+            brain.brief(gh, REPO, EPIC, "Ticket", no_diff, "muse")
+        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+    def test_rebrief_regressed_remote_lane_on_public_repo_files_queued(self):
+        issue = item(5, body="Difficulty: easy\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {"private": False}),
+                     reply(200, []),
+                     reply(200, {}),
+                     reply(200, {}))
+        gh = GitHub("t", transport=fake)
+        brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
+        put_labels = next(c for c in fake.calls if c[0] == "PUT")
+        labels = put_labels[2]["labels"]
+        self.assertIn("loom:queued", labels)
+        self.assertIn("lane:muse", labels)
+        self.assertNotIn("loom:briefed", labels)
+        self.assertIn("loom:regression", labels)
+
+    def test_rebrief_regressed_remote_lane_refuses_private_repo(self):
+        issue = item(5, body="Difficulty: easy\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {"private": True}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "this repo is private"):
+            brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
+        self.assertFalse(any(c[0] in ("PATCH", "PUT", "POST") for c in fake.calls))
+
+    def test_rebrief_regressed_remote_lane_refuses_hard_tier(self):
+        issue = item(5, body="Difficulty: hard\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {"private": False}), reply(200, []))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "hard.*not one of"):
+            brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
+        self.assertFalse(any(c[0] in ("PATCH", "PUT", "POST") for c in fake.calls))
+
+    def test_rebrief_regressed_local_lane_still_files_briefed(self):
+        issue = item(5, body="Difficulty: medium\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {}),  # PATCH body
+                     reply(200, {}))  # PUT labels
+        gh = GitHub("t", transport=fake)
+        brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "codex", None)
+        put_labels = next(c for c in fake.calls if c[0] == "PUT")
+        self.assertIn("loom:briefed", put_labels[2]["labels"])
+        self.assertIn("lane:codex", put_labels[2]["labels"])
+        self.assertNotIn("loom:queued", put_labels[2]["labels"])
 
     def test_a_remote_lane_is_refused_for_any_state_but_queued(self):
         # A limit hand-off or a fix round (briefed) must never land on a
@@ -2460,21 +2552,21 @@ class TriageTests(unittest.TestCase):
         self.assert_never_edited(routes)
 
     def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
+        # 2026-10-20: a "not a ticket yet" comment on each one emailed the
+        # issue's author 161 times in a morning; the label and the station's
+        # log line say it without a notification.
         no_boxes = BODY.replace("- [ ] ", "")
         routes = Routes([item(6, body="It is slow.\n## Why\nusers wait"), item(7, body=no_boxes),
                          item(8, body=None)])
-        self.run_triage(routes)
+        lines = self.run_triage(routes)
         self.assertEqual(routes.labelled(), {6: ["loom:triage"], 7: ["loom:triage"], 8: ["loom:triage"]})
-        comments = {int(c[1].split("/issues/")[1].split("/")[0]): c[2]["body"]
-                    for c in routes.calls if c[1].endswith("/comments")}
-        self.assertIn("Missing: What, Acceptance criteria, Size (a ## Size section or a "
-                      "Size: XS|S|M|L line), Out of scope.", comments[6])
-        self.assertNotIn("Why", comments[6].split("Missing:")[1].split(".")[0])
-        self.assertIn("Missing: checkboxes under Acceptance criteria.", comments[7])
-        self.assertIn("Missing: Why, What", comments[8])
-        for body in comments.values():
-            self.assertTrue(body.startswith(brain.TRIAGE_MARKER))
-            text.check(body)
+        self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
+        self.assertEqual(lines, [
+            "#6 loom:triage, missing What, Acceptance criteria, Size (a ## Size section or a "
+            "Size: XS|S|M|L line), Out of scope",
+            "#7 loom:triage, missing checkboxes under Acceptance criteria",
+            "#8 loom:triage, missing Why, What, Acceptance criteria, Size (a ## Size section or a "
+            "Size: XS|S|M|L line), Out of scope"])
         self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST" for c in routes.calls))
         self.assert_never_edited(routes)
 
@@ -2522,6 +2614,18 @@ class TriageTests(unittest.TestCase):
             item(3, labels=["wayfinder:map"], body="## Destination\nthree levels"),
             item(4, labels=["wayfinder:research"], body="## Question\nwhich call sites"),
             item(5, labels=["wayfinder:grilling"], body="## Question\napprove the list"),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
+    def test_a_factory_incident_issue_is_not_triaged(self):
+        # loom#918: a factory incident is filed as a plain open issue; the
+        # backlog triage must leave it alone (no loom:triage, no comment).
+        marker = "<!-- loom:factory-incident v1 -->"
+        routes = Routes([
+            item(5, body=marker + "\nRepo: x\nKind: environment\nTicket: x#12\n"),
             item(8, labels=["bug"], body="broken"),
         ])
         self.run_triage(routes)
@@ -2931,7 +3035,7 @@ class OnboardTests(unittest.TestCase):
 
     def test_command_line_prints_the_lines(self):
         fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
-        with unittest.mock.patch.object(brain, "GitHub", lambda token: GitHub(token, transport=fake)), \
+        with unittest.mock.patch.object(brain, "GitHub", lambda token, **kw: GitHub(token, transport=fake)), \
                 unittest.mock.patch.object(brain, "auth_from_env", lambda: "t"), \
                 unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""}), \
                 unittest.mock.patch("sys.stdout") as out:
@@ -3262,6 +3366,65 @@ class ReportCadenceTest(unittest.TestCase):
         # 2026-10-18: 2-hourly reports on 13 goals sent the operator about 13
         # emails an hour; the operator chose every 6 hours.
         self.assertEqual(brain.REPORT_EVERY, 6 * 3600)
+
+class LiveCriterionTest(unittest.TestCase):
+    """2026-10-18: 3 of 72 merged tickets verified; most verify runs found no
+    evidence for a Live criterion written as prose, so the station had no
+    string to look for in its logs."""
+
+    def body(self, live):
+        return ("## Why\nx\n\n## What\ny\n\n## Acceptance criteria\n- [ ] a\n- [ ] b\n"
+                "- [ ] %s\n\n## Size\nS\n\n## Out of scope\nz\n" % live)
+
+    def test_a_prose_live_criterion_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "names no exact string"):
+            brain._check_live_criterion(self.body(
+                "Live: the station log for the 24 hours after deploy shows it working"))
+
+    def test_a_live_criterion_naming_a_string_passes(self):
+        brain._check_live_criterion(self.body(
+            "Live: the station log shows `deployed` within a pass of the merge"))
+        brain._check_live_criterion(self.body('Live: "/api/v2/health" reports no finding'))
+
+    def test_a_body_with_no_live_criterion_is_left_alone(self):
+        brain._check_live_criterion(self.body("A test fails without the change"))
+
+class RestateLiveTest(unittest.TestCase):
+    """Tickets shipped before #925 state their Live criterion in prose and
+    can never be verified; the brain restates it naming the string."""
+
+    BODY = ("## Acceptance criteria\n- [ ] A test fails without the fix\n"
+            "- [ ] Live: the logs show it working after deploy\n\n## Size\nS\n")
+    ENV = {"LOOM_BRIEF_AUTHORS": "trusted"}
+
+    def issue(self, labels=("loom:ticket", "loom:shipped"), body=None):
+        return {"state": "open", "body": self.BODY if body is None else body,
+                "labels": [{"name": n} for n in labels], "user": {"login": "trusted"}}
+
+    def test_a_shipped_ticket_gets_its_live_line_replaced_in_place(self):
+        fake = Fake(reply(200, self.issue()), reply(200, {}))
+        brain.restate_live(GitHub("t", transport=fake), REPO, 8,
+                           "Live: the station log shows `deployed` within a pass", env=self.ENV)
+        self.assertEqual(fake.calls[1][0], "PATCH")
+        self.assertEqual(fake.calls[1][2]["body"], self.BODY.replace(
+            "Live: the logs show it working after deploy",
+            "Live: the station log shows `deployed` within a pass"))
+
+    def test_refusals_make_no_writes(self):
+        cases = [
+            (self.issue(), "Live: the logs show it"),                       # names no string
+            (self.issue(), "live: the station log shows `deployed`"),        # not read as Live
+            (self.issue(), "The station log shows `deployed`"),             # not a Live line
+            (self.issue(labels=("loom:ticket", "loom:merged")), "Live: `deployed` shows"),
+            (self.issue(body="## Acceptance criteria\n- [ ] a\n"), "Live: `deployed` shows"),
+        ]
+        for issue, text in cases:
+            with self.subTest(text=text):
+                fake = Fake(reply(200, issue))
+                with self.assertRaises(ValueError):
+                    brain.restate_live(GitHub("t", transport=fake), REPO, 8, text, env=self.ENV)
+                self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -3646,3 +3809,18 @@ class RepairsEpicTests(unittest.TestCase):
         brain.brief(gh, REPO, epic, "Repair", BODY, "codex")
         tree = brain.goal_tree(gh, REPO, 1)[1]
         self.assertNotIn(epic, [e["number"] for e in brain.finished_epics(tree)])
+
+
+class WaitLabelTests(unittest.TestCase):
+    def test_a_state_move_clears_every_wait_label(self):
+        kept = brain._moved_labels(["loom:ticket", "loom:briefed", "lane:codex", "wait:gate"],
+                                   "running", None)
+        self.assertNotIn("wait:gate", kept)
+        self.assertIn("loom:running", kept)
+
+    def test_the_wait_labels_are_managed(self):
+        from bus import labels
+        for name in ("wait:gate", "wait:model-limit", "wait:lane", "wait:incident",
+                     "wait:after", "wait:window"):
+            self.assertIn(name, labels.LABELS)
+        self.assertIn("wait:", labels.MANAGED_PREFIXES)

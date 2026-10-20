@@ -204,12 +204,20 @@ class RewriteIssueTest(Base):
         text = "Here you go:\n```json\n%s\n```\nDone." % json.dumps(BRIEF)
         self.assertEqual(self.rewrite(text), "brief")
 
-    def test_a_human_answer_labels_the_issue_with_the_ask(self):
+    def test_a_human_answer_is_left_to_the_brain_with_no_comment(self):
+        # 2026-10-18: the free rewrite model still labelled factory work as
+        # person-only after #843; each loom:human reaches the operator's
+        # digest. The model proposes, the brain decides.
         answer = {"action": "human", "kind": "money", "ask": "Buy the domain name for the site."}
         self.assertEqual(self.rewrite(answer), "human")
-        self.assertEqual(self.fake.labels, [(7, ["loom:human"])])
-        self.assertIn("Buy the domain name", self.fake.comments[0][1])
+        self.assertEqual(self.fake.labels, [(7, ["needs-brain"])])
+        self.assertEqual(self.fake.comments, [])
         self.assertEqual(self.fake.created, [])
+
+    def test_an_issue_left_to_the_brain_is_not_rewritten_again(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
+        self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
     def test_a_human_answer_without_a_person_only_kind_writes_nothing(self):
         # 2026-10-18: a free model parked "Using GitHub credentials, locate the
@@ -244,6 +252,10 @@ class RewriteIssueTest(Base):
 
     def test_a_body_without_checkboxes_writes_nothing(self):
         self.assert_writes_nothing(dict(BRIEF, body=BODY.replace("- [ ] ", "- ")))
+
+    def test_a_prose_live_criterion_writes_nothing(self):
+        prose = BODY.replace("- [ ] ", "- [ ] Live: the logs show it working after deploy\n- [ ] ", 1)
+        self.assert_writes_nothing(dict(BRIEF, body=prose))
 
     def test_a_bad_difficulty_writes_nothing(self):
         self.assert_writes_nothing(dict(BRIEF, difficulty="impossible"))
@@ -352,6 +364,21 @@ class StationRewriteTest(Base):
         self.run_station(self.station(cmd=cmd, now=1800))
         self.assertEqual(self.fake.requests, [])
 
+    def test_the_station_wide_hourly_cap_binds_across_passes(self):
+        # 2026-10-18: per-goal caps alone let about 80 rewrites through in ten
+        # minutes across ten backlog goals, each one emailing the operator.
+        for n in range(1, 9):
+            self.fake.add_triage(n, created="2030-01-%02dT00:00:00Z" % n)
+        cmd = self.agent({"action": "skip", "reason": "later"})
+        with mock.patch.object(station, "REWRITE_STATION_PER_HOUR", 3):
+            self.run_station(self.station(cmd=cmd))
+            self.assertEqual(self.fake.read_comments(), [1, 2, 3])
+            self.fake.requests.clear()
+            self.run_station(self.station(cmd=cmd, now=600))
+            self.assertEqual(self.fake.requests, [])
+            self.run_station(self.station(cmd=cmd, now=3700))
+            self.assertEqual(self.fake.read_comments(), [4, 5, 6])
+
     def test_the_next_hour_takes_the_next_five_and_skips_the_ones_just_tried(self):
         for n in range(1, 9):
             self.fake.add_triage(n, created="2030-01-%02dT00:00:00Z" % n)
@@ -397,3 +424,31 @@ class StationRewriteTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AnswerShapeTest(unittest.TestCase):
+    """An unusable answer is described by its shape, never its words: all
+    eight Live restates and 113 rewrites failed with one message on
+    2026-10-19, and nothing said what the model had returned."""
+
+    def check(self, output, want):
+        with self.assertRaises(rewrite.Invalid) as ctx:
+            rewrite.parse_answer(output)
+        self.assertIn("the answer holds no JSON object with an action", str(ctx.exception))
+        self.assertIn(want, str(ctx.exception))
+
+    def test_each_shape_of_an_unusable_answer_is_named(self):
+        self.check("", "it was empty")
+        self.check("I cannot help with that request.", "32 characters of text")
+        self.check("Here: {not json", "with a { but no JSON")
+        self.check('{"line": "Live: x", "kind": "y"}', "a JSON object with keys kind, line")
+        self.check('{"line": "Live: x", "leakedSecretName": 1}', "keys line and 1 other key(s)")
+        self.check('{"zzz": 1}', "a JSON object with no expected key and 1 other key(s)")
+
+    def test_the_words_of_the_answer_never_appear(self):
+        with self.assertRaises(rewrite.Invalid) as ctx:
+            rewrite.parse_answer("secret-sounding prose about token abc123")
+        self.assertNotIn("abc123", str(ctx.exception))
+        self.assertNotIn("prose", str(ctx.exception))
+        with self.assertRaises(rewrite.Invalid) as ctx:
+            rewrite.parse_answer('{"tokenabc123": 1}')
+        self.assertNotIn("abc123", str(ctx.exception))

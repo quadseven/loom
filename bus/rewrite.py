@@ -9,6 +9,7 @@ its ticket is verified.
 from __future__ import annotations
 
 import json
+import sys
 import os
 import re
 import shlex
@@ -36,6 +37,14 @@ class Invalid(Exception):
 class CommandFailure(Invalid):
     """The agent command failed before producing an answer."""
 
+
+
+# A rewrite the model thinks only a person can do waits for the brain.
+NEEDS_BRAIN = "needs-brain"
+
+
+def _names(issue: Dict[str, Any]) -> List[str]:
+    return [str(x.get("name") if isinstance(x, dict) else x) for x in issue.get("labels") or []]
 
 def command_for(public_cmd: str, private_cmd: str, private: bool) -> str:
     """The agent command for a repo, or "" when the repo is skipped. A
@@ -104,6 +113,8 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
         "sentence. Acceptance criteria has at least three checkboxes. Size is one of XS, "
         "S, M or L. Out of scope names at least one thing. Do not write header lines "
         "such as Priority, Difficulty, After or Not before; the station adds those.",
+        "A Live criterion, if you write one, names the exact log line, field or endpoint "
+        "its proof will show, in backticks.",
         "Use human only when the work needs money, hardware, an account, a credential, "
         "someone physically present or an operator decision nobody has made, and name that "
         "reason as kind. A credential is a secret only the owner holds, not repository or "
@@ -164,7 +175,41 @@ def parse_answer(output: str) -> Dict[str, Any]:
             continue
         if isinstance(value, dict) and "action" in value:
             return value
-    raise Invalid("the answer holds no JSON object with an action")
+    raise Invalid("the answer holds no JSON object with an action (%s)" % answer_shape(output))
+
+
+# Keys an answer is expected to carry; only these are named in answer_shape.
+ANSWER_KEYS = frozenset({"action", "line", "title", "body", "ask", "reason", "difficulty",
+                         "kind", "epic", "priority", "size"})
+
+
+def answer_shape(output: str) -> str:
+    """What an unusable answer looked like, never its words (only keys from
+    ANSWER_KEYS are named; others are counted): the reason can
+    reach a public issue (the repeated-failure invariant), and the model's
+    text is not checked. All eight Live restates and 113 rewrites failed
+    with one message on 2026-10-19, and nothing said whether the model
+    answered empty, in prose, or in JSON without an action."""
+    text = str(output or "")
+    if not text.strip():
+        return "it was empty"
+    decoder = json.JSONDecoder()
+    keys: List[str] = []
+    for m in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text, m.start())
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            keys = [str(k) for k in value]
+            break
+    if keys:
+        known = sorted(k for k in keys if k in ANSWER_KEYS)
+        others = len(keys) - len(known)
+        return "a JSON object with %s%s" % (
+            "keys %s" % ", ".join(known) if known else "no expected key",
+            " and %d other key(s)" % others if others else "")
+    return "%d characters of text%s" % (len(text), ", with a { but no JSON" if "{" in text else "")
 
 
 def _text(answer: Dict[str, Any], key: str) -> str:
@@ -205,6 +250,7 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
         if missing:
             raise Invalid("body lacks: %s" % ", ".join(missing))
         brain._check_written_text(title + "\n" + body)
+        brain._check_live_criterion(body)
     except ValueError as err:
         raise Invalid(str(err)) from None
     return "brief", {"title": title, "difficulty": difficulty, "body": body}
@@ -216,7 +262,7 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
     return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-            and not brain.owned_elsewhere(i)]
+            and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)]
 
 
 def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: str,
@@ -233,5 +279,11 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
         brain.brief_intake(gh, repo, goal, fields["title"], fields["body"],
                     difficulty=fields["difficulty"], refs=number)
     elif action == "human":
-        brain.human(gh, repo, number, fields["ask"])
+        # The rewrite model only proposes it: free models labelled factory
+        # work as person-only (GitHub access as "a credential", a Datadog
+        # monitor while Datadog is off), and every loom:human lands in the
+        # operator's digest. The brain decides; the issue stays loom:triage.
+        gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_BRAIN]})
+        print("rewrite: %s#%d proposed as person-only, left to the brain: %s"
+              % (repo, number, fields["ask"][:200]), file=sys.stderr)
     return action

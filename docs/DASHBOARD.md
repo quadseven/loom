@@ -1,7 +1,16 @@
 # Dashboard settings
 
 Run the stdlib dashboard with `python3 -m dashboard`. It serves on port 8080
-by default. Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
+by default, on every interface. Set `LOOM_DASHBOARD_HOST` to the one address
+it should listen on (on a laptop, its private-network address, so the
+dashboard is not served on whatever network the laptop joins). On a lane
+machine, `LOOM_DASHBOARD=1 lanes/mac/install.sh` installs it as the launchd
+agent `com.loom.dashboard` (restarted if it exits, logging to
+`$LOOM_HOME/logs/dashboard.log`) with every `LOOM_*` setting of the installing
+environment; `LOOM_DASHBOARD=0` removes it. With no `LOOM_DB_PASSWORD` the
+agent sets `LOOM_TRANSCRIPTS_MEMORY=1`, so it starts with transcripts kept in
+memory, and its log says so.
+Set `LOOM_DASHBOARD_PORT` to change the port and `LOOM_REPOS` to a
 space-separated list of `OWNER/NAME` repositories. Set
 `LOOM_DASHBOARD_GITHUB_TOKEN` to provide a read-only GitHub token; without it,
 the dashboard also checks the standard GitHub CLI authentication. To read
@@ -95,6 +104,37 @@ records the pass already holds, and the check runs of at most 30 open
 linked heads. An issue assigned to another operator with no claim label
 shows only when it is a Loom ticket or a pull request.
 
+The same page groups every open issue and pull request labelled
+`needs:<login>` under that login as "Waiting on <login>", with its age and
+the ask: the body's `## Ask` section when it has one, else the newest
+comment that names the ask (a `## Ask` section, a line that starts with
+"Ask", or a mention of the item's needs label), else the latest comment,
+one line, HTML comment markers dropped. Every login is listed, this Loom's
+own included, because the person named is the one who has to act;
+`needs:<login>` never blocks a lane. An item claimed by one login and
+waiting on another is a row in each group. The Floor shows a "Waiting on a
+person" card with each person's count, linking to
+`/operators#person-<login>`, and no card when nothing waits. The reads ride
+the same pass and interval: one open list per `needs:<login>` label per repo
+(at most 10), then one comment page (the last 100) per item whose
+`updated_at` changed since the last read and whose body has no `## Ask`
+(at most 30 a pass); below the budget floor nothing is read and the last
+result stays shown.
+
+`/needs-you` lists every open item that waits on a person, each once: the
+`needs-operator` issues ("waits on the operator") from Hunt's backlog
+document and the store's own read, and the `needs:<login>` items above
+("waits on <login>"), each card marked "needs a human" with its ask (the
+`## Ask` section, else the picked comment, linked). It makes no request of
+its own: the `needs:<login>` items come from the Operators pass, and a
+`needs-operator` issue with no `## Ask` in its body takes its ask from a
+comment read the same way. Chips at the top filter it with plain links:
+All, one per login with its count, and Operator (`?who=<login>`,
+`?who=operator`). A repo named bare (`app#7`, as Hunt's document does) and
+by `OWNER/NAME` (`example-owner/app#7`) is one item when only one
+configured repo has that name. The Floor's "Needs you" count is the same
+deduplicated list.
+
 `/free` lists, per repo, the open issues free for the operator named by
 `?operator=<login>` (anyone, with none), from `bus.free`, the function
 behind `python3 -m bus.free` (docs/LANES.md, "Two Looms on shared repos").
@@ -104,6 +144,71 @@ page, following the `Link` header) at most once an hour
 covering tickets from the ticket records and the comment feed every pass
 already holds. Issues whose Loom ticket is closed or merged are listed to
 check.
+
+`/tiers` (Tiers and allowances, loom#968) shows the whole tier system in
+one page. "Tiers" lists Loom's easy, medium and hard lanes in order and the
+model ladder (`TIERS` and `LADDER` in `bus/factory.py`), each lane with the
+model it runs and its kind from `LANE_KINDS` (base lanes; a numbered slot
+takes its lane's kind): own hardware (the Sparks), free, subscription or never
+paid (a prepaid credit the operator does not top up), then Grug's review
+order. Two tables follow, so a Spark or free-pool lane is not read as two
+providers:
+
+- "Gateway calls by target and model": the gateway's calls per target (a
+  Spark or a free provider) and model. Success is ok out of the calls that
+  were not limits (a limit is allowance, not failure), so a row whose every
+  call was a limit reads "n/a", not 0%. Allowance is the gateway's `open`
+  breakers: an open breaker on the row's target (lane `*` or the row's
+  model) is "cooling until" its reopen time (`generated_at` plus
+  `reopens_in_s`), with the breaker window, its reason and its caller when
+  set, whatever the reason; "benched" is only a model the gateway reports
+  benched.
+- "Loom runs by lane and model": Loom's lane runs per lane (numbered slots
+  with their lane) and model, with a row for every lane the tiers name even
+  when it has not run in 7 days, since an out-of-credit lane is the one most
+  worth seeing. Allowance comes from the station's usage readings: cooling
+  until a hold ends, with the window whose reading holds it; benched for a
+  hold with no end; the tightest fresh meter's amount left; or available.
+  Limits are not separated in Loom rows: a stored run is done or failed, and
+  the runner's `[limit]` failure line is past the transcript's text cut, so a
+  failed run may have been a provider limit. A lane with no failure reads
+  100%; one with any failure reads "unknown (limits not separated)", with
+  its done and failed counts, rather than a rate that counts limits as
+  failures.
+
+A stale source makes no current claim: when the gateway stats (both
+windows) or the usage snapshot are stale, the allowance cells they feed read
+"unknown (stale since <time>)", never "available". "Live now" lists the
+running Loom tickets, the gateway's calls in flight and Grug's Elder reviews
+in flight (an entry naming another persona is left out).
+
+Its sources are read once a background refresh pass, side by side, each with
+a 5 second timeout, never by a page request (`dashboard/tiers_sources.py`):
+
+- `LOOM_GATEWAY_URL`: the inference gateway's base URL inside the
+  dashboard's own network, no token. `GET /ui/stats?window=24h` and
+  `?window=7d` give the per provider and model counts and the breaker lanes
+  cooling now (`open`), the gateway half of allowance state; `GET /ui/state`
+  gives `inflight`. Unset, those panels say so.
+- `LOOM_GRUG_STATS_URL` and the optional bearer token
+  `LOOM_GRUG_STATS_TOKEN`: Grug's stats endpoint, read for an `inflight`
+  list of `{persona, repo, pr, model, started_at}` and its review order
+  (`tiers`, `review_order` or `order`: model names, or objects with `model`
+  and `backend`). Unset, the Grug panels say "not configured yet"; with no
+  order listed, the order says it is waiting for Grug's endpoint.
+- The transcript store: lane runs per lane, model and outcome over the last
+  7 days and 24 hours, with the median run time (`Store.model_outcomes`).
+  Brain ticks are not counted.
+- The usage readings the station uploads (`POST /api/usage`): Loom lanes'
+  holds and meters, the Loom half of allowance state.
+- The ticket snapshot: the open tickets labelled `loom:running`.
+
+Each source keeps its last good answer and when it was read. A read that
+fails, times out or answers 503 (the gateway's ledger is off) marks that
+source stale: its panel says so with the error and the last good read time
+and keeps showing the last good figures, while the rest of the page renders
+as usual. A source with no answer at all leaves its cells "unknown", never
+zero. A redirect is not followed, and an answer over 4 MiB is refused.
 
 `/goals` shows one card per top-level goal home. A goal home rolls up into a
 bigger one through a `Parent goal: OWNER/NAME#N` line in its body or its
@@ -120,7 +225,12 @@ Backlog's "Outside any epic" lists open tickets with no epic.
 
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one
-repository, and startup logs the time taken for that snapshot.
+repository, and startup logs the time taken for that snapshot. Every source of
+that first pass overlaps its reads: the per-ticket event lists behind the
+state waits, the pages of each repo's two-week comment feed, the open issues
+for `/free`, the goal homes, and the Operators page's check and ask reads. One
+after another they made a cold first snapshot take over five minutes; it
+takes about a minute (loom#433).
 Each refresh keeps only the fields the pages read from each pull request and
 comment it lists (`PULL_REQUEST_FIELDS` and `COMMENT_FIELDS` in
 `dashboard/github.py`), not GitHub's whole answers with their embedded

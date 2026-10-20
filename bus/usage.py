@@ -382,6 +382,8 @@ def _provider_groups(lane_names: List[str]) -> Dict[str, List[str]]:
             provider = "opencode-go"
         elif lane.startswith("spark"):
             provider = "spark"
+        elif lane.startswith("free-"):
+            provider = "free"
         elif lane.startswith("claude"):
             provider = "claude"
         else:

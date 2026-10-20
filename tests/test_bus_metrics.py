@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from datetime import datetime, timezone
@@ -123,6 +125,31 @@ class MetricsTest(unittest.TestCase):
         gh = metrics.Collector(self.gh, [REPO], self.home, NOW, "Review", trusted=["trusted-bot"])
         throughput = next(n for n in gh.collect() if n.name == "Throughput")
         self.assertIn("verified 3/3 (lane 2, brain 1)", throughput.line())
+
+    def test_throughput_holds_only_goal_repos_with_workable_tickets_to_a_merge(self):
+        # A backlog goal whose every issue is done or a person's ask has
+        # nothing to merge; 8 of 17 goal repos read FAIL that way (2026-10-19).
+        total = metrics.Totals(goals=2, goal_repos={"o/busy", "o/idle"},
+                               workable_repos={"o/busy"},
+                               merged_by_repo={"o/busy": 1, "o/idle": 0},
+                               merged_tickets=2, verified=1)
+        number = metrics.throughput_number(total)
+        self.assertTrue(number.passed, number.line())
+        self.assertIn("o/idle 0 (no work)", number.line())
+        total.workable_repos.add("o/idle")
+        self.assertFalse(metrics.throughput_number(total).passed)
+
+    def test_an_open_queued_ticket_holds_its_goal_repo_to_a_merge(self):
+        self.gh.pr["merged_at"] = None
+        self.gh.pr["state"] = "open"
+        throughput = next(n for n in self.numbers() if n.name == "Throughput")
+        self.assertIn("%s 0 (no work)" % REPO, throughput.line())
+        self.gh.issues.append({"number": 6, "state": "open", "created_at": iso(NOW - 500),
+                               "labels": [label("loom:ticket"), label("loom:queued")]})
+        self.gh.events[6], self.gh.comments[6] = [], []
+        throughput = next(n for n in self.numbers() if n.name == "Throughput")
+        self.assertIn("%s 0;" % REPO, throughput.line())
+        self.assertFalse(throughput.passed)
 
     def test_ticket_waits_include_reentered_state_and_current_state(self):
         events = []
@@ -393,6 +420,21 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(sent), 2)
 
 
+
+class VisibilityCadenceTest(unittest.TestCase):
+    def test_the_visibility_target_follows_the_report_cadence(self):
+        # 2026-10-18: the operator moved reports to every 6 hours; a 2-hour
+        # target would fail every goal from then on.
+        def number(hours):
+            total = metrics.Totals()
+            total.goals = 1
+            total.report_ages = {"example-owner/example-repo#1": hours * 3600}
+            return metrics.visibility_number(total)
+        self.assertTrue(number(5).passed)
+        self.assertFalse(number(7).passed)
+        self.assertIn("<=6h", number(5).target)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -435,3 +477,67 @@ class WaitsCommandTest(unittest.TestCase):
         want = datetime.fromtimestamp(now - 7 * 86400, timezone.utc)
         got = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         self.assertLess(abs((got - want).total_seconds()), 120)
+
+
+class SlowEvents:
+    """A GitHub boundary for waits_for_repos whose every request sleeps:
+    four tickets per repo (plus one too old to count and a pull request,
+    neither read further) and one queued event per ticket."""
+
+    def __init__(self, now, delay=0.03, failing=None):
+        self.now, self.delay, self.failing = now, delay, failing
+        self.lock = threading.Lock()
+        self.active = self.max_active = 0
+        self.request_time = 0.0
+        self.paths = []
+
+    def paginate(self, path):
+        started = time.monotonic()
+        with self.lock:
+            self.paths.append(path)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(self.delay)
+            if "/events" not in path:
+                return ([{"number": n, "updated_at": iso(self.now - n * 60)} for n in range(1, 5)]
+                        + [{"number": 9, "updated_at": iso(self.now - 8 * 86400)},
+                           {"number": 10, "updated_at": iso(self.now), "pull_request": {}}])
+            if self.failing and self.failing in path:
+                raise GitHubError("events read failed", 502)
+            number = int(path.split("/issues/")[1].split("/")[0])
+            return [{"event": "labeled", "label": {"name": "loom:queued"},
+                     "created_at": iso(self.now - number * 3600)}]
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.request_time += time.monotonic() - started
+
+
+class WaitsReadTest(unittest.TestCase):
+    """waits_for_repos reads one event list per ticket updated in the last
+    week. Read one after another that was 699 requests and 229 s of a cold
+    dashboard's 320 s first snapshot (loom#433), so they overlap now."""
+
+    REPOS = ["example-owner/one", "example-owner/two", "example-owner/three"]
+
+    def test_event_reads_overlap_and_the_result_matches_a_serial_read(self):
+        gh = SlowEvents(NOW)
+        entered = {}
+        started = time.monotonic()
+        rows, bottleneck = metrics.waits_for_repos(gh, self.REPOS, NOW, entered)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len([p for p in gh.paths if "/events" in p]), 12)
+        self.assertGreater(gh.max_active, 1)
+        self.assertLess(elapsed, gh.request_time * 0.5)
+        serial_entered = {}
+        want = metrics.waits_for_repos(SlowEvents(NOW, delay=0), self.REPOS, NOW, serial_entered,
+                                       workers=1)
+        self.assertEqual((rows, bottleneck), want)
+        self.assertEqual(list(entered.items()), list(serial_entered.items()))
+        self.assertEqual(list(entered), ["%s#%d" % (repo, n) for repo in self.REPOS for n in range(1, 5)])
+
+    def test_one_failed_event_read_fails_the_whole_read(self):
+        gh = SlowEvents(NOW, delay=0, failing="example-owner/two/issues/3/")
+        with self.assertRaises(GitHubError):
+            metrics.waits_for_repos(gh, self.REPOS, NOW, {})

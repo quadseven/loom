@@ -55,7 +55,7 @@ def _optional_fields(row: dict[str, Any]) -> dict[str, Any]:
     """When the provider wrote the reading, the machine that collected it, and
     its window length: a bad value is dropped, not refused, since none is
     needed to show it."""
-    if row.get("observed_at") is not None and _parse_time(row["observed_at"]) is None:
+    if row.get("observed_at") is not None and parse_time(row["observed_at"]) is None:
         row["observed_at"] = None
     host = row.get("host")
     if host is not None and (not isinstance(host, str) or not host or len(host) > 100):
@@ -106,7 +106,7 @@ DOWN_WORDS = ("endpoint", "503", "unreachable", "down")
 RECENT_PR_DAYS = 7
 
 
-def _parse_time(value: Any) -> datetime | None:
+def parse_time(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -126,12 +126,12 @@ def _zone():
     return timezone.utc
 
 
-def _clock(moment: datetime) -> str:
+def clock(moment: datetime) -> str:
     local = moment.astimezone(_zone())
     return local.strftime("%Y-%m-%d %H:%M ") + (local.tzname() or "UTC")
 
 
-def _span(seconds: float) -> str:
+def span(seconds: float) -> str:
     """A duration in its two largest units: 6d 6h, 3h 12m, 8m."""
     seconds = max(0, int(seconds))
     days, rest = divmod(seconds, 86400)
@@ -144,17 +144,17 @@ def _span(seconds: float) -> str:
     return "%dm" % minutes if minutes else "under 1m"
 
 
-def _ago(moment: datetime, now: datetime) -> str:
+def time_ago(moment: datetime, now: datetime) -> str:
     seconds = (now - moment).total_seconds()
-    return "just now" if seconds < 60 else _span(seconds) + " ago"
+    return "just now" if seconds < 60 else span(seconds) + " ago"
 
 
-def _until(moment: datetime, now: datetime) -> str:
+def time_until(moment: datetime, now: datetime) -> str:
     seconds = (moment - now).total_seconds()
-    return "in " + _span(seconds) if seconds >= 60 else ("now" if seconds >= 0 else _span(-seconds) + " ago")
+    return "in " + span(seconds) if seconds >= 60 else ("now" if seconds >= 0 else span(-seconds) + " ago")
 
 
-def _pct(value: float) -> str:
+def percent(value: float) -> str:
     return ("%.1f" % value).rstrip("0").rstrip(".") + "%"
 
 
@@ -168,7 +168,7 @@ def lane_state(reason: str, now: datetime) -> dict[str, Any]:
     until = None
     match = HOLD_UNTIL.search(text)
     if match:
-        until = _parse_time(match.group(1).rstrip(";"))
+        until = parse_time(match.group(1).rstrip(";"))
         if until:
             text = text[:match.start()].strip()
     kind = "down" if any(word in reason.lower() for word in DOWN_WORDS) else "held"
@@ -176,10 +176,10 @@ def lane_state(reason: str, now: datetime) -> dict[str, Any]:
         # The hold ran out and the lane has not written a heartbeat since (a
         # runner busy on a long run writes none): it no longer holds the lane.
         return {"kind": "free", "until": until,
-                "why": "free: its hold (%s) ended %s (%s)" % (text or kind, _clock(until), _ago(until, now))}
+                "why": "free: its hold (%s) ended %s (%s)" % (text or kind, clock(until), time_ago(until, now))}
     why = text or kind
     if until:
-        why += " until %s (%s)" % (_clock(until), _until(until, now))
+        why += " until %s (%s)" % (clock(until), time_until(until, now))
     return {"kind": kind, "why": why, "until": until}
 
 
@@ -193,7 +193,7 @@ def lane_activity(prs: list[dict[str, Any]], now: datetime) -> dict[str, dict[st
         if not parsed:
             continue
         lane, model = parsed[2], parsed[3]
-        when = _parse_time(str(pr.get("created_at") or pr.get("updated_at") or ""))
+        when = parse_time(str(pr.get("created_at") or pr.get("updated_at") or ""))
         info = out.setdefault(lane, {"model": None, "at": None, "recent": 0})
         if when and (info["at"] is None or when >= info["at"]):
             info["model"], info["at"] = model, when
@@ -217,9 +217,9 @@ def _staleness(used: float | None, reset: datetime | None, observed: datetime | 
         return None
     if used is not None and reset is not None and reset <= now:
         # The window rolled over after the reading: its figure is history.
-        return "the window reset %s, after this reading" % _until(reset, now)
+        return "the window reset %s, after this reading" % time_until(reset, now)
     if (now - observed).total_seconds() > STALE_AFTER:
-        return "read %s ago" % _span((now - observed).total_seconds())
+        return "read %s ago" % span((now - observed).total_seconds())
     return None
 
 
@@ -242,12 +242,12 @@ def _projection(used: float, reset: datetime, observed: datetime, minutes: float
     return {"pace": rate, "at_reset": min(100.0, used + rate * left / 3600)}
 
 
-def _window(row: dict[str, Any], now: datetime) -> dict[str, Any]:
+def read_window(row: dict[str, Any], now: datetime) -> dict[str, Any]:
     """One reading, judged: its figures, reset, pace and freshness."""
     window = str(row.get("window") or "")
-    collected = _parse_time(row.get("as_of"))
-    observed = _parse_time(row.get("observed_at")) or collected
-    reset = _parse_time(row.get("resets_at"))
+    collected = parse_time(row.get("as_of"))
+    observed = parse_time(row.get("observed_at")) or collected
+    reset = parse_time(row.get("resets_at"))
     used = _number(row.get("used_pct"))
     note = str(row.get("note") or "").strip()
     w = {"name": WINDOW_NAMES.get(window, window[:1].upper() + window[1:]), "kind": window,
@@ -306,7 +306,7 @@ def _status(lanes: list[str], kinds: list[str], windows: list[dict[str, Any]]) -
 def _provider(name: str, rows: list[dict[str, Any]], holds: dict[str, str],
               activity: dict[str, dict[str, Any]], models: dict[str, str], now: datetime) -> dict[str, Any]:
     lanes = _unique(lane for row in rows for lane in row.get("lanes") or [])
-    windows = [_window(row, now) for row in rows]
+    windows = [read_window(row, now) for row in rows]
     states = {lane: lane_state(holds.get(lane, ""), now) for lane in lanes}
     status, rank = _status(lanes, [s["kind"] for s in states.values()], windows)
     read = [w["collected"] for w in windows if w["collected"]]
@@ -332,11 +332,11 @@ def _window_ask(name: str, w: dict[str, Any], now: datetime) -> list[tuple[str, 
     if w["stale"] or w["used"] is None:
         pass
     elif w["used"] >= NEAR_LIMIT_PCT:
-        pace = "; at this pace it runs out %s" % _until(w["runs_out"], now) if w["runs_out"] else ""
-        asks.append(("bad", "%s is %s used%s." % (label, _pct(w["used"]), pace)))
+        pace = "; at this pace it runs out %s" % time_until(w["runs_out"], now) if w["runs_out"] else ""
+        asks.append(("bad", "%s is %s used%s." % (label, percent(w["used"]), pace)))
     elif w["runs_out"]:
         asks.append(("warn", "%s: at this pace it runs out %s, %s before its reset." % (
-            label, _until(w["runs_out"], now), _span((w["reset"] - w["runs_out"]).total_seconds()))))
+            label, time_until(w["runs_out"], now), span((w["reset"] - w["runs_out"]).total_seconds()))))
     if w["error"]:
         asks.append(("warn", "%s: the usage adapter failed (%s)." % (name, w["note"])))
     elif w["kind"] == "credit" and w["used"] is None and "not configured" in w["note"]:
@@ -364,7 +364,7 @@ def _asks(providers: list[dict[str, Any]], newest: datetime | None, now: datetim
     if snapshot_stale:
         asks.append(("bad", "The usage snapshot is %s old (read %s): no station upload since, so "
                             "every figure here may be out of date."
-                     % (_span((now - newest).total_seconds()), _clock(newest))))
+                     % (span((now - newest).total_seconds()), clock(newest))))
     for p in providers:
         if not snapshot_stale:
             asks += _stale_ask(p)
@@ -374,7 +374,7 @@ def _asks(providers: list[dict[str, Any]], newest: datetime | None, now: datetim
     return sorted(asks, key=lambda a: ("bad", "warn", "info").index(a[0]))
 
 
-def _all_holds(rows: list[dict[str, Any]]) -> dict[str, str]:
+def all_holds(rows: list[dict[str, Any]]) -> dict[str, str]:
     holds: dict[str, str] = {}
     for row in rows:
         if isinstance(row.get("holds"), dict):
@@ -387,7 +387,7 @@ def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] |
     """The Usage view's data from the stored readings: providers worst first,
     the asks for the operator, and how fresh the snapshot is."""
     rows = [row for row in rows if isinstance(row, dict)]
-    holds = _all_holds(rows)
+    holds = all_holds(rows)
     by_name: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_name.setdefault(str(row.get("provider") or "unknown"), []).append(row)
@@ -422,7 +422,7 @@ def _unknown_note(w: dict[str, Any], now: datetime) -> str:
     if w["kind"] == "last 429" and w["reset"] is not None:
         limit = w["note"].replace("limitName:", "").strip() or "a"
         return ("Last hit its %s limit; the provider said retry after %s (%s)."
-                % (limit, _clock(w["reset"]), _until(w["reset"], now)))
+                % (limit, clock(w["reset"]), time_until(w["reset"], now)))
     if w["kind"] == "limit":
         return _limit_note(w, now)
     return _sentence(w["note"])
@@ -437,11 +437,11 @@ def _limit_note(w: dict[str, Any], now: datetime) -> str:
         if note.startswith(prefix):
             why = note[len(prefix):].strip()
             if prefix == "limited:":
-                until = (" until %s (%s)" % (_clock(w["reset"]), _until(w["reset"], now))
+                until = (" until %s (%s)" % (clock(w["reset"]), time_until(w["reset"], now))
                          if w["reset"] and w["reset"] > now else ", reset time unknown")
                 return "%s limited%s: %s." % (lanes, until, why.rstrip("."))
-            seen = " %s" % _ago(w["observed"], now) if w["observed"] and w["observed"] != w["collected"] else ""
-            lifted = (", lifted %s (%s)" % (_clock(w["reset"]), _ago(w["reset"], now))
+            seen = " %s" % time_ago(w["observed"], now) if w["observed"] and w["observed"] != w["collected"] else ""
+            lifted = (", lifted %s (%s)" % (clock(w["reset"]), time_ago(w["reset"], now))
                       if w["reset"] and w["reset"] <= now else "")
             return "%s last limited%s%s: %s." % (lanes, seen, lifted, why.rstrip("."))
     if note == "no limit seen":
@@ -461,17 +461,17 @@ def _meter_detail(w: dict[str, Any], now: datetime) -> str:
     detail = []
     if w["reset"] is not None:
         verb = "Expires" if w["kind"] == "credit" else "Resets"
-        detail.append("%s %s (%s)." % (verb, _clock(w["reset"]), _until(w["reset"], now)))
+        detail.append("%s %s (%s)." % (verb, clock(w["reset"]), time_until(w["reset"], now)))
     elif w["kind"] != "credit":
         detail.append("Reset time unknown.")
     if w["stale"]:
         detail.append("Stale: %s." % w["stale"])
     elif w["runs_out"]:
         detail.append("Pace %s/h since the window opened: runs out %s (%s), before the reset."
-                      % (_pct(w["pace"]), _clock(w["runs_out"]), _until(w["runs_out"], now)))
+                      % (percent(w["pace"]), clock(w["runs_out"]), time_until(w["runs_out"], now)))
     elif w["pace"] is not None and w["at_reset"] is not None:
         detail.append("Pace %s/h since the window opened: lasts to the reset, about %s used by then."
-                      % (_pct(w["pace"]), _pct(w["at_reset"])))
+                      % (percent(w["pace"]), percent(w["at_reset"])))
     elif w["reset"] is not None and w["kind"] in WINDOW_MINUTES:
         detail.append("Too early in the window to project a pace.")
     return " ".join(detail)
@@ -488,9 +488,9 @@ def _meter(w: dict[str, Any], now: datetime) -> str:
     marker = ""
     if w["at_reset"] is not None and w["at_reset"] > used:
         marker = '<i class="um-proj" style="left:%.1f%%"></i>' % w["at_reset"]
-    label = "%s used, %s left%s" % (_pct(used), _pct(100 - used), ", stale" if stale else "")
+    label = "%s used, %s left%s" % (percent(used), percent(100 - used), ", stale" if stale else "")
     figure = '<strong>%s</strong> used <span class="um-sep">/</span> <strong>%s</strong> left' % (
-        _pct(used), _pct(100 - used))
+        percent(used), percent(100 - used))
     if "usd_left" in w:
         figure += ' <span class="um-usd">(USD %.2f left)</span>' % w["usd_left"]
     return ('<div class="um%s%s"><span class="um-name">%s</span>'
@@ -503,7 +503,7 @@ def _meter(w: dict[str, Any], now: datetime) -> str:
 def _holds(windows: list[dict[str, Any]], now: datetime) -> str:
     """Every thermal hold window of a provider as one line: one window per
     lane would repeat "none active" once per slot."""
-    held = ["%s until %s (%s)%s" % (", ".join(w["lanes"]), _clock(w["reset"]), _until(w["reset"], now),
+    held = ["%s until %s (%s)%s" % (", ".join(w["lanes"]), clock(w["reset"]), time_until(w["reset"], now),
                                     ": " + w["note"] if w["note"] else "")
             for w in windows if w["reset"] is not None and w["reset"] > now]
     figure = "; ".join(held) if held else "none active on %s" % _count(len(windows), "lane")
@@ -540,11 +540,11 @@ def _read_line(p: dict[str, Any], newest: datetime | None, now: datetime) -> str
     if p["read"] is None:
         parts.append("read time unknown")
     elif newest is None or abs((newest - p["read"]).total_seconds()) >= 60:
-        parts.append("read %s (%s)" % (_clock(p["read"]), _ago(p["read"], now)))
+        parts.append("read %s (%s)" % (clock(p["read"]), time_ago(p["read"], now)))
     observed = [w["observed"] for w in p["windows"] if w["observed"] and w["collected"]
                 and (w["collected"] - w["observed"]).total_seconds() >= 60]
     if observed:
-        parts.append("%s last reported %s (%s)" % (p["name"], _clock(min(observed)), _ago(min(observed), now)))
+        parts.append("%s last reported %s (%s)" % (p["name"], clock(min(observed)), time_ago(min(observed), now)))
     return ("; ".join(parts) + ".") if parts else ""
 
 
@@ -581,14 +581,14 @@ def _quiet_html(p: dict[str, Any], newest: datetime | None, now: datetime) -> st
 def _freshness_html(newest: datetime | None, now: datetime) -> str:
     esc = html.escape
     if newest is None or (now - newest).total_seconds() > STALE_AFTER:
-        when = "%s (%s)" % (_clock(newest), _ago(newest, now)) if newest else "an unknown time"
+        when = "%s (%s)" % (clock(newest), time_ago(newest, now)) if newest else "an unknown time"
         return ('<p class="stale-note usage-fresh" role="status"><strong>Stale snapshot.</strong> '
                 'The newest usage reading is from %s. Every figure below is as of its own read '
                 'time; the station uploads a snapshot each pass, so it has stopped running or '
                 'uploading.</p>' % esc(when))
     return ('<p class="usage-fresh machine-fact"><i class="status-dot" aria-hidden="true"></i>'
             'Snapshot read %s (%s). Readings older than %dh are marked stale.</p>'
-            % (esc(_clock(newest)), esc(_ago(newest, now)), STALE_AFTER // 3600))
+            % (esc(clock(newest)), esc(time_ago(newest, now)), STALE_AFTER // 3600))
 
 
 def _summary(data: dict[str, Any]) -> str:
@@ -602,7 +602,7 @@ def _summary(data: dict[str, Any]) -> str:
              if w["used"] is not None and not w["stale"]]
     if fresh:
         used, name, window = max(fresh, key=lambda item: item[0])
-        text += " Tightest meter: %s %s at %s used." % (name, window.lower(), _pct(used))
+        text += " Tightest meter: %s %s at %s used." % (name, window.lower(), percent(used))
     return '<p class="usage-summary">%s</p>' % html.escape(text)
 
 

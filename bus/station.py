@@ -44,6 +44,7 @@ from . import rewrite
 from . import roll_pin
 from . import revert
 from . import spend
+from . import status
 from . import usage
 from . import verify_data
 from . import text as _text
@@ -52,7 +53,7 @@ from . import transcripts
 from . import watch
 from .brain import HUMAN_MARKER
 from . import brain
-from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm
+from .github import GitHub, GitHubError, RateLimited, _OPENER, _next_link, read_ssm, unreadable
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -79,6 +80,17 @@ NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
 # longer waiting or running is removed once it is this old. On 2026-10-13 the
 # 385 left behind held 7.8 GB and the disk filled.
 TREE_KEEP = 3600
+# The loom home is kept bounded (loom#643): a lane's logs (logs/<slot>/) are
+# removed once nothing in them changed for LOOM_LOG_KEEP_DAYS days (0 keeps
+# them all), unless a brief of that name is waiting or running or its
+# transcript has not reached the dashboard yet. Every pass warns when the
+# home's disk has less than LOOM_DISK_FREE_MIN_GB free; every DISK_EVERY
+# seconds the old logs go and the home's size is logged. On 2026-10-17 logs/
+# held 4.2 GB, growing 0.6 GB a day, and the disk was down to 8 GB free.
+LOG_KEEP_DAYS = 7
+DISK_FREE_MIN_GB = 10.0
+DISK_EVERY = 3600
+GB = 1024 ** 3
 # A fix brief's answers to findings (lanes/run_lane.sh keep_answers).
 ANSWER_FILE_RE = re.compile(r"^(PRRT_[A-Za-z0-9_-]{1,100})\.md$")
 ANSWER_MAX = 3000
@@ -100,9 +112,6 @@ LIMIT = "limit:"
 # push moved the pull request's branch during the run. Not a failure: the
 # ticket goes back to loom:pr, and the factory judges the new head.
 BRANCH_MOVED = "branch moved:"
-# Asks the review bot to review a pull request's head again; it resolves the
-# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
-REVIEW_AGAIN = "/grug improve"
 LANE_SAID_MAX = 2500
 PATH_RE = _text.PATH_RE
 SECRET_RE = _text.SECRET_RE
@@ -121,6 +130,8 @@ USAGE_RETRY_PAUSE = 2
 DIGEST_HEAD = "Asks waiting for you:"
 # Open loom:human issues wait for the daily digest.
 HUMAN = "loom:human"
+# Why a ticket waits (bus/labels.py): one wait:* label at a time.
+WAIT = "wait:"
 HUMAN_HEAD = "Waiting on you"
 HUMAN_SHOWN = 5
 # A report first line whose only count is work in flight: the digest counts
@@ -139,8 +150,10 @@ MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
-# The last line of a quiet standup the station edits in place.
+# The last line of a quiet standup the station edits in place, and of a
+# standup that repeats an earlier one word for word.
 QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
+SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
 # Reports come every REPORT_EVERY (6 hours), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
@@ -163,7 +176,35 @@ TRIAGE_INTERVAL = 3600
 # pass (each one waits on an agent command), and how long before an issue
 # whose rewrite did not produce a ticket is tried again.
 REWRITE_PER_HOUR = 5
+# A brief that has waited this long in a down lane's inbox stops blocking its
+# ticket's next claim (_return_dead_brief).
+DEAD_BRIEF_AGE = 3600
 REWRITE_PER_PASS = 5
+# Rewrites across every backlog goal in any hour: each one comments on its
+# issue or files a ticket, and both email the operator. Per goal alone, ten
+# backlog goals let about 80 through in ten minutes (2026-10-18).
+REWRITE_STATION_PER_HOUR = 6
+REWRITE_STATION_KEY = "_station"
+# Live-line restates have their own hourly allowance: an edit of the ticket
+# body, never a comment, so no email. Sharing REWRITE_STATION_PER_HOUR, the
+# rewrite step spent all six calls every hour and no shipped ticket was ever
+# restated (2026-10-19).
+RESTATE_PER_HOUR = 4
+# Done tickets closed per pass (close_done_tickets), so a backlog of them
+# drains over a few passes instead of one burst of API writes.
+CLOSE_DONE_PER_PASS = 25
+# A ticket carrying one of these stays open for the brain whatever its state.
+# An open loom:rewritten source whose ticket is closed is settled at most
+# once an hour, this many a run (settle_orphan_sources); a source's ticket is
+# read from its rewrite comment once and kept in SOURCES_FILE.
+SETTLE_EVERY = 3600
+SETTLE_PER_RUN = 25
+SOURCES_FILE = "sources.json"
+SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
+REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
+CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
+CLOSE_DONE_LABEL = "force-close"
+RESTATE_KEY = "_live_station"
 REWRITE_RETRY = 24 * 3600
 REWRITE_TIMEOUT = 600
 # Through the bot, a report is one short line (the goal's short name and the
@@ -192,6 +233,12 @@ JOURNAL_LOOKBACK = 24 * 3600
 DEPLOYED_FILE = "deployed.json"
 SHIP_PER_PASS = 20
 SHIP_PAGES = 5
+# A merged ticket _merged_pulls did not match: at most this many of its
+# cross-referencing merged pull requests are read, and one with no match is
+# not looked up again for SHIP_LOOKUP_RETRY (SHIP_LOOKUPS_FILE).
+SHIP_XREF_MAX = 3
+SHIP_LOOKUP_RETRY = 6 * 3600
+SHIP_LOOKUPS_FILE = "ship_lookups.json"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 # The handoff packet is rebuilt at most this often, or sooner when a brain
 # tick on this machine just ended (publish_handoff).
@@ -254,7 +301,6 @@ RETRY_MAX = 2
 # Where the runner files its validation incidents (lanes/run_lane.sh
 # FACTORY_REPO), and the marker and ticket line their bodies carry.
 FACTORY_REPO = "quadseven/loom"
-FACTORY_LABEL = "loom:factory"
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
@@ -277,6 +323,7 @@ LANE_MODELS = {
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],
     "spark": ["spark/?*"],
+    "free": ["free/?*"],
     "agy": ["gemini-*", "claude-*", "gpt-oss-*"],
 }
 # Operator messages in the Discord channel become notes on a goal home, and
@@ -378,6 +425,9 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
     due = []
     for repo, issue in issues:
         labels = _label_names(issue)
+        needles = live_needles(issue.get("body"))
+        if needles is not None and not needles:
+            continue
         key = "%s#%s" % (repo, issue.get("number"))
         if (issue.get("state") != "open" or "loom:ticket" not in labels
                 or "loom:shipped" not in labels or "loom:verified" in labels
@@ -393,6 +443,14 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
         not item[1].get("health_proof"),
         float(item[1].get("shipped_at", 0) or 0),
         item[0], int(item[1].get("number", 0))))
+
+
+def live_needles(body: Optional[str]) -> Optional[List[str]]:
+    """Needles for a Live criterion, or None when the ticket has no Live line."""
+    live = brain.live_criterion(body, limit=None)
+    if live == "(no Live criterion on the ticket)":
+        return None
+    return evidence.needles(live)
 
 
 def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:
@@ -437,13 +495,19 @@ class Settings:
                  briefers: Sequence[str] = (),
                  ship_on_merge: Sequence[str] = (),
                  ship_workflows: Optional[Dict[str, str]] = None,
-                 no_topup: Sequence[str] = ()) -> None:
+                 no_topup: Sequence[str] = (),
+                 log_keep_days: int = LOG_KEEP_DAYS,
+                 disk_free_min_gb: float = DISK_FREE_MIN_GB) -> None:
         self.home = home
         # LOOM_NO_TOPUP: provider lanes (anthropic) whose credit the operator
         # never tops up. Their slots held out of credit wait for the credit
         # to renew, so the lane-held invariant skips them. Empty (the
         # default) keeps the invariant on every held lane.
         self.no_topup = [lane.lower() for lane in no_topup]
+        # Days a lane's logs are kept (0: forever), and the free disk under
+        # which every pass warns (Station.tend_disk).
+        self.log_keep_days = log_keep_days
+        self.disk_free_min_gb = disk_free_min_gb
         # Repos whose merged tickets ship at merge (ship_on_merge), and repos
         # whose merged tickets ship when their deploy workflow succeeds on the
         # merge commit, repo to workflow file (ship_workflows).
@@ -573,7 +637,69 @@ class Settings:
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
                    ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
                    ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")),
-                   no_topup=words("LOOM_NO_TOPUP"))
+                   no_topup=words("LOOM_NO_TOPUP"),
+                   log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
+                   disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")))
+
+
+def _keep_days(raw: str) -> int:
+    """LOOM_LOG_KEEP_DAYS: a whole number of days, 0 for forever; anything
+    else is said once and the default kept."""
+    raw = raw.strip()
+    if not raw:
+        return LOG_KEEP_DAYS
+    if raw.isdigit():
+        return int(raw)
+    _say("ignoring LOOM_LOG_KEEP_DAYS %r: not a whole number of days" % raw)
+    return LOG_KEEP_DAYS
+
+
+def _free_floor(raw: str) -> float:
+    """LOOM_DISK_FREE_MIN_GB: a non-negative number of GB, else the default."""
+    raw = raw.strip()
+    if not raw:
+        return DISK_FREE_MIN_GB
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not (value >= 0 and math.isfinite(value)):
+        _say("ignoring LOOM_DISK_FREE_MIN_GB %r: not a number of GB" % raw)
+        return DISK_FREE_MIN_GB
+    return value
+
+
+def _gb(n: float) -> str:
+    return "%.1f GB" % (n / GB)
+
+
+def _tree_stat(path: str) -> Tuple[float, int]:
+    """(newest mtime, bytes on disk) of a path and, for a real directory,
+    everything under it. Links are counted as themselves, never followed."""
+    st = os.lstat(path)
+    newest, size = st.st_mtime, _disk_bytes(st)
+    if stat.S_ISDIR(st.st_mode):
+        for root, dirs, files in os.walk(path, followlinks=False):
+            for name in dirs + files:
+                try:
+                    st = os.lstat(os.path.join(root, name))
+                except OSError:
+                    continue
+                newest, size = max(newest, st.st_mtime), size + _disk_bytes(st)
+    return newest, size
+
+
+def _disk_bytes(st: os.stat_result) -> int:
+    blocks = getattr(st, "st_blocks", None)
+    return blocks * 512 if isinstance(blocks, int) else st.st_size
+
+
+def _remove(path: str) -> None:
+    """Remove a file, a link (never what it points at) or a whole folder."""
+    if stat.S_ISDIR(os.lstat(path).st_mode):
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        os.unlink(path)
 
 
 def _ship_workflows(items: List[str]) -> Dict[str, str]:
@@ -586,6 +712,54 @@ def _ship_workflows(items: List[str]) -> Dict[str, str]:
             found[repo] = workflow
         else:
             _say("ignoring %r in LOOM_SHIP_WORKFLOWS: not OWNER/NAME=WORKFLOW.yml" % item)
+    return found
+
+
+_PULL_REQUEST_TRIGGER = re.compile(
+    r"(?m)^\s*pull_request\s*(?::|,|\])|^\s*on:\s*\[[^\]]*pull_request")
+
+
+def _has_pull_request_trigger(workflow: str) -> bool:
+    """Whether a workflow's text runs on pull_request."""
+    return bool(_PULL_REQUEST_TRIGGER.search(workflow))
+
+
+def _block_scalar(lines: List[str], index: int, indent: int) -> Tuple[str, int]:
+    """Join a run: | block's lines deeper than indent; return it and the next index."""
+    block = []
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        block.append(line.strip())
+        index += 1
+    return " ".join(part for part in block if part), index
+
+
+def _workflow_run_steps(path: str, workflow: str) -> List[Tuple[str, str]]:
+    """Each non-empty run step of a workflow as (where it comes from, command)."""
+    lines = workflow.splitlines()
+    found: List[Tuple[str, str]] = []
+    index = 0
+    step_name = ""
+    run_number = 0
+    while index < len(lines):
+        line = lines[index]
+        if re.match(r"^\s*-\s+", line):
+            step_name = ""
+        named = re.match(r"^\s*-\s*name:\s*(.+?)\s*$", line)
+        if named:
+            step_name = named.group(1).strip("\"'")
+        index += 1
+        match = re.match(r"^\s*(?:-\s*)?run:\s*(.*)$", line)
+        if not match:
+            continue
+        run_number += 1
+        command = match.group(1).strip()
+        if command in ("|", ">", "|-", ">-"):
+            command, index = _block_scalar(lines, index, len(line) - len(line.lstrip()))
+        if command:
+            found.append(("%s, step %s" % (path, step_name or str(run_number)), command))
     return found
 
 
@@ -870,8 +1044,10 @@ def _clip(text: str, limit: int) -> str:
 
 
 def provider(lane: str) -> str:
-    """The provider lane of a slot (anthropic-2 -> anthropic), as the runner
-    maps it."""
+    """The provider lane of a slot (anthropic-2 -> anthropic, free-kilo ->
+    free), as the runner maps it."""
+    if re.fullmatch(r"free-[a-z]+", lane):
+        return "free"
     return re.sub(r"-[0-9]+$", "", lane)
 
 
@@ -926,9 +1102,24 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     return at is not None and beat_fresh(at, now, window)
 
 
+def hold_expired(beat: Dict[str, Any], now: float) -> bool:
+    """Whether a lane's limit hold has run out: the reset it names is in the
+    past. A beat with no reset has no known end, so its hold stands. The Usage
+    view reads the same heartbeat the same way (bus/usage.py _limit_hold)."""
+    until = beat.get("retry_at")
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return False
+    return until <= now
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
-    repos only."""
+    repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
+    to its provider: free-nvidia, free-kilo and free-groq are free provider
+    slots that may train (infra#5617), while free-ollama and free-gemma may
+    take private repos."""
+    if lane in factory.PUBLIC_ONLY:
+        return True
     lane = provider(lane)
     return (lane in FREE_LANES or lane in REMOTE_LANES or lane == "agy"
             or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
@@ -968,8 +1159,9 @@ def _fix_round_limit() -> int:
 
 def _refs_numbers(repo: str, body: str) -> List[int]:
     """The ticket numbers a pull request body names with a `Refs` line, in
-    the full `Refs OWNER/NAME#N` form or the same-repo `Refs #N` form."""
-    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)[ \t]*$" % re.escape(repo),
+    the full `Refs OWNER/NAME#N` form or the same-repo `Refs #N` form; the
+    line may carry trailing words after the number."""
+    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)\b" % re.escape(repo),
                                        body, re.M)]
 
 
@@ -1035,6 +1227,10 @@ class Station:
                  head: Optional[Callable[[], str]] = None,
                  fetch: Optional[Fetcher] = None) -> None:
         self.gh = gh
+        # Status comments by the station's trusted writers read as events.
+        writers = getattr(gh, "status_authors", None)
+        if isinstance(writers, set):
+            writers |= {a.lower() for a in settings.authors}
         self.s = settings
         self.read_secret = read_secret or read_ssm
         self.post = post or post_webhook
@@ -1074,6 +1270,8 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        # Log data sections the verify gate already read this pass, by ticket.
+        self._evidence_text: Dict[str, str] = {}
         # This pass's factory-repair tickets over the unproven-work limit, per
         # (repo, goal): running, at a pull request, or let through (loom#767).
         self._repair_flying: Dict[Tuple[str, int], List[int]] = {}
@@ -1427,6 +1625,19 @@ class Station:
         os.replace(tmp, path)
         return path
 
+    def _fix_round_for(self, repo: str, ticket: Dict[str, Any], pr: int) -> bool:
+        """Whether the ticket's newest trusted loom:fix comment, after its last
+        claim, sends a lane to fix pull request `pr`. An unreadable or unusable
+        fix is no fix round."""
+        try:
+            comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, int(ticket["number"])))
+            found = self._fix_for(repo, comments)
+        except RateLimited:
+            raise
+        except (GitHubError, ValueError):
+            return False
+        return found is not None and found[0].pr == pr
+
     def _fix_for(self, repo: str, comments: List[Any]) -> Optional[Tuple[tickets.Fix, Any]]:
         """Return the newest trusted fix after the last claim, regardless of
         later non-fix comments. Raises ValueError for an unusable fix."""
@@ -1487,7 +1698,8 @@ class Station:
             # is refused: the newest claim's run must end first.
             newest = tickets.ticket_name(repo, number, earlier)
             busy = [l for l in LANES
-                    if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))]
+                    if os.path.exists(os.path.join(self.inbox(l), newest + ".md"))
+                    and not self._return_dead_brief(l, newest)]
             if busy:
                 _say("not claiming %s#%d: its brief %s is still in lane %s's inbox; next pass"
                      % (repo, number, newest, busy[0]))
@@ -1501,7 +1713,7 @@ class Station:
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
         # assignee is emailed for every comment on the ticket (2026-10-18).
-        labels = [n for n in _label_names(issue) if n != BRIEFED]
+        labels = [n for n in _label_names(issue) if n != BRIEFED and not n.startswith(WAIT)]
         if RUNNING not in labels:
             labels.append(RUNNING)
         mark = self._claim_label(repo)
@@ -1509,9 +1721,10 @@ class Station:
             labels.append(mark)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                     {"body": "Claimed for lane %s (body sha256 %s)"
-                      % (lane, _sha12(issue.get("body")))})
+        # The claim marker goes on the ticket's one status comment, edited in
+        # place: a new comment emailed the operator on every claim (loom#866).
+        status.add(self.gh, repo, number, "Claimed for lane %s (body sha256 %s)"
+                   % (lane, _sha12(issue.get("body"))), self.now, self.s.authors)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         if fix:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
@@ -1522,6 +1735,59 @@ class Station:
         goal = self._goal_of(repo, issue)
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
+        return True
+
+    def _return_dead_brief(self, lane: str, name: str) -> bool:
+        """Move a brief out of a dead lane's inbox into the inbox's returned/
+        (which nothing reads), so the ticket can be claimed on a live lane.
+        True when it was moved. A brief stays in the inbox while its run goes
+        on, so "dead" needs every sign that nothing runs there: no runner lock
+        with a live pid (lanes/run_lane.sh holds run/<lane>.lock for the whole
+        run), a heartbeat whose own time is DEAD_BRIEF_AGE old or missing (the
+        runner beats every tick, available or not: a limit or the spend floor
+        is not death), and a brief that has waited DEAD_BRIEF_AGE. A ticket
+        waited two days behind a brief in the inbox of a lane whose key had
+        expired (2026-10-18)."""
+        if self._runner_alive(lane):
+            return False
+        beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                          None, strict=False)
+        at = beat.get("at") if isinstance(beat, dict) else None
+        if isinstance(at, (int, float)) and not isinstance(at, bool) \
+                and self.now - at < DEAD_BRIEF_AGE:
+            return False
+        path = os.path.join(self.inbox(lane), name + ".md")
+        try:
+            if self.now - os.path.getmtime(path) < DEAD_BRIEF_AGE:
+                return False
+            returned = os.path.join(self.inbox(lane), "returned")
+            os.makedirs(returned, exist_ok=True)
+            os.replace(path, os.path.join(returned, name + ".md"))
+        except OSError:
+            return False
+        _say("returned brief %s from lane %s: no runner and no heartbeat for an hour"
+             % (name, lane))
+        return True
+
+    def _runner_alive(self, lane: str) -> bool:
+        """Whether lane's runner holds its lock with a live pid. A name that
+        is not one of LANES counts as alive, so it never builds a path and its
+        brief is never moved."""
+        if lane not in LANES:
+            return True
+        lock = os.path.join(self.s.home, "run", lane + ".lock")
+        try:
+            with open(os.path.join(lock, "pid")) as fh:
+                pid = int(fh.read().strip())
+        except (OSError, ValueError):
+            # A lock with no readable pid may be a runner starting up.
+            return os.path.isdir(lock)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass  # alive, owned by another user (the lane user)
         return True
 
     def _claim_label(self, repo: str) -> Optional[str]:
@@ -1564,41 +1830,8 @@ class Station:
             if not path.endswith((".yml", ".yaml")):
                 continue
             workflow = self._contents_text(repo, path)
-            has_pull_request = workflow is not None and bool(re.search(
-                r"(?m)^\s*pull_request\s*(?::|,|\])|^\s*on:\s*\[[^\]]*pull_request",
-                workflow))
-            if not has_pull_request:
-                continue
-            lines = workflow.splitlines()
-            index = 0
-            step_name = ""
-            run_number = 0
-            while index < len(lines):
-                if re.match(r"^\s*-\s+", lines[index]):
-                    step_name = ""
-                named = re.match(r"^\s*-\s*name:\s*(.+?)\s*$", lines[index])
-                if named:
-                    step_name = named.group(1).strip("\"'")
-                match = re.match(r"^\s*(?:-\s*)?run:\s*(.*)$", lines[index])
-                if not match:
-                    index += 1
-                    continue
-                run_number += 1
-                command = match.group(1).strip()
-                indent = len(lines[index]) - len(lines[index].lstrip())
-                index += 1
-                if command in ("|", ">", "|-", ">-"):
-                    block = []
-                    while index < len(lines):
-                        line = lines[index]
-                        if line.strip() and len(line) - len(line.lstrip()) <= indent:
-                            break
-                        block.append(line.strip())
-                        index += 1
-                    command = " ".join(part for part in block if part)
-                if command:
-                    source = "%s, step %s" % (path, step_name or str(run_number))
-                    found.append((source, command))
+            if workflow is not None and _has_pull_request_trigger(workflow):
+                found.extend(_workflow_run_steps(path, workflow))
         return False, found
 
     def file_validation_contracts(self) -> None:
@@ -1718,11 +1951,19 @@ class Station:
             value = cached.get("heartbeat")
             return value if isinstance(value, (int, float)) else None
         heartbeat = self._read_remote_heartbeat(lane)
-        counts = self._read_remote_claim_count(lane) if heartbeat is not None else 0
-        if not isinstance(saved, dict):
-            saved = {}
-        saved[lane] = {"checked_at": self.now, "heartbeat": heartbeat, "claims": counts}
-        _write_json(os.path.join(self.state, "remote-status.json"), saved)
+        counts, repos = (0, 0)
+        try:
+            if heartbeat is not None:
+                counts, repos = self._read_remote_claim_count(lane)
+        finally:
+            # Always written once the heartbeat was read: a failed count
+            # read must not leave every later caller in the pass reading
+            # again and raising again.
+            if not isinstance(saved, dict):
+                saved = {}
+            saved[lane] = {"checked_at": self.now, "heartbeat": heartbeat,
+                           "claims": counts, "repos": repos}
+            _write_json(os.path.join(self.state, "remote-status.json"), saved)
         return heartbeat
 
     def _read_remote_heartbeat(self, lane: str) -> Optional[float]:
@@ -1753,9 +1994,28 @@ class Station:
         """Lanes whose fresh heartbeat says unavailable at a limit."""
         return list(self._limit_reasons())
 
+    def down_lanes(self) -> List[str]:
+        """Lanes whose fresh heartbeat says unavailable for a reason other
+        than a limit (an expired key, a lane stopped on purpose). A stale or
+        missing heartbeat is not counted: a lane deep in a long run can go
+        quiet without being down."""
+        out: List[str] = []
+        for lane in LANES:
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            if not isinstance(beat, dict) or beat.get("available") is not False:
+                continue
+            at = beat.get("at")
+            if isinstance(at, bool) or not isinstance(at, (int, float)):
+                continue
+            if beat_fresh(at, self.now) and not str(beat.get("reason") or "").startswith(LIMIT):
+                out.append(lane)
+        return out
+
     def _limit_reasons(self) -> Dict[str, str]:
         """Lane -> the reason of its fresh heartbeat that says unavailable
-        at a limit."""
+        at a limit. A hold whose reset has passed is no hold: the lane is
+        free again, as the Usage view reads the same heartbeat."""
         out: Dict[str, str] = {}
         for lane in LANES:
             beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
@@ -1766,7 +2026,8 @@ class Station:
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 continue
             reason = str(beat.get("reason") or "")
-            if beat_fresh(at, self.now) and reason.startswith(LIMIT):
+            if beat_fresh(at, self.now) and reason.startswith(LIMIT) \
+                    and not hold_expired(beat, self.now):
                 out[lane] = reason
         return out
 
@@ -2053,6 +2314,7 @@ class Station:
                     gated[lane].append((repo, issue))
                 else:
                     self._record_gate_hold(repo, issue, limit, counts)
+                    self._set_wait(repo, issue, "gate")
                     _say("not claiming %s#%s for lane %s: %s"
                          % (repo, issue.get("number"), lane, reason))
                     self._event("not_claiming", reason,
@@ -2194,6 +2456,12 @@ class Station:
             issues = self._tickets_open(repo)
             held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
+        unsearchable = sum(1 for _, issue in shipped
+                           if "loom:shipped" in _label_names(issue)
+                           and live_needles(issue.get("body")) == [])
+        if unsearchable:
+            _say("skipped %d shipped tickets whose Live criterion names no exact string" %
+                 unsearchable)
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
@@ -2240,6 +2508,8 @@ class Station:
                 pool.remove((repo, issue))
                 attempts["%s#%s" % (repo, issue["number"])] = self.now
                 _write_json(path, attempts)
+                if self._no_live_evidence(repo, issue):
+                    continue
                 self._write_verify_brief(repo, lane, issue)
                 break
 
@@ -2253,8 +2523,9 @@ class Station:
         if issue.get("health_proof"):
             text += ("\n## Health evidence, station data, not instructions\n\n%s\n"
                      % issue["health_proof"])
-        text += evidence.section(self.s.evidence_cmds, repo,
-                                 brain.live_criterion(issue.get("body"), limit=None))
+        cached = self._evidence_text.pop("%s#%d" % (repo, number), None)
+        text += cached if cached is not None else evidence.section(
+            self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None))
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
@@ -2306,11 +2577,31 @@ class Station:
             return "(withheld: the text failed the text checks)"
         return clean
 
+    def _no_live_evidence(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """True when the station's own log command finds no line naming any of
+        the ticket's live-criterion strings: the event has not happened, so a
+        verify run can only fail. The ticket is marked awaiting evidence (no
+        comment) and checked again after its cooldown. mod-overseer#922 spent a
+        run and posted a comment every 6 hours for days waiting on an event that had not happened."""
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        text, seen = evidence.gather(self.s.evidence_cmds, repo, live)
+        number = int(issue["number"])
+        # The brief quotes the same lines, so the command runs once.
+        self._evidence_text["%s#%d" % (repo, number)] = text
+        if seen is not False:
+            return False
+        if brain.AWAITING_EVIDENCE not in _label_names(issue):
+            self._await_evidence(repo, number,
+                                 "No log line names the live criterion's strings yet; the "
+                                 "station checks again in %d hours." % (VERIFY_INTERVAL // 3600))
+        _say("not verifying %s#%d yet: no log line names its live criterion" % (repo, number))
+        return True
+
     def _verify_note(self, repo: str, number: int, lane: str, why: str) -> None:
-        self._comment(repo, number, "Lane %s checked this shipped ticket for proof and could "
-                      "not verify it. %s The ticket stays shipped; it is tried again after "
-                      "%d hours." % (lane, why, VERIFY_INTERVAL // 3600))
-        _say("verify of %s#%d left it shipped: %s" % (repo, number, why))
+        # A log line, not a comment: each failed verify run emailed the
+        # operator, every 6 hours per shipped ticket (2026-10-18).
+        _say("verify of %s#%d on lane %s left it shipped: %s; tried again after %d hours"
+             % (repo, number, lane, why, VERIFY_INTERVAL // 3600))
 
     def _await_evidence(self, repo: str, number: int, missing: Any) -> None:
         """Mark a ticket a verifier found waiting on live evidence, so it does
@@ -2551,6 +2842,7 @@ class Station:
         if released and not waiting:
             self._release_hold(repo, issue, released)
         if waiting:
+            self._set_wait(repo, issue, "after")
             _say("%s#%s waits for %s" % (repo, issue["number"], ", ".join(
                 "%s (%s)" % (a.short, a.why) for a in waiting)))
             return False
@@ -2586,6 +2878,7 @@ class Station:
             return False
         _say("%s#%s waits: model %s is limited on lane %s until %s"
              % (repo, issue["number"], model, lane, self._utc(until)))
+        self._set_wait(repo, issue, "model-limit")
         return True
 
     def _route_model_claim(self, repo: str, issue: Dict[str, Any], lane: str,
@@ -2596,10 +2889,12 @@ class Station:
         number = int(issue["number"])
         names = [name for name in _label_names(issue) if not name.startswith("lane:")]
         if target is None:
-            names = [name for name in names if name != BRIEFED] + ["loom:queued"]
+            names = [name for name in names if name != BRIEFED and not name.startswith(WAIT)] \
+                + ["loom:queued", WAIT + "lane"]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": names})
-            self._comment(repo, number, "Model %s waits for a free compatible lane." % model)
+            # A log line, not a comment: each comment emails the operator
+            # (2026-10-18), and the ticket's labels already say it waits.
             _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
             self._event("model_wait", "no free lane takes model %s" % model,
                         "%s#%d" % (repo, number), lane, model)
@@ -2689,9 +2984,48 @@ class Station:
                      {"labels": kept})
         ticket["labels"] = [{"name": name} for name in kept]
 
+    def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
+        """Move each open adoption ticket to loom:merged once the pull
+        request its title and body name has merged, freeing its lane. A
+        target still open, or closed unmerged, leaves the ticket: its job is
+        then to supersede that pull request (loom#1020)."""
+        waiting = ("loom:queued", "loom:briefed", "loom:running", "loom:answered")
+        for issue in open_tickets:
+            if (not isinstance(issue, dict) or "pull_request" in issue
+                    or not set(_label_names(issue)).intersection(waiting)):
+                continue
+            number = self._adopted_pull_number(issue)
+            if number is None:
+                continue
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+            if isinstance(pr, dict) and self._terminal_label(pr) == "loom:merged":
+                self._move_adoption_to_merged(repo, issue, pr)
+
+    def _move_adoption_to_merged(self, repo: str, ticket: Dict[str, Any],
+                                 pr: Dict[str, Any]) -> None:
+        """Move an adoption ticket to loom:merged with a note naming the
+        merged target, its merge commit and time, and drop the lane label."""
+        number = int(ticket["number"])
+        states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
+        kept = [name for name in _label_names(ticket)
+                if name not in states and not name.startswith(("lane:", "wait:"))]
+        kept.append("loom:merged")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+        note = ("Pull request #%d merged at %s (merge commit %s), so this Land or supersede "
+                "ticket moved to loom:merged." % (
+                    int(pr["number"]), str(pr.get("merged_at") or "").replace("T", " "),
+                    str(pr.get("merge_commit_sha") or "")[:12]))
+        self._comment(repo, number, note)
+        _say("moved %s#%d to loom:merged: land-or-supersede target #%d merged"
+             % (repo, number, int(pr["number"])))
+
     def _reconcile_repo(self, repo: str) -> None:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
+        open_tickets = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        self._reconcile_adoptions(repo, open_tickets)
         # Only a closed pull request changes a ticket. Those PRs are the most
         # recently updated closed ones, so one page of them is read, never the
         # repo's whole PR history. A merged one delivers the ticket even while
@@ -2733,6 +3067,12 @@ class Station:
                 continue
             if not _linked_pr(ticket, repo, pr):
                 continue
+            if "loom:briefed" in labels and self._fix_round_for(repo, ticket, int(pr["number"])):
+                # A brain fix round moved it back to briefed for a lane to fix
+                # this very pull request: not a new link. Relabelling it pr
+                # undid the round every pass, and the brain re-briefed it
+                # (zippie#269, 2026-10-18: a flip and a comment every 3-6 min).
+                continue
             trusted, _ = self._check_trust(repo, ticket)
             if not trusted:
                 continue
@@ -2742,12 +3082,12 @@ class Station:
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept})
             ticket["labels"] = [{"name": name} for name in kept]
-            self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
+            _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
         # A ticket still at queued or briefed whose pull request merged:
         # a brain fix round sent it back to briefed and the pull request
         # merged before a lane took the fix, or the pull request opened and
         # merged between two passes (loom#784).
-        unlinked = self._unlinked_tickets(repo, tickets_by_number)
+        unlinked = self._unlinked_tickets(repo, tickets_by_number, open_tickets)
         if not tickets_by_number and not unlinked:
             return
         waiting = {n: t for n, t in tickets_by_number.items()
@@ -2762,13 +3102,12 @@ class Station:
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
 
-    def _unlinked_tickets(self, repo: str,
-                          linked: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
+                          found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
         """The repo's open tickets at loom:queued or loom:briefed that a
         briefing login filed, by number. The open-tickets list is the verify
         runs' own read, so a pass that reads both pays for it once; with no
         such ticket and no loom:pr ticket, no closed pull request is read."""
-        found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         out: Dict[int, Dict[str, Any]] = {}
         for issue in found:
             if (isinstance(issue, dict) and "pull_request" not in issue
@@ -2780,6 +3119,19 @@ class Station:
                 issue.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
                 out[int(issue["number"])] = issue
         return out
+
+    def _deliver_trusted_author(self, repo: str, ticket: Dict[str, Any],
+                                    pr: Dict[str, Any]) -> bool:
+        """Whether the pull request author may deliver the ticket: a trusted
+        author of a trusted ticket, or the contributor who owns it and whose
+        ticket a trusted login filed."""
+        author = tickets._login(pr.get("user"))
+        authors = {name.lower() for name in self.s.authors}
+        if author in authors:
+            return self._check_trust(repo, ticket)[0]
+        owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+        return bool(author and author in owners
+                    and tickets._login(ticket.get("user")) in authors)
 
     def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
                           unlinked: Dict[int, Dict[str, Any]]) -> None:
@@ -2794,16 +3146,8 @@ class Station:
         head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
         if head_repo != repo:
             return
-        author = tickets._login(pr.get("user"))
-        authors = {name.lower() for name in self.s.authors}
-        if author in authors:
-            if not self._check_trust(repo, ticket)[0]:
-                return
-        else:
-            owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
-            if (not author or author not in owners
-                    or tickets._login(ticket.get("user")) not in authors):
-                return
+        if not self._deliver_trusted_author(repo, ticket, pr):
+            return
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
             return
@@ -2855,7 +3199,7 @@ class Station:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         ticket["labels"] = [{"name": n} for n in kept]
         found[number] = ticket
-        self._comment(repo, number, "Linked pull request #%d is open." % int(pr["number"]))
+        _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
 
     def reconcile_pull_requests(self) -> None:
         """Repair ticket state from the PR's authoritative terminal state.
@@ -3217,6 +3561,10 @@ class Station:
         if not merged:
             return
         latest = self._merged_pulls(repo, merged)
+        for number in sorted(merged - set(latest))[:SHIP_PER_PASS]:
+            pr = self._ticket_pull_beyond_window(repo, number)
+            if pr is not None:
+                latest[number] = pr
         groups = self._ticket_pulls(repo, set(latest))
         hands = self._hand_reverts(repo, self._closed_pulls(repo))
         carried = sorted((str(pr["merged_at"]), number, pr)
@@ -3229,6 +3577,77 @@ class Station:
                            "the station deployed revision %s at %s" % (
                                revision[:12], self._utc(at)),
                            "deployed %s" % revision[:12])
+
+    def _ticket_pull_beyond_window(self, repo: str, number: int) -> Optional[Dict[str, Any]]:
+        """The merged pull request of a merged ticket that _merged_pulls did
+        not find: the one a station-filed adoption ticket names
+        (_adopted_pull_number), else one merged pull request that
+        cross-references the ticket (_xref_pull_numbers) whose Refs line or
+        loom branch names it. Neither path was read, so five adoption tickets
+        and three tickets merged a day before never shipped while the station
+        deployed their merges (2026-10-19). A ticket with no match is not
+        looked up again for SHIP_LOOKUP_RETRY. None when there is none."""
+        key = "%s#%d" % (repo, number)
+        if self._lookup_recent(key):
+            return None
+        found: List[Dict[str, Any]] = []
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+            adopted = self._adopted_pull_number(issue if isinstance(issue, dict) else {})
+            numbers = [adopted] if adopted else self._xref_pull_numbers(repo, number)
+            for pr_number in numbers:
+                pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data
+                if (isinstance(pr, dict) and pr.get("merged_at")
+                        and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))
+                        and (adopted or self._pr_ticket_number(repo, pr) == number)):
+                    found.append(pr)
+        except RateLimited:
+            raise
+        except (GitHubError, ValueError, TypeError) as err:
+            _say("could not find the merged pull request of %s: %s" % (key, err))
+        if not found:
+            self._lookup_failed(key)
+            return None
+        return max(found, key=lambda pr: str(pr["merged_at"]))
+
+    def _adopted_pull_number(self, issue: Dict[str, Any]) -> Optional[int]:
+        """The pull request an adoption ticket names, when a trusted login
+        filed it and its title and body (adoption_body) name the same #N: a
+        title alone can be edited by anyone who can triage (security review)."""
+        title = re.match(r"Land or supersede #([0-9]+)\b", str(issue.get("title") or ""))
+        if (title is None
+                or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                or "Pull request #%s is open in this repo" % title.group(1)
+                not in str(issue.get("body") or "")):
+            return None
+        return int(title.group(1))
+
+    def _xref_pull_numbers(self, repo: str, number: int) -> List[int]:
+        """The newest SHIP_XREF_MAX merged pull requests of the repo that
+        cross-reference the ticket, from the first page of its timeline."""
+        events = self.gh.rest("GET", "/repos/%s/issues/%d/timeline?per_page=100"
+                              % (repo, number)).data
+        numbers = []
+        for event in events if isinstance(events, list) else []:
+            ref = ((event or {}).get("source") or {}).get("issue") or {}
+            if (event.get("event") == "cross-referenced"
+                    and (ref.get("pull_request") or {}).get("merged_at")
+                    and str((ref.get("repository") or {}).get("full_name") or "") == repo):
+                numbers.append(int(ref["number"]))
+        return numbers[-SHIP_XREF_MAX:]
+
+    def _lookup_recent(self, key: str) -> bool:
+        tried = _read_json(os.path.join(self.state, SHIP_LOOKUPS_FILE), {}, strict=False)
+        last = tried.get(key) if isinstance(tried, dict) else None
+        return isinstance(last, (int, float)) and 0 <= self.now - last < SHIP_LOOKUP_RETRY
+
+    def _lookup_failed(self, key: str) -> None:
+        path = os.path.join(self.state, SHIP_LOOKUPS_FILE)
+        tried = _read_json(path, {}, strict=False)
+        tried = tried if isinstance(tried, dict) else {}
+        tried[key] = self.now
+        _write_json(path, {k: v for k, v in tried.items()
+                           if isinstance(v, (int, float)) and 0 <= self.now - v < SHIP_LOOKUP_RETRY})
 
     def _merged_tickets(self, repo: str) -> set:
         """The numbers of the repo's open merged tickets."""
@@ -3257,18 +3676,26 @@ class Station:
     # -- shipping on merge or on a deploy workflow --------------------------
     def ship_merged(self) -> None:
         """Move the open merged tickets of each LOOM_SHIP_ON_MERGE repo to
-        loom:shipped: nothing deploys those repos, so the merge is the ship."""
+        loom:shipped: nothing deploys those repos, so the merge is the ship.
+        A pull request a later merged pull request reverted is skipped, as
+        the pin step does."""
         for repo in [r for r in self.s.ship_on_merge if tickets.REPO_RE.fullmatch(r)]:
             try:
                 merged = self._merged_tickets(repo)
                 if not merged:
                     continue
-                latest = self._merged_pulls(repo, merged)
+                seen: List[Dict[str, Any]] = []
+                latest = self._merged_pulls(repo, merged, seen)
             except GitHubError as err:
                 _say("could not ship merged tickets of %s: %s" % (repo, err))
                 continue
+            branch = self._default_branch(repo)
             ordered = sorted((str(pr["merged_at"]), number, pr) for number, pr in latest.items())
             for _, number, pr in ordered[:SHIP_PER_PASS]:
+                if branch and self._reverted(repo, pr, seen, branch):
+                    _say("%s#%d stays merged: pull request #%d was reverted" % (
+                        repo, number, int(pr["number"])))
+                    continue
                 self._ship_one(repo, number, pr,
                                "%s ships on merge (LOOM_SHIP_ON_MERGE); pull request #%d "
                                "merged at %s" % (repo, int(pr["number"]),
@@ -3296,13 +3723,16 @@ class Station:
             return
         by_sha = {str(r["head_sha"]): r for r in runs}
         newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
-        latest = self._merged_pulls(repo, merged)
+        seen: List[Dict[str, Any]] = []
+        latest = self._merged_pulls(repo, merged, seen)
         shipped = 0
         for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
             if shipped >= SHIP_PER_PASS:
                 return
             run = self._covering_run(repo, pr, by_sha, newest)
-            if run is not None and self._ship_one(
+            if run is None or self._reverted(repo, pr, seen, str(run["head_sha"])):
+                continue
+            if self._ship_one(
                     repo, number, pr,
                     "workflow %s succeeded on %s revision %s (run %s)" % (
                         workflow, repo, str(run["head_sha"])[:12], run.get("id")),
@@ -3460,17 +3890,16 @@ class Station:
     def _reverted(self, repo: str, pr: Dict[str, Any], seen: List[Dict[str, Any]],
                   revision: str) -> bool:
         """A later merged pull request the revision carries reverts this one:
-        its body says "Reverts <repo>#<n>" or its title is 'Revert "<title>"',
-        the forms GitHub's revert button writes."""
-        number, title = int(pr["number"]), str(pr.get("title") or "")
-        body = re.compile(r"\bReverts\s+(?:%s)?#%d\b" % (re.escape(repo), number))
+        a hand-made revert of it (its body says "Reverts <repo>#<n>", its
+        title is 'Revert #<n>' or 'Revert "<title>"', or its body runs git
+        revert on the pull request's merge commit, full or short), the
+        forms GitHub's revert button and the revert pass write."""
         for other in seen:
             if other is pr or str(other.get("merged_at")) <= str(pr["merged_at"]):
                 continue
-            if body.search(str(other.get("body") or "")) or (
-                    title and str(other.get("title") or "") == 'Revert "%s"' % title):
-                if self._carries(repo, str(other["merge_commit_sha"]), revision):
-                    return True
+            if revert.undoes(other, pr) \
+                    and self._carries(repo, str(other["merge_commit_sha"]), revision):
+                return True
         return False
 
     def hand_back(self) -> None:
@@ -3504,10 +3933,15 @@ class Station:
             self._release_held(key, info, closed_incidents)
 
     def _closed_incidents(self) -> Dict[str, Dict[str, Any]]:
-        """Closed factory incidents the runner filed, by "owner/repo#n"."""
+        """Closed factory incidents the runner filed, by "owner/repo#n".
+
+        Incidents are found by the body marker, not the loom:factory label:
+        the label may not exist in a repo (loom#918), so filtering on it
+        loses every unlabelled incident. Closed issues are listed without the
+        label and then matched on the marker."""
         closed: Dict[str, Dict[str, Any]] = {}
         for incident in self._paginate(
-                "/repos/%s/issues?state=closed&labels=%s&per_page=100" % (FACTORY_REPO, FACTORY_LABEL)):
+                "/repos/%s/issues?state=closed&per_page=100" % FACTORY_REPO):
             if isinstance(incident, dict) and INCIDENT_MARKER in str(incident.get("body") or ""):
                 closed["%s#%d" % (FACTORY_REPO, incident.get("number"))] = incident
         return closed
@@ -3544,7 +3978,9 @@ class Station:
             # (loom#572); a runaway label kept here held tickets for hours.
             kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-        self._comment(repo, number,
+        # A status event, not a comment: closing five incidents released 16
+        # tickets and sent 16 emails at once (2026-10-19).
+        self._routine(repo, number,
                       "Factory incident %s is closed: the ticket is back in the queue "
                       "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                           if cleared else ""))
@@ -3821,7 +4257,8 @@ class Station:
             match = HELD_FOR_RE.search(bare)
             self._note_held(repo, number,
                             "%s#%s" % (match.group(1), match.group(2)) if match else None)
-            self._comment(repo, number,
+            self._set_wait(repo, self._issue(repo, number), "incident")
+            self._routine(repo, number,
                           "Lane %s held: %s. The ticket keeps its rung and returns to the "
                           "queue when the factory incident closes." % (lane, bare))
             _say("held %s#%d for the factory: %s" % (repo, number, reason))
@@ -3841,7 +4278,7 @@ class Station:
             # rounds in 77 minutes on 2026-10-14. A transient failure retries.
             state = "loom:failed" if klass == "work" else "loom:pr"
             self._relabel(repo, number, state)
-            self._comment(repo, number, "Lane %s failed: %s. This was a fix round on pull "
+            self._routine(repo, number, "Lane %s failed: %s. This was a fix round on pull "
                           "request #%s; the ticket is back at %s and the pull request "
                           "is unchanged." % (lane, reason, fix_pr, state))
             _say("reported %s#%d fix failed, back to %s: %s" % (repo, number, state, reason))
@@ -3860,9 +4297,17 @@ class Station:
                 return True
             note = ". Not retried: %s." % note
         self._relabel(repo, number, "loom:failed")
-        self._comment(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
+        self._routine(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _routine(self, repo: str, number: int, text: str) -> None:
+        """A lane failure or factory hold the factory acts on by itself, as an
+        event in the ticket's status comment: an edit sends no email. Each one
+        was a new comment, an email apiece (an infra ticket, 2026-10-19). The
+        GitHub client expands status events, so the attempt table still reads
+        "Lane X failed:" lines (factory.attempts)."""
+        status.add(self.gh, repo, number, text, self.now, self.s.authors)
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
         """Hold a ticket after the same consecutive failure or three attempts in
@@ -3917,9 +4362,10 @@ class Station:
                 return "no other eligible lane is available"
             # The comment comes first: it is the count of retries, and it tells
             # a pass that finds the relabel undone where the ticket was going.
-            self._comment(repo, number, "Automatic retry %d of %d (%s): moved from lane %s "
-                          "to lane %s. Lane %s failed: %s"
-                          % (used + 1, self.s.retry_max, klass, lane, target, lane, reason))
+            status.add(self.gh, repo, number, "Automatic retry %d of %d (%s): moved from lane %s "
+                       "to lane %s. Lane %s failed: %s"
+                       % (used + 1, self.s.retry_max, klass, lane, target, lane, reason),
+                       self.now, self.s.authors)
         labels = [n for n in names if n != RUNNING and not n.startswith("lane:")]
         labels += [BRIEFED, "lane:" + target]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
@@ -3996,9 +4442,10 @@ class Station:
         ticket goes back to briefed, where the factory moves it to the next
         lane; a fix brief's goes back to loom:pr, where the factory sends its
         pull request back again."""
-        self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
-        self._comment(repo, number, "Lane %s is unavailable (%s). This is not a failure: "
-                      "the ticket goes to the next lane." % (lane, reason))
+        self._relabel(repo, number, "loom:pr" if fix else BRIEFED,
+                      wait="" if fix else "model-limit")
+        # No comment: a limit is not news, and one comment a bounce emailed
+        # the operator dozens of times an hour (2026-10-18).
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
 
     def _unauthenticated(self, repo: str, number: int, fix: bool, lane: str,
@@ -4009,8 +4456,7 @@ class Station:
         ticket goes back to briefed, where the factory moves it to a lane whose
         key works; a fix brief's goes back to loom:pr."""
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
-        self._comment(repo, number, "Lane %s could not authenticate (%s). This is not a "
-                      "failure: the ticket goes to a lane with a working key." % (lane, reason))
+        # No comment: the runner already opened the operator one ask for the key.
         _say("reported %s#%d unauthenticated on lane %s: %s" % (repo, number, lane, reason))
 
     def _branch_moved(self, repo: str, number: int, pr: int, lane: str, reason: str) -> None:
@@ -4019,9 +4465,7 @@ class Station:
         of the ladder is spent: the ticket returns to loom:pr, where the
         factory judges the new head and sends it back if it still needs a fix."""
         self._relabel(repo, number, "loom:pr")
-        self._comment(repo, number, "Lane %s did not push its fix to #%d: the branch moved "
-                      "during the run (%s). This is not a failure: the new head goes back "
-                      "to review." % (lane, pr, reason))
+        # No comment: nothing failed, and the new head's review says the rest.
         _say("reported %s#%d: branch moved on lane %s: %s" % (repo, number, lane, reason))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
@@ -4074,8 +4518,8 @@ class Station:
         pr = next((n for n in sorted(prs) if _open_on(node, repo, n)), None)
         if not said or pr is None:
             return
-        body = "Lane %s answered this finding instead of changing the code:\n\n%s" % (
-            lane, "\n".join("> " + line for line in said.splitlines()))
+        body = "Lane %s %s\n\n%s" % (
+            lane, factory.ANSWER_REPLY, "\n".join("> " + line for line in said.splitlines()))
         try:
             _text.check(body)
         except ValueError as err:
@@ -4116,7 +4560,7 @@ class Station:
             body = ("Lane %s made no change for this fix; its explanation did not "
                     "pass the text checks and is in the lane log." % lane)
         self._comment(repo, pr, body)
-        self._comment(repo, pr, os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN)
+        self._comment(repo, pr, factory.review_again())
         self._relabel(repo, number, "loom:pr")
         self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
                       "on the pull request; the review bot was asked to review it again."
@@ -4152,15 +4596,31 @@ class Station:
             pass
         return scrub(reason) or "no reason was recorded"
 
-    def _relabel(self, repo: str, number: int, new: str) -> None:
+    def _relabel(self, repo: str, number: int, new: str, wait: str = "") -> None:
+        """Move a running ticket to `new`, with wait:<wait> as its only wait
+        label when given, in one labels write."""
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = [n for n in names if n != RUNNING]
+        labels = [n for n in names if n != RUNNING and not n.startswith(WAIT)]
         if new not in labels:
             labels.append(new)
+        if wait:
+            labels.append(WAIT + wait)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
+
+    def _set_wait(self, repo: str, issue: Dict[str, Any], reason: str) -> None:
+        """Make wait:<reason> the ticket's only wait label, from the labels
+        already read; no write when it already is (loom labels, not comments:
+        a comment emails the operator, a label does not)."""
+        names = _label_names(issue)
+        want = [n for n in names if not n.startswith(WAIT)] + [WAIT + reason]
+        if set(want) == set(names):
+            return
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                     {"labels": want})
+        issue["labels"] = [{"name": n} for n in want]
 
     def _comment(self, repo: str, number: int, body: str) -> None:
         self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
@@ -4245,15 +4705,30 @@ class Station:
         cached = saved.get(lane) if isinstance(saved, dict) else None
         return int(cached.get("claims", 0)) if isinstance(cached, dict) else 0
 
-    def _read_remote_claim_count(self, lane: str) -> int:
+    def _read_remote_claim_count(self, lane: str) -> Tuple[int, int]:
+        """(claimed tickets, repos read) across the station's repo list.
+
+        A repo GitHub reports as unreadable (moved, gone, or not granted to
+        the token) is skipped with one log line, so one unreadable repo no
+        longer stops the whole pass. Any other GitHub failure still raises.
+        """
         count = 0
+        readable = 0
         for repo in self.s.repos:
-            found = self.gh.rest("GET", "/repos/%s/issues?state=open&labels=loom:running,lane:%s"
-                                 % (repo, lane)).data
+            try:
+                found = self.gh.rest("GET", "/repos/%s/issues?state=open&labels=loom:running,lane:%s"
+                                     % (repo, lane)).data
+            except GitHubError as err:
+                why = unreadable(err)
+                if why is None:
+                    raise
+                _say("remote claims: skipped %s: %s" % (repo, why))
+                continue
+            readable += 1
             if isinstance(found, list):
                 count += sum(1 for item in found if isinstance(item, dict)
                              and "pull_request" not in item)
-        return count
+        return count, readable
 
     def _upsert_lanes_comment(self, repo: str, number: int, body: str) -> Optional[int]:
         for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
@@ -5131,8 +5606,7 @@ class Station:
                         "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
                     if len(queued if isinstance(queued, list) else []) >= 3:
                         continue
-                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT,
-                                         comment_limit=5)
+                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
                     counts = (sum(" queued under #" in line for line in lines),
                               sum(" loom:triage" in line for line in lines),
                               sum(" held:" in line for line in lines))
@@ -5231,23 +5705,240 @@ class Station:
         if not isinstance(state, dict):
             state = {}
         goals = self._rewrite_goals()
-        for stale in [k for k in state if k not in {g[0] for g in goals}]:
+        recent = [t for t in state.get(REWRITE_STATION_KEY) or []
+                  if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
+        for stale in [k for k in state
+                      if k not in (REWRITE_STATION_KEY, "_live_tried")
+                      and k not in {g[0] for g in goals}]:
             del state[stale]
-        budget = REWRITE_PER_PASS
+        state[REWRITE_STATION_KEY] = recent
+        budget = min(REWRITE_PER_PASS, REWRITE_STATION_PER_HOUR - len(recent))
+        if budget <= 0:
+            return
         cmds: Dict[str, str] = {}
         for key, repo, goal in goals:
             rec = state.get(key)
             if not isinstance(rec, dict):
                 rec = state[key] = {}
+            used = 0
             try:
-                budget -= self._rewrite_goal(key, repo, goal, rec, budget, cmds)
+                used = self._rewrite_goal(key, repo, goal, rec, budget, cmds)
             except RateLimited:
                 raise
             except (GitHubError, OSError) as err:
                 _say("rewrite %s failed: %s" % (key, err))
+            budget -= used
+            recent.extend([self.now] * used)
             _write_json(path, state)
             if budget <= 0 or self._deferred():
                 break
+
+    def close_done_tickets(self) -> None:
+        """Close each done ticket, by the operator's rule (2026-10-19): a
+        shipped one whose Live line names no string a log search can find (its
+        pull request merged on green checks and the review bot to get there).
+        A Live line that names one keeps the ticket open for a verify run, and
+        a verified ticket closes through brain.close on the verify path, which
+        checks its criteria. Done tickets never closed: 199 sat shipped and
+        the backlog grew all week though the work was finished."""
+        if self._deferred():
+            return
+        left = CLOSE_DONE_PER_PASS
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                if left <= 0:
+                    return
+                why = self._done_reason(issue)
+                if not why:
+                    continue
+                number = int(issue["number"])
+                try:
+                    self._routine(repo, number, "Closed: %s. Not verified live; its criteria "
+                                  "were not ticked one by one." % why)
+                    # force-close is the close-completeness guard's escape hatch:
+                    # this close is by rule, not a claim that each box was seen to
+                    # hold. Without it the guard reopened 46 of 175 such closes,
+                    # each with an email (2026-10-19).
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                                 {"labels": [CLOSE_DONE_LABEL]})
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                                 {"state": "closed", "state_reason": "completed"})
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not close done %s#%d: %s" % (repo, number, err))
+                    continue
+                left -= 1
+                _say("closed done %s#%d: %s" % (repo, number, why))
+
+    def settle_orphan_sources(self) -> None:
+        """Settle each open loom:rewritten issue whose ticket is closed. A
+        source was settled only when its ticket was verified or closed
+        through brain.close, so a ticket the done close or a person closed
+        left its source open: 87 such sources counted as open backlog on
+        2026-10-20. A ticket closed as completed closes its source; one
+        closed as not planned leaves it open with a comment."""
+        path = os.path.join(self.state, SOURCES_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < SETTLE_EVERY:
+            return
+        pairs = state.get("pairs") if isinstance(state.get("pairs"), dict) else {}
+        left = SETTLE_PER_RUN
+        # The run is stamped however it ends: at the cap, deferred, or past a
+        # repo GitHub refused. Stamped only on a full run, it ran every pass,
+        # so the cap held per pass and 91 sources settled in minutes, and a
+        # repo the App could not read stopped every run (2026-10-20).
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    left -= self._settle_repo_sources(repo, pairs, left)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not settle the sources of %s: %s" % (repo, err))
+        finally:
+            state["_at"] = self.now
+            state["pairs"] = pairs
+            _write_json(path, state)
+
+    def _settle_repo_sources(self, repo: str, pairs: Dict[str, Any], left: int) -> int:
+        """Settle up to `left` of the repo's orphaned sources; how many were."""
+        sources = [i for i in self._paginate(
+            "/repos/%s/issues?labels=loom:rewritten&state=open" % repo)
+            if isinstance(i, dict) and "pull_request" not in i]
+        if not sources:
+            return 0
+        listed = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        still_open = {int(i["number"]) for i in listed if isinstance(i, dict)}
+        done = 0
+        for source in sources:
+            if done >= left:
+                break
+            key = "%s#%d" % (repo, int(source["number"]))
+            if key not in pairs:
+                pairs[key] = self._rewritten_as(repo, int(source["number"]))
+            ticket = pairs[key]
+            if isinstance(ticket, int) and ticket and ticket not in still_open:
+                done += self._settle_source_of(repo, key, ticket, pairs)
+        return done
+
+    def _settle_source_of(self, repo: str, key: str, ticket: int,
+                          pairs: Dict[str, Any]) -> int:
+        """Settle the source of a ticket not listed open: 1 when something
+        was said or done, else 0. A source with nothing left to do is
+        recorded as 0 in `pairs` and not read again."""
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket)).data or {}
+        if issue.get("state") != "closed":
+            return 0
+        labels = set(_label_names(issue))
+        completed = issue.get("state_reason") == "completed"
+        # Closed as completed settles the source only when the ticket's work
+        # landed, the close rule's bar; any other completed close is left for
+        # a person.
+        if ("loom:ticket" not in labels
+                or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                or (completed and not labels & set(SETTLE_LANDED))):
+            pairs[key] = 0
+            return 0
+        said = brain.settle_source(self.gh, repo, ticket, issue.get("body"),
+                                   "completed" if completed else "not_planned",
+                                   unproven=completed)
+        if said is None or not completed:
+            pairs[key] = 0  # nothing more to do for this source
+        if said is None:
+            return 0
+        _say("settled the source of %s#%d: %s" % (repo, ticket, said))
+        return 1
+
+    def _rewritten_as(self, repo: str, number: int) -> int:
+        """The ticket the newest rewrite comment by a briefing login names, 0
+        for none: anyone may comment on a public issue."""
+        authors = {author.lower() for author in self.s.authors}
+        found = 0
+        for comment in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
+            if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
+                continue
+            body = str(comment.get("body") or "")
+            match = REWRITTEN_AS_RE.search(body)
+            if brain.TRIAGE_MARKER in body and match:
+                found = int(match.group(1))
+        return found
+
+    @staticmethod
+    def _done_reason(issue: Dict[str, Any]) -> str:
+        """Why the ticket is done and may close, or "" to leave it open."""
+        labels = set(_label_names(issue))
+        if issue.get("state") != "open" or labels & set(CLOSE_DONE_HOLDS):
+            return ""
+        if "loom:shipped" in labels and "loom:verified" not in labels and not live_needles(issue.get("body")):
+            return ("shipped after merging on green checks, and its Live line names "
+                    "nothing a log search can find")
+        return ""
+
+    def restate_shipped_live(self) -> None:
+        """Restate shipped Live lines with no searchable exact string, using
+        the rewrite command and its own hourly allowance (RESTATE_PER_HOUR)."""
+        if not (self.s.rewrite_cmd or self.s.rewrite_private_cmd):
+            return
+        path = os.path.join(self.state, "rewrite.json")
+        state = _read_json(path, {}, strict=False)
+        if not isinstance(state, dict):
+            state = {}
+        recent = [t for t in state.get(RESTATE_KEY) or []
+                  if isinstance(t, (int, float)) and 0 <= self.now - t < 3600]
+        state[RESTATE_KEY] = recent
+        budget = min(REWRITE_PER_PASS, RESTATE_PER_HOUR - len(recent))
+        if budget <= 0:
+            return
+        tried = state.get("_live_tried")
+        if not isinstance(tried, dict):
+            tried = state["_live_tried"] = {}
+        cmds: Dict[str, str] = {}
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                if budget <= 0 or self._deferred():
+                    break
+                labels = _label_names(issue)
+                live = brain.live_criterion(issue.get("body"), limit=None)
+                if ("loom:shipped" not in labels
+                        or live == "(no Live criterion on the ticket)"
+                        or live_needles(issue.get("body"))):
+                    continue
+                key = "%s#%s" % (repo, issue["number"])
+                last = tried.get(key)
+                if isinstance(last, (int, float)) and 0 <= self.now - last < REWRITE_RETRY:
+                    continue
+                cmd = self._rewrite_command(repo, cmds)
+                if not cmd:
+                    continue
+                tried[key] = self.now
+                recent.append(self.now)
+                budget -= 1
+                prompt = ("Rewrite the shipped ticket's Live criterion. Return one JSON object "
+                          'with "action":"restate" and a "line" string: one complete Live: '
+                          "line naming an exact string the merged pull request makes the live "
+                          "system print or serve. "
+                          "Do not include markdown or explanation.\n\nTitle: %s\nBody:\n%s" %
+                          (issue.get("title", ""), issue.get("body", "")))
+                try:
+                    answer = rewrite.parse_answer(rewrite.run_agent(cmd, prompt, REWRITE_TIMEOUT))
+                    line = answer.get("line")
+                    if not isinstance(line, str):
+                        raise rewrite.Invalid("the answer has no Live line")
+                    brain.restate_live(self.gh, repo, int(issue["number"]), line,
+                                       env={"LOOM_BRIEF_AUTHORS": ",".join(self.s.authors),
+                                            "LOOM_BRIEFERS": ",".join(self.s.briefers)})
+                except RateLimited:
+                    raise
+                except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
+                    _say("could not restate the Live criterion of %s: %s" % (key, err))
+                    continue
+                _say("restated the Live criterion of %s" % key)
+            _write_json(path, state)
 
     # -- health findings -------------------------------------------------
     def health_intake(self) -> None:
@@ -5447,6 +6138,7 @@ class Station:
         facts = invariants.Facts(now=self.now)
         for name, read in (("events", self._read_events),
                            ("runs", self._invariant_runs),
+                           ("silent_runs", self._invariant_silent),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
             try:
@@ -5523,8 +6215,10 @@ class Station:
         journals, posts = [], []
         for repo, goal in homes:
             ref = self._invariant_ref(repo, int(goal["number"]))
-            for c in self._paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
-                                      % (repo, int(goal["number"]), stamp)):
+            # A journal edited in place counts once per tick, at its Tick time.
+            for c in handoff.expand_journals(
+                    self._paginate("/repos/%s/issues/%d/comments?since=%s&per_page=100"
+                                   % (repo, int(goal["number"]), stamp)), at_key="created_at"):
                 if not isinstance(c, dict) or tickets._login(c.get("user")).lower() not in authors:
                     continue
                 at = self._epoch(str(c.get("created_at") or ""))
@@ -5952,8 +6646,16 @@ class Station:
                 and 0 <= self.now - checked < REPORT_CHECK:
             return
         state["_checked"] = self.now
-        for repo, goal in self._goal_homes():
-            self._post_overdue_goal_standup(repo, goal, state, authors, now)
+        # One goal's failure must not skip the later goals' standups, nor drop
+        # the stamps of the goals already posted this pass (loom#201), and one
+        # unreadable repo must not skip the other repos' goals (loom#1071).
+        for repo, goal in self._readable_goal_homes():
+            try:
+                self._post_overdue_goal_standup(repo, goal, state, authors, now)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("standup %s#%s failed: %s" % (repo, goal.get("number"), err))
         _write_json(state_path, state)
 
     def _post_overdue_goal_standup(self, repo: str, goal: Dict[str, Any],
@@ -5988,29 +6690,36 @@ class Station:
         brain._check_written_text(body)
         quiet = hold is None and body == self._overdue_standup_body(
             [], None, None if breaches is None else [])
-        previous = self._last_quiet_report(comments, authors, body) if quiet else None
+        previous = self._last_same_report(comments, authors, body)
         if previous is not None:
-            # Every new comment emails the goal's author; a quiet goal edits
-            # its last quiet report instead, which notifies no one.
+            # Every new comment emails the goal's author; a report that says
+            # what an earlier one said edits that one instead, which notifies
+            # no one, even when a brain's report came in between.
+            stamp = QUIET_STAMP if quiet else SAME_STAMP
             self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, previous),
-                         {"body": body + "\n" + QUIET_STAMP % now.strftime("%Y-%m-%dT%H:%MZ")})
+                         {"body": body + "\n" + stamp % now.strftime("%Y-%m-%dT%H:%MZ")})
         else:
             self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                          {"body": body})
         state[key] = self.now
 
     @staticmethod
-    def _last_quiet_report(comments: List[Any], authors: List[str], quiet: str) -> Optional[int]:
-        """The id of the goal's latest report by `authors` when it is this same
-        quiet report (its stamp line aside), else None."""
-        reports = [c for c in comments if isinstance(c, dict)
-                   and tickets._login(c.get("user")).lower() in authors
-                   and str(c.get("body") or "").startswith(REPORT_MARKER)]
-        if not reports or not isinstance(reports[-1].get("id"), int):
-            return None
-        lines = str(reports[-1].get("body") or "").splitlines()
-        kept = [line for line in lines if not line.startswith(QUIET_STAMP.split("%")[0])]
-        return reports[-1]["id"] if "\n".join(kept) == quiet else None
+    def _last_same_report(comments: List[Any], authors: List[str], body: str) -> Optional[int]:
+        """The id of the goal's latest report by `authors` that says `body`
+        (its stamp line aside), else None. Reports in between do not matter:
+        the brain's reports on the same goal never match the station's."""
+        stamps = tuple(stamp.split("%")[0] for stamp in (QUIET_STAMP, SAME_STAMP))
+        for comment in reversed(comments):
+            if not isinstance(comment, dict) or not isinstance(comment.get("id"), int) \
+                    or tickets._login(comment.get("user")).lower() not in authors:
+                continue
+            text = str(comment.get("body") or "")
+            if not text.startswith(REPORT_MARKER):
+                continue
+            kept = [line for line in text.splitlines() if not line.startswith(stamps)]
+            if "\n".join(kept) == body:
+                return comment["id"]
+        return None
 
     def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
         """The open loom:invariant issues filed on the goal home."""
@@ -6168,8 +6877,10 @@ class Station:
                 if not isinstance(goal, dict) or "number" not in goal:
                     continue
                 number = int(goal["number"])
-                for c in self._paginate(
-                        "/repos/%s/issues/%d/comments?since=%s" % (repo, number, since)):
+                # A journal edited in place is newest at its newest Tick.
+                for c in handoff.expand_journals(self._paginate(
+                        "/repos/%s/issues/%d/comments?since=%s" % (repo, number, since)),
+                        at_key="created_at"):
                     login = (c.get("user") or {}).get("login")
                     body = str(c.get("body") or "").lstrip()
                     at = self._epoch(c.get("created_at", ""))
@@ -6309,6 +7020,29 @@ class Station:
                            if tickets.REPO_RE.fullmatch(repo)
                            for issue in self._goal_issues(repo)]
         return self._goals
+
+    def _readable_goal_homes(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """(repo, issue) for every open loom:goal issue in the LOOM_REPOS
+        repos that can be read. A repo whose goal list fails is skipped with
+        one log line (loom#1071); only a complete list is kept for
+        _goal_homes, which must never route a note from a partial one."""
+        if self._goals is not None:
+            return self._goals
+        homes: List[Tuple[str, Dict[str, Any]]] = []
+        complete = True
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                homes += [(repo, issue) for issue in self._goal_issues(repo)]
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("standup: skipped %s: %s" % (repo, err))
+                complete = False
+        if complete:
+            self._goals = homes
+        return homes
 
     def _goal_for(self, text: str) -> Optional[Tuple[str, int, str, bool]]:
         """(repo, number, link, named) of the goal the message names: an
@@ -6474,7 +7208,60 @@ class Station:
         factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
         if not self.s.factory_on or not factory.due(self.state, self.now):
             return
-        self._factory().run()
+        runner = self._factory()
+        runner.run()
+        self._record_silent(runner.silent_running, runner.silent)
+
+    def _silent_lanes(self) -> Dict[str, float]:
+        """Local lane -> seconds since its last heartbeat, for each lane
+        without a live one (_heartbeat_ok false) that has ever reported and
+        whose runner does not hold its lock with a live pid. A lane deep in a
+        long run writes no heartbeat until the run ends: counted silent, two
+        spark runs had their tickets re-queued and lane labels removed while
+        they ran, and their finished pull requests were left with no lane
+        (2026-10-19)."""
+        out = {}
+        for lane in LANES:
+            if lane in REMOTE_LANES or self._heartbeat_ok(lane) or self._runner_alive(lane):
+                continue
+            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                              None, strict=False)
+            at = beat.get("at") if isinstance(beat, dict) else None
+            if self._num(at):
+                out[lane] = max(0.0, self.now - at)
+        return out
+
+    def _record_silent(self, found: Dict[str, List[Tuple[str, int]]],
+                       silent: Dict[str, float]) -> None:
+        """Keep the lanes the factory found holding a running ticket while
+        silent for the invariant check (invariants.SILENT_KEEP), which may
+        come passes after the move."""
+        if not found:
+            return
+        path = os.path.join(self.state, "silent-lanes.json")
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        for lane, held in found.items():
+            saved[lane] = {"at": self.now, "silent_for": silent[lane],
+                           "tickets": ["%s#%d" % item for item in held]}
+        _write_json(path, saved)
+
+    def _invariant_silent(self) -> List[invariants.SilentRun]:
+        """The lanes _record_silent kept, their tickets named for a public
+        issue."""
+        saved = _read_json(os.path.join(self.state, "silent-lanes.json"), {}, strict=False)
+        out = []
+        for lane, info in sorted(saved.items() if isinstance(saved, dict) else []):
+            if not (isinstance(info, dict) and self._num(info.get("at"))
+                    and self._num(info.get("silent_for"))):
+                continue
+            refs = []
+            for key in info.get("tickets") or []:
+                match = re.fullmatch(r"(.+)#([0-9]+)", str(key))
+                if match:
+                    refs.append(self._invariant_ref(match.group(1), int(match.group(2))))
+            out.append(invariants.SilentRun(lane, info["silent_for"], tuple(refs), info["at"]))
+        return out
 
     def assign_queued(self) -> None:
         """Give ready queued tickets a free lane after this pass's claims."""
@@ -6491,7 +7278,9 @@ class Station:
                                model_limits=self.model_limits(),
                                no_test_repos=self.s.no_test_repos,
                                available=[x for x in LANES if self._heartbeat_ok(x)],
-                               held=list(self._held_tickets()) + self._gate_held())
+                               held=list(self._held_tickets()) + self._gate_held(),
+                               silent=self._silent_lanes(),
+                               down=self.down_lanes())
 
     def watch_default_branches(self) -> None:
         """Fix forward after a red lane merge, then revert if it stays red.
@@ -6834,6 +7623,115 @@ class Station:
         if removed:
             _say("removed %d finished lane tree(s)" % removed)
 
+    def tend_disk(self) -> None:
+        """Keep the loom home bounded and say how big it is (loom#643). Every
+        pass warns when its disk has less than disk_free_min_gb free. Every
+        DISK_EVERY seconds the lane logs past retention go (prune_logs) and
+        the home's size is logged, by top-level folder."""
+        try:
+            free: Optional[int] = shutil.disk_usage(self.s.home).free
+        except OSError as err:
+            _say("cannot read the free space on the loom home's disk: %s" % err)
+            free = None
+        if free is not None and free < self.s.disk_free_min_gb * GB:
+            # Worded so the log watcher (bus/watch.py KEEP_RE) does not count
+            # it: the line repeats every pass until space is freed.
+            _say("warning: only %s free on the loom home's disk (under %s); "
+                 "lanes keep writing" % (_gb(free), _gb(self.s.disk_free_min_gb * GB)))
+        path = os.path.join(self.state, "disk.json")
+        saved = _read_json(path, {}, strict=False)
+        last = saved.get("at") if isinstance(saved, dict) else None
+        if self._num(last) and 0 <= self.now - last < DISK_EVERY:
+            return
+        self.prune_logs()
+        sizes: Dict[str, int] = {}
+        try:
+            names = os.listdir(self.s.home)
+        except OSError as err:
+            _say("cannot list the loom home to measure it: %s" % err)
+            return
+        for name in names:
+            try:
+                key = name if stat.S_ISDIR(os.lstat(os.path.join(self.s.home, name)).st_mode) else "files"
+                sizes[key] = sizes.get(key, 0) + _tree_stat(os.path.join(self.s.home, name))[1]
+            except OSError:
+                continue
+        total = sum(sizes.values())
+        parts = ", ".join("%s %s" % (k, _gb(v)) for k, v in
+                          sorted(sizes.items(), key=lambda kv: (-kv[1], kv[0])))
+        _say("loom home holds %s (%s); %s free on its disk"
+             % (_gb(total), parts or "empty", "unknown" if free is None else _gb(free)))
+        _write_json(path, {"at": self.now, "bytes": total, "free": free, "folders": sizes})
+
+    def _logs_kept(self) -> Optional[Tuple[Set[str], Set[str]]]:
+        """(names, slot/name keys) whose lane logs stay however old: every
+        brief waiting or running in a lane inbox, and, while transcripts are
+        uploaded, every finished run the ledger does not hold as settled.
+        None when an inbox or the ledger cannot be read: remove nothing."""
+        live: Set[str] = set()
+        for lane in LANES:
+            try:
+                live |= {e[:-3] for e in os.listdir(self.inbox(lane)) if e.endswith(".md")}
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's inbox, so no lane log is removed: %s" % (lane, err))
+                return None
+        pending: Set[str] = set()
+        if self.s.transcript_url and self.s.transcript_token_ssm:
+            ledger = _read_json(os.path.join(self.state, "transcripts.json"), None, strict=False)
+            if not isinstance(ledger, dict):
+                return None
+            for lane, _, _, name in self._finished_briefs():
+                rec = ledger.get("%s/%s" % (lane, name))
+                if rec is None or (isinstance(rec, int) and not isinstance(rec, bool)):
+                    pending.add("%s/%s" % (lane, name))
+        return live, pending
+
+    def prune_logs(self) -> None:
+        """Remove each entry of a lane's log folder (logs/<slot>/: a run's
+        log, result and records, its archived transcripts) whose newest file
+        is older than log_keep_days, unless _logs_kept keeps its ticket. The
+        station's own logs in logs/ are not touched."""
+        if self.s.log_keep_days <= 0:
+            return
+        kept = self._logs_kept()
+        if kept is None:
+            return
+        live, pending = kept
+        cutoff = self.now - self.s.log_keep_days * 24 * 3600
+        removed = freed = 0
+        for slot in LANES:
+            folder = os.path.join(self.s.home, "logs", slot)
+            try:
+                if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                    continue
+                names = os.listdir(folder)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's logs to remove old ones: %s" % (slot, err))
+                continue
+            keep = live | {k.split("/", 1)[1] for k in pending if k.startswith(slot + "/")}
+            for name in names:
+                # A run's files are <ticket>, <ticket>.log, <ticket>.result...
+                if any(name == t or name.startswith(t + ".") for t in keep):
+                    continue
+                path = os.path.join(folder, name)
+                try:
+                    newest, size = _tree_stat(path)
+                    if newest >= cutoff:
+                        continue
+                    _remove(path)
+                except OSError as err:
+                    _say("cannot remove old lane log %s/%s: %s" % (slot, name, err))
+                    continue
+                removed += 1
+                freed += size
+        if removed:
+            _say("removed %d lane log(s) older than %d days (%s)"
+                 % (removed, self.s.log_keep_days, _gb(freed)))
+
     # -- the GitHub budget --------------------------------------------------
     def _budget_state(self) -> Dict[str, Any]:
         if self._budget is None:
@@ -6975,8 +7873,9 @@ class Station:
                      self.ship_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.close_done_tickets, self.settle_orphan_sources,
+                     self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
-                     self.post_metrics,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -6990,16 +7889,27 @@ class Station:
                 raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("%s failed: %s" % (step.__name__, err))
+        # The day's metrics line goes out even below the budget floor: one post
+        # a day, and on 2026-10-18 the floor deferred it every pass, so the
+        # operator got no numbers for the day. Only a spent budget stops it.
+        try:
+            self.post_metrics()
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("post_metrics failed: %s" % err)
         try:
             self.watch_logs()
         except RateLimited:
             raise
         except (GitHubError, OSError) as err:
             _say("watch_logs failed: %s" % err)
-        try:
-            self.prune_trees()
-        except OSError as err:
-            _say("prune_trees failed: %s" % err)
+        # Local housekeeping: finished lane trees, old lane logs, the disk.
+        for local in (self.prune_trees, self.tend_disk):
+            try:
+                local()
+            except OSError as err:
+                _say("%s failed: %s" % (local.__name__, err))
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)

@@ -233,5 +233,40 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(self.repo.writes(SOURCE), [])
 
 
+class UnprovenCloseTests(unittest.TestCase):
+    """A ticket closed as completed with no proof (the station's done close,
+    or a person's) closes its source by the same rule (2026-10-20)."""
+
+    setUp = SourceTests.setUp
+    given = SourceTests.given
+
+    def settle(self):
+        return brain.settle_source(self.gh, REPO, TICKET, ticket_body(), "completed",
+                                   unproven=True)
+
+    def test_the_source_closes_saying_the_ticket_was_closed_not_verified(self):
+        self.given()
+        self.assertIn("closed source issue #%d" % SOURCE, self.settle())
+        source = self.repo.issues[SOURCE]
+        self.assertEqual((source["state"], source.get("state_reason")), ("closed", "completed"))
+        comment = self.repo.said(SOURCE)[-1]
+        self.assertIn("was closed as completed", comment)
+        self.assertNotIn("verified", comment)
+        self.assertNotIn("force-close", self.repo.names(SOURCE))
+
+    def test_a_source_with_unchecked_criteria_closes_labelled_force_close(self):
+        self.given(source_body="## Acceptance criteria\n- [ ] The daily line shows it\n")
+        self.settle()
+        self.assertEqual(self.repo.issues[SOURCE]["state"], "closed")
+        self.assertIn("force-close", self.repo.names(SOURCE))
+
+    def test_a_source_loom_already_held_is_left_alone(self):
+        held = "%s\nTicket #%d ... stays open." % (brain._source_marker(TICKET, "held"), TICKET)
+        self.given(source_comments=[rewrite_comment(), {"body": held,
+                                                        "user": {"login": "station-bot"}}])
+        self.assertIsNone(self.settle())
+        self.assertEqual(self.repo.writes(SOURCE), [])
+
+
 if __name__ == "__main__":
     unittest.main()

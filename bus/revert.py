@@ -75,14 +75,16 @@ HAND_REVERT_WINDOW = 7 * 86400
 # moves the ticket back once for each revert pull request.
 HAND_REVERT_MARKER = "<!-- loom:hand-revert %d -->"
 REVERT_TITLE_RE = re.compile(r'^Revert "')
-GIT_REVERT_RE = re.compile(r"\bgit revert (?:--no-edit )?([0-9a-f]{40})\b")
+REVERT_NUM_TITLE_RE = re.compile(r"^Revert #(\d+)\b")
+GIT_REVERT_RE = re.compile(r"\bgit revert (?:--no-edit )?([0-9a-f]{7,40})\b")
 REVERTS_NUM_RE = re.compile(r"\bReverts\s+(?:[\w.-]+/[\w.-]+)?#(\d+)\b")
 
 
 def is_hand_revert(pr: Dict[str, Any], now: float, default_branch: str) -> bool:
     """A merged hand-made revert pull request: into the default branch
-    within HAND_REVERT_WINDOW, its title starting 'Revert "' or its body
-    running `git revert <sha>` (GitHub's revert button writes both)."""
+    within HAND_REVERT_WINDOW, its title starting 'Revert "' or 'Revert #N',
+    or its body running `git revert <sha>` (a full sha or a prefix of 7 or
+    more hex characters; GitHub's revert button writes both)."""
     if not isinstance(pr, dict) or not pr.get("merged_at"):
         return False
     if str((pr.get("base") or {}).get("ref") or "") != default_branch:
@@ -90,17 +92,22 @@ def is_hand_revert(pr: Dict[str, Any], now: float, default_branch: str) -> bool:
     if now - _ts(str(pr.get("merged_at") or "")) > HAND_REVERT_WINDOW:
         return False
     return bool(REVERT_TITLE_RE.match(str(pr.get("title") or ""))
+                or REVERT_NUM_TITLE_RE.match(str(pr.get("title") or ""))
                 or GIT_REVERT_RE.search(str(pr.get("body") or "")))
 
 
 def reverted_keys(pr: Dict[str, Any]) -> List[str]:
     """How a hand-made revert names what it undoes: the commit shas from
-    `git revert` in its body, the pull request numbers from 'Reverts
-    <repo>#<n>' lines, and the title from 'Revert "<title>"'."""
+    `git revert` in its body (a full sha or a prefix of 7 or more hex
+    characters), the pull request numbers from 'Reverts <repo>#<n>' lines
+    and from a 'Revert #<n>' title, and the title from 'Revert "<title>"'."""
     body = str(pr.get("body") or "")
     keys = ["sha:" + s for s in GIT_REVERT_RE.findall(body)]
     keys += ["pr:" + n for n in REVERTS_NUM_RE.findall(body)]
     title = str(pr.get("title") or "")
+    m = REVERT_NUM_TITLE_RE.match(title)
+    if m:
+        keys.append("pr:" + m.group(1))
     if REVERT_TITLE_RE.match(title):
         keys.append("title:" + " ".join(title[len('Revert "'):].rstrip('"').split()))
     return keys
@@ -109,10 +116,11 @@ def reverted_keys(pr: Dict[str, Any]) -> List[str]:
 def undoes(hand: Dict[str, Any], pr: Dict[str, Any]) -> bool:
     """The hand-made revert undoes the merged pull request: its body runs
     git revert on the request's merge (or squash) commit, names it in a
-    'Reverts <repo>#<n>' line, or its title is 'Revert "<the request's
-    title>"'."""
+    'Reverts <repo>#<n>' line or a 'Revert #<n>' title, or its title is
+    'Revert "<the request's title>"'."""
     keys = reverted_keys(hand)
-    if "sha:" + str(pr.get("merge_commit_sha") or "") in keys:
+    sha = str(pr.get("merge_commit_sha") or "")
+    if sha and any(sha.startswith(k[4:]) for k in keys if k.startswith("sha:")):
         return True
     if "pr:%d" % int(pr.get("number") or 0) in keys:
         return True

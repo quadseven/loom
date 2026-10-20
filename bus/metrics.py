@@ -8,6 +8,7 @@ import subprocess
 import sys
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
@@ -19,6 +20,11 @@ from .labels import LANES
 
 WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 WAIT_WINDOW = 7 * 86400
+# Ticket event lists read at once by waits_for_repos (bus.brain status and
+# the dashboard read with eight workers too).
+WAIT_READ_WORKERS = 8
+# Ticket states a lane can still move toward a merge.
+WORKABLE = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 # A ticket in a terminal state is done, not waiting: verified is the end of the
 # line and closed-unmerged was dropped. Neither is ever the bottleneck, and the
 # Brain ranking leaves them out too. Counting verified as a queue named it the
@@ -115,27 +121,41 @@ def entered_state(events: Sequence[Dict[str, Any]]) -> tuple[str, float] | None:
 
 
 def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float,
-                    entered: Dict[str, tuple[str, float]] | None = None) -> tuple[List[Dict[str, Any]], str | None]:
+                    entered: Dict[str, tuple[str, float]] | None = None,
+                    workers: int = WAIT_READ_WORKERS) -> tuple[List[Dict[str, Any]], str | None]:
     """Median and worst hours per state over the last week. With `entered`,
     also fills it with each read ticket's current state and the time it
     entered it ({"owner/name#N": (state, epoch seconds)}), from the same
     events: the Tickets page shows that as the age in state."""
-    tickets: List[tuple[str, Dict[str, float]]] = []
     since = datetime.fromtimestamp(now - WAIT_WINDOW, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for repo in repos:
+
+    def recent(repo: str) -> List[tuple[str, int]]:
         issues = gh.paginate("/repos/%s/issues?state=all&labels=loom%%3Aticket&since=%s&per_page=100" % (repo, since))
-        for issue in issues:
-            if not isinstance(issue, dict) or "pull_request" in issue:
-                continue
-            if stamp(issue.get("updated_at")) < now - WAIT_WINDOW:
-                continue
-            number = int(issue["number"])
-            events = gh.paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
-            tickets.append(("%s#%d" % (repo, number), ticket_waits(events, now)))
-            if entered is not None:
-                found = entered_state(events)
-                if found:
-                    entered["%s#%d" % (repo, number)] = found
+        return [(repo, int(issue["number"])) for issue in issues
+                if isinstance(issue, dict) and "pull_request" not in issue
+                and stamp(issue.get("updated_at")) >= now - WAIT_WINDOW]
+
+    def events(ref: tuple[str, int]) -> List[Any]:
+        return gh.paginate("/repos/%s/issues/%d/events?per_page=100" % ref)
+
+    # One event list per ticket: read one after another that was 699
+    # requests and 229 s of a cold dashboard's 320 s first snapshot
+    # (loom#433). The reads overlap; results keep repo and ticket order, and
+    # the first failure stops the reads not yet started and fails the read.
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        try:
+            refs = [ref for found in pool.map(recent, repos) for ref in found]
+            read = list(pool.map(events, refs))
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+    tickets: List[tuple[str, Dict[str, float]]] = []
+    for (repo, number), found in zip(refs, read, strict=True):
+        tickets.append(("%s#%d" % (repo, number), ticket_waits(found, now)))
+        if entered is not None:
+            state = entered_state(found)
+            if state:
+                entered["%s#%d" % (repo, number)] = state
     return summarize_waits(tickets)
 
 
@@ -256,6 +276,10 @@ class Totals:
     merged_by_repo: Dict[str, int] = field(default_factory=dict)
     report_ages: Dict[str, float] = field(default_factory=dict)
     goal_repos: set[str] = field(default_factory=set)
+    # Repos with an open ticket a lane can work (WORKABLE): a goal repo with
+    # none, such as a backlog goal whose every issue is done or a person's
+    # ask, has nothing to merge and is not held to a daily merge.
+    workable_repos: set[str] = field(default_factory=set)
 
 
 class Collector:
@@ -499,6 +523,9 @@ class Collector:
         if "pull_request" in issue:
             return
         labels = names(issue)
+        if (issue.get("state") == "open" and "loom:ticket" in labels
+                and any(state in labels for state in WORKABLE)):
+            total.workable_repos.add(repo)
         created = stamp(issue.get("created_at"))
         if created >= self.since and ("needs-operator" in labels or
                 self.label_time(repo, issue, "needs-operator")):
@@ -582,10 +609,13 @@ def flow_number(total: Totals) -> Number:
 
 
 def throughput_number(total: Totals) -> Number:
-    ok = (bool(total.goals) and all(total.merged_by_repo[r] for r in total.goal_repos)
+    owing = total.goal_repos & total.workable_repos
+    ok = (bool(total.goals) and all(total.merged_by_repo[r] for r in owing)
           and total.merged_tickets > 0 and total.verified * 2 >= total.merged_tickets)
     return Number("Throughput", "%s; verified %d/%d (lane %d, brain %d)" %
-                  (", ".join("%s %d" % pair for pair in total.merged_by_repo.items()),
+                  (", ".join("%s %d%s" % (repo, count, "" if repo in owing or count
+                                          else " (no work)")
+                             for repo, count in total.merged_by_repo.items()),
                    total.verified, total.merged_tickets, total.verified_lane,
                    total.verified_brain),
                   "each goal repo >=1 merge; >=50% verified", ok)
@@ -633,10 +663,14 @@ def autonomy_number(total: Totals) -> Number:
 
 
 def visibility_number(total: Totals) -> Number:
+    """Each goal home's newest report is no older than the report cadence
+    (brain.REPORT_EVERY: 6 hours since the operator chose it on 2026-10-18)."""
+    from .brain import REPORT_EVERY
     max_age = max(total.report_ages.values(), default=float("inf"))
     return Number("Visibility", "%s" % ", ".join("%s %.1fh" % (r, age / 3600)
                                                 for r, age in total.report_ages.items()),
-                  "each goal report <=2h", bool(total.goals) and max_age <= 7200)
+                  "each goal report <=%gh" % (REPORT_EVERY / 3600),
+                  bool(total.goals) and max_age <= REPORT_EVERY)
 
 
 def self_repair_number(total: Totals) -> Number:

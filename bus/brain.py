@@ -65,6 +65,8 @@ RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 TRIAGE_MARKER = "<!-- loom:triage v1 -->"
+# The marker on a factory incident issue body (lanes/run_lane.sh files it).
+FACTORY_INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 HUMAN_MARKER = "<!-- loom:human v1 -->"
 # Opens the comment Loom leaves on a rewritten issue when the ticket it
 # became is verified or dropped; the rest of the line names the ticket and
@@ -242,7 +244,9 @@ def _goal_comments(node: Optional[Dict[str, Any]],
     those by `authors` when given."""
     allowed = {a.lower() for a in authors} if authors else None
     found = []
-    for c in ((node or {}).get("comments") or {}).get("nodes") or []:
+    # A journal edited in place counts once per tick, at the tick's time.
+    nodes = ((node or {}).get("comments") or {}).get("nodes") or []
+    for c in handoff.expand_journals(nodes, at_key="createdAt"):
         login = rest_login(c.get("author")).lower()
         at = str(c.get("createdAt") or "")
         if _stamp(at) is None or (allowed is not None and login not in allowed):
@@ -837,6 +841,22 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
     if found:
         raise ValueError("the pull request this brief makes would fail the review "
                          "bot's plan checks: " + "; ".join(found))
+
+
+def _check_live_criterion(body: str) -> None:
+    """A Live criterion names at least one exact string the station can look
+    for: a log line, field or endpoint in backticks or double quotes. Without
+    one, no verify brief carries log data and the ticket can only stay
+    shipped (2026-10-18: 3 of 72 merged tickets verified, most refused for
+    missing evidence on criteria written as prose)."""
+    found = _LIVE_LINE.search(body or "")
+    if not found:
+        return
+    from .evidence import needles
+    if not needles(found.group(1)):
+        raise ValueError("the Live criterion names no exact string the station can look "
+                         "for: put the log line, field or endpoint it means in backticks, "
+                         "for example `overseer: summoned` or `/api/v2/health`")
 
 
 def plan_problems(body: str) -> List[str]:
@@ -1545,9 +1565,13 @@ def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
                  lane: Optional[str], extra: Sequence[str] = ()) -> Dict[str, Any]:
     """File the ticket and link it as a sub-issue of goal (an epic, for every
     brief), with a Part of line when GitHub refuses the link."""
-    names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
-    if lane:
-        names.append("lane:" + lane)
+    if lane and lane in REMOTE_LANES:
+        _check_remote_lane(gh, repo, body, lane)
+        names = ["loom:ticket", "loom:queued", "lane:" + lane]
+    else:
+        names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
+        if lane:
+            names.append("lane:" + lane)
     issue = gh.rest("POST", "/repos/%s/issues" % repo, {
         "title": title, "body": body, "labels": names + list(extra)}).data
     if not _link_to_goal(gh, repo, goal, issue):
@@ -1571,7 +1595,10 @@ def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
         new = _with_model(new, model)
     _check_written_text(new)
     tickets.parse(new)
-    kept = _moved_labels(_labels(issue), "briefed" if lane else "queued", lane)
+    if lane and lane in REMOTE_LANES:
+        _check_remote_queue(gh, repo, number, issue, lane, body=new)
+    state = "queued" if (not lane or lane in REMOTE_LANES) else "briefed"
+    kept = _moved_labels(_labels(issue), state, lane)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
             {"labels": kept + [REGRESSION] if REGRESSION not in kept else kept})
@@ -1805,7 +1832,9 @@ def _journal_brief_done(gh: GitHub, repo: str, goal: int, holder: str, line: str
     body = "\n".join([JOURNAL_MARKER, "Tick %s, %s" % (_iso(datetime.now(timezone.utc)), holder),
                       "- Briefed: %s" % url, line])
     try:
-        gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, goal), {"body": body})
+        # Into the holder's journal of the day, edited in place (bus/journal.py).
+        from . import journal
+        journal.post(gh, repo, goal, body, holder)
     except GitHubError as exc:
         raise GitHubError("filed %s, but its brief done marker was not posted (%s); put this "
                           "line in your journal: %s" % (url, exc, line), exc.status, exc.body) from exc
@@ -1891,6 +1920,10 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
     if any(name.startswith("wayfinder:") for name in names):
         # A wayfinder map or decision ticket is planning, not work for a lane.
         return "wayfinder"
+    if FACTORY_INCIDENT_MARKER in str(issue.get("body") or ""):
+        # A factory incident is filed as a plain issue; it is not a ticket
+        # the backlog should triage (loom#918).
+        return "factory incident"
     if _is_epic(issue):
         return "epic"
     return None
@@ -1908,23 +1941,16 @@ def _oldest_open_issues(gh: GitHub, repo: str):
         url = _next_link(resp.headers.get("link", ""))
 
 
-def _triage_comment(missing: List[str]) -> str:
-    return ("%s\nLoom triage: this issue is not a ticket yet. Missing: %s.\n\n"
-            "The brain will write a ticket from it that refs this issue, or label it "
-            "loom:human if only a person can do it. This issue stays open as it is."
-            % (TRIAGE_MARKER, ", ".join(missing)))
-
-
-def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
-          comment_limit: Optional[int] = None) -> List[str]:
+def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
     anything with a loom: label. A ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
-    the goal, while the goal has room; the rest get loom:triage and one
-    comment naming what is missing. A ready issue goes under the goal's
-    intake epic (intake_epic). Only labels, sub-issue links, that comment and
+    the goal, while the goal has room; the rest get loom:triage, and the
+    returned line names what is missing. No comment: each one emailed the
+    issue's author, and 161 older issues got one on 2026-10-20. A ready issue goes under the goal's
+    intake epic (intake_epic). Only labels, sub-issue links and
     an intake epic when one is needed are written, plus a Part of line at the
     end of a ready issue's body when GitHub refuses the sub-issue link: an issue is never closed or
     retitled, and nothing else in it is edited.
@@ -1938,7 +1964,6 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
     briefers = trusted_briefers()
     lines: List[str] = []
     done = 0
-    comments = 0
     intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
     for issue in _oldest_open_issues(gh, repo):
         if done >= limit:
@@ -1969,11 +1994,6 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
             intake = (intake[0], intake[1] + 1)
             lines.append("#%d queued under #%d" % (number, intake[0]))
         else:
-            if comment_limit is None or comments < comment_limit:
-                comment = _triage_comment(missing)
-                _check_written_text(comment)
-                gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {"body": comment})
-                comments += 1
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:triage"]})
             lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
@@ -2197,7 +2217,8 @@ def _moved_labels(have: List[str], state: str, lane: Optional[str]) -> List[str]
     # (tickets.ticket_state), and the Priorities list showed shipped work as
     # lane work (2026-10-15).
     states = ["loom:" + item for item in STATES + tickets.TICKET_STATES]
-    kept = [x for x in have if x not in states
+    # A move ends whatever the ticket waited for, so its wait:* label goes.
+    kept = [x for x in have if x not in states and not x.startswith("wait:")
             and not (lane is not None and x.startswith("lane:"))]
     kept.append("loom:" + state)
     if lane:
@@ -2321,6 +2342,37 @@ def prioritize(gh: GitHub, repo: str, number: int, priority: Optional[str],
                           "note comment")
 
 
+def restate_live(gh: GitHub, repo: str, number: int, text: str,
+                 env: Optional[Dict[str, str]] = None) -> None:
+    """Replace a shipped ticket's Live acceptance line with one that names
+    the exact string its proof will show, so the station can look for it
+    before it spends a verify run (bus/evidence.py). Tickets shipped before
+    #925 state it in prose and could never be verified."""
+    text = " ".join(str(text or "").split())
+    # Case-sensitive, exactly as _LIVE_LINE reads it: "live:" would replace
+    # the Live line with one no reader sees as Live.
+    if not re.match(r"^Live\b", text):
+        raise ValueError("the new line must start with Live")
+    _check_live_criterion("- [ ] " + text)
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    if issue.get("state") != "open" or "loom:shipped" not in _labels(issue):
+        raise ValueError("only an open loom:shipped ticket has its Live criterion restated")
+    _prioritize_body(issue, None, env)
+    body = str(issue.get("body") or "")
+    found = _LIVE_LINE.search(body)
+    if not found:
+        raise ValueError("the ticket has no Live line to restate")
+    line = body[found.start():found.end()]
+    new = body[:found.start()] + line[:line.index(found.group(1))] + text + body[found.end():]
+    after = _LIVE_LINE.search(new)
+    if not after or " ".join(after.group(1).split()) != text:
+        raise ValueError("the restated body does not read back with the new Live line")
+    _check_live_criterion(new)
+    _check_written_text(new)
+    if new != body:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
+
+
 def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
                model: str) -> None:
     """Rewrite the ticket body's Model: line; done before the labels change so
@@ -2374,17 +2426,43 @@ def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[st
     return None
 
 
+def _check_remote_tier(body: str, lane: str) -> None:
+    """Refuse a remote lane brief whose difficulty the lane does not run."""
+    try:
+        difficulty = tickets.parse(body)[0].get("Difficulty", "")
+    except ValueError:
+        difficulty = ""
+    if difficulty not in REMOTE_LANES[lane]["tiers"]:
+        raise ValueError("difficulty %r is not one of %s: remote lane %s "
+                         "only runs %s" % (difficulty or "none", ", ".join(DIFFICULTIES),
+                                          lane, ", ".join(REMOTE_LANES[lane]["tiers"])))
+
+
+def _check_remote_lane(gh: GitHub, repo: str, body: str, lane: str) -> None:
+    """Refuse a brief to a remote lane the lane could never claim: a private repo
+    for a public-only lane, or a difficulty tier the lane does not run.
+    Called when a new ticket is filed, so a branch check is not yet possible."""
+    repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+        raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
+    _check_remote_tier(body, lane)
+
+
 def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
-                        lane: str) -> None:
+                        lane: str, body: Optional[str] = None) -> None:
     """Refuse a queued move to a remote lane that the lane could never claim:
-    a private repo for a public-only lane, or a ticket whose branch already
-    has a pull request (a fix round, which remote lanes do not run)."""
+    a private repo for a public-only lane, a ticket whose branch already has a
+    pull request (a fix round, which remote lanes do not run), or a difficulty
+    tier the lane does not run. The body is checked when the caller has it
+    (re-briefing a regression ticket); omitted for a plain queued move."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
     if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
     branch = tickets.branch_for(number, str(issue.get("title") or ""))
     if _open_or_merged_pull(gh, repo, branch) is not None:
         raise ValueError("ticket branch %s already has a pull request" % branch)
+    if body is not None:
+        _check_remote_tier(body, lane)
 
 
 def move(gh: GitHub, repo: str, number: int, state: str,
@@ -2825,6 +2903,9 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     return settle_source(gh, repo, number, issue.get("body"), reason, proof_url)
 
 
+# The close-completeness guard's escape hatch (bus/github.py): a close by
+# rule, not a claim that each box was seen to hold.
+FORCE_CLOSE_LABEL = "force-close"
 _REWRITTEN_FROM = re.compile(r"^Rewritten from issue (\d+)\.[ \t]*$", re.M)
 # Rewrites before loom#462 ended the ticket with this line instead.
 _REFS_LINE = re.compile(r"^Refs #(\d+)[ \t]*$", re.M)
@@ -2875,13 +2956,16 @@ def _paired_source(gh: GitHub, repo: str, number: int, body: Any
 
 
 def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
-                  proof_url: str = "") -> Optional[str]:
+                  proof_url: str = "", unproven: bool = False) -> Optional[str]:
     """Settle the issue ticket #number was rewritten from, once the ticket is
     verified or closed. Completed (verified, or closed as completed) closes
     the source as completed with a comment naming the ticket and its proof;
     a source whose own acceptance criteria are unchecked stays open with a
     comment saying why, since the close gate refuses it. not_planned leaves
     the source open with a comment. Each outcome is said once per ticket.
+    Unproven is a ticket closed as completed with no proof (the station's
+    done close, or a person's): the source closes with it by the same rule,
+    labelled force-close when its own criteria are unchecked.
     Returns a line saying what was done, or None when the ticket names no
     open paired source. A GitHub failure is returned as that line, never
     raised: the ticket has already moved by then."""
@@ -2894,10 +2978,16 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
         source, issue, comments = found
         if issue.get("state") != "open":
             return None
+        if unproven and _said_for(comments, number) is not None:
+            return None  # an unproven close never overrides what Loom said
         if reason == "not_planned":
             outcome = "dropped"
             words = ("Ticket #%d, rewritten from this issue, was closed as not planned. "
                      "This issue stays open for a person to decide." % number)
+        elif unproven:
+            outcome = "closed"
+            words = ("Ticket #%d, rewritten from this issue, was closed as completed, so "
+                     "this issue closes as completed." % number)
         elif any(not checked for checked, _ in proof.criteria(str(issue.get("body") or ""))):
             outcome = "held"
             words = ("Ticket #%d, rewritten from this issue, is verified (%s). This issue "
@@ -2916,6 +3006,10 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
         elif outcome != "closed":
             return None
         if outcome == "closed":
+            if unproven and any(not checked for checked, _ in
+                                proof.criteria(str(issue.get("body") or ""))):
+                gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, source),
+                        {"labels": [FORCE_CLOSE_LABEL]})
             gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, source),
                     {"state": "closed", "state_reason": "completed"})
             return "closed source issue #%d as completed" % source
@@ -3521,6 +3615,18 @@ def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     return out if due else out + ["- none"]
 
 
+def _sensitive_head(gh: GitHub, repo: str, pr: Dict[str, Any]
+                    ) -> Tuple[str, Dict[str, Any]]:
+    """The head sha and pull request details for a sensitive resume check,
+    preferring the GraphQL head oid and falling back to the REST head sha."""
+    owner, name = repo.split("/", 1)
+    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
+                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
+    details = (data.get("repository") or {}).get("p") or {}
+    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    return sha, details
+
+
 def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
                      check: str) -> Optional[Dict[str, Any]]:
     """A needs-brain sensitive pull request older than 2 hours whose checks
@@ -3537,11 +3643,7 @@ def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
         return None
     if ticket is None:
         return None
-    owner, name = repo.split("/", 1)
-    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
-                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
-    details = (data.get("repository") or {}).get("p") or {}
-    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    sha, details = _sensitive_head(gh, repo, pr)
     if not _checks_green(details) or not sha or not _review_check_passed(gh, repo, sha, check):
         return None
     return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details}
@@ -3639,7 +3741,7 @@ def _when(stamp: Any) -> Optional[datetime]:
         return None
 
 
-def _lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+def lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """The model a lane runs when a brief names none: its configured setting,
     LOOM_<SLOT>_MODEL, else LOOM_<PROVIDER>_MODEL for a numbered slot
     (lanes/run_lane.sh lane_setting); None when neither is set. Never a fixed
@@ -3709,7 +3811,7 @@ def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datet
     force (an escalation or an equivalent move, bus/factory.py EQUIVALENTS,
     sets the one it gave), else the model the runner footer of the claim's
     lane's pull request names (`footer`, (lane, model)), else the lane's
-    configured model (_lane_model), as bus/factory.py claim_models reads it."""
+    configured model (lane_model), as bus/factory.py claim_models reads it."""
     from .factory import EQUIVALENT_RE  # factory imports this module
     tried: List[str] = []
     for body, _ in bodies:
@@ -3722,7 +3824,7 @@ def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datet
             current = equivalent.group(1)
         elif claim:
             lane = claim.group(1)
-            model = current or (footer[1] if footer and footer[0] == lane else _lane_model(lane))
+            model = current or (footer[1] if footer and footer[0] == lane else lane_model(lane))
             if model and model not in tried:
                 tried.append(model)
     return tried
@@ -4019,6 +4121,7 @@ def parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
+    lv = sub.add_parser("live"); lv.add_argument("ticket"); lv.add_argument("--text", required=True)
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
@@ -4059,6 +4162,9 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
                          "epics are listed by bus.brain status; open one with bus.brain epic)")
     body = _read(args.file)
     _check_brief_difficulty(body, args.lane, args.difficulty)
+    # Hand-written briefs only: health and friction intake are verified by
+    # the station's own absence tracking, not by a log string.
+    _check_live_criterion(body)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
@@ -4091,6 +4197,11 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
     said = move(gh, repo, number, args.to, args.lane, args.note, record, args.model)
     if said:
         print(said)
+
+
+def _cmd_live(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    restate_live(gh, repo, number, args.text)
 
 
 def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
@@ -4150,7 +4261,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
-            "prioritize": _cmd_prioritize,
+            "prioritize": _cmd_prioritize, "live": _cmd_live,
             "close": _cmd_close, "audit": _cmd_audit, "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
@@ -4163,7 +4274,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gh: Optional[GitHub] = None
     try:
         args = parser().parse_args(argv)
-        gh = GitHub(auth_from_env())
+        gh = GitHub(auth_from_env(), unsubscribe=True)
+        # Status comments by the trusted writers read as events (bus/status.py).
+        gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
         COMMANDS[args.command](gh, args)
         return 0
     except (ValueError, OSError, GitHubError) as exc:

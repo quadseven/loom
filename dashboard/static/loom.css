@@ -291,12 +291,16 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .backlog-asks { max-width: 760px; margin: 18px 0; }
 .backlog-asks summary { min-height: 44px; display: flex; align-items: center; color: var(--muted); font: 12px var(--font-mono); cursor: pointer; }
 .ask-missing { margin: 0; color: var(--muted); font-size: 13px; }
+.ask-head .ask-human { margin-left: auto; padding: 0 8px; border: 1px solid var(--info); border-radius: 999px; color: var(--info-on-bg); white-space: nowrap; }
+.ask-source { margin: 0; color: var(--muted); font-size: 12px; }
+.needs-filter .chip[aria-current="true"] { border-color: var(--accent); color: var(--accent-on-bg); }
+.needs-read { color: var(--muted); font-size: 12px; }
 .backlog-ask { margin: 6px 0; color: var(--body); font-size: 13px; }
 .share-track span, .quota span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .share-track i { position: absolute; left: 50%; top: -4px; height: 16px; border-left: 2px solid var(--bad); }
 .empty-state { color: var(--muted); border: 1px dashed var(--line-strong); border-radius: 10px; padding: 14px; }
 /* Ticket page (docs/design/floor, Ticket) */
-.ticket-header { display: grid; gap: 10px; margin-bottom: 18px; }
+.ticket-header { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-bottom: 18px; overflow-wrap: anywhere; }
 .ticket-topline { display: flex; justify-content: space-between; gap: 12px; font: 12px var(--font-mono); }
 .ticket-topline a { color: var(--muted); }
 .ticket-ids { color: var(--dim); font: 12px var(--font-mono); }
@@ -312,8 +316,12 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .strip-step.current b { color: var(--text); }
 .tone-good { color: var(--good); } .tone-bad { color: var(--bad); } .tone-accent { color: var(--accent); }
 .tone-info { color: var(--info); } .tone-dim { color: var(--dim); } .tone-body { color: var(--body); }
-.ticket-columns { display: grid; grid-template-columns: 260px minmax(0, 1fr) 300px; gap: 28px; align-items: start; }
-.ticket-pane { display: grid; gap: 16px; align-content: start; min-width: 0; }
+/* The ticket page never scrolls sideways (#865): every grid on it has a
+   minmax(0, 1fr) track, so a long unbroken line (a command, a path, a check
+   name) cannot size its column past the track, and text breaks anywhere. */
+.ticket-columns { display: grid; grid-template-columns: 260px minmax(0, 1fr) 300px; gap: 28px; align-items: start; overflow-wrap: anywhere; }
+.ticket-pane { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-content: start; min-width: 0; }
+.checks-card, .proof, .strip-step, .run-events, .transcript-event, .tool-block, .pr-thread, .ticket-timeline li > div { grid-template-columns: minmax(0, 1fr); }
 .ticket-pane .label { color: var(--dim); font: 10.5px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
 .ticket-pane p { margin: 0; }
 .ticket-segments { display: none; }
@@ -321,7 +329,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .check { display: flex; gap: 10px; font-size: 13px; line-height: 1.42; }
 .check span:first-child { flex-shrink: 0; width: 14px; color: var(--dim); font-family: var(--font-mono); }
 .check.checked span:first-child { color: var(--good); }
-.check span:last-child { color: var(--body); }
+.check span:last-child { min-width: 0; color: var(--body); }
 .ticket-timeline { margin: 0; padding: 0; list-style: none; }
 .ticket-timeline li { display: flex; gap: 12px; }
 .ticket-timeline .dot { position: relative; flex-shrink: 0; width: 9px; height: 9px; margin: 5px 1px 0; border-radius: 50%; background: var(--muted); }
@@ -358,7 +366,7 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .transcript-event.edited .tx-label { color: var(--good); }
 .transcript-event.grug .tx-label { color: var(--bad); }
 .transcript-event.answered .tx-label, .transcript-event.live .tx-label { color: var(--accent); }
-.transcript-event.waiting .tx-label { color: var(--accent); }
+.transcript-event.waiting .tx-label, .transcript-event.escalated .tx-label { color: var(--accent); }
 .transcript-event.failed .tx-label { color: var(--bad); }
 .transcript-event p { color: var(--text); font-size: 14px; line-height: 1.55; white-space: pre-wrap; text-wrap: pretty; }
 .transcript-event em { color: var(--muted); font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; }
@@ -382,7 +390,8 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .transcript-event.waiting .live-row .dot { background: var(--dim); }
 .transcript-event.failed .live-row .dot { background: var(--bad); }
 .pr-line { display: flex; justify-content: space-between; gap: 8px; font: 12px var(--font-mono); }
-.pr-line span:first-child { min-width: 0; overflow: hidden; color: var(--body); text-overflow: ellipsis; white-space: nowrap; }
+.pr-line span:first-child { min-width: 0; color: var(--body); }
+.pr-line span:not(:first-child) { flex-shrink: 0; }
 .pr-line.file span:first-child { flex: 1; }
 .pr-thread { display: grid; gap: 4px; font-size: 13px; line-height: 1.45; }
 .pr-thread span { font: 11px var(--font-mono); }
@@ -701,3 +710,46 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .operators-note { max-width: 72ch; margin: 0 0 14px; color: var(--body); font-size: 14px; line-height: 1.5; }
 .operators-adopted { margin: 0 0 18px; }
 .operators-adopted > .machine-fact, .operators-read { margin: 4px 0 10px; color: var(--muted); font-size: 12px; }
+.operators-sub { display: block; margin: 12px 0 6px; }
+.operators-ask { color: var(--body); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+.waiting-on { margin: 6px 0 10px; padding: 0; list-style: none; }
+.waiting-on li { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+/* Tiers and allowances page (loom#968): the tier lists side by side, one
+   dense table of provider and model rows that stacks into a card per row on
+   a phone (each cell labelled), and the three Live now lists. */
+.tiers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: 14px 18px; }
+.tiers-tier h3, .tiers-live h3 { margin: 0 0 6px; color: var(--text); font-size: 13px; font-weight: 600; }
+.tiers-entries { margin: 0; padding-left: 22px; color: var(--muted); font-size: 12.5px; }
+.tiers-entry { padding: 3px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.tiers-lane { color: var(--text); font-family: var(--font-mono); }
+.tiers-model { color: var(--body); font-family: var(--font-mono); }
+.tiers-rung { color: var(--muted); font: 11px var(--font-mono); }
+.tiers-kind { display: inline-block; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font: 10.5px var(--font-mono); white-space: nowrap; }
+.tiers-kind-own-hardware { border-color: var(--good); color: var(--good-on-bg); }
+.tiers-kind-free { border-color: var(--info); color: var(--info-on-bg); }
+.tiers-kind-subscription { border-color: var(--accent); color: var(--accent-on-bg); }
+.tiers-kind-never-paid { border-color: var(--bad); color: var(--bad-on-bg); }
+.tiers-note { margin: 0 0 8px; color: var(--muted-on-bg); font-size: 13px; }
+.tiers-stale { margin: 0 0 8px; font-size: 13px; }
+.tiers-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tiers-table th, .tiers-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.tiers-table thead th { color: var(--dim-on-bg); font: 500 10.5px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+.tiers-table tbody th { color: var(--text); font-family: var(--font-mono); font-weight: 500; }
+.tiers-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tiers-table td.tiers-unknown { color: var(--muted); }
+.tiers-table .tiers-allowance { color: var(--body); overflow-wrap: anywhere; }
+.tiers-cooling .tiers-allowance, .tiers-metered .tiers-allowance { color: var(--accent-on-bg); }
+.tiers-benched .tiers-allowance { color: var(--bad-on-bg); }
+.tiers-live-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 14px 18px; }
+.tiers-live-list { margin: 0; padding: 0; list-style: none; }
+.tiers-live-list li { padding: 5px 0; border-bottom: 1px solid var(--line); color: var(--body); font-size: 13px; overflow-wrap: anywhere; }
+.tiers-live-title { color: var(--body); }
+@media (max-width: 959px) {
+  .tiers-table, .tiers-table tbody, .tiers-table tr, .tiers-table th, .tiers-table td { display: block; }
+  .tiers-table thead { display: none; }
+  .tiers-table tr { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .tiers-table th, .tiers-table td { padding: 0; border: 0; }
+  .tiers-table tbody th, .tiers-table td.tiers-allowance { grid-column: 1 / -1; }
+  .tiers-table td::before { display: block; color: var(--muted); font: 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; content: attr(data-label); }
+  .tiers-live-list li > a { display: inline-flex; min-height: 44px; align-items: center; }
+}

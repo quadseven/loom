@@ -34,6 +34,7 @@ from . import goals as goals_view
 from . import ticket_data
 from . import tickets_table
 from . import operators as operators_view
+from . import needs_you as needs_you_view
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
@@ -285,7 +286,9 @@ def _floor(state):
         '<dt class="since-%s">%s</dt><dd>%s</dd>' % (key.replace(" ", "-"), esc(label), esc(str(since.get(key) or missing)))
         for key, label in (("well", "well"), ("not well", "not well"), ("stuck", "stuck"), ("next", "next"))))
     needs = context.get("needs_you")
-    asks = payload.get("operator_items") or []
+    asks = needs_you_view.entries(payload.get("operator_items") or [],
+                                  (payload.get("operator_claims") or {}).get("needs") or [],
+                                  getattr(state, "repos", None) or [])
     if isinstance(needs, int):
         top = asks[0] if asks else None
         needs_html = '<p><strong class="count">%d</strong> %s</p>%s<a href="/needs-you">all asks &rarr;</a>' % (
@@ -293,6 +296,7 @@ def _floor(state):
             '<p>%s</p>' % esc(str(top.get("title") or "")) if top else "")
     else:
         needs_html = '<p class="muted">not looked: %s</p>' % esc(str(context.get("needs_you_reason") or "needs-operator source unavailable"))
+    parts.append(operators_view.floor_html(payload.get("operator_claims")))
     parts.append('<section class="card"><span class="label">Needs you</span>%s</section></aside></div>' % needs_html)
     return page("Floor", "floor", "".join(parts), status="snapshot")
 
@@ -715,10 +719,17 @@ def _backlog_page(document, parsed, state):
     # Sorted by score, highest first; the source's own order breaks ties and
     # an epic with no score sorts last.
     ranked.sort(key=lambda epic: (_score(epic) is None, -(_score(epic) or 0.0)))
-    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter))]
+    out = [_outside_section(_outside_any_epic(_all_tickets(state), all_epics, repo_filter)),
+           _ranked_section(ranked, form), _empty_epics(empty), _render_inspectors(document)]
+    return page("Backlog", "backlog", "".join(out), status="Read only")
+
+
+def _ranked_section(ranked, form):
+    """The Epics by score section: the filter form, the top RANKED_SHOWN
+    epics as a table and the rest collapsed below it."""
     dated = any(_epic_age(epic) for epic in ranked)
-    out.append('<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
-               '<span class="machine-fact">%d ranked</span></div>' % len(ranked))
+    out = ['<section class="section"><div class="section-head"><span class="label">Epics by score</span>'
+           '<span class="machine-fact">%d ranked</span></div>' % len(ranked)]
     out.append('<p class="backlog-note">One row per epic with children, ranked by Hunt\'s score.%s</p>' % (
         "" if dated else " Age shows a dash: the backlog source carries no epic dates."))
     out.extend(form)
@@ -731,73 +742,61 @@ def _backlog_page(document, parsed, state):
     else:
         out.append('<p class="empty-state">No epic with children matches this filter.</p>')
     out.append('</section>')
-    if empty:
-        out.append('<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
-            len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
-                _link_or_text(epic.get("html_url") or epic.get("url"), strip_kind(epic.get("title")) or "Untitled epic"),
-                html.escape(_repo_number(epic))) for epic in empty)))
-    out.append(_render_inspectors(document))
-    return page("Backlog", "backlog", "".join(out), status="Read only")
+    return "".join(out)
 
 
-_ASK_SECTION = re.compile(r"^##\s*Ask\s*\n(.*?)(?=^##\s|\Z)", re.M | re.S)
+def _empty_epics(empty):
+    """The collapsed list of epics tracking no children; nothing when none."""
+    if not empty:
+        return ""
+    return '<details class="backlog-group"><summary>Empty epics (%d), tracking no children</summary><ul>%s</ul></details>' % (
+        len(empty), "".join('<li>%s <span class="machine-fact">%s</span></li>' % (
+            _link_or_text(epic.get("html_url") or epic.get("url"), strip_kind(epic.get("title")) or "Untitled epic"),
+            html.escape(_repo_number(epic))) for epic in empty))
 
 
-def _exact_ask(item):
-    """The issue's "## Ask" section, else a one-line ask as written, else
-    None: a missing ask is shown as missing, never stood in by the title."""
-    body = str(item.get("ask") or item.get("body") or "")
-    found = _ASK_SECTION.search(body)
-    text = found.group(1).strip() if found else ("" if "\n" in body.strip() else body.strip())
-    return text if text and text != str(item.get("title") or "").strip() else None
-
-
-def _ask_card(item):
-    esc = html.escape
-    waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
-    since = item.get("created_at") or item.get("waiting_since")
-    age = views.format_age(since) if since and since != "9999" else None
-    ask = _exact_ask(item)
-    ask_html = ('<blockquote>%s</blockquote>' % esc(ask) if ask else
-                '<p class="ask-missing">No exact ask is written on the issue (no "## Ask" section).</p>')
-    return ('<article class="card ask-card"><div class="ask-head"><span>%s - needs-operator</span>'
-            '<span>%s</span></div><h2><a href="%s">%s</a></h2>%s'
-            '<p class="machine-fact">%s | unblocks %s | <a href="%s">open the issue</a></p></article>') % (
-        esc(_repo_number(item)), esc(age or "age unknown"), esc(_issue_url(item), quote=True),
-        esc(str(item.get("title") or _repo_number(item))), ask_html, waiting,
-        esc(str(item.get("unblocks", 0))), esc(_issue_url(item), quote=True))
-
-
-def _needs_you(document, state, *, source_missing=False):
-    order = lambda item: (-_number(item.get("unblocks")), str(item.get("waiting_since", "9999")))
-    asks = {}
-    for item in list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", [])):
-        key = _repo_number(item)
-        if key:
-            asks.setdefault(key, {**item, "queue": "needs_operator"})
-    backlog = {}
-    for item in document.get("ready_for_human") or []:
-        key = _repo_number(item)
-        if key and key not in asks:
-            backlog.setdefault(key, {**item, "queue": "ready_for_human"})
-    out = ['<p class="page-lede">Only what only you can do. Everything else the brain does itself.</p>']
+def _needs_you(document, state, *, source_missing=False, who=""):
+    """Everything waiting on a person (loom#810): needs-operator asks from
+    Hunt's document and the store, and needs:<login> items from the
+    Operators pass, each once, filtered by ?who=."""
+    asks = list(document.get("needs_operator") or []) + list(getattr(state, "operator_items", []))
+    response = getattr(state, "response", None)
+    claims = (response() if callable(response) else {}).get("operator_claims") or {}
+    repos = list(getattr(state, "repos", None) or [])
+    found, cards = needs_you_view.render(asks, claims, who, repos)
+    out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
+           'Everything else the brain does itself.</p>']
     if source_missing:
         out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
-    if not asks:
-        out.append('<p class="empty-state">Nothing needs you right now: no open needs-operator issue.</p>')
-    out.extend(_ask_card(item) for item in sorted(asks.values(), key=order))
-    if backlog:
-        out.append('<details class="backlog-asks"><summary>From the backlog (%d), ready for a person</summary>' % len(backlog))
-        for item in sorted(backlog.values(), key=order):
-            waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
-            out.append('<p class="backlog-ask"><a href="%s">%s</a> %s <span class="machine-fact">%s | unblocks %s</span></p>' % (
-                html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item)),
-                html.escape(str(item.get("title") or "")), waiting, html.escape(str(item.get("unblocks", 0)))))
-        out.append('</details>')
+    out.append(cards)
+    if not who:
+        out.append(_backlog_asks(document, found, repos))
     counts = getattr(state, "human_counts", None) or document.get("loom_human_counts") or {}
     out.append('<footer>loom:human counts by repo: %s</footer>' % html.escape(
         ", ".join("%s: %s" % (repo, count) for repo, count in counts.items()) or "none"))
     return page("Needs you", "needs-you", "".join(out), status="Read only")
+
+
+def _backlog_asks(document, found, repos):
+    """Hunt's ready-for-a-person items not already listed above, collapsed."""
+    names = needs_you_view.full_names(list(repos) + [entry["repo"] for entry in found])
+    listed = {entry["key"] for entry in found}
+    backlog = {}
+    for item in document.get("ready_for_human") or []:
+        key = needs_you_view.ref_key(item.get("repo"), item.get("number"), names) if _repo_number(item) else ""
+        if key and key not in listed:
+            backlog.setdefault(key, {**item, "queue": "ready_for_human"})
+    if not backlog:
+        return ""
+    order = lambda item: (-_number(item.get("unblocks")), str(item.get("waiting_since", "9999")))
+    rows = []
+    for item in sorted(backlog.values(), key=order):
+        waiting = "idle" if item.get("waiting_since_source") == "updated" else "waiting"
+        rows.append('<p class="backlog-ask"><a href="%s">%s</a> %s <span class="machine-fact">%s | unblocks %s</span></p>' % (
+            html.escape(_issue_url(item), quote=True), html.escape(_repo_number(item)),
+            html.escape(str(item.get("title") or "")), waiting, html.escape(str(item.get("unblocks", 0)))))
+    return ('<details class="backlog-asks"><summary>From the backlog (%d), ready for a person</summary>%s</details>'
+            % (len(backlog), "".join(rows)))
 
 
 def _number(value):
@@ -991,6 +990,8 @@ def _dispatch_get(handler, state):
         return _dispatch_free(handler, state, parsed)
     if path == "/usage":
         return _dispatch_usage(handler, state)
+    if path == "/tiers":
+        return _dispatch_tiers(handler, state)
     if path in ("/brain", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
     if path in ("/", "/goals", "/tickets"):
@@ -1055,7 +1056,8 @@ def _dispatch_backlog(handler, state, path, parsed):
         if raw is None:
             return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
         return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
-    return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None))
+    who = needs_you_view.who_param(parse_qs(parsed.query).get("who", [""])[0])
+    return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None, who=who))
 
 
 # Served path -> (file under static/, content type). Browsers ask for
@@ -1147,9 +1149,57 @@ def _dispatch_usage(handler, state):
     now = datetime.now(timezone.utc)
     payload = state.response() if hasattr(state, "response") else {}
     lanes = {lane for row in rows for lane in (row.get("lanes") or []) if isinstance(lane, str)}
-    models = {lane: model for lane in lanes for model in [bus_brain._lane_model(lane)] if model}
+    models = {lane: model for lane in lanes for model in [bus_brain.lane_model(lane)] if model}
     data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models)
     return handler.send_page(page("Usage", "usage", usage_store.render(data),
+                                  status="stale" if payload.get("stale") else "live"))
+
+
+def _tiers_usage(state, now):
+    """The station's usage readings as a Tiers page SourceState: stale when
+    none has arrived since the dashboard started, or the newest is older than
+    the Usage page's limit."""
+    from .tiers_sources import SourceState
+    store = getattr(state, "usage", None)
+    received = getattr(store, "received_at", None)
+    if received is None:
+        return SourceState.not_read(
+            "Usage readings", "no usage snapshot since the dashboard started (the station uploads one each pass)")
+    age = (now - received).total_seconds()
+    stale = age > usage_store.STALE_AFTER
+    return SourceState(name="Usage readings", data=[row for items in store.providers.values() for row in items],
+                       last_good_at=received.timestamp(), read_at=received.timestamp(), stale=stale,
+                       error="no station upload in %dh" % (age // 3600) if stale else "")
+
+
+def _tiers_station(state, payload):
+    """The running Loom tickets the dashboard already holds, as a Tiers page
+    SourceState: stale with the ticket snapshot."""
+    from .tiers_sources import SourceState
+    if not any(rows is not None for rows in (payload.get("tickets") or {}).values()):
+        return SourceState.not_read("Station tickets", "ticket data not read yet")
+    entered = payload.get("state_entered") or {}
+    runs = [{"repo": row.get("repo"), "number": row.get("number"), "title": row.get("title"),
+             "lane": row.get("lane"), "model": row.get("run_model") or row.get("model"),
+             "age": tickets_table.age_in_state(row, entered, time.time())[0], "html_url": row.get("html_url")}
+            for row in _all_tickets(state) if row.get("state") == "running" and row.get("open", True)]
+    stale = bool(payload.get("stale"))
+    read = payload.get("ticket_refreshed_at")
+    return SourceState(name="Station tickets", data=runs, last_good_at=read, read_at=read, stale=stale,
+                       error=(payload.get("stale_reason") or "GitHub could not refresh ticket data") if stale else "")
+
+
+def _dispatch_tiers(handler, state):
+    """The Tiers and allowances page (loom#968), from the background reads:
+    a request never reads the gateway, Grug or the database."""
+    from . import tiers, tiers_sources
+    now = datetime.now(timezone.utc)
+    payload = state.response() if hasattr(state, "response") else {}
+    background = getattr(state, "tier_sources", None)
+    snapshot = background.snapshot() if background is not None else tiers_sources.empty_snapshot()
+    sources = dict(snapshot, usage=_tiers_usage(state, now), station=_tiers_station(state, payload))
+    body = tiers.render(tiers.build(sources, now))
+    return handler.send_page(page("Tiers and allowances", "tiers", body,
                                   status="stale" if payload.get("stale") else "live"))
 
 
@@ -1297,36 +1347,31 @@ def _hold_reason(lane, rows, now=None):
     return reason[:match.start()] + " until " + local
 
 
-def _lane_view_data(payload, tickets, state=None):
-    lane_rows = _merge_lane_rows(payload.get("lanes", []))
-    prs = payload.get("pull_requests", [])
-    newest_pr_for_lane = _newest_lane_models(prs)
-    usage_records = _usage_rows(payload, state)
+def _lane_card(item, tickets, newest_pr_for_lane, usage_records):
+    """One lane's card: its row plus the active ticket, model, quota and reason."""
+    lane_name = item["lane"]
+    active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
+                   and ticket.get("state") in ("running", "pr")), None)
+    model_info = newest_pr_for_lane.get(lane_name)
+    model_display = None
+    if model_info:
+        age_str = views.format_age(model_info["time"])
+        model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
+                         if age_str else model_info["model"])
+    reason = _hold_reason(lane_name, usage_records)
+    if item["available"] and reason == "no reason":
+        reason = "available"
+    item.update({
+        "ticket": active,
+        "model": model_display or bus_brain.lane_model(lane_name),
+        "quota": _lane_quota(lane_name, usage_records),
+        "reason": reason,
+    })
+    return item
 
-    lanes = []
-    for item in lane_rows:
-        lane_name = item["lane"]
-        active = next((ticket for ticket in tickets if ticket.get("lane") == lane_name
-                       and ticket.get("state") in ("running", "pr")), None)
-        model_info = newest_pr_for_lane.get(lane_name)
-        model_display = None
-        if model_info:
-            age_str = views.format_age(model_info["time"])
-            model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
-                             if age_str else model_info["model"])
-        lane_quota = _lane_quota(lane_name, usage_records)
-        reason = _hold_reason(lane_name, usage_records)
-        if item["available"] and reason == "no reason":
-            reason = "available"
 
-        item.update({
-            "ticket": active,
-            "model": model_display or bus_brain._lane_model(lane_name),
-            "quota": lane_quota,
-            "reason": reason,
-        })
-        lanes.append(item)
-
+def _scoreboard_rows(prs, tickets):
+    """The lane pull requests with a footer, each tagged with its ticket's tier."""
     tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets}
     prepared = []
     for pr in prs:
@@ -1335,12 +1380,26 @@ def _lane_view_data(payload, tickets, state=None):
             continue
         ticket = tickets_by_ref.get(parsed[:2])
         prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
+    return prepared
+
+
+def _anthropic_share(payload):
+    """The Anthropic percentage from the newest metrics comment's Spread line."""
     metric_rows = views.parse_metrics(payload.get("improving", {}).get("metrics_comments", []))
-    share = None
-    if metric_rows:
-        spread = metric_rows[0][1].get("Spread", {}).get("value", "")
-        match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
-        if match and int(match.group(2)):
-            share = round(100 * int(match.group(1)) / int(match.group(2)))
-    return {"lanes": lanes, "scoreboard": views.build_scoreboard(prepared),
-            "anthropic_share": share}
+    if not metric_rows:
+        return None
+    spread = metric_rows[0][1].get("Spread", {}).get("value", "")
+    match = re.search(r"Anthropic\s+(\d+)/(\d+)", spread)
+    if match and int(match.group(2)):
+        return round(100 * int(match.group(1)) / int(match.group(2)))
+    return None
+
+
+def _lane_view_data(payload, tickets, state=None):
+    prs = payload.get("pull_requests", [])
+    newest_pr_for_lane = _newest_lane_models(prs)
+    usage_records = _usage_rows(payload, state)
+    lanes = [_lane_card(item, tickets, newest_pr_for_lane, usage_records)
+             for item in _merge_lane_rows(payload.get("lanes", []))]
+    return {"lanes": lanes, "scoreboard": views.build_scoreboard(_scoreboard_rows(prs, tickets)),
+            "anthropic_share": _anthropic_share(payload)}

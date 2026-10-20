@@ -5,7 +5,9 @@ The station runs Watcher.run each pass. For each watched component
 each lane's service log) it reads the lines added since the last offset and
 keeps those that say error, failed, Traceback or refused, or carry an HTTP
 4xx/5xx, but not the station's hold line ("x#5 waits for #3 (failed)"), which
-is status whatever state it names. Each kept line is reduced to a signature: times, numbers, hex ids,
+is status whatever state it names, nor the brain's own status output (its
+stage handoff lines, ticket report and headings, resume lines and the tick or
+journal JSON it echoes), which names states and outcomes. Each kept line is reduced to a signature: times, numbers, hex ids,
 repos, issue numbers and paths become placeholders, so the same error on two
 repos is one signature.
 
@@ -13,7 +15,10 @@ A signature seen REPEAT times within WINDOW seconds, and not in the DAY before,
 files one loom:triage issue in the lanes repo titled "<component>: <signature>"
 with the count and the first and last example lines (redacted, then passed
 through the written-text check). A signature already open as an issue gets a
-count comment at most once an hour. Offsets and signatures are kept in the
+count comment at most once an hour, with when it was last seen: one rolling
+issue per signature. The issue a signature was filed on is remembered until
+it closes, so a signature that comes back after a quiet day, on an issue the
+brain has since retitled or relabelled, is counted there, not filed twice. Offsets and signatures are kept in the
 station's state directory (watch.json); no model is involved.
 """
 from __future__ import annotations
@@ -21,8 +26,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import handoff
 from . import text as _text
 from . import transcripts
 from .github import GitHubError
@@ -33,6 +40,8 @@ REPEAT = 3
 DAY = 24 * 3600
 COMMENT_EVERY = 3600
 SUMMARY_EVERY = 3600
+# Signatures remembered with their open issue after their record is pruned.
+ISSUES_MAX = 500
 # Bytes read from one log in one pass; a longer backlog is read over passes.
 READ_MAX = 1 << 20
 # Issues filed plus count comments posted in one pass.
@@ -64,7 +73,47 @@ KEEP_RE = re.compile(r"(?i)error|failed|traceback|refused")
 _HOLD_REF = r"[A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)?#[0-9]+ \([a-z-]+\)"
 HOLD_RE = re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ waits for "
                      + _HOLD_REF + r"(?:, " + _HOLD_REF + r")*[ \t]*")
+# The brain's own status output, read back into its log: it names stages,
+# states and outcomes ("failed"), so the error words match, but none of it is
+# an error (loom#871: one tick's report filed six issues, one per line).
+# - a stage handoff line, bus/handoff.py stage_lines;
+# - a markdown heading of its report ("#### failed", "### Held tickets");
+# - a ticket or goal row of the report (bus/brain.py _ticket_lines and the
+#   goal ledger), whose title and marks ("REPEATEDLY STUCK (failed 4 times")
+#   are free text;
+# - a defer resume line, bus/brain.py _resume_item_line;
+# - the tick record "brain step" prints, or a journal comment, as JSON.
+_STAGE = "(?:%s)" % "|".join(handoff.STAGES)
+_ITEM = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+"
+_AT = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z"
+STATUS_RES = (
+    re.compile(r"- stage " + _STAGE + r": (?:held by \S+|yielded by \S+ at " + _AT + r")"
+               r"(?:; last done " + _ITEM + r" by \S+ at " + _AT + r")?"),
+    re.compile(r"#{1,6} .*"),
+    re.compile(r"- #[0-9]+ .* - (?:lane:[A-Za-z0-9_.-]+|none) - [0-9]+h(?: - .*)?"),
+    re.compile(r"- #[0-9]+ .* - latest journal .*, report .*, measure .*, action .*"
+               r" - report .*"),
+    re.compile(r"- (?:dropped " + _STAGE + " " + _ITEM + r": (?:finished or closed|changed)"
+               r" since the defer|resume " + _STAGE + " " + _ITEM + r".* \(deferred by \S+ at "
+               + _AT + r"\))"),
+)
 TRACEBACK = "Traceback (most recent call last)"
+# A lane run the runner already classed as transient or as a limit: the
+# station retries or holds it (bus/station.py), so it is never a factory
+# fault to file. loom#467 counted zen's "[transient] agent exited 124" lines
+# 26 times, one emailed comment each (2026-10-18).
+CLASSED_RE = re.compile(r"\bfailed: \[(?:transient|limit)\]")
+# A line of a GitHub Actions job log that an agent read and echoed: "gh run
+# view --log" puts the job and the step before each line's timestamp, which
+# has seven fraction digits (the raw step log has the stamp alone). It is
+# the CI run's output, not the component's own error: a green run's test
+# names and captured output say "failed" and "error", and loom#880-#904 were
+# about 25 issues filed for one passing suite (2026-10-18). A failing run is
+# reported by its own check. The job and step names carry no colon, so a
+# line that only quotes such a stamp ("brain: ... at <stamp> failed") is
+# still judged.
+CI_LOG_RE = re.compile(r"(?:[^:\r\n]{0,160}\s)?[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+                       r"\.[0-9]{7}Z(?=\s|$)")
 
 _TIME_RE = re.compile(
     r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?"
@@ -160,10 +209,42 @@ def redact(line: str) -> str:
 
 def keep(line: str) -> bool:
     """A line worth a signature: it names an error or an HTTP 4xx/5xx. The
-    station's hold line is status, whatever state word it names."""
+    station's hold line is status, whatever state word it names, so is the
+    brain's own status output (brain_status), and a relayed CI log line is
+    the run's output (CI_LOG_RE)."""
     if HOLD_RE.fullmatch(_LEAD_RE.sub("", line).rstrip("\r\n")):
         return False
+    if brain_status(line):
+        return False
+    if CLASSED_RE.search(line):
+        return False
+    if CI_LOG_RE.match(_LEAD_RE.sub("", line)):
+        return False
     return bool(KEEP_RE.search(line) or HTTP_RE.search(line))
+
+
+def _echoed_json(line: str) -> bool:
+    """A JSON object the brain printed or read back: its tick record (a
+    holder and notes) or a journal comment (the journal marker, escaped or
+    not). Its notes and text are narrative, whatever words they use."""
+    if not line.startswith("{"):
+        return False
+    try:
+        data = json.loads(line)
+    except ValueError:
+        # Cut short (a log line is often truncated): judged by its keys.
+        return line.startswith('{"holder"') or (
+            line.startswith('{"body"') and "loom:journal" in line)
+    if not isinstance(data, dict):
+        return False
+    return ("holder" in data and "notes" in data) or "loom:journal" in str(data.get("body") or "")
+
+
+def brain_status(line: str) -> bool:
+    """The line is the brain's own status output (STATUS_RES or an echoed
+    tick or journal record), not an error."""
+    text = _LEAD_RE.sub("", line).strip()
+    return any(r.fullmatch(text) for r in STATUS_RES) or _echoed_json(text)
 
 
 def _num(value: Any) -> Optional[float]:
@@ -194,6 +275,8 @@ class Watcher:
         self.say = say
         self.write = write
         self.writes = 0
+        # Signature key -> the open issue it was filed or counted on.
+        self.issues: Dict[str, int] = {}
 
     # -- state -----------------------------------------------------------
     def _load(self) -> Dict[str, Any]:
@@ -321,6 +404,23 @@ class Watcher:
             del logs[gone]
         return seen
 
+    def _remember(self, state: Dict[str, Any]) -> None:
+        """Load the signature -> issue map and add each record's issue, so a
+        record pruned after a quiet day still knows where it was filed."""
+        raw = state.get("issues")
+        self.issues = {k: int(v) for k, v in (raw.items() if isinstance(raw, dict) else ())
+                       if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)}
+        for key, rec in state["sigs"].items():
+            number = rec.get("issue") if isinstance(rec, dict) else None
+            if isinstance(number, int) and not isinstance(number, bool):
+                self.issues[key] = number
+        state["issues"] = self.issues
+
+    def _forget_oldest(self) -> None:
+        for key, _ in sorted(self.issues.items(), key=lambda kv: kv[1])[
+                :max(0, len(self.issues) - ISSUES_MAX)]:
+            del self.issues[key]
+
     def _prune(self, sigs: Dict[str, Any]) -> None:
         for key in list(sigs):
             rec = sigs[key]
@@ -381,7 +481,10 @@ class Watcher:
     def _count_body(self, rec: Dict[str, Any]) -> str:
         return "\n".join([
             MARKER,
-            "Seen %d more times since the last count." % (rec["total"] - rec.get("told_total", 0)),
+            "Seen %d more times since the last count (this comment is edited in place)."
+            " Last seen %s."
+            % (rec["total"] - rec.get("told_total", 0),
+               time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_num(rec.get("last")) or self.now))),
             "",
             "Last example:",
             "```text",
@@ -412,15 +515,22 @@ class Watcher:
         was closed, so this appearance is not told again)."""
         rec["done"] = True
         number = _num(rec.get("issue"))
+        if number is None and key in self.issues:
+            # Filed before this appearance (its record pruned since), maybe
+            # retitled or relabelled by the brain: the same rolling issue.
+            number = rec["issue"] = self.issues[key]
         if number is not None and not self._is_open(int(number)):
             number = rec["issue"] = None
+            self.issues.pop(key, None)
         if number is None and kind == "count":
             self._told(rec)
             return "closed"
         if number is None:
             number = self._open_titled(key)
         if number is not None:
-            rec["issue"] = int(number)
+            if rec.get("issue") != int(number):
+                rec.pop("count_comment", None)
+            rec["issue"] = self.issues[key] = int(number)
             return self._count(rec)
         body = self._body(key, rec)
         try:
@@ -433,16 +543,33 @@ class Watcher:
                             {"title": key, "body": body, "labels": [LABEL]}).data
         self.writes += 1
         rec["issue"] = int(made["number"]) if isinstance(made, dict) and "number" in made else None
+        if rec["issue"] is not None:
+            self.issues[key] = rec["issue"]
         self._told(rec)
         self.say("watch: filed %s#%s for a repeated %s line"
                  % (self.repo, rec["issue"], key.split(": ", 1)[0]))
         return "filed"
 
     def _count(self, rec: Dict[str, Any]) -> str:
+        """One count comment per issue, edited in place each hour after the
+        first: an edit sends no email, a new comment does."""
         body = self._count_body(rec)
         _text.check(body)
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, rec["issue"]),
-                     {"body": body})
+        comment = rec.get("count_comment")
+        if isinstance(comment, int) and not isinstance(comment, bool):
+            try:
+                self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (self.repo, comment),
+                             {"body": body})
+                self.writes += 1
+                self._told(rec)
+                return "counted"
+            except GitHubError as err:
+                if err.status != 404:
+                    raise
+        made = self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (self.repo, rec["issue"]),
+                            {"body": body}).data
+        if isinstance(made, dict) and isinstance(made.get("id"), int):
+            rec["count_comment"] = int(made["id"])
         self.writes += 1
         self._told(rec)
         return "counted"
@@ -468,6 +595,7 @@ class Watcher:
         state = self._load()
         seen = self._scan(state)
         sigs = state["sigs"]
+        self._remember(state)
         self._prune(sigs)
         done: Dict[str, int] = {}
         try:
@@ -488,4 +616,5 @@ class Watcher:
                 state["said"] = self.now
                 hour = {}
             state["hour"] = hour
+            self._forget_oldest()
             self._save(state)

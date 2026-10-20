@@ -213,6 +213,26 @@ class Intake(Base):
                 with self.assertRaises(health.NotLooked):
                     health.findings(doc)
 
+    def test_a_key_with_an_apostrophe_is_read_and_its_finding_returned(self):
+        # A live key carrying an apostrophe blinded intake to every finding of
+        # its goal: one key outside the shape made the whole read "not looked".
+        key = "stuck:Waiting on Member 7's card"
+        item = finding(key=key, title="Member 7's card is never charged")
+        found, refused = health.findings({"findings": [item]})
+        self.assertEqual([f.key for f in found], [key])
+        self.assertEqual(refused, {})
+        self.doc["findings"] = [item]
+        self.run_once()
+        self.assertEqual(len(self.briefs), 1)
+        self.assertEqual(self.said, ["health %s#1: briefed https://github.com/%s/issues/100 (P1)"
+                                     % (REPO, REPO)])
+
+    def test_a_key_with_a_character_outside_the_contract_is_still_not_looked(self):
+        for key in ("stuck:Waiting on Member `7` card", "stuck:Waiting on Member 7\ncard"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(health.NotLooked, "finding field key"):
+                    health.findings({"findings": [finding(key=key)]})
+
     def test_text_that_could_leak_refuses_the_finding_without_a_scrub(self):
         leaks = ["see https://example.com/x", "visit www.example", "host 10.0.0.12 is down",
                  "the box at srv-1.example.lan", "mail ops@example.com", "ask the bot @someone",
@@ -303,6 +323,161 @@ class Intake(Base):
         self.gh.closed[100] = {"state": "closed", "state_reason": "completed"}
         self.run_once()
         self.assertEqual(len(self.briefs), 1)
+
+
+class SameCause(Base):
+    """One rolling ticket per cause: a finding whose cause already has an
+    open ticket joins it instead of filing another (the same step across
+    members, or a key whose shape changed)."""
+
+    STEP = "Waiting on the payment step"
+
+    def legacy_ticket(self, number=100, title="Health: Ana is stuck: " + STEP,
+                      key="stuck:Ana:" + STEP, priority="P1"):
+        issue = self.open_ticket(number, sha(finding(key=key)), priority)
+        issue["title"] = title
+        issue["body"] = issue["body"].replace(
+            "## Why\nx", "## Why\nthe endpoint reports a live problem in the search area")
+        return issue
+
+    def step_finding(self, **extra):
+        item = {"key": "stuck:" + self.STEP, "title": "3 members are stuck: " + self.STEP,
+                "evidence": "Ana, Bo, Cy; the card form never answers"}
+        item.update(extra)
+        return finding(**item)
+
+    def comments(self):
+        return [w[2]["body"] for w in self.gh.writes
+                if w[0] == "POST" and w[1].endswith("/comments")]
+
+    def test_the_cause_of_a_title_drops_who_it_hits(self):
+        self.assertEqual(health.cause("Ana is stuck: Checkout: card step"),
+                         health.cause("3 members are stuck: Checkout: card step"))
+        self.assertEqual(health.cause("Health: Ana is stuck: Checkout: card step"),
+                         "stuck: checkout: card step")
+        self.assertEqual(health.cause("Ana waits on slow search"), "ana waits on slow search")
+        self.assertNotEqual(health.cause("Ana is stuck: Signing in"),
+                            health.cause("Ana is stuck: Waiting on the payment step"))
+
+    def test_a_finding_whose_cause_has_an_open_ticket_joins_it_instead_of_a_new_one(self):
+        issue = self.legacy_ticket()
+        self.doc["findings"] = [self.step_finding()]
+        self.run_once()
+        self.assertEqual(self.briefs, [])
+        patch = [w for w in self.gh.writes if w[0] == "PATCH"]
+        self.assertEqual(len(patch), 1)
+        self.assertEqual(patch[0][1], "/repos/%s/issues/100" % REPO)
+        body = patch[0][2]["body"]
+        self.assertIn(health.MARKER % sha(self.step_finding()), body)
+        self.assertIn(health.MARKER % sha(finding(key="stuck:Ana:" + self.STEP)), body)
+        self.assertEqual(issue["body"], body)
+        # One seen-again note with the count, and no "absent" note for the
+        # old marker: its cause is still reported.
+        notes = self.comments()
+        self.assertEqual(len(notes), 1)
+        self.assertIn(health.RESEEN_MARKER, notes[0])
+        self.assertIn("Seen again 1 time", notes[0])
+        self.assertIn("last seen 2030-01-02T00:00:00Z", notes[0])
+        self.assertNotIn("absent", "".join(notes))
+        self.assertTrue(any("joined #100" in s for s in self.said))
+        # The next pass finds the finding's own marker: nothing more.
+        writes = len(self.gh.writes)
+        self.run_once(NOW + 900)
+        self.assertEqual(self.briefs, [])
+        self.assertEqual(len(self.gh.writes), writes)
+
+    def test_a_clipped_ticket_title_still_names_its_cause(self):
+        step = "Waiting on the address form of the very long checkout flow"
+        title = health.ticket_title(health._finding(finding(
+            key="stuck:Dee:" + step, title="Dee is stuck: " + step))[0])
+        self.assertTrue(title.endswith("..."))
+        self.legacy_ticket(title=title, key="stuck:Dee:" + step)
+        self.doc["findings"] = [finding(key="stuck:" + step,
+                                        title="2 members are stuck: " + step)]
+        self.run_once()
+        self.assertEqual(self.briefs, [])
+
+    def test_the_same_cause_in_another_area_files_its_own_ticket(self):
+        self.legacy_ticket()
+        self.doc["findings"] = [self.step_finding(area="checkout")]
+        self.run_once()
+        self.assertEqual(len(self.briefs), 1)
+
+    def test_a_ticket_without_a_health_marker_is_not_joined(self):
+        self.gh.open.append({"number": 100, "title": "Health: Ana is stuck: " + self.STEP,
+                             "body": "Priority: P1\n\n## Why\nx",
+                             "labels": [{"name": "loom:ticket"}]})
+        self.doc["findings"] = [self.step_finding()]
+        self.run_once()
+        self.assertEqual(len(self.briefs), 1)
+
+    def test_joining_raises_the_priority_for_a_more_urgent_finding_and_never_lowers_it(self):
+        issue = self.legacy_ticket(priority="P2")
+        self.doc["findings"] = [self.step_finding(hours=80.0)]  # 3 x 80 = 240: P0
+        self.run_once()
+        self.assertEqual(tickets.priority_of(issue), "P0")
+        self.setUp()
+        issue = self.legacy_ticket(priority="P0")
+        self.doc["findings"] = [self.step_finding(hours=1.0)]  # P3
+        self.run_once()
+        self.assertEqual(tickets.priority_of(issue), "P0")
+        self.run_once(NOW + 900)
+        self.assertEqual(tickets.priority_of(issue), "P0")
+
+    def test_two_new_findings_with_one_cause_file_one_ticket(self):
+        self.doc["findings"] = [finding(key="stuck:Ana:x", title="Ana is stuck: " + self.STEP),
+                                finding(key="stuck:Bo:x", title="Bo is stuck: " + self.STEP)]
+        self.run_once()
+        self.assertEqual(len(self.briefs), 1)
+        self.gh.open[0]["title"] = self.briefs[0]["title"]
+        self.run_once(NOW + 900)
+        self.assertEqual(len(self.briefs), 1)
+        body = self.gh.open[0]["body"]
+        for item in self.doc["findings"]:
+            self.assertIn(health.MARKER % sha(item), body)
+
+    def test_a_returning_finding_gets_a_seen_again_note_at_most_once_a_day(self):
+        self.open_ticket(100, sha())
+        self.run_once()
+        self.doc["findings"] = []
+        self.run_once(NOW + 900)
+        self.doc["findings"] = [finding()]
+        self.run_once(NOW + 1800)
+        notes = [c for c in self.comments() if health.RESEEN_MARKER in c]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Seen again 1 time", notes[0])
+        # Gone and back again within the day: counted, not posted.
+        self.doc["findings"] = []
+        self.run_once(NOW + 2700)
+        self.doc["findings"] = [finding()]
+        self.run_once(NOW + 3600)
+        self.assertEqual(len([c for c in self.comments() if health.RESEEN_MARKER in c]), 1)
+        self.assertEqual(self.briefs, [])
+        # A day after the last note, the count so far is posted once.
+        self.run_once(NOW + 1800 + health.RESEEN_EVERY)
+        self.run_once(NOW + 2700 + health.RESEEN_EVERY)
+        notes = [c for c in self.comments() if health.RESEEN_MARKER in c]
+        self.assertEqual(len(notes), 2)
+        self.assertIn("Seen again 2 times", notes[1])
+
+    def test_a_not_planned_ticket_is_remembered_after_its_finding_goes_quiet(self):
+        # The ticket was closed as not planned while the finding was absent;
+        # the finding coming back must not file the same ticket again.
+        self.open_ticket(100, sha())
+        self.run_once()
+        self.doc["findings"] = []
+        self.run_once(NOW + 900)
+        self.gh.open.clear()
+        self.gh.closed[100] = {"state": "closed", "state_reason": "not_planned"}
+        self.run_once(NOW + 1800)
+        self.doc["findings"] = [finding()]
+        self.run_once(NOW + 2700)
+        self.assertEqual(self.briefs, [])
+        # Long gone records are still dropped.
+        self.doc["findings"] = []
+        self.run_once(NOW + 3600)
+        self.run_once(NOW + 3600 + health.RETAIN + 1)
+        self.assertEqual(self.state["keys"][REPO + "#1"], {})
 
 
 class Sources(unittest.TestCase):

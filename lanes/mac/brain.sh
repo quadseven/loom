@@ -203,6 +203,24 @@ bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
 brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record lock step"
 
+# With GitHub App settings (the Loom Brain App) the tick writes as that App,
+# never as the operator (loom#1142): every rung's gh and GitHub API calls get
+# the App's installation token, which lasts an hour, longer than a tick. A
+# personal token in the environment is dropped first, so a failed mint runs
+# no rung at all.
+if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+  [ "$MINUTES" -le 50 ] ||
+    { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
+  unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
+  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_]+$ ]]; then
+    say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
+    beat failed 1
+    exit 1
+  fi
+  export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
+  unset app_token
+fi
+
 # A rung may have changed the checkout (a hook, a config, an edited
 # docs/MUSE.md the next tick would follow). Each tick starts from origin's
 # head: fetched and reset with hooks and fsmonitor off, and untracked and
@@ -300,7 +318,12 @@ for lane in $LADDER; do
   runs=$((runs + 1))
   say "tick end (exit $code)"
   [ "$code" -ne 0 ] && [ "$runs" -lt 2 ] || break
-  classify_failure "$code" "$(tail -c +$((log_start + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)" ""
+  # Classify from the whole tick output (loom#934): a limit printed before more
+  # CLI output must still be a limit. The short tail stays the tail for the
+  # auth/transient patterns and the reason shown to people.
+  whole_output="$(tail -c +$((log_start + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  fail_tail="$(printf '%s\n' "$whole_output" | tail -n 5)"
+  classify_failure "$code" "$whole_output" "" "$fail_tail"
   [ "$FAIL_CLASS" = limit ] || break
   say "lane $RUNG hit a limit; the tick moves to the next rung with usage"
 done

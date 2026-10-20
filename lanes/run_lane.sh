@@ -63,10 +63,15 @@ SLOT="${1:?usage: run_lane.sh <lane>}"
 # The provider lane: the slot without a trailing -<n> (opencode-go stays whole).
 LANE="$SLOT"
 [[ "$SLOT" =~ -[0-9]+$ ]] && LANE="${SLOT%-*}"
+# A free provider slot (free-ollama, free-kilo, ...) is lane free: one
+# OpenAI-compatible route per provider in the spark-gateway's free pool
+# (infra#5617). Not a Spark: it shares the spark lane's endpoint handling.
+[[ "$SLOT" =~ ^free-[a-z]+$ ]] && LANE=free
 LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -112,13 +117,31 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+# The check's scratch home (CHECK_HOME, a few hundred MB once a check has
+# built its caches) goes with the runner, before the lock is let go, so run/
+# holds one only while its lane is running (loom#643).
+drop_check_home() { [ -z "${CHECK_HOME:-}" ] || rm -rf "$CHECK_HOME"; }
+trap 'drop_check_home; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
-CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
+# A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
+# writes as that App, never as the operator (loom#1142): lanes opened 58 pull
+# requests as the operator in a day. It clones over https, and each run mints
+# an installation token for gh and git (lane_app_token); the agent never gets
+# it, its settings or git's helper. LOOM_APP_TOKEN_CMD, when set, is the command
+# that prints the token in place of `python3 -m bus app token`.
+if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+  CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
+  # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
+  export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.https://github.com.helper \
+    GIT_CONFIG_VALUE_0="" GIT_CONFIG_KEY_1=credential.https://github.com.helper \
+    GIT_CONFIG_VALUE_1="!gh auth git-credential"
+else
+  CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
+fi
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$SLOT"
 # The agy lane's agent runs as a dedicated macOS user (default "loom") that
@@ -220,14 +243,14 @@ SUMMARY_FILE=.loom/summary.md
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and the runner posts it on the ticket as the answer.\n' "$SUMMARY_FILE"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and the runner posts it on the ticket as the answer.\n' "$SUMMARY_FILE"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
@@ -316,7 +339,7 @@ prepare_intent() {
 }
 
 pr_body() {
-  local size issue refs=""
+  local size issue refs="" criteria
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -327,8 +350,10 @@ pr_body() {
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
+  criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
-    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
+    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
@@ -506,6 +531,55 @@ post_no_change() {
 # The reason starts with the failure's class ($3, default work): the station
 # re-briefs limit and transient failures to another lane as a new attempt,
 # and leaves work failures to the brain.
+# A lane whose runs fail [transient] TRANSIENT_STRIKES times in a row rests
+# TRANSIENT_REST seconds, unavailable "at a limit", so the station stops
+# sending it tickets and the factory moves its briefed ones aside. A free
+# model answering "Unexpected server error" to every run failed 14 of zen's
+# 40 runs on 2026-10-19 while the lane kept claiming. A run that ends any
+# other way clears the count.
+TRANSIENT_STRIKES=3
+TRANSIENT_REST=1800
+TRANSIENT_FILE="$LOOM_HOME/state/usage/$SLOT.transient"
+transient_rest_until() {
+  local count until
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || return 1
+  [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
+}
+# Count one transient run; prints the epoch the lane rests until once the
+# count reaches TRANSIENT_STRIKES, and fails before that.
+transient_strike() {
+  local count until now
+  now="$(date +%s)"
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || count=0
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  count=$((count + 1))
+  if [ "$count" -ge "$TRANSIENT_STRIKES" ]; then
+    printf '0 %s\n' "$((now + TRANSIENT_REST))" > "$TRANSIENT_FILE"
+    printf '%s' "$((now + TRANSIENT_REST))"
+    return 0
+  fi
+  printf '%s 0\n' "$count" > "$TRANSIENT_FILE"
+  return 1
+}
+transient_clear() { rm -f "$TRANSIENT_FILE"; }
+
+# Mint this run's App token into GH_TOKEN. A personal token in the
+# environment is dropped first, so a failed mint leaves gh with nothing to
+# post as. Installation tokens last an hour: a run mints again after its agent.
+lane_app_token() {
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  local token
+  unset GH_TOKEN GITHUB_TOKEN
+  if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
+    token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
+  else
+    token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
+  fi
+  [[ "$token" =~ ^[A-Za-z0-9_]+$ ]] || return 1
+  export GH_TOKEN="$token"
+}
+APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
+
 park() {
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
   echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $2" | tee -a "$LOG" >&2
@@ -640,6 +714,8 @@ SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_WHY=""
+# Whether the provider answered the last probe at all (provider_at_limit).
+PROBE_ANSWERED=0
 # An expired key holds a lane with no retry time, so its reason is the whole
 # of it: "API key expired: renew <the SSM parameter, or the lane sign-in>".
 AUTH_HELD=""
@@ -652,10 +728,10 @@ spark_probe() {
   local code status
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
-  if [ "$status" -eq 7 ]; then LIMIT_WHY="the spark endpoint refused the connection"; return 1; fi
-  if [ "$code" = 503 ]; then LIMIT_WHY="the spark endpoint answered 503"; return 1; fi
+  if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
+  if [ "$code" = 503 ]; then LIMIT_WHY="the $LANE endpoint answered 503"; return 1; fi
   [ "$status" -eq 0 ] && return 0
-  READY_REASON="the spark endpoint did not answer (curl exit $status)"
+  READY_REASON="the $LANE endpoint did not answer (curl exit $status)"
   return 2
 }
 
@@ -701,11 +777,27 @@ spark_ready() {
 # The key goes to curl as a config file on stdin, written by the printf
 # builtin, so it reaches no process's argv and no log.
 PROBE_TIMEOUT=20
+# How long a lane waits before it asks the provider again whether the limit
+# has lifted. The provider's allowance refills while the lane sleeps (OpenCode
+# Go refills 20% of a model's allowance every 5 hours), so a lane that waited
+# out the whole window sat idle for days while the provider served it again
+# (opencode-go, 2026-10-20: the lane-held invariant fired and the tier's
+# tickets waited behind a lane the provider had long since freed).
+LIMIT_RECHECK=1800
+
+# The provider's own word for a usage limit. It is in the body the provider
+# answers with and in the reason the heartbeat carries, so a lane that asks
+# the provider again can tell a hold the probe took from a hold the agent CLI
+# recorded (a model it no longer offers, an expired key, a spent allowance).
+GO_LIMIT_ERROR="GoUsageLimitError"
 
 # 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
 # MODEL; 1 for any other answer, no answer, or no probe configured.
+# PROBE_ANSWERED says the provider answered at all, so a lane that asks it
+# again can tell a provider that serves it from one it cannot reach.
 provider_at_limit() {
   local url header session model body out code limit_name headers retry_after stamp
+  PROBE_ANSWERED=0
   url="$(lane_setting PROBE_URL)" header="$(lane_setting PROBE_HEADER)"
   [ -n "$url" ] && [ -n "$API_KEY" ] || return 1
   [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 1
@@ -725,24 +817,91 @@ provider_at_limit() {
       -H 'Content-Type: application/json' ${header:+-H "$header: $session"} \
       --data-binary "$body" "$url" 2>/dev/null)"; then
     rm -f "$headers"
+    provider_checked
     return 1
   fi
+  PROBE_ANSWERED=1
+  provider_checked
   code="${out##*$'\n'}" body="${out%$'\n'*}"
-  if [ "$code" != 429 ] || [[ "$body" != *GoUsageLimitError* ]]; then
+  if [ "$code" != 429 ] || [[ "$body" != *"$GO_LIMIT_ERROR"* ]]; then
     rm -f "$headers"
     return 1
   fi
   limit_name="$(printf '%s' "$body" | sed -nE 's/.*"limitName" *: *"([A-Za-z0-9_-]+)".*/\1/p' | head -1)"
-  retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
+  # The provider's Retry-After header, in any case: the awk on the lane
+  # machine has no IGNORECASE, so a case-sensitive match never read it and
+  # every limit fell back to the window name (2026-10-20).
+  retry_after="$(awk 'tolower($0) ~ /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
   rm -f "$headers"
   retry_after="$(printf '%s' "$retry_after" | tr -cd '[:alnum:], :-')"
   stamp="$(date +%s)"
   [[ "$retry_after" =~ ^[0-9]+$ ]] && retry_after=$((stamp + retry_after))
-  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s"}\n' \
-    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
+  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s", "model": "%s"}\n' \
+    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" "$model" \
+    > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
     mv -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
-  LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 GoUsageLimitError)"
+  LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 $GO_LIMIT_ERROR)"
   return 0
+}
+
+# When the provider was last asked whether it is at a limit: the epoch, one
+# line. A lane held by a limit asks it again every LIMIT_RECHECK minutes
+# (provider_limit_lifted), so the hold ends when the provider serves it.
+provider_checked() {
+  mkdir -p "$LOOM_HOME/state/usage"
+  printf '%s\n' "$(date +%s)" > "$LOOM_HOME/state/usage/$SLOT.provider-check"
+}
+
+# Whether the lane asks the provider again: the last probe was at least
+# LIMIT_RECHECK minutes ago, and the hold in force is the one the probe took
+# (its reason names the provider's limit; no other hold carries that).
+provider_recheck_due() {
+  local at reason
+  [ -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" ] || return 1
+  reason="$(sed -nE 's/.*"reason": *"([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  case "$reason" in *"$GO_LIMIT_ERROR"*) ;; *) return 1 ;; esac
+  at="$(cat "$LOOM_HOME/state/usage/$SLOT.provider-check" 2>/dev/null)"
+  [[ "$at" =~ ^[0-9]+$ ]] || return 1
+  [ "$(( $(date +%s) - at ))" -ge "$LIMIT_RECHECK" ]
+}
+
+# Whether the provider serves this lane again. The provider is asked at most
+# once every LIMIT_RECHECK minutes, and only for a hold the probe itself took:
+# a hold the agent CLI recorded (a model it no longer offers, a spent
+# allowance) stands, for no probe says otherwise. A provider that cannot be
+# reached is not a provider that serves the lane: the hold stands.
+provider_limit_lifted() {
+  local model key_ssm
+  provider_recheck_due || return 1
+  [ -n "$(lane_setting PROBE_URL)" ] || return 1
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || return 1
+  API_KEY="$(ssm_value "$key_ssm")"
+  [ -n "$API_KEY" ] || return 1
+  # The model the probe found at a limit: the provider's answer is about that
+  # model, so that is the model to ask about again.
+  model="$(sed -nE 's/.*"model": *"([A-Za-z0-9._:/@-]+)".*/\1/p' \
+    "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" 2>/dev/null | head -1)"
+  [ -n "$model" ] || model="$(lane_setting MODEL)"
+  [ -n "$model" ] || return 1
+  MODEL="$model"
+  if provider_at_limit; then
+    hold_provider_limit
+    return 1
+  fi
+  [ "${PROBE_ANSWERED:-0}" = 1 ] || return 1
+  lift_provider_limit
+  return 0
+}
+
+# The provider serves the group again: the hold is over for every slot that
+# shares the account. The record of the refusal stays: it is the last 429 the
+# Usage view shows.
+lift_provider_limit() {
+  local slot
+  for slot in $(key_group); do
+    write_beat "$slot" true ""
+  done
 }
 
 # A free lane whose provider has a read-only meter (openrouter: the key's
@@ -924,6 +1083,16 @@ record_model_limit() {
     printf '%s %s %s\n' "$model" "$ends" "$(printf '%s' "$why" | tr -cd '[:alnum:] ._:-')"; } > "$tmp"
   mv "$tmp" "$MODEL_LIMIT_FILE"
 }
+# The epoch the last of the lane's configured models comes off its limit;
+# fails when one of them is not limited now.
+all_models_limited_until() {
+  local model ends last=0
+  for model in $CONFIGURED_MODELS; do
+    ends="$(model_limit_until "$model")" || return 1
+    [ "$ends" -gt "$last" ] && last="$ends"
+  done
+  [ "$last" -gt 0 ] && printf '%s' "$last"
+}
 ladder_reason() {
   local models="$1" model ends why="" first=1
   for model in $models; do
@@ -1028,6 +1197,25 @@ contract_command_ok() {
   [ "${#1}" -le 1000 ] && [ "$1" = "$(printf '%s' "$1" | LC_ALL=C tr -cd ' -~')" ]
 }
 
+# Remove untracked virtual environments left by the agent before the final
+# check. Their interpreter symlinks can point outside the check sandbox.
+# A .venv containing any tracked path is retained intact.
+remove_untracked_venvs() {
+  local candidate relative tracked
+  while IFS= read -r -d '' candidate; do
+    relative="${candidate#"$TREE"/}"
+    tracked="$(safe_git ls-files -- "$relative")" || return 1
+    [ -z "$tracked" ] || continue
+    rm -rf -- "$candidate" || return 1
+  done < <(find "$TREE" -type d -name .venv -prune -print0)
+}
+
+validation_interpreter_denied() {
+  local status="$1" output="$2"
+  [ "$status" -ne 0 ] && [[ "$output" == *"Failed to query Python interpreter"* &&
+    "$output" == *"Operation not permitted"* ]]
+}
+
 # One line of $RECORD per step: phase, command, exit code, the tree revision
 # it ran on, and whether it passed. Only a final line with "ok": true lets the
 # runner open (or push to) a pull request.
@@ -1060,6 +1248,27 @@ open_issue() {
     --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
     -- "$1" 2>>"$LOG" | head -1
 }
+# Each open incident this machine filed or updated, one file per repo and
+# kind holding its number, so a run whose check passes can close it without
+# a search. Nothing closed incidents: 16 tickets sat held behind five whose
+# checks had passed again for hours (2026-10-19).
+INCIDENT_DIR="$LOOM_HOME/state/incidents"
+incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
+# Close this repo's environment and base-check incidents once the check has
+# passed on the unmodified base; the station then releases their tickets.
+resolve_factory_incidents() {
+  local kind file number
+  for kind in environment base-check; do
+    file="$(incident_file "$kind")"
+    [ -f "$file" ] || continue
+    number="$(tr -cd '0-9' < "$file")"
+    if [ -n "$number" ]; then
+      gh issue close --repo "$FACTORY_REPO" "$number" \
+        --comment "Cleared: the check passed on the unmodified base in $TICKET." >>"$LOG" 2>&1 || continue
+    fi
+    rm -f "$file"
+  done
+}
 file_factory_incident() {  # kind, detail
   local kind="$1" detail="$2" title body number existing
   title="Factory incident: $REPO validation $kind"
@@ -1079,6 +1288,7 @@ file_factory_incident() {  # kind, detail
     case "$number" in ''|*[!0-9]*) number="" ;; esac
   fi
   if [ -n "$number" ]; then
+    mkdir -p "$INCIDENT_DIR" && printf '%s\n' "$number" > "$(incident_file "$kind")"
     printf 'factory incident %s#%s' "$FACTORY_REPO" "$number"
   else
     printf 'factory incident filing failed'
@@ -1106,9 +1316,25 @@ note_factory_incident() {  # kind, detail, reason_var_name
 # branch, and contract_command_ok refuses (exit 125, nothing run) any string
 # that is not one bounded line of printable ASCII.
 contract_run() {
-  local profile
+  local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins=""
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
-  profile="$(AGENT_HOME="$CHECK_HOME" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
+  # A contract that runs `uvx` failed every check with 127 on the unmodified
+  # base: the lane machine keeps uv and uvx in the runner's .local/bin,
+  # outside the runner's PATH, and the check sandbox refused to read them.
+  # Find both with command -v, falling back to the runner's .local/bin,
+  # put their directories on the check's PATH, and name their exact paths
+  # in CHECK_UV_BINS so the check profile allows those two files only.
+  for tool in uv uvx; do
+    uv_bin="$(command -v "$tool" 2>/dev/null)" || uv_bin=""
+    [ -x "$uv_bin" ] || uv_bin="$HOME/.local/bin/$tool"
+    [ -x "$uv_bin" ] || continue
+    uv_bin="$(realpath "$uv_bin" 2>/dev/null)" && [ -n "$uv_bin" ] || continue
+    uv_dir="$(dirname "$uv_bin")"
+    case ":$uv_path_dirs:" in *":$uv_dir:"*) ;; *)
+      uv_path_dirs="${uv_path_dirs:+$uv_path_dirs:}$uv_dir" ;; esac
+    uv_bins="${uv_bins:+$uv_bins }$uv_bin"
+  done
+  profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
   # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
   (
     cd "$TREE" || exit 125
@@ -1119,13 +1345,72 @@ contract_run() {
     # python3 on an arm64 host without Rosetta) made uv exit 2 before any
     # test, so every muster lane run failed on the unmodified base
     # (2026-10-16).
-    export PATH="$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
+    export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     exec timeout "$CHECK_TIMEOUT" sandbox-exec -p "$profile" /bin/bash -c "$1" < /dev/null
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
 
 tracked_changes() {
   safe_git status --porcelain --untracked-files=no --ignore-submodules=dirty | head -5 | tr '\n' ' '
+}
+
+# Check the trusted default branch in its own worktree when a fix branch is
+# red or has merge conflicts. The merged branch and its setup files remain
+# available for the agent. DEFAULT_EXIT is the default branch's check result.
+check_default_branch() {
+  local branch_tree="$TREE" branch_home="$CHECK_HOME" default_tree="$WORKDIR/$TICKET-default-check" rc=0
+  DEFAULT_EXIT="" DEFAULT_CHANGED=""
+  DEFAULT_REV="$(safe_git rev-parse "origin/$FIX_DEFAULT")" || {
+    SETUP_REASON="could not read the default branch revision"; return 1;
+  }
+  # A local clone, not a worktree: a worktree's .git is a file naming the
+  # fix tree's .git, which the check sandbox cannot read, so every check that
+  # runs git failed there (loom's metrics tests, a false base-check incident
+  # on each loom fix round, 2026-10-19). The clone hardlinks its objects and
+  # takes the real origin, so relative submodule URLs still resolve. The fix
+  # tree is shallow, so git ignores --local and copies only its branches:
+  # the fetch brings origin's default branch across, which a conflicting
+  # round has not merged (2026-10-20). A checkout that still fails is the
+  # runner's fault, not the ticket's: a factory incident, so the round
+  # spends no ladder attempt and never counts toward the runaway hold.
+  if ! { timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+           clone -q --local --no-checkout "$branch_tree" "$default_tree" >> "$LOG" 2>&1 &&
+         timeout "$NET_TIMEOUT" git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+           fetch -q --update-shallow "$branch_tree" "+refs/remotes/origin/$FIX_DEFAULT:refs/remotes/origin/$FIX_DEFAULT" >> "$LOG" 2>&1 &&
+         git -C "$default_tree" -c core.hooksPath=/dev/null remote set-url origin \
+           "$(safe_git remote get-url origin)" >> "$LOG" 2>&1 &&
+         git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+           checkout -q --detach "$DEFAULT_REV" >> "$LOG" 2>&1; }; then
+    rm -rf "$default_tree"
+    SETUP_REASON="could not check out the default branch for validation"
+    note_factory_incident environment "could not check out $FIX_DEFAULT at $DEFAULT_REV for validation" SETUP_REASON
+    return 1
+  fi
+  TREE="$default_tree" CHECK_HOME="$branch_home-default"
+  if ! mkdir -p "$CHECK_HOME/tmp"; then
+    SETUP_REASON="could not prepare the default branch check home"; rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+         -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
+    SETUP_REASON="default branch submodule checkout failed"; rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$C_SETUP" ]; then
+    contract_run "$C_SETUP"; rc=$?
+    [ "$rc" -eq 0 ] || SETUP_REASON="default branch setup exited $rc"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    contract_run "$C_CHECK"; DEFAULT_EXIT=$?
+    DEFAULT_CHANGED="$(tracked_changes)"
+    record default-baseline "$C_CHECK" "$DEFAULT_EXIT" "$DEFAULT_REV" \
+      "$([ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ] && echo true || echo false)" \
+      "${DEFAULT_CHANGED:+changed tracked files: $DEFAULT_CHANGED}"
+  fi
+  TREE="$branch_tree" CHECK_HOME="$branch_home"
+  rm -rf "$branch_home-default"
+  if ! rm -rf "$default_tree"; then
+    SETUP_REASON="could not remove the default branch validation tree"; return 1
+  fi
+  [ "$rc" -eq 0 ]
 }
 
 # What setup and the first check leave untracked (a venv, caches) stays out
@@ -1141,14 +1426,12 @@ exclude_untracked() {
 }
 
 # Before the agent: interpreter, submodules, setup, then the check on the
-# base (recorded, so a failure the base already had is told apart from one
-# the agent caused). A failure the repo did not cause -- the contract cannot
-# be read, the environment cannot run the check, or the check is already
-# red on the unmodified base -- is a factory incident, not a [work]
-# failure: the ticket keeps its rung. Returns 1 with SETUP_REASON when the
-# environment cannot be prepared.
+# current tree. A fix round checks the branch after merging the default
+# branch; a red result is compared with the default branch's own head.
+# Only a red default branch check is a base-check factory incident. Returns
+# 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what
+  local rc interp="" subs="" changed what baseline_rev
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -1171,6 +1454,20 @@ prepare_validation() {
   CHECK_CLI="${C_INTERP:-bash}"
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
+  if [ -n "$CONFLICTS" ]; then
+    check_default_branch || return 1
+    BASELINE_EXIT="$DEFAULT_EXIT"
+    if [ -n "$DEFAULT_CHANGED" ]; then
+      SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
+      return 1
+    fi
+    if [ "$BASELINE_EXIT" -ne 0 ]; then
+      SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
+      note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      return 1
+    fi
+    return 0
+  fi
   # C_SETUP and C_CHECK are shell on purpose, like a CI run: step. They are
   # validated in load_contract: read only from the base branch (never the
   # agent's), one line of printable ASCII, at most 1000 characters; and
@@ -1182,7 +1479,8 @@ prepare_validation() {
   fi
   contract_run "$C_CHECK"; BASELINE_EXIT=$?
   changed="$(tracked_changes)"
-  record baseline "$C_CHECK" "$BASELINE_EXIT" "$BASE" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
+  baseline_rev="$(safe_git rev-parse HEAD)"
+  record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
     "${changed:+changed tracked files: $changed}"
   # A check that cannot run, or is already red, on the unmodified base is
   # the factory's problem, not the ticket's: file the incident and stop
@@ -1193,7 +1491,28 @@ prepare_validation() {
       note_factory_incident environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1 ;;
   esac
+  # Only a pass on the trusted base clears an incident: a fix round's tree
+  # holds the agent's unmerged edits, so it counts only once the default
+  # branch itself passes (below).
+  [ -z "$FIX_PR" ] && [ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && resolve_factory_incidents
   if [ "$BASELINE_EXIT" -ne 0 ]; then
+    if [ -n "$FIX_PR" ]; then
+      check_default_branch || return 1
+      if [ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ]; then
+        resolve_factory_incidents
+        if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
+          SETUP_REASON="could not restore tracked files changed by the baseline check"
+          return 1
+        fi
+        exclude_untracked
+        return $?
+      fi
+      if [ "$DEFAULT_EXIT" -eq 0 ]; then
+        SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
+        return 1
+      fi
+      BASELINE_EXIT="$DEFAULT_EXIT"
+    fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
     note_factory_incident base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
@@ -1209,7 +1528,21 @@ final_validation() {
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
+  if ! remove_untracked_venvs; then
+    VALIDATION_REASON="validation environment unavailable: could not remove untracked virtual environments"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" 125 "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   contract_run "$C_CHECK"; rc=$?
+  if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
+    VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" "$rc" "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
@@ -1223,6 +1556,8 @@ final_validation() {
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "${changed:+changed tracked files: $changed}"
+  # The last check of this brief has run; the next one starts a fresh home.
+  drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
 }
@@ -1369,12 +1704,15 @@ agy_skills() {
 # them). Their briefs must name a public repo.
 trains_on_prompts() {
   case "$LANE:$MODEL" in zen:*|zai:*|agy:*|opencode-go:*muse-spark*contributor*) return 0 ;; esac
+  # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
+  # tests/test_bus_station.py keeps the two lists equal).
+  case "$SLOT" in free-nvidia|free-kilo|free-groq) return 0 ;; esac
   return 1
 }
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free) return 0 ;; esac
   return 1
 }
 
@@ -1394,6 +1732,7 @@ update_fix_branch() {
   if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     UPDATE_REASON="could not read the default branch"; return 1
   fi
+  FIX_DEFAULT="$default"
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
     UPDATE_REASON="could not fetch $default"; return 1
@@ -1497,7 +1836,7 @@ run_agent() {
     openrouter) opencode_agent OPENROUTER_API_KEY "$brief_text" ;;
     opencode-go) opencode_agent OPENCODE_API_KEY "$brief_text" ;;
     zen) opencode_agent - "$brief_text" ;;
-    spark) opencode_agent - "$brief_text" ;;
+    spark|free) opencode_agent - "$brief_text" ;;
     zai) opencode_agent ZHIPU_API_KEY "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent CLOUDFLARE_API_KEY "$brief_text" ;;
@@ -1553,14 +1892,14 @@ lane_ready() {
     return
   fi
   case "$LANE" in
-    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark) cli="$(opencode_bin)" ;;
+    codex) cli=codex ;; claude|anthropic) cli=claude ;; openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   command -v sandbox-exec > /dev/null || { READY_REASON="sandbox-exec not available"; return 1; }
-  case "$LANE" in zen) return 0 ;; spark) spark_ready; return ;; esac
+  case "$LANE" in zen) return 0 ;; spark|free) spark_ready; return ;; esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(ssm_value "$key_ssm")"
@@ -1614,6 +1953,11 @@ for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_T
   fi
 done
 
+if REST_UNTIL="$(transient_rest_until)"; then
+  heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+  exit 0
+fi
+
 # A provider limit hit by an earlier pass holds until its retry time. A
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
@@ -1621,8 +1965,17 @@ CONFIGURED_MODELS="$(lane_setting MODELS)"
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
-  heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
-  exit 0
+  # The provider's allowance refills while the lane sleeps, so the lane asks
+  # it again rather than waiting out the whole window (opencode-go,
+  # 2026-10-20: the lane sat idle for days while the provider served it).
+  if ! provider_limit_lifted; then
+    # The re-check may have found a reset of its own: the beat the group hold
+    # wrote says how long the lane waits now.
+    NEW_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+    [ -n "$NEW_UNTIL" ] && LIMIT_UNTIL="$NEW_UNTIL"
+    heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
+    exit 0
+  fi
 fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
@@ -1635,6 +1988,13 @@ if ! lane_ready; then
   # A limited lane, or one whose key expired, still passes over its inbox, to
   # hand every brief on.
   [ -n "$LIMITED" ] || [ -n "$AUTH_HELD" ] || exit 0
+elif [ -n "$CONFIGURED_MODELS" ] && ALL_LIMITED_UNTIL="$(all_models_limited_until)"; then
+  # Every model of the lane's ladder is limited: the lane is unavailable
+  # until the last lifts. Said available, the station claimed a ticket here
+  # every few minutes that failed at once on "all models limited" (agy, an
+  # account quota on all four of its models, 2026-10-19).
+  LIMITED=1
+  heartbeat false "limit: all models limited: $(ladder_reason "$CONFIGURED_MODELS")" "$ALL_LIMITED_UNTIL"
 else
   heartbeat true ""
   lane_meter
@@ -1647,6 +2007,7 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  PR_BODY=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
   BRANCH="$(field Branch "$BRIEF")"
@@ -1666,6 +2027,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY" limit; continue; fi
   if [ -n "$AUTH_HELD" ]; then park "$BRIEF" "$AUTH_WHY" auth; continue; fi
+  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -1730,6 +2092,8 @@ for BRIEF in "$INBOX"/*.md; do
     workersai:cloudflare-workers-ai/@cf/*) ;;
     spark:spark/?*) ;;
     spark:*) park "$BRIEF" "model $MODEL is not a spark model (spark/...)"; continue ;;
+    free:free/?*) ;;
+    free:*) park "$BRIEF" "model $MODEL is not a free provider model (free/...)"; continue ;;
     agy:gemini-*|agy:claude-*|agy:gpt-oss-*)
       case "$MODEL" in
         *-low|*-medium|*-high) ;;
@@ -1749,16 +2113,20 @@ for BRIEF in "$INBOX"/*.md; do
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
+  if ! REPO_PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
+    echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
+  fi
+  case "$REPO_PRIVATE" in
+    true|false) ;;
+    *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+  esac
   # Providers that train on prompts take public repos only. Asked before the
   # clone; a failed lookup proves nothing, so the brief waits for the next pass.
   if trains_on_prompts; then
-    if ! PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
-      echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
-    fi
-    case "$PRIVATE" in
+    case "$REPO_PRIVATE" in
       false) ;;
       true) park "$BRIEF" "$REPO is private; lane $LANE with $MODEL trains on prompts and takes public repos only"; continue ;;
-      *) echo "$TICKET: unexpected privacy answer '$PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+      *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
     esac
   fi
 
@@ -1808,13 +2176,10 @@ for BRIEF in "$INBOX"/*.md; do
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
-  # A verify run changes no code, so there is nothing to validate.
-  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
-    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
-  fi
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
   FIX_UPSTREAM=""
+  FIX_DEFAULT=""
   if [ -n "$FIX_PR" ]; then
     # BASE is taken first, so a clean merge alone counts as a change and an
     # out-of-date pull request is pushed up to date.
@@ -1827,6 +2192,10 @@ for BRIEF in "$INBOX"/*.md; do
       } > "$RUN_BRIEF"
     fi
   fi
+  # A verify run changes no code, so there is nothing to validate.
+  if [ "$DELIVERABLE" != verify ] && ! prepare_validation >> "$LOG" 2>&1; then
+    park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
+  fi
   LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
   # The agent runs as a background job of a job-control subshell, which puts
@@ -1835,14 +2204,16 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
-    (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+      run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
-  if [ "$STATUS" -ne 0 ] && [ "$LANE" = spark ] && { spark_probe; [ $? -eq 1 ]; }; then
+  if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
@@ -1860,19 +2231,38 @@ for BRIEF in "$INBOX"/*.md; do
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
   FAIL_CLASS=work
-  FAILURE_OUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$' | tail -n 5)"
+  # The whole run output (from LOG_START), for the limit and credit patterns;
+  # the short tail (its last five non-blank lines), kept for the reason shown
+  # to people and for the auth/transient patterns (loom#934).
+  RUN_OUTPUT="$(tail -c +$((LOG_START + 1)) "$LOG" | grep -v '^[[:space:]]*$')"
+  FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
-    classify_failure "$STATUS" "$FAILURE_OUT" "$EDITED"
+    classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
+  fi
+  if [ "$FAIL_CLASS" != transient ]; then
+    transient_clear
+  elif REST_UNTIL="$(transient_strike)"; then
+    heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
+    park "$BRIEF" "agent exited $STATUS" transient
+    break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
     # this lane the retry. The rest of the inbox waits for the reset.
-    if [[ "$(printf '%s' "$FAILURE_OUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
+    LIMIT_REASON="provider limit reached"
+    [[ "$RUN_OUTPUT" =~ $MODEL_GONE_RE ]] && LIMIT_REASON="model $MODEL not found by the agent CLI"
+    if [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
       heartbeat false "limit: out of credit; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
+    elif [ -n "$CONFIGURED_MODELS" ] &&
+         [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $ACCOUNT_QUOTA_RE ]]; then
+      LIMIT_REASON="account quota reached"
+      for candidate in $CONFIGURED_MODELS $MODEL; do
+        record_model_limit "$candidate" "$RETRY_AT" "$LIMIT_REASON"
+      done
+      heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ]; then
-      LIMIT_REASON="provider limit reached"
       record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
       WHY="$(ladder_reason "$CONFIGURED_MODELS")"
       MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
@@ -1886,7 +2276,6 @@ for BRIEF in "$INBOX"/*.md; do
         heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
       fi
     else
-      LIMIT_REASON="provider limit reached"
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
@@ -2017,6 +2406,40 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
+  if [ "$REPO_PRIVATE" = false ]; then
+    if [ ! -f "$LEAK_SCANNER" ]; then
+      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
+      continue
+    fi
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$BASE..HEAD" 2>&1)"; then
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
+      continue
+    fi
+    printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    if [ -z "$FIX_PR" ]; then
+      INTENT_CLASS=""
+      INTENT_TEXT=""
+      prepare_intent "$BRIEF" >> "$LOG" 2>&1
+      if [ -n "$DROPPED_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+      fi
+      PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+      PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
+        'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
+        park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
+      }
+      BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
+      printf '%s\n' "$PR_BODY" > "$BODY_FILE"
+      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" 2>&1)"; then
+        rm -f "$BODY_FILE"
+        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
+        continue
+      fi
+      rm -f "$BODY_FILE"
+      printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    fi
+  fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
@@ -2112,17 +2535,14 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
-  INTENT_CLASS=""
-  INTENT_TEXT=""
-  prepare_intent "$BRIEF" >> "$LOG" 2>&1
-  # Name every sandbox probe file the runner dropped, per the ticket.
-  if [ -n "$DROPPED_FILES" ]; then
-    INTENT_TEXT="${INTENT_TEXT}
-- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+  if [ "$REPO_PRIVATE" = true ]; then
+    INTENT_CLASS=""
+    INTENT_TEXT=""
+    prepare_intent "$BRIEF" >> "$LOG" 2>&1
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
-  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
   # Briefs are checked when filed, so this only fires on a brief filed
   # before that check or edited by hand: the PR still opens (the work is
   # done), and the log names what the review bot will hold it for.

@@ -35,6 +35,16 @@ complexity 15, no swallowed errors, no dead code, docs in step, ASCII
 only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
+Before pushing a branch or opening a pull request on a public repository, the
+lane runner uses infra-public's `check_private_leaks.py` in shape-only mode on
+the diff and generated pull request body. Set `LOOM_LEAK_SCANNER` to that
+script's path when it is not at `../infra-public/.github/scripts/check_private_leaks.py`
+relative to the Loom checkout. A missing scanner or a hit blocks the push.
+Private repositories skip this scan. Test IP addresses in public changes must
+use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
+`203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
+range bound must appear.
+
 ## Validation contract
 
 A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
@@ -75,8 +85,9 @@ lane and CI cannot drift apart. Unknown lines are refused.
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
   recovered.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
-  HOME (`run/<lane>-check`), under `sandbox-exec`, with network but no
-  access to the runner's HOME. A machine without `sandbox-exec` fails setup
+  HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
+  runner's HOME, but with the network and the writes outside HOME a step's
+  setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
@@ -176,7 +187,13 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 flags `loom:runaway`, and every lane that bills that key stays unavailable
 with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
 `retry_at`, until the value at that parameter changes. The runner opens one
-`needs-operator` ask on the factory repo naming that parameter. It reads
+`needs-operator` ask on the factory repo naming that parameter. opencode
+lanes run with `--print-logs --log-level ERROR`, because opencode's own
+output says only "UnknownError: Unexpected server error" for every provider
+fault: the logged error shows an upstream 429 (a limit) or a model opencode
+no longer offers (`ProviderModelNotFoundError`, which it reports for a model
+models.dev marks deprecated). A missing model is a limit on that model for
+24 hours, with `model <id> not found by the agent CLI` in the heartbeat. It reads
 `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
@@ -220,6 +237,28 @@ a permission Loom needs that it lacks. It never prints or writes the key or
 the tokens it mints. The dashboard takes the same three settings when its host has
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
+
+The station, the brain and the lanes each post as their own App, never as
+the operator (loom#1142). The installer writes the station's App
+(`LOOM_GITHUB_APP_*`) into the station and dashboard, `LOOM_LANES_GITHUB_APP_*`
+into every lane and `LOOM_BRAIN_GITHUB_APP_*` into the brain, each as that
+launchd job's own `LOOM_GITHUB_APP_*`; the brain keeps the station's App until
+it has its own, and half an App's settings install nothing.
+`python3 -m bus app token` prints the installation token of the App those
+settings name, and fails with no output without them. A lane with the
+settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
+start of each run and again after its agent (a token lasts an hour), clones
+over https with `gh` as git's credential helper, and runs its agent without
+the token, the App settings or that helper; a failed mint parks the run
+`[transient]` before anything is posted. `lanes/mac/brain.sh` mints once per
+tick, after the lock, and gives every rung that token as `GH_TOKEN`,
+`GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
+`LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
+login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
+`LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
+admit the lanes' login for lane pull requests to run.
+A new App is easiest made from
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
@@ -287,6 +326,12 @@ answer as the reply on its thread, redacted and text-checked. The station
 resolves the thread only when the round ran on a ladder model and the thread
 is the review bot's own medium or low finding; any other answered thread
 stays open, and the factory reads it as a finding that survived.
+An answered thread that survives and leaves its ticket with no lane up for
+its next rung does not wait with nothing to move it: the factory asks the
+review bot to judge the answer instead, commenting `/grug improve` on the
+pull request once per head commit, so Elder re-reviews the head with the
+reply in view. It clears the head if the answer holds, and keeps the finding
+if it does not, and the ticket then waits for its rung as before.
 A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
@@ -306,7 +351,13 @@ A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
 does while its box is hot) is not failing: a ticket briefed on it moves at
 once to a free lane in its difficulty tier (docs/MUSE.md, Lane choice), with
 no rung marker, or a ticket on a ladder rung to a free lane of that rung; with
-none free it waits where it is for its lane to come back. A failed or stalled
+none free it waits where it is for its lane to come back. A `loom:running`
+ticket on a local lane with no live heartbeat for 30 minutes (an unloaded or
+crashed lane, or a machine that is off) moves the same way, with a comment
+naming the lane and how long it was silent: to a free lane of its tier, or of
+its Model, else back to `loom:queued`. It is no failure and no retry, so it
+never climbs, and the station files a `silent-lane` invariant naming the lane.
+A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Landing
 keeps the default branch green: a ready pull request that is behind its base
 is brought up to date first (GitHub's update-branch) and lands only after its
@@ -634,6 +685,24 @@ Before the agent starts, `lanes/mac/brain.sh` reads the handoff packet with
 parameter) and puts it in the prompt. With either setting empty, or the
 dashboard down, the tick runs without it.
 
+## Disk
+
+The loom home is kept bounded by the station and the runner (loom#643).
+
+- A lane's logs (`logs/<slot>/`: each run's log, result, validation records
+  and archived transcripts) are removed once nothing in an entry changed for
+  `LOOM_LOG_KEEP_DAYS` days (default 7; `0` keeps them all). An entry is kept
+  however old while a brief of its name is waiting or running in a lane
+  inbox, and, while transcripts are uploaded, until the ledger holds the run
+  as sent or settled; an unreadable inbox or ledger removes nothing. The
+  station's own logs at the top of `logs/` are not touched.
+- The runner removes a check's scratch home (`run/<slot>-check`) after the
+  final check and when it exits, so `run/` holds one only while that lane runs.
+- Every pass logs a warning to `station.log` while the home's disk has less
+  than `LOOM_DISK_FREE_MIN_GB` free (default 10). Every hour the station
+  removes the old lane logs and logs the home's size by top-level folder
+  (`loom home holds ...`), kept in `state/station/disk.json`.
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the
@@ -642,7 +711,16 @@ last pass: by default `logs/station.log` (as `station`), `logs/brain.log`
 `LOOM_WATCH` replaces that list with lines of `name=path`, a relative path
 being under `$LOOM_HOME`. A line counts when it says `error`, `failed`,
 `Traceback` or `refused`, or carries an HTTP 4xx or 5xx; a Python traceback
-counts once, as its exception line. Each line is reduced to a signature:
+counts once, as its exception line. A line of a GitHub Actions job log that
+an agent echoed (a seven-digit-fraction timestamp, after the job and step
+names `gh run view --log` adds) never counts: it is the run's output, and a
+green run's test names say `failed` too. Nor does the brain's own status
+output: a stage handoff line (`- stage failed: held by ...`), a markdown
+heading of its report (`#### failed`), a ticket or goal row of the report
+(free-text titles and `REPEATEDLY STUCK` marks), a defer resume line
+(`- dropped failed ...: finished or closed since the defer`), or the tick
+record or journal comment it echoes as JSON. Anything more on such a line is
+judged as usual. Each line is reduced to a signature:
 times, numbers, hex ids and SHAs, long mixed ids, repos and issue numbers,
 paths, addresses and mentions become placeholders, so a 403 on two repos is
 one signature (the status code is kept).
@@ -654,11 +732,16 @@ lines. The examples have paths, credential shapes, mail addresses, mentions,
 private hosts, IP addresses and repo names replaced, and each must pass the
 written-text check (`bus/text.py`) or is withheld. An open `loom:triage` issue
 with the same title is counted instead of filed again. While the signature
-keeps repeating its open issue gets a count comment at most once an hour; a
-closed one is left alone. No model is involved: diagnosis is the brain's.
+keeps repeating its open issue gets a count comment at most once an hour,
+edited in place and saying when it was last seen; a closed one is left alone.
+The issue a signature was filed or counted on is remembered until it closes,
+so a signature that comes back after a quiet day is counted on that issue
+even after the brain has retitled or relabelled it: one rolling issue per
+signature. No model is involved: diagnosis is the brain's.
 
-`state/station/watch.json` keeps each log's inode and offset and each
-signature seen in the last 24 hours. The first scan starts at the end of each
+`state/station/watch.json` keeps each log's inode and offset, each
+signature seen in the last 24 hours, and each signature's open issue (at most
+500). The first scan starts at the end of each
 log; a log that is later created, rotated (a new inode) or truncated is read
 from its start. One pass reads at most 1 MB of each log, files or counts at
 most 5, and below the GitHub budget floor only reads, filing on a later
@@ -690,9 +773,12 @@ Each invariant is one function returning breaches with evidence:
   provider lanes whose credit the operator never tops up (for example
   `anthropic`); a slot of one held out of credit is skipped, since it waits
   for the credit to renew and nothing is briefed onto it meanwhile. Unset,
-  every held lane counts.
+  every held lane counts. A hold whose reset has passed is no hold: the lane
+  is free again, as the Usage view reads the same heartbeat.
 - The epic shape (decision 0003): a goal home with open `loom:ticket` issues
-  under no epic (one breach per goal), an epic holding more than 15 tickets,
+  under no epic (one rolling issue for every goal, a line per goal home,
+  rewritten in place while the list changes; the older per-goal issues are
+  closed as folded into it), an epic holding more than 15 tickets,
   a goal with more open epics than its cap (6, or the goal home's
   `Epic cap: N until DATE` exception), and a closed epic that still holds
   open tickets. These replaced the goal home sub-issue count check.
@@ -737,7 +823,8 @@ Claude Code transcripts (claude and anthropic lanes), opencode's SQLite store
 lists under its own name and reads as its lane. It binds localhost only and
 answers only localhost Host headers; the viewer itself sends nothing off
 the machine (the uploads above do). API-lane agents run on the same machine, so their sandbox denies every
-loopback connection; they cannot query the viewer or any other local service.
+loopback connection outside their provider's port (443, and the spark endpoint's on the spark lane); they
+cannot query the viewer or any other local service.
 
 ## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
 
@@ -753,6 +840,18 @@ loopback connection; they cannot query the viewer or any other local service.
   tree but cannot read credentials, push, open, or merge; the runner does
   that with the machine's own credentials. Without `sandbox-exec` an API lane
   reports itself unavailable.
+- Writes go only to the worktree (its `.git` stays read-only) and the scratch
+  home, plus the device nodes every CLI opens (`/dev/null`, `/dev/fd/*` and a
+  few more): nothing outside HOME is writable either, `/tmp`, the runner's
+  temp directory and Homebrew's prefix included.
+- Outbound connections go only to the provider's port: 443 (the provider's
+  HTTPS API, which also carries the CLI's own model catalogue and package
+  fetches), plus on the spark lane the port of `LOOM_SPARK_URL`. Every other
+  port, on any host, is refused. A Seatbelt profile cannot name a host, and on
+  the same port it cannot tell loopback from a remote address, so 443 stays
+  open on loopback as well; every other loopback port stays closed. DNS goes
+  through the system resolver's socket. The agy lane and the validation run
+  keep the network and their writes outside HOME.
 - A brief whose branch already has a PR in any state moves to `done/`
   without running. Restarts cannot re-run a ticket.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
@@ -776,10 +875,22 @@ loopback connection; they cannot query the viewer or any other local service.
   `x-opencode-session`), the runner sends one `max_tokens` 1 request for the
   run's model before each run, and again after a run that timed out (exit
   124). The key goes to curl on stdin, never in argv or a log. A 429 naming
-  `GoUsageLimitError` holds the lane 12 hours (heartbeat `limit: the
-  provider's weekly limit ...` with a `retry_at`) and hands the brief on as
-  `[limit]`; any other answer lets the run go ahead. Another provider can
-  name its own endpoint in the same setting.
+  `GoUsageLimitError` holds the lane until the reset the provider's
+  `Retry-After` header gives (heartbeat `limit: the provider's weekly limit
+  ...` with a `retry_at`) and hands the brief on as `[limit]`; a provider that
+  gives no reset holds the lane for a week, the fallback for a window the
+  runner does not know. Any other answer lets the run go ahead. Another
+  provider can name its own endpoint in the same setting.
+- A lane held by such a limit asks the provider again every 30 minutes and
+  comes back as soon as it serves the lane again, because the provider's
+  allowance refills while the lane sleeps (OpenCode Go refills 20% of a
+  model's allowance every 5 hours). It asks about the model the probe found at
+  a limit, and only for a hold the probe itself took: a hold the agent CLI
+  recorded (a model it no longer offers, a spent allowance) stands, for no
+  probe says otherwise. On 2026-10-20 the four opencode-go slots stayed held
+  for days (the provider's `Retry-After` was never read, so every limit fell
+  back to a week) and the lane-held invariant fired while 33 tickets of the
+  tier waited.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
   read-only meter with the key they already hold, at most every five minutes,
@@ -893,10 +1004,16 @@ lookup leaves the brief for the next pass. The rule covers:
 ## API lanes: zen, zai
 
 - `zen`: OpenCode Zen free models through opencode, `-m opencode/<id>-free`
-  (default `opencode/space-bunny-free`). Zen serves its free models with no
-  stored credential, so the lane reads no key; the agent's environment holds
-  no provider key at all. opencode sends Zen's `x-opencode-session` header
-  itself.
+  (default `opencode/minimax-m3.1-flash-free`). Zen serves its free models
+  with no stored credential, so the lane reads no key; the agent's
+  environment holds no provider key at all. opencode sends Zen's
+  `x-opencode-session` header itself, and Zen refuses free-tier calls from
+  any other client (FreeTierError). Zen rotates its free models often: on
+  2026-10-19 `space-bunny-free` had left the catalogue, and zen runs
+  failed "Unexpected server error". Check `https://opencode.ai/zen/v1/models`
+  for the current `-free` ids before changing the default, and try a
+  candidate with `opencode run -m opencode/<id>` (that day
+  `minimax-m3.1-flash-free` answered in seconds; three others hung).
 - `zai`: Z.ai's free Flash models through opencode's `zai` provider,
   `zai/glm-4.7-flash` (default) or `zai/glm-4.5-flash`. GLM-5.3 Flash and
   the FlashX models are paid and refused. The key comes from SSM
@@ -955,8 +1072,9 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - opencode against a vLLM server you run yourself, through a custom
   OpenAI-compatible provider named `spark`. `LOOM_SPARK_URL` is its base URL
-  (e.g. `http://your-spark.internal:8000/v1`, reachable from the lane machine
-  but not on its loopback, which the sandbox denies); it takes no key.
+  (e.g. `http://your-spark.internal:8000/v1`, reachable from the lane machine;
+  besides 443 the agent's sandbox opens only that URL's port, the scheme's
+  default when it names none); it takes no key.
   Models are `spark/<served model id>`, from the brief's `Model:` line or
   `LOOM_SPARK_MODEL`.
 - One slot: the server serves one stream at a time.

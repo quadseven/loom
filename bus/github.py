@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import proof
+from . import proof, status
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -398,13 +398,24 @@ class GitHub:
     def __init__(self, token: Auth, api: str = DEFAULT_API,
                  transport: Optional[Transport] = None,
                  cache_dir: Optional[str] = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 unsubscribe: bool = False) -> None:
         # A personal token string, or an AppToken minted on first use.
         self._token = token
+        # With a personal token, leave each issue this client opens or
+        # comments on: GitHub subscribes the person, and every later bot
+        # comment there emailed them. An @mention still notifies.
+        self.unsubscribe = unsubscribe
+        self._node_ids: Dict[Tuple[str, int], str] = {}
+        self.unsubscribe_failures: List[str] = []
         self.app: Optional[AppToken] = token if isinstance(token, AppToken) else None
         # What the budget lines name: an App installation or a personal token.
         self.auth = "app" if self.app is not None else "token"
         self._app_login: Optional[str] = None
+        # Logins whose status comments read as events (bus/status.py): this
+        # client's own App bot login is added on first use; a caller adds its
+        # trusted writers (the station its LOOM_BRIEF_AUTHORS).
+        self.status_authors: set = set()
         self._sleep = sleep
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
@@ -439,6 +450,19 @@ class GitHub:
 
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
+        resp = self._rest(method, path, body, etag, ok)
+        if method == "POST" and self.unsubscribe and self.app is None:
+            self._leave_thread(path, resp.data)
+        if method == "GET" and status.COMMENTS_RE.search(path):
+            # A ticket's status comment reads as one comment per event, so
+            # every reader of those events sees them as before (loom#866).
+            expanded = status.expand(resp.data, self._status_logins())
+            if expanded is not resp.data:
+                resp = Response(resp.status, expanded, resp.etag, resp.headers)
+        return resp
+
+    def _rest(self, method: str, path: str, body: Any = None,
+              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
         self._refuse_incomplete_close(method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
@@ -446,32 +470,66 @@ class GitHub:
         cached = self._cached(url) if method == "GET" and not etag else None
         headers, payload = self._request(body, etag or (cached or {}).get("etag"))
         status, resp_headers, text = self._send(method, url, headers, payload)
-        if status == 401 and self.app is not None:
-            # A revoked or early-expired installation token: mint a new one next.
-            self.app.invalidate()
-        if not (200 <= status < 300 or status == 304 or status in ok):
-            raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
+        self._check_status(method, path, status, text, ok)
         if status == 304 and cached is not None:
             return self._from_cache(url, cached, resp_headers)
         data = _json_or_none(text)
         if method == "GET" and not etag:
             self._keep_answer(url, status, data, resp_headers)
         if method != "GET":
-            changed = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", path)
-            if changed:
-                self.issue_writes.add((changed.group(1), int(changed.group(2))))
-            elif re.match(r"^/repos/[^/]+/[^/]+/issues/comments/\d+$", path):
-                # An edited comment's answer names its issue: mark that one
-                # changed. Only an edit that names none spoils every cached read;
-                # the station edits a comment every pass (loom#722).
-                owner = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$",
-                                  str((data or {}).get("issue_url") or "")
-                                  if isinstance(data, dict) else "")
-                if owner:
-                    self.issue_writes.add((owner.group(1), int(owner.group(2))))
-                else:
-                    self.comment_edits = True
+            self._note_write(path, data)
         return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    def _leave_thread(self, path: str, data: Any) -> None:
+        """Unsubscribe the token's person from the issue a POST opened or
+        commented on. A failure is kept in unsubscribe_failures, never raised:
+        the write itself already happened."""
+        opened = re.match(r"^/repos/([^/]+/[^/]+)/issues$", path)
+        commented = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)/comments$", path)
+        if not (opened or commented) or not isinstance(data, dict):
+            return
+        try:
+            if opened:
+                node = str(data.get("node_id") or "")
+                key = (opened.group(1), int(data.get("number") or 0))
+            else:
+                key = (commented.group(1), int(commented.group(2)))
+                node = self._node_ids.get(key) or str(
+                    (self._rest("GET", "/repos/%s/issues/%d" % key).data or {}).get("node_id") or "")
+            if not node:
+                raise GitHubError("no node id for %s#%d" % key)
+            self._node_ids[key] = node
+            self.graphql("mutation($id: ID!) { updateSubscription(input: "
+                         "{subscribableId: $id, state: UNSUBSCRIBED}) "
+                         "{ subscribable { viewerSubscription } } }", {"id": node})
+        except (GitHubError, ValueError, TypeError) as err:
+            self.unsubscribe_failures.append("%s: %s" % (path, err))
+
+    def _check_status(self, method: str, path: str, status: int, text: str,
+                      ok: Tuple[int, ...]) -> None:
+        """Raise GitHubError for an answer the caller did not accept."""
+        if status == 401 and self.app is not None:
+            # A revoked or early-expired installation token: mint a new one next.
+            self.app.invalidate()
+        if not (200 <= status < 300 or status == 304 or status in ok):
+            raise GitHubError("%s %s -> %d" % (method, path, status), status, text)
+
+    def _note_write(self, path: str, data: Any) -> None:
+        """Mark the issue a write changed, so its cached reads are dropped."""
+        changed = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)", path)
+        if changed:
+            self.issue_writes.add((changed.group(1), int(changed.group(2))))
+        elif re.match(r"^/repos/[^/]+/[^/]+/issues/comments/\d+$", path):
+            # An edited comment's answer names its issue: mark that one
+            # changed. Only an edit that names none spoils every cached read;
+            # the station edits a comment every pass (loom#722).
+            owner = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$",
+                              str((data or {}).get("issue_url") or "")
+                              if isinstance(data, dict) else "")
+            if owner:
+                self.issue_writes.add((owner.group(1), int(owner.group(2))))
+            else:
+                self.comment_edits = True
 
     def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
         """Refuse a PATCH that would close an issue as completed while its
@@ -532,6 +590,13 @@ class GitHub:
             headers["If-None-Match"] = if_none_match
         return headers, payload
 
+    def app_token(self) -> str:
+        """The App installation token this client sends, minted when none is
+        held or it is about to expire; GitHubError when the client has no App."""
+        if self.app is None:
+            raise GitHubError("this client holds a personal token, not a GitHub App")
+        return self.app.token(self._mint_app_token)
+
     def _bearer(self) -> str:
         """The token for the Authorization header."""
         if self.app is None:
@@ -565,6 +630,19 @@ class GitHub:
         if not isinstance(token, str) or not token.strip():
             raise GitHubError("the installation token answer has no token", status)
         return token.strip(), data.get("expires_at")
+
+    def _status_logins(self) -> set:
+        """Who may write status comments this client expands: its trusted
+        writers and, on an App, its own bot login."""
+        logins = {a.lower() for a in self.status_authors}
+        if self.app is not None:
+            try:
+                login = self.app_login()
+            except GitHubError:
+                login = None
+            if login:
+                logins.add(login.lower())
+        return logins
 
     def app_login(self) -> Optional[str]:
         """The App's own bot login, "<slug>[bot]", read once from GET /app
@@ -761,7 +839,7 @@ class GitHub:
             url = nxt
             if url:
                 resp = self.rest("GET", url)
-        return items
+        return status.resort(items)
 
     def paginate_parallel(self, path: str, workers: int = 8) -> List[Any]:
         """Read known pages concurrently, preserving their page order."""
@@ -784,7 +862,7 @@ class GitHub:
             items.extend(self.paginate(next_url))
         elif final.status == 304 and isinstance(final.data, list) and len(final.data) >= _per_page(path):
             items.extend(self.paginate(_with_page(path, _page_of(last) + 1)))
-        return items
+        return status.resort(items)
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.rest("POST", "/graphql",

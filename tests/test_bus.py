@@ -353,6 +353,15 @@ class LabelTests(unittest.TestCase):
         labels.ensure_labels(GitHub("tok", transport=t), REPO)
         self.assertFalse([c for c in t.calls if c[0] == "PATCH"])
 
+    def test_factory_label_is_created_when_missing(self):
+        # loom#918: the loom:factory label was not in LABELS, so ensure_labels
+        # never created it and the runner could not apply it.
+        t = Scripted(reply(200, []), *[reply(201, {})] * (len(labels.LABELS) + 5))
+        changed = labels.ensure_labels(GitHub("tok", transport=t), REPO)
+        self.assertIn("loom:factory", changed)
+        created = [json.loads(c[3])["name"] for c in t.calls if c[0] == "POST"]
+        self.assertIn("loom:factory", created)
+
 
 class LockTests(unittest.TestCase):
     def test_acquire_free(self):
@@ -432,13 +441,15 @@ class JournalTests(unittest.TestCase):
         self.assertTrue(lines[3].startswith("- Shipped: none"))
 
     def test_post_marker_check(self):
-        t = Scripted(reply(201, {}))
+        # The writer reads its login and the day's comments, then posts.
+        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
         gh = GitHub("tok", transport=t)
         with self.assertRaises(ValueError):
             journal.post(gh, REPO, 7, "hello")
         self.assertEqual(gh.requests, 0)
         journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx")
-        self.assertTrue(t.calls[0][1].endswith("/repos/%s/issues/7/comments" % REPO))
+        self.assertEqual(t.calls[2][0], "POST")
+        self.assertTrue(t.calls[2][1].endswith("/repos/%s/issues/7/comments" % REPO))
 
     def test_a_journal_without_its_tick_line_is_refused_unless_a_holder_adds_it(self):
         # No brain's journal carried a Tick line on 2026-10-16, so each read its
@@ -522,10 +533,13 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(json.loads(t.calls[1][3])["body"], journal.REPORT_MARKER + "\nReport")
 
     def test_a_journal_is_never_held_by_the_report_gap(self):
-        t = Scripted(reply(201, {}))
+        # A journal reads only its login and its own day's comments (to edit
+        # the day's journal in place), never the report gap's window.
+        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
         gh = GitHub("tok", transport=t)
         journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx", now=NOW)
-        self.assertEqual([c[0] for c in t.calls], ["POST"])
+        self.assertEqual([c[0] for c in t.calls], ["GET", "GET", "POST"])
+        self.assertIn("since=2030-01-01T00:00:00Z", t.calls[1][1])
 
 
 class CliTests(unittest.TestCase):
@@ -561,7 +575,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("requests: 1", err)
 
     def test_journal_command_holder_adds_the_tick_line(self):
-        t = Scripted(reply(201, {}))
+        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "j.md")
             with open(path, "w") as fh:
@@ -569,7 +583,7 @@ class CliTests(unittest.TestCase):
             code, _ = self.run_cli(["journal", REPO + "#5", "--file", path,
                                     "--holder", "lane-machine"], t)
         self.assertEqual(code, 0)
-        posted = json.loads(t.calls[0][3])["body"].splitlines()
+        posted = json.loads(t.calls[2][3])["body"].splitlines()
         self.assertRegex(posted[1], r"^Tick \S+Z, lane-machine$")
         self.assertEqual(posted[2], "Moved: nothing.")
 

@@ -15,11 +15,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
-from bus import brain, labels, tickets
+from bus import brain, handoff, labels, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import free_view, goals, operators, transcripts, views
+from . import free_view, goals, needs_you, operators, tiers_sources, transcripts, views
 
 
 READ_WORKERS = 8
@@ -41,6 +41,12 @@ REQUEST_LOG_SECONDS = 3600
 OPERATOR_CLAIMS_SECONDS = 900
 OPERATOR_CLAIM_LABELS = 10
 OPERATOR_CHECK_READS = 30
+# needs:<login> lists (loom#810) ride the same pass: at most this many needs
+# labels are listed per repo, and at most this many items' latest comments
+# (the ask) are read in one pass; an item whose updated_at did not change
+# keeps the ask the last pass read.
+OPERATOR_NEEDS_LABELS = 10
+OPERATOR_ASK_READS = 30
 LOG = logging.getLogger(__name__)
 
 
@@ -220,6 +226,20 @@ def _unique_by_number(records) -> List[Dict[str, Any]]:
     return out
 
 
+def _unique_by_id(items) -> List[Dict[str, Any]]:
+    """The dict items in order, each comment id once."""
+    seen, out = set(), []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("id")
+        if key is not None and key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 def _int_or(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -288,6 +308,9 @@ class TicketStore:
         self._kept_prs: Dict[str, Dict[str, Any]] = {}
         self._kept_lock = threading.Lock()
         self._request_mark: Optional[Tuple[float, Dict[str, int], int]] = None
+        # The Tiers and allowances page's sources (the gateway, Grug, run
+        # outcomes), read once a pass below, never by a page request.
+        self.tier_sources = tiers_sources.TierSources(runs_store=self._runs_store)
 
     @property
     def data(self):
@@ -375,11 +398,23 @@ class TicketStore:
         count = len([row for row in humans if isinstance(row, dict) and "pull_request" not in row])
         found = [{"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
                   "html_url": issue.get("html_url"), "ask": issue.get("body") or issue.get("title", ""),
-                  "created_at": issue.get("created_at"),
+                  "body_ask": operators.body_ask(issue.get("body")),
+                  "labels": _label_names(issue), "comments": _int_or(issue.get("comments")),
+                  "created_at": issue.get("created_at"), "updated_at": issue.get("updated_at"),
                   "waiting_since": issue.get("updated_at", "9999"), "waiting_since_source": "updated",
                   "unblocks": 0, "queue": "needs_operator"}
                  for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
         return repo, found, count, ""
+
+    def _read_operator_asks(self, snapshot: Dict[str, Any], previous: List[Dict[str, Any]]) -> None:
+        """A needs-operator issue with no "## Ask" section in its body takes
+        its ask from a comment (comment_ask, comment_ask_url), read as the
+        needs:<login> asks are; a failed read is listed with the pass's
+        errors and keeps the last ask."""
+        errors: List[str] = []
+        self._read_asks(self.operator_items, previous, errors, field="comment_ask")
+        if errors:
+            snapshot["dashboard_errors"] = list(snapshot.get("dashboard_errors") or []) + errors
 
     def _init_open_issues(self) -> None:
         # repo -> open issue records for the /free page, None until read.
@@ -393,17 +428,26 @@ class TicketStore:
         fails keeps its last read and the error is shown on the page."""
         if now - self.open_issues_read_at < FREE_ISSUES_SECONDS or self._below_floor():
             return
+        # The repos are read at once: one after another they took 12.4 s of
+        # a cold first snapshot (loom#433).
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(self._open_issues_for_repo, self.repos))
         errors = []
-        for repo in self.repos:
-            try:
-                found = self.gh.paginate("/repos/%s/issues?state=open" % quote(repo, safe="/"))
-            except (GitHubError, OSError, ValueError) as exc:
-                errors.append("%s: %s" % (repo, self._error_reason(exc)))
-                continue
-            self.open_issues[repo] = [free_view.open_issue_record(item) for item in found
-                                      if isinstance(item, dict) and "pull_request" not in item]
+        for repo, (found, error) in zip(self.repos, results, strict=True):
+            if error:
+                errors.append(error)
+            else:
+                self.open_issues[repo] = found
         self.open_issues_error = "; ".join(errors)
         self.open_issues_read_at = now
+
+    def _open_issues_for_repo(self, repo: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        try:
+            found = self.gh.paginate("/repos/%s/issues?state=open" % quote(repo, safe="/"))
+        except (GitHubError, OSError, ValueError) as exc:
+            return None, "%s: %s" % (repo, self._error_reason(exc))
+        return [free_view.open_issue_record(item) for item in found
+                if isinstance(item, dict) and "pull_request" not in item], ""
 
     def _skip_dashboard_below_floor(self, data: Dict[str, Any]) -> None:
         reset = ("at %s UTC" % datetime.fromtimestamp(self._reset_at, timezone.utc).strftime("%H:%M")
@@ -517,46 +561,110 @@ class TicketStore:
             return
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             results = list(pool.map(self._claims_for_repo, self.repos))
-        claimed, errors = [], []
-        for repo, (found, error) in zip(self.repos, results, strict=True):
+        claimed, waiting, errors = [], [], []
+        for repo, (found, needs, error) in zip(self.repos, results, strict=True):
             if error:
                 errors.append(error)
                 found = [item for item in previous.get("items") or [] if item.get("repo") == repo]
+                needs = [item for item in previous.get("needs") or [] if item.get("repo") == repo]
             claimed.extend(found)
+            waiting.extend(needs)
         rows = [row for found in (data.get("tickets") or {}).values() if found for row in found]
         items = operators.collect(claimed, rows, data.get("pull_requests") or [])
         checks = self._read_claim_checks(items, errors)
-        data["operator_claims"] = {"items": items, "checks": checks, "error": "; ".join(errors),
+        needs = operators.collect_needs(waiting)
+        self._read_asks(needs, previous.get("needs") or [], errors)
+        data["operator_claims"] = {"items": items, "checks": checks, "needs": needs, "error": "; ".join(errors),
                                    "read_at": now, "every": OPERATOR_CLAIMS_SECONDS, "retry": bool(errors)}
 
-    def _claims_for_repo(self, repo: str) -> Tuple[List[Dict[str, Any]], str]:
+    def _claims_for_repo(self, repo: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+        """One repo's foreign claim:<login> items and needs:<login> items,
+        from its label list and one open list per such label."""
         path = quote(repo, safe="/")
         found: List[Dict[str, Any]] = []
+        needs: List[Dict[str, Any]] = []
         try:
             names = [label.get("name") for label in self.gh.paginate("/repos/%s/labels?per_page=100" % path)
                      if isinstance(label, dict) and isinstance(label.get("name"), str)]
             for name in operators.foreign_claim_labels(names)[:OPERATOR_CLAIM_LABELS]:
-                issues = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
-                                          % (path, quote(name, safe="")))
-                found.extend(operators.claim_record(repo, issue) for issue in issues if isinstance(issue, dict))
+                found.extend(operators.claim_record(repo, issue) for issue in self._open_with_label(path, name))
+            for name in operators.needs_labels(names)[:OPERATOR_NEEDS_LABELS]:
+                needs.extend(operators.needs_record(repo, issue) for issue in self._open_with_label(path, name))
         except (GitHubError, OSError, ValueError) as exc:
-            return found, "%s claims: %s" % (repo, self._error_reason(exc))
-        return found, ""
+            return found, needs, "%s claims: %s" % (repo, self._error_reason(exc))
+        return found, needs, ""
+
+    def _open_with_label(self, path: str, name: str) -> List[Dict[str, Any]]:
+        issues = self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100" % (path, quote(name, safe="")))
+        return [issue for issue in issues if isinstance(issue, dict)]
+
+    def _read_asks(self, items, previous, errors, field: str = "ask") -> None:
+        """Set each item's ask (item[field]) and the comment it came from
+        (item[field + "_url"]): its body's "## Ask" section when it has one,
+        else operators.pick_ask over its comments. An item whose updated_at
+        is unchanged keeps the last pass's ask; an item with no comment has
+        none; at most OPERATOR_ASK_READS comment reads a pass (the last page
+        of operators.ASK_COMMENTS each), the rest keep their last ask or say
+        it is not read yet (None)."""
+        url = field + "_url"
+        kept = {"%s#%s" % (item.get("repo"), item.get("number")): item for item in previous}
+        to_read = []
+        for item in items:
+            old = kept.get("%s#%s" % (item.get("repo"), item.get("number"))) or {}
+            if item.get("body_ask"):
+                item[field], item[url] = operators.ask_line(item["body_ask"]), ""
+            elif old.get("updated_at") == item.get("updated_at") and field in old:
+                item[field], item[url] = old[field], old.get(url) or ""
+            elif not item.get("comments"):
+                item[field], item[url] = "", ""
+            elif len(to_read) >= OPERATOR_ASK_READS:
+                item[field], item[url] = old.get(field), old.get(url) or ""
+            else:
+                to_read.append((item, (old.get(field), old.get(url) or "")))
+        # The comment reads overlap (loom#433); errors keep the items' order.
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(lambda pair: self._read_ask(*pair), to_read))
+        for (item, _), (found, error) in zip(to_read, results, strict=True):
+            item[field], item[url] = found
+            if error:
+                errors.append(error)
+
+    def _read_ask(self, item, fallback) -> Tuple[Tuple[Optional[str], str], str]:
+        """((ask, comment url), error): the fallback with the error when the
+        comments cannot be read."""
+        page = (int(item["comments"]) - 1) // operators.ASK_COMMENTS + 1
+        try:
+            resp = self.gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=%d&page=%d" % (
+                quote(str(item["repo"]), safe="/"), int(item["number"]), operators.ASK_COMMENTS, page))
+        except (GitHubError, OSError, ValueError) as exc:
+            return fallback, "%s#%s ask: %s" % (item["repo"], item["number"], self._error_reason(exc))
+        found = resp.data if isinstance(resp.data, list) else []
+        return operators.pick_ask(found, operators.ask_names(item.get("labels") or [])), ""
 
     def _read_claim_checks(self, items, errors) -> Dict[str, Dict[str, Any]]:
         """repo@sha -> operators.checks_summary of each open linked pull
         request's head, at most OPERATOR_CHECK_READS reads a pass (an
         unchanged head answers 304 from the GitHub client's ETag cache)."""
-        out: Dict[str, Dict[str, Any]] = {}
-        for repo, sha in operators.checks_wanted(items)[:OPERATOR_CHECK_READS]:
+        def read(wanted):
+            repo, sha = wanted
             try:
                 resp = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
                                     % (quote(repo, safe="/"), quote(sha, safe="")))
             except (GitHubError, OSError, ValueError) as exc:
-                errors.append("%s checks: %s" % (repo, self._error_reason(exc)))
-                continue
+                return None, "%s checks: %s" % (repo, self._error_reason(exc))
             runs = resp.data.get("check_runs") if isinstance(resp.data, dict) else None
-            out["%s@%s" % (repo, sha)] = operators.checks_summary(runs or [])
+            return operators.checks_summary(runs or []), ""
+
+        # The reads overlap (loom#433); results and errors keep their order.
+        wanted = operators.checks_wanted(items)[:OPERATOR_CHECK_READS]
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(read, wanted))
+        out: Dict[str, Dict[str, Any]] = {}
+        for (repo, sha), (summary, error) in zip(wanted, results, strict=True):
+            if error:
+                errors.append(error)
+            else:
+                out["%s@%s" % (repo, sha)] = summary
         return out
 
     def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
@@ -578,19 +686,27 @@ class TicketStore:
         pending = sorted(named)
         seen = set()
         now = time.time()
+        # One level at a time, the level's reads overlapping: one after
+        # another they took 12.5 s of a cold first snapshot (loom#433).
         while pending and len(seen) < GOAL_INFO_MAX:
-            goal = pending.pop(0)
-            if goal in seen:
-                continue
-            seen.add(goal)
-            entry = cache.get(goal)
-            if not entry or not entry.get("title") or now - entry.get("read_at", 0) >= GOAL_INFO_TTL:
-                entry = self._read_goal_home(goal, entry, now, configured)
-                cache[goal] = entry
-            if entry.get("parent") and entry["parent"] not in seen:
-                pending.append(entry["parent"])
-            if entry.get("is_epic") and entry.get("epic_goal") and entry["epic_goal"] not in seen:
-                pending.append(entry["epic_goal"])
+            level: List[str] = []
+            for goal in pending:
+                if goal not in seen and goal not in level and len(seen) + len(level) < GOAL_INFO_MAX:
+                    level.append(goal)
+            seen.update(level)
+            stale = [goal for goal in level if not (cache.get(goal) or {}).get("title")
+                     or now - cache[goal].get("read_at", 0) >= GOAL_INFO_TTL]
+            with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+                read = list(pool.map(lambda goal: self._read_goal_home(goal, cache.get(goal), now, configured),
+                                     stale))
+            cache.update(zip(stale, read, strict=True))
+            pending = []
+            for goal in level:
+                entry = cache[goal]
+                if entry.get("parent") and entry["parent"] not in seen:
+                    pending.append(entry["parent"])
+                if entry.get("is_epic") and entry.get("epic_goal") and entry["epic_goal"] not in seen:
+                    pending.append(entry["epic_goal"])
 
         def accepted(parent):
             if not parent or parent.partition("#")[0] not in configured:
@@ -672,11 +788,16 @@ class TicketStore:
     def _comments_for_repo(self, repo, since, trusted):
         path = quote(repo, safe="/")
         issues, reviews = [], []
+        # A busy repo's two-week feed is dozens of pages: read one after
+        # another they took 32 s of a cold first snapshot (loom#433). A page
+        # shift between reads can repeat a comment, so each counts once.
         try:
-            found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-            issues = [comment_record(c, repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
-            found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
-            reviews = [comment_record(c, repo) for c in found if isinstance(c, dict)]
+            found = _unique_by_id(self.gh.paginate_parallel(
+                "/repos/%s/issues/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
+            issues = [comment_record(c, repo) for c in found if _by_trusted(c, trusted)]
+            found = _unique_by_id(self.gh.paginate_parallel(
+                "/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
+            reviews = [comment_record(c, repo) for c in found]
         except (GitHubError, OSError, ValueError) as exc:
             return issues, reviews, "%s comments: %s" % (repo, self._error_reason(exc))
         return issues, reviews, ""
@@ -699,7 +820,8 @@ class TicketStore:
                     comment.update({"repo": repo, "issue_number": issue["number"],
                                     "issue_title": issue.get("title")})
                     if body.startswith("<!-- loom:journal v1 -->"):
-                        journals.append(comment)
+                        # A journal edited in place shows once per tick.
+                        journals.extend(handoff.expand_journals([comment], at_key="created_at"))
                     if body.startswith("<!-- loom:report v1 -->"):
                         reports.append(comment)
                     if body.startswith("<!-- loom:metrics v1 -->"):
@@ -908,15 +1030,23 @@ class TicketStore:
                     snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
                     snapshot.setdefault("dashboard_errors", []).append(
                         "repeated failure invariants: " + self._error_reason(exc))
+            previous_items = self.operator_items
             self.operator_items, self.human_counts = operator_items, human_counts
             self.operator_error = ask_error
             self._read_dashboard(snapshot)
+            if not self._below_floor():
+                self._read_operator_asks(snapshot, previous_items)
             self._read_latest_runs(snapshot)
+            self.tier_sources.refresh()
             now = time.time()
             self._refresh_waits(snapshot, now)
             self._read_open_issues(now)
             floor_context = dict(snapshot.get("floor_context") or {})
-            floor_context.update({"needs_you": None if ask_error else len(self.operator_items),
+            # The Floor's count is every item the Needs-you page lists:
+            # needs-operator asks and needs:<login> items, each once.
+            needs = (snapshot.get("operator_claims") or {}).get("needs") or []
+            floor_context.update({"needs_you": None if ask_error else len(
+                                      needs_you.entries(self.operator_items, needs, self.repos)),
                                   "needs_you_reason": ask_error,
                                   "waits_error": self.waits_error})
             snapshot["floor_context"] = floor_context
@@ -925,6 +1055,14 @@ class TicketStore:
             self._log_requests(now)
             if snapshot["ready"] and not current["ready"]:
                 LOG.info("first dashboard snapshot ready in %.1fs", time.monotonic() - started)
+
+    def _runs_store(self) -> Any:
+        """The transcript store; RuntimeError when none is configured."""
+        store = getattr(self, "transcripts", None)
+        if store is None:
+            store = transcripts.Store()
+            self.transcripts = store
+        return store
 
     def _read_latest_runs(self, snapshot: Dict[str, Any]) -> None:
         """{ticket: its newest stored run}, read once a pass here so no page

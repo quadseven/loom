@@ -44,6 +44,7 @@ class OpencodePortTest(unittest.TestCase):
         return subprocess.run(["bash", "-c", '. "$1"; ' + script, "bash", str(SANDBOX), *args],
                               capture_output=True, text=True, env=full, timeout=60)
 
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
     def test_the_picker_prints_a_free_port_in_the_dynamic_range(self):
         result = self.bash("free_loopback_port")
         self.assertEqual(result.returncode, 0, result.stderr)

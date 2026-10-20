@@ -2,6 +2,7 @@
 with a fake launchctl and a throwaway HOME/LOOM_HOME."""
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -51,7 +52,8 @@ class InstallScriptTest(unittest.TestCase):
         # owner check or the App check.
         full = {k: v for k, v in os.environ.items()
                 if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")
-                and not k.startswith("LOOM_GITHUB_APP_")}
+                and not k.startswith(("LOOM_GITHUB_APP_", "LOOM_LANES_GITHUB_APP_",
+                                       "LOOM_BRAIN_GITHUB_APP_"))}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,
                     HOME=str(self.home),
                     LOOM_HOME=str(self.loom),
@@ -161,6 +163,13 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_SHIP_WORKFLOWS</key><string>example-owner/svc=deploy.yml</string>",
                       plist)
 
+    def test_disk_settings_are_written_to_station_plist(self):
+        result = self.run_install(LOOM_LOG_KEEP_DAYS="14", LOOM_DISK_FREE_MIN_GB="20")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_LOG_KEEP_DAYS</key><string>14</string>", plist)
+        self.assertIn("<key>LOOM_DISK_FREE_MIN_GB</key><string>20</string>", plist)
+
     def test_trusted_briefers_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -171,7 +180,7 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_lane_model_settings_are_written_to_station_plist(self):
         # The factory reads what a lane ran from its setting (bus/brain.py
-        # _lane_model) when no Model: line or runner footer names the model.
+        # lane_model) when no Model: line or runner footer names the model.
         result = self.run_install(LOOM_CLAUDE_MODEL="claude-test")
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
@@ -218,6 +227,46 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn(missing + " is missing", result.stderr)
                 self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def job_env(self, label):
+        plist = (self.home / "Library" / "LaunchAgents" / ("%s.plist" % label)).read_text()
+        return dict(re.findall(r"<key>(LOOM_[A-Z_]*GITHUB_APP_[A-Z_]+)</key><string>([^<]*)</string>",
+                               plist))
+
+    def test_each_writer_gets_its_own_app_in_its_own_job(self):
+        # loom#1142: the lanes and the brain post as their own Apps.
+        result = self.run_install(
+            LOOM_GITHUB_APP_ID="1", LOOM_GITHUB_APP_INSTALLATION_ID="2",
+            LOOM_GITHUB_APP_KEY_SSM="/station/key",
+            LOOM_LANES_GITHUB_APP_ID="11", LOOM_LANES_GITHUB_APP_INSTALLATION_ID="12",
+            LOOM_LANES_GITHUB_APP_KEY_SSM="/lanes/key",
+            LOOM_BRAIN_GITHUB_APP_ID="21", LOOM_BRAIN_GITHUB_APP_INSTALLATION_ID="22",
+            LOOM_BRAIN_GITHUB_APP_KEY_SSM="/brain/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.job_env("com.loom.codex"), {
+            "LOOM_GITHUB_APP_ID": "11", "LOOM_GITHUB_APP_INSTALLATION_ID": "12",
+            "LOOM_GITHUB_APP_KEY_SSM": "/lanes/key"})
+        self.assertEqual(self.job_env("com.loom.brain"), {
+            "LOOM_GITHUB_APP_ID": "21", "LOOM_GITHUB_APP_INSTALLATION_ID": "22",
+            "LOOM_GITHUB_APP_KEY_SSM": "/brain/key"})
+        station = self.job_env("com.loom.station")
+        self.assertEqual((station["LOOM_GITHUB_APP_ID"], station["LOOM_GITHUB_APP_KEY_SSM"]),
+                         ("1", "/station/key"))
+        self.assertFalse([k for k in station if not k.startswith("LOOM_GITHUB_APP_")], station)
+
+    def test_without_their_own_app_a_lane_gets_none_and_the_brain_keeps_the_stations(self):
+        result = self.run_install(LOOM_GITHUB_APP_ID="1", LOOM_GITHUB_APP_INSTALLATION_ID="2",
+                                  LOOM_GITHUB_APP_KEY_SSM="/station/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.job_env("com.loom.codex"), {})
+        self.assertEqual(self.job_env("com.loom.brain")["LOOM_GITHUB_APP_ID"], "1")
+
+    def test_half_a_lanes_app_installs_nothing(self):
+        result = self.run_install(LOOM_LANES_GITHUB_APP_ID="11",
+                                  LOOM_LANES_GITHUB_APP_KEY_SSM="/lanes/key")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("LOOM_LANES_GITHUB_APP_INSTALLATION_ID is missing", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
 
     def test_the_app_id_alone_names_the_missing_installation_id(self):
         result = self.run_install(LOOM_GITHUB_APP_ID="123")
@@ -318,6 +367,99 @@ class InstallScriptTest(unittest.TestCase):
         result = self.run_install(LOOM_REPOS="a/x, A/z", LOOM_REPO_OWNERS="a")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("installed com.loom.station", result.stdout)
+
+
+    # The dashboard agent (issue 678): LOOM_DASHBOARD=1 installs it,
+    # LOOM_DASHBOARD=0 removes it, unset leaves it alone.
+    DASHBOARD_KEYS = ("LOOM_DASHBOARD", "LOOM_DASHBOARD_HOST", "LOOM_DASHBOARD_PORT",
+                      "LOOM_TRANSCRIPTS_MEMORY", "LOOM_DB_PASSWORD")
+
+    def run_dashboard_install(self, **env):
+        clean = {k: v for k, v in os.environ.items() if k not in self.DASHBOARD_KEYS}
+        with unittest.mock.patch.dict(os.environ, clean, clear=True):
+            return self.run_install(**env)
+
+    def dashboard_plist(self):
+        return self.home / "Library" / "LaunchAgents" / "com.loom.dashboard.plist"
+
+    def assert_valid_plist(self, path):
+        plutil = shutil.which("plutil")
+        if plutil:
+            lint = subprocess.run([plutil, "-lint", str(path)], capture_output=True, text=True)
+            self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+
+    def test_dashboard_is_installed_on_the_given_host_with_memory_transcripts(self):
+        result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DASHBOARD_HOST="127.0.0.1",
+                                            LOOM_DASHBOARD_PORT="8181",
+                                            LOOM_DASHBOARD_BUDGET_FLOOR="250")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = self.dashboard_plist().read_text()
+        self.assertIn("<key>KeepAlive</key><true/>", plist)
+        self.assertIn("<string>-m</string>\n    <string>dashboard</string>", plist)
+        self.assertIn("<key>WorkingDirectory</key><string>%s</string>" % self.checkout, plist)
+        self.assertIn("<key>LOOM_DASHBOARD_HOST</key><string>127.0.0.1</string>", plist)
+        self.assertIn("<key>LOOM_DASHBOARD_PORT</key><string>8181</string>", plist)
+        self.assertIn("<key>LOOM_TRANSCRIPTS_MEMORY</key><string>1</string>", plist)
+        self.assertIn("<key>LOOM_DASHBOARD_BUDGET_FLOOR</key><string>250</string>", plist)
+        for key in ("LOOM_DASHBOARD_HOST", "LOOM_DASHBOARD_PORT", "LOOM_TRANSCRIPTS_MEMORY"):
+            self.assertEqual(plist.count("<key>%s</key>" % key), 1, key)
+        self.assertNotIn("<key>LOOM_DASHBOARD</key>", plist)
+        self.assert_valid_plist(self.dashboard_plist())
+        self.assertIn("transcripts are kept in memory", result.stdout)
+        self.assertIn("launchctl bootstrap gui/%d %s" % (os.getuid(), self.dashboard_plist()),
+                      self.log.read_text())
+
+    def test_a_crafted_loom_value_stays_one_plist_string(self):
+        # A LOOM_* value is XML-escaped into an EnvironmentVariables string, so
+        # it cannot close the string and add a key launchd would run.
+        crafted = "</string><key>ProgramArguments</key><array><string>/bin/sh</string></array><string>"
+        result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DASHBOARD_BUDGET_FLOOR=crafted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = self.dashboard_plist().read_text()
+        self.assertEqual(plist.count("<key>ProgramArguments</key>"), 1)
+        self.assertNotIn("<string>/bin/sh</string>", plist)
+        self.assertIn("<key>LOOM_DASHBOARD_BUDGET_FLOOR</key><string>&lt;/string&gt;", plist)
+        self.assert_valid_plist(self.dashboard_plist())
+
+    def test_dashboard_keeps_the_database_when_it_is_configured(self):
+        result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DB_PASSWORD="placeholder")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = self.dashboard_plist().read_text()
+        self.assertIn("<key>LOOM_TRANSCRIPTS_MEMORY</key><string></string>", plist)
+        self.assertIn("<key>LOOM_DB_PASSWORD</key><string>placeholder</string>", plist)
+        self.assertIn("<key>LOOM_DASHBOARD_HOST</key><string></string>", plist)
+        self.assertIn("<key>LOOM_DASHBOARD_PORT</key><string>8080</string>", plist)
+        self.assertNotIn("transcripts are kept in memory", result.stdout)
+
+    def test_dashboard_zero_removes_an_installed_dashboard(self):
+        self.assertEqual(self.run_dashboard_install(LOOM_DASHBOARD="1").returncode, 0)
+        self.assertTrue(self.dashboard_plist().exists())
+        result = self.run_dashboard_install(LOOM_DASHBOARD="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.dashboard_plist().exists())
+        self.assertIn("removed com.loom.dashboard", result.stdout)
+        self.assertIn("launchctl bootout gui/%d/com.loom.dashboard" % os.getuid(),
+                      self.log.read_text())
+
+    def test_dashboard_unset_installs_nothing(self):
+        result = self.run_dashboard_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.dashboard_plist().exists())
+        self.assertNotIn("com.loom.dashboard", result.stdout)
+
+    def test_a_dashboard_host_that_is_not_one_ipv4_address_installs_nothing(self):
+        for bad in ("127.0.0.1; true", "dashboard.example", "127.0.0.1 10.0.0.1", "01.2.3.4", "10.0.0.08", "300.1.1.1"):
+            with self.subTest(bad=bad):
+                result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DASHBOARD_HOST=bad)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("LOOM_DASHBOARD_HOST", result.stderr)
+                self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
+    def test_a_bad_dashboard_port_installs_nothing(self):
+        result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DASHBOARD_PORT="web")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("LOOM_DASHBOARD_PORT", result.stderr)
+        self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
 
 
 if __name__ == "__main__":

@@ -275,6 +275,9 @@ class StoreReadTest(unittest.TestCase):
                         dict(outcome("zen", "failed: tests failed"), user={"login": "stranger"})]
             return []
 
+        def paginate_parallel(self, path, workers=8):
+            return self.paginate(path)
+
     def test_store_reads_the_step_record_and_trusted_outcome_comments(self):
         import os
         from unittest import mock

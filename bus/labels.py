@@ -1,6 +1,7 @@
 """The label set from docs/BRAIN.md and an idempotent way to create it."""
 from __future__ import annotations
 
+import re
 from typing import Dict, List
 from urllib.parse import quote
 
@@ -24,8 +25,24 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # LOOM_SPARK_4_URL): each box served three requests at once on
          # 2026-10-16, so a second slot runs beside the first instead of
          # queueing (operator: use the Sparks much more).
-         "spark-3", "spark-4"]
+         "spark-3", "spark-4",
+         # One slot per free provider in the spark-gateway's pool (infra#5617),
+         # each a spark-type slot at the gateway's pinned free route, waiting
+         # out its own provider's reset. Not Sparks. free-ollama Ollama Cloud and
+         # free-gemma Gemma (both allowed private code, /free/<provider>/v1);
+         # free-nvidia NVIDIA NIM, free-kilo Kilo and free-groq Groq (public repos
+         # only, /free-public/<provider>/v1).
+         "free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq"]
 LANES = LANES + SLOTS
+
+
+def base_lane(slot: str) -> str:
+    """The lane a numbered slot belongs to (anthropic-2 -> anthropic, spark-3
+    -> spark), as run_lane.sh maps it; a free provider slot such as free-kilo
+    has no number and is its own lane. bus.factory.lane_kind and the
+    dashboard's run outcomes (dashboard/transcripts.py) both use it."""
+    return re.sub(r"-[0-9]+$", "", slot)
+
 # Remote lanes pull ticket work from GitHub and have no local station inbox.
 # beat_max: seconds a remote worker's last heartbeat counts as up. Muse runs
 # on its own schedule (about every 30 minutes), not every minute like a
@@ -62,6 +79,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:invariant": {"color": "b60205", "description": "Filed by the station: one of the factory's own invariants broke"},
     "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
+    "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
     "needs-operator": {"color": "b60205", "description": "An ask for the operator"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder or the fix round limit; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs-operator: forward now"},
@@ -71,12 +89,21 @@ LABELS: Dict[str, Dict[str, str]] = {
     "class:logic": {"color": "0075ca", "description": "Changes behavior-carrying code"},
     "class:tests": {"color": "0e8a16", "description": "Changes test files only"},
     "class:docs": {"color": "ededed", "description": "Changes docs only"},
+    # Why a ticket waits, set where the station or factory decides it waits
+    # and cleared at the claim: a label change sends no email, a comment does.
+    "wait:gate": {"color": "fef2c0", "description": "Waiting: the unproven-work gate holds its goal"},
+    "wait:model-limit": {"color": "fef2c0", "description": "Waiting: its model or lane is at a limit until a reset"},
+    "wait:lane": {"color": "fef2c0", "description": "Waiting: no free lane takes its model"},
+    "wait:incident": {"color": "fef2c0", "description": "Waiting: held for an open factory incident"},
+    "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
+    "wait:window": {"color": "fef2c0", "description": "Waiting: a deploy or roll window"},
 }
 for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",
                                "description": "Work for the %s lane" % _lane}
 
-MANAGED_PREFIXES = ("loom:", "lane:", "class:")
+MANAGED_PREFIXES = ("loom:", "lane:", "class:", "wait:")
+WAIT_PREFIX = "wait:"
 
 
 def ensure_labels(gh: GitHub, repo: str) -> List[str]:

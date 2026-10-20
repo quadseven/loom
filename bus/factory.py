@@ -65,6 +65,13 @@ Neither needs a model:
   2026-10-13 were the bot's own "Fixed in" threads).
 - A round where the lane made no change and explained why waits for the
   review it asked for, up to REVIEW_GRACE, before the round is judged.
+- A pull request whose open thread carries a lane's answer to a finding, and
+  whose ticket has no lane up for its next rung, does not wait with nothing
+  to move it: the review bot is asked to judge the answer (`/grug improve`,
+  once per head commit), so it re-reviews the head with the reply in view. It
+  clears the head if the answer holds, and keeps the finding if it does not
+  (2026-10-19: grug#1189 waited from 18:25Z on an answered thread nothing
+  judged).
 - A failed ticket climbs the ladder, but only once for a run that committed
   nothing and wrote no reason (lanes/run_lane.sh NO_REASON): at the second
   such failure it is left failed with needs-brain for the brain, since a
@@ -84,6 +91,9 @@ Neither needs a model:
   the ticket's Model: among its limited_models (a model ladder lane, up for
   its other models) counts as at a limit for that ticket, and the ladder
   never climbs to a rung whose model is limited on every lane of it.
+- A running ticket on a local lane with no live heartbeat for SILENT_MAX
+  moves like a limit move: to a free lane of its tier (of its Model: for a
+  pinned ticket), else back to queued. It is no failure and no retry.
 - When no lane of a ticket's tier is up, a limit move or a queued assignment
   falls back to a free lane of the tiers FALLBACK lists (medium: hard, then
   easy), and says so in its note. The ticket's Difficulty: line is kept, so
@@ -118,8 +128,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, naming, tickets
-from .github import GitHub, GitHubError
+from . import brain, change_class, labels, naming, status, tickets
+from .github import GitHub, GitHubError, rest_login
 from .labels import REMOTE_LANES
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
 
@@ -138,6 +148,27 @@ DEFAULT_REVIEW_CHECK = "Grug - Elder"
 # The review bot's login as GraphQL reports it (an app, without "[bot]").
 DEFAULT_REVIEW_BOT = "grug-tribe"
 BOT_FIXED_PREFIX = "Fixed in "
+# Asks the review bot to review a pull request's head again; it resolves the
+# threads it no longer raises. LOOM_REVIEW_AGAIN overrides it.
+REVIEW_AGAIN = "/grug improve"
+# The reply a lane posts on a review thread when it answered the finding
+# instead of changing the code (bus/station.py writes it). The factory reads
+# the same words to know a thread was answered and not settled.
+ANSWER_REPLY = "answered this finding instead of changing the code:"
+ANSWER_RE = re.compile(r"^Lane [A-Za-z0-9_.-]+ %s" % re.escape(ANSWER_REPLY))
+# The marker on the comment that asks the review bot to judge an answer: it
+# carries the head commit, so the ask happens once per head.
+IMPROVE_MARKER = "<!-- loom:improve-head %s -->"
+# The review bot's check output title that means it did not finish every part
+# of the diff ("WARN Elder review coverage partial", "WARN Grug eyes clouded").
+# A lane cannot finish someone else's review by editing code, so the factory
+# asks the bot to look at the head again instead of sending the pull request
+# back for a fix round it cannot close.
+PARTIAL_REVIEW_TITLES = ("WARN Elder review coverage partial",
+                         "WARN Grug eyes clouded")
+# Posted once per head commit on a pull request whose only failing check is a
+# partial review, so a second partial result on the same head goes back.
+REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The slots that draw on one API credit: an empty credit holds all of them.
@@ -156,6 +187,13 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
 # hot spark lane went up the ladder to claude, the operator's subscription.
 SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
+# One slot per free provider in the spark-gateway's pool (infra#5617): spark-
+# type slots whose endpoint is the gateway's route pinned to that provider,
+# never a Spark. Operator 2026-10-19: make every free provider a lane, spend
+# its allowance and wait out each reset. free-ollama Ollama Cloud and free-gemma
+# Gemma may take private repos; free-nvidia NVIDIA NIM, free-kilo Kilo and free-groq
+# Groq may train on prompts, so they are public only (PUBLIC_ONLY).
+FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq")
 TIERS: Dict[str, Tuple[str, ...]] = {
     # The operator's priorities: Muse and agy first on public repos, so their
     # allowances are spent before the rest (2026-10-14); then the Sparks,
@@ -168,16 +206,41 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # 61 on its model card; 6/6 on assay's agentic_coding). Artificial
     # Analysis has no listing for it yet. A ticket a Spark fails still climbs
     # the model ladder, so nothing waits on them.
-    "easy": SPARKS + ("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+    "easy": SPARKS + ("muse", "agy") + FREE_POOL + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
                       "openrouter", "workersai", "zen", "zai"),
-    "medium": SPARKS + ("muse", "agy", "codex", "codex-2", "opencode-go", "opencode-go-2",
-                        "opencode-go-3", "opencode-go-4") + ANTHROPIC,
+    # The free lanes take medium work too, before the paid ones (operator
+    # 2026-10-19: "I always want my free tier used up"). 84 medium tickets
+    # waited a median 18.5 hours for codex while these sat idle; a ticket a
+    # free model fails still climbs the model ladder.
+    "medium": SPARKS + ("muse", "agy") + FREE_POOL + ("openrouter", "workersai", "zen", "zai")
+              + ("codex", "codex-2", "opencode-go", "opencode-go-2",
+                 "opencode-go-3", "opencode-go-4") + ANTHROPIC,
     # agy runs Gemini 4 Argon on the operator's Google plan since 2026-10-15:
     # Artificial Analysis Intelligence Index 53 at high effort, beside Claude
     # Opus 5.5 high (54) and GPT-6.1 Sol high (50), so it takes hard work on
     # public repos (agy stays public only).
     "hard": SPARKS + ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
 }
+# What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
+# own-hardware (the Sparks), free (a free provider's allowance), subscription
+# (a plan with a usage window: claude, codex, opencode-go, agy on the
+# operator's Google plan, muse) or never-paid (a prepaid API credit the
+# operator does not top up, LOOM_NO_TOPUP: the anthropic slots). Every lane
+# TIERS and LADDER name has one (tests/test_bus_factory.py LaneKinds). Base
+# lanes only: a numbered slot takes its lane's kind (lane_kind).
+KINDS = ("own-hardware", "free", "subscription", "never-paid")
+LANE_KINDS: Dict[str, str] = {
+    "spark": "own-hardware",
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai")},
+    **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
+    "anthropic": "never-paid",
+}
+
+
+def lane_kind(lane: str) -> Optional[str]:
+    """LANE_KINDS for a lane or a numbered slot of one (anthropic-9 is an
+    anthropic slot, labels.base_lane); None for a lane it does not know."""
+    return LANE_KINDS.get(labels.base_lane(lane))
 # The strongest model each lane has, for a hard ticket with no Model: line
 # (bus/tickets.py render_brief writes it into the brief, so run_lane.sh runs
 # it instead of the lane default). Artificial Analysis Intelligence Index at
@@ -233,11 +296,20 @@ EQUIVALENT_RE = re.compile(r"<!-- loom:equivalent (\S+) -->")
 FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
-PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse")
+# free-nvidia, free-kilo and free-groq are free providers that may train on prompts.
+PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.
 RUNG_BUSY = 2
+# A ladder ticket whose rung has no lane serving its model for longer than
+# this (each lane down, or its model limited past it) climbs to the next
+# untried rung instead of waiting, as no failure. An account quota held a
+# rung's one lane for a day while two fix rounds and their open pull requests
+# waited on it (2026-10-19).
+RUNG_LIMIT_WAIT = 2 * 3600
+# A running ticket on a lane with no live heartbeat for this long moves off it.
+SILENT_MAX = 30 * 60
 RUNG_MARKER = "<!-- loom:rung %d -->"
 RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 # The thread and check headings bus.brain.fix writes into a loom:fix comment.
@@ -311,6 +383,8 @@ LEAK_DIFF_MARK = "--- PR diff ---"
 LEAK_TEXT_MARK = "--- title and body ---"
 LEAK_HIT_RE = re.compile(r"^\s*\S+:(\d+)\s+\[([\w-]+)\]\s")
 LEAK_REF_RULE = "private-issue-ref"
+CRITERION_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+?)\s*$")
+NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
 # The scanner's cross-repo reference shape: [owner/]name#N.
 SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
                          r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
@@ -434,6 +508,32 @@ def bot_marked_fixed(thread: Dict[str, Any], bot: str) -> bool:
 
 def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
     return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
+
+
+def lane_answered(comment: Dict[str, Any], trusted: set) -> bool:
+    """A lane's answer to a finding, posted as the reply on its thread by a
+    trusted login (bus/station.py writes it as the App)."""
+    return (rest_login(comment.get("author")).lower() in trusted
+            and bool(ANSWER_RE.match(str(comment.get("body") or ""))))
+
+
+def answered_threads(threads: Sequence[Dict[str, Any]], trusted: set) -> List[str]:
+    """The open threads a lane answered instead of changing the code: the
+    thread carries the answer as one of its replies."""
+    out = []
+    for t in threads:
+        if t.get("isResolved"):
+            continue
+        nodes = (t.get("comments") or {}).get("nodes") or []
+        if any(lane_answered(c, trusted) for c in nodes):
+            out.append(str(t.get("id")))
+    return out
+
+
+def review_again() -> str:
+    """The comment that asks the review bot to review a pull request's head
+    again (LOOM_REVIEW_AGAIN overrides the default)."""
+    return os.environ.get("LOOM_REVIEW_AGAIN", "").strip() or REVIEW_AGAIN
 
 
 def asked_threads(comments: Sequence[Dict[str, Any]]) -> set:
@@ -584,7 +684,7 @@ def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
     when none rewrote it since (lanes/run_lane.sh runs a brief's Model: line
     as it is). A claim with no Model: line in force ran on the model the
     runner footer of its lane's pull request names (`footer`, (lane, model)),
-    else on its lane's configured model setting (bus/brain.py _lane_model),
+    else on its lane's configured model setting (bus/brain.py lane_model),
     else on a model nothing names. Never a fixed lane-to-model map: on
     2026-10-17 five runs on lane claude used claude-opus-5-5 while the ladder
     recorded claude-sonnet-5-5 and gave up with two strong models untried.
@@ -606,7 +706,7 @@ def claim_models(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
         claim = CLAIMED_RE.fullmatch(body.strip())
         if claim:
             lane = claim.group(1)
-            ran = footer[1] if footer and footer[0] == lane else brain._lane_model(lane)
+            ran = footer[1] if footer and footer[0] == lane else brain.lane_model(lane)
             out.append((comments[i], current or ran))
     return out
 
@@ -764,6 +864,55 @@ def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
     return [w for bad, w in ((not brain._checks_green(details), "failing checks"),
                              (not brain._threads_resolved(details), "open review threads"),
                              (full.get("mergeable") is False, "a conflict")) if bad]
+
+
+def acceptance_criteria(body: str) -> List[str]:
+    """Checkbox criteria in the Acceptance criteria section."""
+    found = []
+    active = False
+    for line in (body or "").splitlines():
+        if line.strip() == "## Acceptance criteria":
+            active = True
+            continue
+        if active and line.startswith("## "):
+            break
+        match = CRITERION_RE.match(line)
+        if active and match:
+            found.append(("x" if match.group(1).lower() == "x" else "") +
+                         " " + match.group(2).strip())
+    return found
+
+
+def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
+    """Ticket criteria that a lane PR leaves unticked, excluding Live checks."""
+    ticket = acceptance_criteria(ticket_body)
+    pull = acceptance_criteria(pull_body)
+    states = {}
+    for criterion in pull:
+        checked, _, text = criterion.partition(" ")
+        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
+        states[clean] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
+    missing = []
+    for criterion in ticket:
+        _, _, text = criterion.partition(" ")
+        if text.casefold().startswith("live:"):
+            continue
+        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
+        checked, not_built = states.get(clean, (False, False))
+        if not checked and not not_built:
+            missing.append(text)
+    return missing
+
+
+def not_built_criteria(ticket_body: str, pull_body: str) -> List[str]:
+    """Ticket criteria explicitly marked not built with a reason in a PR."""
+    ticket = [item.partition(" ")[2] for item in acceptance_criteria(ticket_body)]
+    marked = {NOT_BUILT_RE.sub("", item.partition(" ")[2]).strip().casefold()
+              for item in acceptance_criteria(pull_body)
+              if NOT_BUILT_RE.search(item.partition(" ")[2])}
+    return [item for item in ticket
+            if not item.strip().casefold().startswith("live:")
+            and item.strip().casefold() in marked]
 
 
 def is_code(path: str) -> bool:
@@ -929,7 +1078,9 @@ class Factory:
                  available: Optional[Sequence[str]] = None,
                  close: Optional[Callable[..., Any]] = None,
                  held: Sequence[str] = (),
-                 model_limits: Optional[Dict[str, Dict[str, float]]] = None) -> None:
+                 model_limits: Optional[Dict[str, Dict[str, float]]] = None,
+                 silent: Optional[Dict[str, float]] = None,
+                 down: Sequence[str] = ()) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -942,6 +1093,11 @@ class Factory:
         self.merge, self.fix, self.move = merge, fix, move
         self.close = close if close is not None else _default_close
         self.limited = set(limited)
+        # Lanes whose fresh heartbeat says unavailable for another reason (an
+        # expired key, a lane stopped on purpose): their briefed tickets step
+        # aside as from a limit. Left to the BRIEFED_STALL move, three tickets
+        # waited two hours on lanes whose key had expired (2026-10-19).
+        self.down = set(down)
         # Lane -> {model: epoch its limit lifts}: a lane with a model ladder
         # is up while one model is limited, but not for that model.
         self.model_limits = dict(model_limits or {})
@@ -952,6 +1108,11 @@ class Factory:
         # incident (they keep their running label and lane, but no lane is
         # working them) or refused this pass by the unproven-work gate.
         self.held = set(held)
+        # Lane -> seconds since its last heartbeat, for each local lane
+        # without a live one; silent_running is the lanes found holding a
+        # running ticket past SILENT_MAX, with those tickets.
+        self.silent = dict(silent or {})
+        self.silent_running: Dict[str, List[Tuple[str, int]]] = {}
         self._private: Dict[str, bool] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         self.actions = 0
@@ -1005,8 +1166,14 @@ class Factory:
                 if isinstance(i, dict) and "pull_request" not in i and "number" in i
                 and self._trusted_ticket(i)}
 
+    def _status_note(self, repo: str, number: int, text: str) -> None:
+        """A routine event on the ticket's one status comment, edited in place
+        (bus/status.py): a new comment would email the operator (loom#866)."""
+        status.add(self.gh, repo, number, text, self.now, self.trusted)
+
     def _comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
-        """The ticket's comments from trusted logins only."""
+        """An issue's comments (a ticket's or a pull request's) from trusted
+        logins only."""
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return [c for c in data if isinstance(c, dict) and self._trusted(c)]
 
@@ -1110,13 +1277,16 @@ class Factory:
                    for r in self._runs.get(sha, []))
 
     # -- writes ----------------------------------------------------------
-    def _resolve_bot_fixed(self, repo: str, number: int) -> None:
+    def _threads(self, repo: str, number: int) -> List[Dict[str, Any]]:
+        """The pull request's review threads, with their replies."""
         owner, name = repo.split("/", 1)
         data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
                                                "number": number}) or {}
-        threads = ((((data.get("repository") or {}).get("pullRequest") or {})
-                    .get("reviewThreads") or {}).get("nodes") or [])
-        picked = bot_fixed(threads, self.review_bot)
+        return ((((data.get("repository") or {}).get("pullRequest") or {})
+                 .get("reviewThreads") or {}).get("nodes") or [])
+
+    def _resolve_bot_fixed(self, repo: str, number: int) -> None:
+        picked = bot_fixed(self._threads(repo, number), self.review_bot)
         for thread_id in picked:
             self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
         if picked:
@@ -1158,11 +1328,7 @@ class Factory:
         """Defer the open medium and low findings of a reviewed, green pull
         request to a follow-up issue, then resolve them. True when it did.
         With `immediate` (docs, tests, or a revert) they defer at once."""
-        owner, name = repo.split("/", 1)
-        data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
-                                               "number": number}) or {}
-        threads = ((((data.get("repository") or {}).get("pullRequest") or {})
-                    .get("reviewThreads") or {}).get("nodes") or [])
+        threads = self._threads(repo, number)
         rounds = fixes_of(comments)
         picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
@@ -1231,10 +1397,9 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "%s\n%s (%s): the factory moved this ticket up the "
-                    "model ladder to rung %d, %s on lane %s." % (
-                        RUNG_MARKER % rung, head, why, rung, model, lane)})
+        self._status_note(repo, number, "%s\n%s (%s): the factory moved this ticket up the "
+                          "model ladder to rung %d, %s on lane %s." % (
+                              RUNG_MARKER % rung, head, why, rung, model, lane))
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
@@ -1267,7 +1432,13 @@ class Factory:
                 if self._rungs_left(repo, issue, comments, footer):
                     # Not past the ladder: no lane of an untried rung is up.
                     # It waits, with no comment, and climbs on a later pass.
-                    _say("%s#%d waits: no lane is up for its next rung" % (repo, number))
+                    # An answered thread is judged by the review bot instead:
+                    # it re-reviews the head with the reply in view.
+                    asked = self._ask_reviewer(repo, pr)
+                    note = ("; the review bot was asked to judge the answer on #%d"
+                            % int(pr["number"])) if asked else ""
+                    _say("%s#%d waits: no lane is up for its next rung%s"
+                         % (repo, number, note))
                     return
                 tried, _ = self._tried(issue, comments, footer=footer)
                 self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
@@ -1286,6 +1457,27 @@ class Factory:
                      TEST_NOTES if no_test else FIX_NOTES)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
+
+    def _ask_reviewer(self, repo: str, pr: Dict[str, Any]) -> bool:
+        """Ask the review bot to judge a lane's answer on a pull request whose
+        ticket has no lane up for its next rung. It re-reviews the head with
+        the reply in view: it clears the head if the answer holds, and keeps
+        the finding if it does not. The ask happens once per head commit, so
+        a ticket that waits does not ask again and again. True when it asked.
+        """
+        number = int(pr["number"])
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        if not sha:
+            return False
+        marker = IMPROVE_MARKER % sha
+        if any(marker in str(c.get("body") or "") for c in self._comments(repo, number)):
+            return False  # this head was asked already
+        if not answered_threads(self._threads(repo, number), self.trusted):
+            return False  # nothing was answered: the finding stands on its own
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                     {"body": "%s\n\n%s" % (review_again(), marker)})
+        self.actions += 1
+        return True
 
     # -- the three kinds of stuck ----------------------------------------
     def _footer(self, repo: str, pr: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
@@ -1445,7 +1637,8 @@ class Factory:
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and (
                 self._repair_body_leak(repo, number, full, issue, comments, sha)
-                or self._run_again(repo, number, sha)):
+                or self._run_again(repo, number, sha)
+                or self._review_again(repo, number, full, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
@@ -1499,11 +1692,36 @@ class Factory:
                           sensitive: bool = False) -> None:
         """Land a clean, reviewed pull request, or send it back when it
         changes code without a test. A clean sensitive one waits for the brain."""
-        if self._needs_test(repo, number, issue):
+        missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
+        if missing:
+            self._send_back(repo, full, issue, comments,
+                            "unticked acceptance criteria; build these or mark each "
+                            "not built with a reason: " + "; ".join(missing))
+        elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
         elif not sensitive:
+            self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue)
+
+    def _file_criterion_follow_up(self, repo: str, number: int,
+                                  issue: Dict[str, Any], full: Dict[str, Any]) -> None:
+        """File a ticket for criteria explicitly marked not built in a lane PR."""
+        criteria = not_built_criteria(str(issue.get("body") or ""),
+                                      str(full.get("body") or ""))
+        if not criteria:
+            return
+        title = "Complete criteria left from PR #%d" % number
+        if any(isinstance(found, dict) and found.get("title") == title
+               for found in self.gh.paginate("/repos/%s/issues?labels=loom:ticket" % repo)):
+            return
+        body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
+                "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
+                "\n".join("- [ ] " + item for item in criteria) +
+                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" %
+                int(issue["number"]))
+        self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]})
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a
@@ -1527,6 +1745,32 @@ class Factory:
             self.gh.rest("POST", "/repos/%s/actions/runs/%s/rerun-failed-jobs" % (repo, run_id))
         self.actions += 1
         _say("re-ran failed jobs on %s#%d once before sending it back" % (repo, number))
+        return True
+
+    def _review_again(self, repo: str, number: int, full: Dict[str, Any],
+                      sha: str) -> bool:
+        """Ask the review bot to look at this head again, once per head
+        commit, when the only failing check is a partial review a lane cannot
+        fix by editing code. False when a marker for this head is already on
+        the pull request (a second partial result goes to the usual paths)."""
+        failed = [r for r in self._runs.get(sha, [])
+                  if r.get("conclusion") not in GREEN]
+        review = [r for r in failed if r.get("name") == self.review_check]
+        if len(review) != 1 or len(failed) != 1:
+            return False
+        title = str((review[0].get("output") or {}).get("title") or "")
+        if not any(title.startswith(mark) for mark in PARTIAL_REVIEW_TITLES):
+            return False
+        marker = REVIEW_AGAIN_MARKER % sha
+        for comment in self.gh.paginate(
+                "/repos/%s/issues/%d/comments" % (repo, number)):
+            if marker in str(comment.get("body") or ""):
+                return False
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                     {"body": "%s\n%s" % (marker, REVIEW_AGAIN)})
+        self.actions += 1
+        _say("asked the review bot to review %s#%d again after a partial review"
+             % (repo, number))
         return True
 
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
@@ -1626,11 +1870,54 @@ class Factory:
             # stalled, so it climbs nothing, and only a long hold is reported.
             self._tell_held(repo, issue, waiting)
             return
-        if _lane(issue) in self.limited or not self._serves(_lane(issue), issue_model(issue)):
+        if (_lane(issue) in self.limited or _lane(issue) in self.down
+                or not self._serves(_lane(issue), issue_model(issue))):
             self._step_aside(repo, issue)
             return
         if not self._spread(repo, issue):
             self._unclaimed(repo, issue)
+
+    def running(self, repo: str, issue: Dict[str, Any]) -> None:
+        """A running ticket whose lane has sent no heartbeat for SILENT_MAX
+        moves like a transient failure but is no failure: a free lane of its
+        tier (of its model, for a Model: ticket), else back to the queue. It
+        takes no rung marker and none of its automatic retries. A remote lane
+        is left to the remote heartbeat rules, a held ticket to the station."""
+        old = _lane(issue)
+        number = int(issue["number"])
+        silent = self.silent.get(old, 0)
+        if (old in REMOTE_LANES or silent < SILENT_MAX
+                or "%s#%d" % (repo, number) in self.held):
+            return
+        self.silent_running.setdefault(old, []).append((repo, number))
+        model = issue_model(issue)
+        lane = (self._queued_model_lane(repo, model) if model != "unspecified"
+                else self._tier_move(repo, issue, old, allow_remote=False)[0])
+        said = ("Not a failure (lane %s has sent no heartbeat for %d minutes): "
+                % (old, silent // 60))
+        if lane is None:
+            self._status_note(repo, number,
+                              said + "no lane of its tier is free, so the ticket goes back to the queue.")
+            kept = [x for x in _labels(issue) if x != "loom:running" and not x.startswith("lane:")]
+            self._relabel(repo, issue, kept + ["loom:queued"])
+            _say("queued %s#%d: lane %s sent no heartbeat for %d minutes"
+                 % (repo, number, old, silent // 60))
+        else:
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
+                "body": said + "the factory moved this ticket to lane %s, %s." % (
+                    lane, "in its difficulty tier" if model == "unspecified"
+                    else "which takes its model")})
+            kept = brain._moved_labels(_labels(issue), "briefed", lane)
+            self._relabel(repo, issue, kept)
+            self.load[lane] = self.load.get(lane, 0) + 1
+            _say("moved running %s#%d off silent lane %s to %s" % (repo, number, old, lane))
+        self.load[old] = self.load.get(old, 0) - 1
+        self.actions += 1
+
+    def _relabel(self, repo: str, issue: Dict[str, Any], labels: List[str]) -> None:
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, issue["number"]),
+                     {"labels": labels})
+        issue["labels"] = [{"name": x} for x in labels]
 
     def held_by(self, repo: str, issue: Dict[str, Any]) -> List[tickets.After]:
         """The After: tickets of this one that are not merged yet."""
@@ -1722,11 +2009,11 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "Not a failure (briefed %.0f hours on lane %s with no claim): the "
-                    "factory moved this ticket to lane %s, %s." % (
-                        hours, old, lane,
-                        "on the same rung" if rung else "in its difficulty tier")})
+        self._status_note(repo, number,
+                          "Not a failure (briefed %.0f hours on lane %s with no claim): the "
+                          "factory moved this ticket to lane %s, %s." % (
+                              hours, old, lane,
+                              "on the same rung" if rung else "in its difficulty tier"))
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
@@ -1755,14 +2042,27 @@ class Factory:
         _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
         return True
 
+    def _rung_waits_long(self, repo: str, rung: int) -> bool:
+        """Whether no lane of the rung serves its model within RUNG_LIMIT_WAIT:
+        each is down, or holds the model limited past it. A lane at a limit
+        with no known end is not counted as a long wait."""
+        model = CLIMB[rung - 1][1]
+        lanes = self._rung_lanes(repo, rung)
+        return bool(lanes) and all(
+            lane in self.down
+            or self.model_limits.get(lane, {}).get(model, 0) > self.now + RUNG_LIMIT_WAIT
+            for lane in lanes)
+
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Move a ticket off a lane at a limit to the first free lane of its
+        """Move a ticket off a lane at a limit (or down) to the first free lane of its
         difficulty tier (or of a FALLBACK tier when none of its tier is up),
         or a ladder ticket to a free lane of its rung, with no rung marker.
-        With none free it stays where it is, for the lane to take once it is
-        back."""
+        A ladder ticket whose rung serves no lane within RUNG_LIMIT_WAIT
+        climbs to its next untried rung instead. With none free it stays where
+        it is, for the lane to take once it is back."""
         number = int(issue["number"])
         old = _lane(issue)
+        why = "down" if old in self.down and old not in self.limited else "at a limit"
         rung = current_rung(issue)
         fallback = ""
         if rung:
@@ -1770,9 +2070,19 @@ class Factory:
                          and self._serves(x, CLIMB[rung - 1][1])), None)
         else:
             lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
+        if lane is None and rung and self._rung_waits_long(repo, rung):
+            climbed = self._climb(repo, issue, self._comments(repo, number),
+                                  "lane %s is %s for over %d hours" % (
+                                      old, why, RUNG_LIMIT_WAIT // 3600),
+                                  head="Not a failure", failed_here=False, skip=rung)
+            if climbed is not None:
+                self.load[old] = self.load.get(old, 0) - 1
+                self.actions += 1
+                _say("climbed %s#%d off lane %s, %s, to %s" % (repo, number, old, why, climbed))
+                return
         if lane is None:
-            _say("%s#%d waits on lane %s, at a limit: no free lane in its %s"
-                 % (repo, number, old, "rung" if rung else "tier"))
+            _say("%s#%d waits on lane %s, %s: no free lane in its %s"
+                 % (repo, number, old, why, "rung" if rung else "tier"))
             return
         body = str(issue.get("body") or "")
         if not rung:
@@ -1782,16 +2092,16 @@ class Factory:
         kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
         issue["labels"] = [{"name": x} for x in kept]
-        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), {
-            "body": "Not a failure (lane %s is at a limit): the factory moved this "
-                    "ticket to lane %s, %s." % (
-                        old, lane, "on the same rung" if rung else
-                        fallback or "in its difficulty tier")})
+        self._status_note(repo, number,
+                          "Not a failure (lane %s is %s): the factory moved this "
+                          "ticket to lane %s, %s." % (
+                              old, why, lane, "on the same rung" if rung else
+                              fallback or "in its difficulty tier"))
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
-        _say("moved %s#%d off lane %s, at a limit, to %s%s" % (
-            repo, number, old, lane, " (%s)" % fallback if fallback else ""))
+        _say("moved %s#%d off lane %s, %s, to %s%s" % (
+            repo, number, old, why, lane, " (%s)" % fallback if fallback else ""))
 
     # -- lane load -------------------------------------------------------
     def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
@@ -1891,10 +2201,11 @@ class Factory:
         to its Model: line, so its claim records the model that ran. The note
         carries EQUIVALENT_MARKER, which leaves the pinned rung untried."""
         number = int(issue["number"])
-        self.move(self.gh, repo, number, "briefed", lane=lane, model=model,
-                  note="%s\nThe station gave this queued ticket lane %s with model %s in "
-                       "place of %s (equivalent: %s)." % (
-                           EQUIVALENT_MARKER % model, lane, model, pinned, why))
+        self.move(self.gh, repo, number, "briefed", lane=lane, model=model)
+        self._status_note(repo, number,
+                          "%s\nThe station gave this queued ticket lane %s with model %s in "
+                          "place of %s (equivalent: %s)." % (
+                              EQUIVALENT_MARKER % model, lane, model, pinned, why))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         issue["body"] = with_model(str(issue.get("body") or ""), model)
@@ -1906,18 +2217,19 @@ class Factory:
                            tier: str) -> None:
         number = int(issue["number"])
         if lane in REMOTE_LANES:
-            self.move(self.gh, repo, number, "queued", lane=lane,
-                      note="The station reserved this queued ticket for remote lane %s (tier %s)."
-                           % (lane, tier))
+            self.move(self.gh, repo, number, "queued", lane=lane)
+            self._status_note(repo, number,
+                              "The station reserved this queued ticket for remote lane %s (tier %s)."
+                              % (lane, tier))
             issue["labels"] = [{"name": x} for x in brain._moved_labels(
                 _labels(issue), "queued", lane)]
             self.load[lane] = self.load.get(lane, 0) + 1
             _say("reserved queued %s#%d for remote lane %s (tier %s)"
                  % (repo, number, lane, tier))
             return
-        self.move(self.gh, repo, number, "briefed", lane=lane,
-                  note="The station gave this queued ticket lane %s (tier %s)." %
-                       (lane, tier))
+        self.move(self.gh, repo, number, "briefed", lane=lane)
+        self._status_note(repo, number,
+                          "The station gave this queued ticket lane %s (tier %s)." % (lane, tier))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         self.load[lane] = self.load.get(lane, 0) + 1
@@ -1952,7 +2264,8 @@ class Factory:
             if self.actions >= MAX_ACTIONS:
                 return
             self._guarded(self.pull_request, repo, pr, tickets)
-        steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed}
+        steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
+                 "running": self.running}
         for issue in list(tickets.values()):
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:

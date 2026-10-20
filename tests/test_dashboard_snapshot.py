@@ -1,4 +1,5 @@
 """Snapshot behavior with a GitHub boundary that controls request latency."""
+import contextlib
 import os
 import json
 import threading
@@ -231,3 +232,168 @@ class SnapshotTest(unittest.TestCase):
                 store.refresh()
         self.assertEqual(len(logs.output), 1)
         self.assertRegex(logs.output[0], r"first dashboard snapshot ready in [0-9.]+s")
+
+    def test_open_issue_reads_overlap_and_an_error_stays_with_its_repo(self):
+        # The /free page's open issues are read in the first pass too, one
+        # repo after another: 12.4 s of a cold 320 s first snapshot (loom#433).
+        class OpenIssues(SlowGitHub):
+            def paginate(self, path):
+                found = super().paginate(path)
+                repo = next(repo for repo in REPOS if "/" + repo + "/" in path)
+                if repo == REPOS[1]:
+                    raise GitHubError("open issues failed")
+                return [{"number": REPOS.index(repo) + 1, "title": repo},
+                        {"number": 99, "pull_request": {}}] if "issues?state=open" in path else found
+
+        gh = OpenIssues(delay=0.05)
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore(REPOS, gh=gh)
+            store.open_issues[REPOS[1]] = [{"number": 7}]
+            started = time.monotonic()
+            store._read_open_issues(10000.0)
+            elapsed = time.monotonic() - started
+        self.assertGreater(gh.max_active, 1)
+        self.assertLess(elapsed, gh.request_time * 0.7)
+        self.assertEqual({repo: [row["number"] for row in rows] for repo, rows in store.open_issues.items()},
+                         {REPOS[0]: [1], REPOS[1]: [7], REPOS[2]: [3]})
+        self.assertEqual(list(store.open_issues), REPOS)
+        self.assertEqual(store.open_issues_error, "%s: open issues failed" % REPOS[1])
+        self.assertEqual(store.open_issues_read_at, 10000.0)
+
+    def test_comment_feed_pages_overlap_within_a_repo_and_keep_page_order(self):
+        # One repo's two-week comment feed was read one page after another:
+        # 32 s of a cold first snapshot (loom#433).
+        repo = REPOS[0]
+        clock = Overlap()
+
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if path != "/repos/%s/issues/comments" % repo:
+                return 200, {}, b"[]"
+            page = int(parse_qs(urlsplit(url).query).get("page", ["1"])[0])
+            with clock.request():
+                links = "" if page == 6 else (
+                    '<https://api.github.com%s?per_page=100&page=%d>; rel="next", '
+                    '<https://api.github.com%s?per_page=100&page=6>; rel="last"' % (path, page + 1, path))
+                # The last page repeats one comment, as a page shift does.
+                found = [{"id": page, "user": {"login": "bot"}}] + (
+                    [{"id": 5, "user": {"login": "bot"}}] if page == 6 else [])
+                return 200, {"Link": links}, json.dumps(found).encode()
+
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=GitHub("", transport=transport))
+            data = {}
+            store._read_hot_spot_comments(data)
+        clock.assert_overlapped(self)
+        self.assertEqual([row["id"] for row in data["issue_comments"]], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(data["hot_spots_error"], "")
+
+    def test_claim_check_reads_overlap_and_an_error_stays_with_its_pull_request(self):
+        clock = Overlap()
+        repos = ["example-owner/r%d" % n for n in range(6)]
+
+        class Checks:
+            rate = {}
+
+            def rest(self, method, path, body=None):
+                with clock.request():
+                    if "/r3/" in path:
+                        raise GitHubError("checks failed")
+                    return type("R", (), {"data": {"check_runs": [
+                        {"name": path, "status": "completed", "conclusion": "success"}]}})()
+
+        items = [{"linked": [{"repo": repo, "sha": "%040d" % n, "state": "open"}]}
+                 for n, repo in enumerate(repos)]
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore(repos, gh=Checks())
+            errors = []
+            out = store._read_claim_checks(items, errors)
+        clock.assert_overlapped(self)
+        self.assertEqual(list(out), ["%s@%040d" % (repo, n) for n, repo in enumerate(repos) if n != 3])
+        self.assertEqual(errors, ["example-owner/r3 checks: checks failed"])
+
+    def test_ask_reads_overlap_keep_their_item_and_stop_at_the_cap(self):
+        clock = Overlap()
+
+        class Comments:
+            rate = {}
+
+            def rest(self, method, path, body=None):
+                with clock.request():
+                    number = int(path.split("/issues/")[1].split("/")[0])
+                    if number == 2:
+                        raise GitHubError("comments failed")
+                    return type("R", (), {"data": [{"body": "Ask: do thing %d" % number,
+                                                    "html_url": "u%d" % number}]})()
+
+        items = [{"repo": REPOS[0], "number": n, "comments": 1, "labels": [], "updated_at": "t"}
+                 for n in range(1, 8)]
+        previous = [{"repo": REPOS[0], "number": 7, "updated_at": "old", "ask": "kept", "ask_url": "k"}]
+        with patch.dict(os.environ, {}, clear=True), patch("dashboard.github.OPERATOR_ASK_READS", 6):
+            store = TicketStore(REPOS, gh=Comments())
+            errors = []
+            store._read_asks(items, previous, errors)
+        clock.assert_overlapped(self)
+        self.assertEqual(clock.count, 6)
+        self.assertEqual([(item["ask"], item["ask_url"]) for item in items],
+                         [("Ask: do thing 1", "u1"), (None, ""), ("Ask: do thing 3", "u3"),
+                          ("Ask: do thing 4", "u4"), ("Ask: do thing 5", "u5"),
+                          ("Ask: do thing 6", "u6"), ("kept", "k")])
+        self.assertEqual(errors, ["%s#2 ask: comments failed" % REPOS[0]])
+
+    def test_goal_home_reads_overlap_and_follow_parents(self):
+        clock = Overlap()
+        repo = REPOS[0]
+
+        class Goals:
+            rate = {}
+
+            def rest(self, method, path, body=None):
+                with clock.request():
+                    number = int(path.rsplit("/", 1)[1])
+                    # Goals 1-6 roll up into goal 7, which is labelled a goal.
+                    body = "Parent goal: #7" if number < 7 else ""
+                    return type("R", (), {"data": {"number": number, "title": "Goal %d" % number,
+                                                   "body": body, "labels": [{"name": "loom:goal"}]}})()
+
+        rows = [{"goal": "%s#%d" % (repo, n)} for n in range(1, 7)]
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=Goals())
+            titles, parents = store._goal_info(rows)
+        clock.assert_overlapped(self)
+        self.assertEqual(clock.count, 7)
+        self.assertEqual(titles, {"%s#%d" % (repo, n): "Goal %d" % n for n in range(1, 8)})
+        self.assertEqual(parents, dict({"%s#%d" % (repo, n): "%s#7" % repo for n in range(1, 7)},
+                                       **{"%s#7" % repo: None}))
+
+
+class Overlap:
+    """Counts requests that sleep, and how many ran at once."""
+
+    def __init__(self, delay=0.05):
+        self.delay = delay
+        self.lock = threading.Lock()
+        self.active = self.max_active = self.count = 0
+        self.first_started = self.last_finished = None
+        self.request_time = 0.0
+
+    @contextlib.contextmanager
+    def request(self):
+        started = time.monotonic()
+        with self.lock:
+            self.first_started = self.first_started or started
+            self.count += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(self.delay)
+            yield
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.last_finished = time.monotonic()
+                self.request_time += self.last_finished - started
+
+    def assert_overlapped(self, test):
+        test.assertGreater(self.max_active, 1)
+        test.assertLess(self.last_finished - self.first_started, self.request_time * 0.7)
