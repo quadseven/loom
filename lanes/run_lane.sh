@@ -2076,6 +2076,8 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
     # this lane the retry. The rest of the inbox waits for the reset.
+    LIMIT_REASON="provider limit reached"
+    [[ "$RUN_OUTPUT" =~ $MODEL_GONE_RE ]] && LIMIT_REASON="model $MODEL not found by the agent CLI"
     if [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
@@ -2088,7 +2090,6 @@ for BRIEF in "$INBOX"/*.md; do
       done
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ]; then
-      LIMIT_REASON="provider limit reached"
       record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
       WHY="$(ladder_reason "$CONFIGURED_MODELS")"
       MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
@@ -2102,7 +2103,6 @@ for BRIEF in "$INBOX"/*.md; do
         heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
       fi
     else
-      LIMIT_REASON="provider limit reached"
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
