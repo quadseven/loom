@@ -3062,6 +3062,15 @@ exit %d
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()) + 86000)
 
+    def test_a_lane_with_no_transient_count_writes_nothing_to_its_service_log(self):
+        # 2026-10-20: every pass read the missing count file with the stderr
+        # redirect after the input one, so bash printed "No such file or
+        # directory" first; each lane's service log held about 1000 such lines.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
+        self.assertNotIn(".transient", result.stderr)
+        self.assertNotIn(".transient", result.stdout)
+
     def test_a_run_that_is_not_transient_clears_the_transient_count(self):
         for n, (out, status) in enumerate((("Unexpected server error", "1"),
                                            ("Unexpected server error", "1"),
