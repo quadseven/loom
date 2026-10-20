@@ -3545,6 +3545,23 @@ class RetryTest(Base):
         self.assertNotIn("loom:running", self.fake.names(12))
         self.assertIn("loom:failed", self.fake.names(12))
 
+    def test_a_reported_failure_never_leaves_its_ticket_running(self):
+        # Any failure path that reports a run and forgets to move the ticket
+        # left it loom:running on a lane with no brief: a runaway hold did, and
+        # four tickets sat 8 to 48 hours (2026-10-20).
+        self.failed(reason="[work] agent made no commit on loom/12-fix-the-thing")
+        with mock.patch.object(station.Station, "_report_failure", return_value=True):
+            self.run_pass()
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertIn("nothing moved the ticket", self.bodies()[-1])
+
+    def test_a_factory_hold_keeps_its_ticket_running(self):
+        self.failed(reason="[factory] setup failed: base check exited 1 on the unmodified "
+                           "repo; factory incident %s#900; the agent did not run" % REPO)
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+
     def test_attempts_that_ended_transient_or_limit_do_not_count_toward_runaway(self):
         self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
