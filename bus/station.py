@@ -7614,6 +7614,7 @@ class Station:
         runner = self._factory()
         runner.run()
         self._record_silent(runner.silent_running, runner.silent)
+        self._return_silent_briefs(runner.silent_running)
 
     def _silent_lanes(self) -> Dict[str, float]:
         """Local lane -> seconds since its last heartbeat, for each lane
@@ -7648,6 +7649,38 @@ class Station:
             saved[lane] = {"at": self.now, "silent_for": silent[lane],
                            "tickets": ["%s#%d" % item for item in held]}
         _write_json(path, saved)
+
+    def _return_silent_briefs(self, found: Dict[str, List[Tuple[str, int]]]) -> None:
+        """Move the still-unpicked briefs of tickets the factory just moved
+        off silent lanes out of those lanes' inboxes into returned/ (which
+        nothing reads). The factory's silent-lane move relabels the ticket
+        but leaves its brief behind; a revived runner would otherwise pick up
+        the stale brief and work a ticket it no longer holds (loom#1206). A
+        brief the runner already picked up sits in done/ or failed/, not the
+        inbox, so only stale unpicked briefs move."""
+        for lane, held in found.items():
+            inbox = self.inbox(lane)
+            try:
+                files = os.listdir(inbox)
+            except OSError:
+                continue
+            wanted = []
+            for repo, number in held:
+                base = tickets.ticket_name(repo, number)
+                pattern = re.compile(re.escape(base) + r"(-r[0-9]+)?\.md\Z")
+                wanted.extend(name for name in files if pattern.fullmatch(name))
+            if not wanted:
+                continue
+            returned = os.path.join(inbox, "returned")
+            try:
+                os.makedirs(returned, exist_ok=True)
+                for name in wanted:
+                    os.replace(os.path.join(inbox, name),
+                               os.path.join(returned, name))
+            except OSError:
+                continue
+            _say("returned %d stale brief(s) from silent lane %s"
+                 % (len(wanted), lane))
 
     def _invariant_silent(self) -> List[invariants.SilentRun]:
         """The lanes _record_silent kept, their tickets named for a public
