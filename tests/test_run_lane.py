@@ -2521,11 +2521,13 @@ cat > /dev/null
     GO_LIMIT = (429, '{"type": "GoUsageLimitError", "limitName": "weekly", '
                      '"message": "Weekly usage limit reached"}')
 
-    def provider(self, *answers):
+    def provider(self, *answers, **kw):
         """A fake OpenCode Go chat endpoint on loopback. Answers each POST with
         the next (status, body) of answers (the last repeats) and records the
-        request; real curl runs behind a wrapper that records its argv."""
+        request; real curl runs behind a wrapper that records its argv.
+        retry_after sends the header a provider sends with a refusal."""
         requests, queue = [], list(answers)
+        retry_after = kw.get("retry_after")
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -2535,6 +2537,8 @@ cat > /dev/null
                 status, text = queue.pop(0) if len(queue) > 1 else queue[0]
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                if retry_after:
+                    self.send_header("Retry-After", str(retry_after))
                 self.end_headers()
                 self.wfile.write(text.encode())
 
@@ -2604,6 +2608,28 @@ cat > /dev/null
             self.assertIn("weekly", self.beat(slot)["reason"])
             self.assertTrue(self.beat(slot)["reason"].startswith("limit: "))
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_go_limit_holds_the_group_for_the_reset_the_provider_gave(self):
+        # 2026-10-20: the provider's Retry-After header was never read (the awk
+        # that read it wanted IGNORECASE, which the awk on the lane machine has
+        # no), so every OpenCode Go limit held the four opencode-go slots for a
+        # week: the lane-held invariant fired and the tier's tickets waited days
+        # for a lane the provider served again hours later.
+        requests, env = self.provider(self.GO_LIMIT, retry_after=1800)
+        before = int(time.time())
+        inbox, result = self.api_lane("opencode-go", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beats = {slot: self.beat(slot) for slot in
+                 ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")}
+        for slot, beat in beats.items():
+            self.assertFalse(beat["available"], slot)
+            self.assertTrue(beat["reason"].startswith("limit: "), beat)
+        until = beats["opencode-go"]["retry_at"]
+        self.assertGreaterEqual(until, before + 1800)
+        self.assertLessEqual(until, before + 1800 + 300)
+        for slot, beat in beats.items():
+            self.assertEqual(beat["retry_at"], until, slot)
+
     def test_a_model_with_a_quote_never_reaches_the_probe_body(self):
         # The probe checks the model itself, not only through the brief loop's allowlist.
         sent = Path(self._tmp.name) / "probe-sent"
@@ -2625,6 +2651,143 @@ cat > /dev/null
         (usage / (slot + ".provider-limit.json")).write_text(json.dumps({
             "at": int(time.time()), "limit_name": limit_name,
             "retry_after": retry_after if retry_after is not None else ""}) + "\n")
+
+    # The provider the probe asks: the headers it sent, the body it answered
+    # and the status, read from the environment.
+    FAKE_CURL_PROVIDER = """#!/usr/bin/env bash
+h=""
+while [ $# -gt 0 ]; do case "$1" in -D) shift; h="$1";; esac; shift; done
+if [ "$FAKE_STATUS" = refused ]; then printf '000'; exit 7; fi
+[ -n "$h" ] && printf 'HTTP/1.1 %s\\r\\n%s\\r\\n\\r\\n' "$FAKE_STATUS" "$FAKE_HEADERS" > "$h"
+printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
+"""
+
+    def fake_provider(self, status=200, headers="", body='{"ok": true}'):
+        """A curl that answers the probe the way the environment says."""
+        self.write_tool(self.bin / "curl", self.FAKE_CURL_PROVIDER)
+        return {"FAKE_STATUS": str(status), "FAKE_HEADERS": headers, "FAKE_BODY": body}
+
+    def provider_probe(self, **env):
+        """Run the runner's probe in a shell of its own and say what it found."""
+        script = self.source_functions("provider_at_limit", "provider_checked") + (
+            'lane_setting() { case "$1" in PROBE_URL) echo http://127.0.0.1:9/v1/chat ;; esac; }\n'
+            'SLOT=opencode-go API_KEY=k PROBE_TIMEOUT=1 MODEL="opencode-go/kimi-k2.7-code"\n'
+            'provider_at_limit; echo "rc=$?"')
+        return subprocess.run(["bash", "-c", script, "bash"],
+                              env={**self.lane_env(), "LOOM_HOME": str(self.loom), **env},
+                              capture_output=True, text=True)
+
+    def test_the_providers_retry_after_is_the_time_the_lane_waits(self):
+        # 2026-10-20: the awk that read the provider's Retry-After wanted
+        # IGNORECASE, which the awk on the lane machine has no, so the header
+        # was never read: every OpenCode Go limit fell back to the window name
+        # and held the four opencode-go slots for a week, and the tier's
+        # tickets waited days for a lane the provider served again hours later.
+        env = self.fake_provider(status=429, headers="Retry-After: 1800",
+                                 body='{"type": "GoUsageLimitError", "limitName": "monthly"}')
+        before = int(time.time())
+        result = self.provider_probe(**env)
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        row = json.loads((self.loom / "state/usage/opencode-go.provider-limit.json").read_text())
+        self.assertEqual(row["limit_name"], "monthly")
+        self.assertGreaterEqual(int(row["retry_after"]), before + 1800)
+        self.assertLessEqual(int(row["retry_after"]), before + 1800 + 60)
+
+    def provider_lift(self, slot="opencode-go", **env):
+        """Run the runner's re-check in a shell of its own and say what it did."""
+        script = self.source_functions(
+            "provider_at_limit", "provider_checked", "provider_limit_lifted",
+            "provider_recheck_due", "lift_provider_limit", "hold_provider_limit",
+            "limit_until", "key_group", "write_beat", "limited_models_json", "utc",
+            "setting_var", "lane_var", "lane_setting") + (
+            'ssm_value() { printf "%s" "$FAKE_KEY"; }\n'
+            'LIMIT_RECHECK=1800 GO_LIMIT_ERROR=GoUsageLimitError\n'
+            'SLOT=' + slot + ' LANE=opencode-go '
+            'BEAT="$LOOM_HOME/state/usage/$SLOT.json"\n'
+            'LIMIT_WHY="the provider monthly limit (429 GoUsageLimitError)"\n'
+            'provider_limit_lifted; echo "rc=$?"')
+        return subprocess.run(["bash", "-c", script, "bash"],
+                              env={**self.lane_env(), "LOOM_HOME": str(self.loom),
+                                   "SLOT": slot, "LANE": "opencode-go",
+                                   "LOOM_OPENCODE_GO_MODEL": "opencode-go/kimi-k2.7-code",
+                                   "LOOM_OPENCODE_GO_PROBE_URL": "http://127.0.0.1:9/v1/chat",
+                                   "LOOM_OPENCODE_GO_KEY_SSM": "/k/go",
+                                   "FAKE_KEY": "fake-go-key", **env},
+                              capture_output=True, text=True)
+
+    def hold_the_group(self, checked_at):
+        """The group held by a provider limit, as the runner leaves it."""
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        until = int(time.time()) + 1800
+        for slot in self.GROUP:
+            (usage / (slot + ".provider-limit.json")).write_text(json.dumps(
+                {"at": int(time.time()), "limit_name": "monthly",
+                 "retry_after": str(until), "model": "kimi-k2.7-code"}) + "\n")
+            (usage / (slot + ".provider-check")).write_text("%d\n" % checked_at)
+            (usage / (slot + ".json")).write_text(json.dumps(
+                {"lane": slot, "at": int(time.time()), "available": False,
+                 "reason": "limit: the provider monthly limit (429 GoUsageLimitError)",
+                 "retry_at": until}) + "\n")
+
+    def test_a_lane_held_by_a_limit_asks_the_provider_again_and_comes_back(self):
+        # The provider's allowance refills while the lane sleeps, so the lane
+        # asks it again instead of waiting out the whole window (opencode-go,
+        # 2026-10-20: the lane sat idle for days and the lane-held invariant
+        # fired while the tier's tickets waited).
+        self.hold_the_group(int(time.time()) - 1801)
+        env = self.fake_provider(status=200)
+        result = self.provider_lift(**env)
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        for slot in self.GROUP:
+            beat = json.loads((self.loom / "state/usage" / (slot + ".json")).read_text())
+            self.assertTrue(beat["available"], slot)
+            self.assertEqual(beat["reason"], "", slot)
+        # The record of the refusal stays: it is the last 429 the Usage view shows.
+        self.assertTrue((self.loom / "state/usage/opencode-go.provider-limit.json").exists())
+
+    def test_a_lane_asks_the_provider_again_only_after_the_recheck_window(self):
+        self.hold_the_group(int(time.time()) - 60)
+        env = self.fake_provider(status=200)
+        result = self.provider_lift(**env)
+        self.assertEqual(result.stdout.strip(), "rc=1", result.stderr)
+        beat = json.loads((self.loom / "state/usage/opencode-go.json").read_text())
+        self.assertFalse(beat["available"])
+
+    def test_a_provider_that_still_refuses_keeps_the_hold(self):
+        self.hold_the_group(int(time.time()) - 1801)
+        env = self.fake_provider(status=429, headers="Retry-After: 1800",
+                                 body='{"type": "GoUsageLimitError", "limitName": "monthly"}')
+        result = self.provider_lift(**env)
+        self.assertEqual(result.stdout.strip(), "rc=1", result.stderr)
+        for slot in self.GROUP:
+            beat = json.loads((self.loom / "state/usage" / (slot + ".json")).read_text())
+            self.assertFalse(beat["available"], slot)
+            self.assertTrue(beat["reason"].startswith("limit: "), beat)
+
+    def test_a_provider_that_cannot_be_reached_keeps_the_hold(self):
+        # A provider that does not answer is not a provider that serves the
+        # lane: the hold stands, so the lane does not claim work it cannot run.
+        self.hold_the_group(int(time.time()) - 1801)
+        env = self.fake_provider(status="refused")
+        result = self.provider_lift(**env)
+        self.assertEqual(result.stdout.strip(), "rc=1", result.stderr)
+        beat = json.loads((self.loom / "state/usage/opencode-go.json").read_text())
+        self.assertFalse(beat["available"])
+
+    def test_a_hold_the_agent_cli_recorded_is_not_lifted_by_the_probe(self):
+        # The agent CLI's own hold (a model it no longer offers) carries no
+        # provider limit: no probe says otherwise, so it stands.
+        self.hold_the_group(int(time.time()) - 1801)
+        beat = json.loads((self.loom / "state/usage/opencode-go.json").read_text())
+        beat["reason"] = "limit: model opencode-go/kimi-k2.7-code not found by the agent CLI"
+        (self.loom / "state/usage/opencode-go.json").write_text(json.dumps(beat))
+        env = self.fake_provider(status=200)
+        result = self.provider_lift(**env)
+        self.assertEqual(result.stdout.strip(), "rc=1", result.stderr)
+        beat = json.loads((self.loom / "state/usage/opencode-go.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("not found by the agent CLI", beat["reason"])
 
     def hold_provider_limit_for(self, slot="opencode-go-2", limit_name="weekly", retry_after=None):
         self.write_provider_limit(slot, limit_name, retry_after)

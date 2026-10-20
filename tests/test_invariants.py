@@ -403,10 +403,10 @@ class StationTest(StationBase):
                 {"lane": lane, "at": at, "available": False,
                  "reason": "limit: out of credit; unavailable until %s" % stamp(at + DAY_S)}))
 
-    def queued_ticket(self, number, *labels, author=AUTHOR):
+    def queued_ticket(self, number, *labels, author=AUTHOR, difficulty="hard"):
         self.gh.tickets.setdefault(REPO, []).append(
             {"number": number, "state": "open", "user": {"login": author},
-             "body": "Difficulty: hard\n\n## Why\nx\n",
+             "body": "Difficulty: %s\n\n## Why\nx\n" % difficulty,
              "labels": [{"name": n} for n in ("loom:ticket",) + labels]})
 
     def held_out_of_credit(self):
@@ -439,6 +439,46 @@ class StationTest(StationBase):
             self.run_at(at)
         (filed,) = self.breaches()
         self.assertIn("Lane anthropic-3 held", filed["title"])
+
+    def test_a_lane_whose_limit_hold_expired_is_not_held(self):
+        # A hold whose time has passed is no hold: the lane is free again and
+        # the lane-held invariant stops firing, as the Usage view reads the
+        # same heartbeat the same way. 2026-10-20: a lane held by a limit the
+        # provider had already lifted stayed held for days.
+        self.queued_ticket(653, "loom:queued", difficulty="medium")
+        usage = os.path.join(self.home, "state", "usage", "opencode-go.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps(
+                {"lane": "opencode-go", "at": at, "available": False,
+                 "reason": "limit: the provider's monthly limit (429 GoUsageLimitError)",
+                 "retry_at": at - 3600}))
+            self.run_at(at)
+        self.assertEqual(self.breaches(), [])
+
+    def test_a_lane_held_by_a_limit_that_has_not_expired_is_held(self):
+        self.queued_ticket(653, "loom:queued", difficulty="medium")
+        usage = os.path.join(self.home, "state", "usage", "opencode-go.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps(
+                {"lane": "opencode-go", "at": at, "available": False,
+                 "reason": "limit: the provider's monthly limit (429 GoUsageLimitError)",
+                 "retry_at": at + 7 * 86400}))
+            self.run_at(at)
+        (filed,) = self.breaches()
+        self.assertIn("Lane opencode-go held", filed["title"])
+
+    def test_a_lane_held_by_a_limit_with_no_end_is_held(self):
+        # A hold with no known end (an expired key, a limit the provider gave
+        # no reset for) is held until the lane says otherwise.
+        self.queued_ticket(653, "loom:queued", difficulty="medium")
+        usage = os.path.join(self.home, "state", "usage", "opencode-go.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps(
+                {"lane": "opencode-go", "at": at, "available": False,
+                 "reason": "limit: the provider's monthly limit (429 GoUsageLimitError)"}))
+            self.run_at(at)
+        (filed,) = self.breaches()
+        self.assertIn("Lane opencode-go held", filed["title"])
 
     def test_a_ticket_queued_beside_a_later_state_or_claimed_elsewhere_is_not_counted(self):
         self.queued_ticket(653, "loom:queued", "loom:shipped")

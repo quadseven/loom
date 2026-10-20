@@ -1100,6 +1100,16 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     return at is not None and beat_fresh(at, now, window)
 
 
+def hold_expired(beat: Dict[str, Any], now: float) -> bool:
+    """Whether a lane's limit hold has run out: the reset it names is in the
+    past. A beat with no reset has no known end, so its hold stands. The Usage
+    view reads the same heartbeat the same way (bus/usage.py _limit_hold)."""
+    until = beat.get("retry_at")
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return False
+    return until <= now
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
@@ -2002,7 +2012,8 @@ class Station:
 
     def _limit_reasons(self) -> Dict[str, str]:
         """Lane -> the reason of its fresh heartbeat that says unavailable
-        at a limit."""
+        at a limit. A hold whose reset has passed is no hold: the lane is
+        free again, as the Usage view reads the same heartbeat."""
         out: Dict[str, str] = {}
         for lane in LANES:
             beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
@@ -2013,7 +2024,8 @@ class Station:
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 continue
             reason = str(beat.get("reason") or "")
-            if beat_fresh(at, self.now) and reason.startswith(LIMIT):
+            if beat_fresh(at, self.now) and reason.startswith(LIMIT) \
+                    and not hold_expired(beat, self.now):
                 out[lane] = reason
         return out
 
