@@ -1134,6 +1134,31 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
 
+    def test_a_timeout_whose_output_only_mentions_a_quota_is_not_a_limit(self):
+        # Three Spark lanes were held an hour as "provider limit reached": each
+        # agent timed out after printing git log, whose newest subject said "A
+        # lane at its quota is not a broken lane" (2026-10-20).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="124", FAKE_OUT=(
+            "4c48db6 A lane at its quota is not a broken lane, and a second close says why\n"
+            "Read docs/USAGE.md [limit=25, offset=626]"))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient]", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertNotIn("limit", beat.get("reason") or "")
+
+    def test_provider_quota_messages_are_still_limits(self):
+        for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                    "Error: You exceeded your current quota, please check your plan",
+                    "error: Individual quota reached. Resets in 2h",
+                    "quota exceeded for this project"):
+            with self.subTest(out=out):
+                self.drop_brief()
+                self.run_lane(FAKE_AGENT="say", FAKE_OUT=out)
+                self.assertIn("[limit]", self.run_log())
+                (self.loom / "state" / "usage" / "codex.json").unlink(missing_ok=True)
+
     def test_a_limited_ladder_model_falls_back_on_the_next_pass(self):
         models = "gpt-test-high gpt-test-low"
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
