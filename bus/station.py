@@ -4381,7 +4381,25 @@ class Station:
             self._comment(repo, number, "Lane %s %s a pull request: %s" % (lane, verb, url))
             _say("reported %s#%d done: %s" % (repo, number, url))
             return True
-        return self._report_failure(repo, number, lane, text, name)
+        if not self._report_failure(repo, number, lane, text, name):
+            return False
+        self._never_left_running(repo, number, lane)
+        return True
+
+    def _never_left_running(self, repo: str, number: int, lane: str) -> None:
+        """A reported failure ends the run, so a ticket still loom:running on
+        that lane goes to loom:failed, where the factory acts on it. A path
+        that reported and forgot to move it left the ticket running with no
+        brief: a runaway hold did, and four tickets sat 8 to 48 hours
+        (2026-10-20). A factory hold (wait:incident) stays running by design."""
+        names = _label_names(self._issue(repo, number))
+        if (RUNNING not in names or "lane:" + lane not in names
+                or WAIT + "incident" in names):
+            return
+        self._relabel(repo, number, "loom:failed")
+        self._routine(repo, number, "Lane %s's run ended and nothing moved the ticket, so it "
+                                    "is loom:failed for the factory to act on." % lane)
+        _say("moved %s#%d to loom:failed: its reported run left it running" % (repo, number))
 
     def _report_failure(self, repo: str, number: int, lane: str, text: str, name: str) -> bool:
         """Report a failed brief, keeping fix rounds on their existing pull request."""
