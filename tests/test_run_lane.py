@@ -163,6 +163,11 @@ if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
   printf 'contact %s\\n' "$(printf 'MTAuMjMuNC41' | base64 -d)" >> fix.txt
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
+  echo "fixed" > fix.txt
+  echo "see repo-legacy-private#3 and example/repo#7" >> fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
   exit 0
@@ -468,6 +473,7 @@ mode, value = args[0], args[1]
 # The real scanner's private-issue-ref rule: an issue reference to any repo
 # but the ones named with --allow-repo-ref may name a private repo.
 allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
+# As the real scanner builds it: the exemption sits after the optional owner.
 exempt = r'(?!(?:%s)\\b)' % '|'.join(map(re.escape, allowed)) if allowed else ''
 ref = re.compile(r'(?<![\\w/-])(?:[a-z0-9][a-z0-9._-]*/)?' + exempt + r'[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
 if mode == '--diff':
@@ -615,6 +621,15 @@ print('leak guard: clean (shape patterns only)')
         heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
+        # The body's own-repo Refs line is exempt, nothing else: private repos
+        # named NAME-legacy-private exist beside public NAME repos.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="private-ref")
+        self.assertIn("[private-issue-ref]", self.run_log())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
 

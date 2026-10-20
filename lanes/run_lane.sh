@@ -2411,10 +2411,7 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
       continue
     fi
-    # --allow-repo-ref: a reference to this public repo's own issues names
-    # nothing private, and every lane PR body carries one ("Refs OWNER/NAME#N",
-    # which links the ticket); without it the scanner refused them all.
-    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$BASE..HEAD" --allow-repo-ref "${REPO#*/}" 2>&1)"; then
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$BASE..HEAD" 2>&1)"; then
       park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
       continue
     fi
@@ -2433,8 +2430,13 @@ for BRIEF in "$INBOX"/*.md; do
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
       }
       BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
-      printf '%s\n' "$PR_BODY" > "$BODY_FILE"
-      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" --allow-repo-ref "${REPO#*/}" 2>&1)"; then
+      # The body refs its own ticket ("Refs OWNER/NAME#N"), which names nothing
+      # private, and the scanner flags every OWNER/NAME#N; its --allow-repo-ref
+      # would also pass NAME-legacy-private#N and other owners' NAME#N. So the
+      # copy it scans says "#N" for exactly this repo, and the body posted is
+      # unchanged.
+      printf '%s\n' "${PR_BODY//"$REPO#"/#}" > "$BODY_FILE"
+      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" 2>&1)"; then
         rm -f "$BODY_FILE"
         park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
         continue
