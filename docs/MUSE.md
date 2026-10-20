@@ -2,14 +2,17 @@
 
 At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
-Run every command from that checkout. Set `LOOM_GITHUB_TOKEN`,
-`LOOM_REPOS` (space separated `OWNER/NAME` values) and `LOOM_BRIEF_AUTHORS`
-(the login or logins that brief tickets and post proofs, the same value the
-station uses). Without it `prioritize`, `close`, verified moves and merges
-refuse every ticket as untrusted. With a personal `LOOM_GITHUB_TOKEN`, every
-issue a `bus` or `bus.brain` command opens or comments on is unsubscribed for
-that person afterwards, so later bot comments there send them no email; an
-@mention still does. Use `muse` as your lock
+Run every command from that checkout. Set the Loom Brain App's
+`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (or `LOOM_GITHUB_APP_KEY_FILE`), so every write is the
+brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
+for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
+values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
+post proofs, the same value the station uses). Without it `prioritize`,
+`close`, verified moves and merges refuse every ticket as untrusted. With a
+personal `LOOM_GITHUB_TOKEN`, every issue a `bus` or `bus.brain` command opens
+or comments on is unsubscribed for that person afterwards, so later bot
+comments there send them no email; an @mention still does. Use `muse` as your lock
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 

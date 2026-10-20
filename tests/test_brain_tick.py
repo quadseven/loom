@@ -25,6 +25,12 @@ if [ "$2" = bus.brain_memory ]; then
   printf '%s\\n' "${FAKE_PACKET:-}"
   exit "${FAKE_PACKET_EXIT:-0}"
 fi
+if [ "$3 $4" = "app token" ]; then
+  # FAKE_APP_TOKEN: the Brain App's installation token; unset, minting fails.
+  [ -n "${FAKE_APP_TOKEN:-}" ] || { echo "no App key" >&2; exit 2; }
+  printf '%s\\n' "$FAKE_APP_TOKEN"
+  exit 0
+fi
 if [ "$3" = lock ]; then
   # FAKE_LOCK_FREE_AFTER=n: the lock is held for the first n tries.
   if [ -n "${FAKE_LOCK_FREE_AFTER:-}" ]; then
@@ -427,6 +433,29 @@ class BrainTickTest(unittest.TestCase):
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         last, _ = self.beat()
         self.assertEqual(("ok", "spark", "spark/coder"), (last["outcome"], last["lane"], last["model"]))
+
+    def test_with_its_app_settings_the_tick_writes_as_the_brain_app_not_the_operator(self):
+        # loom#1142: the brain's rungs used the operator's own GitHub token.
+        self.usage("claude", False, "limit: provider limit reached")
+        self.usage("spark", True)
+        run, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
+                               LOOM_SPARK_URL="http://spark.invalid:8000/v1",
+                               LOOM_GITHUB_APP_ID="5396750", FAKE_APP_TOKEN="ghs_brain_token",
+                               GITHUB_TOKEN="ghp_personal")
+        self.assertEqual(0, run.returncode)
+        self.assertIn("opencode env GH_TOKEN=ghs_brain_token GITHUB_TOKEN=ghs_brain_token "
+                      "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
+        self.assertNotIn("gh auth token", calls)
+
+    def test_a_tick_whose_app_token_cannot_be_minted_runs_no_rung(self):
+        self.usage("codex", True)
+        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="5396750",
+                               GITHUB_TOKEN="ghp_personal")
+        self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
+        self.assertTrue(any(" unlock " in c for c in calls), calls)
+        last, ok = self.beat()
+        self.assertEqual("failed", last["outcome"])
+        self.assertFalse(ok)
 
     def spark_tick(self, **env):
         self.usage("claude", False, "limit: provider limit reached")

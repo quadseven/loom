@@ -238,6 +238,23 @@ the tokens it mints. The dashboard takes the same three settings when its host h
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
 
+Each writer posts as its own App, never as the operator (loom#1142): the
+station as its App, the brain as Loom Brain, and the lanes as Loom Lanes, each
+job with its own three `LOOM_GITHUB_APP_*` settings. `python3 -m bus app token`
+prints the installation token of the App those settings name, and fails with
+no output without them. A lane with the settings drops any personal
+`GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the start of each run and again
+after its agent (a token lasts an hour), clones over https with `gh` as git's
+credential helper, and runs its agent without the token; a failed mint parks
+the run `[transient]` before anything is posted. `lanes/mac/brain.sh` mints
+once per tick, after the lock, and gives every rung that token as `GH_TOKEN`,
+`GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint runs no rung. The
+station trusts its own App's login by itself, so the Brain and Lanes logins
+(`<slug>[bot]`) go in `LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit
+only collaborators must admit the Lanes login for lane pull requests to run.
+A new App is easiest made from
+`https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=read`.
+
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 It skips future `Not before:` times and tickets without a readable Difficulty.

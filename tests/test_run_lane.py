@@ -64,6 +64,7 @@ S: one function.
 # Every call is appended to $FAKE_LOG.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
+[ -z "${FAKE_GH_TOKENS:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" >> "$FAKE_GH_TOKENS"
 if [ -n "${FAKE_GH_HANG:-}" ]; then exec sleep 30; fi
 if [ "$1" = api ]; then
   [ -z "${FAKE_GH_API_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
@@ -134,6 +135,7 @@ fi
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
+[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" >> "$FAKE_AGENT_ENV"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
@@ -3236,6 +3238,34 @@ exit %d
                 # lane that reads its key from a parameter, and codex, which
                 # reads no key here, keeps its heartbeat as it is.
                 self.assertEqual(self.beat()["available"], want != "limit")
+
+    def app_token_cmd(self, script):
+        cmd = Path(self._tmp.name) / "app-token"
+        self.write_tool(cmd, "#!/usr/bin/env bash\n" + script)
+        return str(cmd)
+
+    def test_a_lane_with_its_app_settings_writes_as_the_app_and_the_agent_never_sees_the_token(self):
+        # loom#1142: lanes opened every pull request as the operator.
+        seen_gh = Path(self._tmp.name) / "gh-tokens"
+        seen_agent = Path(self._tmp.name) / "agent-tokens"
+        self.drop_brief()
+        self.run_lane(LOOM_GITHUB_APP_ID="5396753",
+                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes_token"),
+                      GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
+                      FAKE_AGENT_ENV=str(seen_agent))
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
+        self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes_token"})
+        self.assertEqual(seen_agent.read_text().split(), ["none"])
+
+    def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
+        self.drop_brief()
+        self.run_lane(LOOM_GITHUB_APP_ID="5396753",
+                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo 'key not found' >&2; exit 2"),
+                      GH_TOKEN="ghp_personal")
+        self.assertEqual([c for c in self.calls() if c.startswith(("gh ", "codex "))], [])
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[transient] "), line)
+        self.assertIn("could not mint the lane's GitHub App token", line)
 
     def test_a_lane_rests_after_three_transient_failures_in_a_row(self):
         # zen, 2026-10-19: a free model answered "Unexpected server error" to

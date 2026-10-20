@@ -196,3 +196,46 @@ class Ids(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Token(unittest.TestCase):
+    """`python3 -m bus app token` (loom#1142): a lane or the brain mints its
+    own App's installation token for `gh` and `git`, and never falls back to
+    a personal token."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.key = os.path.join(self.dir, "app.pem")
+        with open(self.key, "w", encoding="ascii") as fh:
+            fh.write(KEY)
+        self.minted = []
+
+    def tearDown(self):
+        os.remove(self.key)
+        os.rmdir(self.dir)
+
+    def fake(self, method, url, headers, body):
+        self.minted.append((method, url))
+        answer = {"token": "ghs_lanes_token", "expires_at": "2099-01-01T00:00:00Z"}
+        return 201, {}, json.dumps(answer).encode()
+
+    def token(self, env):
+        with mock.patch.dict(os.environ, env, clear=True):
+            return run(["app", "token"], app_transport=self.fake,
+                       app_sign=lambda data, key: b"sig")
+
+    def test_prints_the_installation_token_of_the_app_the_settings_name(self):
+        code, out, err = self.token({"LOOM_GITHUB_APP_ID": "5396753",
+                                     "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
+                                     "LOOM_GITHUB_APP_KEY_FILE": self.key})
+        self.assertEqual((code, out), (0, "ghs_lanes_token\n"))
+        self.assertEqual(self.minted, [
+            ("POST", "https://api.github.com/app/installations/77/access_tokens")])
+        self.assertNotIn(KEY_MARK, out + err)
+
+    def test_without_the_app_settings_it_prints_nothing_and_fails(self):
+        with mock.patch("bus.github.token_from_env", side_effect=AssertionError("personal token read")):
+            code, out, err = self.token({"GITHUB_TOKEN": "ghp_personal"})
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("LOOM_GITHUB_APP_ID", err)
+        self.assertEqual(self.minted, [])
