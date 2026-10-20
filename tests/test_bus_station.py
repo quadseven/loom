@@ -2374,6 +2374,32 @@ class HandBackTest(unittest.TestCase):
         self.assertLess(len(body), 65536)
         self.assertIn("loom:fix-head " + "a" * 40, body)
 
+    def test_a_degraded_review_is_not_handed_back(self):
+        # The review bot's own "not a verdict" result: a lane cannot fix it, so
+        # the station leaves it at loom:pr for the factory's re-review.
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK,
+                                    "WARN Elder review low confidence\n"
+                                    "Degraded review (low_confidence_review): not a verdict.")])
+        names = [x["name"] for x in self.gh.issue["labels"]]
+        self.assertFalse(any(str(c.get("body") or "").startswith(tickets.FIX_MARKER)
+                             for c in self.gh.comments))
+        self.assertIn("loom:pr", names)
+        for label in ("loom:briefed", "needs-brain", "loom:ready"):
+            self.assertNotIn(label, names)
+
+    def test_a_degraded_review_beside_a_real_failure_sends_only_the_real_one(self):
+        self.run_hand_back(checks=[
+            ("lint", "last log line"),
+            (factory.DEFAULT_REVIEW_CHECK,
+             "Living Hunt 3c63e18b..30d00ebb - WARN Elder review low confidence (deep append)\n"
+             "Degraded review (low_confidence_review): not a verdict.")])
+        body = self.gh.comments[0]["body"]
+        self.assertIn("lint", body)
+        self.assertIn("last log line", body)
+        self.assertNotIn("Degraded review", body)
+        self.assertNotIn(factory.DEFAULT_REVIEW_CHECK, body)
+        self.assertIn("loom:briefed", [x["name"] for x in self.gh.issue["labels"]])
+
     def test_unresolved_review_bot_thread_is_sent_back(self):
         thread = {"id": "PRRT_fake", "path": "a.py", "line": 4,
                   "comments": {"nodes": [{"databaseId": 9, "body": "change this",

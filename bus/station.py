@@ -4059,11 +4059,20 @@ class Station:
             self._remove_ready_if_present(repo, number, names)
             return
         failed = brain._failing_checks(self.gh, repo, sha)
+        # A degraded review result is the review bot's "not a verdict": a lane
+        # cannot fix it, so it stays at loom:pr for the factory's re-review
+        # (factory._review_again) instead of spending a fix round.
+        kept = [(name, tail) for name, tail in failed
+                if not (name == self.s.review_check and factory.degraded_review(tail, tail))]
+        degraded = len(kept) != len(failed)
+        failed = kept
         threads = self._bot_threads(repo, pr_number)
-        if not failed and not threads:
+        if not failed and not threads and not degraded:
             self._mark_ready(repo, number, sha, names, ready)
             return
         self._remove_ready_if_present(repo, number, names)
+        if not failed and not threads:
+            return
         self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
                                    comments, names, failed, threads, rounds)
 

@@ -160,12 +160,29 @@ ANSWER_RE = re.compile(r"^Lane [A-Za-z0-9_.-]+ %s" % re.escape(ANSWER_REPLY))
 # carries the head commit, so the ask happens once per head.
 IMPROVE_MARKER = "<!-- loom:improve-head %s -->"
 # The review bot's check output title that means it did not finish every part
-# of the diff ("WARN Elder review coverage partial", "WARN Grug eyes clouded").
+# of the diff, or did not trust its own result ("WARN Elder review coverage
+# partial", "WARN Grug eyes clouded", "WARN Elder review low confidence").
 # A lane cannot finish someone else's review by editing code, so the factory
 # asks the bot to look at the head again instead of sending the pull request
 # back for a fix round it cannot close.
 PARTIAL_REVIEW_TITLES = ("WARN Elder review coverage partial",
-                         "WARN Grug eyes clouded")
+                         "WARN Grug eyes clouded",
+                         "WARN Elder review low confidence")
+# The review bot's own words for a result that is not a verdict ("Degraded
+# review (low_confidence_review): not a verdict. Comment /grug improve to
+# re-run once the backend recovers.").
+DEGRADED_REVIEW_MARK = "Degraded review ("
+
+
+def degraded_review(title: str, summary: str) -> bool:
+    """True when a review check's output is a partial or degraded result, not
+    a verdict: the summary carries the review bot's degraded marker, or the
+    title names a partial-review form anywhere (a hunt title puts a commit
+    range before it, "Living Hunt a..b - WARN ...")."""
+    return (DEGRADED_REVIEW_MARK in str(summary or "")
+            or any(mark in str(title or "") for mark in PARTIAL_REVIEW_TITLES))
+
+
 # Posted once per head commit on a pull request whose only failing check is a
 # partial review, so a second partial result on the same head goes back.
 REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
@@ -1758,8 +1775,9 @@ class Factory:
         review = [r for r in failed if r.get("name") == self.review_check]
         if len(review) != 1 or len(failed) != 1:
             return False
-        title = str((review[0].get("output") or {}).get("title") or "")
-        if not any(title.startswith(mark) for mark in PARTIAL_REVIEW_TITLES):
+        output = review[0].get("output") or {}
+        if not degraded_review(str(output.get("title") or ""),
+                               str(output.get("summary") or "")):
             return False
         marker = REVIEW_AGAIN_MARKER % sha
         for comment in self.gh.paginate(
