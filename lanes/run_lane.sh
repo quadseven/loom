@@ -2431,7 +2431,12 @@ for BRIEF in "$INBOX"/*.md; do
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
       }
       BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
-      printf '%s\n' "$PR_BODY" > "$BODY_FILE"
+      # The body refs its own ticket ("Refs OWNER/NAME#N"), which names nothing
+      # private, and the scanner flags every OWNER/NAME#N; its --allow-repo-ref
+      # would also pass NAME-legacy-private#N and other owners' NAME#N. So the
+      # copy it scans says "#N" for exactly this repo, and the body posted is
+      # unchanged.
+      printf '%s\n' "${PR_BODY//"$REPO#"/#}" > "$BODY_FILE"
       if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" 2>&1)"; then
         rm -f "$BODY_FILE"
         park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
