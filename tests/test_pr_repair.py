@@ -98,6 +98,21 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("## Acceptance criteria\n- [x] The thing works\n- [x] A test covers the thing\n"
                       "- [x] Nothing else changes\n", result["body"])
 
+    def test_a_lane_can_tick_but_never_rewrite_a_criterion_or_add_unsafe_text(self):
+        self.write_brief(BRIEF)
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("## Acceptance criteria\n- [x] The thing works\n"
+                     "- [x] A test covers everything, see 10.1.2.3\n"
+                     "- [ ] Nothing else changes; not built: see other-private#4\n"
+                     "- [x] An extra criterion\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
+                                     "codex", "gpt-test", "T42", summary_path=summary)
+        self.assertIn("## Acceptance criteria\n- [x] The thing works\n- [ ] A test covers the thing\n"
+                      "- [ ] Nothing else changes\n\n", result["body"])
+        for unsafe in ("10.1.2.3", "other-private", "extra"):
+            self.assertNotIn(unsafe, result["body"])
+
     def test_ticks_already_in_the_body_survive_a_round_with_no_checklist(self):
         self.write_brief(BRIEF)
         result = pr_repair.reconcile(self.brief, "Fix the thing", self.TICKED_BODY,
