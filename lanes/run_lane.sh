@@ -793,8 +793,10 @@ PROBE_TIMEOUT=20
 # Go refills 20% of a model's allowance every 5 hours), so a lane that waited
 # out the whole window sat idle for days while the provider served it again
 # (opencode-go, 2026-10-20: the lane-held invariant fired and the tier's
-# tickets waited behind a lane the provider had long since freed).
+# tickets waited behind a lane the provider had long since freed). Other
+# providers retain their existing recheck interval.
 LIMIT_RECHECK=1800
+[ "$LANE" = opencode-go ] && LIMIT_RECHECK=300
 
 # The provider's own word for a usage limit. It is in the body the provider
 # answers with and in the reason the heartbeat carries, so a lane that asks
@@ -856,34 +858,52 @@ provider_at_limit() {
 }
 
 # When the provider was last asked whether it is at a limit: the epoch, one
-# line. A lane held by a limit asks it again every LIMIT_RECHECK minutes
+# line. A lane held by a limit asks it again every LIMIT_RECHECK seconds
 # (provider_limit_lifted), so the hold ends when the provider serves it.
 provider_checked() {
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s\n' "$(date +%s)" > "$LOOM_HOME/state/usage/$SLOT.provider-check"
 }
 
+# Older shared holds recorded the provider answer only on the slot that saw
+# it. Use that answer when another slot in the group wakes first.
+provider_limit_source() {
+  local slot
+  if [ -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" ]; then
+    printf '%s' "$SLOT"
+    return 0
+  fi
+  for slot in $(key_group); do
+    if [ -f "$LOOM_HOME/state/usage/$slot.provider-limit.json" ]; then
+      printf '%s' "$slot"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Whether the lane asks the provider again: the last probe was at least
-# LIMIT_RECHECK minutes ago, and the hold in force is the one the probe took
+# LIMIT_RECHECK seconds ago, and the hold in force is the one the probe took
 # (its reason names the provider's limit; no other hold carries that).
 provider_recheck_due() {
-  local at reason
-  [ -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" ] || return 1
+  local at reason source
+  source="$(provider_limit_source)" || return 1
   reason="$(sed -nE 's/.*"reason": *"([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$reason" in *"$GO_LIMIT_ERROR"*) ;; *) return 1 ;; esac
-  at="$(cat "$LOOM_HOME/state/usage/$SLOT.provider-check" 2>/dev/null)"
+  at="$(cat "$LOOM_HOME/state/usage/$source.provider-check" 2>/dev/null)"
   [[ "$at" =~ ^[0-9]+$ ]] || return 1
   [ "$(( $(date +%s) - at ))" -ge "$LIMIT_RECHECK" ]
 }
 
 # Whether the provider serves this lane again. The provider is asked at most
-# once every LIMIT_RECHECK minutes, and only for a hold the probe itself took:
+# once every LIMIT_RECHECK seconds, and only for a hold the probe itself took:
 # a hold the agent CLI recorded (a model it no longer offers, a spent
 # allowance) stands, for no probe says otherwise. A provider that cannot be
 # reached is not a provider that serves the lane: the hold stands.
 provider_limit_lifted() {
-  local model key_ssm
+  local model key_ssm source
   provider_recheck_due || return 1
+  source="$(provider_limit_source)" || return 1
   [ -n "$(lane_setting PROBE_URL)" ] || return 1
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || return 1
@@ -892,7 +912,7 @@ provider_limit_lifted() {
   # The model the probe found at a limit: the provider's answer is about that
   # model, so that is the model to ask about again.
   model="$(sed -nE 's/.*"model": *"([A-Za-z0-9._:/@-]+)".*/\1/p' \
-    "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" 2>/dev/null | head -1)"
+    "$LOOM_HOME/state/usage/$source.provider-limit.json" 2>/dev/null | head -1)"
   [ -n "$model" ] || model="$(lane_setting MODEL)"
   [ -n "$model" ] || return 1
   MODEL="$model"
@@ -970,10 +990,18 @@ limit_until() {
 # Hold every slot in this slot's group until the provider's reset, and
 # hand on every brief still in the inbox this pass.
 hold_provider_limit() {
-  local until slot
+  local until slot source checked
   until="$(limit_until)" || return 0
   LIMITED=1
+  source="$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  checked="$(date +%s)"
   for slot in $(key_group); do
+    if [ "$slot" != "$SLOT" ]; then
+      cp "$source" "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" || return 1
+      mv -f "$LOOM_HOME/state/usage/$slot.provider-limit.json.tmp" \
+        "$LOOM_HOME/state/usage/$slot.provider-limit.json" || return 1
+    fi
+    printf '%s\n' "$checked" > "$LOOM_HOME/state/usage/$slot.provider-check" || return 1
     write_beat "$slot" false "limit: $LIMIT_WHY; unavailable until $(utc "$until")" "$until"
   done
 }

@@ -2818,11 +2818,11 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         """Run the runner's re-check in a shell of its own and say what it did."""
         script = self.source_functions(
             "provider_at_limit", "provider_checked", "provider_limit_lifted",
-            "provider_recheck_due", "lift_provider_limit", "hold_provider_limit",
+            "provider_recheck_due", "provider_limit_source", "lift_provider_limit", "hold_provider_limit",
             "limit_until", "key_group", "write_beat", "limited_models_json", "utc",
             "setting_var", "lane_var", "lane_setting") + (
             'ssm_value() { printf "%s" "$FAKE_KEY"; }\n'
-            'LIMIT_RECHECK=1800 GO_LIMIT_ERROR=GoUsageLimitError\n'
+            'LIMIT_RECHECK=300 GO_LIMIT_ERROR=GoUsageLimitError\n'
             'SLOT=' + slot + ' LANE=opencode-go '
             'BEAT="$LOOM_HOME/state/usage/$SLOT.json"\n'
             'LIMIT_WHY="the provider monthly limit (429 GoUsageLimitError)"\n'
@@ -2866,6 +2866,31 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
             self.assertEqual(beat["reason"], "", slot)
         # The record of the refusal stays: it is the last 429 the Usage view shows.
         self.assertTrue((self.loom / "state/usage/opencode-go.provider-limit.json").exists())
+
+    def test_a_shared_slot_releases_within_five_minutes_when_the_provider_recovers(self):
+        self.hold_provider_limit_for("opencode-go")
+        usage = self.loom / "state" / "usage"
+        for slot in self.GROUP:
+            self.assertTrue((usage / (slot + ".provider-limit.json")).exists(), slot)
+            (usage / (slot + ".provider-check")).write_text(
+                "%d\n" % (int(time.time()) - 300))
+        result = self.provider_lift(slot="opencode-go-2", **self.fake_provider(status=200))
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        for slot in self.GROUP:
+            self.assertTrue(self.beat(slot)["available"], slot)
+
+    def test_a_shared_slot_recovers_from_a_hold_written_before_group_records_were_shared(self):
+        self.hold_provider_limit_for("opencode-go")
+        usage = self.loom / "state" / "usage"
+        for slot in self.GROUP[1:]:
+            (usage / (slot + ".provider-limit.json")).unlink(missing_ok=True)
+            (usage / (slot + ".provider-check")).unlink(missing_ok=True)
+        (usage / "opencode-go.provider-check").write_text(
+            "%d\n" % (int(time.time()) - 300))
+        result = self.provider_lift(slot="opencode-go-2", **self.fake_provider(status=200))
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        for slot in self.GROUP:
+            self.assertTrue(self.beat(slot)["available"], slot)
 
     def test_a_lane_asks_the_provider_again_only_after_the_recheck_window(self):
         self.hold_the_group(int(time.time()) - 60)
