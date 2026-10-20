@@ -91,6 +91,17 @@ def _names(issue: Dict[str, Any]) -> List[str]:
             if isinstance(label, dict)]
 
 
+def _holds(name: str) -> bool:
+    return name.startswith(HOLD_PREFIXES) or name in HOLD_LABELS
+
+
+def _epic(issue: Dict[str, Any]) -> bool:
+    """An `Epic:` title or sub-issues (the `epic` label is a hold)."""
+    summary = issue.get("sub_issues_summary")
+    return str(issue.get("title") or "").lower().startswith("epic:") \
+        or bool(isinstance(summary, dict) and summary.get("total"))
+
+
 def skip_reason(issue: Dict[str, Any]) -> str:
     """Why the claimed settle leaves the issue alone, or "" for a candidate."""
     names = [name.lower() for name in _names(issue)]
@@ -98,12 +109,10 @@ def skip_reason(issue: Dict[str, Any]) -> str:
         return "not an open issue"
     if not any(name.startswith(CLAIM_PREFIX) for name in names):
         return "no claim label"
-    held = [name for name in names if name.startswith(HOLD_PREFIXES) or name in HOLD_LABELS]
+    held = next((name for name in names if _holds(name)), "")
     if held:
-        return "labelled %s" % held[0]
-    summary = issue.get("sub_issues_summary") or {}
-    if str(issue.get("title") or "").lower().startswith("epic:") \
-            or (isinstance(summary, dict) and summary.get("total")):
+        return "labelled %s" % held
+    if _epic(issue):
         return "an epic"
     if not proof.criteria(str(issue.get("body") or "")):
         return "no acceptance boxes"
@@ -127,11 +136,19 @@ def pull_gate(pr: Dict[str, Any], runs: Sequence[Dict[str, Any]], review_check: 
     merged into `branch` with the review check concluding success on its
     head and every other check success or skipped. `runs` are its head's
     newest runs, one per check name."""
+    return _merge_gap(pr, branch) or _checks_gap(runs, review_check)
+
+
+def _merge_gap(pr: Dict[str, Any], branch: str) -> str:
     if not pr.get("merged_at") or not verify_data.COMMIT_RE.fullmatch(
             str(pr.get("merge_commit_sha") or "")):
         return "not merged"
     if not branch or str((pr.get("base") or {}).get("ref") or "") != branch:
         return "merged into another branch than %s" % (branch or "the default branch")
+    return ""
+
+
+def _checks_gap(runs: Sequence[Dict[str, Any]], review_check: str) -> str:
     if not runs:
         return "no check runs on its head"
     results = {verify_data._plain(run.get("name")): verify_data._run_result(run) for run in runs}

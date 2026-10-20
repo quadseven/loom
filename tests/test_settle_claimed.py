@@ -80,55 +80,62 @@ class FakeGitHub:
 
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
-        path, query = parts.path, parse_qs(parts.query)
         data = json.loads(body) if body else None
-        prefix = "/repos/%s" % REPO
         if method != "GET":
-            self.writes.append((method, path, data))
-        if path == prefix:
+            self.writes.append((method, parts.path, data))
+        if parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "default_branch": "main", "private": False})
-        rest = path[len(prefix) + 1:]
-        if method == "GET" and rest == "labels":
+        rest = parts.path[len("/repos/%s/" % REPO):]
+        issue = re.fullmatch(r"issues/(\d+)(?:/(\w+))?", rest)
+        found = (self._issue(method, int(issue.group(1)), issue.group(2), data) if issue
+                 else self._read(rest, parse_qs(parts.query)) if method == "GET" else None)
+        if found is None:
+            raise AssertionError("unexpected call %s %s" % (method, url))
+        return found
+
+    def _read(self, rest, query):
+        runs = re.fullmatch(r"commits/([0-9a-f]{40})/check-runs", rest)
+        files = re.fullmatch(r"pulls/(\d+)/files", rest)
+        if rest == "labels":
             names = sorted({x["name"] for i in self.issues.values() for x in i["labels"]})
             return reply(200, [{"name": name} for name in names])
-        if method == "GET" and rest == "issues":
+        if rest == "issues":
             wanted = set(query.get("labels", [""])[0].split(","))
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and wanted <= set(x["name"] for x in i["labels"])])
-        if method == "GET" and rest == "pulls":
+        if rest == "pulls":
             return reply(200, self.open_pulls if query.get("state") == ["open"]
                          else self.closed_pulls)
-        runs = re.fullmatch(r"commits/([0-9a-f]{40})/check-runs", rest)
-        if method == "GET" and runs:
+        if runs:
             return reply(200, {"check_runs": self.check_runs.get(runs.group(1), [])})
-        files = re.fullmatch(r"pulls/(\d+)/files", rest)
-        if method == "GET" and files:
+        if files:
             return reply(200, self.files.get(int(files.group(1)), []))
-        if method == "GET" and rest.startswith("contents/"):
-            source = self.contents.get(unquote(rest[len("contents/"):]))
-            if source is None:
-                return reply(404, {"message": "Not Found"})
-            return reply(200, {"encoding": "base64",
-                               "content": base64.b64encode(source.encode()).decode()})
-        issue = re.fullmatch(r"issues/(\d+)(?:/(\w+))?", rest)
-        if issue:
-            n, sub = int(issue.group(1)), issue.group(2)
-            if sub is None and method == "GET":
-                return reply(200, self.issues[n])
-            if sub is None and method == "PATCH":
+        if rest.startswith("contents/"):
+            return self._contents(unquote(rest[len("contents/"):]))
+        return None
+
+    def _contents(self, path):
+        source = self.contents.get(path)
+        if source is None:
+            return reply(404, {"message": "Not Found"})
+        return reply(200, {"encoding": "base64",
+                           "content": base64.b64encode(source.encode()).decode()})
+
+    def _issue(self, method, n, sub, data):
+        if sub is None:
+            if method == "PATCH":
                 self.issues[n].update(data)
-                return reply(200, self.issues[n])
-            if sub == "comments" and method == "GET":
-                return reply(200, self.comments[n])
-            if sub == "comments" and method == "POST":
-                self.comments[n].append({"body": data["body"], "user": {"login": "station"}})
-                return reply(201, self.comments[n][-1])
-            if sub == "labels" and method == "POST":
-                have = self.names(n)
-                self.issues[n]["labels"] += [{"name": x} for x in data["labels"]
-                                             if x not in have]
-                return reply(200, self.issues[n]["labels"])
-        raise AssertionError("unexpected call %s %s" % (method, url))
+            return reply(200, self.issues[n])
+        if sub == "comments" and method == "POST":
+            self.comments[n].append({"body": data["body"], "user": {"login": "station"}})
+            return reply(201, self.comments[n][-1])
+        if sub == "comments":
+            return reply(200, self.comments[n])
+        if sub == "labels" and method == "POST":
+            have = self.names(n)
+            self.issues[n]["labels"] += [{"name": x} for x in data["labels"] if x not in have]
+            return reply(200, self.issues[n]["labels"])
+        return None
 
 
 class Base(unittest.TestCase):

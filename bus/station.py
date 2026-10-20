@@ -6091,6 +6091,21 @@ class Station:
 
     def _settle_claimed_repo(self, repo: str, left: int, pacer: "claimed.Pacer") -> int:
         """Settle up to `left` of the repo's claimed issues; how many were."""
+        found = self._claimed_issues(repo)
+        if not found:
+            return 0
+        still_open = {n for pr in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+                      if isinstance(pr, dict)
+                      for n in _refs_numbers(repo, str(pr.get("body") or ""))}
+        done = 0
+        for number in sorted(set(found) - still_open):
+            if done >= left:
+                break
+            done += self._try_settle_claimed(repo, found[number], pacer)
+        return done
+
+    def _claimed_issues(self, repo: str) -> Dict[int, Dict[str, Any]]:
+        """The repo's open claim:<login> issues claimed.skip_reason allows."""
         claims = [str(label.get("name") or "") for label in self.gh.paginate(
             "/repos/%s/labels" % repo) if isinstance(label, dict)
             and str(label.get("name") or "").lower().startswith(claimed.CLAIM_PREFIX)]
@@ -6100,34 +6115,29 @@ class Station:
                                         % (repo, quote(name, safe=":"))):
                 if isinstance(issue, dict) and not claimed.skip_reason(issue):
                     found[int(issue["number"])] = issue
-        if not found:
+        return found
+
+    def _try_settle_claimed(self, repo: str, issue: Dict[str, Any],
+                            pacer: "claimed.Pacer") -> int:
+        """Settle one candidate when its merged pull requests prove it: 1 when
+        it was settled. One issue GitHub or the text checks refuse is logged
+        and skipped; it does not stop the others."""
+        number = int(issue["number"])
+        pulls = [pr for pr in self._closed_pulls(repo)
+                 if number in _refs_numbers(repo, str(pr.get("body") or ""))]
+        if not pulls or len(pulls) > claimed.MAX_PULLS:
             return 0
-        still_open = {n for pr in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
-                      if isinstance(pr, dict)
-                      for n in _refs_numbers(repo, str(pr.get("body") or ""))}
         branch = self._default_branch(repo)
-        merged = self._closed_pulls(repo)
-        done = 0
-        for number in sorted(found):
-            if done >= left:
-                break
-            if number in still_open:
-                continue
-            pulls = [pr for pr in merged
-                     if number in _refs_numbers(repo, str(pr.get("body") or ""))]
-            if not pulls or len(pulls) > claimed.MAX_PULLS:
-                continue
-            # One issue GitHub or the text checks refuse is logged and
-            # skipped; it does not stop the others.
-            try:
-                checked = self._claimed_pulls(repo, number, branch, pulls)
-                if checked is not None:
-                    done += self._settle_claimed(repo, found[number], branch, checked, pacer)
-            except RateLimited:
-                raise
-            except (GitHubError, ValueError) as err:
-                _say("settle-claimed: could not settle %s#%d: %s" % (repo, number, err))
-        return done
+        try:
+            checked = self._claimed_pulls(repo, number, branch, pulls)
+            if checked is None:
+                return 0
+            return self._settle_claimed(repo, issue, branch, checked, pacer)
+        except RateLimited:
+            raise
+        except (GitHubError, ValueError) as err:
+            _say("settle-claimed: could not settle %s#%d: %s" % (repo, number, err))
+            return 0
 
     def _claimed_pulls(self, repo: str, number: int, branch: str,
                        pulls: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
