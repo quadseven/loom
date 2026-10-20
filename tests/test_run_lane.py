@@ -170,7 +170,7 @@ if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
 fi
 if [ "${FAKE_AGENT:-commit}" = own-ref ]; then
   echo "fixed" > fix.txt
-  echo "see repo#7 and example/repo#8" >> fix.txt
+  echo "see repo#7 and example/repo#8" >> fix.txt  # leak-guard-allow: the case under test
   exit 0
 fi
 if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
