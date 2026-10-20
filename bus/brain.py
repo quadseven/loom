@@ -2916,6 +2916,9 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     return settle_source(gh, repo, number, issue.get("body"), reason, proof_url)
 
 
+# The close-completeness guard's escape hatch (bus/github.py): a close by
+# rule, not a claim that each box was seen to hold.
+FORCE_CLOSE_LABEL = "force-close"
 _REWRITTEN_FROM = re.compile(r"^Rewritten from issue (\d+)\.[ \t]*$", re.M)
 # Rewrites before loom#462 ended the ticket with this line instead.
 _REFS_LINE = re.compile(r"^Refs #(\d+)[ \t]*$", re.M)
@@ -2966,13 +2969,16 @@ def _paired_source(gh: GitHub, repo: str, number: int, body: Any
 
 
 def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
-                  proof_url: str = "") -> Optional[str]:
+                  proof_url: str = "", unproven: bool = False) -> Optional[str]:
     """Settle the issue ticket #number was rewritten from, once the ticket is
     verified or closed. Completed (verified, or closed as completed) closes
     the source as completed with a comment naming the ticket and its proof;
     a source whose own acceptance criteria are unchecked stays open with a
     comment saying why, since the close gate refuses it. not_planned leaves
     the source open with a comment. Each outcome is said once per ticket.
+    Unproven is a ticket closed as completed with no proof (the station's
+    done close, or a person's): the source closes with it by the same rule,
+    labelled force-close when its own criteria are unchecked.
     Returns a line saying what was done, or None when the ticket names no
     open paired source. A GitHub failure is returned as that line, never
     raised: the ticket has already moved by then."""
@@ -2985,10 +2991,16 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
         source, issue, comments = found
         if issue.get("state") != "open":
             return None
+        if unproven and _said_for(comments, number) is not None:
+            return None  # an unproven close never overrides what Loom said
         if reason == "not_planned":
             outcome = "dropped"
             words = ("Ticket #%d, rewritten from this issue, was closed as not planned. "
                      "This issue stays open for a person to decide." % number)
+        elif unproven:
+            outcome = "closed"
+            words = ("Ticket #%d, rewritten from this issue, was closed as completed, so "
+                     "this issue closes as completed." % number)
         elif any(not checked for checked, _ in proof.criteria(str(issue.get("body") or ""))):
             outcome = "held"
             words = ("Ticket #%d, rewritten from this issue, is verified (%s). This issue "
@@ -3007,6 +3019,10 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
         elif outcome != "closed":
             return None
         if outcome == "closed":
+            if unproven and any(not checked for checked, _ in
+                                proof.criteria(str(issue.get("body") or ""))):
+                gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, source),
+                        {"labels": [FORCE_CLOSE_LABEL]})
             gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, source),
                     {"state": "closed", "state_reason": "completed"})
             return "closed source issue #%d as completed" % source
