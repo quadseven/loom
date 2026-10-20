@@ -683,6 +683,8 @@ SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_WHY=""
+# Whether the provider answered the last probe at all (provider_at_limit).
+PROBE_ANSWERED=0
 # An expired key holds a lane with no retry time, so its reason is the whole
 # of it: "API key expired: renew <the SSM parameter, or the lane sign-in>".
 AUTH_HELD=""
@@ -744,11 +746,27 @@ spark_ready() {
 # The key goes to curl as a config file on stdin, written by the printf
 # builtin, so it reaches no process's argv and no log.
 PROBE_TIMEOUT=20
+# How long a lane waits before it asks the provider again whether the limit
+# has lifted. The provider's allowance refills while the lane sleeps (OpenCode
+# Go refills 20% of a model's allowance every 5 hours), so a lane that waited
+# out the whole window sat idle for days while the provider served it again
+# (opencode-go, 2026-10-20: the lane-held invariant fired and the tier's
+# tickets waited behind a lane the provider had long since freed).
+LIMIT_RECHECK=1800
+
+# The provider's own word for a usage limit. It is in the body the provider
+# answers with and in the reason the heartbeat carries, so a lane that asks
+# the provider again can tell a hold the probe took from a hold the agent CLI
+# recorded (a model it no longer offers, an expired key, a spent allowance).
+GO_LIMIT_ERROR="GoUsageLimitError"
 
 # 0 with LIMIT_WHY set when the provider answers 429 GoUsageLimitError for
 # MODEL; 1 for any other answer, no answer, or no probe configured.
+# PROBE_ANSWERED says the provider answered at all, so a lane that asks it
+# again can tell a provider that serves it from one it cannot reach.
 provider_at_limit() {
   local url header session model body out code limit_name headers retry_after stamp
+  PROBE_ANSWERED=0
   url="$(lane_setting PROBE_URL)" header="$(lane_setting PROBE_HEADER)"
   [ -n "$url" ] && [ -n "$API_KEY" ] || return 1
   [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 1
@@ -768,24 +786,91 @@ provider_at_limit() {
       -H 'Content-Type: application/json' ${header:+-H "$header: $session"} \
       --data-binary "$body" "$url" 2>/dev/null)"; then
     rm -f "$headers"
+    provider_checked
     return 1
   fi
+  PROBE_ANSWERED=1
+  provider_checked
   code="${out##*$'\n'}" body="${out%$'\n'*}"
-  if [ "$code" != 429 ] || [[ "$body" != *GoUsageLimitError* ]]; then
+  if [ "$code" != 429 ] || [[ "$body" != *"$GO_LIMIT_ERROR"* ]]; then
     rm -f "$headers"
     return 1
   fi
   limit_name="$(printf '%s' "$body" | sed -nE 's/.*"limitName" *: *"([A-Za-z0-9_-]+)".*/\1/p' | head -1)"
-  retry_after="$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
+  # The provider's Retry-After header, in any case: the awk on the lane
+  # machine has no IGNORECASE, so a case-sensitive match never read it and
+  # every limit fell back to the window name (2026-10-20).
+  retry_after="$(awk 'tolower($0) ~ /^retry-after:/ {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END{print value}' "$headers" 2>/dev/null)"
   rm -f "$headers"
   retry_after="$(printf '%s' "$retry_after" | tr -cd '[:alnum:], :-')"
   stamp="$(date +%s)"
   [[ "$retry_after" =~ ^[0-9]+$ ]] && retry_after=$((stamp + retry_after))
-  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s"}\n' \
-    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
+  printf '{"at": %s, "limit_name": "%s", "retry_after": "%s", "model": "%s"}\n' \
+    "$stamp" "${limit_name:-unknown}" "${retry_after//\"/}" "$model" \
+    > "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" &&
     mv -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json.tmp" "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
-  LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 GoUsageLimitError)"
+  LIMIT_WHY="the provider's ${limit_name:-usage} limit (429 $GO_LIMIT_ERROR)"
   return 0
+}
+
+# When the provider was last asked whether it is at a limit: the epoch, one
+# line. A lane held by a limit asks it again every LIMIT_RECHECK minutes
+# (provider_limit_lifted), so the hold ends when the provider serves it.
+provider_checked() {
+  mkdir -p "$LOOM_HOME/state/usage"
+  printf '%s\n' "$(date +%s)" > "$LOOM_HOME/state/usage/$SLOT.provider-check"
+}
+
+# Whether the lane asks the provider again: the last probe was at least
+# LIMIT_RECHECK minutes ago, and the hold in force is the one the probe took
+# (its reason names the provider's limit; no other hold carries that).
+provider_recheck_due() {
+  local at reason
+  [ -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" ] || return 1
+  reason="$(sed -nE 's/.*"reason": *"([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+  case "$reason" in *"$GO_LIMIT_ERROR"*) ;; *) return 1 ;; esac
+  at="$(cat "$LOOM_HOME/state/usage/$SLOT.provider-check" 2>/dev/null)"
+  [[ "$at" =~ ^[0-9]+$ ]] || return 1
+  [ "$(( $(date +%s) - at ))" -ge "$LIMIT_RECHECK" ]
+}
+
+# Whether the provider serves this lane again. The provider is asked at most
+# once every LIMIT_RECHECK minutes, and only for a hold the probe itself took:
+# a hold the agent CLI recorded (a model it no longer offers, a spent
+# allowance) stands, for no probe says otherwise. A provider that cannot be
+# reached is not a provider that serves the lane: the hold stands.
+provider_limit_lifted() {
+  local model key_ssm
+  provider_recheck_due || return 1
+  [ -n "$(lane_setting PROBE_URL)" ] || return 1
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || return 1
+  API_KEY="$(ssm_value "$key_ssm")"
+  [ -n "$API_KEY" ] || return 1
+  # The model the probe found at a limit: the provider's answer is about that
+  # model, so that is the model to ask about again.
+  model="$(sed -nE 's/.*"model": *"([A-Za-z0-9._:/@-]+)".*/\1/p' \
+    "$LOOM_HOME/state/usage/$SLOT.provider-limit.json" 2>/dev/null | head -1)"
+  [ -n "$model" ] || model="$(lane_setting MODEL)"
+  [ -n "$model" ] || return 1
+  MODEL="$model"
+  if provider_at_limit; then
+    hold_provider_limit
+    return 1
+  fi
+  [ "${PROBE_ANSWERED:-0}" = 1 ] || return 1
+  lift_provider_limit
+  return 0
+}
+
+# The provider serves the group again: the hold is over for every slot that
+# shares the account. The record of the refusal stays: it is the last 429 the
+# Usage view shows.
+lift_provider_limit() {
+  local slot
+  for slot in $(key_group); do
+    write_beat "$slot" true ""
+  done
 }
 
 # A free lane whose provider has a read-only meter (openrouter: the key's
@@ -1849,8 +1934,17 @@ CONFIGURED_MODELS="$(lane_setting MODELS)"
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
-  heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
-  exit 0
+  # The provider's allowance refills while the lane sleeps, so the lane asks
+  # it again rather than waiting out the whole window (opencode-go,
+  # 2026-10-20: the lane sat idle for days while the provider served it).
+  if ! provider_limit_lifted; then
+    # The re-check may have found a reset of its own: the beat the group hold
+    # wrote says how long the lane waits now.
+    NEW_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
+    [ -n "$NEW_UNTIL" ] && LIMIT_UNTIL="$NEW_UNTIL"
+    heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
+    exit 0
+  fi
 fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"

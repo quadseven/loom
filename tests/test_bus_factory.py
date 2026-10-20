@@ -1338,6 +1338,14 @@ class Queued(Base):
         self.assign(limited=["codex"], available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
 
+    def test_a_queued_ticket_of_the_opencode_go_tier_takes_that_lane(self):
+        # 2026-10-20: the opencode-go lane was held by a limit for days while
+        # the tickets of its tier queued; once the lane comes back it takes
+        # that queued work.
+        self.queued(7)
+        self.assign(available=["opencode-go"])
+        self.assertEqual(self.lane(7), "opencode-go")
+
     def test_a_pass_that_assigns_no_queued_ticket_says_why_for_the_first(self):
         self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n", age=600)
         self.queued(8, age=60)

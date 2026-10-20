@@ -745,7 +745,8 @@ Each invariant is one function returning breaches with evidence:
   provider lanes whose credit the operator never tops up (for example
   `anthropic`); a slot of one held out of credit is skipped, since it waits
   for the credit to renew and nothing is briefed onto it meanwhile. Unset,
-  every held lane counts.
+  every held lane counts. A hold whose reset has passed is no hold: the lane
+  is free again, as the Usage view reads the same heartbeat.
 - The epic shape (decision 0003): a goal home with open `loom:ticket` issues
   under no epic (one rolling issue for every goal, a line per goal home,
   rewritten in place while the list changes; the older per-goal issues are
@@ -846,10 +847,22 @@ cannot query the viewer or any other local service.
   `x-opencode-session`), the runner sends one `max_tokens` 1 request for the
   run's model before each run, and again after a run that timed out (exit
   124). The key goes to curl on stdin, never in argv or a log. A 429 naming
-  `GoUsageLimitError` holds the lane 12 hours (heartbeat `limit: the
-  provider's weekly limit ...` with a `retry_at`) and hands the brief on as
-  `[limit]`; any other answer lets the run go ahead. Another provider can
-  name its own endpoint in the same setting.
+  `GoUsageLimitError` holds the lane until the reset the provider's
+  `Retry-After` header gives (heartbeat `limit: the provider's weekly limit
+  ...` with a `retry_at`) and hands the brief on as `[limit]`; a provider that
+  gives no reset holds the lane for a week, the fallback for a window the
+  runner does not know. Any other answer lets the run go ahead. Another
+  provider can name its own endpoint in the same setting.
+- A lane held by such a limit asks the provider again every 30 minutes and
+  comes back as soon as it serves the lane again, because the provider's
+  allowance refills while the lane sleeps (OpenCode Go refills 20% of a
+  model's allowance every 5 hours). It asks about the model the probe found at
+  a limit, and only for a hold the probe itself took: a hold the agent CLI
+  recorded (a model it no longer offers, a spent allowance) stands, for no
+  probe says otherwise. On 2026-10-20 the four opencode-go slots stayed held
+  for days (the provider's `Retry-After` was never read, so every limit fell
+  back to a week) and the lane-held invariant fired while 33 tickets of the
+  tier waited.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
   read-only meter with the key they already hold, at most every five minutes,
