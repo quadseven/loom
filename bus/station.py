@@ -3650,7 +3650,11 @@ class Station:
                       seen: Optional[List[Dict[str, Any]]] = None) -> Dict[int, Dict[str, Any]]:
         """Each wanted ticket's latest merged pull request, found by its Refs
         line or loom branch in the most recently updated closed pull requests
-        (the URL reconciliation reads), stopping once every one is found.
+        (the URL reconciliation reads), stopping once every one is found, then
+        for up to SHIP_PER_PASS tickets still missing, the one an adoption
+        ticket names or one past the window (_ticket_pull_beyond_window): every
+        ship rule reads this, and only the deploy rule looked those up, so 33
+        adoption tickets in other repos never shipped (2026-10-20).
         Every merged pull request read is added to seen when it is given."""
         found: Dict[int, Dict[str, Any]] = {}
         url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
@@ -3670,6 +3674,12 @@ class Station:
             url = _next_link(resp.headers.get("link", ""))
             if not url or wanted <= set(found):
                 break
+        for number in sorted(wanted - set(found))[:SHIP_PER_PASS]:
+            pr = self._ticket_pull_beyond_window(repo, number)
+            if pr is not None:
+                found[number] = pr
+                if seen is not None:
+                    seen.append(pr)
         return found
 
     def ship_deployed(self) -> None:
@@ -3686,10 +3696,6 @@ class Station:
         if not merged:
             return
         latest = self._merged_pulls(repo, merged)
-        for number in sorted(merged - set(latest))[:SHIP_PER_PASS]:
-            pr = self._ticket_pull_beyond_window(repo, number)
-            if pr is not None:
-                latest[number] = pr
         groups = self._ticket_pulls(repo, set(latest))
         hands = self._hand_reverts(repo, self._closed_pulls(repo))
         carried = sorted((str(pr["merged_at"]), number, pr)
