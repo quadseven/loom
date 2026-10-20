@@ -81,6 +81,36 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
         self.assertIn("\nRefs example-owner/example-repo#42", body)
 
+    TICKED_BODY = RUNNER_BODY.replace("- [ ] The thing works", "- [x] The thing works").replace(
+        "- [ ] Nothing else changes", "- [ ] Nothing else changes; not built: out of reach")
+
+    def test_a_fix_rounds_checklist_ticks_the_body(self):
+        # A fix round's ticks never reached its pull request: the repair
+        # rendered the ticket's unticked criteria every round (2026-10-20).
+        self.write_brief(BRIEF)
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("Fix it\n\n## Acceptance criteria\n- [x] The thing works\n"
+                     "- [x] A test covers the thing\n- [x] Nothing else changes\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
+                                     "codex", "gpt-test", "T42", summary_path=summary)
+        self.assertTrue(result["changed"])
+        self.assertIn("## Acceptance criteria\n- [x] The thing works\n- [x] A test covers the thing\n"
+                      "- [x] Nothing else changes\n", result["body"])
+
+    def test_ticks_already_in_the_body_survive_a_round_with_no_checklist(self):
+        self.write_brief(BRIEF)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", self.TICKED_BODY,
+                                     "codex", "gpt-test", "T42")
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["body"], self.TICKED_BODY)
+
+    def test_a_corrected_ticket_still_replaces_criteria_whose_text_changed(self):
+        self.write_brief(BRIEF_CORRECTED)
+        result = pr_repair.reconcile(self.brief, "Fix the thing", self.TICKED_BODY,
+                                     "codex", "gpt-test", "T42")
+        self.assertIn("- [ ] The edge case is handled", result["body"])
+
     def test_no_change_when_body_and_title_match(self):
         self.write_brief(BRIEF)
         result = pr_repair.reconcile(

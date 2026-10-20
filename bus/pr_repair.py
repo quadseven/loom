@@ -86,12 +86,43 @@ def _brief_title(brief: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _render_generated(brief: str, lane: str, model: str, ticket: str) -> str:
+_CRITERION = re.compile(r"^- \[[ xX]\] (.*?)(?:; not built: .*)?$")
+
+
+def _criteria_text(section: str) -> list:
+    """The criteria of a checklist without their ticks and not-built
+    reasons, to tell whether two checklists name the same criteria."""
+    return [m.group(1).strip() if m else line.strip()
+            for line in section.split("\n") if line.strip()
+            for m in [_CRITERION.match(line.strip())]]
+
+
+def _checklist(brief: str, current_body: str, summary: str) -> str:
+    """The body's acceptance checklist: the lane's from its summary when it
+    wrote one, else the pull request's own when it names the ticket's
+    criteria (so a round keeps earlier ticks), else the ticket's. Rendering
+    the ticket's every round dropped every tick a lane made (2026-10-20)."""
+    ticket = _brief_section(brief, "Acceptance criteria")
+    lane = _brief_section(summary, "Acceptance criteria") if summary else ""
+    if lane:
+        return lane
+    # The body's section runs on to its Size: line; its checklist is the
+    # "- [" lines.
+    current = "\n".join(line for line in _brief_section(current_body, "Acceptance criteria")
+                         .split("\n") if line.startswith("- ["))
+    if current and _criteria_text(current) == _criteria_text(ticket):
+        return current
+    return ticket
+
+
+def _render_generated(brief: str, lane: str, model: str, ticket: str,
+                      acceptance: Optional[str] = None) -> str:
     """Render the generated sections the way lanes/run_lane.sh::pr_body does."""
     _check_footer_fields(ticket, lane, model)
     why = _brief_section(brief, "Why")
     summary = _brief_section(brief, "What")
-    acceptance = _brief_section(brief, "Acceptance criteria")
+    if acceptance is None:
+        acceptance = _brief_section(brief, "Acceptance criteria")
     size = _brief_size(brief)
     out_of_scope = _brief_section(brief, "Out of scope")
     issue = _field(brief, "Issue")
@@ -157,7 +188,8 @@ def _split_current(body: str) -> Tuple[str, str, str]:
 
 
 def reconcile(brief_path: str, current_title: str, current_body: str,
-              lane: str, model: str, ticket: str) -> Dict[str, object]:
+              lane: str, model: str, ticket: str,
+              summary_path: Optional[str] = None) -> Dict[str, object]:
     """Return new title/body and hashes, or a reason why it cannot be done.
 
     The returned dict has keys:
@@ -184,8 +216,18 @@ def reconcile(brief_path: str, current_title: str, current_body: str,
         result["reason"] = "cannot read brief: %s" % err
         return result
 
+    summary = ""
+    if summary_path:
+        try:
+            with open(summary_path, encoding="utf-8") as fh:
+                summary = _normalise(fh.read())
+        except OSError:
+            summary = ""
+
     try:
-        desired_generated = _render_generated(brief, lane, model, ticket)
+        desired_generated = _render_generated(
+            brief, lane, model, ticket,
+            _checklist(brief, _normalise(current_body), summary))
         new_hash = _sha12(_normalise(desired_generated))
         result["new_hash"] = new_hash
         old_hash = _hash_generated(current_body)
@@ -274,6 +316,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("lane", help="lane name")
     parser.add_argument("model", help="model id")
     parser.add_argument("ticket", help="ticket id used in the PR footer")
+    parser.add_argument("--summary",
+                        help="the lane's Intent summary, whose ## Acceptance criteria "
+                             "checklist goes in the body")
     args = parser.parse_args(argv)
 
     if args.apply and not args.repo:
@@ -299,7 +344,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     current_body = str(pr.get("body") or "")
 
     result = reconcile(args.brief, current_title, current_body,
-                       args.lane, args.model, args.ticket)
+                       args.lane, args.model, args.ticket, args.summary)
 
     if not args.apply:
         print(json.dumps(result))
