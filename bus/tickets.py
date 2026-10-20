@@ -74,6 +74,28 @@ _AFTER_REF_RE = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#([0-9]+)")
 # that looks like a header must not follow the real header lines.
 FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable):")
 SLUG_MAX = 40
+# An issue rewritten in place (brain.brief --refs, loom#1229) keeps its
+# original title and text under this last section, quoted line by line, so
+# no reader takes a header, section, checkbox or Refs line from it and the
+# lane pull request body (which copies named sections) never carries it.
+ORIGINAL_HEADING = "## Original issue"
+
+
+def with_original(body: str, issue: Dict[str, Any]) -> str:
+    """The ticket body followed by the issue's original title and text,
+    quoted in a collapsed section."""
+    text = str(issue.get("body") or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = ["Original title: %s" % " ".join(str(issue.get("title") or "").split()), ""]
+    lines += text.rstrip("\n").split("\n")
+    quoted = "\n".join(("> " + line) if line.strip() else ">" for line in lines)
+    return "%s\n\n%s\n\n<details><summary>Original issue</summary>\n\n%s\n\n</details>\n" % (
+        body.rstrip("\n"), ORIGINAL_HEADING, quoted)
+
+
+def without_original(body: str) -> str:
+    """The body without the original text an in-place rewrite kept."""
+    found = re.search(r"^%s[ \t]*$" % re.escape(ORIGINAL_HEADING), body, re.M)
+    return body[:found.start()] if found else body
 
 
 def slug(title: str) -> str:
