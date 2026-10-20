@@ -6,7 +6,10 @@ Run every command from that checkout. Set `LOOM_GITHUB_TOKEN`,
 `LOOM_REPOS` (space separated `OWNER/NAME` values) and `LOOM_BRIEF_AUTHORS`
 (the login or logins that brief tickets and post proofs, the same value the
 station uses). Without it `prioritize`, `close`, verified moves and merges
-refuse every ticket as untrusted. Use `muse` as your lock
+refuse every ticket as untrusted. With a personal `LOOM_GITHUB_TOKEN`, every
+issue a `bus` or `bus.brain` command opens or comments on is unsubscribed for
+that person afterwards, so later bot comments there send them no email; an
+@mention still does. Use `muse` as your lock
 holder (the lane machine's tick uses its own name and takes the lock for
 you). The lock lives in `quadseven/loom`.
 

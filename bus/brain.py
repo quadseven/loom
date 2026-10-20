@@ -4274,7 +4274,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gh: Optional[GitHub] = None
     try:
         args = parser().parse_args(argv)
-        gh = GitHub(auth_from_env())
+        gh = GitHub(auth_from_env(), unsubscribe=True)
         # Status comments by the trusted writers read as events (bus/status.py).
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
         COMMANDS[args.command](gh, args)

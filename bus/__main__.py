@@ -126,7 +126,7 @@ def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None,
             return 2
     try:
         if gh is None:
-            gh = GitHub(auth_from_env())
+            gh = GitHub(auth_from_env(), unsubscribe=True)
         try:
             return _run(args, gh)
         finally:
