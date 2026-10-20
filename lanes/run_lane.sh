@@ -293,6 +293,37 @@ EOF
   fi
 }
 
+# Remove untracked scratch additions before the brief-scope check. Rebuild a
+# new-PR commit without them; fix rounds keep their branch fast-forwardable.
+drop_scratch_files() {
+  local paths f
+  SCRATCH_DROPPED=""
+  paths="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.scratch_drop "$TREE" "$BASE" HEAD "$1" 2>/dev/null)" || return 1
+  [ -n "$paths" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rm -f "$TREE/$f" || return 1
+    printf '[%s] %s dropped out-of-path scratch file: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$f"
+  done <<EOF
+$paths
+EOF
+  SCRATCH_DROPPED="$paths"
+  if [ -z "$FIX_PR" ] && [ -z "$CONFLICTS" ]; then
+    safe_git reset -q --soft "$BASE" || return 1
+    safe_git add -A || return 1
+    safe_git diff --cached --quiet && return 0
+    safe_git commit -qm "${TITLE:-$TICKET}" || return 1
+  else
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      safe_git rm -q -r -- "$f" || return 1
+    done <<EOF
+$paths
+EOF
+    safe_git commit -qm "Drop out-of-path scratch files: ${paths//$'\n'/, }" || return 1
+  fi
+}
+
 # Sets STRAY_FILES to the files the agent's commits (BASE..HEAD) add outside
 # the brief: not named by it (as a path or a directory above one) and not
 # under a non-hidden top-level directory the base already tracks
@@ -2412,6 +2443,9 @@ for BRIEF in "$INBOX"/*.md; do
   if ! drop_probe_files >> "$LOG" 2>&1; then
     park "$BRIEF" "could not drop sandbox probe files" transient; continue
   fi
+  if ! drop_scratch_files "$BRIEF" >> "$LOG" 2>&1; then
+    park "$BRIEF" "could not drop out-of-path scratch files" transient; continue
+  fi
   if ! BRANCH_HEAD="$(safe_git rev-parse "$BRANCH" 2>> "$LOG")" || [ -z "$BRANCH_HEAD" ]; then
     park "$BRIEF" "could not read the lane branch after validation" transient; continue
   fi
@@ -2459,6 +2493,10 @@ for BRIEF in "$INBOX"/*.md; do
       if [ -n "$DROPPED_FILES" ]; then
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+      fi
+      if [ -n "$SCRATCH_DROPPED" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped out-of-path scratch files: ${SCRATCH_DROPPED//$'\n'/, }"
       fi
       PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \

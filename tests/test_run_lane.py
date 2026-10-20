@@ -223,6 +223,24 @@ if [ "${FAKE_AGENT:-commit}" = stray ]; then
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = scratch-stray ]; then
+  printf 'fixed\n' > fix.txt
+  printf 'debug\n' > test_debug.py
+  mkdir -p build_test .loom
+  printf 'object\n' > build_test/overseer_decisions.o
+  printf 'scratch\n' > .loom/test.txt
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
+if [ "${FAKE_AGENT:-commit}" = github-stray ]; then
+  printf 'fixed\n' > fix.txt
+  mkdir -p .github/workflows
+  printf 'on: push\n' > .github/workflows/extra.yml
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = binref ]; then
   mkdir -p bin
   printf '#!/bin/sh\\n' > bin/tool
@@ -633,6 +651,26 @@ print('leak guard: clean (shape patterns only)')
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_out_of_path_scratch_files_are_dropped_and_named(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="scratch-stray")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        log = self.run_log()
+        for path in ("test_debug.py", "build_test/overseer_decisions.o", ".loom/test.txt"):
+            self.assertIn("dropped out-of-path scratch file: " + path, log)
+        self.assertIn("Dropped out-of-path scratch files: .loom/test.txt, "
+                      "build_test/overseer_decisions.o, test_debug.py",
+                      self.body.read_text())
+
+    def test_github_file_outside_the_brief_is_still_refused(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="github-stray")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertIn("commit refused: it adds files outside the brief's paths: "
+                      ".github/workflows/extra.yml; nothing pushed", self.run_log())
 
     def test_public_repo_private_ip_diff_is_refused_before_push(self):
         self.drop_brief()
