@@ -529,7 +529,7 @@ on hard work):
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4, muse, free-nvidia, free-kilo and free-groq on public repos only
+  opencode-go-4, muse, copilot, free-nvidia, free-kilo and free-groq on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
   are NVIDIA NIM, Kilo and Groq).
   Never anthropic or claude for an easy ticket.

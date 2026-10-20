@@ -52,6 +52,7 @@ AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|h
 # OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,
 # every hour until then (2026-10-19).
 DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
+MONTHLY_RE='copilot.*(allowance|limit|quota|usage|request)|monthly ([a-z]+ )*(allocation|allowance|limit|quota)|per[ _-]month|resets? (at|on) the first of (the )?month'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 
@@ -65,7 +66,7 @@ LIMIT_WAIT_MAX=86400
 # offline until the operator renews it. A crash before any edit, a timeout,
 # a signal or a network fault is transient; anything else is work.
 classify_failure() {
-  local status="$1" whole="$2" edited="$3" now n tail
+  local status="$1" whole="$2" edited="$3" now n tail monthly=0
   tail="${4:-$whole}"
   FAIL_CLASS=work RETRY_AT=""
   now="$(date +%s)"
@@ -84,9 +85,12 @@ classify_failure() {
       RETRY_AT=$((now + n))
     elif [[ "$whole" =~ $DAILY_RE ]]; then
       RETRY_AT=$((now - now % 86400 + 86400))
+    elif [[ "$whole" =~ $MONTHLY_RE ]]; then
+      monthly=1
+      RETRY_AT="$(python3 -c 'from datetime import datetime, timezone; n=datetime.now(timezone.utc); y=n.year+(n.month==12); m=1 if n.month==12 else n.month+1; print(int(datetime(y,m,1,tzinfo=timezone.utc).timestamp()))')"
     fi
     [ "$RETRY_AT" -ge $((now + 60)) ] || RETRY_AT=$((now + 60))
-    [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX))
+    [ "$monthly" -eq 1 ] || { [ "$RETRY_AT" -le $((now + LIMIT_WAIT_MAX)) ] || RETRY_AT=$((now + LIMIT_WAIT_MAX)); }
   elif [ "$status" -ne 0 ]; then
     if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
        [[ "$tail" =~ $NET_RE ]]; then

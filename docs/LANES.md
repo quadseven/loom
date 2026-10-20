@@ -781,10 +781,11 @@ the machine (the uploads above do). API-lane agents run on the same machine, so 
 loopback connection outside their provider's port (443, and the spark endpoint's on the spark lane); they
 cannot query the viewer or any other local service.
 
-## API lanes: openrouter, opencode-go, anthropic (and zen, zai below)
+## API lanes: openrouter, opencode-go, anthropic, copilot (and zen, zai below)
 
 - `openrouter` (free models via opencode), `opencode-go` (subscription models
-  via opencode) and `anthropic` (API credits via the official Claude Code CLI).
+  via opencode), `anthropic` (API credits via the official Claude Code CLI),
+  and `copilot` (GitHub Copilot CLI with its Free allowance).
 - The provider key is read from SSM at run time (`LOOM_<LANE>_KEY_SSM`, set at
   install, never in this repo) and exported to the agent, never passed in
   argv, in an otherwise empty environment with a scratch HOME and TMPDIR.
@@ -812,6 +813,11 @@ cannot query the viewer or any other local service.
 - Otherwise: fresh clone, the lane's official CLI with the brief, then the
   runner (not the agent) pushes the branch and opens the PR in the format
   the Chief check requires.
+- `copilot` reads its token from `LOOM_COPILOT_KEY_SSM` and exports it only as
+  `COPILOT_GITHUB_TOKEN`. It invokes one `copilot -p` prompt with
+  `--allow-all-tools`; the run output, including any CLI usage details, is
+  retained in the lane log. Monthly usage-limit messages hold the lane until
+  the next UTC month begins.
 - Any step that fails moves the brief to `failed/` with the reason in
   `logs/<lane>/<ticket>.log`. Failed briefs are never retried; the
   orchestrator re-briefs.
@@ -941,6 +947,7 @@ lookup leaves the brief for the next pass. The rule covers:
 - the `zen` lane (several OpenCode Zen free models may train on prompts;
   Nemotron free models are NVIDIA trial endpoints),
 - the `zai` lane (Z.ai free Flash models),
+- the `copilot` lane (Free allowance; public repositories only),
 - `opencode-go` runs of a Muse Spark Contributor model (it trains Meta's
   models); other Go models keep 0 to 30 days and take any repo.
 

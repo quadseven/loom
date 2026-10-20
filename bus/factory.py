@@ -190,7 +190,7 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # Analysis has no listing for it yet. A ticket a Spark fails still climbs
     # the model ladder, so nothing waits on them.
     "easy": SPARKS + ("muse", "agy") + FREE_POOL + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-                      "openrouter", "workersai", "zen", "zai"),
+                      "openrouter", "workersai", "zen", "zai", "copilot"),
     # The free lanes take medium work too, before the paid ones (operator
     # 2026-10-19: "I always want my free tier used up"). 84 medium tickets
     # waited a median 18.5 hours for codex while these sat idle; a ticket a
@@ -214,7 +214,7 @@ TIERS: Dict[str, Tuple[str, ...]] = {
 KINDS = ("own-hardware", "free", "subscription", "never-paid")
 LANE_KINDS: Dict[str, str] = {
     "spark": "own-hardware",
-    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai")},
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")},
     **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
     "anthropic": "never-paid",
 }
@@ -280,7 +280,7 @@ FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
 # free-nvidia, free-kilo and free-groq are free providers that may train on prompts.
-PUBLIC_ONLY = ("zen", "zai", "agy", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
+PUBLIC_ONLY = ("zen", "zai", "agy", "copilot", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane"). The last rung takes the work regardless.

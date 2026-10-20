@@ -3598,6 +3598,7 @@ class RetryTest(Base):
         self.assertTrue(station.lane_takes_model("codex", "gpt-x"))
         self.assertFalse(station.lane_takes_model("zen", "opencode/paid"))
         self.assertTrue(station.needs_public_repo("agy", ""))
+        self.assertTrue(station.needs_public_repo("copilot", ""))
         self.assertFalse(station.needs_public_repo("opencode-go", "opencode-go/kimi"))
         self.assertTrue(station.needs_public_repo("opencode-go", "opencode-go/muse-spark-contributor"))
 
