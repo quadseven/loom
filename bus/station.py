@@ -3046,6 +3046,19 @@ class Station:
                 out[int(issue["number"])] = issue
         return out
 
+    def _deliver_trusted_author(self, repo: str, ticket: Dict[str, Any],
+                                    pr: Dict[str, Any]) -> bool:
+        """Whether the pull request author may deliver the ticket: a trusted
+        author of a trusted ticket, or the contributor who owns it and whose
+        ticket a trusted login filed."""
+        author = tickets._login(pr.get("user"))
+        authors = {name.lower() for name in self.s.authors}
+        if author in authors:
+            return self._check_trust(repo, ticket)[0]
+        owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
+        return bool(author and author in owners
+                    and tickets._login(ticket.get("user")) in authors)
+
     def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
                           unlinked: Dict[int, Dict[str, Any]]) -> None:
         """Move a queued or briefed ticket to loom:merged when this merged
@@ -3059,16 +3072,8 @@ class Station:
         head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
         if head_repo != repo:
             return
-        author = tickets._login(pr.get("user"))
-        authors = {name.lower() for name in self.s.authors}
-        if author in authors:
-            if not self._check_trust(repo, ticket)[0]:
-                return
-        else:
-            owners = set(tickets.assignees(ticket)) | set(tickets.claimed_by(ticket))
-            if (not author or author not in owners
-                    or tickets._login(ticket.get("user")) not in authors):
-                return
+        if not self._deliver_trusted_author(repo, ticket, pr):
+            return
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
             return

@@ -3579,6 +3579,18 @@ def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     return out if due else out + ["- none"]
 
 
+def _sensitive_head(gh: GitHub, repo: str, pr: Dict[str, Any]
+                    ) -> Tuple[str, Dict[str, Any]]:
+    """The head sha and pull request details for a sensitive resume check,
+    preferring the GraphQL head oid and falling back to the REST head sha."""
+    owner, name = repo.split("/", 1)
+    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
+                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
+    details = (data.get("repository") or {}).get("p") or {}
+    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    return sha, details
+
+
 def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
                      check: str) -> Optional[Dict[str, Any]]:
     """A needs-brain sensitive pull request older than 2 hours whose checks
@@ -3595,11 +3607,7 @@ def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
         return None
     if ticket is None:
         return None
-    owner, name = repo.split("/", 1)
-    data = gh.graphql('query { repository(owner:%s,name:%s) { p: pullRequest(number:%d) { headRefOid %s } } }'
-                      % (_gql(owner), _gql(name), int(pr["number"]), READY_FIELDS)) or {}
-    details = (data.get("repository") or {}).get("p") or {}
-    sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    sha, details = _sensitive_head(gh, repo, pr)
     if not _checks_green(details) or not sha or not _review_check_passed(gh, repo, sha, check):
         return None
     return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details}
