@@ -157,6 +157,11 @@ if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
   printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
+  echo "fixed" > fix.txt
+  printf 'contact %s\\n' "$(printf 'MTAuMjMuNC41' | base64 -d)" >> fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
   exit 0
@@ -457,6 +462,26 @@ class LaneRunnerTest(unittest.TestCase):
             'printf \'copilot %s | token=%s | home=%s\\n\' "$*" "${COPILOT_GITHUB_TOKEN:-}" "$HOME" >> "$FAKE_LOG"'))
         self.write_tool(self.bin / "aws", FAKE_AWS)
         self.write_tool(self.bin / "curl", FAKE_CURL)
+        self.scanner = root / "check_private_leaks.py"
+        self.scanner.write_text("""#!/usr/bin/env python3
+import re, subprocess, sys
+mode, value = sys.argv[1:]
+if mode == '--diff':
+    text = subprocess.run(['git', 'diff', '-U0', value], capture_output=True,
+                          text=True, check=True).stdout
+    diff = True
+else:
+    text = open(value, encoding='utf-8').read()
+    diff = False
+for number, line in enumerate(text.splitlines(), 1):
+    if diff and (line.startswith(('---', '+++', '-'))):
+        continue
+    if re.search(r'\\b(?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3}|172\\.(?:1[6-9]|2[0-9]|3[01])\\.\\d{1,3}\\.\\d{1,3})\\b', line):
+        print(f'BLOCKED: private identifier found\\n  {value}:{number} [rfc1918-ip] - a private-range IP address', file=sys.stderr)
+        sys.exit(1)
+print('leak guard: clean (shape patterns only)')
+""")
+        self.scanner.chmod(0o755)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -482,6 +507,7 @@ class LaneRunnerTest(unittest.TestCase):
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
             "LOOM_REPO_OWNERS": "example",
+            "LOOM_LEAK_SCANNER": str(self.scanner),
             "LOOM_CODEX_MODEL": "gpt-test-default",
             "LOOM_CLAUDE_MODEL": "claude-test-default",
             # The free lanes' usage meters (bus/meter.py) read a closed
@@ -572,6 +598,26 @@ class LaneRunnerTest(unittest.TestCase):
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_public_repo_private_ip_diff_is_refused_before_push(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="private-ip")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rfc1918-ip", self.run_log())
+        self.assertIn("[rfc1918-ip]", self.run_log())
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_private_repo_does_not_run_leak_scan_and_pushes(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="private-ip", FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        self.assertNotIn("leak guard", self.run_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_files_the_brief_names_commit_and_push_normally(self):
         self.drop_brief(text=BRIEF.replace(
@@ -1646,7 +1692,7 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         agent = [c for c in self.calls() if c.startswith("opencode ")]
         self.assertEqual(len(agent), 1, self.calls())
-        self.assertIn("-m openrouter/vendor/model:free", agent[0])
+        self.assertIn("-m openrouter/vendor/model:free --print-logs --log-level ERROR", agent[0])
         self.assertIn("keyvar=OPENROUTER_API_KEY key=fake-or-key", agent[0])
         self.assertIn("ssh=none", agent[0])
         self.assertIn("ghtoken=none", agent[0])
@@ -2390,11 +2436,12 @@ cat > /dev/null
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
-        # The local coder trains on nothing: no privacy lookup, private is fine.
+        # Visibility is checked for scanning; private repos skip the scan.
         inbox, result = self.api_lane("spark", FAKE_GH_PRIVATE="true", **self.SPARK)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertFalse(any(c.startswith("gh api ") for c in calls), calls)
+        self.assertIn("gh api repos/example/repo --jq .private", calls)
+        self.assertNotIn("leak guard: clean (shape patterns only)", self.spark_log())
         self.assertTrue(any(c.startswith("curl ") and "http://spark.example.invalid:8000/v1/models" in c
                             for c in calls), calls)
         agent = [c for c in calls if c.startswith("opencode ")]
@@ -3035,6 +3082,9 @@ exit %d
         ("AuthenticationError: HTTP 401 Unauthorized", 1, True, "auth"),
         ("panic: something broke before any edit", 1, False, "transient"),
         ("killed", 137, True, "transient"),
+        ('level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
+         'openrouter/vendor/gone:free. Did you mean: vendor/other:free?"\n'
+         'Error: {"name": "UnknownError", "message": "Unexpected server error."}', 1, False, "limit"),
         ("FAILED tests/test_x.py::test_y - AssertionError at line 429", 1, True, "work"),
         ("I looked and there is nothing to change.", 0, False, "work"),
     ]
@@ -3077,6 +3127,30 @@ exit %d
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
         self.assertEqual(self.calls(), [])
         self.assertFalse(self.beat()["available"])
+
+    def test_a_model_the_cli_no_longer_offers_rests_the_lane_for_a_day(self):
+        # openrouter, 2026-10-20: models.dev marked the lane's free model
+        # deprecated, opencode dropped it and printed only "UnknownError:
+        # Unexpected server error", and every run failed transient while the
+        # lane rested 30 minutes at a time and claimed again.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="1", FAKE_OUT=(
+            'level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
+            'openrouter/vendor/gone:free."\nError: {"name": "UnknownError"}'))
+        self.assertTrue(self.failure_line().startswith("[limit] "), self.failure_line())
+        self.assertIn("not found by the agent CLI", self.failure_line())
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()) + 86000)
+
+    def test_a_lane_with_no_transient_count_writes_nothing_to_its_service_log(self):
+        # 2026-10-20: every pass read the missing count file with the stderr
+        # redirect after the input one, so bash printed "No such file or
+        # directory" first; each lane's service log held about 1000 such lines.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
+        self.assertNotIn(".transient", result.stderr)
+        self.assertNotIn(".transient", result.stdout)
 
     def test_a_run_that_is_not_transient_clears_the_transient_count(self):
         for n, (out, status) in enumerate((("Unexpected server error", "1"),
@@ -3657,6 +3731,28 @@ exit %d
         self.assertEqual((default["exit"], default["revision"]), (0, self.remote_head("main")))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    def test_a_default_branch_checkout_that_still_fails_is_a_factory_incident_not_work(self):
+        # A [work] failure here spent a ladder attempt, and counted toward
+        # the runaway hold, for a fault in the runner's own clone (2026-10-20).
+        real_git = shutil.which("git")
+        self.write_tool(self.bin / "git", "#!/bin/sh\ncase \" $* \" in *\" checkout -q --detach \"*) "
+                        "echo 'fatal: unable to read tree' >&2; exit 128;; esac\n"
+                        f"exec {shlex.quote(real_git)} \"$@\"\n")
+        self.contract_repo(contract=CONTRACT.replace(
+            "setup: loom-test-python -c 'open(\".prepared\", \"w\").write(\"ok\")'\n", "").replace(
+            "test -f .prepared && ", ""))
+        name, _ = self.fix_brief()
+        self.advance_main("first.txt", "main's version\n")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        log = self.run_log(name + ".log")
+        self.assertIn("failed: [factory] setup failed: could not check out the default branch", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+        self.assertFalse(list(self.loom.glob("**/*-default-check")))
+
     def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
@@ -3814,6 +3910,76 @@ exit %d
                                 env=env, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("uvx 0.9.0 (scratch)", log.read_text())
+
+    def test_final_validation_removes_an_untracked_agent_venv_before_uv_check(self):
+        # The agent commits its change, then leaves an untracked environment
+        # whose interpreter is unusable to the final sandbox.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = "interpreter: loom-test-python\ncheck: test ! -e .venv && test -f fix.txt\n"
+        self.contract_repo(contract=contract)
+        self.drop_brief(text=BRIEF.replace("Make the thing work.",
+                                           "Make the thing work. Leave a .venv for validation."))
+        replacement = FAKE_AGENT.replace(
+            'git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"',
+            'git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"\n'
+            'echo /.venv >> .git/info/exclude\nmkdir -p .venv/bin\nprintf "blocked" > .venv/bin/python3')
+        self.write_tool(self.bin / "codex", replacement)
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        self.assertFalse(self.records()[-1]["ok"] is False, self.lane_log())
+
+    def test_final_validation_classifies_denied_python_interpreter_as_factory(self):
+        text = RUNNER.read_text()
+        function = re.search(r"^validation_interpreter_denied\(\) \{\n.*?^\}\n",
+                             text, re.S | re.M).group(0)
+        script = function + 'validation_interpreter_denied "$1" "$2" && echo factory\n'
+        result = subprocess.run(["bash", "-c", script, "test", "2",
+                                 "Failed to query Python interpreter\\nOperation not permitted"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "factory")
+        result = subprocess.run(["bash", "-c", script, "test", "1", "ordinary test failure"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout, "")
+
+    def test_final_interpreter_permission_error_is_a_factory_failure(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = ("interpreter: loom-test-python\n"
+                    "check: grep -q todo fix.txt || { echo 'Failed to query Python interpreter'; "
+                    "echo 'Operation not permitted'; exit 2; }\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("Python interpreter query was denied by the sandbox", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+
+    def test_untracked_venv_cleanup_preserves_tracked_files_under_venv(self):
+        text = RUNNER.read_text()
+        function = re.search(r"^remove_untracked_venvs\(\) \{\n.*?^\}\n",
+                             text, re.S | re.M).group(0)
+        tree = Path(self._tmp.name) / "tree"
+        tree.mkdir()
+        tracked = tree / ".venv" / "tracked.txt"
+        tracked.parent.mkdir()
+        tracked.write_text("tracked\n")
+        git("init", "-q", str(tree))
+        git("add", ".venv/tracked.txt", cwd=tree)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "seed", cwd=tree)
+        (tree / ".venv" / "untracked.txt").write_text("keep with tracked directory\n")
+        untracked = tree / "nested" / ".venv"
+        untracked.mkdir(parents=True)
+        (untracked / "python").write_text("stub\n")
+        script = 'safe_git() { git -C "$TREE" "$@"; }\n' + function + 'remove_untracked_venvs\n'
+        result = subprocess.run(["bash", "-c", script], env={"PATH": os.environ["PATH"],
+                                 "TREE": str(tree)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(tracked.exists())
+        self.assertTrue((tree / ".venv" / "untracked.txt").exists())
+        self.assertFalse(untracked.exists())
 
     def test_the_check_profile_allows_the_uv_files_but_not_their_directory(self):
         # The check profile lets the contract read and execute the runner's

@@ -71,6 +71,7 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_ROOT/../infra-public/.github/scripts/check_private_leaks.py}"
 INBOX="$LOOM_HOME/briefs/$SLOT"
 LOCK="$LOOM_HOME/run/$SLOT.lock"
 
@@ -228,14 +229,14 @@ SUMMARY_FILE=.loom/summary.md
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and the runner posts it on the ticket as the answer.\n' "$SUMMARY_FILE"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion built, leave Live criteria unticked, and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and the runner posts it on the ticket as the answer.\n' "$SUMMARY_FILE"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
 # tickets took six or more rounds: no lane ran a test before opening its pull
 # request, and most fix rounds answered review findings a checklist covers.
 work_note() {
-  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the files the agent's commits added (BASE..HEAD) that only probe the
@@ -324,7 +325,7 @@ prepare_intent() {
 }
 
 pr_body() {
-  local size issue refs=""
+  local size issue refs="" criteria
   issue="$(field Issue "$1" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
@@ -335,8 +336,10 @@ pr_body() {
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
+  criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
-    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$(section 'Acceptance criteria' "$1")" \
+    "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
     "$size" "$(section 'Out of scope' "$1")" "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
@@ -525,7 +528,7 @@ TRANSIENT_REST=1800
 TRANSIENT_FILE="$LOOM_HOME/state/usage/$SLOT.transient"
 transient_rest_until() {
   local count until
-  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || return 1
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || return 1
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 # Count one transient run; prints the epoch the lane rests until once the
@@ -533,7 +536,7 @@ transient_rest_until() {
 transient_strike() {
   local count until now
   now="$(date +%s)"
-  read -r count until < "$TRANSIENT_FILE" 2>/dev/null || count=0
+  read -r count until 2>/dev/null < "$TRANSIENT_FILE" || count=0
   [[ "$count" =~ ^[0-9]+$ ]] || count=0
   count=$((count + 1))
   if [ "$count" -ge "$TRANSIENT_STRIKES" ]; then
@@ -1078,6 +1081,25 @@ contract_command_ok() {
   [ "${#1}" -le 1000 ] && [ "$1" = "$(printf '%s' "$1" | LC_ALL=C tr -cd ' -~')" ]
 }
 
+# Remove untracked virtual environments left by the agent before the final
+# check. Their interpreter symlinks can point outside the check sandbox.
+# A .venv containing any tracked path is retained intact.
+remove_untracked_venvs() {
+  local candidate relative tracked
+  while IFS= read -r -d '' candidate; do
+    relative="${candidate#"$TREE"/}"
+    tracked="$(safe_git ls-files -- "$relative")" || return 1
+    [ -z "$tracked" ] || continue
+    rm -rf -- "$candidate" || return 1
+  done < <(find "$TREE" -type d -name .venv -prune -print0)
+}
+
+validation_interpreter_denied() {
+  local status="$1" output="$2"
+  [ "$status" -ne 0 ] && [[ "$output" == *"Failed to query Python interpreter"* &&
+    "$output" == *"Operation not permitted"* ]]
+}
+
 # One line of $RECORD per step: phase, command, exit code, the tree revision
 # it ran on, and whether it passed. Only a final line with "ok": true lets the
 # runner open (or push to) a pull request.
@@ -1232,7 +1254,9 @@ check_default_branch() {
   # takes the real origin, so relative submodule URLs still resolve. The fix
   # tree is shallow, so git ignores --local and copies only its branches:
   # the fetch brings origin's default branch across, which a conflicting
-  # round has not merged (2026-10-20).
+  # round has not merged (2026-10-20). A checkout that still fails is the
+  # runner's fault, not the ticket's: a factory incident, so the round
+  # spends no ladder attempt and never counts toward the runaway hold.
   if ! { timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            clone -q --local --no-checkout "$branch_tree" "$default_tree" >> "$LOG" 2>&1 &&
          timeout "$NET_TIMEOUT" git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
@@ -1242,7 +1266,9 @@ check_default_branch() {
          git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            checkout -q --detach "$DEFAULT_REV" >> "$LOG" 2>&1; }; then
     rm -rf "$default_tree"
-    SETUP_REASON="could not check out the default branch for validation"; return 1
+    SETUP_REASON="could not check out the default branch for validation"
+    note_factory_incident environment "could not check out $FIX_DEFAULT at $DEFAULT_REV for validation" SETUP_REASON
+    return 1
   fi
   TREE="$default_tree" CHECK_HOME="$branch_home-default"
   if ! mkdir -p "$CHECK_HOME/tmp"; then
@@ -1386,7 +1412,21 @@ final_validation() {
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
+  if ! remove_untracked_venvs; then
+    VALIDATION_REASON="validation environment unavailable: could not remove untracked virtual environments"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" 125 "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   contract_run "$C_CHECK"; rc=$?
+  if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
+    VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" "$rc" "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
@@ -1844,6 +1884,7 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  PR_BODY=""
   TICKET="$(basename "$BRIEF" .md)"
   REPO="$(field Repo "$BRIEF")"
   BRANCH="$(field Branch "$BRIEF")"
@@ -1950,16 +1991,20 @@ for BRIEF in "$INBOX"/*.md; do
   if [[ "$REPO_OWNERS" != *" ${REPO%%/*} "* ]]; then
     park "$BRIEF" "owner ${REPO%%/*} is not in LOOM_REPO_OWNERS"; continue
   fi
+  if ! REPO_PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
+    echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
+  fi
+  case "$REPO_PRIVATE" in
+    true|false) ;;
+    *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+  esac
   # Providers that train on prompts take public repos only. Asked before the
   # clone; a failed lookup proves nothing, so the brief waits for the next pass.
   if trains_on_prompts; then
-    if ! PRIVATE="$(timeout "$NET_TIMEOUT" gh api "repos/$REPO" --jq .private)"; then
-      echo "$TICKET: gh api repos/$REPO failed; will retry next pass" >&2; continue
-    fi
-    case "$PRIVATE" in
+    case "$REPO_PRIVATE" in
       false) ;;
       true) park "$BRIEF" "$REPO is private; lane $LANE with $MODEL trains on prompts and takes public repos only"; continue ;;
-      *) echo "$TICKET: unexpected privacy answer '$PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
+      *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
     esac
   fi
 
@@ -2080,6 +2125,8 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$FAIL_CLASS" = limit ]; then
     # Unavailable before the brief is parked, so the station never sends
     # this lane the retry. The rest of the inbox waits for the reset.
+    LIMIT_REASON="provider limit reached"
+    [[ "$RUN_OUTPUT" =~ $MODEL_GONE_RE ]] && LIMIT_REASON="model $MODEL not found by the agent CLI"
     if [[ "$(printf '%s' "$RUN_OUTPUT" | tr '[:upper:]' '[:lower:]')" =~ $OUT_OF_CREDIT_RE ]]; then
       LIMIT_REASON="out of credit"
       hold_shared_credit "$RETRY_AT"
@@ -2092,7 +2139,6 @@ for BRIEF in "$INBOX"/*.md; do
       done
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     elif [ -n "$CONFIGURED_MODELS" ]; then
-      LIMIT_REASON="provider limit reached"
       record_model_limit "$MODEL" "$RETRY_AT" "$LIMIT_REASON"
       WHY="$(ladder_reason "$CONFIGURED_MODELS")"
       MAX_UNTIL="$(awk 'BEGIN{m=0} {if ($2>m)m=$2} END{print m}' "$MODEL_LIMIT_FILE")"
@@ -2106,7 +2152,6 @@ for BRIEF in "$INBOX"/*.md; do
         heartbeat false "limit: all models limited: $WHY" "$MAX_UNTIL"
       fi
     else
-      LIMIT_REASON="provider limit reached"
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
     park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
@@ -2237,6 +2282,40 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
+  if [ "$REPO_PRIVATE" = false ]; then
+    if [ ! -f "$LEAK_SCANNER" ]; then
+      park "$BRIEF" "public repo leak scan unavailable: scanner not found; nothing pushed" transient
+      continue
+    fi
+    if ! LEAK_OUT="$(cd "$TREE" && timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --diff "$BASE..HEAD" 2>&1)"; then
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
+      continue
+    fi
+    printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    if [ -z "$FIX_PR" ]; then
+      INTENT_CLASS=""
+      INTENT_TEXT=""
+      prepare_intent "$BRIEF" >> "$LOG" 2>&1
+      if [ -n "$DROPPED_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+      fi
+      PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+      PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
+        'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
+        park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
+      }
+      BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
+      printf '%s\n' "$PR_BODY" > "$BODY_FILE"
+      if ! LEAK_OUT="$(timeout "$NET_TIMEOUT" python3 -B "$LEAK_SCANNER" --text-file "$BODY_FILE" 2>&1)"; then
+        rm -f "$BODY_FILE"
+        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
+        continue
+      fi
+      rm -f "$BODY_FILE"
+      printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    fi
+  fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
@@ -2332,17 +2411,14 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
-  INTENT_CLASS=""
-  INTENT_TEXT=""
-  prepare_intent "$BRIEF" >> "$LOG" 2>&1
-  # Name every sandbox probe file the runner dropped, per the ticket.
-  if [ -n "$DROPPED_FILES" ]; then
-    INTENT_TEXT="${INTENT_TEXT}
-- Dropped sandbox probe files: ${DROPPED_FILES//$'\n'/, }"
+  if [ "$REPO_PRIVATE" = true ]; then
+    INTENT_CLASS=""
+    INTENT_TEXT=""
+    prepare_intent "$BRIEF" >> "$LOG" 2>&1
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).
-  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  [ -n "${PR_BODY:-}" ] || PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
   # Briefs are checked when filed, so this only fires on a brief filed
   # before that check or edited by hand: the PR still opens (the work is
   # done), and the log names what the review bot will hold it for.
