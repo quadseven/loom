@@ -4691,6 +4691,22 @@ class OutcomeTest(Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         self.assertEqual(st.limited_lanes(), ["spark"])
 
+    def test_limit_until_is_each_limited_lanes_retry_at(self):
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        now = int(time.time())
+        for lane, available, reason, retry in (
+                ("opencode-go-2", False, "limit: the provider's monthly limit", now + 86400),
+                ("spark", False, "limit: 503", None),
+                ("zen", False, "opencode not on PATH", now + 60)):
+            beat = {"lane": lane, "at": now, "available": available, "reason": reason}
+            if retry is not None:
+                beat["retry_at"] = retry
+            with open(os.path.join(d, lane + ".json"), "w") as fh:
+                json.dump(beat, fh)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertEqual(st.limit_until(), {"opencode-go-2": float(now + 86400)})
+
     def test_down_lanes_are_those_with_a_fresh_unavailable_heartbeat_not_at_a_limit(self):
         d = os.path.join(self.home, "state", "usage")
         for lane, available, reason, age in (
