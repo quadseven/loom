@@ -111,6 +111,30 @@ class SourceTests(unittest.TestCase):
         self.assertTrue(old["stale"])
         self.assertIn("no read since", old["error"])
 
+    def test_a_secret_in_an_error_never_reaches_the_envelope(self):
+        def fetch():
+            raise OSError("upstream echoed Bearer YOUR_GRUG_TOKEN_HERE back")
+        source = tiers_sources.Source("Grug stats", fetch, secrets=("YOUR_GRUG_TOKEN_HERE",))
+        with self.assertLogs(tiers_sources.LOG, "WARNING") as logged:
+            source.refresh(now=100.0)
+        envelope = source.envelope(now=100.0)
+        self.assertNotIn("YOUR_GRUG_TOKEN_HERE", envelope["error"])
+        self.assertIn("[redacted]", envelope["error"])
+        self.assertNotIn("YOUR_GRUG_TOKEN_HERE", "".join(logged.output))
+
+    def test_only_http_and_https_urls_are_read(self):
+        for url in ("file:///etc/passwd", "ftp://example.com/x", "gopher://example.com/"):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(tiers_sources.SourceError, "http"):
+                    tiers_sources.fetch_json(url)
+        sources = tiers_sources.TierSources(env={"LOOM_GATEWAY_URL": "file:///etc",
+                                                 "LOOM_GRUG_STATS_URL": "file:///etc/passwd"},
+                                            runs_store=lambda: FakeRuns())
+        snap = sources.snapshot(now=1.0)
+        self.assertFalse(snap["gateway_state"]["configured"])
+        self.assertIn("not an http(s) URL", snap["gateway_state"]["missing"])
+        self.assertFalse(snap["grug"]["configured"])
+
     def test_an_unconfigured_source_is_not_stale_and_says_what_to_set(self):
         source = tiers_sources.Source("Grug stats", None, missing="LOOM_GRUG_STATS_URL is not set")
         source.refresh(now=100.0)

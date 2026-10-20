@@ -130,30 +130,40 @@ def _newest_open(*envelopes: Optional[Envelope]) -> Optional[Dict[str, Any]]:
     return max(answers, key=lambda d: _number(d.get("generated_at")) or 0.0) if answers else None
 
 
+def _open_breaker(target: str, model: str, answer: Dict[str, Any],
+                  now: datetime) -> Optional[tuple]:
+    """(reason, reopen time or None) of the gateway breaker open on this
+    target and model now, or None. A breaker whose reopen time has passed is
+    closed."""
+    generated = _number(answer.get("generated_at"))
+    for entry in answer.get("open") or []:
+        if not isinstance(entry, dict) or _text(entry.get("target") or "") != target:
+            continue
+        if entry.get("lane") not in (None, "", "*") and _text(entry.get("lane")) != model:
+            continue
+        wait = _number(entry.get("reopens_in_s"))
+        until = None
+        if generated is not None and wait is not None:
+            until = datetime.fromtimestamp(generated, timezone.utc) + timedelta(seconds=wait)
+        if until is None or until > now:
+            return _text(entry.get("reason") or "open"), until
+    return None
+
+
 def _gateway_allowance(target: str, model: str, answer: Optional[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
     """Available, cooling until its breaker reopens, or benched for the
     breaker's reason, from the gateway's open list."""
     if answer is None:
         return {"state": "unknown", "text": "unknown: the gateway's stats have not been read", "until": None}
-    generated = _number(answer.get("generated_at"))
-    for entry in answer.get("open") or []:
-        if not isinstance(entry, dict) or _text(entry.get("target") or "") != target:
-            continue
-        lane = entry.get("lane")
-        if lane not in (None, "", "*") and _text(lane) != model:
-            continue
-        reason = _text(entry.get("reason") or "open")
-        wait = _number(entry.get("reopens_in_s"))
-        until = (datetime.fromtimestamp(generated, timezone.utc) + timedelta(seconds=wait)
-                 if generated is not None and wait is not None else None)
-        if until is not None and until <= now:
-            continue
-        if reason in LIMIT_REASONS:
-            when = "until %s (%s)" % (usage._clock(until), usage._until(until, now)) if until else "reopen time unknown"
-            return {"state": "cooling", "until": until, "window": "breaker",
-                    "text": "cooling %s: gateway breaker, %s" % (when, reason)}
+    found = _open_breaker(target, model, answer, now)
+    if found is None:
+        return {"state": "available", "text": "available", "until": None}
+    reason, until = found
+    if reason not in LIMIT_REASONS:
         return {"state": "benched", "until": until, "text": "benched: %s (gateway breaker)" % reason}
-    return {"state": "available", "text": "available", "until": None}
+    when = "until %s (%s)" % (usage._clock(until), usage._until(until, now)) if until else "reopen time unknown"
+    return {"state": "cooling", "until": until, "window": "breaker",
+            "text": "cooling %s: gateway breaker, %s" % (when, reason)}
 
 
 def _gateway_rows(day: Envelope, week: Envelope, now: datetime) -> List[Dict[str, Any]]:
@@ -184,6 +194,34 @@ def _runs_cell(groups: Sequence[Dict[str, Any]], window: str) -> Dict[str, Any]:
             "p50_ms": int(p50 * 1000) if p50 is not None else None}
 
 
+def _hold_allowance(states: Sequence[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+    """Every slot held: cooling until the first hold ends, or benched for a
+    hold with no end."""
+    untils = [s["until"] for s in states if s["until"] is not None]
+    if not untils:
+        return {"state": "benched", "until": None, "text": "benched: " + states[0]["why"]}
+    until = min(untils)
+    why = re.sub(r" until .*$", "", states[0]["why"])
+    return {"state": "cooling", "until": until, "window": "lane hold",
+            "text": "cooling until %s (%s): %s" % (usage._clock(until), usage._until(until, now), why)}
+
+
+def _meter_allowance(slots: Sequence[str], rows: Sequence[Dict[str, Any]], now: datetime) -> Optional[Dict[str, Any]]:
+    """The tightest fresh meter over these slots as an amount left, or None
+    when no fresh reading meters them."""
+    windows = [usage._window(row, now) for row in rows if set(row.get("lanes") or []) & set(slots)]
+    meters = [w for w in windows if w["used"] is not None and not w["stale"]]
+    if not meters:
+        return None
+    tight = max(meters, key=lambda w: w["used"])
+    text = "%s left (%s window)" % (usage._pct(100 - tight["used"]), tight["name"].lower())
+    if "usd_left" in tight:
+        text += ", USD %.2f" % tight["usd_left"]
+    if tight["reset"] is not None:
+        text += ", resets %s" % usage._clock(tight["reset"])
+    return {"state": "metered", "until": tight["reset"], "window": tight["name"], "text": text}
+
+
 def _usage_allowance(slots: Sequence[str], readings: Any, now: datetime,
                      missing: str = "") -> Dict[str, Any]:
     """A Loom lane's allowance from the usage readings: cooling until its
@@ -195,29 +233,8 @@ def _usage_allowance(slots: Sequence[str], readings: Any, now: datetime,
     holds = usage._all_holds(rows)
     states = [usage.lane_state(holds.get(slot, ""), now) for slot in slots]
     if states and all(s["kind"] != "free" for s in states):
-        untils = [s["until"] for s in states if s["until"] is not None]
-        if untils:
-            until = min(untils)
-            return {"state": "cooling", "until": until, "window": "lane hold",
-                    "text": "cooling until %s (%s): %s" % (usage._clock(until), usage._until(until, now),
-                                                          re.sub(r" until .*$", "", states[0]["why"]))}
-        return {"state": "benched", "until": None, "text": "benched: " + states[0]["why"]}
-    meters = []
-    for row in rows:
-        if not set(row.get("lanes") or []) & set(slots):
-            continue
-        window = usage._window(row, now)
-        if window["used"] is not None and not window["stale"]:
-            meters.append(window)
-    if meters:
-        tight = max(meters, key=lambda w: w["used"])
-        text = "%s left (%s window)" % (usage._pct(100 - tight["used"]), tight["name"].lower())
-        if "usd_left" in tight:
-            text += ", USD %.2f" % tight["usd_left"]
-        if tight["reset"] is not None:
-            text += ", resets %s" % usage._clock(tight["reset"])
-        return {"state": "metered", "until": tight["reset"], "window": tight["name"], "text": text}
-    return {"state": "available", "text": "available", "until": None}
+        return _hold_allowance(states, now)
+    return _meter_allowance(slots, rows, now) or {"state": "available", "text": "available", "until": None}
 
 
 def _loom_rows(runs: Envelope, usage_readings: Envelope, now: datetime) -> List[Dict[str, Any]]:
@@ -453,39 +470,58 @@ def _live_block(key: str, title: str, block: Dict[str, Any], items: List[str], e
     return '<div class="tiers-live" id="live-%s"><h3>%s</h3>%s%s</div>' % (key, html.escape(title), note, body)
 
 
-def _live_html(data: Dict[str, Any], now: datetime) -> str:
+def _loom_items(runs: Sequence[Dict[str, Any]]) -> List[str]:
     esc = html.escape
-    live = data["live"]
-    loom = []
-    for run in live["loom"]["items"]:
+    out = []
+    for run in runs:
         ref = "%s#%s" % (run.get("repo") or "?", run.get("number") or "?")
         url = str(run.get("html_url") or "")
         link = '<a href="%s">%s</a>' % (esc(url, quote=True), esc(ref)) if url.startswith("https://") else esc(ref)
-        facts = " / ".join(str(v) for v in (run.get("lane") or "lane unknown", run.get("model") or "model not recorded",
-                                            run.get("age") or "") if v)
-        loom.append('<li>%s <span class="tiers-live-title">%s</span> <span class="machine-fact">%s</span></li>'
-                    % (link, esc(_text(run.get("title") or "")), esc(facts)))
-    gateway = ['<li><span class="tiers-lane">%s</span> <span class="tiers-model">%s</span> '
-               '<span class="machine-fact">%s</span></li>'
-               % (esc(c["target"]), esc(c["model"]),
-                  esc(" / ".join(v for v in ("from " + c["source"] if c["source"] else "", _seconds(c["age_s"]),
-                                             "cancelling" if c["cancelling"] else "") if v)))
-               for c in live["gateway"]["items"]]
-    grug = []
-    for review in live["grug"]["items"]:
-        ref = "%s#%d" % (review["repo"], review["pr"]) if review["repo"] and review["pr"] else (
-            review["repo"] or "pull request not named")
-        grug.append('<li><span class="tiers-lane">%s</span> %s <span class="tiers-model">%s</span> '
-                    '<span class="machine-fact">%s</span></li>'
-                    % (esc(review["persona"]), esc(ref), esc(review["model"]), esc(_seconds(review["age_s"]))))
+        facts = [run.get("lane") or "lane unknown", run.get("model") or "model not recorded", run.get("age") or ""]
+        out.append('<li>%s <span class="tiers-live-title">%s</span> <span class="machine-fact">%s</span></li>'
+                   % (link, esc(_text(run.get("title") or "")), esc(" / ".join(str(f) for f in facts if f))))
+    return out
+
+
+def _gateway_items(calls: Sequence[Dict[str, Any]]) -> List[str]:
+    esc = html.escape
+    out = []
+    for call in calls:
+        facts = ["from " + call["source"] if call["source"] else "", _seconds(call["age_s"]),
+                 "cancelling" if call["cancelling"] else ""]
+        out.append('<li><span class="tiers-lane">%s</span> <span class="tiers-model">%s</span> '
+                   '<span class="machine-fact">%s</span></li>'
+                   % (esc(call["target"]), esc(call["model"]), esc(" / ".join(f for f in facts if f))))
+    return out
+
+
+def _grug_items(reviews: Sequence[Dict[str, Any]]) -> List[str]:
+    esc = html.escape
+    out = []
+    for review in reviews:
+        if review["repo"] and review["pr"]:
+            ref = "%s#%d" % (review["repo"], review["pr"])
+        else:
+            ref = review["repo"] or "pull request not named"
+        out.append('<li><span class="tiers-lane">%s</span> %s <span class="tiers-model">%s</span> '
+                   '<span class="machine-fact">%s</span></li>'
+                   % (esc(review["persona"]), esc(ref), esc(review["model"]), esc(_seconds(review["age_s"]))))
+    return out
+
+
+def _live_html(data: Dict[str, Any], now: datetime) -> str:
+    live = data["live"]
     return ('<section class="section tiers-section" id="tiers-live" aria-labelledby="tiers-live-h">'
             '<div class="section-head"><h2 class="label" id="tiers-live-h">Live now</h2></div>'
             '<p class="section-note">Loom runs from the station, calls in flight at the gateway, and Grug '
             'reviews in flight, as of the last background read.</p><div class="tiers-live-grid">%s%s%s</div>'
             '</section>'
-            % (_live_block("loom", "Loom runs", live["loom"], loom, "No Loom run is running now.", now),
-               _live_block("gateway", "Gateway calls", live["gateway"], gateway, "No calls in flight now.", now),
-               _live_block("grug", "Grug reviews", live["grug"], grug, "No reviews in flight now.", now)))
+            % (_live_block("loom", "Loom runs", live["loom"], _loom_items(live["loom"]["items"]),
+                           "No Loom run is running now.", now),
+               _live_block("gateway", "Gateway calls", live["gateway"], _gateway_items(live["gateway"]["items"]),
+                           "No calls in flight now.", now),
+               _live_block("grug", "Grug reviews", live["grug"], _grug_items(live["grug"]["items"]),
+                           "No reviews in flight now.", now)))
 
 
 def render(data: Dict[str, Any]) -> str:

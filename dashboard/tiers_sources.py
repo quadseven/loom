@@ -25,7 +25,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -52,6 +52,10 @@ class SourceError(Exception):
 
 
 class _NoRedirects(HTTPRedirectHandler):
+    """Installed in fetch_json's opener: urllib calls redirect_request on a
+    3xx answer, and refusing it keeps the Grug token from following a
+    redirect to another host."""
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise SourceError("answered %d, a redirect; redirects are not followed" % code)
 
@@ -60,12 +64,15 @@ def fetch_json(url: str, token: str = "", timeout: float = TIMEOUT) -> Dict[str,
     """GET url and return its JSON object. Any status but 200, a redirect, a
     timeout or an answer that is not a JSON object raises, with the reason; a
     503's own `error` field is part of the reason."""
+    if urlsplit(url).scheme not in ("http", "https"):
+        raise SourceError("only http and https URLs are read")
     headers = {"Accept": "application/json", "User-Agent": "loom-dashboard"}
     if token:
         headers["Authorization"] = "Bearer " + token
     opener = build_opener(_NoRedirects)
     try:
-        with opener.open(Request(url, headers=headers), timeout=timeout) as response:
+        # S310: the scheme is checked above, so no file: or custom URL opens.
+        with opener.open(Request(url, headers=headers), timeout=timeout) as response:  # noqa: S310
             raw = response.read(MAX_BYTES + 1)
     except HTTPError as exc:
         raise SourceError("answered %d%s" % (exc.code, _error_field(exc))) from None
@@ -102,9 +109,13 @@ def _error_field(exc: HTTPError) -> str:
 class Source:
     """One upstream read and its last good answer."""
 
-    def __init__(self, name: str, fetch: Optional[Callable[[], Any]], missing: str = "") -> None:
+    def __init__(self, name: str, fetch: Optional[Callable[[], Any]], missing: str = "",
+                 secrets: Sequence[str] = ()) -> None:
         self.name = name
         self.fetch = fetch
+        # Values never written into an error, a log line or the page (the
+        # Grug bearer token), whatever an exception's text carries.
+        self.secrets = tuple(secret for secret in secrets if secret)
         self.missing = missing if fetch is None else ""
         self.data: Any = None
         self.last_good_at: Optional[float] = None
@@ -121,7 +132,7 @@ class Source:
         # Broad on purpose: this runs on the background refresh thread, and
         # one source's failure must neither end the loop nor touch the others.
         except Exception as exc:  # noqa: BLE001
-            error = str(exc) or type(exc).__name__
+            error = self._redact(str(exc) or type(exc).__name__)
             LOG.warning("%s read failed: %s", self.name, error)
             with self._lock:
                 self.error, self.read_at = error, time.time() if now is None else now
@@ -129,6 +140,11 @@ class Source:
         with self._lock:
             at = time.time() if now is None else now
             self.data, self.last_good_at, self.read_at, self.error = data, at, at, ""
+
+    def _redact(self, text: str) -> str:
+        for secret in self.secrets:
+            text = text.replace(secret, "[redacted]")
+        return text
 
     def envelope(self, now: Optional[float] = None) -> Dict[str, Any]:
         """{name, configured, missing, data, last_good_at, read_at, stale,
@@ -201,7 +217,9 @@ class TierSources:
                                     missing=gateway_missing),
             "grug": Source(NAMES["grug"],
                            (lambda: fetch_json(grug_url, token=grug_token, timeout=timeout)) if grug_url else None,
-                           missing="not configured yet: LOOM_GRUG_STATS_URL is not set"),
+                           missing="not configured yet: LOOM_GRUG_STATS_URL is %s"
+                           % ("not an http(s) URL" if env.get("LOOM_GRUG_STATS_URL", "").strip() else "not set"),
+                           secrets=(grug_token,)),
             "loom_runs": Source(NAMES["loom_runs"], runs),
         }
 
