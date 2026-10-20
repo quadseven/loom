@@ -848,6 +848,61 @@ class ReconcilePullRequestTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
 
+    def adoption(self, number, pr, state="queued", lane="codex"):
+        self.fake.add(number, state=state, lane=lane, body=station.adoption_body(pr))
+        self.fake.issues[number]["title"] = "Land or supersede #%d: A fix" % pr
+
+    def target(self, pr, state="closed", merged_at="2030-01-02T00:00:00Z"):
+        return {"number": pr, "state": state, "merged_at": merged_at,
+                "merge_commit_sha": "%040x" % pr, "body": "A fix.",
+                "head": {"ref": "a-fix"}}
+
+    def test_an_adoption_ticket_moves_to_merged_when_its_target_merges(self):
+        sha = "%040x" % 77
+        for index, state in enumerate(("queued", "briefed", "running", "answered")):
+            with self.subTest(state=state):
+                number = 12 + index
+                self.adoption(number, 77, state=state, lane="spark-2")
+                self.fake.pulls = [self.target(77)]
+                station.Station(GitHub("token", transport=self.fake),
+                                self.settings).reconcile_pull_requests()
+                self.assertIn("loom:merged", self.fake.names(number))
+                self.assertNotIn("loom:" + state, self.fake.names(number))
+                self.assertFalse([n for n in self.fake.names(number) if n.startswith("lane:")],
+                                 self.fake.names(number))
+                note = self.fake.comments[number][-1]["body"]
+                self.assertIn("#77", note)
+                self.assertIn(sha[:12], note)
+                self.assertIn("2030-01-02 00:00:00Z", note)
+
+    def test_an_adoption_ticket_whose_target_closed_unmerged_is_left_alone(self):
+        for index, state in enumerate(("queued", "briefed")):
+            with self.subTest(state=state):
+                number = 12 + index
+                self.adoption(number, 77, state=state)
+                self.fake.pulls = [self.target(77, merged_at=None)]
+                station.Station(GitHub("token", transport=self.fake),
+                                self.settings).reconcile_pull_requests()
+                self.assertIn("loom:" + state, self.fake.names(number))
+                self.assertNotIn("loom:merged", self.fake.names(number))
+                self.assertEqual(self.fake.comments[number], [])
+
+    def test_an_adoption_ticket_whose_target_is_open_is_left_alone(self):
+        self.adoption(12, 77, state="queued")
+        self.fake.pulls = [self.target(77, state="open", merged_at=None)]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertEqual(self.fake.comments[12], [])
+
+    def test_a_title_naming_a_pull_request_is_not_trusted_without_the_adoption_body(self):
+        self.fake.add(12, state="queued")
+        self.fake.issues[12]["title"] = "Land or supersede #77: A fix"
+        self.fake.pulls = [self.target(77)]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
 
 class AdoptUntrackedPullRequestTest(Base):
     def setUp(self):
