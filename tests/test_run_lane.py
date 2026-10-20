@@ -197,6 +197,7 @@ fi
 [ -f vendor/sub/value.txt ] && echo "agent-saw submodule" >> "$FAKE_LOG"
 [ -z "${FAKE_AGENT_WEAKEN:-}" ] || { mkdir -p .loom; echo 'check: true' > .loom/validation.conf; }
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
+if [ -n "${FAKE_SUMMARY:-}" ]; then mkdir -p .loom; printf '%s\n' "$FAKE_SUMMARY" > .loom/summary.md; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
 if [ "${FAKE_AGENT:-commit}" = probes ]; then
   printf '# test\\n' > .test_write
@@ -637,6 +638,28 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("[private-issue-ref]", self.run_log())
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    TICKED = ("Fix the thing so it works\n\n## Acceptance criteria\n"
+              "- [x] The thing works\n- [x] A test covers the thing\n"
+              "- [ ] Nothing else changes; not built: out of reach")
+
+    def test_the_lanes_ticked_criteria_reach_the_pull_request_body(self):
+        # The runner moved .loom/summary.md out of the tree before it built
+        # the body, so every lane pull request carried the ticket's unticked
+        # criteria and went back for them however much it built; the ticks
+        # landed as Intent bullets instead (2026-10-20).
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        criteria = body.split("## Acceptance criteria\n", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(criteria, "- [x] The thing works\n- [x] A test covers the thing\n"
+                                   "- [ ] Nothing else changes; not built: out of reach")
+        intent = body.split("## Why", 1)[0]
+        self.assertIn("Fix the thing so it works", intent)
+        self.assertNotIn("Acceptance criteria", intent)
+        self.assertNotIn("[x]", intent)
+        self.assertEqual(body.count("## Acceptance criteria"), 1)
 
     def test_private_repo_does_not_run_leak_scan_and_pushes(self):
         self.drop_brief()

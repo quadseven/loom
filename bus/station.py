@@ -4292,7 +4292,9 @@ class Station:
                     ready: Optional[Tuple[Any, str]]) -> None:
         if "loom:ready" not in names:
             self._add_label(repo, number, "loom:ready")
-        body = {"body": "<!-- loom:ready-head %s -->" % sha}
+        # The marker alone posted an email with nothing in it (2026-10-20).
+        body = {"body": "<!-- loom:ready-head %s -->\nChecks and review passed on head %s; "
+                        "the factory lands the pull request in its turn." % (sha, sha[:12])}
         if not ready:
             self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number), body)
         elif ready[1] != sha:

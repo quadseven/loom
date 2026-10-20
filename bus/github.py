@@ -223,6 +223,28 @@ def _json_or_none(text: str) -> Any:
         return None
 
 
+def _proxy_env_for_aws() -> Dict[str, str]:
+    """Return an environment dict for the AWS CLI with only https_proxy set.
+
+    The AWS CLI fails when multiple proxy variables are present. It works with
+    only https_proxy (or HTTPS_PROXY). Lowercase https_proxy is preferred when
+    both are set.
+    """
+    env = os.environ.copy()
+    # Remove all proxy variables first
+    for key in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
+                "all_proxy", "ALL_PROXY"):
+        env.pop(key, None)
+    # Restore only https_proxy (lowercase preferred)
+    lower = os.environ.get("https_proxy")
+    upper = os.environ.get("HTTPS_PROXY")
+    if lower is not None:
+        env["https_proxy"] = lower
+    elif upper is not None:
+        env["HTTPS_PROXY"] = upper
+    return env
+
+
 def read_ssm(name: str, region: str) -> str:
     """A SecureString parameter, read the way lanes/run_lane.sh reads keys.
     The read is bounded by TIMEOUT, so a hung call cannot stall a pass. The
@@ -230,7 +252,7 @@ def read_ssm(name: str, region: str) -> str:
     out = subprocess.run(
         ["aws", "ssm", "get-parameter", "--region", region, "--name", name,
          "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
-        capture_output=True, text=True, timeout=TIMEOUT)
+        capture_output=True, text=True, timeout=TIMEOUT, env=_proxy_env_for_aws())
     if out.returncode != 0 or not out.stdout.strip():
         raise OSError("could not read the parameter from SSM")
     return out.stdout.strip()
