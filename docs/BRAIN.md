@@ -553,8 +553,9 @@ label, an epic (`epic` label, an `Epic:` title or sub-issues), and one with
 no acceptance boxes. The rest settle only when every pull request whose
 `Refs` line names the issue is merged into the default branch, the review
 check (`LOOM_REVIEW_CHECK`) concluded success on its head (neutral is not a
-pass), every other check on the head concluded success or skipped, and no
-open pull request names the issue. Then:
+pass), every other check on the head concluded success, skipped or neutral
+(the review bot's other checks conclude neutral when they have nothing to say),
+and no open pull request names the issue. Then:
 
 - **Every box asks for merged code or tests:** one comment starting
   `<!-- loom:claimed-settle v1 -->` states each pull request, its merge

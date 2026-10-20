@@ -9,7 +9,8 @@ day while their work had landed.
 The station's settle_claimed_tickets step reads each such issue at most once
 an hour. When every pull request whose `Refs` line names it is merged into
 the default branch, with the review check concluding success on its head and
-every other check success or skipped, and no open pull request names it:
+every other check success, skipped or neutral, and no open pull request
+names it:
 
 - every acceptance box asks only for merged code or tests: one evidence
   comment of checked facts, the boxes ticked, the issue closed as completed;
@@ -45,6 +46,10 @@ WRITE_GAP = 3.0
 # Pull requests per issue, and test files per pull request, read in full.
 MAX_PULLS = verify_data.MAX_PULLS
 MAX_TEST_FILES = 10
+# What a check other than the review check may conclude. The review bot's
+# other checks conclude neutral when they have nothing to say, on nearly every
+# head, and the merge gate takes that; the review check itself must succeed.
+PASSING = verify_data.GREEN_CONCLUSIONS + ("neutral",)
 HOLD_PREFIXES = ("loom:", "needs:", "needs-")
 HOLD_LABELS = ("ready-for-human", "epic", "wontfix", LIVE_LABEL)
 
@@ -134,7 +139,7 @@ def pull_gate(pr: Dict[str, Any], runs: Sequence[Dict[str, Any]], review_check: 
               branch: str) -> str:
     """Why a referencing pull request does not prove its issue, or "" when it
     merged into `branch` with the review check concluding success on its
-    head and every other check success or skipped. `runs` are its head's
+    head and every other check success, skipped or neutral. `runs` are its head's
     newest runs, one per check name."""
     return _merge_gap(pr, branch) or _checks_gap(runs, review_check)
 
@@ -156,7 +161,7 @@ def _checks_gap(runs: Sequence[Dict[str, Any]], review_check: str) -> str:
     if review != "success":
         return "%s %s on its head" % (review_check, review or "missing")
     red = [(name, result) for name, result in results.items()
-           if result not in verify_data.GREEN_CONCLUSIONS]
+           if result not in PASSING]
     if red:
         return "%s %s on its head" % red[0]
     return ""
@@ -220,7 +225,7 @@ def evidence_comment(pulls: Sequence[Dict[str, Any]], branch: str, review_check:
         MARKER,
         "Settled by the station: every pull request whose Refs line names this issue is "
         "merged into %s, with %s concluding success on its head and every other check "
-        "success or skipped, and none is still open." % (branch, review_check),
+        "success, skipped or neutral, and none is still open." % (branch, review_check),
         ""] + kept + ([""] + ["%d lines failed the text checks and were left out." % dropped]
                       if dropped else []) + [
         "",
