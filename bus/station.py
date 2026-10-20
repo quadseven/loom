@@ -2744,6 +2744,60 @@ class Station:
             return "unknown"
         return model
 
+    def _proof_mismatch(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]) -> str:
+        """Why a lane's proof does not prove the ticket's merged change, or ""
+        when it does: its revision must contain the merge commit of each linked
+        merged pull request (the ones the verify brief shows), and its observed
+        window must not start before the newest of them merged. A stale build,
+        or evidence read before the fix landed, proves nothing about the fix.
+        A ticket with no linked merged pull request is left to the close rule,
+        and a pull request merged into another branch is not counted."""
+        branch = self._default_branch(repo)
+        linked = sorted((pr for pr in self._closed_pulls(repo) if _linked_pr(issue, repo, pr)
+                         and str((pr.get("base") or {}).get("ref") or branch) == branch),
+                        key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
+        linked = linked[:verify_data.MAX_PULLS]
+        if not linked:
+            return ""
+        revision = str(record["revision"]).strip()
+        for pr in linked:
+            sha = str(pr["merge_commit_sha"])
+            if not self._carries(repo, sha, revision):
+                return "revision %s does not contain the merge commit %s of PR #%d" % (
+                    revision[:12], sha[:12], int(pr["number"]))
+        newest = linked[0]
+        start = str(record["observed"]["start"])
+        merged, began = self._epoch(str(newest["merged_at"])), self._epoch(start)
+        if merged is not None and began is not None and began < merged:
+            return "the observed window starts %s before PR #%d merged at %s" % (
+                start, int(newest["number"]), newest["merged_at"])
+        return ""
+
+    def _merge_refusal(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]) -> str:
+        """The verify note for a proof that does not prove the merged change,
+        or "" when it does. A GitHub error other than a rate limit leaves the
+        ticket shipped with a note, never verified on an unchecked revision."""
+        try:
+            mismatch = self._proof_mismatch(repo, issue, record)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            return ("could not check the proof's revision against its merged pull requests: "
+                    "%s" % self._note_text(err))
+        return "Its proof was refused: %s." % mismatch if mismatch else ""
+
+    def _proof_facts(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]
+                     ) -> Tuple[str, List[str]]:
+        """(why the lane's evidence contradicts the merged pull requests'
+        checks, or "", the facts the proof comment carries). Facts the station
+        could not read cannot back a close: it tries again after the cooldown
+        rather than sign the lane's prose alone."""
+        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        if error:
+            return "the station could not read the merged pull requests (%s)" % error, []
+        return (proof.contradicts(record, verify_data.failing_checks(pulls)),
+                verify_data.proof_facts(branch, pulls))
+
     def _apply_proof(self, lane: str, repo: str, number: int, record: Dict[str, Any],
                      model: str) -> None:
         """Check the record with bus/proof.py, tick the criteria and move the
@@ -2764,23 +2818,21 @@ class Station:
         except ValueError as err:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(err))
             return
-        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
-        # Facts the station could not read cannot back a close: it tries again
-        # after the cooldown rather than sign the lane's prose alone.
-        contradiction = ("the station could not read the merged pull requests (%s)" % error
-                         if error else
-                         proof.contradicts(record, verify_data.failing_checks(pulls)))
-        if contradiction:
-            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(
-                contradiction))
-            return
-        facts = verify_data.proof_facts(branch, pulls)
-        if _text.CREDENTIAL_RE.search(proof.render(record, ticked, facts)):
+        if _text.CREDENTIAL_RE.search(proof.render(record, ticked)):
             self._verify_note(repo, number, lane, "Its proof holds text shaped like a credential.")
             return
         unseen = unseen_live_evidence(record)
         if unseen:
             self._verify_note(repo, number, lane, "Its proof was refused: %s." % unseen)
+            return
+        refusal = self._merge_refusal(repo, issue, record)
+        if refusal:
+            self._verify_note(repo, number, lane, refusal)
+            return
+        contradiction, facts = self._proof_facts(repo, issue, record)
+        if contradiction:
+            self._verify_note(repo, number, lane, "Its proof was refused: %s." % self._note_text(
+                contradiction))
             return
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         try:

@@ -6803,6 +6803,13 @@ class VerifyDispatchTest(Base):
                          [t for _, t in proof.criteria(SHIPPED_BODY)])
         self.assertEqual(set(template["observed"]), {"start", "end"})
 
+    def test_verify_brief_says_the_revision_carries_the_merge_and_the_window_follows_it(self):
+        self.run_pass()
+        text = " ".join(self.text().split())
+        self.assertIn("The revision must be a merge commit the GitHub data section shows, or a "
+                      "later commit on the default branch", text)
+        self.assertIn("observed.start must not be before that pull request merged", text)
+
     def test_verify_brief_quotes_each_requested_log_line_with_a_twenty_line_cap(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "prints `daily status ready`", "see `server ready` and `presence flag:` in the log")
@@ -7339,7 +7346,7 @@ class VerifyResultTest(Base):
         sha = "c" * 40
         self.fake.pulls.append({
             "number": 31, "state": "closed", "title": "Fix the thing",
-            "merged_at": "2030-01-02T00:00:00Z", "merge_commit_sha": sha,
+            "merged_at": "2029-12-31T00:00:00Z", "merge_commit_sha": sha,
             "head": {"ref": "x"}, "body": "Change.\n\nRefs %s#5\n" % REPO})
         self.fake.carried.add(sha)
         self.fake.check_runs[sha] = [
@@ -7385,7 +7392,7 @@ class VerifyResultTest(Base):
         self.assertIn("Grug - Guard neutral", posted)
         facts = proof.read(posted)["station_facts"]
         self.assertEqual(len(facts), 1)
-        self.assertIn("PR #31 merged 2030-01-02T00:00:00Z as %s" % sha[:12], facts[0])
+        self.assertIn("PR #31 merged 2029-12-31T00:00:00Z as %s" % sha[:12], facts[0])
         self.assertIn("main contains it: yes", facts[0])
 
     def test_an_invalid_proof_leaves_the_ticket_shipped_with_no_comment(self):
@@ -7451,6 +7458,82 @@ class VerifyResultTest(Base):
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
+
+    MERGE = "a" * 40
+
+    def merged(self):
+        """Ticket 5's pull request, merged at 2030-01-01T00:30:00Z."""
+        self.fake.pulls = [{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:30:00Z",
+                            "merge_commit_sha": self.MERGE, "body": "Refs %s#5" % REPO,
+                            "head": {"ref": "loom/5-fix"}, "user": {"login": "alice-example"}}]
+
+    def verify_logged(self):
+        with mock.patch("bus.station._say") as say:
+            self.run_pass()
+        return " ".join(str(c) for c in say.call_args_list)
+
+    def test_a_proof_whose_revision_lacks_the_merge_commit_is_refused(self):
+        # A stale build: the revision GitHub compares as behind the merge.
+        self.merged()
+        self.result(self.good(revision="b" * 40,
+                              observed={"start": "2030-01-01T01:00:00Z",
+                                        "end": "2030-01-01T02:00:00Z"}))
+        logged = self.verify_logged()
+        self.assertEqual(self.fake.issues[5]["state"], "open")
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertNotIn("loom:verified", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["body"], SHIPPED_BODY)
+        self.assertIn("does not contain the merge commit %s of PR #77" % self.MERGE[:12], logged)
+
+    def test_a_proof_observed_before_the_merge_is_refused(self):
+        self.merged()
+        self.fake.carried.add(self.MERGE)
+        self.result(self.good(revision="b" * 40))  # observed from 2030-01-01T00:00:00Z
+        logged = self.verify_logged()
+        self.assertEqual(self.fake.issues[5]["state"], "open")
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertNotIn("loom:verified", self.fake.names(5))
+        self.assertIn("starts 2030-01-01T00:00:00Z before PR #77 merged at "
+                      "2030-01-01T00:30:00Z", logged)
+
+    def test_a_proof_whose_revision_carries_the_merge_verifies(self):
+        self.merged()
+        self.fake.carried.add(self.MERGE)
+        self.result(self.good(revision=self.MERGE,
+                              observed={"start": "2030-01-01T00:30:00Z",
+                                        "end": "2030-01-01T02:00:00Z"}))
+        self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "closed")
+        self.assertEqual(self.fake.issues[5].get("state_reason"), "completed")
+
+    def test_a_pull_request_merged_into_another_branch_is_not_required(self):
+        self.merged()
+        self.fake.pulls[0]["base"] = {"ref": "release-1"}
+        self.result(self.good(revision="b" * 40))
+        self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+
+    def test_a_github_failure_on_the_merge_check_leaves_the_ticket_shipped(self):
+        self.merged()
+        self.result(self.good(revision=self.MERGE,
+                              observed={"start": "2030-01-01T01:00:00Z",
+                                        "end": "2030-01-01T02:00:00Z"}))
+        fake = self.fake
+
+        def request(method, url, headers, body):
+            if "/compare/" in url:
+                return reply(422, {"message": "refused"})
+            return fake(method, url, headers, body)
+
+        with mock.patch("bus.station._say") as say:
+            self.assertEqual(station.run(self.settings, GitHub("token", transport=request)), 0)
+        logged = " ".join(str(c) for c in say.call_args_list)
+        self.assertIn("loom:shipped", self.fake.names(5))
+        self.assertNotIn("loom:verified", self.fake.names(5))
+        self.assertEqual(self.fake.issues[5]["state"], "open")
+        self.assertEqual(self.fake.issues[5]["body"], SHIPPED_BODY)
+        self.assertIn("could not check the proof's revision", logged)
 
 
 class UnseenLiveEvidenceTest(unittest.TestCase):
