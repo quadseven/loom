@@ -8,6 +8,7 @@ import subprocess
 import sys
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
@@ -19,6 +20,9 @@ from .labels import LANES
 
 WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 WAIT_WINDOW = 7 * 86400
+# Ticket event lists read at once by waits_for_repos (bus.brain status and
+# the dashboard read with eight workers too).
+WAIT_READ_WORKERS = 8
 # Ticket states a lane can still move toward a merge.
 WORKABLE = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 # A ticket in a terminal state is done, not waiting: verified is the end of the
@@ -117,27 +121,41 @@ def entered_state(events: Sequence[Dict[str, Any]]) -> tuple[str, float] | None:
 
 
 def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float,
-                    entered: Dict[str, tuple[str, float]] | None = None) -> tuple[List[Dict[str, Any]], str | None]:
+                    entered: Dict[str, tuple[str, float]] | None = None,
+                    workers: int = WAIT_READ_WORKERS) -> tuple[List[Dict[str, Any]], str | None]:
     """Median and worst hours per state over the last week. With `entered`,
     also fills it with each read ticket's current state and the time it
     entered it ({"owner/name#N": (state, epoch seconds)}), from the same
     events: the Tickets page shows that as the age in state."""
-    tickets: List[tuple[str, Dict[str, float]]] = []
     since = datetime.fromtimestamp(now - WAIT_WINDOW, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for repo in repos:
+
+    def recent(repo: str) -> List[tuple[str, int]]:
         issues = gh.paginate("/repos/%s/issues?state=all&labels=loom%%3Aticket&since=%s&per_page=100" % (repo, since))
-        for issue in issues:
-            if not isinstance(issue, dict) or "pull_request" in issue:
-                continue
-            if stamp(issue.get("updated_at")) < now - WAIT_WINDOW:
-                continue
-            number = int(issue["number"])
-            events = gh.paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
-            tickets.append(("%s#%d" % (repo, number), ticket_waits(events, now)))
-            if entered is not None:
-                found = entered_state(events)
-                if found:
-                    entered["%s#%d" % (repo, number)] = found
+        return [(repo, int(issue["number"])) for issue in issues
+                if isinstance(issue, dict) and "pull_request" not in issue
+                and stamp(issue.get("updated_at")) >= now - WAIT_WINDOW]
+
+    def events(ref: tuple[str, int]) -> List[Any]:
+        return gh.paginate("/repos/%s/issues/%d/events?per_page=100" % ref)
+
+    # One event list per ticket: read one after another that was 699
+    # requests and 229 s of a cold dashboard's 320 s first snapshot
+    # (loom#433). The reads overlap; results keep repo and ticket order, and
+    # the first failure stops the reads not yet started and fails the read.
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        try:
+            refs = [ref for found in pool.map(recent, repos) for ref in found]
+            read = list(pool.map(events, refs))
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+    tickets: List[tuple[str, Dict[str, float]]] = []
+    for (repo, number), found in zip(refs, read, strict=True):
+        tickets.append(("%s#%d" % (repo, number), ticket_waits(found, now)))
+        if entered is not None:
+            state = entered_state(found)
+            if state:
+                entered["%s#%d" % (repo, number)] = state
     return summarize_waits(tickets)
 
 

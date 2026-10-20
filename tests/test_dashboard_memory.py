@@ -73,7 +73,9 @@ class RawGitHub:
         return []
 
     def paginate_parallel(self, path, workers=8):
-        return [_pull(n) for n in range(1, PULLS + 1)]
+        if "/pulls?" in path:
+            return [_pull(n) for n in range(1, PULLS + 1)]
+        return self.paginate(path)
 
     def rest(self, *args, **kwargs):
         raise OSError("not in this fixture")
