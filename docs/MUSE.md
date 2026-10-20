@@ -600,8 +600,8 @@ failed twice; review sent it back twice; it sat briefed with no lane signal
 for 2 hours twice; or it has been stuck, failed or unmerged for more than 6
 hours. This covers every Loom task, fix briefs included. Its next attempt
 takes the lowest rung it has not tried whose lane is free (a higher rung
-rather than a wait behind a busy lane), never the model that already failed
-it, and never a free lane:
+rather than a wait behind a busy lane that is up), never the model that
+already failed it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
 2. the codex lane (or codex-2) with `gpt-6-sol`;

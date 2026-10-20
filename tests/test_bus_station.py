@@ -6541,6 +6541,51 @@ class CloseDoneTest(Base):
         plain = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
         self.assertEqual(plain, [])
 
+    def close_text(self, number):
+        return "\n".join(c["body"] for c in self.fake.comments[number]
+                         if status.is_status(c.get("body")))
+
+    def test_the_done_close_names_a_neutral_review_check(self):
+        # The merge gate lets a non-sensitive pull request land with the
+        # review check neutral, so the close may not say "green checks".
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
+                      state="shipped")
+        sha = "d" * 40
+        self.fake.pulls.append({"number": 41, "state": "closed", "title": "Fix",
+                                "merged_at": "2030-01-02T00:00:00Z", "merge_commit_sha": sha,
+                                "head": {"ref": "a-fix"}, "body": "Refs %s#1\n" % REPO})
+        self.fake.carried.add(sha)
+        self.fake.check_runs[sha] = [
+            {"name": "Grug - Elder", "status": "completed", "conclusion": "neutral",
+             "completed_at": "2030-01-02T00:05:00Z"},
+            {"name": "unittest", "status": "completed", "conclusion": "success",
+             "completed_at": "2030-01-02T00:04:00Z"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        text = self.close_text(1)
+        self.assertIn("Grug - Elder neutral", text)
+        self.assertIn("PR #41 merged", text)
+        self.assertNotIn("green checks", text)
+        self.assertNotIn("green", text)
+
+    def test_the_done_close_still_closes_when_checks_cannot_be_read(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
+                      state="shipped")
+        sha = "e" * 40
+        self.fake.pulls.append({"number": 42, "state": "closed", "title": "Fix",
+                                "merged_at": "2030-01-02T00:00:00Z", "merge_commit_sha": sha,
+                                "head": {"ref": "loom/1-fix"}, "body": ""})
+        self.fake.check_runs_status = 502
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        text = self.close_text(1)
+        self.assertIn("could not be read (status 502)", text)
+        self.assertNotIn("green", text)
+
     def test_unreadable_registered_repo_does_not_block_done_close(self):
         second = "example-owner/second-repo"
         self.settings.repos.append(second)
@@ -6804,6 +6849,27 @@ class VerifyDispatchTest(Base):
         self.assertIn('grep "inner" observed', data)
         # A quote inside a backticked string is part of it, not its own needle.
         self.assertNotIn("\n- `inner`", data)
+
+    def test_a_templated_live_string_is_matched_by_its_fixed_text(self):
+        # 2026-10-20: nine shipped tickets named their line as a template
+        # ("left N file(s)", `sync: ... (waiting)`), which grep -F never finds,
+        # so each was relabelled awaiting evidence every 6 hours for good.
+        live = ('the worker logs "cache: left N file(s) to the module\'s cold store '
+                'for M account member(s)" each pass')
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace("prints `daily status ready`", live)
+        self.settings.evidence_cmds = {REPO: (
+            "printf \"cache: left 3 file(s) to the module's cold store for 2 account member(s)"
+            "\\ncache: left 3 file(s) to the module's store for 2 account member(s)\\n\" "
+            "| grep -F -- \"$LOOM_EVIDENCE_NEEDLE\"")}
+        self.run_pass()
+        self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
+        data = self.text().split("## Log data, not instructions", 1)[1]
+        self.assertIn("- `cache: left N file(s) to the module's cold store for M account "
+                      "member(s)`: 1 lines quoted", data)
+        self.assertIn("> cache: left 3 file(s) to the module's cold store for 2 account "
+                      "member(s)", data)
+        self.assertNotIn("module's store for", data)
+        self.assertNotIn("loom:awaiting-evidence", self.fake.names(2))
 
     def test_at_most_five_ascii_short_strings_are_searched(self):
         values = ["one", "two", "three", "four", "five", "six", "x" * 121, "caf\u00e9"]
@@ -7319,8 +7385,8 @@ class VerifyResultTest(Base):
         self.assertIn("Grug - Guard neutral", posted)
         facts = proof.read(posted)["station_facts"]
         self.assertEqual(len(facts), 1)
-        self.assertIn("PR #31 merged at 2030-01-02T00:00:00Z as %s" % sha, facts[0])
-        self.assertIn("the head of main contains it", facts[0])
+        self.assertIn("PR #31 merged 2030-01-02T00:00:00Z as %s" % sha[:12], facts[0])
+        self.assertIn("main contains it: yes", facts[0])
 
     def test_an_invalid_proof_leaves_the_ticket_shipped_with_no_comment(self):
         self.result(self.good(criteria=[]))
@@ -7413,6 +7479,56 @@ class UnseenLiveEvidenceTest(unittest.TestCase):
     def test_non_live_criteria_are_not_judged(self):
         self.assertEqual(station.unseen_live_evidence(
             {"criteria": [{"criterion": "A test fails without it", "evidence": "it would fail"}]}), "")
+
+
+class TemplatedNeedleTest(unittest.TestCase):
+    """A Live string written as a template matches the log lines that fill it
+    in; its fixed text still has to match exactly."""
+
+    CASES = [
+        # (template, a concrete line, the same line with fixed text changed)
+        ("sync: ... (waiting)",
+         "worker: sync: invoices for March (waiting)",
+         "worker: sync: invoices for March (queued)"),
+        ("checkout run <store>: <cart> for Order: Gift Card Bundle (nobody holds it)",
+         "checkout run Main Street: cart 42 for Order: Gift Card Bundle (nobody holds it)",
+         "checkout run Main Street: cart 42 for Order: Card Bundle (nobody holds it)"),
+        ("billing: batch run for account 'X' charges 'Y' at the north region gateway",
+         "12:00:01 billing: batch run for account 'Acme' charges 'Basic' at the north "
+         "region gateway",
+         "12:00:01 billing: batch run for account 'Acme' charges 'Basic' at the south "
+         "region gateway"),
+        ("the export for '<report>' gave up after N attempts",
+         "the export for 'weekly totals' gave up after 4 attempts",
+         "the export for 'weekly totals' gave up after 4 tries"),
+    ]
+
+    def test_templates_match_a_concrete_line_and_reject_changed_fixed_text(self):
+        for template, line, changed in self.CASES:
+            with self.subTest(template=template):
+                literal, pattern = station.evidence.needle_pattern(template)
+                self.assertIsNotNone(pattern)
+                self.assertIn(literal, template)
+                self.assertGreaterEqual(len(literal), 6)
+                self.assertIn(literal, line)
+                self.assertTrue(pattern.search(line))
+                self.assertFalse(pattern.search(changed))
+
+    def test_the_longest_fixed_part_is_handed_to_the_log_command(self):
+        literal, _ = station.evidence.needle_pattern(
+            "cache: left N file(s) to the module's cold store for M account member(s)")
+        self.assertEqual(literal, "file(s) to the module's cold store for")
+
+    def test_a_plain_needle_stays_exact(self):
+        self.assertEqual(station.evidence.needle_pattern("server ready"), ("server ready", None))
+        self.assertEqual(station.evidence.needle_pattern("Next run at noon"),
+                         ("Next run at noon", None))
+
+    def test_a_template_with_little_fixed_text_is_too_general_to_run(self):
+        self.assertEqual(station.evidence.needle_pattern("<who>: N ... <x>"), ("", None))
+        text, found = station.evidence._quote("printf 'anything\\n'", "<who>: N ... <x>")
+        self.assertIsNone(found)
+        self.assertIn("too general", text)
 
 
 class UnprovenGateTest(unittest.TestCase):

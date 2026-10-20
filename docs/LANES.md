@@ -564,9 +564,10 @@ evidence says every check passed ("all checks passed", "checks green") while
 the newest run of a check on a merge commit concluded other than success or
 skipped is refused, and so is any record when GitHub cannot be read for
 them (the ticket is tried again after its cooldown). The proof comment then carries a `Checked by the
-station:` section, one line per merged pull request with its merged time,
-merge commit, whether the default branch's head contains it and each check's
-newest outcome, stored in the record as `station_facts`; a record that brings
+station:` section, one line per merged pull request, the same sentence the
+done close writes (merged time, merge commit, each check that did not
+conclude success or skipped, whether the default branch contains it),
+stored in the record as `station_facts`; a record that brings
 its own `station_facts` is not believed. A refused record, a missing result or no
 `verify.json` leaves the ticket shipped with one note on it. The run is
 counted like any lane run, and the Spread line also shows how many were

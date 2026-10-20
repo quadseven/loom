@@ -1,5 +1,5 @@
 """Station-checked facts in the proof comment (bus/proof.py render and
-contradicts, bus/verify_data.py close_facts and failing_checks)."""
+contradicts, bus/verify_data.py proof_facts and failing_checks)."""
 from __future__ import annotations
 
 import os
@@ -73,62 +73,53 @@ class ContradictsTest(unittest.TestCase):
         self.assertEqual(proof.contradicts({"criteria": "x"}, self.failing), "")
 
 
-class CloseFactsTest(unittest.TestCase):
+class ProofFactsTest(unittest.TestCase):
     def pull(self, **changes):
         out = {"number": 3, "title": "Fix it", "merge_commit_sha": SHA,
                "merged_at": "2030-01-02T00:00:00Z", "on_branch": True,
-               "check_runs": [{"id": 1, "name": "unit tests", "status": "completed",
-                               "conclusion": "success"},
-                              {"id": 2, "name": "Grug - Guard", "status": "completed",
-                               "conclusion": "neutral"},
-                              {"id": 3, "name": "docs", "status": "completed",
-                               "conclusion": "skipped"}]}
+               "check_runs": [{"name": "unit tests", "status": "completed",
+                               "conclusion": "success", "completed_at": "2030-01-02T00:01:00Z"},
+                              {"name": "Grug - Guard", "status": "completed",
+                               "conclusion": "neutral", "completed_at": "2030-01-02T00:02:00Z"},
+                              {"name": "docs", "status": "completed",
+                               "conclusion": "skipped", "completed_at": "2030-01-02T00:03:00Z"}]}
         out.update(changes)
         return out
 
-    def test_a_merged_pull_is_one_line_with_its_checks(self):
-        lines = verify_data.close_facts("main", [self.pull()])
-        self.assertEqual(lines, [
-            "PR #3 merged at 2030-01-02T00:00:00Z as %s; the head of main contains it; "
-            "checks: unit tests success, Grug - Guard neutral, docs skipped" % SHA])
+    def test_a_merged_pull_is_the_done_close_sentence_as_one_line(self):
+        lines = verify_data.proof_facts("main", [self.pull()])
+        self.assertEqual(lines, [verify_data.close_facts("main", [self.pull()])])
+        self.assertIn("PR #3 merged 2030-01-02T00:00:00Z as %s" % SHA[:12], lines[0])
+        self.assertIn("Grug - Guard neutral", lines[0])
+        self.assertIn("main contains it: yes", lines[0])
 
     def test_failing_checks_are_those_not_success_or_skipped(self):
         self.assertEqual(verify_data.failing_checks([self.pull()]), {"Grug - Guard": "neutral"})
 
     def test_a_rerun_replaces_the_run_before_it(self):
-        runs = [{"id": 5, "name": "Grug - Elder", "status": "completed", "conclusion": "neutral"},
-                {"id": 9, "name": "Grug - Elder", "status": "completed", "conclusion": "success"}]
+        runs = [{"name": "Grug - Elder", "status": "completed", "conclusion": "neutral",
+                 "completed_at": "2030-01-02T00:01:00Z"},
+                {"name": "Grug - Elder", "status": "completed", "conclusion": "success",
+                 "completed_at": "2030-01-02T00:05:00Z"}]
         self.assertEqual(verify_data.failing_checks([self.pull(check_runs=runs)]), {})
-        self.assertIn("Grug - Elder success", verify_data.close_facts("main",
-                                                                      [self.pull(check_runs=runs)])[0])
 
     def test_a_running_check_is_not_passed(self):
-        runs = [{"id": 1, "name": "unit tests", "status": "in_progress", "conclusion": None}]
+        runs = [{"name": "unit tests", "status": "in_progress", "conclusion": None}]
         self.assertEqual(verify_data.failing_checks([self.pull(check_runs=runs)]),
-                         {"unit tests": "in_progress"})
+                         {"unit tests": "in progress"})
 
-    def test_unread_branch_no_checks_no_pulls_and_errors_say_so(self):
-        line = verify_data.close_facts("main", [self.pull(on_branch=None, check_runs=[])])[0]
-        self.assertIn("the head of main is not known to contain it", line)
-        self.assertIn("no check runs on the merge commit", line)
-        self.assertEqual(verify_data.close_facts("main", []),
+    def test_no_pulls_and_unread_pulls_say_so(self):
+        self.assertEqual(verify_data.proof_facts("main", []),
                          ["No merged pull request names this ticket."])
-        self.assertEqual(verify_data.close_facts("main", [], "status 502"),
-                         ["GitHub could not be read (status 502); pull request facts may be "
-                          "missing."])
+        unread = {"number": 9, "merge_commit_sha": "b" * 40, "merged_at": "2030-01-01T00:00:00Z"}
+        lines = verify_data.proof_facts("main", [self.pull(), unread])
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1], "1 more merged pull requests were not read.")
+        self.assertEqual(verify_data.failing_checks([unread]), {})
 
     def test_a_line_that_fails_the_text_checks_is_dropped(self):
-        runs = [{"id": 1, "name": "deploy token=abc123", "status": "completed",
-                 "conclusion": "success"}]
-        self.assertEqual(verify_data.close_facts("main", [self.pull(check_runs=runs)]), [])
-
-    def test_only_the_shown_pulls_are_read(self):
-        unread = {"number": 9, "merge_commit_sha": "b" * 40, "merged_at": "2030-01-01T00:00:00Z"}
-        lines = verify_data.close_facts("main", [self.pull(), unread])
-        self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].startswith("PR #3 merged"))
-        self.assertEqual(lines[1], "1 more merged pull request was not read.")
-        self.assertEqual(verify_data.failing_checks([unread]), {})
+        runs = [{"name": "deploy token=abc123", "status": "completed", "conclusion": "failure"}]
+        self.assertEqual(verify_data.proof_facts("main", [self.pull(check_runs=runs)]), [])
 
 
 if __name__ == "__main__":

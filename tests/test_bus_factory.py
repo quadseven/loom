@@ -1963,6 +1963,40 @@ class Tickets(Base):
         self.go()
         self.assertEqual([self.lane(n) for n in range(1, 6)], ["claude"] * 5)
 
+    def test_a_busy_claude_ticket_is_not_spread_to_opus_on_claude_while_anthropic_is_out(self):
+        # The anthropic slots out of credit hold no tickets, so rung 3 looked
+        # free, and a ticket waiting on a busy claude lane was "spread" to
+        # Opus on the same claude lane (2026-10-19).
+        body = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
+        for n in range(1, 6):
+            self.gh.ticket(n, "briefed", lane="claude", body=body)
+            self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
+        for n, lane in ((11, "codex"), (12, "codex"), (13, "codex-2"), (14, "codex-2")):
+            self.gh.ticket(n, "briefed", lane=lane)
+        self.go(limited=factory.ANTHROPIC)
+        for n in range(1, 6):
+            self.assertNotEqual((self.lane(n), self.model(n)), ("claude", "claude-opus-5-5"))
+            self.assertFalse(any(factory.RUNG_MARKER % 3 in c["body"]
+                                 for c in self.gh.comments[n]))
+
+    def test_two_busy_rungs_do_not_ping_pong_a_ticket(self):
+        # One ticket flipped between rung 2 on codex-2 and rung 3 on claude 8
+        # times in 90 minutes, as each rung looked free by a lane that was
+        # out, and was never claimed (2026-10-20).
+        self.gh.ticket(1, "briefed", lane="claude",
+                       body="Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[1].append({"body": factory.RUNG_MARKER % 3, "user": ME})
+        for n in range(2, 8):
+            self.gh.ticket(n, "briefed", lane="claude")  # claude holds 7
+        for n in range(8, 13):
+            self.gh.ticket(n, "briefed", lane="codex-2")  # codex-2 holds 5
+        before = len(self.gh.comments[1])
+        for _ in range(2):
+            self.go(limited=("codex",) + factory.ANTHROPIC)
+            self.assertEqual((self.lane(1), self.model(1)), ("claude", "claude-opus-5-5"))
+        self.assertFalse(any(factory.RUNG_RE.search(c["body"])
+                             for c in self.gh.comments[1][before:]))
+
     def test_a_pass_stops_after_its_action_cap(self):
         for n in range(1, factory.MAX_ACTIONS + 5):
             self.gh.ticket(n, "failed")
@@ -2069,6 +2103,16 @@ class Helpers(unittest.TestCase):
         self.assertEqual(factory.next_rung({1}, all_busy), 2)
         self.assertEqual(factory.next_rung(set(), dict(all_busy, claude=30)), 2)
         self.assertEqual(factory.next_rung({1}, dict(all_busy, agy=0)), 4)
+        # Only the lanes that may serve a rung now count: rung 3 is not free
+        # when only the busy claude lane serves it, however idle the rest.
+        # With every up rung busy it waits on the least loaded, rung 1, not on
+        # Opus on the same claude lane; a free codex lane takes rung 2.
+        up = {1: ("claude",), 2: ("codex", "codex-2"), 3: ("claude",)}
+        self.assertEqual(factory.next_rung(set(), busy, lanes=up), 1)
+        self.assertEqual(factory.next_rung(set(), dict(busy, codex=1), lanes=up), 2)
+        # A rung with no lane serving it now is passed over.
+        self.assertEqual(factory.next_rung(set(), {"claude": 2},
+                                           lanes={1: ("claude",), 2: (), 3: ("anthropic",)}), 3)
 
     def test_the_tiers_match_the_lane_choice_in_muse_md(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
