@@ -9,6 +9,7 @@ import hmac
 import ssl
 import statistics
 import socket
+import socketserver
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -1262,6 +1263,13 @@ def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     state = store or TicketStore()
 
     class DashboardHTTPServer(ThreadingHTTPServer):
+        def server_bind(self):
+            # HTTPServer.server_bind also resolves server_name with
+            # socket.getfqdn, a reverse-DNS lookup nothing here reads; it took
+            # tens of seconds per server on the macOS runner (issue 1188).
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
         def server_close(self):
             state.stop_background()
             super().server_close()

@@ -69,6 +69,8 @@ class UnittestStep(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("Parallel unittest total: Ran 3 tests across 3 modules",
                           result.stdout)
+            # Each module lists its slowest tests, so a stalled one is named.
+            self.assertEqual(result.stdout.count("Slowest test durations"), 3)
 
 
 class ConcurrencyTest(unittest.TestCase):

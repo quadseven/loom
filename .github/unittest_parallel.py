@@ -29,7 +29,9 @@ def run_module(module: str, test_dir: Path) -> tuple[str, subprocess.CompletedPr
     if env.get("PYTHONPATH"):
         python_path += os.pathsep + env["PYTHONPATH"]
     env["PYTHONPATH"] = python_path
-    result = subprocess.run([sys.executable, "-B", "-m", "unittest", module, "-v"],
+    # --durations prints each module's slowest tests, so a stall like the
+    # reverse-DNS lookup in issue 1188 shows up by name in the CI log.
+    result = subprocess.run([sys.executable, "-B", "-m", "unittest", module, "-v", "--durations", "5"],
                             cwd=test_dir.parent, env=env, text=True, capture_output=True)
     return module, result
 
