@@ -232,9 +232,21 @@ class SettleClaimedTest(Base):
         self.fake.add_issue(8)
         self.fake.add_merged(42, refs=8, others=("failure",), head="c3" * 20)
         self.fake.add_issue(9)
-        self.fake.add_merged(43, refs=9, others=("success", "neutral"), head="d4" * 20)
+        self.fake.add_merged(43, refs=9, others=("success", "cancelled"), head="d4" * 20)
         self.settle()
         self.assertEqual(self.fake.writes, [])
+
+    def test_a_neutral_check_other_than_the_review_check_does_not_block(self):
+        # The review bot's other checks conclude neutral when they have
+        # nothing to say (a skipped pass), on nearly every head; the merge
+        # gate takes them, so the settle does too, and says so by name.
+        self.fake.add_issue(7)
+        self.fake.add_merged(41, refs=7, others=("success", "neutral"))
+        self.settle()
+        self.assertEqual(self.fake.issues[7]["state"], "closed")
+        comment = self.fake.comments[7][0]["body"]
+        self.assertIn("unittest-1 neutral", comment)
+        self.assertIn("Grug - Elder success", comment)
 
     def test_an_unmerged_or_missing_pull_request_is_skipped(self):
         self.fake.add_issue(7)  # its only pull request is still open
