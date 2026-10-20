@@ -3250,11 +3250,13 @@ exit %d
         seen_agent = Path(self._tmp.name) / "agent-tokens"
         self.drop_brief()
         self.run_lane(LOOM_GITHUB_APP_ID="124",
-                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes_token"),
+                      # Installation tokens carry dots and dashes (2026-10-20: 383
+                      # characters, ghs_ then a JWT-like body).
+                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
                       GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
-        self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes_token"})
+        self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
         # Nor the App's settings to mint one, nor git's helper to borrow one.
         self.assertEqual(seen_agent.read_text().split(), ["none", "none", "none"])
 

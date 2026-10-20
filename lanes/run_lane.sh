@@ -575,7 +575,8 @@ lane_app_token() {
   else
     token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
   fi
-  [[ "$token" =~ ^[A-Za-z0-9_]+$ ]] || return 1
+  # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
+  [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   export GH_TOKEN="$token"
 }
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
