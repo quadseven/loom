@@ -1078,6 +1078,25 @@ contract_command_ok() {
   [ "${#1}" -le 1000 ] && [ "$1" = "$(printf '%s' "$1" | LC_ALL=C tr -cd ' -~')" ]
 }
 
+# Remove untracked virtual environments left by the agent before the final
+# check. Their interpreter symlinks can point outside the check sandbox.
+# A .venv containing any tracked path is retained intact.
+remove_untracked_venvs() {
+  local candidate relative tracked
+  while IFS= read -r -d '' candidate; do
+    relative="${candidate#"$TREE"/}"
+    tracked="$(safe_git ls-files -- "$relative")" || return 1
+    [ -z "$tracked" ] || continue
+    rm -rf -- "$candidate" || return 1
+  done < <(find "$TREE" -type d -name .venv -prune -print0)
+}
+
+validation_interpreter_denied() {
+  local status="$1" output="$2"
+  [ "$status" -ne 0 ] && [[ "$output" == *"Failed to query Python interpreter"* &&
+    "$output" == *"Operation not permitted"* ]]
+}
+
 # One line of $RECORD per step: phase, command, exit code, the tree revision
 # it ran on, and whether it passed. Only a final line with "ok": true lets the
 # runner open (or push to) a pull request.
@@ -1386,7 +1405,21 @@ final_validation() {
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
+  if ! remove_untracked_venvs; then
+    VALIDATION_REASON="validation environment unavailable: could not remove untracked virtual environments"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" 125 "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   contract_run "$C_CHECK"; rc=$?
+  if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
+    VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+    record final "$C_CHECK" "$rc" "$rev" false "$VALIDATION_REASON"
+    drop_check_home
+    return 1
+  fi
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
