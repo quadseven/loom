@@ -350,6 +350,15 @@ printf '%s' "$answer"
 """
 
 
+# Fake mktemp for a lane's sandbox, where only the tree and the scratch home
+# are writable: a temp file in the default directory is denied, and only a
+# template under a writable directory works.
+FAKE_SANDBOXED_MKTEMP = """#!/usr/bin/env bash
+case "$*" in *XXXXXX*) exec /usr/bin/mktemp "$@" ;; esac
+echo "mktemp: mkstemp failed: Operation not permitted" >&2
+exit 1
+"""
+
 # Fake "become the lane user" command: runs its arguments as-is and records
 # that it was used. Production uses sudo to the dedicated macOS user.
 FAKE_RUNAS = """#!/usr/bin/env bash
@@ -514,8 +523,8 @@ print('leak guard: clean (shape patterns only)')
     def drop_brief(self, name="T042-fix-the-thing.md", text=BRIEF):
         (self.inbox / name).write_text(text)
 
-    def run_lane(self, lane="codex", **env):
-        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env),
+    def run_lane(self, lane="codex", cwd=None, **env):
+        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
                               capture_output=True, text=True, timeout=60)
 
     def lane_env(self, **env):
@@ -771,6 +780,22 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("agent made no commit and wrote no reason", log)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
+
+    def test_a_denied_temp_directory_leaves_no_summary_in_the_working_directory(self):
+        # A lane agent runs this suite in its tree, inside a sandbox that
+        # denies the default temp directory. A failed mktemp handed cp an
+        # empty target, and macOS cp copied the summary into the working
+        # directory: the agent's tree, whose commit was then refused for
+        # T042-fix-the-thing.summary.md.
+        self.write_tool(self.bin / "mktemp", FAKE_SANDBOXED_MKTEMP)
+        cwd = Path(self._tmp.name) / "cwd"
+        cwd.mkdir()
+        self.drop_brief()
+        result = self.run_lane(cwd=cwd, FAKE_AGENT="no-change",
+                               FAKE_SUMMARY="nothing to change: the finding no longer holds")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(p.name for p in cwd.iterdir()), [])
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
         self.drop_brief()
