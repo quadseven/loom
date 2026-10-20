@@ -1658,7 +1658,7 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         agent = [c for c in self.calls() if c.startswith("opencode ")]
         self.assertEqual(len(agent), 1, self.calls())
-        self.assertIn("-m openrouter/vendor/model:free", agent[0])
+        self.assertIn("-m openrouter/vendor/model:free --print-logs --log-level ERROR", agent[0])
         self.assertIn("keyvar=OPENROUTER_API_KEY key=fake-or-key", agent[0])
         self.assertIn("ssh=none", agent[0])
         self.assertIn("ghtoken=none", agent[0])
@@ -3048,6 +3048,9 @@ exit %d
         ("AuthenticationError: HTTP 401 Unauthorized", 1, True, "auth"),
         ("panic: something broke before any edit", 1, False, "transient"),
         ("killed", 137, True, "transient"),
+        ('level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
+         'openrouter/vendor/gone:free. Did you mean: vendor/other:free?"\n'
+         'Error: {"name": "UnknownError", "message": "Unexpected server error."}', 1, False, "limit"),
         ("FAILED tests/test_x.py::test_y - AssertionError at line 429", 1, True, "work"),
         ("I looked and there is nothing to change.", 0, False, "work"),
     ]
@@ -3090,6 +3093,21 @@ exit %d
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
         self.assertEqual(self.calls(), [])
         self.assertFalse(self.beat()["available"])
+
+    def test_a_model_the_cli_no_longer_offers_rests_the_lane_for_a_day(self):
+        # openrouter, 2026-10-20: models.dev marked the lane's free model
+        # deprecated, opencode dropped it and printed only "UnknownError:
+        # Unexpected server error", and every run failed transient while the
+        # lane rested 30 minutes at a time and claimed again.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="1", FAKE_OUT=(
+            'level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
+            'openrouter/vendor/gone:free."\nError: {"name": "UnknownError"}'))
+        self.assertTrue(self.failure_line().startswith("[limit] "), self.failure_line())
+        self.assertIn("not found by the agent CLI", self.failure_line())
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()) + 86000)
 
     def test_a_run_that_is_not_transient_clears_the_transient_count(self):
         for n, (out, status) in enumerate((("Unexpected server error", "1"),
@@ -3827,6 +3845,76 @@ exit %d
                                 env=env, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("uvx 0.9.0 (scratch)", log.read_text())
+
+    def test_final_validation_removes_an_untracked_agent_venv_before_uv_check(self):
+        # The agent commits its change, then leaves an untracked environment
+        # whose interpreter is unusable to the final sandbox.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = "interpreter: loom-test-python\ncheck: test ! -e .venv && test -f fix.txt\n"
+        self.contract_repo(contract=contract)
+        self.drop_brief(text=BRIEF.replace("Make the thing work.",
+                                           "Make the thing work. Leave a .venv for validation."))
+        replacement = FAKE_AGENT.replace(
+            'git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"',
+            'git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"\n'
+            'echo /.venv >> .git/info/exclude\nmkdir -p .venv/bin\nprintf "blocked" > .venv/bin/python3')
+        self.write_tool(self.bin / "codex", replacement)
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        self.assertFalse(self.records()[-1]["ok"] is False, self.lane_log())
+
+    def test_final_validation_classifies_denied_python_interpreter_as_factory(self):
+        text = RUNNER.read_text()
+        function = re.search(r"^validation_interpreter_denied\(\) \{\n.*?^\}\n",
+                             text, re.S | re.M).group(0)
+        script = function + 'validation_interpreter_denied "$1" "$2" && echo factory\n'
+        result = subprocess.run(["bash", "-c", script, "test", "2",
+                                 "Failed to query Python interpreter\\nOperation not permitted"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "factory")
+        result = subprocess.run(["bash", "-c", script, "test", "1", "ordinary test failure"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout, "")
+
+    def test_final_interpreter_permission_error_is_a_factory_failure(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = ("interpreter: loom-test-python\n"
+                    "check: grep -q todo fix.txt || { echo 'Failed to query Python interpreter'; "
+                    "echo 'Operation not permitted'; exit 2; }\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("Python interpreter query was denied by the sandbox", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+
+    def test_untracked_venv_cleanup_preserves_tracked_files_under_venv(self):
+        text = RUNNER.read_text()
+        function = re.search(r"^remove_untracked_venvs\(\) \{\n.*?^\}\n",
+                             text, re.S | re.M).group(0)
+        tree = Path(self._tmp.name) / "tree"
+        tree.mkdir()
+        tracked = tree / ".venv" / "tracked.txt"
+        tracked.parent.mkdir()
+        tracked.write_text("tracked\n")
+        git("init", "-q", str(tree))
+        git("add", ".venv/tracked.txt", cwd=tree)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "seed", cwd=tree)
+        (tree / ".venv" / "untracked.txt").write_text("keep with tracked directory\n")
+        untracked = tree / "nested" / ".venv"
+        untracked.mkdir(parents=True)
+        (untracked / "python").write_text("stub\n")
+        script = 'safe_git() { git -C "$TREE" "$@"; }\n' + function + 'remove_untracked_venvs\n'
+        result = subprocess.run(["bash", "-c", script], env={"PATH": os.environ["PATH"],
+                                 "TREE": str(tree)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(tracked.exists())
+        self.assertTrue((tree / ".venv" / "untracked.txt").exists())
+        self.assertFalse(untracked.exists())
 
     def test_the_check_profile_allows_the_uv_files_but_not_their_directory(self):
         # The check profile lets the contract read and execute the runner's

@@ -187,7 +187,13 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 flags `loom:runaway`, and every lane that bills that key stays unavailable
 with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
 `retry_at`, until the value at that parameter changes. The runner opens one
-`needs-operator` ask on the factory repo naming that parameter. It reads
+`needs-operator` ask on the factory repo naming that parameter. opencode
+lanes run with `--print-logs --log-level ERROR`, because opencode's own
+output says only "UnknownError: Unexpected server error" for every provider
+fault: the logged error shows an upstream 429 (a limit) or a model opencode
+no longer offers (`ProviderModelNotFoundError`, which it reports for a model
+models.dev marks deprecated). A missing model is a limit on that model for
+24 hours, with `model <id> not found by the agent CLI` in the heartbeat. It reads
 `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
 install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
