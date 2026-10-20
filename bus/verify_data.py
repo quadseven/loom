@@ -186,7 +186,7 @@ def _checks_fact(runs: List[Dict[str, Any]]) -> str:
     rest = len(results) - len(other)
     return "checks on it: %s%s" % (
         ", ".join("%s %s" % pair for pair in other),
-        "; %s more success or skipped" % _runs(rest) if rest else "")
+        "; the rest (%s) success or skipped" % _runs(rest) if rest else "")
 
 
 def _runs(count: int) -> str:
