@@ -168,6 +168,11 @@ if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
   printf 'contact %s\\n' "$(printf 'MTAuMjMuNC41' | base64 -d)" >> fix.txt
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = own-ref ]; then
+  echo "fixed" > fix.txt
+  echo "see repo#7 and example/repo#8" >> fix.txt  # leak-guard-allow: the case under test
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
   echo "fixed" > fix.txt
   echo "see repo-legacy-private#3 and example/repo#7" >> fix.txt
@@ -350,6 +355,15 @@ printf '%s' "$answer"
 """
 
 
+# Fake mktemp for a lane's sandbox, where only the tree and the scratch home
+# are writable: a temp file in the default directory is denied, and only a
+# template under a writable directory works.
+FAKE_SANDBOXED_MKTEMP = """#!/usr/bin/env bash
+case "$*" in *XXXXXX*) exec /usr/bin/mktemp "$@" ;; esac
+echo "mktemp: mkstemp failed: Operation not permitted" >&2
+exit 1
+"""
+
 # Fake "become the lane user" command: runs its arguments as-is and records
 # that it was used. Production uses sudo to the dedicated macOS user.
 FAKE_RUNAS = """#!/usr/bin/env bash
@@ -479,9 +493,11 @@ mode, value = args[0], args[1]
 # The real scanner's private-issue-ref rule: an issue reference to any repo
 # but the ones named with --allow-repo-ref may name a private repo.
 allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
-# As the real scanner builds it: the exemption sits after the optional owner.
-exempt = r'(?!(?:%s)\\b)' % '|'.join(map(re.escape, allowed)) if allowed else ''
-ref = re.compile(r'(?<![\\w/-])(?:[a-z0-9][a-z0-9._-]*/)?' + exempt + r'[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
+# As the real scanner builds it (infra-public PR 159): an OWNER/NAME entry
+# exempts exactly OWNER/NAME#N and NAME#N, checked before the optional owner.
+forms = set(allowed) | {a.split('/', 1)[1] for a in allowed if '/' in a}
+exempt = r'(?!(?:%s)#)' % '|'.join(map(re.escape, sorted(forms))) if forms else ''
+ref = re.compile(r'(?<![\\w/-])' + exempt + r'(?:[a-z0-9][a-z0-9._-]*/)?[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
 if mode == '--diff':
     text = subprocess.run(['git', 'diff', '-U0', value], capture_output=True,
                           text=True, check=True).stdout
@@ -514,8 +530,8 @@ print('leak guard: clean (shape patterns only)')
     def drop_brief(self, name="T042-fix-the-thing.md", text=BRIEF):
         (self.inbox / name).write_text(text)
 
-    def run_lane(self, lane="codex", **env):
-        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env),
+    def run_lane(self, lane="codex", cwd=None, **env):
+        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
                               capture_output=True, text=True, timeout=60)
 
     def lane_env(self, **env):
@@ -629,6 +645,16 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_diff_citing_its_own_repos_issues_pushes(self):
+        # A lane change citing its own ticket (NAME#N in code or a test) was
+        # refused: four fix rounds on one public repo were discarded on
+        # 2026-10-20 until the scanner learned an exact own-repo exemption.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="own-ref")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("leak scan failed", self.run_log())
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
 
     def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
         # The body's own-repo Refs line is exempt, nothing else: private repos
@@ -771,6 +797,33 @@ print('leak guard: clean (shape patterns only)')
         self.assertIn("agent made no commit and wrote no reason", log)
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.answered").exists())
+
+    def test_a_denied_temp_directory_leaves_no_summary_in_the_working_directory(self):
+        # A lane agent runs this suite in its tree, inside a sandbox that
+        # denies the default temp directory. A failed mktemp handed cp an
+        # empty target, and macOS cp copied the summary into the working
+        # directory: the agent's tree, whose commit was then refused for
+        # T042-fix-the-thing.summary.md.
+        self.write_tool(self.bin / "mktemp", FAKE_SANDBOXED_MKTEMP)
+        cwd = Path(self._tmp.name) / "cwd"
+        cwd.mkdir()
+        self.drop_brief()
+        result = self.run_lane(cwd=cwd, FAKE_AGENT="no-change",
+                               FAKE_SUMMARY="nothing to change: the finding no longer holds")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(p.name for p in cwd.iterdir()), [])
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_a_denied_temp_directory_still_classes_the_change(self):
+        # The same failed mktemp left the change unclassed: the pull request
+        # lost its Intent class and file counts, sensitive paths included.
+        self.write_tool(self.bin / "mktemp", FAKE_SANDBOXED_MKTEMP)
+        self.drop_brief()
+        result = self.run_lane(FAKE_SUMMARY="Fix the thing so it works")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        intent = self.body.read_text().split("## Why", 1)[0]
+        self.assertIn("Fix the thing so it works", intent)
+        self.assertIn("Files: 1", intent)
 
     def test_no_commit_with_a_nothing_to_change_summary_is_answered_not_failed(self):
         self.drop_brief()
@@ -1097,6 +1150,31 @@ print('leak guard: clean (shape patterns only)')
         self.run_lane()
         self.assertEqual(sum(c.startswith("codex ") for c in self.calls()), agents)
         self.assertTrue((self.inbox / "T043-next.md").exists())
+
+    def test_a_timeout_whose_output_only_mentions_a_quota_is_not_a_limit(self):
+        # Three Spark lanes were held an hour as "provider limit reached": each
+        # agent timed out after printing git log, whose newest subject said "A
+        # lane at its quota is not a broken lane" (2026-10-20).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="124", FAKE_OUT=(
+            "4c48db6 A lane at its quota is not a broken lane, and a second close says why\n"
+            "Read docs/USAGE.md [limit=25, offset=626]"))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient]", log)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertNotIn("limit", beat.get("reason") or "")
+
+    def test_provider_quota_messages_are_still_limits(self):
+        for out in ("429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                    "Error: You exceeded your current quota, please check your plan",
+                    "error: Individual quota reached. Resets in 2h",
+                    "quota exceeded for this project"):
+            with self.subTest(out=out):
+                self.drop_brief()
+                self.run_lane(FAKE_AGENT="say", FAKE_OUT=out)
+                self.assertIn("[limit]", self.run_log())
+                (self.loom / "state" / "usage" / "codex.json").unlink(missing_ok=True)
 
     def test_a_limited_ladder_model_falls_back_on_the_next_pass(self):
         models = "gpt-test-high gpt-test-low"
