@@ -14,8 +14,9 @@ Difficulty definitions:
 
 Lane routing (v2): only lanes with a worker are routed, and only while that
 worker's runner reports a fresh, available heartbeat (state/usage/<lane>.json,
-written by lanes/run_lane.sh every pass). Anthropic API credits go first
-(they expire 2026-10-21), then subscriptions, then free lanes.
+written by lanes/run_lane.sh every pass). Within the difficulty's lane list,
+lanes whose credits expire soonest go first (loom#1101), then by remaining
+capacity; heartbeats without a limits payload keep the listed order.
   hard   -> anthropic -> claude -> codex
   medium -> anthropic -> claude -> codex -> opencode-go
   easy   -> anthropic -> openrouter (free) -> opencode-go -> codex -> claude
@@ -93,33 +94,75 @@ def set_ticket_status(ticket_path: Path, status: str, lane: str = None, **extra)
     meta_file.write_text(json.dumps(meta, indent=2))
 
 
+# Remaining capacity assumed when a heartbeat carries no limits payload;
+# sits between a nearly-depleted lane and a nearly-full one.
+_UNKNOWN_REMAINING = 0.5
+
+
+def _limit_rank(beat: dict, now: float) -> tuple:
+    """Sort key for a fresh, available lane: lanes with expiring credits
+    (soonest expiry first), then by remaining capacity (most first). A lane
+    counts as expiring only while it still has capacity; heartbeats without
+    a limits payload sort neutrally, keeping the difficulty list's order."""
+    limits = beat.get("limits")
+    remaining = None
+    expires_at = None
+    if isinstance(limits, dict):
+        remaining = limits.get("remaining")
+        expires_at = limits.get("expires_at")
+    if (not isinstance(remaining, (int, float)) or isinstance(remaining, bool)
+            or remaining < 0 or remaining > 1):
+        remaining = _UNKNOWN_REMAINING
+    if (not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool)
+            or expires_at <= now):
+        expires_at = None
+    expiring = expires_at is not None and remaining > 0
+    return (0 if expiring else 1,
+            expires_at if expiring else float("inf"),
+            -remaining)
+
+
+def _fresh_beat(lane: str, now: float) -> dict | None:
+    """The lane's heartbeat when its runner is live and taking work."""
+    path = STATE / "usage" / f"{lane}.json"
+    try:
+        beat = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None  # no runner has ever reported: no worker
+    except (OSError, ValueError) as e:
+        # The file exists but cannot be read: a fault worth seeing, not
+        # the same as a lane with no worker.
+        log(f"  skipping {lane}: unreadable heartbeat {path}: {e}")
+        return None
+    if not isinstance(beat, dict) or not beat.get("available"):
+        return None
+    try:
+        age = now - float(beat.get("at", 0))
+    except (TypeError, ValueError):
+        log(f"  skipping {lane}: heartbeat has no usable time: {beat.get('at')!r}")
+        return None
+    if age > HEARTBEAT_MAX_AGE_S:
+        return None
+    return beat
+
+
 def pick_lane(difficulty: str, state: dict) -> str | None:
-    """The first lane for `difficulty` whose runner reports a fresh, available
-    heartbeat. No heartbeat, a stale one, or an unreadable one means no
-    worker is taking briefs there, so the lane gets nothing."""
+    """A lane for `difficulty` whose runner reports a fresh, available
+    heartbeat, preferring lanes whose credits expire soonest, then the most
+    remaining capacity (loom#1101). No heartbeat, a stale one, or an
+    unreadable one means no worker is taking briefs there."""
     now = time.time()
+    candidates = []
     for lane in DIFFICULTY_LANE.get(difficulty, []):
-        path = STATE / "usage" / f"{lane}.json"
-        try:
-            beat = json.loads(path.read_text())
-        except FileNotFoundError:
-            continue  # no runner has ever reported: no worker
-        except (OSError, ValueError) as e:
-            # The file exists but cannot be read: a fault worth seeing, not
-            # the same as a lane with no worker.
-            log(f"  skipping {lane}: unreadable heartbeat {path}: {e}")
-            continue
-        if not isinstance(beat, dict) or not beat.get("available"):
-            continue
-        try:
-            age = now - float(beat.get("at", 0))
-        except (TypeError, ValueError):
-            log(f"  skipping {lane}: heartbeat has no usable time: {beat.get('at')!r}")
-            continue
-        if age > HEARTBEAT_MAX_AGE_S:
-            continue
-        return lane
-    return None
+        beat = _fresh_beat(lane, now)
+        if beat is not None:
+            # The difficulty order breaks every tie, so heartbeats without
+            # limit data route exactly as before.
+            candidates.append((lane, beat))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: _limit_rank(item[1], now))
+    return candidates[0][0]
 
 
 def render_brief(ticket_path: Path, lane: str) -> Path:

@@ -15,7 +15,26 @@ Every lane writes `state/usage/<lane>.json` on every runner pass (including when
 
 `lane` is the lane name, `at` is a Unix timestamp from the runner's current time, `available` is true when the lane can take new work, and `reason` explains unavailability. The dispatcher reads this file and routes only to lanes with fresh heartbeats (`within 600 seconds`) that report `available: true`.
 
-Quota fields (models, budget, burn_rate_per_hour, rate_limited) are not written yet and are a planned addition.
+`limits` carries the lane's current usage vs limit (loom#1101), computed per
+lane type by `bus/limits.py` (`python3 -B -m bus.limits <lane>`):
+
+```json
+"limits": {
+ "remaining": 0.75,
+ "reset_at": 1731234567,
+ "expires_at": null,
+ "unit": "credits",
+ "source": "openrouter key endpoint",
+ "stale": false
+}
+```
+
+`remaining` is the fraction of capacity left (null when the lane type
+exposes no usage figure), `reset_at` the epoch the current window resets,
+`expires_at` the epoch prepaid credits expire, and `unit` what the fraction
+measures. The dispatcher prefers lanes whose credits expire soonest, then
+the most remaining capacity. Meter reads (OpenRouter, nvidia-smi) are
+cached 5 minutes so a slow or failed probe never blocks the heartbeat.
 
 ## Sources (ToS-clean)
 

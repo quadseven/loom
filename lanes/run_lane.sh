@@ -168,6 +168,19 @@ lane_setting() {
 # model's limit parked the same ticket here every pass, 24 claims in 90
 # minutes, while the beat said available.
 BEAT="$LOOM_HOME/state/usage/$SLOT.json"
+# The slot's current usage vs limit as JSON (bus/limits.py: remaining,
+# reset_at, expires_at), embedded in the heartbeat so the dispatcher can
+# prefer expiring credits, then remaining capacity (loom#1101). Meter reads
+# are cached 5 minutes inside bus/limits; a slow or failed probe never
+# blocks or breaks the beat.
+limits_json() {
+  local out
+  out="$(PYTHONPATH="$LOOM_ROOT" timeout 20 python3 -B -m bus.limits "$1" 2>/dev/null)" || out=""
+  case "$out" in
+    \{*) printf '%s' "$out" ;;
+    *) printf 'null' ;;
+  esac
+}
 write_beat() {
   local slot="$1" reason retry="" models
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
@@ -175,8 +188,8 @@ write_beat() {
   [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
   models="$(limited_models_json "$slot")"
   mkdir -p "$LOOM_HOME/state/usage"
-  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s, "limited_models": {%s}}\n' \
-    "$slot" "$(date +%s)" "$2" "$reason" "$retry" "$models" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
+  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s, "limited_models": {%s}, "limits": %s}\n' \
+    "$slot" "$(date +%s)" "$2" "$reason" "$retry" "$models" "$(limits_json "$slot")" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
     mv "$LOOM_HOME/state/usage/$slot.json.tmp" "$LOOM_HOME/state/usage/$slot.json"
 }
 # The slot's model limits that have not lifted, as JSON object members
