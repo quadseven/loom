@@ -915,7 +915,7 @@ class AdoptUntrackedPullRequestTest(Base):
         self.fake.add_goal(30)
 
     def pull(self, number, author="alice-example", head_repo=REPO, ref="fix/stray-files",
-             body="", draft=False, created="2030-01-01T00:00:00Z", title="Tidy the docs"):
+             body="", draft=False, created="2020-01-01T00:00:00Z", title="Tidy the docs"):
         self.fake.comments.setdefault(number, [])
         pr = {"number": number, "state": "open", "title": title, "user": {"login": author},
               "body": body, "draft": draft, "created_at": created,
@@ -990,8 +990,8 @@ class AdoptUntrackedPullRequestTest(Base):
                 self.assertEqual(self.fake.comments[99], [])
 
     def test_one_adoption_a_pass_per_repo_oldest_pull_request_first(self):
-        self.pull(98, created="2030-01-05T00:00:00Z", title="Newer")
-        self.pull(97, created="2030-01-02T00:00:00Z", title="Older")
+        self.pull(98, created="2020-01-05T00:00:00Z", title="Newer")
+        self.pull(97, created="2020-01-02T00:00:00Z", title="Older")
         self.adopt()
         self.assertEqual([c["title"] for c in self.adoptions()],
                          ["Land or supersede #97: Older"])
@@ -1002,10 +1002,50 @@ class AdoptUntrackedPullRequestTest(Base):
         self.adopt()
         self.assertEqual(len(self.adoptions()), 2)
 
+    def test_a_pull_request_younger_than_the_grace_waits(self):
+        start = calendar.timegm((2030, 1, 1, 12, 0, 0))
+        self.pull(99, created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start - 1800)))
+        self.adopt(now=start)
+        self.assertEqual(self.adoptions(), [])
+        self.assertEqual(self.fake.comments[99], [])
+        self.adopt(now=start - 1800 + station.ADOPT_GRACE)
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Tidy the docs"])
+        self.assertEqual(len(self.markers(99)), 1)
+
+    def test_a_pull_request_merged_since_the_listing_is_not_adopted(self):
+        # The open list is read once a pass; eight tickets were filed at or
+        # after their pull request's merge (2026-10-13 to 2026-10-20).
+        self.pull(99)
+        merged = {"number": 99, "state": "closed", "merged": True,
+                  "merged_at": "2020-01-02T00:00:00Z"}
+
+        def transport(method, url, headers, body):
+            if method == "GET" and url.endswith("/repos/%s/pulls/99" % REPO):
+                return (200, {}, json.dumps(merged).encode())
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.adopt_untracked_pulls()
+        self.assertEqual(self.adoptions(), [])
+        self.assertEqual(self.fake.comments[99], [])
+        self.assertIn("adoption %s#99: closed or merged since the pass began, not adopted"
+                      % REPO, [c.args[0] for c in say.call_args_list])
+        ledger = json.load(open(os.path.join(self.home, "state", "station",
+                                             station.ADOPTIONS_FILE)))
+        self.assertEqual(ledger[REPO]["adopted"], [99])
+
+    def test_a_pull_request_without_a_created_time_is_adopted(self):
+        self.pull(99, created=None)
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Tidy the docs"])
+
     def test_a_trusted_marker_comment_stops_adoption_and_an_untrusted_one_does_not(self):
         marker = station.adoption_comment(REPO, 7)
-        self.pull(98, created="2030-01-01T00:00:00Z", title="Marked by a trusted author")
-        self.pull(99, created="2030-01-02T00:00:00Z", title="Marked by a stranger")
+        self.pull(98, created="2020-01-01T00:00:00Z", title="Marked by a trusted author")
+        self.pull(99, created="2020-01-02T00:00:00Z", title="Marked by a stranger")
         self.fake.comments[98] = [{"body": marker, "user": {"login": "bob-example"}}]
         self.fake.comments[99] = [{"body": marker, "user": {"login": "stranger"}}]
         self.adopt()
@@ -1014,10 +1054,10 @@ class AdoptUntrackedPullRequestTest(Base):
         self.assertEqual(len(self.fake.comments[98]), 1)
 
     def test_an_adopted_pull_requests_comments_are_read_once(self):
-        self.pull(97, created="2030-01-01T00:00:00Z", title="Adopted before")
+        self.pull(97, created="2020-01-01T00:00:00Z", title="Adopted before")
         self.fake.comments[97] = [{"body": station.adoption_comment(REPO, 7),
                                    "user": {"login": "alice-example"}}]
-        self.pull(98, created="2030-01-02T00:00:00Z", title="Untracked")
+        self.pull(98, created="2020-01-02T00:00:00Z", title="Untracked")
         self.adopt()
         self.assertEqual([c["title"] for c in self.adoptions()],
                          ["Land or supersede #98: Untracked"])
