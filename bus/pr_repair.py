@@ -88,8 +88,9 @@ def _brief_title(brief: str) -> Optional[str]:
 
 _CRITERION = re.compile(r"^- \[([ xX])\] (.*?)(?:; not built: (.*))?$")
 # A lane's "not built" reason goes into a public pull request body that no
-# leak scan reads on a fix round, so only plain words and punctuation pass.
-_REASON = re.compile(r"[A-Za-z0-9 ,.'()-]{1,200}")
+# leak scan reads on a fix round, so only plain words and punctuation pass:
+# no digits, so no address, version, token or issue number (security review).
+_REASON = re.compile(r"[A-Za-z ,.'()-]{1,200}")
 
 
 def _criteria_text(section: str) -> list:

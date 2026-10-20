@@ -104,14 +104,23 @@ class ReconcileTest(unittest.TestCase):
         with open(summary, "w", encoding="utf-8") as fh:
             fh.write("## Acceptance criteria\n- [x] The thing works\n"
                      "- [x] A test covers everything, see 10.1.2.3\n"
-                     "- [ ] Nothing else changes; not built: see other-private#4\n"
+                     "- [ ] Nothing else changes; not built: see 10.0.0.5\n"
                      "- [x] An extra criterion\n")
         result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
                                      "codex", "gpt-test", "T42", summary_path=summary)
         self.assertIn("## Acceptance criteria\n- [x] The thing works\n- [ ] A test covers the thing\n"
                       "- [ ] Nothing else changes\n\n", result["body"])
-        for unsafe in ("10.1.2.3", "other-private", "extra"):
+        for unsafe in ("10.1.2.3", "10.0.0.5", "extra"):
             self.assertNotIn(unsafe, result["body"])
+
+    def test_a_plain_not_built_reason_is_kept(self):
+        self.write_brief(BRIEF)
+        summary = os.path.join(self._tmp.name, "summary.md")
+        with open(summary, "w", encoding="utf-8") as fh:
+            fh.write("## Acceptance criteria\n- [ ] Nothing else changes; not built: needs the next deploy\n")
+        result = pr_repair.reconcile(self.brief, "Fix the thing", RUNNER_BODY,
+                                     "codex", "gpt-test", "T42", summary_path=summary)
+        self.assertIn("- [ ] Nothing else changes; not built: needs the next deploy\n", result["body"])
 
     def test_ticks_already_in_the_body_survive_a_round_with_no_checklist(self):
         self.write_brief(BRIEF)
