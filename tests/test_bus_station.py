@@ -7646,3 +7646,90 @@ class BudgetExhaustedTest(unittest.TestCase):
             gh.rest("GET", "/repos/%s/issues" % REPO)
         self.assertNotIsInstance(caught.exception, github_module.RateLimited)
         self.assertIsNone(gh.limited_until)
+
+
+class RemoteClaimCountTest(unittest.TestCase):
+    """One unreadable repo no longer stops every station pass (loom#1079).
+
+    The station's App token answers 404 for private repos it cannot see;
+    the remote claim count must skip just those repos and the heartbeat
+    must still write its cache so later callers in the pass do not read
+    again and raise again.
+    """
+
+    STATUS_REPO = "example-owner/status-repo"
+    READABLE = "example-owner/readable"
+    UNREADABLE = "example-owner/unreadable"
+
+    class Fake:
+        """Answers the remote heartbeat and per-repo claim reads; one repo
+        404s every read of its issues, like a repo the token cannot see."""
+
+        def __init__(self, outer):
+            self.outer = outer
+            self.calls = []
+
+        def rest(self, method, path, data=None, ok=()):
+            self.calls.append((method, path))
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?labels=%s" % (self.outer.STATUS_REPO,
+                                                   station.LANES_LABEL))):
+                return mock.Mock(status=200, data=[{"number": 9}])
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?state=open&labels=loom:running,lane:muse"
+                    % self.outer.UNREADABLE)):
+                raise GitHubError("Not Found", status=404,
+                                  body='{"message": "Not Found"}')
+            if (method == "GET" and path.startswith(
+                    "/repos/%s/issues?state=open&labels=loom:running,lane:muse"
+                    % self.outer.READABLE)):
+                return mock.Mock(status=200, data=[{"number": 7}])
+            raise AssertionError("unexpected %s %s" % (method, path))
+
+        def paginate(self, path):
+            if path == "/repos/%s/issues/9/comments" % self.outer.STATUS_REPO:
+                return [{"body": "<!-- loom:remote-heartbeat v1 muse %d -->"
+                                 % int(self.outer.now)}]
+            raise AssertionError("unexpected paginate %s" % path)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.now = calendar.timegm(time.strptime("2030-01-01T12:00:00Z",
+                                                 "%Y-%m-%dT%H:%M:%SZ"))
+        self.settings = station.Settings(
+            os.path.join(self.temp.name, "loom"),
+            [self.READABLE, self.UNREADABLE],
+            list(AUTHORS), list(OWNERS), status_repo=self.STATUS_REPO,
+            anthropic=spend.Budget())
+        self.gh = self.Fake(self)
+
+    def runner(self):
+        return station.Station(self.gh, self.settings, now=self.now)
+
+    def test_one_unreadable_repo_is_skipped_not_fatal(self):
+        counts, readable = self.runner()._read_remote_claim_count("muse")
+        self.assertEqual((counts, readable), (1, 1))
+
+    def test_skip_is_logged_once(self):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.runner()._read_remote_claim_count("muse")
+        lines = [line for line in out.getvalue().splitlines()
+                 if "remote claims: skipped" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(self.UNREADABLE, lines[0])
+
+    def test_a_server_error_still_fails_the_pass(self):
+        def fail(method, path, data=None, ok=()):
+            raise GitHubError("boom", status=500)
+        self.gh.rest = fail
+        with self.assertRaises(GitHubError):
+            self.runner()._read_remote_claim_count("muse")
+
+    def test_lanes_body_builds_and_shows_remote_claims(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner = self.runner()
+            body = runner._lanes_body(runner._lane_rows())
+        self.assertIn("Remote claims: muse 1/1", body)
