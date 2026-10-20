@@ -1081,6 +1081,13 @@ def ending_class(reason: str) -> str:
     return "transient" if CLASS_RE.sub("", reason).startswith(BRANCH_MOVED) else failure_class(reason)
 
 
+def fix_pr_merged(fix_pr: str, reason: str) -> bool:
+    """Whether a fix brief was parked unrun because its own pull request,
+    fix_pr, merged before the lane ran it (PR_GONE_RE)."""
+    m = PR_GONE_RE.match(CLASS_RE.sub("", reason))
+    return bool(m) and m.group(1) == fix_pr and m.group(2) == "MERGED"
+
+
 def lane_takes_model(lane: str, model: str) -> bool:
     """Whether the lane's runner accepts the model (lanes/run_lane.sh)."""
     lane = provider(lane)
@@ -4348,8 +4355,7 @@ class Station:
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
-        gone = PR_GONE_RE.match(bare)
-        if fix_pr.isdigit() and gone and gone.group(1) == fix_pr and gone.group(2) == "MERGED":
+        if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
         if self._flag_repeated_failure(repo, number, lane, reason):
