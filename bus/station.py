@@ -5729,13 +5729,22 @@ class Station:
             return
         pairs = state.get("pairs") if isinstance(state.get("pairs"), dict) else {}
         left = SETTLE_PER_RUN
+        # The run is stamped however it ends: at the cap, deferred, or past a
+        # repo GitHub refused. Stamped only on a full run, it ran every pass,
+        # so the cap held per pass and 91 sources settled in minutes, and a
+        # repo the App could not read stopped every run (2026-10-20).
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
-                    return
-                left -= self._settle_repo_sources(repo, pairs, left)
-            state["_at"] = self.now
+                    break
+                try:
+                    left -= self._settle_repo_sources(repo, pairs, left)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not settle the sources of %s: %s" % (repo, err))
         finally:
+            state["_at"] = self.now
             state["pairs"] = pairs
             _write_json(path, state)
 
