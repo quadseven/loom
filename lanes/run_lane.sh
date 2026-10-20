@@ -315,11 +315,16 @@ stray_list() {
 # class, one line per behavior change, and the counts of files by class.
 # Sensitive globs come from SENSITIVE_FILE on the base revision; a missing
 # file means no sensitive class. Sets INTENT_CLASS and INTENT_TEXT.
+# The scratch files live under $LOOM_HOME/run, never the default temp
+# directory: a lane sandbox denies that one, and a failed mktemp handed cp
+# an empty target, which macOS cp takes as the working directory.
 prepare_intent() {
-  local brief="$1" files_tmp sens_tmp sum_tmp what_tmp out
+  local brief="$1" dir files_tmp sens_tmp sum_tmp what_tmp out
   INTENT_CLASS="logic"
   INTENT_TEXT=""
-  files_tmp="$(mktemp)" sens_tmp="$(mktemp)" sum_tmp="$(mktemp)" what_tmp="$(mktemp)"
+  dir="$(mktemp -d "$LOOM_HOME/run/$SLOT-intent.XXXXXX")" ||
+    { echo "intent: could not make a scratch directory; class stays $INTENT_CLASS" >&2; return 0; }
+  files_tmp="$dir/files" sens_tmp="$dir/sensitive" sum_tmp="$dir/summary" what_tmp="$dir/what"
   safe_git diff --name-only "$BASE" HEAD 2>/dev/null | sed '/^[[:space:]]*$/d' > "$files_tmp"
   safe_git cat-file blob "$BASE:$SENSITIVE_FILE" 2>/dev/null > "$sens_tmp"
   # Only the change lines before the summary's first heading: its
@@ -331,7 +336,7 @@ prepare_intent() {
   fi
   section What "$brief" > "$what_tmp" 2>/dev/null
   out="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.change_class --files "$files_tmp" --sensitive "$sens_tmp" --summary "$sum_tmp" --what "$what_tmp" 2>/dev/null)"
-  rm -f "$files_tmp" "$sens_tmp" "$sum_tmp" "$what_tmp"
+  rm -rf "$dir"
   [ -n "$out" ] || return 0
   INTENT_CLASS="$(printf '%s' "$out" | tail -1 | sed 's/^class://')"
   case "$INTENT_CLASS" in sensitive|logic|tests|docs) ;;
