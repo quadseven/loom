@@ -713,6 +713,38 @@ class PullRequests(Base):
         self.assertEqual(len(self.fixed), 1)
         self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
 
+    def test_a_partial_review_asks_for_improve_instead_of_a_fix_round(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "WARN Elder review coverage partial"},
+             "details_url": "https://github.com/%s/actions/runs/79/job/1" % REPO}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertFalse(any("rerun" in w[1] for w in self.gh.writes))
+        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
+        self.assertTrue(any("/grug improve" in body for body in bodies))
+        self.assertTrue(any(factory.REVIEW_AGAIN_MARKER % "sha50" in body for body in bodies))
+
+    def test_a_second_partial_review_on_the_same_head_is_sent_back(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, green=False)
+        self.gh.runs["sha50"] = [
+            {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed", "conclusion": "failure",
+             "output": {"title": "WARN Grug eyes clouded"},
+             "details_url": "https://github.com/%s/actions/runs/80/job/1" % REPO}]
+        self.go()
+        self.assertEqual(self.fixed, [])
+        improve = [c for c in self.gh.comments[50]
+                   if "/grug improve" in str(c.get("body") or "")]
+        self.assertEqual(len(improve), 1)
+        # The same head, still partial: back to the usual fix round.
+        self.go()
+        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(len([c for c in self.gh.comments[50]
+                              if "/grug improve" in str(c.get("body") or "")]), 1)
+
     def test_pull_requests_of_tickets_not_in_pr_are_left_alone(self):
         self.gh.ticket(5, "briefed")
         self.gh.pull(50, 5)

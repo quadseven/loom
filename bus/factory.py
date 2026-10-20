@@ -159,6 +159,16 @@ ANSWER_RE = re.compile(r"^Lane [A-Za-z0-9_.-]+ %s" % re.escape(ANSWER_REPLY))
 # The marker on the comment that asks the review bot to judge an answer: it
 # carries the head commit, so the ask happens once per head.
 IMPROVE_MARKER = "<!-- loom:improve-head %s -->"
+# The review bot's check output title that means it did not finish every part
+# of the diff ("WARN Elder review coverage partial", "WARN Grug eyes clouded").
+# A lane cannot finish someone else's review by editing code, so the factory
+# asks the bot to look at the head again instead of sending the pull request
+# back for a fix round it cannot close.
+PARTIAL_REVIEW_TITLES = ("WARN Elder review coverage partial",
+                         "WARN Grug eyes clouded")
+# Posted once per head commit on a pull request whose only failing check is a
+# partial review, so a second partial result on the same head goes back.
+REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The slots that draw on one API credit: an empty credit holds all of them.
@@ -1576,7 +1586,8 @@ class Factory:
             faults = pr_faults(details, full)
         if faults == ["failing checks"] and (
                 self._repair_body_leak(repo, number, full, issue, comments, sha)
-                or self._run_again(repo, number, sha)):
+                or self._run_again(repo, number, sha)
+                or self._review_again(repo, number, full, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
@@ -1658,6 +1669,32 @@ class Factory:
             self.gh.rest("POST", "/repos/%s/actions/runs/%s/rerun-failed-jobs" % (repo, run_id))
         self.actions += 1
         _say("re-ran failed jobs on %s#%d once before sending it back" % (repo, number))
+        return True
+
+    def _review_again(self, repo: str, number: int, full: Dict[str, Any],
+                      sha: str) -> bool:
+        """Ask the review bot to look at this head again, once per head
+        commit, when the only failing check is a partial review a lane cannot
+        fix by editing code. False when a marker for this head is already on
+        the pull request (a second partial result goes to the usual paths)."""
+        failed = [r for r in self._runs.get(sha, [])
+                  if r.get("conclusion") not in GREEN]
+        review = [r for r in failed if r.get("name") == self.review_check]
+        if len(review) != 1 or len(failed) != 1:
+            return False
+        title = str((review[0].get("output") or {}).get("title") or "")
+        if not any(title.startswith(mark) for mark in PARTIAL_REVIEW_TITLES):
+            return False
+        marker = REVIEW_AGAIN_MARKER % sha
+        for comment in self.gh.paginate(
+                "/repos/%s/issues/%d/comments" % (repo, number)):
+            if marker in str(comment.get("body") or ""):
+                return False
+        self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                     {"body": "%s\n%s" % (marker, REVIEW_AGAIN)})
+        self.actions += 1
+        _say("asked the review bot to review %s#%d again after a partial review"
+             % (repo, number))
         return True
 
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
