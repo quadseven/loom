@@ -153,8 +153,10 @@ MENTION_ROOM = 40
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 REPORT_MARKER = "<!-- loom:report v1 -->"
-# The last line of a quiet standup the station edits in place.
+# The last line of a quiet standup the station edits in place, and of a
+# standup that repeats an earlier one word for word.
 QUIET_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
+SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
 # Reports come every REPORT_EVERY (6 hours), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
 # comment ids keeps a report from going out twice).
@@ -6672,29 +6674,36 @@ class Station:
         brain._check_written_text(body)
         quiet = hold is None and body == self._overdue_standup_body(
             [], None, None if breaches is None else [])
-        previous = self._last_quiet_report(comments, authors, body) if quiet else None
+        previous = self._last_same_report(comments, authors, body)
         if previous is not None:
-            # Every new comment emails the goal's author; a quiet goal edits
-            # its last quiet report instead, which notifies no one.
+            # Every new comment emails the goal's author; a report that says
+            # what an earlier one said edits that one instead, which notifies
+            # no one, even when a brain's report came in between.
+            stamp = QUIET_STAMP if quiet else SAME_STAMP
             self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, previous),
-                         {"body": body + "\n" + QUIET_STAMP % now.strftime("%Y-%m-%dT%H:%MZ")})
+                         {"body": body + "\n" + stamp % now.strftime("%Y-%m-%dT%H:%MZ")})
         else:
             self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
                          {"body": body})
         state[key] = self.now
 
     @staticmethod
-    def _last_quiet_report(comments: List[Any], authors: List[str], quiet: str) -> Optional[int]:
-        """The id of the goal's latest report by `authors` when it is this same
-        quiet report (its stamp line aside), else None."""
-        reports = [c for c in comments if isinstance(c, dict)
-                   and tickets._login(c.get("user")).lower() in authors
-                   and str(c.get("body") or "").startswith(REPORT_MARKER)]
-        if not reports or not isinstance(reports[-1].get("id"), int):
-            return None
-        lines = str(reports[-1].get("body") or "").splitlines()
-        kept = [line for line in lines if not line.startswith(QUIET_STAMP.split("%")[0])]
-        return reports[-1]["id"] if "\n".join(kept) == quiet else None
+    def _last_same_report(comments: List[Any], authors: List[str], body: str) -> Optional[int]:
+        """The id of the goal's latest report by `authors` that says `body`
+        (its stamp line aside), else None. Reports in between do not matter:
+        the brain's reports on the same goal never match the station's."""
+        stamps = tuple(stamp.split("%")[0] for stamp in (QUIET_STAMP, SAME_STAMP))
+        for comment in reversed(comments):
+            if not isinstance(comment, dict) or not isinstance(comment.get("id"), int) \
+                    or tickets._login(comment.get("user")).lower() not in authors:
+                continue
+            text = str(comment.get("body") or "")
+            if not text.startswith(REPORT_MARKER):
+                continue
+            kept = [line for line in text.splitlines() if not line.startswith(stamps)]
+            if "\n".join(kept) == body:
+                return comment["id"]
+        return None
 
     def _open_breaches(self, repo: str, goal: int) -> List[Dict[str, Any]]:
         """The open loom:invariant issues filed on the goal home."""
