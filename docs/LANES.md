@@ -1083,6 +1083,19 @@ lookup leaves the brief for the next pass. The rule covers:
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
 
+## free provider slots on the spark-gateway
+
+Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The five free slots use
+separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
+`free-gemma` uses `/free/gemini/v1`, and `free-nvidia`, `free-kilo` and
+`free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
+`/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
+derived URL. Each slot probes its own route's `/models` before a run. A 503
+holds only that slot for 15 minutes as a limit, so the station can assign the
+ticket elsewhere without counting it as a work failure. Ollama and Gemma
+accept private repos; the other three accept public repos only. The routes
+need your own gateway and provider configuration.
+
 ## spark: a local vLLM coder, one stream at a time
 
 - opencode against a vLLM server you run yourself, through a custom
