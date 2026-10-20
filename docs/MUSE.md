@@ -435,8 +435,8 @@ this tick"; a step with no note shows nothing there.
    default limit of 25 issues a run, oldest first. It skips pull requests,
    epics, asks and anything with a `loom:` label; a ready issue (every brief
    section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal's intake epic, the rest get `loom:triage` and one comment naming
-   what is missing. Where the station has `LOOM_REWRITE_CMD` set it rewrites
+   ticket under the goal's intake epic, the rest get `loom:triage` (no comment;
+   the printed line names what is missing). Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left (the `needs-brain` ones first: the station's rewrite
    model judged them person-only, and you decide), and only rewrites

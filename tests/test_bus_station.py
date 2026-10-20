@@ -1944,8 +1944,7 @@ class TriageTest(Base):
                              now=self.start)
         with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
             st.triage_backlogs()
-        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT,
-                                       comment_limit=5)
+        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT)
         self.assertIn("loom:queued", self.fake.names(102))
         triage_json = os.path.join(self.home, "state", "station", "triage.json")
         with open(triage_json) as fh:
@@ -1958,7 +1957,7 @@ class TriageTest(Base):
         with open(rewrite_json) as fh:
             self.assertIn("%s#31" % REPO, json.load(fh))
 
-    def test_fallback_goal_waits_at_three_queued_and_caps_not_ready_comments(self):
+    def test_fallback_goal_waits_at_three_queued_and_triages_without_comments(self):
         self.fake.add_goal(31, title="Ship the thing")
         for number in range(100, 106):
             self.fake.add_open_issue(number, body="It is slow.", created="2030-01-%02dT00:00:00Z" % (number - 90))
@@ -1982,8 +1981,9 @@ class TriageTest(Base):
         with mock.patch.object(st.gh, "paginate", side_effect=lambda path: (
                 [] if "labels=loom:queued" in path else original_paginate(path))):
             st.triage_backlogs()
-        comments = [p for p in self.fake.paths("POST") if p.endswith("/comments")]
-        self.assertEqual(len(comments), 5)
+        self.assertEqual([p for p in self.fake.paths("POST") if p.endswith("/comments")], [])
+        self.assertEqual([n for n in range(100, 106) if "loom:triage" in self.fake.names(n)],
+                         list(range(100, 106)))
 
     def test_below_the_budget_floor_triage_is_deferred(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
@@ -5518,6 +5518,49 @@ class ReportsTest(Base):
         self.assertEqual(len(self.fake.edits), 1)
         self.assertTrue(self.fake.edits[0].startswith(quiet + "\n"))
         self.assertNotIn("2026-01-01T00:00Z", self.fake.edits[0])
+
+    def test_a_quiet_standup_edits_its_quiet_report_past_a_brain_report(self):
+        # gemini-plugin-cc, 2026-10-20: the brain reported between the
+        # station's quiet reports, so each one was the newest report only
+        # until the next, and every "Nothing moved" went out as a new email.
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        quiet = st._overdue_standup_body([], None)
+        self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
+        self.comment(40, 6, station.REPORT_MARKER + "\nSame as the last report: the backlog is empty.")
+        for c in self.fake.comments[40]:
+            c["created_at"] = old
+        st.post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 2)  # nothing posted, so no email
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertTrue(self.fake.edits[0].startswith(quiet + "\n"))
+
+    def test_a_standup_that_repeats_an_earlier_one_edits_it_instead_of_posting(self):
+        self.add_goal()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.fake.sub_issues[40] = [
+            {"number": 41, "title": "Waiting its turn", "state": "open", "updated_at": old,
+             "created_at": old, "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}]
+        self.comment(40, 1, station.REPORT_MARKER + "\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        st.post_overdue_standups()
+        first = self.fake.comments[40][-1]["body"]
+        self.assertIn("Waiting its turn", first)
+        self.fake.comments[40][-1].update(id=7, created_at=old)  # as GitHub returns it
+        self.comment(40, 99, station.REPORT_MARKER + "\nThe brain's own report.")
+        self.fake.comments[40][-1]["created_at"] = old
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time() + brain.REPORT_EVERY).post_overdue_standups()
+        self.assertEqual(len(self.fake.comments[40]), 3)
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertTrue(self.fake.edits[0].startswith(first + "\n"))
+        self.assertIn("Unchanged as of", self.fake.edits[0])
 
     def test_a_standup_after_a_report_that_was_not_quiet_is_posted(self):
         self.add_goal()
