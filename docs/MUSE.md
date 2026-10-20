@@ -571,6 +571,11 @@ no fallback, for the rules above. A fallback move says so in its note
 ("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
 so its next move takes its own tier again once a lane of it is up. A tier
 with a lane up but busy is waited for, not fallen back from.
+A ticket briefed to a lane that is down, or at a limit lifting more than
+two hours off (`LIMIT_REQUEUE`), does not wait on it when no lane of its
+tier is free: it goes back to `loom:queued` with no lane, and takes the next
+free lane of its tier in the queue's order (priority, then age). A ladder
+ticket keeps its rung's rules.
 
 An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
 brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
