@@ -1229,9 +1229,14 @@ check_default_branch() {
   # fix tree's .git, which the check sandbox cannot read, so every check that
   # runs git failed there (loom's metrics tests, a false base-check incident
   # on each loom fix round, 2026-10-19). The clone hardlinks its objects and
-  # takes the real origin, so relative submodule URLs still resolve.
+  # takes the real origin, so relative submodule URLs still resolve. The fix
+  # tree is shallow, so git ignores --local and copies only its branches:
+  # the fetch brings origin's default branch across, which a conflicting
+  # round has not merged (2026-10-20).
   if ! { timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            clone -q --local --no-checkout "$branch_tree" "$default_tree" >> "$LOG" 2>&1 &&
+         timeout "$NET_TIMEOUT" git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+           fetch -q --update-shallow "$branch_tree" "+refs/remotes/origin/$FIX_DEFAULT:refs/remotes/origin/$FIX_DEFAULT" >> "$LOG" 2>&1 &&
          git -C "$default_tree" -c core.hooksPath=/dev/null remote set-url origin \
            "$(safe_git remote get-url origin)" >> "$LOG" 2>&1 &&
          git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \

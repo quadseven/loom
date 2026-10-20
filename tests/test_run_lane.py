@@ -3597,6 +3597,32 @@ exit %d
         self.assertEqual(default["exit"], 0)
         self.assertFalse(list(self.loom.glob("**/*-default-check")))
 
+    def test_a_conflicting_fix_round_checks_a_default_branch_its_shallow_clone_never_held(self):
+        # The fix tree is a shallow clone, so `git clone --local` of it falls
+        # back to a plain clone that copies branches but not origin/main.
+        # With main past the conflicting fix branch, the default branch
+        # commit was missing and every such round failed setup before its
+        # agent could resolve the conflict (2026-10-20). No setup
+        # step: a conflicting round runs setup only in the default tree.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract=CONTRACT.replace(
+            "setup: loom-test-python -c 'open(\".prepared\", \"w\").write(\"ok\")'\n", "").replace(
+            "test -f .prepared && ", ""))
+        name, _ = self.fix_brief()
+        self.advance_main("first.txt", "main's version\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "printf 'both kept\\n' > first.txt\n")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.run_log(name + ".log")
+        self.assertIn("shallow", log)
+        self.assertNotIn("could not check out the default branch", log)
+        self.assertIn("agent saw conflicts", self.calls())
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        default = next(r for r in records if r["phase"] == "default-baseline")
+        self.assertEqual((default["exit"], default["revision"]), (0, self.remote_head("main")))
+        self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
     def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
