@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from datetime import datetime, timezone
@@ -475,3 +477,67 @@ class WaitsCommandTest(unittest.TestCase):
         want = datetime.fromtimestamp(now - 7 * 86400, timezone.utc)
         got = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         self.assertLess(abs((got - want).total_seconds()), 120)
+
+
+class SlowEvents:
+    """A GitHub boundary for waits_for_repos whose every request sleeps:
+    four tickets per repo (plus one too old to count and a pull request,
+    neither read further) and one queued event per ticket."""
+
+    def __init__(self, now, delay=0.03, failing=None):
+        self.now, self.delay, self.failing = now, delay, failing
+        self.lock = threading.Lock()
+        self.active = self.max_active = 0
+        self.request_time = 0.0
+        self.paths = []
+
+    def paginate(self, path):
+        started = time.monotonic()
+        with self.lock:
+            self.paths.append(path)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(self.delay)
+            if "/events" not in path:
+                return ([{"number": n, "updated_at": iso(self.now - n * 60)} for n in range(1, 5)]
+                        + [{"number": 9, "updated_at": iso(self.now - 8 * 86400)},
+                           {"number": 10, "updated_at": iso(self.now), "pull_request": {}}])
+            if self.failing and self.failing in path:
+                raise GitHubError("events read failed", 502)
+            number = int(path.split("/issues/")[1].split("/")[0])
+            return [{"event": "labeled", "label": {"name": "loom:queued"},
+                     "created_at": iso(self.now - number * 3600)}]
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.request_time += time.monotonic() - started
+
+
+class WaitsReadTest(unittest.TestCase):
+    """waits_for_repos reads one event list per ticket updated in the last
+    week. Read one after another that was 699 requests and 229 s of a cold
+    dashboard's 320 s first snapshot (loom#433), so they overlap now."""
+
+    REPOS = ["example-owner/one", "example-owner/two", "example-owner/three"]
+
+    def test_event_reads_overlap_and_the_result_matches_a_serial_read(self):
+        gh = SlowEvents(NOW)
+        entered = {}
+        started = time.monotonic()
+        rows, bottleneck = metrics.waits_for_repos(gh, self.REPOS, NOW, entered)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len([p for p in gh.paths if "/events" in p]), 12)
+        self.assertGreater(gh.max_active, 1)
+        self.assertLess(elapsed, gh.request_time * 0.5)
+        serial_entered = {}
+        want = metrics.waits_for_repos(SlowEvents(NOW, delay=0), self.REPOS, NOW, serial_entered,
+                                       workers=1)
+        self.assertEqual((rows, bottleneck), want)
+        self.assertEqual(list(entered.items()), list(serial_entered.items()))
+        self.assertEqual(list(entered), ["%s#%d" % (repo, n) for repo in self.REPOS for n in range(1, 5)])
+
+    def test_one_failed_event_read_fails_the_whole_read(self):
+        gh = SlowEvents(NOW, delay=0, failing="example-owner/two/issues/3/")
+        with self.assertRaises(GitHubError):
+            metrics.waits_for_repos(gh, self.REPOS, NOW, {})

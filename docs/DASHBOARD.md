@@ -160,7 +160,12 @@ Backlog's "Outside any epic" lists open tickets with no epic.
 
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one
-repository, and startup logs the time taken for that snapshot.
+repository, and startup logs the time taken for that snapshot. Every source of
+that first pass overlaps its reads: the per-ticket event lists behind the
+state waits, the pages of each repo's two-week comment feed, the open issues
+for `/free`, the goal homes, and the Operators page's check and ask reads. One
+after another they made a cold first snapshot take over five minutes; it
+takes about a minute (loom#433).
 Each refresh keeps only the fields the pages read from each pull request and
 comment it lists (`PULL_REQUEST_FIELDS` and `COMMENT_FIELDS` in
 `dashboard/github.py`), not GitHub's whole answers with their embedded

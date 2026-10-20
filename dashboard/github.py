@@ -226,6 +226,20 @@ def _unique_by_number(records) -> List[Dict[str, Any]]:
     return out
 
 
+def _unique_by_id(items) -> List[Dict[str, Any]]:
+    """The dict items in order, each comment id once."""
+    seen, out = set(), []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("id")
+        if key is not None and key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 def _int_or(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -411,17 +425,26 @@ class TicketStore:
         fails keeps its last read and the error is shown on the page."""
         if now - self.open_issues_read_at < FREE_ISSUES_SECONDS or self._below_floor():
             return
+        # The repos are read at once: one after another they took 12.4 s of
+        # a cold first snapshot (loom#433).
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(self._open_issues_for_repo, self.repos))
         errors = []
-        for repo in self.repos:
-            try:
-                found = self.gh.paginate("/repos/%s/issues?state=open" % quote(repo, safe="/"))
-            except (GitHubError, OSError, ValueError) as exc:
-                errors.append("%s: %s" % (repo, self._error_reason(exc)))
-                continue
-            self.open_issues[repo] = [free_view.open_issue_record(item) for item in found
-                                      if isinstance(item, dict) and "pull_request" not in item]
+        for repo, (found, error) in zip(self.repos, results, strict=True):
+            if error:
+                errors.append(error)
+            else:
+                self.open_issues[repo] = found
         self.open_issues_error = "; ".join(errors)
         self.open_issues_read_at = now
+
+    def _open_issues_for_repo(self, repo: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        try:
+            found = self.gh.paginate("/repos/%s/issues?state=open" % quote(repo, safe="/"))
+        except (GitHubError, OSError, ValueError) as exc:
+            return None, "%s: %s" % (repo, self._error_reason(exc))
+        return [free_view.open_issue_record(item) for item in found
+                if isinstance(item, dict) and "pull_request" not in item], ""
 
     def _skip_dashboard_below_floor(self, data: Dict[str, Any]) -> None:
         reset = ("at %s UTC" % datetime.fromtimestamp(self._reset_at, timezone.utc).strftime("%H:%M")
@@ -582,7 +605,7 @@ class TicketStore:
         it is not read yet (None)."""
         url = field + "_url"
         kept = {"%s#%s" % (item.get("repo"), item.get("number")): item for item in previous}
-        reads = 0
+        to_read = []
         for item in items:
             old = kept.get("%s#%s" % (item.get("repo"), item.get("number"))) or {}
             if item.get("body_ask"):
@@ -591,37 +614,54 @@ class TicketStore:
                 item[field], item[url] = old[field], old.get(url) or ""
             elif not item.get("comments"):
                 item[field], item[url] = "", ""
-            elif reads >= OPERATOR_ASK_READS:
+            elif len(to_read) >= OPERATOR_ASK_READS:
                 item[field], item[url] = old.get(field), old.get(url) or ""
             else:
-                reads += 1
-                item[field], item[url] = self._read_ask(item, errors, (old.get(field), old.get(url) or ""))
+                to_read.append((item, (old.get(field), old.get(url) or "")))
+        # The comment reads overlap (loom#433); errors keep the items' order.
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(lambda pair: self._read_ask(*pair), to_read))
+        for (item, _), (found, error) in zip(to_read, results, strict=True):
+            item[field], item[url] = found
+            if error:
+                errors.append(error)
 
-    def _read_ask(self, item, errors, fallback) -> Tuple[Optional[str], str]:
+    def _read_ask(self, item, fallback) -> Tuple[Tuple[Optional[str], str], str]:
+        """((ask, comment url), error): the fallback with the error when the
+        comments cannot be read."""
         page = (int(item["comments"]) - 1) // operators.ASK_COMMENTS + 1
         try:
             resp = self.gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=%d&page=%d" % (
                 quote(str(item["repo"]), safe="/"), int(item["number"]), operators.ASK_COMMENTS, page))
         except (GitHubError, OSError, ValueError) as exc:
-            errors.append("%s#%s ask: %s" % (item["repo"], item["number"], self._error_reason(exc)))
-            return fallback
+            return fallback, "%s#%s ask: %s" % (item["repo"], item["number"], self._error_reason(exc))
         found = resp.data if isinstance(resp.data, list) else []
-        return operators.pick_ask(found, operators.ask_names(item.get("labels") or []))
+        return operators.pick_ask(found, operators.ask_names(item.get("labels") or [])), ""
 
     def _read_claim_checks(self, items, errors) -> Dict[str, Dict[str, Any]]:
         """repo@sha -> operators.checks_summary of each open linked pull
         request's head, at most OPERATOR_CHECK_READS reads a pass (an
         unchanged head answers 304 from the GitHub client's ETag cache)."""
-        out: Dict[str, Dict[str, Any]] = {}
-        for repo, sha in operators.checks_wanted(items)[:OPERATOR_CHECK_READS]:
+        def read(wanted):
+            repo, sha = wanted
             try:
                 resp = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
                                     % (quote(repo, safe="/"), quote(sha, safe="")))
             except (GitHubError, OSError, ValueError) as exc:
-                errors.append("%s checks: %s" % (repo, self._error_reason(exc)))
-                continue
+                return None, "%s checks: %s" % (repo, self._error_reason(exc))
             runs = resp.data.get("check_runs") if isinstance(resp.data, dict) else None
-            out["%s@%s" % (repo, sha)] = operators.checks_summary(runs or [])
+            return operators.checks_summary(runs or []), ""
+
+        # The reads overlap (loom#433); results and errors keep their order.
+        wanted = operators.checks_wanted(items)[:OPERATOR_CHECK_READS]
+        with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+            results = list(pool.map(read, wanted))
+        out: Dict[str, Dict[str, Any]] = {}
+        for (repo, sha), (summary, error) in zip(wanted, results, strict=True):
+            if error:
+                errors.append(error)
+            else:
+                out["%s@%s" % (repo, sha)] = summary
         return out
 
     def _goal_info(self, rows, configured=None) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
@@ -643,19 +683,27 @@ class TicketStore:
         pending = sorted(named)
         seen = set()
         now = time.time()
+        # One level at a time, the level's reads overlapping: one after
+        # another they took 12.5 s of a cold first snapshot (loom#433).
         while pending and len(seen) < GOAL_INFO_MAX:
-            goal = pending.pop(0)
-            if goal in seen:
-                continue
-            seen.add(goal)
-            entry = cache.get(goal)
-            if not entry or not entry.get("title") or now - entry.get("read_at", 0) >= GOAL_INFO_TTL:
-                entry = self._read_goal_home(goal, entry, now, configured)
-                cache[goal] = entry
-            if entry.get("parent") and entry["parent"] not in seen:
-                pending.append(entry["parent"])
-            if entry.get("is_epic") and entry.get("epic_goal") and entry["epic_goal"] not in seen:
-                pending.append(entry["epic_goal"])
+            level: List[str] = []
+            for goal in pending:
+                if goal not in seen and goal not in level and len(seen) + len(level) < GOAL_INFO_MAX:
+                    level.append(goal)
+            seen.update(level)
+            stale = [goal for goal in level if not (cache.get(goal) or {}).get("title")
+                     or now - cache[goal].get("read_at", 0) >= GOAL_INFO_TTL]
+            with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+                read = list(pool.map(lambda goal: self._read_goal_home(goal, cache.get(goal), now, configured),
+                                     stale))
+            cache.update(zip(stale, read, strict=True))
+            pending = []
+            for goal in level:
+                entry = cache[goal]
+                if entry.get("parent") and entry["parent"] not in seen:
+                    pending.append(entry["parent"])
+                if entry.get("is_epic") and entry.get("epic_goal") and entry["epic_goal"] not in seen:
+                    pending.append(entry["epic_goal"])
 
         def accepted(parent):
             if not parent or parent.partition("#")[0] not in configured:
@@ -737,11 +785,16 @@ class TicketStore:
     def _comments_for_repo(self, repo, since, trusted):
         path = quote(repo, safe="/")
         issues, reviews = [], []
+        # A busy repo's two-week feed is dozens of pages: read one after
+        # another they took 32 s of a cold first snapshot (loom#433). A page
+        # shift between reads can repeat a comment, so each counts once.
         try:
-            found = self.gh.paginate("/repos/%s/issues/comments?since=%s&per_page=100" % (path, since))
-            issues = [comment_record(c, repo) for c in found if isinstance(c, dict) and _by_trusted(c, trusted)]
-            found = self.gh.paginate("/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since))
-            reviews = [comment_record(c, repo) for c in found if isinstance(c, dict)]
+            found = _unique_by_id(self.gh.paginate_parallel(
+                "/repos/%s/issues/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
+            issues = [comment_record(c, repo) for c in found if _by_trusted(c, trusted)]
+            found = _unique_by_id(self.gh.paginate_parallel(
+                "/repos/%s/pulls/comments?since=%s&per_page=100" % (path, since), workers=READ_WORKERS))
+            reviews = [comment_record(c, repo) for c in found]
         except (GitHubError, OSError, ValueError) as exc:
             return issues, reviews, "%s comments: %s" % (repo, self._error_reason(exc))
         return issues, reviews, ""
