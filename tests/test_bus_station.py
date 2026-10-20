@@ -302,6 +302,8 @@ class FakeGitHub:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:shipped" in self.names(i["number"])])
         if "labels=loom:rewritten&" in query:
+            if getattr(self, "rewritten_status", 200) != 200:
+                return reply(self.rewritten_status, {"message": "Not Found"})
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:rewritten" in self.names(i["number"])])
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
@@ -6432,6 +6434,33 @@ class SettleOrphanSourcesTest(Base):
         self.assertEqual(self.fake.issues[2]["state"], "open")
         self.assertEqual(len(self.fake.comments[1]), 1)
         self.assertEqual(len(self.fake.comments[2]), 1)
+
+    def test_the_cap_holds_for_the_hour_not_the_pass(self):
+        self.fake.private = False
+        for n in (1, 2):
+            self.ticket(10 + n, n, "closed", "completed")
+            self.source(n, 10 + n)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        # A second repo after the cap is reached (the fake serves one repo).
+        with mock.patch.object(station, "SETTLE_PER_RUN", 1), \
+                mock.patch.object(st, "_verify_repos", return_value=[REPO, REPO]):
+            st.settle_orphan_sources()
+            st.settle_orphan_sources()
+            self.assertEqual(sorted(self.fake.issues[n]["state"] for n in (1, 2)),
+                             ["closed", "open"])
+            st.now += station.SETTLE_EVERY
+            st.settle_orphan_sources()
+        self.assertEqual([self.fake.issues[n]["state"] for n in (1, 2)], ["closed", "closed"])
+
+    def test_a_repo_github_refuses_is_logged_and_the_run_still_waits_an_hour(self):
+        self.fake.rewritten_status = 404
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        lists = [p for p in self.fake.paths("GET") if "labels=loom:rewritten" in p]
+        st.settle_orphan_sources()
+        self.assertEqual([p for p in self.fake.paths("GET") if "labels=loom:rewritten" in p],
+                         lists)
+        self.assertEqual(len(lists), 1)
 
     def test_it_runs_once_an_hour_and_reads_each_rewrite_comment_once(self):
         self.fake.private = False
