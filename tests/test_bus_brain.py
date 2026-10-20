@@ -2778,7 +2778,8 @@ class HumanAndRefsTests(unittest.TestCase):
         fake = Fake(reply(200, item(6, labels=["loom:triage"])), reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t"}),
                     reply(201, {}), reply(201, {}), reply(200, []), reply(200, []))
-        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
+        with redirect_stderr(io.StringIO()):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
         # Words, not "Refs #6": lanes copy the brief into their pull request,
         # and a linked original in no epic fails the plan check.
         self.assertTrue(fake.calls[3][2]["body"].endswith(
@@ -2796,6 +2797,102 @@ class HumanAndRefsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
             self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    # loom#1229: a rewrite filed a second issue and commented on the first,
+    # two more notification emails and a duplicate open issue per rewrite.
+    ORIGINAL = "## Problem\nThe page query is slow.\nRefs #9\nDifficulty: easy\n"
+
+    def source(self, **extra):
+        fields = dict(labels=["loom:triage", "needs-brain", "bug"], title="Slow page",
+                      body=self.ORIGINAL, user={"login": "example-brain"},
+                      html_url="https://example.com/6")
+        fields.update(extra)
+        return item(6, **fields)
+
+    def brief_in_place(self, source, *replies, lane=None):
+        fake = Fake(reply(200, source), reply(200, goal()), reply(200, []), *replies)
+        url = brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6,
+                          lane=lane, env=TRUSTED)
+        fake.assert_all_used()
+        return fake, url
+
+    def test_brief_refs_rewrites_a_briefing_logins_issue_in_place(self):
+        fake, url = self.brief_in_place(self.source(), reply(200, {}), reply(200, []),
+                                        reply(201, {}), reply(200, []), reply(200, []))
+        writes = [(c[0], c[1].split(REPO)[-1]) for c in fake.calls if c[0] != "GET"]
+        self.assertEqual(writes, [("PATCH", "/issues/6"), ("POST", "/issues/6/labels"),
+                                  ("POST", "/issues/%d/sub_issues" % EPIC),
+                                  ("DELETE", "/issues/6/labels/loom%3Atriage"),
+                                  ("DELETE", "/issues/6/labels/needs-brain")])
+        self.assertEqual(url, "https://example.com/6")
+        patch = fake.calls[3][2]
+        self.assertEqual(patch["title"], "Ticket")
+        self.assertEqual(fake.calls[4][2], {"labels": ["loom:ticket", "loom:queued"]})
+        self.assertEqual(fake.calls[5][2], {"sub_issue_id": 1006})
+        # No new issue and no comment: nothing is POSTed to /issues or /comments.
+        self.assertFalse(any(c[1].endswith("/issues") or c[1].endswith("/comments")
+                             for c in fake.calls))
+        self.assertNotIn("Rewritten from issue", patch["body"])
+
+    def test_the_in_place_body_is_the_ticket_with_the_original_kept_below(self):
+        fake, _ = self.brief_in_place(self.source(), reply(200, {}), reply(200, []),
+                                      reply(201, {}), reply(200, []), reply(200, []))
+        body = fake.calls[3][2]["body"]
+        self.assertTrue(body.startswith(BODY))
+        ticket, kept = body.split(tickets.ORIGINAL_HEADING)
+        self.assertTrue(ticket.rstrip().endswith("Part of #%d" % EPIC))
+        self.assertIn("<details><summary>Original issue</summary>", kept)
+        self.assertIn("> Original title: Slow page", kept)
+        self.assertIn("> ## Problem\n> The page query is slow.\n> Refs #9\n", kept)
+        # The kept text is quoted, so the runner reads no header or section from it.
+        tickets.parse(body)
+        self.assertEqual(tickets.without_original(body).rstrip(), ticket.rstrip())
+        self.assertEqual(brain.missing_sections(body), [])
+
+    def test_an_in_place_brief_to_a_lane_gets_the_briefed_labels(self):
+        fake, _ = self.brief_in_place(self.source(labels=["loom:triage"]), reply(200, {}),
+                                      reply(200, []), reply(201, {}), reply(200, []),
+                                      lane="claude")
+        self.assertEqual(fake.calls[4][2], {"labels": ["loom:ticket", "loom:briefed",
+                                                       "lane:claude"]})
+
+    def test_a_refused_epic_link_leaves_the_part_of_line_as_the_link(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            fake, _ = self.brief_in_place(self.source(labels=["loom:triage"]), reply(200, {}),
+                                          reply(200, []), reply(422, {"message": "has a parent"}),
+                                          reply(200, []))
+        self.assertIn("Part of #%d" % EPIC, fake.calls[3][2]["body"])
+        self.assertIn("refused the sub-issue link", err.getvalue())
+
+    def test_a_source_the_station_could_not_claim_is_rewritten_as_a_new_ticket(self):
+        made = {"id": 202, "number": 20, "html_url": "https://example.com/t"}
+        for why, source in (("author", self.source(user={"login": "a-stranger"})),
+                            ("locked", self.source(locked=True))):
+            with self.subTest(why=why):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    fake, url = self.brief_in_place(
+                        source, reply(201, made), reply(201, {}), reply(201, {}),
+                        reply(200, []), reply(200, []))
+                self.assertEqual(url, "https://example.com/t")
+                self.assertTrue(fake.calls[3][1].endswith("/repos/%s/issues" % REPO))
+                self.assertTrue(fake.calls[3][2]["body"].endswith(
+                    "\n\nRewritten from issue 6.\n\nPart of #2\n"))
+                self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
+                self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+                self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
+                self.assertIn("#6 is rewritten as a new ticket", err.getvalue())
+
+    def test_the_lane_pull_request_body_leaves_the_kept_original_out(self):
+        from bus import lane
+        fake, _ = self.brief_in_place(self.source(), reply(200, {}), reply(200, []),
+                                      reply(201, {}), reply(200, []), reply(200, []))
+        issue = {"number": 6, "title": "Ticket", "body": fake.calls[3][2]["body"]}
+        body = lane.pr_body(REPO, issue, "logic", {"logic": 1})
+        self.assertNotIn("Original issue", body)
+        self.assertNotIn("The page query is slow", body)
+        self.assertNotIn("Refs #9", body)
 
 
 class FakeRepo:
