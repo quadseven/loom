@@ -1317,7 +1317,7 @@ class ShipRuleTest(Base):
             # check of event, branch and head repository is what is tested.
             return reply(200, {"workflow_runs": [r for r in self.runs
                                                  if r["conclusion"] == "success"]})
-        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)$" % REPO,
+        compare = re.match(r"/repos/%s/compare/([0-9a-f]+)\.\.\.([0-9A-Za-z_./-]+)$" % REPO,
                            parts.path)
         if compare:
             self.compares.append(compare.groups())
@@ -1421,6 +1421,64 @@ class ShipRuleTest(Base):
             settings = station.Settings.from_env(env)
         self.assertEqual(settings.ship_on_merge, [REPO, "example-owner/second"])
         self.assertEqual(settings.ship_workflows, {REPO: "deploy.k8s.yml"})
+
+    def test_a_pull_request_a_later_revert_undid_ships_on_no_step(self):
+        # loom#1077: a revert titled "Revert #99: ..." whose body cites the
+        # first 10 characters of PR 99's merge commit must keep every ship
+        # step from shipping ticket 12 by PR 99.
+        self.settings.ship_on_merge = [REPO]
+        self.settings.ship_workflows = {REPO: self.WORKFLOW}
+        sha = self.merged(12, 99)
+        rsha = "%040x" % 101
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T02:00:00Z",
+                                "merge_commit_sha": rsha,
+                                "title": "Revert #99: undo the change",
+                                "body": "A hand revert.\n\n## Why\nIt broke the build.\n\n"
+                                        "```\ngit revert --no-edit %s\n```\n" % sha[:10],
+                                "head": {"ref": "revert-101"}, "base": {"ref": "main"}})
+        self.carried.add((rsha, "main"))
+        self.carried.add((rsha, "f" * 40))
+        self.deploy_run("f" * 40, created="2030-01-02T03:00:00Z")
+        self.carried.add((sha, "f" * 40))
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_revert_citing_only_a_short_commit_prefix_also_blocks_shipping(self):
+        # The title names nothing revertable (no Revert #N, no quoted
+        # title); only the 10-character commit in the body identifies the
+        # undone pull request.
+        self.settings.ship_on_merge = [REPO]
+        sha = self.merged(12, 99)
+        rsha = "%040x" % 101
+        self.fake.pulls.append({"number": 101, "state": "closed",
+                                "merged_at": "2030-01-02T02:00:00Z",
+                                "merge_commit_sha": rsha,
+                                "title": "Revert the deploy config tweak",
+                                "body": "git revert --no-edit %s\n\n## Why\nIt broke.\n" % sha[:10],
+                                "head": {"ref": "revert-101"}, "base": {"ref": "main"}})
+        self.carried.add((rsha, "main"))
+        self.ship()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:shipped", self.fake.names(12))
+
+    def test_a_refs_line_with_trailing_words_links_the_ticket(self):
+        # loom#1077: "Refs #12 (part of goal #512)" still names ticket 12,
+        # so the ticket's pull request is found and ships on merge.
+        self.assertEqual(station._refs_numbers(
+            REPO, "Why.\n\nRefs #12 (part of goal #512)\n"), [12])
+        self.assertEqual(station._refs_numbers(REPO, "Refs #12\n"), [12])
+        self.settings.ship_on_merge = [REPO]
+        self.fake.add(12, state="merged")
+        sha = "%040x" % 77
+        self.fake.pulls.append({"number": 77, "state": "closed",
+                                "merged_at": "2030-01-02T00:00:00Z",
+                                "merge_commit_sha": sha, "title": "Fix the thing",
+                                "body": "Refs #12 (part of goal #512)",
+                                "head": {"ref": "fix-a-thing"}})
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
 
 
 DEPLOY = "example-owner/deploy"

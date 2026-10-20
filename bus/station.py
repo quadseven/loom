@@ -1147,8 +1147,9 @@ def _fix_round_limit() -> int:
 
 def _refs_numbers(repo: str, body: str) -> List[int]:
     """The ticket numbers a pull request body names with a `Refs` line, in
-    the full `Refs OWNER/NAME#N` form or the same-repo `Refs #N` form."""
-    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)[ \t]*$" % re.escape(repo),
+    the full `Refs OWNER/NAME#N` form or the same-repo `Refs #N` form; the
+    line may carry trailing words after the number."""
+    return [int(n) for n in re.findall(r"^Refs (?:%s)?#([0-9]+)\b" % re.escape(repo),
                                        body, re.M)]
 
 
@@ -3643,18 +3644,26 @@ class Station:
     # -- shipping on merge or on a deploy workflow --------------------------
     def ship_merged(self) -> None:
         """Move the open merged tickets of each LOOM_SHIP_ON_MERGE repo to
-        loom:shipped: nothing deploys those repos, so the merge is the ship."""
+        loom:shipped: nothing deploys those repos, so the merge is the ship.
+        A pull request a later merged pull request reverted is skipped, as
+        the pin step does."""
         for repo in [r for r in self.s.ship_on_merge if tickets.REPO_RE.fullmatch(r)]:
             try:
                 merged = self._merged_tickets(repo)
                 if not merged:
                     continue
-                latest = self._merged_pulls(repo, merged)
+                seen: List[Dict[str, Any]] = []
+                latest = self._merged_pulls(repo, merged, seen)
             except GitHubError as err:
                 _say("could not ship merged tickets of %s: %s" % (repo, err))
                 continue
+            branch = self._default_branch(repo)
             ordered = sorted((str(pr["merged_at"]), number, pr) for number, pr in latest.items())
             for _, number, pr in ordered[:SHIP_PER_PASS]:
+                if branch and self._reverted(repo, pr, seen, branch):
+                    _say("%s#%d stays merged: pull request #%d was reverted" % (
+                        repo, number, int(pr["number"])))
+                    continue
                 self._ship_one(repo, number, pr,
                                "%s ships on merge (LOOM_SHIP_ON_MERGE); pull request #%d "
                                "merged at %s" % (repo, int(pr["number"]),
@@ -3682,13 +3691,16 @@ class Station:
             return
         by_sha = {str(r["head_sha"]): r for r in runs}
         newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
-        latest = self._merged_pulls(repo, merged)
+        seen: List[Dict[str, Any]] = []
+        latest = self._merged_pulls(repo, merged, seen)
         shipped = 0
         for _, number, pr in sorted((str(pr["merged_at"]), n, pr) for n, pr in latest.items()):
             if shipped >= SHIP_PER_PASS:
                 return
             run = self._covering_run(repo, pr, by_sha, newest)
-            if run is not None and self._ship_one(
+            if run is None or self._reverted(repo, pr, seen, str(run["head_sha"])):
+                continue
+            if self._ship_one(
                     repo, number, pr,
                     "workflow %s succeeded on %s revision %s (run %s)" % (
                         workflow, repo, str(run["head_sha"])[:12], run.get("id")),
@@ -3846,17 +3858,16 @@ class Station:
     def _reverted(self, repo: str, pr: Dict[str, Any], seen: List[Dict[str, Any]],
                   revision: str) -> bool:
         """A later merged pull request the revision carries reverts this one:
-        its body says "Reverts <repo>#<n>" or its title is 'Revert "<title>"',
-        the forms GitHub's revert button writes."""
-        number, title = int(pr["number"]), str(pr.get("title") or "")
-        body = re.compile(r"\bReverts\s+(?:%s)?#%d\b" % (re.escape(repo), number))
+        a hand-made revert of it (its body says "Reverts <repo>#<n>", its
+        title is 'Revert #<n>' or 'Revert "<title>"', or its body runs git
+        revert on the pull request's merge commit, full or short), the
+        forms GitHub's revert button and the revert pass write."""
         for other in seen:
             if other is pr or str(other.get("merged_at")) <= str(pr["merged_at"]):
                 continue
-            if body.search(str(other.get("body") or "")) or (
-                    title and str(other.get("title") or "") == 'Revert "%s"' % title):
-                if self._carries(repo, str(other["merge_commit_sha"]), revision):
-                    return True
+            if revert.undoes(other, pr) \
+                    and self._carries(repo, str(other["merge_commit_sha"]), revision):
+                return True
         return False
 
     def hand_back(self) -> None:
