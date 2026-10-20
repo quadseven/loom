@@ -6625,7 +6625,9 @@ class Station:
         state["_checked"] = self.now
         # One goal's failure must not skip the later goals' standups, nor drop
         # the stamps of the goals already posted this pass (loom#201).
-        for repo, goal in self._goal_homes():
+        # Unreadable repos are skipped in _goal_homes_for_standup so one bad
+        # repo does not block standups for the rest.
+        for repo, goal in self._goal_homes_for_standup():
             try:
                 self._post_overdue_goal_standup(repo, goal, state, authors, now)
             except RateLimited:
@@ -6989,6 +6991,25 @@ class Station:
                            if tickets.REPO_RE.fullmatch(repo)
                            for issue in self._goal_issues(repo)]
         return self._goals
+
+    def _goal_homes_for_standup(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """(repo, issue) for every open loom:goal issue in LOOM_REPOS, read
+        once per pass. Unreadable repos (404, 410, 301, 302, 307, 308, 403
+        non-rate-limit, GraphQL NOT_FOUND) are logged and skipped so one bad
+        repo does not block standups for the rest. Other errors are raised."""
+        goals: List[Tuple[str, Dict[str, Any]]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                for issue in self._goal_issues(repo):
+                    goals.append((repo, issue))
+            except GitHubError as err:
+                reason = unreadable(err)
+                if reason is None:
+                    raise
+                _say("standup: skipped %s: %s" % (repo, reason))
+        return goals
 
     def _goal_for(self, text: str) -> Optional[Tuple[str, int, str, bool]]:
         """(repo, number, link, named) of the goal the message names: an

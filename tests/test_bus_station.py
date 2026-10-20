@@ -5588,6 +5588,49 @@ class ReportsTest(Base):
         self.assertIn("%s#41" % REPO, state)
         self.assertNotIn("%s#40" % REPO, state)
 
+    def test_unreadable_repo_is_skipped_in_standup_pass(self):
+        """A repo that returns 404 when listing goals is skipped with a log line,
+        while other repos' goals still get their standups posted."""
+        good_repo = REPO
+        bad_repo = "second-owner/second-repo"
+        settings = station.Settings(self.home, [good_repo, bad_repo], list(AUTHORS), list(OWNERS))
+        settings.webhook_ssm = "/example/webhook"
+        settings.mention = "123456"
+
+        # Good repo: has an overdue goal
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            time.time() - brain.REPORT_EVERY - brain.REPORT_GRACE - 60))
+        self.add_goal(40)
+        self.comment(40, 1, "<!-- loom:report v1 -->\nold report")
+        self.fake.comments[40][0]["created_at"] = old
+
+        # Bad repo: returns 404 on goal list
+        def transport(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/%s/issues" % bad_repo and "labels=loom:goal" in url:
+                raise station.GitHubError("Not Found", 404)
+            return self.fake(method, url, headers, body)
+
+        gh = GitHub("token", transport=transport)
+        st = station.Station(gh, settings, now=time.time())
+
+        with mock.patch("bus.station._say") as say:
+            st.post_overdue_standups()
+            # Verify the bad repo was logged as skipped
+            say.assert_called()
+            logged = say.call_args.args[0]
+            self.assertIn(bad_repo, logged)
+            self.assertIn("404", logged)
+            self.assertIn("skipped", logged.lower())
+
+        # Verify good repo's goal got a standup posted
+        self.assertTrue(self.fake.comments[40][-1]["body"].startswith(station.REPORT_MARKER))
+
+        # Verify standup state was saved for good repo only
+        with open(os.path.join(st.state, "standups.json")) as fh:
+            state = json.load(fh)
+        self.assertIn("%s#40" % good_repo, state)
+
     def report_aged(self, seconds):
         self.add_goal()
         self.comment(40, 1, "<!-- loom:report v1 -->\nearlier report")
