@@ -366,8 +366,9 @@ epic under that epic's goal.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
-rewrites and health intake find"), opened by `bus.brain onboard` and again
-whenever the open one holds 15 tickets.
+rewrites and health intake find"): the newest open one holding fewer than 15
+tickets. One is opened by `bus.brain onboard`, and again whenever no open
+intake epic has room.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
 wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
