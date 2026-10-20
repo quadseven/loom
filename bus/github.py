@@ -398,9 +398,16 @@ class GitHub:
     def __init__(self, token: Auth, api: str = DEFAULT_API,
                  transport: Optional[Transport] = None,
                  cache_dir: Optional[str] = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 unsubscribe: bool = False) -> None:
         # A personal token string, or an AppToken minted on first use.
         self._token = token
+        # With a personal token, leave each issue this client opens or
+        # comments on: GitHub subscribes the person, and every later bot
+        # comment there emailed them. An @mention still notifies.
+        self.unsubscribe = unsubscribe
+        self._node_ids: Dict[Tuple[str, int], str] = {}
+        self.unsubscribe_failures: List[str] = []
         self.app: Optional[AppToken] = token if isinstance(token, AppToken) else None
         # What the budget lines name: an App installation or a personal token.
         self.auth = "app" if self.app is not None else "token"
@@ -444,6 +451,8 @@ class GitHub:
     def rest(self, method: str, path: str, body: Any = None,
              etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
         resp = self._rest(method, path, body, etag, ok)
+        if method == "POST" and self.unsubscribe and self.app is None:
+            self._leave_thread(path, resp.data)
         if method == "GET" and status.COMMENTS_RE.search(path):
             # A ticket's status comment reads as one comment per event, so
             # every reader of those events sees them as before (loom#866).
@@ -470,6 +479,31 @@ class GitHub:
         if method != "GET":
             self._note_write(path, data)
         return Response(status, data, resp_headers.get("etag"), resp_headers)
+
+    def _leave_thread(self, path: str, data: Any) -> None:
+        """Unsubscribe the token's person from the issue a POST opened or
+        commented on. A failure is kept in unsubscribe_failures, never raised:
+        the write itself already happened."""
+        opened = re.match(r"^/repos/([^/]+/[^/]+)/issues$", path)
+        commented = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)/comments$", path)
+        if not (opened or commented) or not isinstance(data, dict):
+            return
+        try:
+            if opened:
+                node = str(data.get("node_id") or "")
+                key = (opened.group(1), int(data.get("number") or 0))
+            else:
+                key = (commented.group(1), int(commented.group(2)))
+                node = self._node_ids.get(key) or str(
+                    (self._rest("GET", "/repos/%s/issues/%d" % key).data or {}).get("node_id") or "")
+            if not node:
+                raise GitHubError("no node id for %s#%d" % key)
+            self._node_ids[key] = node
+            self.graphql("mutation($id: ID!) { updateSubscription(input: "
+                         "{subscribableId: $id, state: UNSUBSCRIBED}) "
+                         "{ subscribable { viewerSubscription } } }", {"id": node})
+        except (GitHubError, ValueError, TypeError) as err:
+            self.unsubscribe_failures.append("%s: %s" % (path, err))
 
     def _check_status(self, method: str, path: str, status: int, text: str,
                       ok: Tuple[int, ...]) -> None:

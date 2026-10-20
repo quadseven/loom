@@ -3035,7 +3035,7 @@ class OnboardTests(unittest.TestCase):
 
     def test_command_line_prints_the_lines(self):
         fake = FakeRepo(prs=[pr(9, "s9")], runs={"s9": 1})
-        with unittest.mock.patch.object(brain, "GitHub", lambda token: GitHub(token, transport=fake)), \
+        with unittest.mock.patch.object(brain, "GitHub", lambda token, **kw: GitHub(token, transport=fake)), \
                 unittest.mock.patch.object(brain, "auth_from_env", lambda: "t"), \
                 unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""}), \
                 unittest.mock.patch("sys.stdout") as out:
