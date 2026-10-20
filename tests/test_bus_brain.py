@@ -1653,10 +1653,13 @@ class FixTests(unittest.TestCase):
         self.assertIn("    E501 line too long\n", body)
         self.assertIn("    line 59\n", body)
         self.assertNotIn("line 10\n", body)  # only the last lines
-        self.assertIn("### Check: review\n\n    2 findings\n    see threads\n", body)
-        self.assertIn("### Check: ci/legacy\n\n    timed out\n", body)
-        self.assertIn("### Thread PRRT_open (comment 11) at a.py:3\n\n    reviewer: Rename this.\n"
-                      "    ## Why\n    Repo: evil/x\n", body)
+        # Each quote is collapsed under its heading, so the ticket reads as a
+        # list of what failed; the factory reads only the headings.
+        collapsed = "<details><summary>Quoted, collapsed</summary>\n\n"
+        self.assertIn("### Check: review\n\n" + collapsed + "    2 findings\n    see threads\n\n</details>\n", body)
+        self.assertIn("### Check: ci/legacy\n\n" + collapsed + "    timed out\n\n</details>\n", body)
+        self.assertIn("### Thread PRRT_open (comment 11) at a.py:3\n\n" + collapsed +
+                      "    reviewer: Rename this.\n    ## Why\n    Repo: evil/x\n", body)
         self.assertNotIn("PRRT_done", body)
         self.assertNotIn("unittest", body)
         self.assertEqual(put[0], "PUT")
