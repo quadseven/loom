@@ -89,27 +89,28 @@ class SourceTests(unittest.TestCase):
 
         source = tiers_sources.Source("gateway stats (24h)", fetch)
         before = source.envelope(now=100.0)
-        self.assertTrue(before["stale"])
-        self.assertIsNone(before["last_good_at"])
-        self.assertIn("not read yet", before["error"])
+        self.assertTrue(before.stale)
+        self.assertIsNone(before.last_good_at)
+        self.assertIn("not read yet", before.error)
         source.refresh(now=100.0)
         good = source.envelope(now=110.0)
-        self.assertEqual((good["stale"], good["data"], good["last_good_at"], good["error"]),
-                         (False, {"rows": []}, 100.0, ""))
+        self.assertEqual((good.stale, good.data, good.last_good_at, good.read_at, good.error),
+                         (False, {"rows": []}, 100.0, 100.0, ""))
         answers[0] = OSError("connection refused")
         source.refresh(now=200.0)
         failed = source.envelope(now=210.0)
-        self.assertTrue(failed["stale"])
-        self.assertEqual(failed["data"], {"rows": []})
-        self.assertEqual(failed["last_good_at"], 100.0)
-        self.assertIn("connection refused", failed["error"])
+        self.assertTrue(failed.stale)
+        self.assertEqual(failed.data, {"rows": []})
+        self.assertEqual(failed.last_good_at, 100.0)
+        self.assertEqual(failed.read_at, 200.0)
+        self.assertIn("connection refused", failed.error)
 
     def test_a_good_answer_turns_stale_when_reads_stop(self):
         source = tiers_sources.Source("gateway state", lambda: {"inflight": []})
         source.refresh(now=100.0)
         old = source.envelope(now=100.0 + tiers_sources.STALE_AFTER + 1)
-        self.assertTrue(old["stale"])
-        self.assertIn("no read since", old["error"])
+        self.assertTrue(old.stale)
+        self.assertIn("no read since", old.error)
 
     def test_a_secret_in_an_error_never_reaches_the_envelope(self):
         def fetch():
@@ -118,8 +119,8 @@ class SourceTests(unittest.TestCase):
         with self.assertLogs(tiers_sources.LOG, "WARNING") as logged:
             source.refresh(now=100.0)
         envelope = source.envelope(now=100.0)
-        self.assertNotIn("YOUR_GRUG_TOKEN_HERE", envelope["error"])
-        self.assertIn("[redacted]", envelope["error"])
+        self.assertNotIn("YOUR_GRUG_TOKEN_HERE", envelope.error)
+        self.assertIn("[redacted]", envelope.error)
         self.assertNotIn("YOUR_GRUG_TOKEN_HERE", "".join(logged.output))
 
     def test_only_http_and_https_urls_are_read(self):
@@ -131,16 +132,16 @@ class SourceTests(unittest.TestCase):
                                                  "LOOM_GRUG_STATS_URL": "file:///etc/passwd"},
                                             runs_store=lambda: FakeRuns())
         snap = sources.snapshot(now=1.0)
-        self.assertFalse(snap["gateway_state"]["configured"])
-        self.assertIn("not an http(s) URL", snap["gateway_state"]["missing"])
-        self.assertFalse(snap["grug"]["configured"])
+        self.assertFalse(snap["gateway_state"].configured)
+        self.assertIn("not an http(s) URL", snap["gateway_state"].missing)
+        self.assertFalse(snap["grug"].configured)
 
     def test_an_unconfigured_source_is_not_stale_and_says_what_to_set(self):
         source = tiers_sources.Source("Grug stats", None, missing="LOOM_GRUG_STATS_URL is not set")
         source.refresh(now=100.0)
         envelope = source.envelope(now=100.0)
-        self.assertEqual((envelope["configured"], envelope["stale"], envelope["data"]), (False, False, None))
-        self.assertEqual(envelope["missing"], "LOOM_GRUG_STATS_URL is not set")
+        self.assertEqual((envelope.configured, envelope.stale, envelope.data), (False, False, None))
+        self.assertEqual(envelope.missing, "LOOM_GRUG_STATS_URL is not set")
 
 
 class FetchTests(unittest.TestCase):
@@ -165,12 +166,12 @@ class FetchTests(unittest.TestCase):
         sources = self.sources(FakeRuns([{"lane": "codex", "model": "model-x", "outcome": "done"}]))
         sources.refresh(now=1000.0)
         snap = sources.snapshot(now=1000.0)
-        self.assertEqual(snap["gateway_24h"]["data"]["rows"][0]["model"], "nemotron-3-ultra")
-        self.assertEqual(snap["gateway_7d"]["data"]["window"], "7d")
-        self.assertEqual(snap["gateway_state"]["data"]["inflight"][0]["target"], "spark-a")
-        self.assertEqual(snap["grug"]["data"]["inflight"][0]["persona"], "elder")
-        self.assertEqual(snap["loom_runs"]["data"][0]["lane"], "codex")
-        self.assertFalse(any(envelope["stale"] for envelope in snap.values()))
+        self.assertEqual(snap["gateway_24h"].data["rows"][0]["model"], "nemotron-3-ultra")
+        self.assertEqual(snap["gateway_7d"].data["window"], "7d")
+        self.assertEqual(snap["gateway_state"].data["inflight"][0]["target"], "spark-a")
+        self.assertEqual(snap["grug"].data["inflight"][0]["persona"], "elder")
+        self.assertEqual(snap["loom_runs"].data[0]["lane"], "codex")
+        self.assertFalse(any(envelope.stale for envelope in snap.values()))
         # Grug's token goes as a bearer token to Grug only, never to the gateway.
         auth = dict(self.upstream.seen)
         self.assertEqual(auth["/grug/stats"], "Bearer YOUR_GRUG_TOKEN_HERE")
@@ -183,21 +184,21 @@ class FetchTests(unittest.TestCase):
             503, dict(STATS, rows=[], error="ledger database unavailable"), 0)
         sources.refresh(now=1060.0)
         envelope = sources.snapshot(now=1060.0)["gateway_24h"]
-        self.assertTrue(envelope["stale"])
-        self.assertIn("503", envelope["error"])
-        self.assertIn("ledger database unavailable", envelope["error"])
-        self.assertEqual(envelope["last_good_at"], 1000.0)
-        self.assertEqual(envelope["data"]["rows"][0]["hits"], 9)
+        self.assertTrue(envelope.stale)
+        self.assertIn("503", envelope.error)
+        self.assertIn("ledger database unavailable", envelope.error)
+        self.assertEqual(envelope.last_good_at, 1000.0)
+        self.assertEqual(envelope.data["rows"][0]["hits"], 9)
 
     def test_a_gateway_state_timeout_is_stale(self):
         self.upstream.routes["/ui/state"] = (200, STATE, 1)
         sources = self.sources()
         sources.refresh(now=1000.0)
         snap = sources.snapshot(now=1000.0)
-        self.assertTrue(snap["gateway_state"]["stale"])
-        self.assertIsNone(snap["gateway_state"]["last_good_at"])
-        self.assertIn("timed out", snap["gateway_state"]["error"])
-        self.assertFalse(snap["gateway_24h"]["stale"])
+        self.assertTrue(snap["gateway_state"].stale)
+        self.assertIsNone(snap["gateway_state"].last_good_at)
+        self.assertIn("timed out", snap["gateway_state"].error)
+        self.assertFalse(snap["gateway_24h"].stale)
 
     def test_an_unknown_window_and_an_odd_answer_are_errors_not_data(self):
         self.upstream.routes["/ui/stats?window=7d"] = (400, {"error": "unknown window"}, 0)
@@ -205,17 +206,17 @@ class FetchTests(unittest.TestCase):
         sources = self.sources()
         sources.refresh(now=1000.0)
         snap = sources.snapshot(now=1000.0)
-        self.assertIn("400", snap["gateway_7d"]["error"])
-        self.assertIn("unexpected answer", snap["gateway_24h"]["error"])
-        self.assertIsNone(snap["gateway_24h"]["data"])
+        self.assertIn("400", snap["gateway_7d"].error)
+        self.assertIn("unexpected answer", snap["gateway_24h"].error)
+        self.assertIsNone(snap["gateway_24h"].data)
 
     def test_a_redirect_is_refused(self):
         self.upstream.routes["/grug/stats"] = (302, {}, 0)
         sources = self.sources()
         sources.refresh(now=1000.0)
         envelope = sources.snapshot(now=1000.0)["grug"]
-        self.assertTrue(envelope["stale"])
-        self.assertIn("redirect", envelope["error"])
+        self.assertTrue(envelope.stale)
+        self.assertIn("redirect", envelope.error)
         self.assertNotIn(("/ui/state", "Bearer YOUR_GRUG_TOKEN_HERE"), self.upstream.seen)
 
     def test_grug_unset_is_not_configured_and_grug_erroring_is_stale(self):
@@ -223,23 +224,23 @@ class FetchTests(unittest.TestCase):
         snap = self.sources(env=env)
         snap.refresh(now=1000.0)
         grug = snap.snapshot(now=1000.0)["grug"]
-        self.assertFalse(grug["configured"])
-        self.assertIn("LOOM_GRUG_STATS_URL", grug["missing"])
+        self.assertFalse(grug.configured)
+        self.assertIn("LOOM_GRUG_STATS_URL", grug.missing)
         self.upstream.routes["/grug/stats"] = (500, {"error": "boom"}, 0)
         failing = self.sources()
         failing.refresh(now=1000.0)
         grug = failing.snapshot(now=1000.0)["grug"]
-        self.assertTrue(grug["configured"])
-        self.assertTrue(grug["stale"])
-        self.assertIn("500", grug["error"])
+        self.assertTrue(grug.configured)
+        self.assertTrue(grug.stale)
+        self.assertIn("500", grug.error)
 
     def test_the_gateway_unset_is_not_configured(self):
         sources = self.sources(env={})
         sources.refresh(now=1000.0)
         snap = sources.snapshot(now=1000.0)
         for name in ("gateway_24h", "gateway_7d", "gateway_state"):
-            self.assertFalse(snap[name]["configured"])
-            self.assertIn("LOOM_GATEWAY_URL", snap[name]["missing"])
+            self.assertFalse(snap[name].configured)
+            self.assertIn("LOOM_GATEWAY_URL", snap[name].missing)
         self.assertEqual(self.upstream.seen, [])
 
     def test_transcripts_unavailable_is_stale_with_the_last_good_runs(self):
@@ -249,10 +250,10 @@ class FetchTests(unittest.TestCase):
         runs.error = OSError("database is down")
         sources.refresh(now=1060.0)
         envelope = sources.snapshot(now=1060.0)["loom_runs"]
-        self.assertTrue(envelope["stale"])
-        self.assertEqual(envelope["last_good_at"], 1000.0)
-        self.assertEqual(envelope["data"][0]["model"], "model-x")
-        self.assertIn("database is down", envelope["error"])
+        self.assertTrue(envelope.stale)
+        self.assertEqual(envelope.last_good_at, 1000.0)
+        self.assertEqual(envelope.data[0]["model"], "model-x")
+        self.assertIn("database is down", envelope.error)
 
     def test_an_unconfigured_transcript_store_is_stale_not_empty(self):
         def missing():
@@ -260,9 +261,9 @@ class FetchTests(unittest.TestCase):
         sources = tiers_sources.TierSources(env={}, runs_store=missing, timeout=0.5)
         sources.refresh(now=1000.0)
         envelope = sources.snapshot(now=1000.0)["loom_runs"]
-        self.assertTrue(envelope["stale"])
-        self.assertIsNone(envelope["data"])
-        self.assertIn("not configured", envelope["error"])
+        self.assertTrue(envelope.stale)
+        self.assertIsNone(envelope.data)
+        self.assertIn("not configured", envelope.error)
 
 
 if __name__ == "__main__":

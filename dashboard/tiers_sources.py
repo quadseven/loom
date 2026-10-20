@@ -25,6 +25,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -106,6 +107,30 @@ def _error_field(exc: HTTPError) -> str:
     return ": %s" % str(error)[:300] if error else ""
 
 
+@dataclass(frozen=True)
+class SourceState:
+    """What a page knows about one source: its last good answer (data, None
+    before one), when that was read (last_good_at) and when any read last ran
+    (read_at), and whether it can be taken as current (stale, with error).
+    An unconfigured source is not stale; missing says what to set."""
+    name: str
+    configured: bool = True
+    missing: str = ""
+    data: Any = None
+    last_good_at: Optional[float] = None
+    read_at: Optional[float] = None
+    stale: bool = False
+    error: str = ""
+
+    @classmethod
+    def not_read(cls, name: str, error: str = "not read yet") -> "SourceState":
+        return cls(name=name, stale=True, error=error)
+
+    @classmethod
+    def unconfigured(cls, name: str, missing: str) -> "SourceState":
+        return cls(name=name, configured=False, missing=missing)
+
+
 class Source:
     """One upstream read and its last good answer."""
 
@@ -146,20 +171,18 @@ class Source:
             text = text.replace(secret, "[redacted]")
         return text
 
-    def envelope(self, now: Optional[float] = None) -> Dict[str, Any]:
-        """{name, configured, missing, data, last_good_at, read_at, stale,
-        error}: data is the last good answer (None before one), and stale says
-        it cannot be taken as current."""
+    def envelope(self, now: Optional[float] = None) -> SourceState:
+        """This source's SourceState now: a good answer older than
+        STALE_AFTER is stale even when no read failed."""
         now = time.time() if now is None else now
         with self._lock:
             data, last_good_at, read_at, error = self.data, self.last_good_at, self.read_at, self.error
-        configured = self.fetch is not None
-        error = error if configured else ""
-        if configured and not error and last_good_at is not None and now - last_good_at > STALE_AFTER:
+        if self.fetch is None:
+            return SourceState.unconfigured(self.name, self.missing)
+        if not error and last_good_at is not None and now - last_good_at > STALE_AFTER:
             error = "no read since %ds ago" % int(now - last_good_at)
-        return {"name": self.name, "configured": configured, "missing": self.missing, "data": data,
-                "last_good_at": last_good_at, "read_at": read_at,
-                "stale": configured and bool(error), "error": error}
+        return SourceState(name=self.name, data=data, last_good_at=last_good_at, read_at=read_at,
+                           stale=bool(error), error=error)
 
 
 def _gateway_stats(base: str, window: str, timeout: float) -> Callable[[], Dict[str, Any]]:
@@ -229,11 +252,11 @@ class TierSources:
         with ThreadPoolExecutor(max_workers=len(self.sources)) as pool:
             list(pool.map(lambda source: source.refresh(now), self.sources.values()))
 
-    def snapshot(self, now: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+    def snapshot(self, now: Optional[float] = None) -> Dict[str, SourceState]:
         return {name: source.envelope(now) for name, source in self.sources.items()}
 
 
-def empty_snapshot(env: Optional[Mapping[str, str]] = None) -> Dict[str, Dict[str, Any]]:
+def empty_snapshot(env: Optional[Mapping[str, str]] = None) -> Dict[str, SourceState]:
     """What a dashboard with no background reads shows: every configured
     source not read yet."""
     return TierSources(env=env).snapshot()

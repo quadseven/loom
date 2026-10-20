@@ -1149,48 +1149,44 @@ def _dispatch_usage(handler, state):
     now = datetime.now(timezone.utc)
     payload = state.response() if hasattr(state, "response") else {}
     lanes = {lane for row in rows for lane in (row.get("lanes") or []) if isinstance(lane, str)}
-    models = {lane: model for lane in lanes for model in [bus_brain._lane_model(lane)] if model}
+    models = {lane: model for lane in lanes for model in [bus_brain.lane_model(lane)] if model}
     data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models)
     return handler.send_page(page("Usage", "usage", usage_store.render(data),
                                   status="stale" if payload.get("stale") else "live"))
 
 
 def _tiers_usage(state, now):
-    """The station's usage readings as a Tiers page source envelope: stale
-    when none has arrived since the dashboard started, or the newest is older
-    than the Usage page's limit."""
+    """The station's usage readings as a Tiers page SourceState: stale when
+    none has arrived since the dashboard started, or the newest is older than
+    the Usage page's limit."""
+    from .tiers_sources import SourceState
     store = getattr(state, "usage", None)
     received = getattr(store, "received_at", None)
-    envelope = {"name": "Usage readings", "configured": True, "missing": "", "data": None,
-                "last_good_at": None, "stale": True,
-                "error": "no usage snapshot since the dashboard started (the station uploads one each pass)"}
     if received is None:
-        return envelope
+        return SourceState.not_read(
+            "Usage readings", "no usage snapshot since the dashboard started (the station uploads one each pass)")
     age = (now - received).total_seconds()
-    envelope.update(data=[row for items in store.providers.values() for row in items],
-                    last_good_at=received.timestamp(), stale=age > usage_store.STALE_AFTER,
-                    error="" if age <= usage_store.STALE_AFTER else "no station upload in %dh" % (age // 3600))
-    return envelope
+    stale = age > usage_store.STALE_AFTER
+    return SourceState(name="Usage readings", data=[row for items in store.providers.values() for row in items],
+                       last_good_at=received.timestamp(), read_at=received.timestamp(), stale=stale,
+                       error="no station upload in %dh" % (age // 3600) if stale else "")
 
 
 def _tiers_station(state, payload):
     """The running Loom tickets the dashboard already holds, as a Tiers page
-    source envelope: stale with the ticket snapshot."""
-    read = any(rows is not None for rows in (payload.get("tickets") or {}).values())
-    runs = []
-    if read:
-        entered = payload.get("state_entered") or {}
-        for row in _all_tickets(state):
-            if row.get("state") == "running" and row.get("open", True):
-                runs.append({"repo": row.get("repo"), "number": row.get("number"), "title": row.get("title"),
-                             "lane": row.get("lane"), "model": row.get("run_model") or row.get("model"),
-                             "age": tickets_table.age_in_state(row, entered, time.time())[0],
-                             "html_url": row.get("html_url")})
-    stale = bool(payload.get("stale")) or not read
-    return {"name": "Station tickets", "configured": True, "missing": "", "data": runs if read else None,
-            "last_good_at": payload.get("ticket_refreshed_at"), "stale": stale,
-            "error": (payload.get("stale_reason") or "GitHub could not refresh ticket data") if read and stale
-            else ("" if read else "ticket data not read yet")}
+    SourceState: stale with the ticket snapshot."""
+    from .tiers_sources import SourceState
+    if not any(rows is not None for rows in (payload.get("tickets") or {}).values()):
+        return SourceState.not_read("Station tickets", "ticket data not read yet")
+    entered = payload.get("state_entered") or {}
+    runs = [{"repo": row.get("repo"), "number": row.get("number"), "title": row.get("title"),
+             "lane": row.get("lane"), "model": row.get("run_model") or row.get("model"),
+             "age": tickets_table.age_in_state(row, entered, time.time())[0], "html_url": row.get("html_url")}
+            for row in _all_tickets(state) if row.get("state") == "running" and row.get("open", True)]
+    stale = bool(payload.get("stale"))
+    read = payload.get("ticket_refreshed_at")
+    return SourceState(name="Station tickets", data=runs, last_good_at=read, read_at=read, stale=stale,
+                       error=(payload.get("stale_reason") or "GitHub could not refresh ticket data") if stale else "")
 
 
 def _dispatch_tiers(handler, state):
@@ -1367,7 +1363,7 @@ def _lane_card(item, tickets, newest_pr_for_lane, usage_records):
         reason = "available"
     item.update({
         "ticket": active,
-        "model": model_display or bus_brain._lane_model(lane_name),
+        "model": model_display or bus_brain.lane_model(lane_name),
         "quota": _lane_quota(lane_name, usage_records),
         "reason": reason,
     })

@@ -3697,7 +3697,7 @@ def _when(stamp: Any) -> Optional[datetime]:
         return None
 
 
-def _lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+def lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """The model a lane runs when a brief names none: its configured setting,
     LOOM_<SLOT>_MODEL, else LOOM_<PROVIDER>_MODEL for a numbered slot
     (lanes/run_lane.sh lane_setting); None when neither is set. Never a fixed
@@ -3767,7 +3767,7 @@ def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datet
     force (an escalation or an equivalent move, bus/factory.py EQUIVALENTS,
     sets the one it gave), else the model the runner footer of the claim's
     lane's pull request names (`footer`, (lane, model)), else the lane's
-    configured model (_lane_model), as bus/factory.py claim_models reads it."""
+    configured model (lane_model), as bus/factory.py claim_models reads it."""
     from .factory import EQUIVALENT_RE  # factory imports this module
     tried: List[str] = []
     for body, _ in bodies:
@@ -3780,7 +3780,7 @@ def _tried_models(current: Optional[str], bodies: List[Tuple[str, Optional[datet
             current = equivalent.group(1)
         elif claim:
             lane = claim.group(1)
-            model = current or (footer[1] if footer and footer[0] == lane else _lane_model(lane))
+            model = current or (footer[1] if footer and footer[0] == lane else lane_model(lane))
             if model and model not in tried:
                 tried.append(model)
     return tried

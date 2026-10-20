@@ -178,7 +178,7 @@ class InstallScriptTest(unittest.TestCase):
 
     def test_lane_model_settings_are_written_to_station_plist(self):
         # The factory reads what a lane ran from its setting (bus/brain.py
-        # _lane_model) when no Model: line or runner footer names the model.
+        # lane_model) when no Model: line or runner footer names the model.
         result = self.run_install(LOOM_CLAUDE_MODEL="claude-test")
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()

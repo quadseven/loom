@@ -15,7 +15,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bus import factory  # noqa: E402
+from bus import labels  # noqa: E402
 from dashboard import tiers, tiers_sources  # noqa: E402
+from dashboard.tiers_sources import SourceState  # noqa: E402
 from dashboard.server import _dispatch_get  # noqa: E402
 from dashboard.shell import VIEWS  # noqa: E402
 
@@ -30,7 +32,11 @@ STATS_24H = {
     "ledger": {"enabled": True, "queued": 0, "written": 9, "dropped": 0, "write_errors": 0,
                "last_error": None, "last_error_at": None},
     "open": [{"target": "groq", "lane": "*", "caller": None, "reason": "rate_limited", "reopens_in_s": 600},
-             {"target": "kilo", "lane": "*", "caller": None, "reason": "auth", "reopens_in_s": 3600}],
+             {"target": "kilo", "lane": "*", "caller": "grug", "reason": "auth", "reopens_in_s": 3600},
+             # A breaker on another model of the same target does not touch this row.
+             {"target": "spark-a", "lane": "other-model", "caller": None, "reason": "error", "reopens_in_s": 60},
+             {"target": "nvidia", "lane": "*", "caller": None, "reason": "benched", "benched": True,
+              "reopens_in_s": None}],
     "rows": [
         {"kind": "remote", "target": "ollama-cloud", "model": "nemotron-3-ultra", "hits": 9, "ok": 9,
          "limit": 0, "auth": 0, "missing": 0, "error": 0, "client_error": 0, "success_rate": 1.0,
@@ -68,11 +74,11 @@ USAGE = [
     {"provider": "codex", "lanes": ["codex", "codex-2"], "window": "weekly", "used_pct": 70.0,
      "resets_at": (NOW + timedelta(days=2)).isoformat(), "source": "fixture",
      "as_of": (NOW - timedelta(minutes=5)).isoformat(), "note": "", "holds": {}},
-    # anthropic: every slot held at its limit until 15:00.
-    {"provider": "anthropic", "lanes": ["anthropic", "anthropic-2"], "window": "credit", "used_pct": None,
+    # anthropic: every slot held out of credit until 15:00 (the runner holds
+    # every slot of a shared credit at once).
+    {"provider": "anthropic", "lanes": list(factory.ANTHROPIC), "window": "credit", "used_pct": None,
      "resets_at": None, "source": "fixture", "as_of": (NOW - timedelta(minutes=5)).isoformat(), "note": "",
-     "holds": {"anthropic": "limit: out of credit; lane waits until 2026-10-19T15:00:00Z",
-               "anthropic-2": "limit: out of credit; lane waits until 2026-10-19T15:00:00Z"}},
+     "holds": {slot: "limit: out of credit; lane waits until 2026-10-19T15:00:00Z" for slot in factory.ANTHROPIC}},
     # claude: held with no end time: benched with its reason.
     {"provider": "claude", "lanes": ["claude"], "window": "5-hour", "used_pct": None, "resets_at": None,
      "source": "fixture", "as_of": (NOW - timedelta(minutes=5)).isoformat(), "note": "",
@@ -82,7 +88,9 @@ STATE = {"inflight": [{"id": 7, "ts": T - 42, "target": "spark-a", "path": "/v1/
                        "model": "coder-120b", "resolved_model": "coder-120b", "source": "grug",
                        "cancelling": False, "age_s": 42.0}]}
 GRUG = {"inflight": [{"persona": "elder", "repo": "example-org/app", "pr": 7, "model": "model-g",
-                      "started_at": "2026-10-19T11:59:00Z"}],
+                      "started_at": "2026-10-19T11:59:00Z"},
+                     {"persona": "chief", "repo": "example-org/app", "pr": 8, "model": "model-c",
+                      "started_at": "2026-10-19T11:59:30Z"}],
         "tiers": [{"model": "model-g", "backend": "gateway"}, "model-h"]}
 STATION = [{"repo": "example-org/app", "number": 12, "title": "Add the export button", "lane": "spark-2",
             "model": "coder-120b", "age": "14m", "html_url": "https://github.com/example-org/app/issues/12"}]
@@ -95,17 +103,15 @@ def setUpModule():
 
 
 def good(data, at=GOOD_AT, name="source"):
-    return {"name": name, "configured": True, "missing": "", "data": data, "last_good_at": at,
-            "read_at": at, "stale": False, "error": ""}
+    return SourceState(name=name, data=data, last_good_at=at, read_at=at)
 
 
 def stale(data, error, at=GOOD_AT, name="source"):
-    return dict(good(data, at, name), stale=True, error=error)
+    return SourceState(name=name, data=data, last_good_at=at, read_at=T, stale=True, error=error)
 
 
 def unset(missing, name="source"):
-    return {"name": name, "configured": False, "missing": missing, "data": None, "last_good_at": None,
-            "read_at": None, "stale": False, "error": ""}
+    return SourceState.unconfigured(name, missing)
 
 
 def sources(**changes):
@@ -130,8 +136,9 @@ def panel(body, key):
     return body[start:body.index("</section>", start)]
 
 
-def row(rows, provider, model):
-    found = [r for r in rows if r["provider"] == provider and r["model"] == model]
+def row(rows, provider, model, source=None):
+    found = [r for r in rows if r["provider"] == provider and r["model"] == model
+             and (source is None or r["source"] == source)]
     if len(found) != 1:
         raise AssertionError("%d rows for %s %s" % (len(found), provider, model))
     return found[0]
@@ -145,7 +152,7 @@ class TierList(unittest.TestCase):
         for tier in listed[:-1]:
             self.assertEqual([e["lane"] for e in tier["entries"]], list(factory.TIERS[tier["name"]]))
             for entry in tier["entries"]:
-                self.assertEqual(entry["kind"], factory.LANE_KINDS[entry["lane"]])
+                self.assertEqual(entry["kind"], factory.lane_kind(entry["lane"]))
         hard = {e["lane"]: e for e in listed[2]["entries"]}
         self.assertEqual(hard["codex"]["model"], factory.HARD_MODELS["codex"])
         easy = {e["lane"]: e for e in listed[0]["entries"]}
@@ -175,6 +182,13 @@ class TierList(unittest.TestCase):
         self.assertIn("waiting for Grug's endpoint", panel(body, "tiers"))
 
 
+def line(body, key):
+    match = re.search(r'<tr class="tiers-row[^"]*" data-row="%s">.*?</tr>' % re.escape(key), body, re.S)
+    if not match:
+        raise AssertionError("no row %s" % key)
+    return match.group(0)
+
+
 class ModelRows(unittest.TestCase):
     def rows(self, **changes):
         s = sources(**changes)
@@ -191,6 +205,8 @@ class ModelRows(unittest.TestCase):
         spark = row(rows, "spark-a", "coder-120b")
         self.assertEqual(spark["kind"], "own-hardware")
         self.assertEqual(spark["w24"]["success"], 0.75)
+        # Its target's breaker on another model does not cool this one.
+        self.assertEqual(spark["allowance"]["state"], "available")
 
     def test_a_limit_only_row_has_no_success_rate_and_cools_until_its_breaker_reopens(self):
         groq = row(self.rows(), "groq", "llama-5-70b")
@@ -198,16 +214,36 @@ class ModelRows(unittest.TestCase):
         self.assertIsNone(groq["w24"]["success"])
         self.assertEqual(groq["allowance"]["state"], "cooling")
         self.assertEqual(groq["allowance"]["until"], NOW + timedelta(seconds=600))
-        body = page()
-        line = re.search(r'<tr class="tiers-row[^"]*" data-row="groq llama-5-70b">.*?</tr>', body, re.S).group(0)
-        self.assertIn(">n/a<", line)
-        self.assertNotIn("0%", line)
-        self.assertIn("cooling until 2026-10-19 12:10 UTC", line)
+        text = line(page(), "groq llama-5-70b")
+        self.assertIn(">n/a<", text)
+        self.assertNotIn("0%", text)
+        self.assertIn("cooling until 2026-10-19 12:10 UTC", text)
+        self.assertIn("10m breaker window", text)
+        self.assertIn("rate_limited", text)
 
-    def test_an_open_breaker_for_another_reason_is_benched_with_it(self):
+    def test_an_open_breaker_for_another_reason_also_cools_with_its_time_reason_and_caller(self):
         kilo = row(self.rows(), "kilo", "kilo-coder")
-        self.assertEqual(kilo["allowance"]["state"], "benched")
+        self.assertEqual(kilo["allowance"]["state"], "cooling")
+        self.assertEqual(kilo["allowance"]["until"], NOW + timedelta(hours=1))
         self.assertIn("auth", kilo["allowance"]["text"])
+        self.assertIn("caller grug", kilo["allowance"]["text"])
+        self.assertIn("1h 0m breaker window", kilo["allowance"]["text"])
+
+    def test_benched_is_only_what_the_gateway_reports_benched(self):
+        nim = row(self.rows(), "nvidia", "nim-coder")
+        self.assertEqual(nim["allowance"]["state"], "benched")
+        self.assertIn("benched", nim["allowance"]["text"])
+
+    def test_stale_gateway_stats_claim_no_allowance(self):
+        rows = self.rows(gateway_24h=stale(STATS_24H, "answered 503: ledger off"),
+                         gateway_7d=stale(STATS_7D, "answered 503: ledger off"))
+        for target, model in (("ollama-cloud", "nemotron-3-ultra"), ("groq", "llama-5-70b")):
+            allowance = row(rows, target, model)["allowance"]
+            self.assertEqual(allowance["state"], "unknown")
+            self.assertEqual(allowance["text"], "unknown (stale since 2026-10-19 11:58 UTC)")
+        # One fresh window is enough for a current claim.
+        rows = self.rows(gateway_7d=stale(STATS_7D, "answered 503: ledger off"))
+        self.assertEqual(row(rows, "groq", "llama-5-70b")["allowance"]["state"], "cooling")
 
     def test_a_row_seen_this_week_only_has_a_real_zero_today(self):
         nim = row(self.rows(), "nvidia", "nim-coder")
@@ -220,21 +256,49 @@ class ModelRows(unittest.TestCase):
         self.assertIsNone(nemotron["w7d"])
         self.assertEqual(nemotron["w24"]["hits"], 9)
         body = page(gateway_7d=stale(None, "answered 503: ledger off", at=None))
-        line = re.search(r'<tr class="tiers-row[^"]*" data-row="ollama-cloud nemotron-3-ultra">.*?</tr>',
-                         body, re.S).group(0)
-        self.assertIn("unknown", line)
+        self.assertIn("unknown", line(body, "ollama-cloud nemotron-3-ultra"))
 
     def test_loom_rows_count_runs_per_lane_and_model(self):
-        rows = self.rows()
-        codex = row(rows, "codex", "gpt-6-sol")
+        codex = row(self.rows(), "codex", "gpt-6-sol")
         self.assertEqual((codex["unit"], codex["kind"]), ("runs", "subscription"))
-        self.assertEqual((codex["w24"]["hits"], codex["w24"]["ok"]), (4, 3))
-        self.assertAlmostEqual(codex["w24"]["success"], 0.75)
-        self.assertEqual((codex["w7d"]["hits"], codex["w7d"]["success"]), (15, 10 / 15))
+        self.assertEqual((codex["w24"]["hits"], codex["w24"]["ok"], codex["w24"]["failed"]), (4, 3, 1))
         # The median of the runs that finished, as the gateway's is of ok calls.
         self.assertEqual(codex["w24"]["p50_ms"], 900000)
 
-    def test_loom_allowance_from_the_usage_readings(self):
+    def test_a_loom_failure_may_be_a_limit_so_its_success_rate_is_unknown(self):
+        rows = self.rows()
+        codex = row(rows, "codex", "gpt-6-sol")
+        self.assertIsNone(codex["w24"]["success"])
+        self.assertTrue(codex["w24"]["limits_unseparated"])
+        text = line(page(), "loom codex gpt-6-sol")
+        self.assertIn("unknown (limits not separated)", text)
+        self.assertNotIn("75%", text)
+        # With no failed run nothing can be a hidden limit: every run finished.
+        self.assertEqual(row(rows, "anthropic", "claude-opus-5-5")["w24"]["success"], 1.0)
+
+    def test_every_lane_in_the_tiers_has_a_loom_row_even_with_no_runs(self):
+        rows = self.rows(loom_runs=good([RUNS[0]]))
+        lanes = {r["provider"] for r in rows if r["source"] == "loom"}
+        wanted = {labels.base_lane(lane) for lanes in factory.TIERS.values() for lane in lanes}
+        self.assertEqual(wanted - lanes, set())
+        anthropic = [r for r in rows if r["source"] == "loom" and r["provider"] == "anthropic"]
+        self.assertEqual(len(anthropic), 1)
+        # Out of credit and no runs this week: the row that matters most.
+        self.assertEqual(anthropic[0]["allowance"]["state"], "cooling")
+        self.assertEqual(anthropic[0]["w24"]["hits"], 0)
+        self.assertTrue(anthropic[0]["no_runs"])
+        self.assertIn("anthropic-8", anthropic[0]["slots"])
+        self.assertIn("no runs in 7 days", line(tiers.render(tiers.build(sources(loom_runs=good([RUNS[0]])), NOW)),
+                                                 "loom anthropic"))
+
+    def test_with_no_run_outcomes_every_tier_lane_still_has_a_row_with_unknown_cells(self):
+        rows = self.rows(loom_runs=stale(None, "database is down", at=None))
+        zen = row(rows, "zen", "", source="loom")
+        self.assertIsNone(zen["w24"])
+        self.assertIsNone(zen["w7d"])
+        self.assertEqual(zen["allowance"]["state"], "available")
+
+    def test_loom_allowance_from_the_usage_readings_with_the_window(self):
         rows = self.rows()
         codex = row(rows, "codex", "gpt-6-sol")
         self.assertEqual(codex["allowance"]["state"], "metered")
@@ -244,6 +308,9 @@ class ModelRows(unittest.TestCase):
         self.assertEqual(anthropic["kind"], "never-paid")
         self.assertEqual(anthropic["allowance"]["state"], "cooling")
         self.assertEqual(anthropic["allowance"]["until"], datetime(2026, 10, 19, 15, 0, tzinfo=timezone.utc))
+        self.assertEqual(anthropic["allowance"]["window"], "Credit")
+        self.assertIn("cooling until 2026-10-19 15:00 UTC (in 3h 0m), credit window: out of credit",
+                      anthropic["allowance"]["text"])
         claude = row(rows, "claude", "claude-sonnet-5-5")
         self.assertEqual(claude["allowance"]["state"], "benched")
         self.assertIn("token expired", claude["allowance"]["text"])
@@ -252,13 +319,29 @@ class ModelRows(unittest.TestCase):
         rows = self.rows(usage=stale(None, "no usage snapshot since the dashboard started", at=None))
         self.assertEqual(row(rows, "codex", "gpt-6-sol")["allowance"]["state"], "unknown")
 
+    def test_a_stale_usage_snapshot_claims_no_allowance(self):
+        rows = self.rows(usage=stale(USAGE, "no station upload in 3h"))
+        allowance = row(rows, "anthropic", "claude-opus-5-5")["allowance"]
+        self.assertEqual(allowance["state"], "unknown")
+        self.assertEqual(allowance["text"], "unknown (stale since 2026-10-19 11:58 UTC)")
+
+    def test_gateway_and_loom_rows_are_two_titled_tables(self):
+        body = page()
+        gateway, loom = panel(body, "gateway"), panel(body, "loom")
+        self.assertIn("Gateway calls by target and model", gateway)
+        self.assertIn("Loom runs by lane and model", loom)
+        self.assertIn('data-row="spark-a coder-120b"', gateway)
+        self.assertNotIn('data-row="loom ', gateway)
+        self.assertIn('data-row="loom spark"', loom)
+        self.assertNotIn('data-row="spark-a', loom)
+
 
 class StalePanels(unittest.TestCase):
     """Stopping any one source shows that panel as stale with its last good
     time, and the rest of the page still renders (one test per source)."""
 
     def assertRestRenders(self, body, *, except_panel):
-        for key in ("tiers", "models", "live"):
+        for key in ("tiers", "gateway", "loom", "live"):
             if key != except_panel:
                 self.assertIn('id="tiers-%s"' % key, body)
         self.assertIn("Add the export button", panel(body, "live"))
@@ -266,13 +349,13 @@ class StalePanels(unittest.TestCase):
     def test_gateway_stats_503_shows_the_models_panel_stale_with_its_last_good_rows(self):
         body = page(gateway_24h=stale(STATS_24H, "answered 503: ledger database unavailable",
                                       name="Gateway stats, 24 hours"))
-        models = panel(body, "models")
+        models = panel(body, "gateway")
         self.assertIn("Stale", models)
         self.assertIn("Gateway stats, 24 hours", models)
         self.assertIn("ledger database unavailable", models)
         self.assertIn("last good read 2026-10-19 11:58 UTC", models)
         self.assertIn('data-row="ollama-cloud nemotron-3-ultra"', models)
-        self.assertRestRenders(body, except_panel="models")
+        self.assertRestRenders(body, except_panel="gateway")
 
     def test_gateway_state_timeout_shows_the_gateway_live_panel_stale(self):
         body = page(gateway_state=stale(None, "timed out after 5s", at=None, name="Gateway in-flight calls"))
@@ -304,12 +387,13 @@ class StalePanels(unittest.TestCase):
 
     def test_transcripts_unavailable_shows_loom_runs_stale_and_the_gateway_rows_still_render(self):
         body = page(loom_runs=stale(None, "database is down", at=None, name="Loom run outcomes"))
-        models = panel(body, "models")
-        self.assertIn("Loom run outcomes", models)
-        self.assertIn("database is down", models)
-        self.assertNotIn('data-row="codex gpt-6-sol"', models)
-        self.assertIn('data-row="ollama-cloud nemotron-3-ultra"', models)
-        self.assertRestRenders(body, except_panel="models")
+        loom = panel(body, "loom")
+        self.assertIn("Loom run outcomes", loom)
+        self.assertIn("database is down", loom)
+        self.assertNotIn('data-row="codex gpt-6-sol"', loom)
+        self.assertIn("unknown", line(body, "loom codex"))
+        self.assertIn('data-row="ollama-cloud nemotron-3-ultra"', panel(body, "gateway"))
+        self.assertRestRenders(body, except_panel="loom")
 
     def test_station_tickets_stale_shows_the_loom_live_panel_stale(self):
         body = page(station=stale(STATION, "GitHub rate limit", name="Station tickets"))
@@ -322,7 +406,7 @@ class StalePanels(unittest.TestCase):
     def test_the_gateway_unset_says_which_setting_is_missing(self):
         missing = unset("LOOM_GATEWAY_URL is not set")
         body = page(gateway_24h=missing, gateway_7d=missing, gateway_state=missing)
-        self.assertIn("LOOM_GATEWAY_URL is not set", panel(body, "models"))
+        self.assertIn("LOOM_GATEWAY_URL is not set", panel(body, "gateway"))
         self.assertIn("LOOM_GATEWAY_URL is not set", panel(body, "live"))
 
 
@@ -330,6 +414,7 @@ class LiveNow(unittest.TestCase):
     def test_live_now_shows_a_loom_run_a_gateway_call_and_a_grug_review(self):
         s = sources()
         live = tiers.live_now(s["station"], s["gateway_state"], s["grug"], NOW)
+        self.assertEqual(live["loom"]["source"].name, "Station tickets")
         self.assertEqual(live["loom"]["items"][0]["lane"], "spark-2")
         self.assertEqual(live["gateway"]["items"][0]["target"], "spark-a")
         self.assertEqual(live["grug"]["items"][0]["persona"], "elder")
@@ -343,14 +428,22 @@ class LiveNow(unittest.TestCase):
         self.assertIn("example-org/app#7", body)
         self.assertIn("model-g", body)
 
+    def test_grug_live_shows_elder_reviews_only(self):
+        s = sources()
+        live = tiers.live_now(s["station"], s["gateway_state"], s["grug"], NOW)
+        self.assertEqual([item["persona"] for item in live["grug"]["items"]], ["elder"])
+        body = panel(page(), "live")
+        self.assertNotIn("model-c", body)
+        self.assertNotIn("example-org/app#8", body)
+
     def test_grug_entries_are_read_defensively(self):
-        grug = good({"inflight": [{"persona": "<b>elder</b>", "pr": "x"}, "junk", None,
+        grug = good({"inflight": [{"persona": "Elder", "pr": "x", "model": "<b>m</b>"}, "junk", None,
                                   {"repo": "example-org/app", "pr": 3, "started_at": "not a time"}]})
         live = tiers.live_now(good([]), good({"inflight": []}), grug, NOW)
         self.assertEqual(len(live["grug"]["items"]), 2)
         body = tiers.render(tiers.build(sources(grug=grug), NOW))
-        self.assertIn("&lt;b&gt;elder&lt;/b&gt;", body)
-        self.assertNotIn("<b>elder</b>", body)
+        self.assertIn("&lt;b&gt;m&lt;/b&gt;", body)
+        self.assertNotIn("<b>m</b>", body)
 
     def test_nothing_in_flight_is_said_plainly(self):
         body = panel(page(gateway_state=good({"inflight": []}), station=good([]), grug=good({"inflight": []})), "live")
@@ -412,8 +505,9 @@ class Route(unittest.TestCase):
         self.assertNotIn("Merged one", live)
         self.assertIn("spark-a", live)
         # No usage snapshot has arrived: allowance is unknown, not available.
-        models = panel(body, "models")
-        self.assertIn("no usage snapshot", models)
+        loom = panel(body, "loom")
+        self.assertIn("no usage snapshot", loom)
+        self.assertIn("unknown", line(body, "loom anthropic claude-opus-5-5"))
 
     def test_a_state_without_background_sources_still_renders(self):
         class State:

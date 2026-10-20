@@ -192,6 +192,17 @@ class ModelOutcomes(unittest.TestCase):
         self.assertIsNone(failed["p50_24h_s"])
         self.assertEqual(failed["p50_7d_s"], 300.0)
 
+    def test_memory_outcomes_map_a_slot_to_its_lane_with_the_shared_rule(self):
+        from bus import labels
+        store = transcripts.Store(transcripts.MemoryBackend())
+        now = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+        for slot in ("opencode-go-3", "free-kilo"):
+            store.upload(self.run_body(slot, "model-x", "done", timedelta(hours=1), 10))
+        with patch.object(labels, "base_lane", side_effect=lambda slot: "lane-of-" + slot) as rule:
+            lanes = {r["lane"] for r in store.model_outcomes(now)}
+        self.assertTrue(rule.called)
+        self.assertEqual(lanes, {"lane-of-opencode-go-3", "lane-of-free-kilo"})
+
     def test_postgres_reads_one_aggregate_and_deletes_nothing(self):
         module = FakeDBAPI()
         backend = transcripts.PostgresBackend(module)

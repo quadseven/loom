@@ -148,17 +148,39 @@ check.
 `/tiers` (Tiers and allowances, loom#968) shows the whole tier system in
 one page. "Tiers" lists Loom's easy, medium and hard lanes in order and the
 model ladder (`TIERS` and `LADDER` in `bus/factory.py`), each lane with the
-model it runs and its kind from `LANE_KINDS`: own hardware (the Sparks),
-free, subscription or never paid (a prepaid credit the operator does not top
-up), then Grug's review order. "Providers and models" has one row per
-provider and model: the gateway's rows (calls, per target and model) and
-Loom's own lane runs (per lane and model, a numbered slot with its lane).
-Each row has its allowance state (available; cooling until a time, with the
-window; the tightest fresh meter's amount left; or benched with the reason)
-and its hits, success rate and median latency over 24 hours and 7 days.
-Success is ok out of the hits that were not limits, so a row whose every hit
-was a limit reads "n/a", not 0%. "Live now" lists the running Loom tickets,
-the gateway's calls in flight and Grug's reviews in flight.
+model it runs and its kind from `LANE_KINDS` (base lanes; a numbered slot
+takes its lane's kind): own hardware (the Sparks), free, subscription or never
+paid (a prepaid credit the operator does not top up), then Grug's review
+order. Two tables follow, so a Spark or free-pool lane is not read as two
+providers:
+
+- "Gateway calls by target and model": the gateway's calls per target (a
+  Spark or a free provider) and model. Success is ok out of the calls that
+  were not limits (a limit is allowance, not failure), so a row whose every
+  call was a limit reads "n/a", not 0%. Allowance is the gateway's `open`
+  breakers: an open breaker on the row's target (lane `*` or the row's
+  model) is "cooling until" its reopen time (`generated_at` plus
+  `reopens_in_s`), with the breaker window, its reason and its caller when
+  set, whatever the reason; "benched" is only a model the gateway reports
+  benched.
+- "Loom runs by lane and model": Loom's lane runs per lane (numbered slots
+  with their lane) and model, with a row for every lane the tiers name even
+  when it has not run in 7 days, since an out-of-credit lane is the one most
+  worth seeing. Allowance comes from the station's usage readings: cooling
+  until a hold ends, with the window whose reading holds it; benched for a
+  hold with no end; the tightest fresh meter's amount left; or available.
+  Limits are not separated in Loom rows: a stored run is done or failed, and
+  the runner's `[limit]` failure line is past the transcript's text cut, so a
+  failed run may have been a provider limit. A lane with no failure reads
+  100%; one with any failure reads "unknown (limits not separated)", with
+  its done and failed counts, rather than a rate that counts limits as
+  failures.
+
+A stale source makes no current claim: when the gateway stats (both
+windows) or the usage snapshot are stale, the allowance cells they feed read
+"unknown (stale since <time>)", never "available". "Live now" lists the
+running Loom tickets, the gateway's calls in flight and Grug's Elder reviews
+in flight (an entry naming another persona is left out).
 
 Its sources are read once a background refresh pass, side by side, each with
 a 5 second timeout, never by a page request (`dashboard/tiers_sources.py`):

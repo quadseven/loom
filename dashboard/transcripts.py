@@ -9,6 +9,8 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from bus import labels
+
 _ISSUE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$")
 _BRAIN = re.compile(r"^brain/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 _FIELDS = ("ticket", "slot", "model", "outcome", "started_at", "finished_at")
@@ -85,7 +87,8 @@ _GET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events
 # Run outcomes per lane and model over the last 7 days and the last 24 hours,
 # with the median run time, for the Tiers and allowances page (loom#968). A
 # numbered slot counts with its lane (codex-2 with codex), and the slots are
-# listed. Brain ticks are not lane runs. No percent sign: pg8000's format
+# listed. The regexp is bus/labels.py base_lane's rule, which the memory
+# backend calls; keep the two the same. Brain ticks are not lane runs. No percent sign: pg8000's format
 # paramstyle reads one as a placeholder.
 _OUTCOMES = ("SELECT regexp_replace(slot, '-[0-9]+$', '') AS lane, model, outcome, "
              "array_agg(DISTINCT slot) AS slots, "
@@ -146,7 +149,7 @@ class MemoryBackend:
             if age > 7 * 86400:
                 continue
             took = (datetime.fromisoformat(r["finished_at"].replace("Z", "+00:00")) - started).total_seconds()
-            lane = re.sub(r"-[0-9]+$", "", r["slot"])
+            lane = labels.base_lane(r["slot"])
             group = groups.setdefault((lane, r["model"], r["outcome"]), {"24h": [], "7d": [], "slots": set()})
             group["slots"].add(r["slot"])
             group["7d"].append(took)

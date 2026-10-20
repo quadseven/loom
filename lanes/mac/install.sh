@@ -188,7 +188,7 @@ loom_env() {
 
 # Each lane's model settings (LOOM_<LANE>_MODEL and LOOM_<LANE>_MODELS), for
 # the station: its factory reads what a lane ran from them when a claim had
-# no Model: line and no runner footer names it (bus/brain.py _lane_model).
+# no Model: line and no runner footer names it (bus/brain.py lane_model).
 model_env() {
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
     case "$k" in LOOM_BRAIN_MODEL) continue ;; LOOM_*_MODEL|LOOM_*_MODELS) ;; *) continue ;; esac
