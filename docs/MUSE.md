@@ -693,6 +693,17 @@ say-so alone:
 - Put asks in a `needs-operator` issue with one exact ask. Use `loom:urgent`
   only for something breaking now.
 - Never retry a failed step in the same tick. Stop at 25 minutes.
+- Every note or piece of evidence a tick leaves on an issue, outside the
+  comments a `bus` or `bus.brain` command writes itself, goes through
+  `python3 -m bus journal OWNER/NAME#N --file FILE --holder NAME`: it edits
+  your journal of the day on that issue in place (a file with no marker is
+  journaled as a tick), and a new comment emails everyone watching the
+  issue. Write the evidence only; the command adds the `Tick` line. Never
+  `gh issue comment` or a raw API comment for it. Evidence whose blocker kind
+  has no issue of exactly that kind goes to the goal home's journal, never to
+  the closest open issue: a comment there emails people about an issue the
+  evidence does not belong to (quadseven/wow-overseer#872, 2026-10-20). A new
+  kind gets its own issue when the goal's rules say so.
 - Never open a pull request for an issue that is not a Loom ticket. To get
   code written, brief a ticket and let a lane take it. The station lands,
   sends back and reconciles only pull requests linked to a ticket, so a pull

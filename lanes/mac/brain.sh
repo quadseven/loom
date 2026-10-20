@@ -261,7 +261,12 @@ step found or decided\" in place of the step \
 command MUSE.md gives; the wrapper records lock and unlock. LOOM_REPOS is \
 set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
-goal. This replaces the 15-minute limit in MUSE.md: stop within \
+goal. Post each journal, and every other note or evidence a tick leaves on \
+an issue, with python3 -m bus journal OWNER/NAME#N --file FILE --holder \
+$HOLDER, which edits your journal of the day there instead of emailing the \
+issue's watchers with a new comment; evidence whose blocker kind has no issue \
+of exactly that kind goes to the goal home's journal, never the closest \
+issue. This replaces the 15-minute limit in MUSE.md: stop within \
 $((MINUTES - 5)) minutes; you are cut off at $MINUTES."
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \
