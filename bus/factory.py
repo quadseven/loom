@@ -409,6 +409,25 @@ plain to the next reader, and say why in the commit message.
 - Keep the whole suite green, and change nothing the threads and checks do not \
 ask for."""
 
+# A green pull request that leaves ticket criteria unticked goes back with
+# each one named under this heading (2026-10-20: the generic note listed no
+# finding, so lanes had nothing to act on and one pull request came back six
+# times). stuck() climbs a ticket whose last round left a named one unticked.
+UNTICKED_HEADING = "### Acceptance criteria not ticked"
+
+
+def unticked_notes(missing: Sequence[str]) -> str:
+    """The fix note for criteria a lane pull request leaves unticked."""
+    return "\n".join([UNTICKED_HEADING, ""] + ["- " + c for c in missing] + [
+        "", "The factory sent this pull request back: its checks and review pass, "
+        "but the ticket criteria above are not ticked in its body.", "",
+        "- Build each criterion the change does not cover yet, with a test that fails "
+        "without it.",
+        "- Then tick each built criterion in the pull request body's ## Acceptance "
+        "criteria, or leave it unticked and end its line with \"; not built: <reason>\".",
+        "- Change nothing else."])
+
+
 TEST_NOTES = NO_TEST_HEADING + """
 
 The factory sent this pull request back: it changes code and no test file.
@@ -475,7 +494,7 @@ def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
 
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
           checks_failing: bool, age: float, now: float = 0.0,
-          no_test: bool = False) -> bool:
+          no_test: bool = False, unticked: Sequence[str] = ()) -> bool:
     """Did the last fix round fail to move this pull request? True when a
     thread it was asked to fix is still open, when checks it was asked to fix
     still fail, when it was asked for a test and still has none, or when the
@@ -490,6 +509,8 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     if set(FIX_THREAD_RE.findall(last)) & set(open_threads):
         return True
     if no_test and NO_TEST_HEADING in last:
+        return True
+    if unticked and UNTICKED_HEADING in last and any("- " + c in last for c in unticked):
         return True
     return checks_failing and bool(FIX_CHECK_RE.search(last))
 
@@ -1438,10 +1459,10 @@ class Factory:
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
-                   no_test: bool = False) -> None:
+                   no_test: bool = False, unticked: Sequence[str] = ()) -> None:
         number = int(issue["number"])
         age = self.now - _ts(pr.get("created_at"))
-        if stuck(comments, open_threads, checks_failing, age, self.now, no_test):
+        if stuck(comments, open_threads, checks_failing, age, self.now, no_test, unticked):
             footer = self._footer(repo, pr)
             if self._climb(repo, issue, comments, why, footer=footer) is None:
                 if RUNAWAY in _labels(issue):
@@ -1466,12 +1487,20 @@ class Factory:
             lane, _ = self._tier_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
+        notes = TEST_NOTES if no_test else FIX_NOTES
+        if unticked:
+            try:
+                # Criteria are ticket text: one the written-text check refuses
+                # (a closing keyword, a path) must not stop the send-back.
+                brain._check_written_text(unticked_notes(unticked))
+                notes = unticked_notes(unticked)
+            except ValueError as err:
+                _say("%s#%d: unticked criteria not quoted in the fix note (%s)"
+                     % (repo, number, err))
         if lane is not None:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
-                     TEST_NOTES if no_test else FIX_NOTES, lane=lane)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes, lane=lane)
         else:
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number),
-                     TEST_NOTES if no_test else FIX_NOTES)
+            self.fix(self.gh, repo, int(pr["number"]), (repo, number), notes)
         self.actions += 1
         _say("sent %s#%d back for #%d (%s)" % (repo, pr["number"], number, why))
 
@@ -1713,7 +1742,8 @@ class Factory:
         if missing:
             self._send_back(repo, full, issue, comments,
                             "unticked acceptance criteria; build these or mark each "
-                            "not built with a reason: " + "; ".join(missing))
+                            "not built with a reason: " + "; ".join(missing),
+                            unticked=missing)
         elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
