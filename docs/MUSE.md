@@ -330,7 +330,9 @@ this tick"; a step with no note shows nothing there.
    fault (file a factory ticket and keep the runaway hold), brief problem
    (rewrite the brief, then clear `loom:runaway`), or model limit (escalate
    once with the reason, then clear `loom:runaway`). Do not clear a factory
-   fault hold until its fix ships.
+   fault hold until its fix ships. A held ticket is `loom:failed`, never a
+   live claim: its last run has ended, and once the hold is cleared the
+   factory moves it up the model ladder.
 3. First run `python3 -m bus.brain step merge --holder muse`. The station hands failed checks and unresolved review-bot threads back to
    the authoring lane automatically, up to `LOOM_FIX_ROUNDS` (default 3).
    The factory pass (bus/factory.py) moves stuck and failed tickets up the
