@@ -55,7 +55,7 @@ that talks to GitHub about tickets.
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; its triage comment names the missing sections. The brain rewrites it (`brief --refs`) or marks it `loom:human`. |
-| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified, then closes as completed (see Rewritten issues close with their ticket). |
+| `loom:rewritten` | The brain wrote a ticket from this issue; the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `loom:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:window` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, or a deploy or roll window. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
@@ -520,6 +520,14 @@ issue when it moves:
   ticket was dropped and a person decides.
 - **A failed proof audit:** a source Loom closed for that ticket opens again,
   and closes again when the ticket is verified again.
+- **Closed with no proof** (the station's done close, or a person's close):
+  once an hour the station reads each open `loom:rewritten` issue, and one
+  whose ticket is closed settles by the ticket's close reason, up to 25 a
+  run. Closed as completed closes the source as completed, labelled
+  `force-close` when its own criteria are unchecked, by the same rule that
+  closed the ticket. A source Loom already said something about for that
+  ticket is left alone. Before 2026-10-20 these sources stayed open: 87 of
+  them counted as open work.
 
 Only the paired source is touched: open (or, for the audit, closed by Loom),
 labelled `loom:rewritten`, and carrying the rewrite comment that names this

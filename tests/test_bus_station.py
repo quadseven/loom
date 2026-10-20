@@ -301,6 +301,9 @@ class FakeGitHub:
         if "labels=loom%3Ashipped" in query or "labels=loom:shipped&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:shipped" in self.names(i["number"])])
+        if "labels=loom:rewritten&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:rewritten" in self.names(i["number"])])
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
@@ -2396,8 +2399,8 @@ class CorruptStateTest(Base):
         # scan's merged and shipped lists, and the invariant check's read of
         # open pull requests (their plan checks) still run, and so does
         # reconciliation's read of the open tickets (loom#784) and the
-        # done-ticket close step's.
-        self.assertEqual(self.run_pass().requests, 9)
+        # done-ticket close step's, and the hourly read of rewritten sources.
+        self.assertEqual(self.run_pass().requests, 10)
 
 
 class TicketsTest(unittest.TestCase):
@@ -6375,6 +6378,61 @@ class CloseDoneTest(Base):
         self.assertNotIn("force-close", self.fake.names(2))
         plain = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
         self.assertEqual(plain, [])
+
+
+class SettleOrphanSourcesTest(Base):
+    """A loom:rewritten source whose ticket a person or the done close
+    closed settles too; before, only a verified or brain-closed ticket's did,
+    and 87 such sources sat open (2026-10-20)."""
+
+    def source(self, number, ticket, labels=("loom:rewritten",)):
+        self.fake.issues[number] = {
+            "number": number, "title": "An old ask", "body": "Please do it.\n",
+            "state": "open", "user": {"login": "alice-example"},
+            "labels": [{"name": x} for x in labels]}
+        self.fake.events[number] = []
+        self.fake.comments[number] = [{
+            "body": "%s\nRewritten as ticket #%d, which refs this issue." % (
+                brain.TRIAGE_MARKER, ticket), "user": {"login": "alice-example"}}]
+
+    def ticket(self, number, source, state="open", reason=None):
+        self.fake.add(number, lane="codex", state="shipped",
+                      body=SHIPPED_BODY + "\nRewritten from issue %d.\n" % source)
+        self.fake.issues[number]["state"] = state
+        if reason:
+            self.fake.issues[number]["state_reason"] = reason
+
+    def test_a_closed_tickets_source_closes_and_an_open_tickets_stays(self):
+        self.fake.private = False
+        self.ticket(11, 1, "closed", "completed")
+        self.source(1, 11)
+        self.ticket(12, 2)
+        self.source(2, 12)
+        self.ticket(13, 3, "closed", "not_planned")
+        self.source(3, 13)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertEqual(self.fake.issues[1]["state_reason"], "completed")
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+        self.assertEqual(self.fake.issues[3]["state"], "open")
+        self.assertIn("not planned", self.fake.comments[3][-1]["body"])
+
+    def test_it_runs_once_an_hour_and_reads_each_rewrite_comment_once(self):
+        self.fake.private = False
+        self.ticket(12, 2)
+        self.source(2, 12)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.settle_orphan_sources()
+        reads = self.fake.paths("GET").count("/repos/%s/issues/2/comments" % REPO)
+        st.settle_orphan_sources()
+        self.assertEqual(self.fake.paths("GET").count("/repos/%s/issues/2/comments" % REPO),
+                         reads)
+        st.now += station.SETTLE_EVERY
+        self.fake.issues[12]["state"] = "closed"
+        self.fake.issues[12]["state_reason"] = "completed"
+        st.settle_orphan_sources()
+        self.assertEqual(self.fake.issues[2]["state"], "closed")
 
 
 class VerifyDispatchTest(Base):
