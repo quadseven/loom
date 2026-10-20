@@ -1803,8 +1803,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         raise ValueError("priority must be one of %s" % ", ".join(tickets.PRIORITIES))
     if refs is not None and regresses is not None:
         raise ValueError("a brief is a rewrite or a regression, not both")
-    source = _check_rewritable(gh, repo, refs) if refs is not None else None
-    elsewhere = _in_place_refusal(source, env) if source is not None else None
+    source, elsewhere = _rewrite_source(gh, repo, refs, env)
     if elsewhere is not None:
         body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
     _check_written_text(title + "\n" + body)
@@ -1832,16 +1831,33 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
         epic = intake_epic(gh, repo, goal)
-    if source is not None and elsewhere is None:
-        issue = _rewrite_in_place(gh, repo, source, epic, title,
-                                  _with_part_of(full_body, epic), lane)
-    else:
-        issue = _filed_rewrite(gh, repo, epic, title, _with_part_of(full_body, epic), lane,
-                               refs, elsewhere)
+    issue = _brief_issue(gh, repo, epic, title, _with_part_of(full_body, epic), lane,
+                         source, elsewhere)
     url = str(issue.get("html_url", ""))
     if done:
         _journal_brief_done(gh, repo, goal, str(holder), done, url)
     return url
+
+
+def _rewrite_source(gh: GitHub, repo: str, refs: Optional[int],
+                    env: Optional[Dict[str, str]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """The issue a brief rewrites and why it cannot become the ticket itself
+    (None when it can); (None, None) for a brief that rewrites nothing."""
+    if refs is None:
+        return None, None
+    source = _check_rewritable(gh, repo, refs)
+    return source, _in_place_refusal(source, env)
+
+
+def _brief_issue(gh: GitHub, repo: str, epic: int, title: str, body: str,
+                 lane: Optional[str], source: Optional[Dict[str, Any]],
+                 elsewhere: Optional[str]) -> Dict[str, Any]:
+    """The ticket a brief makes: the rewritten source itself when it can be
+    (_rewrite_in_place), else a new issue (_filed_rewrite)."""
+    if source is not None and elsewhere is None:
+        return _rewrite_in_place(gh, repo, source, epic, title, body, lane)
+    refs = int(source["number"]) if source is not None else None
+    return _filed_rewrite(gh, repo, epic, title, body, lane, refs, elsewhere)
 
 
 def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
