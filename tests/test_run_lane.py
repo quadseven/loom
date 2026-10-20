@@ -1612,7 +1612,7 @@ cat > /dev/null
         self.assertEqual(result.returncode, 0, result.stderr)
         agent = [c for c in self.calls() if c.startswith("opencode ")]
         self.assertEqual(len(agent), 1, self.calls())
-        self.assertIn("-m openrouter/vendor/model:free", agent[0])
+        self.assertIn("-m openrouter/vendor/model:free --print-logs --log-level ERROR", agent[0])
         self.assertIn("keyvar=OPENROUTER_API_KEY key=fake-or-key", agent[0])
         self.assertIn("ssh=none", agent[0])
         self.assertIn("ghtoken=none", agent[0])
@@ -3001,6 +3001,9 @@ exit %d
         ("AuthenticationError: HTTP 401 Unauthorized", 1, True, "auth"),
         ("panic: something broke before any edit", 1, False, "transient"),
         ("killed", 137, True, "transient"),
+        ('level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
+         'openrouter/vendor/gone:free. Did you mean: vendor/other:free?"\n'
+         'Error: {"name": "UnknownError", "message": "Unexpected server error."}', 1, False, "limit"),
         ("FAILED tests/test_x.py::test_y - AssertionError at line 429", 1, True, "work"),
         ("I looked and there is nothing to change.", 0, False, "work"),
     ]
@@ -3043,6 +3046,21 @@ exit %d
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
         self.assertEqual(self.calls(), [])
         self.assertFalse(self.beat()["available"])
+
+    def test_a_model_the_cli_no_longer_offers_rests_the_lane_for_a_day(self):
+        # openrouter, 2026-10-20: models.dev marked the lane's free model
+        # deprecated, opencode dropped it and printed only "UnknownError:
+        # Unexpected server error", and every run failed transient while the
+        # lane rested 30 minutes at a time and claimed again.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="1", FAKE_OUT=(
+            'level=ERROR message=failed error="ProviderModelNotFoundError: Model not found: '
+            'openrouter/vendor/gone:free."\nError: {"name": "UnknownError"}'))
+        self.assertTrue(self.failure_line().startswith("[limit] "), self.failure_line())
+        self.assertIn("not found by the agent CLI", self.failure_line())
+        beat = self.beat()
+        self.assertFalse(beat["available"])
+        self.assertGreater(beat["retry_at"], int(time.time()) + 86000)
 
     def test_a_run_that_is_not_transient_clears_the_transient_count(self):
         for n, (out, status) in enumerate((("Unexpected server error", "1"),
