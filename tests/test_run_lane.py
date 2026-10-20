@@ -2611,6 +2611,53 @@ cat > /dev/null
     def spark_log(self):
         return (self.loom / "logs" / "spark" / "T042-fix-the-thing.log").read_text()
 
+    def test_spark_continues_a_text_only_final_step_and_succeeds(self):
+        self.write_tool(self.bin / "sandbox-exec", "#!/usr/bin/env bash\nshift 2\nexec \"$@\"\n")
+        self.write_tool(self.bin / "opencode", """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+args="$*"; args="${args//$'\\n'/ }"
+printf 'opencode %s\\n' "$args" >> "$TMPDIR/agent.log"
+if [[ " $* " == *" --continue "* ]]; then
+  echo fixed > fix.txt
+  printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \
+    '{"type":"tool_use","part":{"type":"tool","tool":"edit"}}'
+else
+  printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \
+    '{"type":"text","part":{"type":"text","text":"Let me read the build files."}}'
+fi
+""")
+        inbox = self.loom / "briefs" / "spark"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark"))
+        result = self.run_lane("spark", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("--continue", runs[1])
+        self.assertIn("Continue: carry out the step you just described", runs[1])
+        self.assertIn("Do not search the whole filesystem", runs[0])
+        self.assertIn("read the repository's build files", runs[0])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_spark_stops_after_one_continue_of_a_text_only_step(self):
+        self.write_tool(self.bin / "sandbox-exec", "#!/usr/bin/env bash\nshift 2\nexec \"$@\"\n")
+        self.write_tool(self.bin / "opencode", """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+printf 'opencode %s\\n' "$*" >> "$TMPDIR/agent.log"
+printf '%s\\n' '{"type":"step_start","part":{"type":"step-start"}}' \
+  '{"type":"text","part":{"type":"text","text":"Let me inspect the build."}}'
+""")
+        inbox = self.loom / "briefs" / "spark"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: spark"))
+        result = self.run_lane("spark", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(runs), 2, runs)
+        self.assertIn("--continue", runs[1])
+        self.assertIn("failed: [work] ended on a described step without taking it", self.spark_log())
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
         # Visibility is checked for scanning; private repos skip the scan.
