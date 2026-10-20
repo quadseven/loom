@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlsplit
 
 from bus.github import GitHub
@@ -17,6 +17,7 @@ from dashboard import views
 from dashboard.server import make_server
 
 from tests import sandbox_caps
+from tests.local_http import LocalHTTPServer
 
 
 @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
@@ -57,7 +58,7 @@ class DashboardTest(unittest.TestCase):
             def log_message(inner, fmt, *args):
                 pass
 
-        self.api = ThreadingHTTPServer(("127.0.0.1", 0), APIHandler)
+        self.api = LocalHTTPServer(("127.0.0.1", 0), APIHandler)
         self.api_thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.api_thread.start()
         self.cache = tempfile.TemporaryDirectory()
