@@ -275,6 +275,10 @@ sys.exit("all 64 ports tried were in use")' 2>&1)" ||
 # --auto lets it act without prompting, as 1.x run does.
 # The port comes from free_loopback_port; when there is none, the run parks
 # with the reason in the log and no server or agent starts.
+# --print-logs at ERROR puts opencode's own error on stderr: its run output
+# says only "UnknownError: Unexpected server error" for a model it dropped
+# from its catalogue or an upstream 429, so both read as transient and a lane
+# whose model was gone kept claiming (zen 2026-10-19, openrouter 2026-10-20).
 # Usage: opencode_run <key_var> <opencode binary> <run arguments...>
 opencode_run() {
   local key_var="$1" bin="$2" port
@@ -284,8 +288,8 @@ opencode_run() {
     "opencode v2."*)
       port="$(free_loopback_port)" || return 3
       OPENCODE_SERVER_PORT="$port" api_agent "$key_var" "$bin" run \
-        --server "http://127.0.0.1:$port" --auto -m "$MODEL" "$@"
+        --server "http://127.0.0.1:$port" --auto -m "$MODEL" --print-logs --log-level ERROR "$@"
       return $? ;;
   esac
-  api_agent "$key_var" "$bin" run -m "$MODEL" "$@"
+  api_agent "$key_var" "$bin" run -m "$MODEL" --print-logs --log-level ERROR "$@"
 }

@@ -383,6 +383,8 @@ LEAK_DIFF_MARK = "--- PR diff ---"
 LEAK_TEXT_MARK = "--- title and body ---"
 LEAK_HIT_RE = re.compile(r"^\s*\S+:(\d+)\s+\[([\w-]+)\]\s")
 LEAK_REF_RULE = "private-issue-ref"
+CRITERION_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+?)\s*$")
+NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
 # The scanner's cross-repo reference shape: [owner/]name#N.
 SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
                          r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
@@ -862,6 +864,55 @@ def pr_faults(details: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
     return [w for bad, w in ((not brain._checks_green(details), "failing checks"),
                              (not brain._threads_resolved(details), "open review threads"),
                              (full.get("mergeable") is False, "a conflict")) if bad]
+
+
+def acceptance_criteria(body: str) -> List[str]:
+    """Checkbox criteria in the Acceptance criteria section."""
+    found = []
+    active = False
+    for line in (body or "").splitlines():
+        if line.strip() == "## Acceptance criteria":
+            active = True
+            continue
+        if active and line.startswith("## "):
+            break
+        match = CRITERION_RE.match(line)
+        if active and match:
+            found.append(("x" if match.group(1).lower() == "x" else "") +
+                         " " + match.group(2).strip())
+    return found
+
+
+def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
+    """Ticket criteria that a lane PR leaves unticked, excluding Live checks."""
+    ticket = acceptance_criteria(ticket_body)
+    pull = acceptance_criteria(pull_body)
+    states = {}
+    for criterion in pull:
+        checked, _, text = criterion.partition(" ")
+        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
+        states[clean] = (checked == "x", bool(NOT_BUILT_RE.search(text)))
+    missing = []
+    for criterion in ticket:
+        _, _, text = criterion.partition(" ")
+        if text.casefold().startswith("live:"):
+            continue
+        clean = NOT_BUILT_RE.sub("", text).strip().casefold()
+        checked, not_built = states.get(clean, (False, False))
+        if not checked and not not_built:
+            missing.append(text)
+    return missing
+
+
+def not_built_criteria(ticket_body: str, pull_body: str) -> List[str]:
+    """Ticket criteria explicitly marked not built with a reason in a PR."""
+    ticket = [item.partition(" ")[2] for item in acceptance_criteria(ticket_body)]
+    marked = {NOT_BUILT_RE.sub("", item.partition(" ")[2]).strip().casefold()
+              for item in acceptance_criteria(pull_body)
+              if NOT_BUILT_RE.search(item.partition(" ")[2])}
+    return [item for item in ticket
+            if not item.strip().casefold().startswith("live:")
+            and item.strip().casefold() in marked]
 
 
 def is_code(path: str) -> bool:
@@ -1641,11 +1692,36 @@ class Factory:
                           sensitive: bool = False) -> None:
         """Land a clean, reviewed pull request, or send it back when it
         changes code without a test. A clean sensitive one waits for the brain."""
-        if self._needs_test(repo, number, issue):
+        missing = missing_criteria(str(issue.get("body") or ""), str(full.get("body") or ""))
+        if missing:
+            self._send_back(repo, full, issue, comments,
+                            "unticked acceptance criteria; build these or mark each "
+                            "not built with a reason: " + "; ".join(missing))
+        elif self._needs_test(repo, number, issue):
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
         elif not sensitive:
+            self._file_criterion_follow_up(repo, number, issue, full)
             self._land(repo, number, full, issue)
+
+    def _file_criterion_follow_up(self, repo: str, number: int,
+                                  issue: Dict[str, Any], full: Dict[str, Any]) -> None:
+        """File a ticket for criteria explicitly marked not built in a lane PR."""
+        criteria = not_built_criteria(str(issue.get("body") or ""),
+                                      str(full.get("body") or ""))
+        if not criteria:
+            return
+        title = "Complete criteria left from PR #%d" % number
+        if any(isinstance(found, dict) and found.get("title") == title
+               for found in self.gh.paginate("/repos/%s/issues?labels=loom:ticket" % repo)):
+            return
+        body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
+                "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
+                "\n".join("- [ ] " + item for item in criteria) +
+                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" %
+                int(issue["number"]))
+        self.gh.rest("POST", "/repos/%s/issues" % repo, {
+            "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]})
 
     def _run_again(self, repo: str, number: int, sha: str) -> bool:
         """Re-run the failed Actions jobs on this commit once. False when a

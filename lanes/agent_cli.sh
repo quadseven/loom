@@ -52,6 +52,10 @@ AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|h
 # OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,
 # every hour until then (2026-10-19).
 DAILY_RE='daily (free )?(allocation|allowance|limit|quota)|per[ _-]day'
+# A model the agent CLI no longer offers (opencode drops one models.dev marks
+# deprecated): no retry within the day brings it back, so the model rests
+# LIMIT_WAIT_MAX like a spent allowance and the lane stops claiming.
+MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 
@@ -72,6 +76,8 @@ classify_failure() {
   shopt -s nocasematch
   if [[ "$tail" =~ $AUTH_RE ]]; then
     FAIL_CLASS=auth
+  elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
+    FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT_MAX))
   elif [[ "$whole" =~ $LIMIT_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
     if [[ "$whole" =~ $OUT_OF_CREDIT_RE ]]; then
