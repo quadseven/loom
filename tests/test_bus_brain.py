@@ -946,6 +946,98 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
 
+    def test_brief_remote_lane_on_public_repo_files_queued(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": False}),
+                     reply(201, {"id": 202, "number": 202,
+                                "html_url": "https://example.com/ticket"}),
+                     reply(201, {}))
+        gh = GitHub("t", transport=fake)
+        url = brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
+        self.assertEqual(url, "https://example.com/ticket")
+        payload = fake.calls[3][2]
+        self.assertEqual(payload["labels"], ["loom:ticket", "loom:queued", "lane:muse"])
+
+    def test_brief_remote_lane_refuses_private_repo_before_filing(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": True}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "this repo is private"):
+            brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
+        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+    def test_brief_remote_lane_refuses_hard_tier(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": False}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "hard.*not one of"):
+            brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "hard")
+        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+    def test_brief_local_lane_still_files_briefed(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(201, {"id": 202, "number": 202,
+                                "html_url": "https://example.com/ticket"}),
+                     reply(201, {}))
+        gh = GitHub("t", transport=fake)
+        brain.brief(gh, REPO, EPIC, "Ticket", BODY, "codex", "hard")
+        self.assertEqual(fake.calls[2][2]["labels"], ["loom:ticket", "loom:briefed", "lane:codex"])
+
+    def test_brief_remote_lane_refuses_missing_difficulty(self):
+        no_diff = BODY.replace("## Why\nwhy", "## Why\ndiff")
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": False}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "difficulty.*not one of"):
+            brain.brief(gh, REPO, EPIC, "Ticket", no_diff, "muse")
+        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+    def test_rebrief_regressed_remote_lane_on_public_repo_files_queued(self):
+        issue = item(5, body="Difficulty: easy\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {"private": False}),
+                     reply(200, []),
+                     reply(200, {}),
+                     reply(200, {}))
+        gh = GitHub("t", transport=fake)
+        brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
+        put_labels = next(c for c in fake.calls if c[0] == "PUT")
+        labels = put_labels[2]["labels"]
+        self.assertIn("loom:queued", labels)
+        self.assertIn("lane:muse", labels)
+        self.assertNotIn("loom:briefed", labels)
+        self.assertIn("loom:regression", labels)
+
+    def test_rebrief_regressed_remote_lane_refuses_private_repo(self):
+        issue = item(5, body="Difficulty: easy\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {"private": True}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "this repo is private"):
+            brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
+        self.assertFalse(any(c[0] in ("PATCH", "PUT", "POST") for c in fake.calls))
+
+    def test_rebrief_regressed_remote_lane_refuses_hard_tier(self):
+        issue = item(5, body="Difficulty: hard\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {"private": False}), reply(200, []))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "hard.*not one of"):
+            brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
+        self.assertFalse(any(c[0] in ("PATCH", "PUT", "POST") for c in fake.calls))
+
+    def test_rebrief_regressed_local_lane_still_files_briefed(self):
+        issue = item(5, body="Difficulty: medium\n\n## Why\nx\n",
+                     labels=["loom:ticket", "loom:verified"])
+        fake = Fake(reply(200, {}),  # PATCH body
+                     reply(200, {}))  # PUT labels
+        gh = GitHub("t", transport=fake)
+        brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "codex", None)
+        put_labels = next(c for c in fake.calls if c[0] == "PUT")
+        self.assertIn("loom:briefed", put_labels[2]["labels"])
+        self.assertIn("lane:codex", put_labels[2]["labels"])
+        self.assertNotIn("loom:queued", put_labels[2]["labels"])
+
     def test_a_remote_lane_is_refused_for_any_state_but_queued(self):
         # A limit hand-off or a fix round (briefed) must never land on a
         # remote lane, which claims only new queued tickets.

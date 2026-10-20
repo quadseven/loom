@@ -1565,9 +1565,13 @@ def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
                  lane: Optional[str], extra: Sequence[str] = ()) -> Dict[str, Any]:
     """File the ticket and link it as a sub-issue of goal (an epic, for every
     brief), with a Part of line when GitHub refuses the link."""
-    names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
-    if lane:
-        names.append("lane:" + lane)
+    if lane and lane in REMOTE_LANES:
+        _check_remote_lane(gh, repo, body, lane)
+        names = ["loom:ticket", "loom:queued", "lane:" + lane]
+    else:
+        names = ["loom:ticket", "loom:briefed" if lane else "loom:queued"]
+        if lane:
+            names.append("lane:" + lane)
     issue = gh.rest("POST", "/repos/%s/issues" % repo, {
         "title": title, "body": body, "labels": names + list(extra)}).data
     if not _link_to_goal(gh, repo, goal, issue):
@@ -1591,7 +1595,10 @@ def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
         new = _with_model(new, model)
     _check_written_text(new)
     tickets.parse(new)
-    kept = _moved_labels(_labels(issue), "briefed" if lane else "queued", lane)
+    if lane and lane in REMOTE_LANES:
+        _check_remote_queue(gh, repo, number, issue, lane, body=new)
+    state = "queued" if (not lane or lane in REMOTE_LANES) else "briefed"
+    kept = _moved_labels(_labels(issue), state, lane)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
             {"labels": kept + [REGRESSION] if REGRESSION not in kept else kept})
@@ -2432,17 +2439,43 @@ def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[st
     return None
 
 
+def _check_remote_tier(body: str, lane: str) -> None:
+    """Refuse a remote lane brief whose difficulty the lane does not run."""
+    try:
+        difficulty = tickets.parse(body)[0].get("Difficulty", "")
+    except ValueError:
+        difficulty = ""
+    if difficulty not in REMOTE_LANES[lane]["tiers"]:
+        raise ValueError("difficulty %r is not one of %s: remote lane %s "
+                         "only runs %s" % (difficulty or "none", ", ".join(DIFFICULTIES),
+                                          lane, ", ".join(REMOTE_LANES[lane]["tiers"])))
+
+
+def _check_remote_lane(gh: GitHub, repo: str, body: str, lane: str) -> None:
+    """Refuse a brief to a remote lane the lane could never claim: a private repo
+    for a public-only lane, or a difficulty tier the lane does not run.
+    Called when a new ticket is filed, so a branch check is not yet possible."""
+    repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
+    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+        raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
+    _check_remote_tier(body, lane)
+
+
 def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
-                        lane: str) -> None:
+                        lane: str, body: Optional[str] = None) -> None:
     """Refuse a queued move to a remote lane that the lane could never claim:
-    a private repo for a public-only lane, or a ticket whose branch already
-    has a pull request (a fix round, which remote lanes do not run)."""
+    a private repo for a public-only lane, a ticket whose branch already has a
+    pull request (a fix round, which remote lanes do not run), or a difficulty
+    tier the lane does not run. The body is checked when the caller has it
+    (re-briefing a regression ticket); omitted for a plain queued move."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
     if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
     branch = tickets.branch_for(number, str(issue.get("title") or ""))
     if _open_or_merged_pull(gh, repo, branch) is not None:
         raise ValueError("ticket branch %s already has a pull request" % branch)
+    if body is not None:
+        _check_remote_tier(body, lane)
 
 
 def move(gh: GitHub, repo: str, number: int, state: str,
