@@ -1001,8 +1001,11 @@ pull request's line, so a brain sees them and adopts them.
 
 The station adopts the rest (decision 0002, item 1). Each pass, for the
 oldest open pull request in a scanned repo that is not a draft, comes from
-a `LOOM_BRIEF_AUTHORS` login on a branch of the repo itself, and that no
-open ticket links (by a `Refs` line or a `loom/N` branch), it files one
+a `LOOM_BRIEF_AUTHORS` login on a branch of the repo itself, opened at
+least 2 hours ago (`ADOPT_GRACE`; one with no creation time counts as old
+enough), and that no open ticket links (by a `Refs` line or a `loom/N`
+branch), it re-reads the pull request and, if it is still open and not
+merged, files one
 ticket under the repo's goal home: "Land or supersede #N", in the normal
 brief format with `Difficulty: medium`. The lane that takes it lands the
 change on a `loom/` branch and closes the original with a comment naming
@@ -1015,7 +1018,13 @@ in `state/station/adoptions.json`, and a repo whose brief was refused (its
 goal at the cap) is tried again 10 minutes later, not every pass. The station
 log says `adopted OWNER/NAME#N as ticket ...` for each one, and
 `adoption OWNER/NAME:` with the count of open pull requests no ticket links
-whenever it changes.
+whenever it changes. The grace exists because most pull requests are being
+driven by a person or a session and merge within two hours: over a week in
+October 2026, 49 of 64 adoption tickets were filed within an hour of the
+pull request opening, and 8 at or after its merge. A pull request closed or
+merged since the pass read the open list is logged as `adoption
+OWNER/NAME#N: closed or merged since the pass began, not adopted` and
+remembered, so it gets no ticket and no marker.
 
 ## Journal
 

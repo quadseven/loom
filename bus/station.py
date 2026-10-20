@@ -277,7 +277,9 @@ PIN_SHIPS_FILE = "pin_ships.json"
 # keeps, per repo, the pull requests known to be adopted (so each one's
 # comments are read once), the count and refusal last logged (each logged
 # when it changes), and when a brief was last refused: the repo is tried
-# again ADOPT_RETRY seconds later, not every pass.
+# again ADOPT_RETRY seconds later, not every pass. A pull request is adopted
+# only once it is ADOPT_GRACE old, and is re-read just before its ticket is
+# filed: one closed or merged since the pass read the open list gets no ticket.
 ADOPTED_MARKER = "<!-- loom:adopted v1 ticket=%s#%d -->"
 ADOPTED_RE = re.compile(r"<!-- loom:adopted v1 ticket=[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+ -->")
 ADOPTS_MARKER = "<!-- loom:adopts pr=%d -->"
@@ -288,6 +290,12 @@ OWNED_FILE = "owned.json"
 # The untrusted labellers a briefed ticket was refused for, with when (loom#660).
 LABELER_FILE = "labeler_refusals.json"
 ADOPT_RETRY = 600
+# Over 2026-10-13 to 2026-10-20 the station filed 64 adoption tickets: 49
+# within an hour of the pull request opening (median 13 minutes), and 45 of
+# the 54 that merged did so within 2 hours of their ticket. Those pull
+# requests had a person or a session driving them, so the ticket was only
+# bookkeeping; a pull request that really stalls is still adopted after this.
+ADOPT_GRACE = 2 * 3600
 REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # Automatic retries (docs/BRAIN.md "Claim and outcome"). The runner starts
 # each failure reason with its class; a reason without one is a work failure.
@@ -3374,6 +3382,16 @@ class Station:
             rec.pop("refused_at", None)
             return
         number = int(pr["number"])
+        # The open list was read once for the whole pass; a pull request
+        # merged or closed since then needs no ticket. A failed read raises
+        # GitHubError, which the caller logs, and the next pass tries again.
+        fresh = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+        if not isinstance(fresh, dict) or fresh.get("state") != "open" or fresh.get("merged") \
+                or fresh.get("merged_at"):
+            rec["adopted"] = sorted(set(rec["adopted"]) | {number})
+            _say("adoption %s#%d: closed or merged since the pass began, not adopted"
+                 % (repo, number))
+            return
         goal = self._adoption_goal(repo)
         if goal is None:
             self._adoption_refused(repo, rec, "no goal home to file adoption tickets on")
@@ -3399,15 +3417,19 @@ class Station:
         _say("adopted %s#%d as ticket %s#%s" % (repo, number, repo, ticket))
 
     def _adoptable_pulls(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open pull requests that are not drafts and come from a
-        trusted author on a branch of the repo itself, oldest first. Whether
-        an open ticket links one (a Refs line or a loom/N branch) is checked
-        by the caller."""
+        """The repo's open pull requests that are not drafts, come from a
+        trusted author on a branch of the repo itself and are at least
+        ADOPT_GRACE old, oldest first. One whose created_at is missing or
+        unreadable counts as old enough, so it is never left unadopted.
+        Whether an open ticket links one (a Refs line or a loom/N branch) is
+        checked by the caller."""
         authors = {a.lower() for a in self.s.authors}
         found = [pr for pr in self._open_pulls(repo)
                  if isinstance(pr, dict) and pr.get("state", "open") == "open"
                  and not pr.get("draft") and tickets._login(pr.get("user")) in authors
-                 and brain._same_repo(repo, pr, {}) and not self._owned_elsewhere(repo, pr)]
+                 and brain._same_repo(repo, pr, {}) and not self._owned_elsewhere(repo, pr)
+                 and self.now - (self._epoch(str(pr.get("created_at") or "")) or 0)
+                 >= ADOPT_GRACE]
         return sorted(found, key=lambda pr: (str(pr.get("created_at") or ""),
                                              int(pr.get("number") or 0)))
 
