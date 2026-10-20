@@ -7825,6 +7825,8 @@ class Station:
                     if err.status not in (403, 404):
                         if err.status == 401:
                             _say("repo access check could not authenticate: %s" % err)
+                            self.s.repos = readable
+                            _write_json(path, state)
                             return False
                         record = {"checked": self.now, "readable": True}
                         state[repo] = record

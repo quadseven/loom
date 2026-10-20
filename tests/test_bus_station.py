@@ -6546,6 +6546,30 @@ class CloseDoneTest(Base):
         self.assertIn("needs-operator", asks[0]["labels"])
         self.assertIn(second, asks[0]["title"])
 
+    def test_401_abort_still_persists_operator_ask(self):
+        second = "example-owner/second-repo"
+        self.settings.repos = [REPO, second]
+        self.settings.status_repo = REPO
+        def request(method, url, headers, body):
+            path = urlsplit(url).path
+            if path == "/repos/" + REPO:
+                return reply(404, {"message": "Not Found"})
+            if path == "/repos/" + second:
+                return reply(401, {"message": "Unauthorized"})
+            if method == "POST" and path == "/repos/%s/issues" % REPO:
+                return reply(201, {"number": 5})
+            return self.fake(method, url, headers, body)
+        gh = GitHub("token", transport=request)
+        st = station.Station(gh, self.settings, now=10000)
+        self.assertFalse(st.check_repo_access())
+        # The pass aborted on a 401, but the operator ask recorded for REPO must
+        # still be written to state so a later pass does not file it again.
+        path = os.path.join(st.state, station.REPO_ACCESS_FILE)
+        self.assertTrue(os.path.exists(path))
+        state = station._read_json(path, {}, strict=False)
+        self.assertFalse(state[REPO]["readable"])
+        self.assertIn("_asked:" + REPO, state)
+
 
 class SettleOrphanSourcesTest(Base):
     """A loom:rewritten source whose ticket a person or the done close
