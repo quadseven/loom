@@ -305,8 +305,12 @@ def _push_commit(gh: GitHub, repo: str, local_sha: str, local_parent: str,
     remote commit SHA. Blob and tree SHAs are content-addressed, so re-running
     recreates identical objects."""
     tree_updates = []
-    for line in _git("diff", "--name-status", local_parent, local_sha).splitlines():
-        status, _, path = line.partition("\t")
+    # --no-renames: a rename arrives as a D of the old path and an A of the
+    # new one, never as one "R100 old new" entry. -z: fields are NUL-separated
+    # and paths unquoted, so a tab or non-ASCII byte in a name stays intact.
+    fields = _git("diff", "--name-status", "--no-renames", "-z",
+                  local_parent, local_sha).split("\0")
+    for status, path in zip(fields[0::2], fields[1::2]):
         if status.startswith("D"):
             tree_updates.append({"path": path, "mode": "100644",
                                  "type": "blob", "sha": None})
