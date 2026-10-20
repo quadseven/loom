@@ -597,6 +597,57 @@ class PullRequests(Base):
         self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
         self.assertEqual(self.moved, [])
 
+    def answered_thread(self, number=50, lane="codex", login="alice-example"):
+        """The pull request's only open thread, with a lane's answer on it."""
+        self.gh.details[number]["reviewThreads"]["nodes"] = [{
+            "id": "PRRT_1", "isResolved": False,
+            "comments": {"nodes": [{
+                "author": {"__typename": "User", "login": login},
+                "body": "Lane %s answered this finding instead of changing the code:"
+                        "\n\nThis finding does not apply to the current code" % lane}]}}]
+
+    def test_an_answered_thread_with_no_lane_up_asks_the_review_bot_to_judge_the_answer(self):
+        # 2026-10-19: grug#1189 waited from 18:25Z with no lane up for its next
+        # rung, and its only open thread carried a lane's answer nothing judged.
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.answered_thread()
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        # It still waits for its rung, and the review bot is asked to judge the
+        # answer instead.
+        self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
+        self.assertEqual(len(self.gh.comments[50]), 1)
+        self.assertIn("/grug improve", self.gh.comments[50][0]["body"])
+        # Once per head commit: the next pass asks no more.
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual(len(self.gh.comments[50]), 1)
+
+    def test_a_lane_up_for_the_next_rung_climbs_and_the_review_bot_is_not_asked(self):
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.answered_thread()
+        self.go(limited=NO_OPUS)
+        self.assertEqual((self.lane(5), self.model(5)), ("codex", "gpt-6-sol"))
+        self.assertEqual(self.gh.comments.get(50, []), [])
+
+    def test_a_stranger_s_answer_on_a_thread_asks_nothing(self):
+        # The answer is the App's own, so a stranger's words on a thread are
+        # data and never move the pull request.
+        self.gh.ticket(5, "pr", lane="claude",
+                       body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
+        self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM,
+                                {"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, resolved=False)
+        self.answered_thread(login="mallory-example")
+        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.assertEqual(self.gh.comments.get(50, []), [])
+
     def test_a_runaway_ticket_is_not_climbed_or_given_up_on(self):
         self.gh.ticket(5, "pr", lane="claude")
         self.gh.issues[5]["labels"].append({"name": "loom:runaway"})

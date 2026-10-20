@@ -617,7 +617,11 @@ configured setting (`LOOM_<LANE>_MODEL`), never a fixed lane-to-model map.
 Once a ticket ran on Opus or past it, it climbs only to the untried strong
 models (`gpt-6-sol`, `gemini-4-argon-high`), never back to Sonnet. When no
 lane of its next rung is up, it waits with no comment; the factory says it
-tried every rung only once every rung with a lane for its repo was tried. A green, reviewed pull request is not escalated: a ticket
+tried every rung only once every rung with a lane for its repo was tried. The
+one exception is a pull request whose open thread carries a lane's answer: the
+factory asks the review bot to judge that answer (`/grug improve` on the pull
+request, once per head commit) instead of waiting with nothing to move it
+(docs/LANES.md). A green, reviewed pull request is not escalated: a ticket
 whose open pull request has nothing to fix (its head is green, the review
 check passed on that head, and no review thread is open) is landed, whatever
 its fix rounds.

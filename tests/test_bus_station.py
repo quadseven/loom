@@ -3197,14 +3197,14 @@ class FixTest(Base):
         self.assertIn("> The thread is stale; <path> measures 5.", said)
         self.assertNotIn("rsync", said)
         self.assertNotIn("start, lane", said)
-        self.assertEqual(again, station.REVIEW_AGAIN)
+        self.assertEqual(again, factory.REVIEW_AGAIN)
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
     def test_a_fix_with_nothing_to_change_is_recognised_under_its_failure_class(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] x failed: [work] agent made no commit on loom/12-fix-the-thing"])
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        self.assertEqual(self.fake.comments[99][-1]["body"], station.REVIEW_AGAIN)
+        self.assertEqual(self.fake.comments[99][-1]["body"], factory.REVIEW_AGAIN)
     def test_a_fix_whose_branch_moved_goes_back_to_its_pull_request_not_a_failure(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: branch moved: "

@@ -326,6 +326,12 @@ answer as the reply on its thread, redacted and text-checked. The station
 resolves the thread only when the round ran on a ladder model and the thread
 is the review bot's own medium or low finding; any other answered thread
 stays open, and the factory reads it as a finding that survived.
+An answered thread that survives and leaves its ticket with no lane up for
+its next rung does not wait with nothing to move it: the factory asks the
+review bot to judge the answer instead, commenting `/grug improve` on the
+pull request once per head commit, so Elder re-reviews the head with the
+reply in view. It clears the head if the answer holds, and keeps the finding
+if it does not, and the ticket then waits for its rung as before.
 A fix brief that ends with nothing committed (most often
 every thread was already fixed and the review thread is stale) is not a
 failure: the station posts the lane's explanation on the pull request, asks
