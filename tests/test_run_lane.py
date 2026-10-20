@@ -463,7 +463,13 @@ class LaneRunnerTest(unittest.TestCase):
         self.scanner = root / "check_private_leaks.py"
         self.scanner.write_text("""#!/usr/bin/env python3
 import re, subprocess, sys
-mode, value = sys.argv[1:]
+args = sys.argv[1:]
+mode, value = args[0], args[1]
+# The real scanner's private-issue-ref rule: an issue reference to any repo
+# but the ones named with --allow-repo-ref may name a private repo.
+allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
+exempt = r'(?!(?:%s)\\b)' % '|'.join(map(re.escape, allowed)) if allowed else ''
+ref = re.compile(r'(?<![\\w/-])(?:[a-z0-9][a-z0-9._-]*/)?' + exempt + r'[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
 if mode == '--diff':
     text = subprocess.run(['git', 'diff', '-U0', value], capture_output=True,
                           text=True, check=True).stdout
@@ -476,6 +482,9 @@ for number, line in enumerate(text.splitlines(), 1):
         continue
     if re.search(r'\\b(?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3}|172\\.(?:1[6-9]|2[0-9]|3[01])\\.\\d{1,3}\\.\\d{1,3})\\b', line):
         print(f'BLOCKED: private identifier found\\n  {value}:{number} [rfc1918-ip] - a private-range IP address', file=sys.stderr)
+        sys.exit(1)
+    if ref.search(line):
+        print(f'BLOCKED: private identifier found\\n  {value}:{number} [private-issue-ref] - a cross-repo issue reference', file=sys.stderr)
         sys.exit(1)
 print('leak guard: clean (shape patterns only)')
 """)
