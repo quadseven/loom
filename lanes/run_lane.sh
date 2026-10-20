@@ -187,9 +187,17 @@ write_beat() {
   reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
   [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
   models="$(limited_models_json "$slot")"
+  # The heartbeat's limits member (loom#1101); null when the probe helper is
+  # unavailable or its output is not JSON. write_beat is also exercised
+  # standalone in tests, without limits_json defined.
+  limits="null"
+  if type limits_json >/dev/null 2>&1; then
+    probe="$(limits_json "$slot")"
+    case "$probe" in \{*) limits="$probe" ;; esac
+  fi
   mkdir -p "$LOOM_HOME/state/usage"
   printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s, "limited_models": {%s}, "limits": %s}\n' \
-    "$slot" "$(date +%s)" "$2" "$reason" "$retry" "$models" "$(limits_json "$slot")" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
+    "$slot" "$(date +%s)" "$2" "$reason" "$retry" "$models" "$limits" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
     mv "$LOOM_HOME/state/usage/$slot.json.tmp" "$LOOM_HOME/state/usage/$slot.json"
 }
 # The slot's model limits that have not lifted, as JSON object members
