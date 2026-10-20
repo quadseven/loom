@@ -1755,7 +1755,12 @@ update_fix_branch() {
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
-  FIX_UPSTREAM="origin/$default"
+  # The commit, not the ref: the scope check and the leak scan read it after
+  # the agent ran.
+  if ! FIX_UPSTREAM="$(git -C "$TREE" rev-parse --verify -q "origin/$default^{commit}")" ||
+     [ -z "$FIX_UPSTREAM" ]; then
+    UPDATE_REASON="could not read origin/$default"; return 1
+  fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
