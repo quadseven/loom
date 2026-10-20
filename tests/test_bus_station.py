@@ -3718,6 +3718,51 @@ class RetryTest(Base):
                          "is back at loom:failed and the pull request is unchanged.")
         self.assertEqual(self.listing("codex-2"), [])
 
+    def recent_claims(self, count):
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        self.fake.comments[12][:] = [
+            {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": at,
+             "user": {"login": "alice-example"}} for _ in range(count)]
+
+    def test_a_fix_round_whose_pull_request_merged_is_not_a_failure(self):
+        # The runner parks a fix brief unrun when its pull request is gone,
+        # under the default [work] class. A merged pull request is the work
+        # done, never a rung spent or a runaway (loom#1178).
+        self.heartbeat("codex-2")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[work] pull request #99 is no longer open on "
+                           "loom/12-fix-the-thing (MERGED loom/12-fix-the-thing)",
+                    attempt=3, fix=fix)
+        self.recent_claims(3)
+        self.run_pass()
+        names = self.fake.names(12)
+        self.assertNotIn("loom:runaway", names)
+        self.assertNotIn("loom:failed", names)
+        self.assertEqual(names, ["loom:ticket", "lane:codex", "loom:pr"])
+        self.assertEqual(self.bodies()[-1],
+                         "Lane codex stopped: [transient] pull request #99 merged before "
+                         "lane codex ran its fix round; nothing ran, which is not a failure")
+        self.assertEqual(self.listing("codex-2"), [])
+
+    def test_a_fix_round_whose_pull_request_closed_unmerged_still_fails_its_work(self):
+        self.heartbeat("codex-2")
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        self.failed(reason="[work] pull request #99 is no longer open on "
+                           "loom/12-fix-the-thing (CLOSED loom/12-fix-the-thing)",
+                    attempt=1, fix=fix)
+        self.run_pass()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+
+    def test_a_merged_ticket_is_never_held_as_a_runaway(self):
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        labels = self.fake.issues[12]["labels"]
+        labels[:] = [lab for lab in labels if lab["name"] != "loom:running"]
+        labels.append({"name": "loom:merged"})
+        self.recent_claims(3)
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+        self.assertIn("loom:merged", self.fake.names(12))
+
     def test_retry_chain_and_model_rules(self):
         self.assertEqual(station.failure_class("[limit] x"), "limit")
         self.assertEqual(station.failure_class("limit x"), "work")

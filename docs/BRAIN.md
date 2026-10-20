@@ -640,7 +640,8 @@ comments on the pull request; it never opens a second one. The sandboxed agent
 can write `.loom/replies.json` with thread ids, reply text and a resolve
 boolean. The runner posts valid entries after a successful push and resolves
 those marked true; missing or invalid files produce no replies. A fix brief
-whose pull request is no longer open is parked as failed.
+whose pull request is no longer open is parked as failed (a merged one is
+reported as no failure, below).
 
 When the runner finishes, the station finds the brief in `done/` or
 `failed/` and reports once:
@@ -685,6 +686,14 @@ When the runner finishes, the station finds the brief in `done/` or
   stopped:` event. A claim that ended `[transient]`, `[limit]`, `[auth]` or
   `[factory]` is not a work attempt and never counts toward a runaway; a stop
   is never worded `failed:`, so failure counts do not read it.
+- A fix brief parked unrun because its pull request merged first (`pull
+  request #N is no longer open on <branch> (MERGED ...)`): not a failure, not
+  an attempt and never a runaway. A running ticket goes back to `loom:pr`,
+  where the merged pull request moves it to `loom:merged`; one already merged
+  keeps its labels. It records `Lane <lane> stopped: [transient] pull request
+  #N merged before lane <lane> ran its fix round; ...`. A ticket at
+  `loom:merged`, `loom:shipped` or `loom:verified` is never held as a
+  runaway, whatever fails after.
 
 The runner starts each failure reason with its class: `[limit]` (a usage,
 rate or quota limit, or an HTTP 429 or 402 from the provider), `[auth]` (a

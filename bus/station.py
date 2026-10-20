@@ -112,6 +112,10 @@ LIMIT = "limit:"
 # push moved the pull request's branch during the run. Not a failure: the
 # ticket goes back to loom:pr, and the factory judges the new head.
 BRANCH_MOVED = "branch moved:"
+# The runner's reason when it parked a fix brief unrun because its pull
+# request is no longer open (lanes/run_lane.sh, fix_pr_open). A MERGED one is
+# the ticket's work landed, not a failure (loom#1178).
+PR_GONE_RE = re.compile(r"pull request #([0-9]+) is no longer open on \S+ \((MERGED|CLOSED)\b")
 LANE_SAID_MAX = 2500
 PATH_RE = _text.PATH_RE
 SECRET_RE = _text.SECRET_RE
@@ -1075,6 +1079,13 @@ def ending_class(reason: str) -> str:
     [transient]: the runner parks it under the default [work] class, but the
     model did nothing wrong (_branch_moved)."""
     return "transient" if CLASS_RE.sub("", reason).startswith(BRANCH_MOVED) else failure_class(reason)
+
+
+def fix_pr_merged(fix_pr: str, reason: str) -> bool:
+    """Whether a fix brief was parked unrun because its own pull request,
+    fix_pr, merged before the lane ran it (PR_GONE_RE)."""
+    m = PR_GONE_RE.match(CLASS_RE.sub("", reason))
+    return bool(m) and m.group(1) == fix_pr and m.group(2) == "MERGED"
 
 
 def lane_takes_model(lane: str, model: str) -> bool:
@@ -4364,10 +4375,13 @@ class Station:
     def _report_failure(self, repo: str, number: int, lane: str, text: str, name: str) -> bool:
         """Report a failed brief, keeping fix rounds on their existing pull request."""
         reason = self._failure_reason(lane, name)
-        if self._flag_repeated_failure(repo, number, lane, reason):
-            return True
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        if fix_pr_merged(fix_pr, reason):
+            self._fix_pr_merged(repo, number, lane, int(fix_pr))
+            return True
+        if self._flag_repeated_failure(repo, number, lane, reason):
+            return True
         # Thermal-limit briefs carry "limit:" with or without a class and
         # return to the factory. Provider limits have a class but no marker,
         # so they take the bounded retry path below.
@@ -4452,6 +4466,12 @@ class Station:
             # by the ending each recorded: a failure, a retry, a hold or a
             # stop (factory.attempts).
             return False
+        issue = self._issue(repo, number)
+        if tickets.ticket_state(issue) in tickets.MERGED_STATES:
+            # The ticket's work landed: whatever failed after that, the ticket
+            # is not a runaway, and a hold would only cost the brain a read
+            # each tick (loom#1178).
+            return False
         authors = {author.lower() for author in self.s.authors}
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
@@ -4462,7 +4482,6 @@ class Station:
         recent = [a for a in work if a[0] >= self.now - 6 * 3600]
         if not reason_repeat and len(recent) < 3:
             return False
-        issue = self._issue(repo, number)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
         trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
@@ -4616,6 +4635,22 @@ class Station:
         failures."""
         self._routine(repo, number,
                       "Lane %s stopped: [%s] %s" % (lane, klass, CLASS_RE.sub("", reason)))
+
+    def _fix_pr_merged(self, repo: str, number: int, lane: str, pr: int) -> None:
+        """A fix brief the runner parked unrun because its pull request merged
+        first. Nothing ran and the work landed, so no rung is spent and no
+        hold is set. A running ticket goes back to loom:pr, where
+        reconcile_pull_requests moves it on to loom:merged; one already merged
+        or later keeps its labels."""
+        if tickets.ticket_state(self._issue(repo, number)) not in tickets.MERGED_STATES:
+            self._relabel(repo, number, "loom:pr")
+        # A stop, never "failed:": the claim did no work, so it is not an
+        # attempt toward a runaway (factory.attempts).
+        self._stopped(repo, number, lane, "transient",
+                      "pull request #%d merged before lane %s ran its fix round; nothing "
+                      "ran, which is not a failure" % (pr, lane))
+        _say("reported %s#%d: pull request #%d merged before lane %s's fix round"
+             % (repo, number, pr, lane))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
         """Post each answer a fix round's lane wrote instead of a fix. Only a
