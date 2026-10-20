@@ -590,6 +590,13 @@ class GitHub:
             headers["If-None-Match"] = if_none_match
         return headers, payload
 
+    def app_token(self) -> str:
+        """The App installation token this client sends, minted when none is
+        held or it is about to expire; GitHubError when the client has no App."""
+        if self.app is None:
+            raise GitHubError("this client holds a personal token, not a GitHub App")
+        return self.app.token(self._mint_app_token)
+
     def _bearer(self) -> str:
         """The token for the Authorization header."""
         if self.app is None:

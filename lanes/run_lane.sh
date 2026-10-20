@@ -127,7 +127,21 @@ AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
-CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
+# A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
+# writes as that App, never as the operator (loom#1142): lanes opened 58 pull
+# requests as the operator in a day. It clones over https, and each run mints
+# an installation token for gh and git (lane_app_token); the agent never gets
+# it, its settings or git's helper. LOOM_APP_TOKEN_CMD, when set, is the command
+# that prints the token in place of `python3 -m bus app token`.
+if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+  CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
+  # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
+  export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.https://github.com.helper \
+    GIT_CONFIG_VALUE_0="" GIT_CONFIG_KEY_1=credential.https://github.com.helper \
+    GIT_CONFIG_VALUE_1="!gh auth git-credential"
+else
+  CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
+fi
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$SLOT"
 # The agy lane's agent runs as a dedicated macOS user (default "loom") that
@@ -548,6 +562,23 @@ transient_strike() {
   return 1
 }
 transient_clear() { rm -f "$TRANSIENT_FILE"; }
+
+# Mint this run's App token into GH_TOKEN. A personal token in the
+# environment is dropped first, so a failed mint leaves gh with nothing to
+# post as. Installation tokens last an hour: a run mints again after its agent.
+lane_app_token() {
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  local token
+  unset GH_TOKEN GITHUB_TOKEN
+  if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
+    token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
+  else
+    token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
+  fi
+  [[ "$token" =~ ^[A-Za-z0-9_]+$ ]] || return 1
+  export GH_TOKEN="$token"
+}
+APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
 
 park() {
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
@@ -1996,6 +2027,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ -n "$LIMITED" ]; then park "$BRIEF" "limit: $LIMIT_WHY" limit; continue; fi
   if [ -n "$AUTH_HELD" ]; then park "$BRIEF" "$AUTH_WHY" auth; continue; fi
+  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # Briefs are input: the runner only ever pushes a loom-owned branch.
   if ! [[ "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$BRANCH" =~ ^loom/[A-Za-z0-9._/-]+$ ]]; then
     park "$BRIEF" "brief needs Repo: owner/name and Branch: loom/..."; continue
@@ -2172,12 +2204,14 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
-    (cd "$TREE" && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+      run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!
   STATUS=$?
   is_api_lane && archive_transcripts
+  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
