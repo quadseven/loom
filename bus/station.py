@@ -2960,7 +2960,7 @@ class Station:
                        "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
         kept = [name for name in labels if name not in states]
-        cleared = RUNAWAY in kept
+        cleared = target == "loom:merged" and RUNAWAY in kept
         if cleared:
             kept = [name for name in kept if name != RUNAWAY]
         kept.append(target)
@@ -2970,7 +2970,7 @@ class Station:
         if cleared:
             self._routine(repo, number,
                           "Pull request #%d merged, so this ticket's loom:runaway hold "
-                          "is cleared." % number)
+                          "is cleared." % int(pr["number"]))
 
     def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
         """Move each open adoption ticket to loom:merged once the pull
@@ -3012,7 +3012,7 @@ class Station:
         if cleared:
             self._routine(repo, number,
                           "Pull request #%d merged, so this ticket's loom:runaway hold "
-                          "is cleared." % number)
+                          "is cleared." % int(pr["number"]))
         _say("moved %s#%d to loom:merged: land-or-supersede target #%d merged"
              % (repo, number, int(pr["number"])))
 

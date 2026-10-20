@@ -863,8 +863,18 @@ class ReconcilePullRequestTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
         self.assertNotIn("loom:runaway", self.fake.names(12))
-        self.assertTrue(any("loom:runaway hold is cleared" in c["body"]
-                            for c in self.fake.comments[12]))
+        self.assertTrue(any("Pull request #99 merged, so this ticket's loom:runaway hold is cleared"
+                            in c["body"] for c in self.fake.comments[12]))
+
+    def test_a_pull_request_closed_unmerged_keeps_the_runaway_hold(self):
+        self.fake.add(12, state="pr")
+        self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
+        self.fake.pulls = [{"number": 99, "state": "closed", "merged_at": None,
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:closed-unmerged", self.fake.names(12))
+        self.assertIn("loom:runaway", self.fake.names(12))
 
     def adoption(self, number, pr, state="queued", lane="codex"):
         self.fake.add(number, state=state, lane=lane, body=station.adoption_body(pr))
