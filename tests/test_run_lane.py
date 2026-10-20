@@ -3781,6 +3781,76 @@ exit %d
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("uvx 0.9.0 (scratch)", log.read_text())
 
+    def test_final_validation_removes_an_untracked_agent_venv_before_uv_check(self):
+        # The agent commits its change, then leaves an untracked environment
+        # whose interpreter is unusable to the final sandbox.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = "interpreter: loom-test-python\ncheck: test ! -e .venv && test -f fix.txt\n"
+        self.contract_repo(contract=contract)
+        self.drop_brief(text=BRIEF.replace("Make the thing work.",
+                                           "Make the thing work. Leave a .venv for validation."))
+        replacement = FAKE_AGENT.replace(
+            'git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"',
+            'git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the thing"\n'
+            'echo /.venv >> .git/info/exclude\nmkdir -p .venv/bin\nprintf "blocked" > .venv/bin/python3')
+        self.write_tool(self.bin / "codex", replacement)
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        self.assertFalse(self.records()[-1]["ok"] is False, self.lane_log())
+
+    def test_final_validation_classifies_denied_python_interpreter_as_factory(self):
+        text = RUNNER.read_text()
+        function = re.search(r"^validation_interpreter_denied\(\) \{\n.*?^\}\n",
+                             text, re.S | re.M).group(0)
+        script = function + 'validation_interpreter_denied "$1" "$2" && echo factory\n'
+        result = subprocess.run(["bash", "-c", script, "test", "2",
+                                 "Failed to query Python interpreter\\nOperation not permitted"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "factory")
+        result = subprocess.run(["bash", "-c", script, "test", "1", "ordinary test failure"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout, "")
+
+    def test_final_interpreter_permission_error_is_a_factory_failure(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        contract = ("interpreter: loom-test-python\n"
+                    "check: grep -q todo fix.txt || { echo 'Failed to query Python interpreter'; "
+                    "echo 'Operation not permitted'; exit 2; }\n")
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("Python interpreter query was denied by the sandbox", log)
+        self.assertIn("factory incident quadseven/loom#99", log)
+
+    def test_untracked_venv_cleanup_preserves_tracked_files_under_venv(self):
+        text = RUNNER.read_text()
+        function = re.search(r"^remove_untracked_venvs\(\) \{\n.*?^\}\n",
+                             text, re.S | re.M).group(0)
+        tree = Path(self._tmp.name) / "tree"
+        tree.mkdir()
+        tracked = tree / ".venv" / "tracked.txt"
+        tracked.parent.mkdir()
+        tracked.write_text("tracked\n")
+        git("init", "-q", str(tree))
+        git("add", ".venv/tracked.txt", cwd=tree)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "seed", cwd=tree)
+        (tree / ".venv" / "untracked.txt").write_text("keep with tracked directory\n")
+        untracked = tree / "nested" / ".venv"
+        untracked.mkdir(parents=True)
+        (untracked / "python").write_text("stub\n")
+        script = 'safe_git() { git -C "$TREE" "$@"; }\n' + function + 'remove_untracked_venvs\n'
+        result = subprocess.run(["bash", "-c", script], env={"PATH": os.environ["PATH"],
+                                 "TREE": str(tree)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(tracked.exists())
+        self.assertTrue((tree / ".venv" / "untracked.txt").exists())
+        self.assertFalse(untracked.exists())
+
     def test_the_check_profile_allows_the_uv_files_but_not_their_directory(self):
         # The check profile lets the contract read and execute the runner's
         # uv and uvx while still refusing every other file under the
