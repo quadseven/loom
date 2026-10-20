@@ -1343,6 +1343,31 @@ class ShipRuleTest(Base):
         self.assertIn("loom:shipped", self.fake.names(12))
         self.assertNotIn("loom:merged", self.fake.names(12))
 
+    def adopted(self, number, pr):
+        """A "Land or supersede #pr" ticket whose pull request merged: the
+        pull request has no Refs line or loom branch."""
+        self.fake.add(number, state="merged", body=station.adoption_body(pr))
+        self.fake.issues[number]["title"] = "Land or supersede #%d: A fix" % pr
+        sha = "%040x" % pr
+        self.fake.pulls.append({"number": pr, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                                "merge_commit_sha": sha, "body": "A fix.", "head": {"ref": "a-fix"}})
+        return sha
+
+    def test_an_adoption_ticket_in_a_ship_on_merge_repo_ships(self):
+        # Adoption tickets shipped only in the repo the station deploys: 33
+        # sat merged in the other repos (2026-10-20).
+        self.settings.ship_on_merge = [REPO]
+        self.adopted(12, 77)
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertIn("#77", self.fake.comments[12][-1]["body"])
+
+    def test_an_adoption_ticket_in_a_workflow_repo_ships_on_its_deploy_run(self):
+        self.settings.ship_workflows = {REPO: self.WORKFLOW}
+        self.deploy_run(self.adopted(12, 77))
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+
     def test_an_unlisted_repo_does_not_ship_on_merge(self):
         self.merged(12, 99)
         self.ship()
