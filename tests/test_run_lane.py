@@ -156,6 +156,11 @@ if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
   printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
+  echo "fixed" > fix.txt
+  printf 'contact %s\\n' "$(printf 'MTAuMjMuNC41' | base64 -d)" >> fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
   printf '{"missing": "the station log"}' > verify.json
   exit 0
@@ -453,6 +458,26 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "opencode", FAKE_OPENCODE)
         self.write_tool(self.bin / "aws", FAKE_AWS)
         self.write_tool(self.bin / "curl", FAKE_CURL)
+        self.scanner = root / "check_private_leaks.py"
+        self.scanner.write_text("""#!/usr/bin/env python3
+import re, subprocess, sys
+mode, value = sys.argv[1:]
+if mode == '--diff':
+    text = subprocess.run(['git', 'diff', '-U0', value], capture_output=True,
+                          text=True, check=True).stdout
+    diff = True
+else:
+    text = open(value, encoding='utf-8').read()
+    diff = False
+for number, line in enumerate(text.splitlines(), 1):
+    if diff and (line.startswith(('---', '+++', '-'))):
+        continue
+    if re.search(r'\\b(?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3}|172\\.(?:1[6-9]|2[0-9]|3[01])\\.\\d{1,3}\\.\\d{1,3})\\b', line):
+        print(f'BLOCKED: private identifier found\\n  {value}:{number} [rfc1918-ip] - a private-range IP address', file=sys.stderr)
+        sys.exit(1)
+print('leak guard: clean (shape patterns only)')
+""")
+        self.scanner.chmod(0o755)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -478,6 +503,7 @@ class LaneRunnerTest(unittest.TestCase):
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
             "LOOM_REPO_OWNERS": "example",
+            "LOOM_LEAK_SCANNER": str(self.scanner),
             "LOOM_CODEX_MODEL": "gpt-test-default",
             "LOOM_CLAUDE_MODEL": "claude-test-default",
             # The free lanes' usage meters (bus/meter.py) read a closed
@@ -568,6 +594,26 @@ class LaneRunnerTest(unittest.TestCase):
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_public_repo_private_ip_diff_is_refused_before_push(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="private-ip")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rfc1918-ip", self.run_log())
+        self.assertIn("[rfc1918-ip]", self.run_log())
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_private_repo_does_not_run_leak_scan_and_pushes(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="private-ip", FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        self.assertNotIn("leak guard", self.run_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_files_the_brief_names_commit_and_push_normally(self):
         self.drop_brief(text=BRIEF.replace(
@@ -2356,11 +2402,12 @@ cat > /dev/null
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
-        # The local coder trains on nothing: no privacy lookup, private is fine.
+        # Visibility is checked for scanning; private repos skip the scan.
         inbox, result = self.api_lane("spark", FAKE_GH_PRIVATE="true", **self.SPARK)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertFalse(any(c.startswith("gh api ") for c in calls), calls)
+        self.assertIn("gh api repos/example/repo --jq .private", calls)
+        self.assertNotIn("leak guard: clean (shape patterns only)", self.spark_log())
         self.assertTrue(any(c.startswith("curl ") and "http://spark.example.invalid:8000/v1/models" in c
                             for c in calls), calls)
         agent = [c for c in calls if c.startswith("opencode ")]
@@ -3061,6 +3108,15 @@ exit %d
         beat = self.beat()
         self.assertFalse(beat["available"])
         self.assertGreater(beat["retry_at"], int(time.time()) + 86000)
+
+    def test_a_lane_with_no_transient_count_writes_nothing_to_its_service_log(self):
+        # 2026-10-20: every pass read the missing count file with the stderr
+        # redirect after the input one, so bash printed "No such file or
+        # directory" first; each lane's service log held about 1000 such lines.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="ok")
+        self.assertNotIn(".transient", result.stderr)
+        self.assertNotIn(".transient", result.stdout)
 
     def test_a_run_that_is_not_transient_clears_the_transient_count(self):
         for n, (out, status) in enumerate((("Unexpected server error", "1"),
