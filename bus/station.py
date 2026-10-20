@@ -1062,6 +1062,13 @@ def failure_class(reason: str) -> str:
     return m.group(1) if m else "work"
 
 
+def ending_class(reason: str) -> str:
+    """failure_class, except that a fix round whose branch moved is
+    [transient]: the runner parks it under the default [work] class, but the
+    model did nothing wrong (_branch_moved)."""
+    return "transient" if CLASS_RE.sub("", reason).startswith(BRANCH_MOVED) else failure_class(reason)
+
+
 def lane_takes_model(lane: str, model: str) -> bool:
     """Whether the lane's runner accepts the model (lanes/run_lane.sh)."""
     lane = provider(lane)
@@ -4382,21 +4389,24 @@ class Station:
         return True
 
     def _routine(self, repo: str, number: int, text: str) -> None:
-        """A lane failure or factory hold the factory acts on by itself, as an
-        event in the ticket's status comment: an edit sends no email. Each one
-        was a new comment, an email apiece (an infra ticket, 2026-10-19). The
-        GitHub client expands status events, so the attempt table still reads
-        "Lane X failed:" lines (factory.attempts)."""
+        """A lane failure, factory hold or stop the factory acts on by itself,
+        as an event in the ticket's status comment: an edit sends no email.
+        Each one was a new comment, an email apiece (an infra ticket,
+        2026-10-19). The GitHub client expands status events, so the attempt
+        table still reads each "Lane X failed:", "held:" and "stopped:" line
+        as the ending of the claim before it (factory.attempts)."""
         status.add(self.gh, repo, number, text, self.now, self.s.authors)
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
         """Hold a ticket after the same consecutive failure or three attempts in
         six hours, and record its attempt table."""
-        if failure_class(reason) in NOT_WORK:
+        if ending_class(reason) in NOT_WORK:
             # An incident is the factory's problem repeating, a transient or
             # limit exit is the lane's, and an expired key is the operator's:
             # none did the ticket's work, so none may flag it or cost it a rung
-            # (loom#572, loom#744).
+            # (loom#572, loom#744). Earlier claims that ended so are left out
+            # by the ending each recorded: a failure, a retry, a hold or a
+            # stop (factory.attempts).
             return False
         authors = {author.lower() for author in self.s.authors}
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
@@ -4416,8 +4426,8 @@ class Station:
             trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments))
         skipped = len(attempts) - len(work)
         if skipped:
-            body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit] "
-                     "or [factory]." % skipped)
+            body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit], "
+                     "[auth] or [factory]." % skipped)
         self._comment(repo, number, body)
         return True
 
@@ -4524,8 +4534,11 @@ class Station:
         pull request back again."""
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED,
                       wait="" if fix else "model-limit")
-        # No comment: a limit is not news, and one comment a bounce emailed
-        # the operator dozens of times an hour (2026-10-18).
+        # No new comment: a limit is not news, and one comment a bounce
+        # emailed the operator dozens of times an hour (2026-10-18). A status
+        # event is an edit, and it ends the claim as [limit], so the runaway
+        # detector does not count it as work.
+        self._stopped(repo, number, lane, "limit", reason)
         _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
 
     def _unauthenticated(self, repo: str, number: int, fix: bool, lane: str,
@@ -4536,7 +4549,9 @@ class Station:
         ticket goes back to briefed, where the factory moves it to a lane whose
         key works; a fix brief's goes back to loom:pr."""
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED)
-        # No comment: the runner already opened the operator one ask for the key.
+        # No new comment: the runner already opened the operator one ask for
+        # the key. The status event ends the claim as [auth], not as work.
+        self._stopped(repo, number, lane, "auth", reason)
         _say("reported %s#%d unauthenticated on lane %s: %s" % (repo, number, lane, reason))
 
     def _branch_moved(self, repo: str, number: int, pr: int, lane: str, reason: str) -> None:
@@ -4545,8 +4560,18 @@ class Station:
         of the ladder is spent: the ticket returns to loom:pr, where the
         factory judges the new head and sends it back if it still needs a fix."""
         self._relabel(repo, number, "loom:pr")
-        # No comment: nothing failed, and the new head's review says the rest.
+        # No new comment: nothing failed, and the new head's review says the
+        # rest. The status event ends the claim as [transient], not as work.
+        self._stopped(repo, number, lane, "transient", reason)
         _say("reported %s#%d: branch moved on lane %s: %s" % (repo, number, lane, reason))
+
+    def _stopped(self, repo: str, number: int, lane: str, klass: str, reason: str) -> None:
+        """Record a claim that ended without doing the ticket's work as one
+        routine "Lane X stopped: [class] ..." event (factory.STOPPED_RE).
+        Never "Lane X failed:": the dashboard and the ladder count those as
+        failures."""
+        self._routine(repo, number,
+                      "Lane %s stopped: [%s] %s" % (lane, klass, CLASS_RE.sub("", reason)))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
         """Post each answer a fix round's lane wrote instead of a fix. Only a

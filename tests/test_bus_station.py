@@ -3216,6 +3216,12 @@ class FixTest(Base):
                              for c in self.fake.comments[12][-1:]
                              if not c["body"].startswith("Claimed")))
         self.assertEqual(self.fake.comments[99], [])
+        # A status event ends the claim as [transient], so it is not work.
+        stops = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)
+                 if c["body"].startswith("Lane codex stopped:")]
+        self.assertEqual(len(stops), 1)
+        self.assertTrue(stops[0].startswith("Lane codex stopped: [transient] branch moved: "))
+        self.assertEqual(station.ending_class("[work] branch moved: x"), "transient")
 
     def test_a_lane_explanation_is_redacted_of_credentials_before_it_is_posted(self):
         self.failed_fix([
@@ -3371,7 +3377,10 @@ class RetryTest(Base):
         self.run_pass()
         self.assertNotIn("loom:failed", self.fake.names(12))
         self.assertIn("lane:codex", self.fake.names(12))
-        self.assertEqual([b for b in self.bodies() if b.startswith("Lane codex")], [])
+        # Only a status event that ends the claim as [limit], never a failure.
+        self.assertEqual([b for b in self.bodies() if b.startswith("Lane codex")],
+                         ["Lane codex stopped: [limit] agent exited 3: provider limit reached; "
+                          "lane codex waits until 2030-01-02T00:00:00Z"])
 
     def test_free_lanes_take_only_easy_tickets_on_public_repos(self):
         self.heartbeat("zen")
@@ -3479,6 +3488,46 @@ class RetryTest(Base):
         self.run_pass()
         self.assertNotIn("loom:runaway", self.fake.names(12))
 
+    def test_attempts_that_ended_in_a_retry_or_a_factory_hold_do_not_count_toward_runaway(self):
+        # The status-event shapes (loom#866): neither starts "Lane X failed:".
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        claim = "Claimed for lane %s (body sha256 0123456789ab)"
+        self.fake.comments[12][:] = [
+            dict({"body": claim % "codex"}, **who),
+            dict({"body": "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
+                          "codex-2. Lane codex failed: [transient] agent exited 1"}, **who),
+            dict({"body": claim % "codex-2"}, **who),
+            dict({"body": "Lane codex-2 held: setup failed: could not check out the default "
+                          "branch; factory incident quadseven/loom#99; the agent did not run. "
+                          "The ticket keeps its rung and returns to the queue when the factory "
+                          "incident closes."}, **who),
+            dict({"body": claim % "codex"}, **who)]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
+    def test_a_limit_stop_is_recorded_and_does_not_count_toward_runaway(self):
+        # No other lane is up, so the limit waits briefed (_limited).
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        self.run_pass()
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        stops = [b for b in self.bodies() if b.startswith("Lane codex stopped:")]
+        self.assertEqual(stops, ["Lane codex stopped: [limit] agent exited 1: provider limit reached"])
+        self.assertFalse(any(b.startswith("Lane codex failed:") for b in self.bodies()))
+        # Two claims that ended at that limit, then a work failure: one work attempt.
+        self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing",
+                    number=13)
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        who = {"created_at": at, "user": {"login": "alice-example"}}
+        claim = "Claimed for lane %s (body sha256 0123456789ab)"
+        self.fake.comments[13][:] = [
+            dict({"body": claim % "codex"}, **who), dict({"body": stops[0]}, **who),
+            dict({"body": claim % "codex"}, **who), dict({"body": stops[0]}, **who),
+            dict({"body": claim % "codex"}, **who)]
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(13))
+
     def test_attempts_whose_default_branch_checkout_failed_do_not_count_toward_runaway(self):
         self.failed(body=BODY, reason="[work] agent made no commit on loom/12-fix-the-thing")
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
@@ -3508,7 +3557,7 @@ class RetryTest(Base):
             dict({"body": claim % "codex"}, **who)]
         self.run_pass()
         self.assertIn("loom:runaway", self.fake.names(12))
-        self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit] or "
+        self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit], [auth] or "
                       "[factory].", self.bodies()[-1])
 
     def test_the_attempt_table_names_the_model_each_attempt_ran(self):
@@ -3834,6 +3883,10 @@ class ExpiredKeyTest(Base):
         self.assertNotIn("loom:failed", self.fake.names(12))
         # No comment: the runner already filed the operator one ask for the key.
         self.assertFalse(any("could not authenticate" in b for b in self.bodies()))
+        # One status event ends the claim as [auth], so it is not work.
+        self.assertEqual([b for b in self.bodies() if b.startswith("Lane opencode-go")],
+                         ["Lane opencode-go stopped: [auth] agent exited 1: API key expired: "
+                          "renew <path>"])
 
     def test_expired_key_failures_never_flag_runaway_or_spend_an_attempt(self):
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
@@ -4492,11 +4545,14 @@ class OutcomeTest(Base):
 
     def test_a_limit_is_not_a_failure_and_the_ticket_goes_back_to_briefed(self):
         self.limited()
-        # A wait label instead of a comment: a comment a bounce emailed the
-        # operator dozens of times an hour (2026-10-18).
+        # A wait label and a status event instead of a comment: a comment a
+        # bounce emailed the operator dozens of times an hour (2026-10-18).
         self.assertEqual(self.fake.names(12),
                          ["loom:ticket", "lane:spark", "loom:briefed", "wait:model-limit"])
-        self.assertEqual(self.fake.comments[12], [])
+        self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True])
+        events = [text for _, text in status.parse(self.fake.comments[12][0]["body"])]
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].startswith("Lane spark stopped: [limit] limit: "), events[0])
 
     def test_a_limited_fix_brief_goes_back_to_its_pull_request(self):
         self.limited(fix_body=FIX_BODY)
