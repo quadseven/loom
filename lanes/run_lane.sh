@@ -322,10 +322,12 @@ prepare_intent() {
   files_tmp="$(mktemp)" sens_tmp="$(mktemp)" sum_tmp="$(mktemp)" what_tmp="$(mktemp)"
   safe_git diff --name-only "$BASE" HEAD 2>/dev/null | sed '/^[[:space:]]*$/d' > "$files_tmp"
   safe_git cat-file blob "$BASE:$SENSITIVE_FILE" 2>/dev/null > "$sens_tmp"
+  # Only the change lines before the summary's first heading: its
+  # ## Acceptance criteria checklist goes to the body's own section.
   if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
-    cp "$WORKDIR/$TICKET.summary.md" "$sum_tmp"
+    awk '/^#+ /{exit} {print}' "$WORKDIR/$TICKET.summary.md" > "$sum_tmp"
   elif [ -f "$TREE/$SUMMARY_FILE" ]; then
-    cat "$TREE/$SUMMARY_FILE" > "$sum_tmp" 2>/dev/null
+    awk '/^#+ /{exit} {print}' "$TREE/$SUMMARY_FILE" > "$sum_tmp" 2>/dev/null
   fi
   section What "$brief" > "$what_tmp" 2>/dev/null
   out="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.change_class --files "$files_tmp" --sensitive "$sens_tmp" --summary "$sum_tmp" --what "$what_tmp" 2>/dev/null)"
@@ -350,7 +352,11 @@ pr_body() {
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
-  criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
+  # The lane's checklist, from the summary the runner moved out of the tree
+  # before committing: read from the tree, every lane pull request carried
+  # the ticket's unticked criteria and went back for them (2026-10-20).
+  criteria="$(section 'Acceptance criteria' "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
+  [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(section 'Acceptance criteria' "$1")"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
     "$INTENT_TEXT" "$(section Why "$1")" "$(section What "$1")" "$criteria" \
@@ -457,8 +463,10 @@ post_replies() {
 # outside those sections. Scope changes are logged with old/new body hashes.
 # Exit: 0 = updated, 1 = no change needed, 2 = refused, 3 = gh/helper error.
 repair_pr_text() {
+  local summary=()
+  [ -f "$WORKDIR/$TICKET.summary.md" ] && summary=(--summary "$WORKDIR/$TICKET.summary.md")
   NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
-    --apply "$FIX_PR" --repo "$REPO" "$BRIEF" "$LANE" "$MODEL" "$TICKET"
+    --apply "$FIX_PR" --repo "$REPO" ${summary[@]+"${summary[@]}"} "$BRIEF" "$LANE" "$MODEL" "$TICKET"
 }
 
 # Prints the text of file $1 when it is fit for a ticket comment: at most
