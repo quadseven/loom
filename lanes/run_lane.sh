@@ -2282,11 +2282,15 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
+  # A timeout after editing keeps its edits whatever the failure is classed as;
+  # every park below names the branch.
+  TIMEDOUT_NOTE=""
+  if [ "$STATUS" -eq 124 ] && [ -n "$EDITED" ]; then TIMEDOUT_NOTE="; $(preserve_timedout)"; fi
   if [ "$FAIL_CLASS" != transient ]; then
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
     heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
-    park "$BRIEF" "agent exited $STATUS" transient
+    park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" transient
     break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
@@ -2321,7 +2325,7 @@ for BRIEF in "$INBOX"/*.md; do
     else
       heartbeat false "limit: $LIMIT_REASON; lane waits until $(utc "$RETRY_AT")" "$RETRY_AT"
     fi
-    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")" limit
+    park "$BRIEF" "agent exited $STATUS: $LIMIT_REASON; lane $SLOT waits until $(utc "$RETRY_AT")$TIMEDOUT_NOTE" limit
     break
   fi
   if [ "$FAIL_CLASS" = auth ]; then
@@ -2336,13 +2340,10 @@ for BRIEF in "$INBOX"/*.md; do
       hold_expired_key "$AUTH_WHY"
     fi
     ask_renew_key "$AUTH_WHY"
-    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY" auth
+    park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
     break
   fi
-  if [ "$STATUS" -eq 124 ] && [ -n "$EDITED" ] && [ "$FAIL_CLASS" = transient ]; then
-    park "$BRIEF" "agent exited 124; $(preserve_timedout)" "$FAIL_CLASS"; continue
-  fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS" "$FAIL_CLASS"; continue; fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.

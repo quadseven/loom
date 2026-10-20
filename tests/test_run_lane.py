@@ -1321,6 +1321,18 @@ print('leak guard: clean (shape patterns only)')
         self.assertEqual(kept, "partial\n")
         self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", heads)
 
+    def test_a_limited_timeout_after_editing_still_keeps_the_edits(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.run_lane(FAKE_AGENT="say", FAKE_OUT="429 RESOURCE_EXHAUSTED quota resets in 1 hours",
+                      FAKE_EDIT="1", FAKE_EXIT="124")
+        reason = self.failure_line()
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        side = [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+        self.assertEqual(len(side), 1, heads)
+        self.assertTrue(reason.startswith("[limit] "), reason)
+        self.assertIn("the edits are on branch " + side[0], reason)
+
     def test_a_timeout_that_edited_nothing_pushes_no_side_branch(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="still working", FAKE_EXIT="124")
