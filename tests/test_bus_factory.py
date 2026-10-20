@@ -243,6 +243,43 @@ class Base(unittest.TestCase):
 
 
 class PullRequests(Base):
+    def test_a_pull_request_with_unbuilt_non_live_criteria_goes_back(self):
+        criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        pr_criteria = ("- [x] A1\n- [x] A2\n" +
+                       "\n".join("- [ ] " + item for item in criteria[2:]) + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
+
+    def test_a_pull_request_with_every_non_live_criterion_ticked_lands(self):
+        criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        pr_criteria = ("\n".join("- [x] " + item for item in criteria[:5]) +
+                       "\n- [ ] " + criteria[5] + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_not_built_criterion_creates_a_follow_up_and_does_not_block_landing(self):
+        criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
+        ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +
+                       "\n".join("- [ ] " + item for item in criteria) + "\n")
+        pr_criteria = ("\n".join("- [x] " + item for item in criteria[:4]) +
+                       "\n- [ ] A5; not built: requires a later integration\n" +
+                       "- [ ] " + criteria[5] + "\n")
+        self.gh.ticket(5, "pr", body=ticket_body)
+        self.gh.pull(50, 5, body="## Acceptance criteria\n" + pr_criteria)
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertEqual(len(self.gh.filed), 1)
+        self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
+
     def test_a_ready_pull_request_is_merged(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
