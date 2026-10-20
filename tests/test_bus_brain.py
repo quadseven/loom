@@ -3294,6 +3294,13 @@ class HeldTicketsTest(unittest.TestCase):
         self.assertIn("### Held tickets\n- none", report)
         self.assertNotIn("### Held tickets\n- #12", report)
 
+    def test_status_omits_a_merged_runaway_ticket_from_runaway_tickets(self):
+        issue = dict(ticket("merged"), number=12, title="Merged already",
+                     created_at="2030-01-01T00:00:00Z")
+        issue["labels"] = issue["labels"] + [{"name": "loom:runaway"}]
+        report = self.status_for(issue)
+        self.assertIn("## Runaway tickets\n- none", report)
+
     def test_a_hold_of_more_than_two_days_is_reported_as_stuck(self):
         waiting, events = self.waiting(briefed=OLD)
         report = self.status_for(self.dependency(), waiting, events=events)

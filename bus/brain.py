@@ -351,9 +351,10 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
     return lines
 
 
-def runaway_lines(tickets: List[Dict[str, Any]]) -> List[str]:
+def runaway_lines(issues: List[Dict[str, Any]]) -> List[str]:
     """List held runaway tickets for immediate brain review."""
-    rows = [i for i in tickets if RUNAWAY in _labels(i)]
+    rows = [i for i in issues if RUNAWAY in _labels(i)
+            and tickets.ticket_state(i) not in tickets.MERGED_STATES]
     return ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
                                       for i in rows] or ["- none"])
 
@@ -764,7 +765,8 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
             lambda repo: _readable_section(gh, repo, now, bot, authors, found,
                                            review_check_name(env)), repos))
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
-               if RUNAWAY in _labels(issue)]
+               if RUNAWAY in _labels(issue)
+               and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
     out += [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     out += [""] + priority_lines(found, now)
