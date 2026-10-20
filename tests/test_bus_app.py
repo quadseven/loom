@@ -194,10 +194,6 @@ class Ids(unittest.TestCase):
         self.assertIn("LOOM_GITHUB_APP_KEY_FILE or LOOM_GITHUB_APP_KEY_SSM", err)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Token(unittest.TestCase):
     """`python3 -m bus app token` (loom#1142): a lane or the brain mints its
     own App's installation token for `gh` and `git`, and never falls back to
@@ -225,7 +221,7 @@ class Token(unittest.TestCase):
                        app_sign=lambda data, key: b"sig")
 
     def test_prints_the_installation_token_of_the_app_the_settings_name(self):
-        code, out, err = self.token({"LOOM_GITHUB_APP_ID": "5396753",
+        code, out, err = self.token({"LOOM_GITHUB_APP_ID": "124",
                                      "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
                                      "LOOM_GITHUB_APP_KEY_FILE": self.key})
         self.assertEqual((code, out), (0, "ghs_lanes_token\n"))
@@ -239,3 +235,7 @@ class Token(unittest.TestCase):
         self.assertEqual((code, out), (2, ""))
         self.assertIn("LOOM_GITHUB_APP_ID", err)
         self.assertEqual(self.minted, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

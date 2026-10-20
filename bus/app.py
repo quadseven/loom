@@ -96,9 +96,9 @@ def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
               "LOOM_GITHUB_APP_KEY_SSM (or LOOM_GITHUB_APP_KEY_FILE) name no App",
               file=sys.stderr)
         return 2
-    token = AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign)
-    gh = GitHub(token, transport=transport or urllib_transport)
-    out.write(token.token(gh._mint_app_token) + "\n")
+    gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
+                transport=transport or urllib_transport)
+    out.write(gh.app_token() + "\n")
     return 0
 
 

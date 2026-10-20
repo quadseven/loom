@@ -135,7 +135,7 @@ fi
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
-[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" >> "$FAKE_AGENT_ENV"
+[ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" >> "$FAKE_AGENT_ENV"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
@@ -3249,17 +3249,18 @@ exit %d
         seen_gh = Path(self._tmp.name) / "gh-tokens"
         seen_agent = Path(self._tmp.name) / "agent-tokens"
         self.drop_brief()
-        self.run_lane(LOOM_GITHUB_APP_ID="5396753",
+        self.run_lane(LOOM_GITHUB_APP_ID="124",
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes_token"),
                       GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes_token"})
-        self.assertEqual(seen_agent.read_text().split(), ["none"])
+        # Nor the App's settings to mint one, nor git's helper to borrow one.
+        self.assertEqual(seen_agent.read_text().split(), ["none", "none", "none"])
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
         self.drop_brief()
-        self.run_lane(LOOM_GITHUB_APP_ID="5396753",
+        self.run_lane(LOOM_GITHUB_APP_ID="124",
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo 'key not found' >&2; exit 2"),
                       GH_TOKEN="ghp_personal")
         self.assertEqual([c for c in self.calls() if c.startswith(("gh ", "codex "))], [])

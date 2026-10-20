@@ -209,6 +209,8 @@ brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || sa
 # personal token in the environment is dropped first, so a failed mint runs
 # no rung at all.
 if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+  [ "$MINUTES" -le 50 ] ||
+    { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
   unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
   if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_]+$ ]]; then
     say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"

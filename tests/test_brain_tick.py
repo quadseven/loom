@@ -440,7 +440,7 @@ class BrainTickTest(unittest.TestCase):
         self.usage("spark", True)
         run, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
                                LOOM_SPARK_URL="http://spark.invalid:8000/v1",
-                               LOOM_GITHUB_APP_ID="5396750", FAKE_APP_TOKEN="ghs_brain_token",
+                               LOOM_GITHUB_APP_ID="123", FAKE_APP_TOKEN="ghs_brain_token",
                                GITHUB_TOKEN="ghp_personal")
         self.assertEqual(0, run.returncode)
         self.assertIn("opencode env GH_TOKEN=ghs_brain_token GITHUB_TOKEN=ghs_brain_token "
@@ -449,13 +449,21 @@ class BrainTickTest(unittest.TestCase):
 
     def test_a_tick_whose_app_token_cannot_be_minted_runs_no_rung(self):
         self.usage("codex", True)
-        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="5396750",
+        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
                                GITHUB_TOKEN="ghp_personal")
         self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
         self.assertTrue(any(" unlock " in c for c in calls), calls)
         last, ok = self.beat()
         self.assertEqual("failed", last["outcome"])
         self.assertFalse(ok)
+
+    def test_a_tick_longer_than_its_app_token_lasts_runs_no_rung(self):
+        # An installation token lasts an hour; a 58-minute tick would outlive it.
+        self.usage("codex", True)
+        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
+                               FAKE_APP_TOKEN="ghs_brain_token", LOOM_BRAIN_MINUTES="58")
+        self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
+        self.assertNotEqual(0, run.returncode)
 
     def spark_tick(self, **env):
         self.usage("claude", False, "limit: provider limit reached")

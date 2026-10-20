@@ -131,7 +131,8 @@ REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
 # requests as the operator in a day. It clones over https, and each run mints
 # an installation token for gh and git (lane_app_token); the agent never gets
-# it. LOOM_APP_TOKEN_CMD prints the token instead of `bus app token` (tests).
+# it, its settings or git's helper. LOOM_APP_TOKEN_CMD, when set, is the command
+# that prints the token in place of `python3 -m bus app token`.
 if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
   # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
@@ -2203,7 +2204,8 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   ( set -m
-    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN && run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
+    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+      run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     echo $! > "$LOCK/pgid"
     wait $! ) &
   wait $!

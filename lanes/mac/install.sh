@@ -112,31 +112,36 @@ BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
 STATION_INTERVAL="${LOOM_STATION_INTERVAL:-60}"
 [[ "$STATION_INTERVAL" =~ ^[0-9]+$ ]] && [ "$STATION_INTERVAL" -ge 60 ] ||
   { echo "LOOM_STATION_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
-# A GitHub App needs all of its settings or none: with only some set, the
-# station and the brain would quietly fall back to the personal token
-# (bus/github.py AppToken.from_env), so refuse and name what is missing.
-APP_KEY="${LOOM_GITHUB_APP_KEY_FILE:-}${LOOM_GITHUB_APP_KEY_SSM:-}"
-if [ -n "${LOOM_GITHUB_APP_ID:-}${LOOM_GITHUB_APP_INSTALLATION_ID:-}$APP_KEY" ]; then
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] ||
-    { echo "GitHub App half set up: LOOM_GITHUB_APP_ID is missing (set all App settings or none)" >&2; exit 1; }
-  [ -n "${LOOM_GITHUB_APP_INSTALLATION_ID:-}" ] ||
-    { echo "GitHub App half set up: LOOM_GITHUB_APP_INSTALLATION_ID is missing (set all App settings or none)" >&2; exit 1; }
-  [ -n "$APP_KEY" ] ||
-    { echo "GitHub App half set up: LOOM_GITHUB_APP_KEY_FILE or LOOM_GITHUB_APP_KEY_SSM is missing (set all App settings or none)" >&2; exit 1; }
-fi
-# The App's private key as a file: it must exist and be readable by its owner
-# only (mode 600 or narrower), like an ssh key.
-if [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; then
-  [ -f "$LOOM_GITHUB_APP_KEY_FILE" ] && [ -r "$LOOM_GITHUB_APP_KEY_FILE" ] ||
-    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE is not a file this user can read" >&2; exit 1; }
+# A GitHub App needs all of its settings or none: with only some set, its
+# writer would quietly fall back to the personal token (bus/github.py
+# AppToken.from_env), so refuse and name what is missing. Each writer has its
+# own App (loom#1142): the station LOOM_GITHUB_APP_*, the lanes
+# LOOM_LANES_GITHUB_APP_* and the brain LOOM_BRAIN_GITHUB_APP_*. A key file
+# must exist and be readable by its owner only (mode 600 or narrower), like
+# an ssh key.
+check_app() {
+  local p="LOOM_${1}GITHUB_APP_" id inst file ssm mode
+  id="${p}ID" inst="${p}INSTALLATION_ID" file="${p}KEY_FILE" ssm="${p}KEY_SSM"
+  [ -n "${!id:-}${!inst:-}${!file:-}${!ssm:-}" ] || return 0
+  [ -n "${!id:-}" ] ||
+    { echo "GitHub App half set up: $id is missing (set all App settings or none)" >&2; exit 1; }
+  [ -n "${!inst:-}" ] ||
+    { echo "GitHub App half set up: $inst is missing (set all App settings or none)" >&2; exit 1; }
+  [ -n "${!file:-}${!ssm:-}" ] ||
+    { echo "GitHub App half set up: $file or $ssm is missing (set all App settings or none)" >&2; exit 1; }
+  [ -n "${!file:-}" ] || return 0
+  [ -f "${!file}" ] && [ -r "${!file}" ] ||
+    { echo "$file ${!file} is not a file this user can read" >&2; exit 1; }
   # GNU stat first: BSD stat rejects -c, while GNU stat accepts -f with another meaning.
-  KEY_MODE="$(stat -c %a "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null ||
-    stat -f %Lp "$LOOM_GITHUB_APP_KEY_FILE" 2>/dev/null)" || KEY_MODE=""
-  [[ "$KEY_MODE" =~ ^[0-7]+$ ]] ||
-    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE: could not read its mode with stat" >&2; exit 1; }
-  [ $((8#$KEY_MODE & 8#077)) -eq 0 ] ||
-    { echo "LOOM_GITHUB_APP_KEY_FILE $LOOM_GITHUB_APP_KEY_FILE has mode $KEY_MODE; it must be 600 (chmod 600 $LOOM_GITHUB_APP_KEY_FILE)" >&2; exit 1; }
-fi
+  mode="$(stat -c %a "${!file}" 2>/dev/null || stat -f %Lp "${!file}" 2>/dev/null)" || mode=""
+  [[ "$mode" =~ ^[0-7]+$ ]] ||
+    { echo "$file ${!file}: could not read its mode with stat" >&2; exit 1; }
+  [ $((8#$mode & 8#077)) -eq 0 ] ||
+    { echo "$file ${!file} has mode $mode; it must be 600 (chmod 600 ${!file})" >&2; exit 1; }
+}
+check_app ""
+check_app LANES_
+check_app BRAIN_
 DASHBOARD_PORT="${LOOM_DASHBOARD_PORT:-8080}"
 DASHBOARD_HOST="${LOOM_DASHBOARD_HOST:-}"
 if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
@@ -179,10 +184,28 @@ X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")
 loom_env() {
   local skip=" $* "
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
-    case "$k" in LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS) continue ;; LOOM_*) ;; *) continue ;; esac
+    case "$k" in
+      LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS) continue ;;
+      # Each job gets its own writer's App from app_env, never another's.
+      LOOM_GITHUB_APP_*|LOOM_LANES_GITHUB_APP_*|LOOM_BRAIN_GITHUB_APP_*) continue ;;
+      LOOM_*) ;; *) continue ;;
+    esac
     case "$skip" in *" $k "*) continue ;; esac
     v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
+  done
+}
+
+# One writer's App settings as the job's LOOM_GITHUB_APP_*: $1 is "" for the
+# station's, LANES_ or BRAIN_. The brain keeps the station's App until it has
+# its own, so a reinstall never moves it back to the personal token.
+app_env() {
+  local p="LOOM_${1}GITHUB_APP_" n v
+  [ "$1" = BRAIN_ ] && [ -z "${LOOM_BRAIN_GITHUB_APP_ID:-}" ] && p=LOOM_GITHUB_APP_
+  for n in ID INSTALLATION_ID KEY_SSM KEY_FILE; do
+    v="${p}$n"
+    [ -n "${!v:-}" ] || continue
+    printf '    <key>LOOM_GITHUB_APP_%s</key><string>%s</string>\n' "$n" "$(xml "${!v}")"
   done
 }
 
@@ -226,6 +249,7 @@ for L in "${LANES[@]}"; do
     <key>LOOM_HOME</key><string>$X_LOOM</string>
     <key>LOOM_REPO_OWNERS</key><string>$(xml "$LOOM_REPO_OWNERS")</string>
 $(loom_env)
+$(app_env LANES_)
   </dict>
 </dict>
 </plist>
@@ -407,6 +431,7 @@ else
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
 $(loom_env)
+$(app_env BRAIN_)
   </dict>
 </dict>
 </plist>
@@ -504,6 +529,7 @@ case "${LOOM_DASHBOARD:-}" in
     <key>LOOM_DASHBOARD_PORT</key><string>$(xml "$DASHBOARD_PORT")</string>
     <key>LOOM_TRANSCRIPTS_MEMORY</key><string>$(xml "$DASHBOARD_MEMORY")</string>
 $(loom_env LOOM_DASHBOARD LOOM_DASHBOARD_HOST LOOM_DASHBOARD_PORT LOOM_TRANSCRIPTS_MEMORY)
+$(app_env "")
   </dict>
 </dict>
 </plist>
