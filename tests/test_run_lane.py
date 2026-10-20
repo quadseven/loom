@@ -168,6 +168,11 @@ if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
   printf 'contact %s\\n' "$(printf 'MTAuMjMuNC41' | base64 -d)" >> fix.txt
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = own-ref ]; then
+  echo "fixed" > fix.txt
+  echo "see repo#7 and example/repo#8" >> fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
   echo "fixed" > fix.txt
   echo "see repo-legacy-private#3 and example/repo#7" >> fix.txt
@@ -479,9 +484,11 @@ mode, value = args[0], args[1]
 # The real scanner's private-issue-ref rule: an issue reference to any repo
 # but the ones named with --allow-repo-ref may name a private repo.
 allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
-# As the real scanner builds it: the exemption sits after the optional owner.
-exempt = r'(?!(?:%s)\\b)' % '|'.join(map(re.escape, allowed)) if allowed else ''
-ref = re.compile(r'(?<![\\w/-])(?:[a-z0-9][a-z0-9._-]*/)?' + exempt + r'[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
+# As the real scanner builds it (infra-public PR 159): an OWNER/NAME entry
+# exempts exactly OWNER/NAME#N and NAME#N, checked before the optional owner.
+forms = set(allowed) | {a.split('/', 1)[1] for a in allowed if '/' in a}
+exempt = r'(?!(?:%s)#)' % '|'.join(map(re.escape, sorted(forms))) if forms else ''
+ref = re.compile(r'(?<![\\w/-])' + exempt + r'(?:[a-z0-9][a-z0-9._-]*/)?[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
 if mode == '--diff':
     text = subprocess.run(['git', 'diff', '-U0', value], capture_output=True,
                           text=True, check=True).stdout
@@ -629,6 +636,16 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_diff_citing_its_own_repos_issues_pushes(self):
+        # A lane change citing its own ticket (NAME#N in code or a test) was
+        # refused: four fix rounds on one public repo were discarded on
+        # 2026-10-20 until the scanner learned an exact own-repo exemption.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="own-ref")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("leak scan failed", self.run_log())
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
 
     def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
         # The body's own-repo Refs line is exempt, nothing else: private repos
