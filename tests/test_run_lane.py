@@ -2402,11 +2402,12 @@ cat > /dev/null
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_spark_lane_runs_opencode_against_its_endpoint_and_takes_a_private_repo(self):
-        # The local coder trains on nothing: no privacy lookup, private is fine.
+        # Visibility is checked for scanning; private repos skip the scan.
         inbox, result = self.api_lane("spark", FAKE_GH_PRIVATE="true", **self.SPARK)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertFalse(any(c.startswith("gh api ") for c in calls), calls)
+        self.assertIn("gh api repos/example/repo --jq .private", calls)
+        self.assertNotIn("leak guard: clean (shape patterns only)", self.spark_log())
         self.assertTrue(any(c.startswith("curl ") and "http://spark.example.invalid:8000/v1/models" in c
                             for c in calls), calls)
         agent = [c for c in calls if c.startswith("opencode ")]
