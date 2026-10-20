@@ -6753,6 +6753,45 @@ class CloseDoneTest(Base):
         return "\n".join(c["body"] for c in self.fake.comments[number]
                          if status.is_status(c.get("body")))
 
+    def test_a_shipped_ticket_with_a_time_window_earlier_than_the_log_start_closes(self):
+        # A shipped ticket whose Live line names a time window that ended before
+        # the evidence source's earliest record closes as done. The window and
+        # the earliest record time are mentioned in the close comment.
+        self.fake.private = False
+        # Create a log file with a modification time of 2026-04-01 (after the window ends)
+        import time
+        log_dir = os.path.join(self.home, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "evidence.log")
+        with open(log_path, "w") as f:
+            f.write("")
+        # Set the modification time to 2026-04-01
+        log_timestamp = time.mktime(time.struct_time((2026, 4, 1, 0, 0, 0, 0, 0, -1)))
+        os.utime(log_path, (log_timestamp, log_timestamp))
+        # Update settings to use this log file
+        self.settings.evidence_cmds = {REPO: log_path}
+        
+        # Live line with a time window that ended before the log starts
+        with_window = SHIPPED_BODY.replace(
+            "prints `daily status ready`",
+            "prints `daily status ready` on or after 2026-01-01 and before 2026-03-01"
+        )
+        self.fake.add(1, lane="codex", body=with_window, state="shipped")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.close_done_tickets()
+        # Ticket 1 should be closed because the window ended before the log
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertEqual(self.fake.issues[1]["state_reason"], "completed")
+        # The close comment should mention both the window end and the log start
+        text = self.close_text(1)
+        self.assertIn("2026-03-01", text)
+        self.assertIn("2026-04-01", text)
+        # Live criteria still open or covered by the evidence source should remain open
+        self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped")
+        st.close_done_tickets()
+        # Ticket 2 should remain open because the Live line can still find evidence
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+
     def test_the_done_close_names_a_neutral_review_check(self):
         # The merge gate lets a non-sensitive pull request land with the
         # review check neutral, so the close may not say "green checks".

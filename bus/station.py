@@ -468,6 +468,65 @@ def live_needles(body: Optional[str]) -> Optional[List[str]]:
     return evidence.needles(live)
 
 
+def _evidence_log_path(repo: str, command: str) -> Optional[str]:
+    """Get the log file path for a repo and evidence command, or None.
+    
+    The command string may be a path to a file or a command to run. If it's
+    a path, return it; if it's a command, try to find the log file.
+    """
+    if os.path.isabs(command):
+        return command
+    if command.endswith(".log"):
+        return command
+    return None
+
+
+def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str) -> Optional[datetime]:
+    """Get the earliest record from the evidence source for the given repo, or None.
+    
+    This reads the log file's modification time as a proxy for when the log
+    started being written. If the command is not configured for this repo or
+    the log file does not exist, return None.
+    """
+    command = evidence_cmds.get(repo)
+    if not command:
+        return None
+    log_path = _evidence_log_path(repo, command)
+    if not log_path:
+        return None
+    try:
+        mtime = os.path.getmtime(log_path)
+        return datetime.fromtimestamp(mtime, tz=timezone.utc)
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def _live_time_window(live: str) -> Optional[Tuple[datetime, datetime]]:
+    """Extract the time window from a Live criterion, or None when none exists.
+    
+    Returns (window_start, window_end) as datetime objects, or None when the
+    criterion has no time window (e.g., "Live: prints `foo`").
+    """
+    import re
+    
+    # Pattern to match time expressions like "on or after 2026-01-01" and "before 2026-03-01"
+    after_pattern = re.compile(r"on\s+or\s+after\s+(\d{4}-\d\d-\d\d)", re.I)
+    before_pattern = re.compile(r"before\s+(\d{4}-\d\d-\d\d)", re.I)
+    
+    after_match = after_pattern.search(live)
+    before_match = before_pattern.search(live)
+    
+    if not after_match and not before_match:
+        return None
+    
+    try:
+        window_start = datetime.fromisoformat(after_match.group(1) if after_match else "2000-01-01").replace(tzinfo=timezone.utc)
+        window_end = datetime.fromisoformat(before_match.group(1) if before_match else "2100-01-01").replace(tzinfo=timezone.utc)
+        return window_start, window_end
+    except ValueError:
+        return None
+
+
 def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:
     """Local HH:MM times from a comma or space separated list, sorted; any
     entry that is not a valid time is left out."""
@@ -5971,7 +6030,10 @@ class Station:
         conclusion of every check run on its merge commit, as read now: the
         merge gate lets a review check conclude neutral, so a fixed "merged
         on green checks" was wrong on most closes (2026-10-20). A Live line
-        that names one keeps the ticket open for a verify run, and a verified
+        that names a time window that ended before the evidence source starts
+        also closes, with both times mentioned in the close comment. A Live
+        line that names one that is still open or covered by the evidence
+        source keeps the ticket open for a verify run, and a verified
         ticket closes through brain.close on the verify path, which checks
         its criteria. Done tickets never closed: 199 sat shipped and the
         backlog grew all week though the work was finished."""
@@ -5986,7 +6048,42 @@ class Station:
                 if not why:
                     continue
                 number = int(issue["number"])
-                # A failed read is said in the text; it never stops the close.
+                # Check if the ticket has a Live time window that ended before
+                # the evidence source starts. If so, close it with both times.
+                live = brain.live_criterion(issue.get("body"), limit=None)
+                time_window = _live_time_window(live)
+                if time_window:
+                    earliest_record = _earliest_evidence_record(self.s.evidence_cmds, repo)
+                    if earliest_record is not None:
+                        window_start, window_end = time_window
+                        if earliest_record > window_end:
+                            # The evidence source starts after the window ends.
+                            # Close the ticket with both times.
+                            close_reason = "shipped, its Live window ended %s but evidence started %s"
+                            close_reason = close_reason % (
+                                window_end.strftime("%Y-%m-%d"),
+                                earliest_record.strftime("%Y-%m-%d"))
+                            branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+                            if error:
+                                _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+                            try:
+                                self._routine(repo, number, "Closed: %s. %s Not verified live; its criteria "
+                                              "were not ticked one by one."
+                                              % (close_reason, verify_data.close_facts(branch, pulls, error)))
+                                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                                             {"labels": [CLOSE_DONE_LABEL]})
+                                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                                             {"state": "closed", "state_reason": "completed"})
+                            except RateLimited:
+                                raise
+                            except GitHubError as err:
+                                _say("could not close done %s#%d: %s" % (repo, number, err))
+                                continue
+                            left -= 1
+                            _say("closed done %s#%d: %s" % (repo, number, close_reason))
+                            continue
+                # Normal close for tickets without a time window or with an
+                # open window.
                 branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
                 if error:
                     _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
@@ -6276,8 +6373,13 @@ class Station:
         labels = set(_label_names(issue))
         if issue.get("state") != "open" or labels & set(CLOSE_DONE_HOLDS):
             return ""
-        if "loom:shipped" in labels and "loom:verified" not in labels and not live_needles(issue.get("body")):
-            return "shipped, and its Live line names nothing a log search can find"
+        if "loom:shipped" in labels and "loom:verified" not in labels:
+            live = brain.live_criterion(issue.get("body"), limit=None)
+            time_window = _live_time_window(live)
+            if time_window:
+                return "shipped, its Live window ended before evidence started"
+            if not live_needles(issue.get("body")):
+                return "shipped, and its Live line names nothing a log search can find"
         return ""
 
     def restate_shipped_live(self) -> None:
