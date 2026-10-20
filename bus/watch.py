@@ -9,7 +9,10 @@ is status whatever state it names, nor the brain's own status output (its
 stage handoff lines, ticket report and headings, resume lines and the tick or
 journal JSON it echoes), which names states and outcomes. Each kept line is reduced to a signature: times, numbers, hex ids,
 repos, issue numbers and paths become placeholders, so the same error on two
-repos is one signature.
+repos is one signature. A station stage's failure line ("station: run_factory
+failed: <err>") also loses its stage name, so one error that every stage of a
+pass hits is one signature, not one per stage; the stages seen are kept on the
+record and listed in the issue and its count comment.
 
 A signature seen REPEAT times within WINDOW seconds, and not in the DAY before,
 files one loom:triage issue in the lanes repo titled "<component>: <signature>"
@@ -55,6 +58,8 @@ MARKER = "<!-- loom:watch v1 -->"
 # signatures (which say "error") and must never count as hits themselves.
 SELF = "station: watch: "
 WITHHELD = "(withheld: the line fails the written-text check)"
+# Stage names listed on one signature's record.
+STAGES_MAX = 20
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 # An HTTP status in a context that says so ("HTTP 403", "answered 502",
@@ -65,6 +70,11 @@ HTTP_RE = re.compile(
     r"|not found|method not allowed|conflict|gone|unprocessable|too many requests"
     r"|internal server error|bad gateway|service unavailable|gateway time-?out))")
 KEEP_RE = re.compile(r"(?i)error|failed|traceback|refused")
+# A station pass stage that raised (bus/station.py run_pass: "%s failed: %s"
+# with the step's name). One GitHub error fails most stages of a pass, and on
+# 2026-10-20 a single unreadable repo's 404 filed loom#1054-#1066 and
+# loom#1087, one issue per stage: the name is folded out of the signature.
+STAGE_RE = re.compile(r"^station: (?P<stage>[A-Za-z_][A-Za-z0-9_]*) failed: ")
 # The station's hold line (bus/station.py _try_ticket): a ticket waiting on
 # its After: tickets, each with its state label, said once a pass. A
 # dependency in loom:failed reads "(failed)", but the hold is status, not an
@@ -177,11 +187,20 @@ def _norm(piece: str) -> str:
     return _NUM_RE.sub("<n>", piece)
 
 
+def stage(line: str) -> Optional[str]:
+    """The station stage a "station: <stage> failed: <err>" line names, or
+    None for any other line."""
+    m = STAGE_RE.match(_LEAD_RE.sub("", line))
+    return m.group("stage") if m else None
+
+
 def signature(line: str) -> str:
     """The line with its varying parts replaced by placeholders; HTTP status
-    codes are kept, so a 403 and a 502 differ."""
+    codes are kept, so a 403 and a 502 differ. A station stage's name becomes
+    <stage>, so every stage failing with one error shares the signature."""
+    line = STAGE_RE.sub("station: <stage> failed: ", _LEAD_RE.sub("", line), count=1)
     # The signature becomes a public issue title: strip credentials first.
-    line = _text.SECRET_RE.sub("[redacted]", transcripts.scrub(_LEAD_RE.sub("", line)))
+    line = _text.SECRET_RE.sub("[redacted]", transcripts.scrub(line))
     out, last = [], 0
     for m in HTTP_RE.finditer(line):
         group = "a" if m.group("a") else "b"
@@ -365,6 +384,12 @@ class Watcher:
         rec["last"] = self.now
         rec["total"] = rec.get("total", 0) + 1
         rec["last_line"] = redact(line)
+        name = stage(line)
+        if name is not None:
+            stages = [s for s in rec.get("stages") or [] if isinstance(s, str)]
+            if name not in stages and len(stages) < STAGES_MAX:
+                stages.append(name)
+            rec["stages"] = sorted(stages)
 
     def _scan(self, state: Dict[str, Any]) -> Dict[str, int]:
         logs = state.get("logs")
@@ -456,6 +481,12 @@ class Watcher:
                 return int(issue["number"])
         return None
 
+    @staticmethod
+    def _stages(rec: Dict[str, Any]) -> List[str]:
+        """The "Stages: a, b" lines for a station stage signature, else none."""
+        stages = [s for s in rec.get("stages") or [] if isinstance(s, str)]
+        return ["Stages: %s" % ", ".join(stages), ""] if stages else []
+
     def _body(self, key: str, rec: Dict[str, Any]) -> str:
         name, sig = key.split(": ", 1)
         return "\n".join([
@@ -465,7 +496,7 @@ class Watcher:
             % (name, self._window(rec), WINDOW // 60, DAY // 3600),
             "",
             "Signature: `%s`" % sig,
-            "",
+            ""] + self._stages(rec) + [
             "First example:",
             "```text",
             _checked(str(rec.get("first_line") or "")),
@@ -485,7 +516,7 @@ class Watcher:
             " Last seen %s."
             % (rec["total"] - rec.get("told_total", 0),
                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_num(rec.get("last")) or self.now))),
-            "",
+            ""] + self._stages(rec) + [
             "Last example:",
             "```text",
             _checked(str(rec.get("last_line") or "")),
