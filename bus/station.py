@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import audit
 from . import brain_memory
+from . import claimed
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -511,8 +512,16 @@ class Settings:
                  ship_workflows: Optional[Dict[str, str]] = None,
                  no_topup: Sequence[str] = (),
                  log_keep_days: int = LOG_KEEP_DAYS,
-                 disk_free_min_gb: float = DISK_FREE_MIN_GB) -> None:
+                 disk_free_min_gb: float = DISK_FREE_MIN_GB,
+                 settle_claimed: str = "off",
+                 settle_claimed_max: int = claimed.PER_RUN) -> None:
         self.home = home
+        # LOOM_SETTLE_CLAIMED: "on" settles operator-claimed issues whose pull
+        # requests merged, "dry" (from_env's default) logs what it would do,
+        # "off" skips it; off for a Settings built in code, like the factory
+        # (bus/claimed.py). LOOM_SETTLE_CLAIMED_MAX caps the issues a run settles.
+        self.settle_claimed = settle_claimed
+        self.settle_claimed_max = settle_claimed_max
         # LOOM_NO_TOPUP: provider lanes (anthropic) whose credit the operator
         # never tops up. Their slots held out of credit wait for the credit
         # to renew, so the lane-held invariant skips them. Empty (the
@@ -653,7 +662,9 @@ class Settings:
                    ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")),
                    no_topup=words("LOOM_NO_TOPUP"),
                    log_keep_days=_keep_days(env.get("LOOM_LOG_KEEP_DAYS", "")),
-                   disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")))
+                   disk_free_min_gb=_free_floor(env.get("LOOM_DISK_FREE_MIN_GB", "")),
+                   settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
+                   settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")))
 
 
 def _keep_days(raw: str) -> int:
@@ -6046,6 +6057,169 @@ class Station:
         _say("settled the source of %s#%d: %s" % (repo, ticket, said))
         return 1
 
+    def settle_claimed_tickets(self) -> None:
+        """Settle operator-claimed issues whose pull requests merged
+        (bus/claimed.py): an issue with a claim:<login> label and no loom:
+        label had nothing to close it once its Refs pull request merged, and
+        about 60 stayed open in one day (2026-10-20). At most once an hour,
+        at most settle_claimed_max issues a run, each write WRITE_GAP seconds
+        after the last; "dry" logs each decision and writes nothing."""
+        if self.s.settle_claimed not in ("on", "dry"):
+            return
+        path = os.path.join(self.state, claimed.STATE_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if isinstance(last, (int, float)) and 0 <= self.now - last < claimed.EVERY:
+            return
+        left = self.s.settle_claimed_max
+        pacer = claimed.Pacer()
+        # Stamped however the run ends, as settle_orphan_sources is.
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    left -= self._settle_claimed_repo(repo, left, pacer)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not settle the claimed issues of %s: %s" % (repo, err))
+        finally:
+            state["_at"] = self.now
+            _write_json(path, state)
+
+    def _settle_claimed_repo(self, repo: str, left: int, pacer: "claimed.Pacer") -> int:
+        """Settle up to `left` of the repo's claimed issues; how many were."""
+        found = self._claimed_issues(repo)
+        if not found:
+            return 0
+        still_open = {n for pr in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+                      if isinstance(pr, dict)
+                      for n in _refs_numbers(repo, str(pr.get("body") or ""))}
+        done = 0
+        for number in sorted(set(found) - still_open):
+            if done >= left:
+                break
+            done += self._try_settle_claimed(repo, found[number], pacer)
+        return done
+
+    def _claimed_issues(self, repo: str) -> Dict[int, Dict[str, Any]]:
+        """The repo's open claim:<login> issues claimed.skip_reason allows."""
+        claims = [str(label.get("name") or "") for label in self.gh.paginate(
+            "/repos/%s/labels" % repo) if isinstance(label, dict)
+            and str(label.get("name") or "").lower().startswith(claimed.CLAIM_PREFIX)]
+        found: Dict[int, Dict[str, Any]] = {}
+        for name in claims:
+            for issue in self._paginate("/repos/%s/issues?labels=%s&state=open"
+                                        % (repo, quote(name, safe=":"))):
+                if isinstance(issue, dict) and not claimed.skip_reason(issue):
+                    found[int(issue["number"])] = issue
+        return found
+
+    def _try_settle_claimed(self, repo: str, issue: Dict[str, Any],
+                            pacer: "claimed.Pacer") -> int:
+        """Settle one candidate when its merged pull requests prove it: 1 when
+        it was settled. One issue GitHub or the text checks refuse is logged
+        and skipped; it does not stop the others."""
+        number = int(issue["number"])
+        pulls = [pr for pr in self._closed_pulls(repo)
+                 if number in _refs_numbers(repo, str(pr.get("body") or ""))]
+        if not pulls or len(pulls) > claimed.MAX_PULLS:
+            return 0
+        branch = self._default_branch(repo)
+        try:
+            checked = self._claimed_pulls(repo, number, branch, pulls)
+            if checked is None:
+                return 0
+            return self._settle_claimed(repo, issue, branch, checked, pacer)
+        except RateLimited:
+            raise
+        except (GitHubError, ValueError) as err:
+            _say("settle-claimed: could not settle %s#%d: %s" % (repo, number, err))
+            return 0
+
+    def _claimed_pulls(self, repo: str, number: int, branch: str,
+                       pulls: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        """The issue's merged pull requests with their head's newest check
+        runs, or None when one does not prove it (said once, in the log)."""
+        checked = []
+        for pr in pulls:
+            head = str((pr.get("head") or {}).get("sha") or "")
+            runs: List[Dict[str, Any]] = []
+            if COMMIT_RE.fullmatch(head):
+                data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
+                                    % (repo, head)).data
+                runs = verify_data.newest_runs(
+                    (data.get("check_runs") if isinstance(data, dict) else None) or [])
+            why = claimed.pull_gate(pr, runs, self.s.review_check, branch)
+            if why:
+                _say("settle-claimed: %s#%d stays open: PR #%d %s"
+                     % (repo, number, int(pr.get("number") or 0), why))
+                return None
+            checked.append(dict(pr, runs=runs))
+        return checked
+
+    def _claimed_tests(self, repo: str, branch: str, pr: Dict[str, Any]) -> List[str]:
+        """The test functions the pull request added that `branch` still
+        defines, read from the branch itself."""
+        files = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
+                             % (repo, int(pr["number"]))).data
+        tests = claimed.added_tests(files if isinstance(files, list) else [])
+        sources: Dict[str, str] = {}
+        kept = []
+        for name, test in tests:
+            if name not in sources:
+                if len(sources) >= claimed.MAX_TEST_FILES:
+                    break
+                sources[name] = claimed.decoded(self.gh.rest(
+                    "GET", "/repos/%s/contents/%s?ref=%s"
+                    % (repo, quote(name), quote(branch, safe="")), ok=(404,)).data)
+            if claimed.defines(sources[name], test):
+                kept.append(test)
+        return kept
+
+    def _settle_claimed(self, repo: str, issue: Dict[str, Any], branch: str,
+                        pulls: List[Dict[str, Any]], pacer: "claimed.Pacer") -> int:
+        """Close one proven claimed issue, or label it when a box is live: 1
+        when it was settled (or, in a dry run, would be)."""
+        number = int(issue["number"])
+        body = str(issue.get("body") or "")
+        act = self.s.settle_claimed == "on"
+        live = claimed.live_boxes(body)
+        if live:
+            if act:
+                pacer.wait()
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": [claimed.LIVE_LABEL]})
+            _say("settle-claimed: %s %s#%d %s, a box asks for a live check: %s"
+                 % ("labelled" if act else "would label", repo, number, claimed.LIVE_LABEL,
+                    _clip(live[0], 120)))
+            return 1
+        for pr in pulls:
+            pr["tests"] = self._claimed_tests(repo, branch, pr)
+        comment = claimed.evidence_comment(pulls, branch, self.s.review_check)
+        brain._check_written_text(comment)
+        shown = ", ".join("#%d" % int(pr.get("number") or 0) for pr in pulls)
+        if not act:
+            _say("settle-claimed: would close %s#%d, merged as PR %s" % (repo, number, shown))
+            return 1
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        if not any(str(c.get("body") or "").startswith(claimed.MARKER)
+                   for c in comments if isinstance(c, dict)):
+            pacer.wait()
+            self.gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                         {"body": comment})
+        ticked = proof.tick(body)
+        if ticked != body:
+            pacer.wait()
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
+        pacer.wait()
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                     {"state": "closed", "state_reason": "completed"})
+        _say("settle-claimed: closed %s#%d, merged as PR %s" % (repo, number, shown))
+        return 1
+
     def _rewritten_as(self, repo: str, number: int) -> int:
         """The ticket the newest rewrite comment by a briefing login names, 0
         for none: anyone may comment on a public issue."""
@@ -8122,7 +8296,7 @@ class Station:
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.settle_orphan_sources,
-                     self.restate_shipped_live,
+                     self.settle_claimed_tickets, self.restate_shipped_live,
                      self.health_intake, self.intake_friction,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
